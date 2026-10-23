@@ -4094,6 +4094,9 @@ mod rewrite;
 #[path = "external_tests.rs"]
 mod external;
 
+#[path = "reserve_tests.rs"]
+mod reserve;
+
 #[tokio::test]
 #[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
 async fn s3_copies_plain() {

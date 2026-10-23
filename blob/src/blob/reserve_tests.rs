@@ -1,0 +1,489 @@
+//! Create-only writes to tenant paths on a storage that, like Ceph RGW, ignores the conditions
+//! of copies and multipart completions but honors them on a single put.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use aruna_core::structs::storage::backend_import::PlainPath;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::response::Response;
+use bytes::Bytes;
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+/// One object of the fake storage.
+#[derive(Clone)]
+struct Stored {
+    body: Bytes,
+    etag: String,
+    metadata: Vec<(String, String)>,
+}
+
+#[derive(Default)]
+struct Fake {
+    objects: BTreeMap<String, Stored>,
+    uploads: BTreeMap<String, BTreeMap<u16, Bytes>>,
+    next: u64,
+}
+
+type Shared = Arc<Mutex<Fake>>;
+
+fn md5_hex(bytes: &[u8]) -> String {
+    hex::encode(md5::compute(bytes).0)
+}
+
+fn stored(body: &[u8], metadata: &[(&str, &str)]) -> Stored {
+    let metadata = metadata
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+    Stored {
+        body: Bytes::copy_from_slice(body),
+        etag: md5_hex(body),
+        metadata: metadata.collect(),
+    }
+}
+
+fn answer(status: StatusCode, headers: &[(String, String)], body: impl Into<Body>) -> Response {
+    let mut response = Response::builder().status(status);
+    for (name, value) in headers {
+        response = response.header(name, value);
+    }
+    response.body(body.into()).unwrap()
+}
+
+fn refuse(status: StatusCode, code: &str) -> Response {
+    let body = format!("<Error><Code>{code}</Code><Message>{code}</Message></Error>");
+    let xml = [("content-type".to_string(), "application/xml".to_string())];
+    answer(status, &xml, body)
+}
+
+fn xml(body: String) -> Response {
+    let xml = [("content-type".to_string(), "application/xml".to_string())];
+    answer(StatusCode::OK, &xml, body)
+}
+
+fn decoded(path: &str) -> String {
+    let path = path.split('?').next().unwrap_or_default();
+    let path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    path.trim_start_matches('/').to_string()
+}
+
+/// The inclusive byte range a header like `bytes=2-5` names within `size` bytes.
+fn range(header: Option<&str>, size: usize) -> Option<(usize, usize)> {
+    let (first, last) = header?.strip_prefix("bytes=")?.split_once('-')?;
+    let first = first.parse().ok()?;
+    let end = size.saturating_sub(1);
+    let last = last.parse().map_or(end, |last: usize| last.min(end));
+    Some((first, last))
+}
+
+/// Answers the S3 calls the blob adapter makes, keeping objects in memory.
+async fn serve(
+    State(fake): State<Shared>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let key = decoded(uri.path());
+    let query = uri.query().unwrap_or_default().to_string();
+    let param = |name: &str| {
+        let prefix = format!("{name}=");
+        let found = query.split('&').find_map(|pair| pair.strip_prefix(&prefix));
+        found.map(|value| decoded(value))
+    };
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let unquoted = |etag: &str| etag.trim_matches('"').to_string();
+    let mut fake = fake.lock().unwrap();
+    let source = header("x-amz-copy-source").map(decoded);
+    let copied = source
+        .as_ref()
+        .map(|source| fake.objects.get(source).cloned());
+    // Copies honor only the source condition, never one about the target.
+    if let (Some(Some(found)), Some(etag)) = (&copied, header("x-amz-copy-source-if-match"))
+        && unquoted(etag) != found.etag
+    {
+        return refuse(StatusCode::PRECONDITION_FAILED, "PreconditionFailed");
+    }
+    if matches!(copied, Some(None)) {
+        return refuse(StatusCode::NOT_FOUND, "NoSuchKey");
+    }
+    let copied = copied.flatten();
+    let head = method == Method::HEAD;
+    match (method, param("uploadId")) {
+        (Method::HEAD | Method::GET, _) => {
+            let Some(found) = fake.objects.get(&key) else {
+                return refuse(StatusCode::NOT_FOUND, "NoSuchKey");
+            };
+            let size = found.body.len();
+            let mut listed = vec![
+                ("etag".to_string(), format!("\"{}\"", found.etag)),
+                (
+                    "last-modified".to_string(),
+                    "Fri, 23 Oct 2026 00:00:00 GMT".to_string(),
+                ),
+            ];
+            for (name, value) in &found.metadata {
+                listed.push((format!("x-amz-meta-{name}"), value.clone()));
+            }
+            let (status, body) = match range(header("range"), size).filter(|_| size > 0) {
+                Some((first, last)) => {
+                    let total = format!("bytes {first}-{last}/{size}");
+                    listed.push(("content-range".to_string(), total));
+                    (StatusCode::PARTIAL_CONTENT, found.body.slice(first..=last))
+                }
+                None => (StatusCode::OK, found.body.clone()),
+            };
+            listed.push(("content-length".to_string(), body.len().to_string()));
+            match head {
+                true => answer(status, &listed, Body::empty()),
+                false => answer(status, &listed, body),
+            }
+        }
+        (Method::PUT, Some(upload)) => {
+            let Some(number) = param("partNumber").and_then(|number| number.parse().ok()) else {
+                return refuse(StatusCode::BAD_REQUEST, "InvalidArgument");
+            };
+            let part = match &copied {
+                Some(found) => {
+                    let size = found.body.len();
+                    match range(header("x-amz-copy-source-range"), size) {
+                        Some((first, last)) => found.body.slice(first..=last),
+                        None => found.body.clone(),
+                    }
+                }
+                None => body,
+            };
+            let etag = md5_hex(&part);
+            let Some(parts) = fake.uploads.get_mut(&upload) else {
+                return refuse(StatusCode::NOT_FOUND, "NoSuchUpload");
+            };
+            parts.insert(number, part);
+            match copied {
+                Some(_) => xml(format!(
+                    "<CopyPartResult><ETag>\"{etag}\"</ETag></CopyPartResult>"
+                )),
+                None => answer(
+                    StatusCode::OK,
+                    &[("etag".into(), format!("\"{etag}\""))],
+                    "",
+                ),
+            }
+        }
+        (Method::PUT, None) => {
+            let written = match copied {
+                // A copy keeps the source's ETag, as Ceph RGW does.
+                Some(found) => found,
+                None => {
+                    if header("if-none-match") == Some("*") && fake.objects.contains_key(&key) {
+                        return refuse(StatusCode::PRECONDITION_FAILED, "PreconditionFailed");
+                    }
+                    let metadata = headers.iter().filter_map(|(name, value)| {
+                        let name = name.as_str().strip_prefix("x-amz-meta-")?;
+                        Some((name.to_string(), value.to_str().ok()?.to_string()))
+                    });
+                    Stored {
+                        etag: md5_hex(&body),
+                        body,
+                        metadata: metadata.collect(),
+                    }
+                }
+            };
+            let etag = format!("\"{}\"", written.etag);
+            let copy = source.is_some();
+            fake.objects.insert(key, written);
+            match copy {
+                true => xml(format!(
+                    "<CopyObjectResult><ETag>{etag}</ETag></CopyObjectResult>"
+                )),
+                false => answer(StatusCode::OK, &[("etag".into(), etag)], ""),
+            }
+        }
+        (Method::POST, None) => {
+            fake.next += 1;
+            let upload = format!("upload-{}", fake.next);
+            fake.uploads.insert(upload.clone(), BTreeMap::new());
+            let result = format!("<Bucket>b</Bucket><Key>{key}</Key><UploadId>{upload}</UploadId>");
+            xml(format!(
+                "<InitiateMultipartUploadResult>{result}</InitiateMultipartUploadResult>"
+            ))
+        }
+        // A completion ignores any condition on the target.
+        (Method::POST, Some(upload)) => {
+            let Some(parts) = fake.uploads.remove(&upload) else {
+                return refuse(StatusCode::NOT_FOUND, "NoSuchUpload");
+            };
+            let body = String::from_utf8_lossy(&body).to_string();
+            let numbers = body.split("<PartNumber>").skip(1);
+            let numbers = numbers.filter_map(|rest| rest.split('<').next()?.parse::<u16>().ok());
+            let chosen: Vec<Bytes> = numbers
+                .filter_map(|number| parts.get(&number).cloned())
+                .collect();
+            let digests: Vec<u8> = chosen
+                .iter()
+                .flat_map(|part| md5::compute(part).0)
+                .collect();
+            let etag = format!("{}-{}", md5_hex(&digests), chosen.len());
+            let written = Stored {
+                body: chosen.concat().into(),
+                etag: etag.clone(),
+                metadata: Vec::new(),
+            };
+            fake.objects.insert(key.clone(), written);
+            let result = format!("<Bucket>b</Bucket><Key>{key}</Key><ETag>\"{etag}\"</ETag>");
+            xml(format!(
+                "<CompleteMultipartUploadResult>{result}</CompleteMultipartUploadResult>"
+            ))
+        }
+        (Method::DELETE, Some(upload)) => {
+            fake.uploads.remove(&upload);
+            answer(StatusCode::NO_CONTENT, &[], "")
+        }
+        (Method::DELETE, None) => {
+            let found = fake.objects.get(&key).map(|found| found.etag.clone());
+            if let (Some(etag), Some(wanted)) = (found, header("if-match"))
+                && unquoted(wanted) != etag
+            {
+                return refuse(StatusCode::PRECONDITION_FAILED, "PreconditionFailed");
+            }
+            fake.objects.remove(&key);
+            answer(StatusCode::NO_CONTENT, &[], "")
+        }
+        _ => refuse(StatusCode::NOT_IMPLEMENTED, "NotImplemented"),
+    }
+}
+
+/// Serves the fake storage on an ephemeral port.
+async fn fake_s3() -> (String, Shared) {
+    let fake = Shared::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().fallback(serve).with_state(fake.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    (endpoint, fake)
+}
+
+/// A handler with one group S3 storage, bucket `tenant`, on the fake storage.
+async fn tenant() -> (TestContext, BlobHandler, ResolvedBackend, Shared) {
+    let (endpoint, fake) = fake_s3().await;
+    let context = setup_context(TestContextSetup::TwoFilesystem).await;
+    let config = HashMap::from([
+        ("endpoint".to_string(), endpoint),
+        ("region".to_string(), "us-east-1".to_string()),
+        ("access_key_id".to_string(), "key".to_string()),
+        ("secret_access_key".to_string(), "secret".to_string()),
+        ("force_path_style".to_string(), "true".to_string()),
+        ("bucket".to_string(), "tenant".to_string()),
+    ]);
+    let backend_id = Ulid::generate();
+    let entry = NodeBackend::new(
+        BackendConfig {
+            backend_type: Backend::Group(GroupBackendKind::S3),
+            root: String::new(),
+            service_config: config,
+            bucket_prefix: None,
+            max_bucket_size: None,
+            multipart_bucket: Some("tenant".to_string()),
+            timeouts: Default::default(),
+        },
+        None,
+    );
+    let groups = HashMap::from([(backend_id, Arc::new(entry))]);
+    let handler = BlobHandler {
+        registry: context.blob_handle.handler.registry.with_groups(groups),
+        ..context.blob_handle.handler.clone()
+    };
+    let resolved = ResolvedBackend::new(BackendRef::Group(backend_id), None);
+    (context, handler, resolved, fake)
+}
+
+/// A create-only write of `version_id` to exactly `path`, as a rename makes it.
+fn exact(path: &str, version_id: Ulid) -> PlainPath {
+    PlainPath {
+        path: path.to_string(),
+        ulid: Ulid::generate(),
+        version_id,
+        if_not_exists: true,
+        exact: true,
+    }
+}
+
+/// Writes `bytes` to `path` as the source of a rename.
+async fn source(
+    handler: &BlobHandler,
+    resolved: &ResolvedBackend,
+    bytes: &[u8],
+) -> BackendLocation {
+    let plain = PlainPath {
+        if_not_exists: false,
+        ..exact("raw/7_a.bin", Ulid::generate())
+    };
+    let written = handler.write_plain(
+        resolved.clone(),
+        plain,
+        test_user_id(),
+        stream_from_bytes(bytes),
+    );
+    let BlobEvent::PlainWritten { location, .. } = written.await else {
+        panic!("source write failed")
+    };
+    location
+}
+
+fn body(fake: &Shared, key: &str) -> Option<Bytes> {
+    let fake = fake.lock().unwrap();
+    fake.objects.get(key).map(|found| found.body.clone())
+}
+
+fn place(fake: &Shared, key: &str, object: Stored) {
+    fake.lock().unwrap().objects.insert(key.to_string(), object);
+}
+
+#[tokio::test]
+async fn rename_keeps_taken() {
+    // A taken new name is refused, though the storage ignores the copy's own conditions.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let old = source(&handler, &resolved, b"renamed bytes").await;
+    place(&fake, "tenant/raw/a.bin", stored(b"foreign", &[]));
+    let copied = handler.copy_plain(
+        resolved.clone(),
+        exact("raw/a.bin", Ulid::generate()),
+        old,
+        None,
+    );
+    assert!(matches!(
+        copied.await,
+        BlobEvent::Error(BlobError::PathTaken)
+    ));
+    assert_eq!(body(&fake, "tenant/raw/a.bin").unwrap(), &b"foreign"[..]);
+    // Another write's reservation stays where it is too.
+    let other = Ulid::generate().to_string();
+    let reserved = stored(b"", &[("aruna-reservation", other.as_str())]);
+    place(&fake, "tenant/raw/b.bin", reserved);
+    let old = source(&handler, &resolved, b"renamed bytes").await;
+    let copied = handler.copy_plain(resolved, exact("raw/b.bin", Ulid::generate()), old, None);
+    assert!(matches!(
+        copied.await,
+        BlobEvent::Error(BlobError::PathTaken)
+    ));
+    assert!(body(&fake, "tenant/raw/b.bin").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rename_reuses_reservation() {
+    // The reservation an interrupted try of this version left is its own, and the copy lands.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let old = source(&handler, &resolved, b"renamed bytes").await;
+    let version = Ulid::generate();
+    let reserved = stored(b"", &[("aruna-reservation", version.to_string().as_str())]);
+    place(&fake, "tenant/raw/a.bin", reserved);
+    let copied = handler.copy_plain(resolved.clone(), exact("raw/a.bin", version), old, None);
+    let BlobEvent::PlainWritten { location, .. } = copied.await else {
+        panic!("the copy did not land")
+    };
+    assert_eq!(
+        body(&fake, "tenant/raw/a.bin").unwrap(),
+        &b"renamed bytes"[..]
+    );
+    assert_eq!(read_back(&handler, location).await, b"renamed bytes");
+    // A non-empty file is never removed as a reservation.
+    let backend = resolved.backend.clone();
+    let dropped = handler.drop_reservation(backend, "raw/a.bin".to_string(), version);
+    assert!(matches!(dropped.await, BlobEvent::DeleteFinished));
+    assert!(body(&fake, "tenant/raw/a.bin").is_some());
+}
+
+#[tokio::test]
+async fn failed_copy_unreserves() {
+    // A copy that fails removes its own reservation, so the name is free again.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let old = source(&handler, &resolved, b"renamed bytes").await;
+    let stale = Some("0123456789abcdef0123456789abcdef".to_string());
+    let copied = handler.copy_plain(resolved, exact("raw/a.bin", Ulid::generate()), old, stale);
+    assert!(matches!(copied.await, BlobEvent::Error(_)));
+    assert!(body(&fake, "tenant/raw/a.bin").is_none());
+}
+
+/// Opens a provider upload at the tenant path `path` and writes one part.
+async fn opened(
+    handler: &BlobHandler,
+    resolved: &ResolvedBackend,
+    path: &str,
+) -> (BackendUpload, MultipartPart) {
+    let id = Ulid::generate();
+    let plain = PlainPath {
+        path: path.to_string(),
+        ulid: id,
+        version_id: id,
+        if_not_exists: false,
+        exact: false,
+    };
+    let opened = handler.open_upload(
+        Ulid::generate(),
+        "bucket",
+        "a.bin",
+        resolved.clone(),
+        test_user_id(),
+        Some(plain),
+    );
+    let BlobEvent::UploadOpened {
+        backend_upload: Some(upload),
+    } = opened.await
+    else {
+        panic!("the upload did not open")
+    };
+    let part = super::in_place_part(handler, &upload, 1, b"uploaded bytes").await;
+    (upload, part)
+}
+
+#[tokio::test]
+async fn upload_keeps_taken() {
+    // A completion never replaces a file that took its free path meanwhile; its abort keeps it.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let (upload, part) = opened(&handler, &resolved, "raw/a.bin").await;
+    place(&fake, "tenant/raw/a.bin", stored(b"foreign", &[]));
+    let completed =
+        handler.complete_upload(upload.clone(), vec![part], &[], Compression::Off, true);
+    assert!(matches!(
+        completed.await,
+        BlobEvent::Error(BlobError::PathTaken)
+    ));
+    assert!(matches!(
+        handler.abort_upload(upload).await,
+        BlobEvent::UploadAborted
+    ));
+    assert_eq!(body(&fake, "tenant/raw/a.bin").unwrap(), &b"foreign"[..]);
+}
+
+#[tokio::test]
+async fn upload_reuses_reservation() {
+    // A retried completion reuses its own reservation; an abort removes only its own.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let (upload, part) = opened(&handler, &resolved, "raw/a.bin").await;
+    let version = upload.location.ulid.to_string();
+    let reserved = stored(b"", &[("aruna-reservation", version.as_str())]);
+    place(&fake, "tenant/raw/a.bin", reserved.clone());
+    let completed = handler.complete_upload(upload, vec![part], &[], Compression::Off, true);
+    assert!(matches!(completed.await, BlobEvent::PlainWritten { .. }));
+    assert_eq!(
+        body(&fake, "tenant/raw/a.bin").unwrap(),
+        &b"uploaded bytes"[..]
+    );
+
+    let (upload, _) = opened(&handler, &resolved, "raw/b.bin").await;
+    let version = upload.location.ulid.to_string();
+    place(
+        &fake,
+        "tenant/raw/b.bin",
+        stored(b"", &[("aruna-reservation", version.as_str())]),
+    );
+    place(&fake, "tenant/raw/c.bin", reserved);
+    assert!(matches!(
+        handler.abort_upload(upload).await,
+        BlobEvent::UploadAborted
+    ));
+    assert!(body(&fake, "tenant/raw/b.bin").is_none());
+    assert!(body(&fake, "tenant/raw/c.bin").is_some());
+}
