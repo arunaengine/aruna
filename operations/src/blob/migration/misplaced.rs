@@ -10,12 +10,13 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BROKEN_VERSION_KEYSPACE,
-    IMPORTED_OBJECT_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, copy_provable, object_key, object_prefix,
 };
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
+use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::Key;
 
@@ -252,6 +253,16 @@ pub async fn rename_page(
     };
     let earlier = read_earlier(context, &routing).await?;
     let patterns = earlier.get(&rule.import_id).map_or(&[][..], Vec::as_slice);
+    // Only S3 copies inside the provider; other storages pass every file through the node.
+    let read = StorageEffect::Read {
+        key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
+        key: crate::groups::backends::backend_key(rule.backend_id),
+        txn_id: None,
+    };
+    let event = context.storage_handle.send_storage_effect(read).await;
+    let storage = crate::groups::backends::parse_read(event, GroupStorage::from_bytes);
+    let storage = storage.map_err(|error| error.to_string())?;
+    let native = storage.is_some_and(|storage| storage.kind == GroupBackendKind::S3);
     let shown = |key: &str| {
         key.starts_with(&rule.key_prefix)
             && filter.is_none_or(|filter| key.contains(filter))
@@ -297,8 +308,8 @@ pub async fn rename_page(
             };
             plan.files += 1;
             plan.bytes += row.size;
-            // As the copy decides: a recorded ETag or a one-part MD5 keeps it in the provider.
-            if row.etag.is_none() && !copy_provable(&location) {
+            // Like the copy: on S3 a recorded ETag or a one-part MD5 keeps it in the provider.
+            if !native || (row.etag.is_none() && !copy_provable(&location)) {
                 plan.streamed_files += 1;
                 plan.streamed_bytes += row.size;
             }
@@ -459,9 +470,9 @@ mod tests {
     use std::time::SystemTime;
     use ulid::Ulid;
 
-    /// A bucket that writes to the rule's storage, which the group holds, and the rule's
-    /// earlier pattern `{dir}{id}_{name}`.
-    async fn linked_bucket(context: &DriverContext) {
+    /// A bucket that writes to the rule's storage of `kind`, which the group holds, and the
+    /// rule's earlier pattern `{dir}{id}_{name}`.
+    async fn linked_bucket(context: &DriverContext, kind: GroupBackendKind) {
         let backend = rule().backend_id;
         let target = RoutingTarget::Backend(BackendRef::Group(backend));
         let info = BucketInfo {
@@ -484,7 +495,7 @@ mod tests {
             backend_id: backend,
             group_id: group(),
             name: "lab".to_string(),
-            kind: GroupBackendKind::S3,
+            kind,
             public_config: Default::default(),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
@@ -500,6 +511,9 @@ mod tests {
             storage.to_bytes().unwrap(),
         )
         .await;
+        let record = crate::groups::backends::backend_key(backend).to_vec();
+        let value = storage.to_bytes().unwrap();
+        put(context, STORAGE_BACKEND_KEYSPACE, record, value).await;
         let earlier = write_patterns(&["{dir}{id}_{name}".to_string()]).unwrap();
         let patterns = object_prefix(rule().import_id).to_vec();
         put(context, IMPORT_PATTERN_KEYSPACE, patterns, earlier).await;
@@ -571,7 +585,7 @@ mod tests {
     async fn plans_indexed_renames() {
         // The plan reads the rule's index and counts only files their version still reads.
         let (_directory, context) = setup().await;
-        linked_bucket(&context).await;
+        linked_bucket(&context, GroupBackendKind::S3).await;
         let id = |at: u64| Ulid::from_parts(at, 1);
         let files = [
             ("a.txt", id(11), format!("raw/{}_a.txt", id(11)), 3),
@@ -657,5 +671,11 @@ mod tests {
         let plan = (page.plan.files, page.plan.bytes, page.plan.taken_files);
         assert_eq!((plan, page.plan.unchanged_files), ((1, 5, 1), 0));
         assert_eq!((page.entries.len(), page.next), (1, None));
+        // A storage other than S3 passes every renamed file through the node.
+        linked_bucket(&context, GroupBackendKind::Gcs).await;
+        let page = rename_page(&context, &rule(), checks, (None, None, 1)).await;
+        let plan = page.unwrap().plan;
+        let streamed = (plan.streamed_files, plan.streamed_bytes);
+        assert_eq!(streamed, (3, 8 + COPY_PART + 1));
     }
 }

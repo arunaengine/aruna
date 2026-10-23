@@ -725,8 +725,8 @@ pub struct RenamePageQuery {
 pub struct RenamePlanResponse {
     /// Bytes of the `count` files.
     pub bytes: u64,
-    /// Of them, files without a recorded ETag that are over 1 GiB or have no stored MD5, and their
-    /// bytes; they pass through the node unless the provider keeps a version of them.
+    /// Of them, files that pass through the node, and their bytes: all files of a storage other
+    /// than S3; on S3 those without a recorded ETag that are over 1 GiB or have no stored MD5.
     pub streamed_files: u64,
     pub streamed_bytes: u64,
     /// Of them, files whose new name another file of the rule already holds; they fail.
@@ -772,10 +772,11 @@ key the caller may read are counted and listed.
 - The plan reads only the rule's own record of its files, never the provider. A file counts
   when an earlier pattern of the rule named it for exactly the version recorded for it. Files
   a user put there, and files with their current name, count as `unchanged_files`.
-- Files are copied inside the provider, in parts of up to 1 GiB at any size, while a provider
-  version or the recorded ETag holds the source, or as one part proven by the stored MD5.
-- `plan` splits the counted files: `streamed_files` that none of these holds, which pass
-  through the node unless the provider keeps a version; `taken_files` whose new name the rule
+- On S3 storages, files are copied inside the provider, in parts of up to 1 GiB at any size,
+  while a provider version or the recorded ETag holds the source, or as one part proven by the
+  stored MD5. Other storages pass every file through the node.
+- `plan` splits the counted files: `streamed_files` that pass through the node (on S3 those
+  none of these holds, unless the provider keeps a version); `taken_files` whose new name the rule
   records for another file; `withheld_files` the caller may not write, which make `POST`
   answer 403.
 - Each listed file is also checked against its version; a file whose version changed is not
