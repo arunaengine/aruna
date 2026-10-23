@@ -47,6 +47,7 @@ use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, m
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReplicationMode,
 };
+use crate::replication::queue::complete_put;
 use crate::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
     SourceAuthorizationError,
@@ -972,6 +973,26 @@ async fn put_file_output(
             result.version_id,
         ))
         .await?;
+    } else if !result.replayed {
+        // A retried capture hands back a committed version; its write was already announced.
+        let auth = AuthContext {
+            user_id: record.created_by,
+            realm_id: context.serving_realm(record.created_by.realm_id),
+            path_restrictions: None,
+            session: None,
+        };
+        Box::pin(complete_put(
+            context,
+            auth.realm_id,
+            node_id,
+            auth,
+            spec.group_id,
+            write_bucket.clone(),
+            write_key.clone(),
+            result.version_id,
+            size,
+        ))
+        .await;
     }
     Ok(output_object(
         output,

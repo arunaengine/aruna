@@ -6,21 +6,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aruna_core::effects::IterStart;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+use aruna_core::keyspaces::SYNC_RECEIPT_KEYSPACE;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{
-    BlobVersion, BlobVersionState, BucketInfo, VersionKey, object_permission_path,
-};
-use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::{
-    RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPullAck, SyncRefusal,
-    SyncVersionPage,
+    RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull, SyncPullAck,
+    SyncRefusal, SyncVersionPage,
 };
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key, Value};
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -33,13 +29,11 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use crate::replication::queue::{complete_put, queue_live};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
-
-/// Versions one idempotency scan reads at a time.
-const VERSION_SCAN_PAGE: usize = 256;
 
 /// Serves one forwarded sync pull.
 pub async fn serve_sync_pull(
@@ -47,55 +41,26 @@ pub async fn serve_sync_pull(
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> MetadataTransportMessage {
-    let MetadataTransportMessage::ForwardSyncPull {
-        auth_token,
-        source,
-        blake3,
-        size,
-        target_bucket,
-        target_key,
-        deleted,
-    } = message
-    else {
+    let MetadataTransportMessage::ForwardSyncPull { auth_token, pull } = message else {
         return MetadataTransportMessage::Reject("unexpected metadata control message".to_string());
     };
-    let bucket = target_bucket.clone();
-    let result = apply_pull(
-        context,
-        peer,
-        PullRequest {
-            auth_token,
-            source: *source,
-            blake3,
-            size,
-            target_bucket,
-            target_key,
-            deleted,
-        },
-    )
-    .await;
+    let bucket = pull.target_bucket.clone();
+    let result = apply_pull(context, peer, auth_token, *pull).await;
     if let Err(refusal) = &result {
         warn!(peer = %peer, bucket = %bucket, refusal = refusal_kind(refusal), "Refused a synced-folder pull");
     }
     MetadataTransportMessage::ForwardedSyncPull { result }
 }
 
-struct PullRequest {
-    auth_token: aruna_core::metadata::AuthToken,
-    source: VersionedObjectArn,
-    blake3: Option<[u8; 32]>,
-    size: u64,
-    target_bucket: String,
-    target_key: String,
-    deleted: bool,
-}
-
-async fn apply_pull(
+/// Pulls one device version of `peer` and commits it as the owner's write, or answers with
+/// the version an earlier pull of the same device version already committed.
+pub async fn apply_pull(
     context: &Arc<DriverContext>,
     peer: NodeId,
-    request: PullRequest,
+    auth_token: aruna_core::metadata::AuthToken,
+    request: SyncPull,
 ) -> Result<SyncPullAck, SyncRefusal> {
-    let auth = authorize_peer(context, peer, request.auth_token.clone()).await?;
+    let auth = authorize_peer(context, peer, auth_token).await?;
     // The device may only ask for a version it serves itself: a peer must not
     // make this node read another node's object under its own authority.
     if request.source.node_id != peer {
@@ -108,16 +73,28 @@ async fn apply_pull(
     ensure_write(context, &auth, node_id, &bucket, &request).await?;
 
     // A replay of either kind answers with the version it already produced.
-    if let Some(version_id) = applied_version(context, &request).await {
-        return Ok(SyncPullAck {
+    if let Some(ack) = replayed(context, &request).await {
+        return Ok(ack);
+    }
+    let result = match request.deleted {
+        true => delete_target(context, &auth, node_id, &bucket, &request).await,
+        false => commit_pull(context, &auth, node_id, &bucket, &request).await,
+    };
+    // An overlapping pull of the same version committed first; its receipt is the answer.
+    match result {
+        Err(refusal) => replayed(context, &request).await.ok_or(refusal),
+        ok => ok,
+    }
+}
+
+/// The answer to a pull whose device version already has a receipt here.
+async fn replayed(context: &Arc<DriverContext>, request: &SyncPull) -> Option<SyncPullAck> {
+    applied_version(context, request)
+        .await
+        .map(|version_id| SyncPullAck {
             version_id,
             already_applied: true,
-        });
-    }
-    match request.deleted {
-        true => delete_target(context, &auth, node_id, &bucket, &request).await,
-        false => commit_pull(context, &auth, node_id, &bucket, request).await,
-    }
+        })
 }
 
 /// The owner the device forwards for. A User peer is owner-bound, so the
@@ -187,7 +164,7 @@ async fn ensure_write(
     auth: &AuthContext,
     node_id: NodeId,
     bucket: &BucketInfo,
-    request: &PullRequest,
+    request: &SyncPull,
 ) -> Result<(), SyncRefusal> {
     let operation = match request.deleted {
         true => "s3.DeleteObject",
@@ -248,8 +225,9 @@ async fn delete_target(
     auth: &AuthContext,
     node_id: NodeId,
     bucket: &BucketInfo,
-    request: &PullRequest,
+    request: &SyncPull,
 ) -> Result<SyncPullAck, SyncRefusal> {
+    let (guards, receipts) = pull_fence(request)?;
     let result = drive(
         DeleteObjectOperation::new(DeleteObjectInput {
             bucket: request.target_bucket.clone(),
@@ -260,12 +238,13 @@ async fn delete_target(
             node_id,
             deleted_by: auth.user_id,
         })
-        // The marker carries the device version it came from, so a retried
-        // delete is recognized as the same one instead of stacking markers.
+        // The marker carries the device version it came from, and the receipt
+        // committed with it makes a retried delete the same one.
         .with_metadata(HashMap::from([(
             SYNC_VERSION_TAG.to_string(),
             request.source.version.to_string(),
-        )])),
+        )]))
+        .with_fence(guards, receipts),
         context,
     )
     .await
@@ -273,6 +252,16 @@ async fn delete_target(
         debug!(error = %error, "A forwarded sync delete failed");
         SyncRefusal::Unavailable
     })?;
+    queue_live(
+        context,
+        node_id,
+        auth.clone(),
+        request.target_bucket.clone(),
+        request.target_key.clone(),
+        result.version_id,
+        result.delete_marker,
+    )
+    .await;
     Ok(SyncPullAck {
         version_id: result.version_id,
         already_applied: false,
@@ -285,8 +274,9 @@ async fn commit_pull(
     auth: &AuthContext,
     node_id: NodeId,
     bucket: &BucketInfo,
-    request: PullRequest,
+    request: &SyncPull,
 ) -> Result<SyncPullAck, SyncRefusal> {
+    let (guards, receipts) = pull_fence(request)?;
     let read = BaoReadRequest {
         auth_context: auth.clone(),
         realm_id: auth.realm_id,
@@ -335,11 +325,24 @@ async fn commit_pull(
     .with_metadata(HashMap::from([(
         SYNC_VERSION_TAG.to_string(),
         request.source.version.to_string(),
-    )]));
+    )]))
+    .with_fence(guards, receipts);
     let result = drive(operation, context).await.map_err(|error| {
         debug!(error = %error, "A forwarded sync pull could not be written");
         SyncRefusal::Unavailable
     })?;
+    complete_put(
+        context,
+        auth.realm_id,
+        node_id,
+        auth.clone(),
+        bucket.group_id,
+        request.target_bucket.clone(),
+        request.target_key.clone(),
+        result.version_id,
+        result.location.blob_size,
+    )
+    .await;
     Ok(SyncPullAck {
         version_id: result.version_id,
         already_applied: false,
@@ -358,52 +361,44 @@ fn read_refusal(error: &BaoReadError) -> SyncRefusal {
     }
 }
 
-/// The version this device's exact source already produced here, if any.
-/// Every version of the key is examined, not only the head, so a later
-/// unrelated write cannot make a replayed pull mint a second copy.
-async fn applied_version(context: &Arc<DriverContext>, request: &PullRequest) -> Option<Ulid> {
-    let source = request.source.version.to_string();
-    let prefix = VersionKey::object_prefix(&request.target_bucket, &request.target_key).ok()?;
-    let mut start: Option<aruna_core::types::Key> = None;
-    loop {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                prefix: Some(prefix.clone().into()),
-                start: start.map(IterStart::After),
-                limit: VERSION_SCAN_PAGE,
-                txn_id: None,
-            })
-            .await;
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return None;
-        };
-        for (key, value) in &values {
-            let Ok(version) = BlobVersion::from_bytes(value.as_ref()) else {
-                continue;
-            };
-            // A device version is published once and deleted once, both under
-            // its tag: only the kind this request asks for is its replay.
-            if version
-                .metadata
-                .get(SYNC_VERSION_TAG)
-                .is_some_and(|tag| *tag == source)
-                && matches!(version.state, BlobVersionState::Deleted) == request.deleted
-                && let Ok(parsed) = VersionKey::from_bytes(key.as_ref())
-            {
-                return Some(parsed.version_id);
-            }
-        }
-        match next_start_after {
-            Some(next) => start = Some(next),
-            None => return None,
-        }
-    }
+/// The receipt row of this device version: absent until the version or marker commits.
+fn receipt_of(request: &SyncPull) -> Result<Key, SyncRefusal> {
+    request
+        .receipt_key()
+        .map(Key::from)
+        .map_err(|error| SyncRefusal::Invalid(error.to_string()))
+}
+
+/// Guard rows and receipt keys of one fenced write.
+type FenceRows = (Vec<(String, Key, Option<Value>)>, Vec<(String, Key)>);
+
+/// The receipt must still be absent in the write's transaction, which then records it.
+fn pull_fence(request: &SyncPull) -> Result<FenceRows, SyncRefusal> {
+    let key = receipt_of(request)?;
+    let space = SYNC_RECEIPT_KEYSPACE.to_string();
+    Ok((vec![(space.clone(), key.clone(), None)], vec![(space, key)]))
+}
+
+/// The version this device's exact source already produced here, if any. Its receipt
+/// commits with it, so a later unrelated write cannot make a replay mint a second copy.
+async fn applied_version(context: &Arc<DriverContext>, request: &SyncPull) -> Option<Ulid> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: SYNC_RECEIPT_KEYSPACE.to_string(),
+            key: receipt_of(request).ok()?,
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(value), ..
+    }) = event
+    else {
+        return None;
+    };
+    <[u8; 16]>::try_from(value.as_ref())
+        .ok()
+        .map(Ulid::from_bytes)
 }
 
 /// Serves one bounded listing of the current heads under a bucket prefix.
@@ -588,7 +583,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
-    use aruna_core::structs::storage::format::EncodingClass;
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
 
@@ -699,14 +694,8 @@ mod tests {
         }
     }
 
-    fn pull_request(deleted: bool) -> PullRequest {
-        PullRequest {
-            auth_token: aruna_core::metadata::AuthToken::internal(AuthContext {
-                user_id: UserId::local(Ulid::from_bytes([5; 16]), RealmId::from_bytes([4u8; 32])),
-                realm_id: RealmId::from_bytes([4u8; 32]),
-                path_restrictions: None,
-                session: None,
-            }),
+    fn pull_request(deleted: bool) -> SyncPull {
+        SyncPull {
             source: VersionedObjectArn::new(
                 RealmId::from_bytes([4u8; 32]),
                 iroh::SecretKey::from_bytes(&[9; 32]).public(),
@@ -755,76 +744,57 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn delete_follows_upload() {
-        // A delete must not treat the preceding upload version as its own replay.
-        let fixture = policy_fixture(None).await;
-        let request = pull_request(true);
-        let mut version = BlobVersion::materialized(
-            [4u8; 32],
-            aruna_core::structs::storage::blob::BackendRef::node_default(),
-            EncodingClass::Raw,
-            SystemTime::UNIX_EPOCH,
-            fixture.auth.user_id,
-            None,
-        );
-        version.metadata = HashMap::from([(
-            SYNC_VERSION_TAG.to_string(),
-            request.source.version.to_string(),
-        )]);
-        let key = VersionKey::new(
-            &request.target_bucket,
-            &request.target_key,
-            Ulid::from_bytes([6; 16]),
-        );
-        let _ = fixture
-            .context
+    async fn store_receipt(context: &Arc<DriverContext>, request: &SyncPull, version_id: Ulid) {
+        let stored = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: key.to_bytes().unwrap().into(),
-                value: version.to_bytes().unwrap().into(),
+                key_space: SYNC_RECEIPT_KEYSPACE.to_string(),
+                key: receipt_of(request).unwrap(),
+                value: version_id.to_bytes().to_vec().into(),
                 txn_id: None,
             })
             .await;
+        assert!(matches!(
+            stored,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
 
-        assert_eq!(applied_version(&fixture.context, &request).await, None);
+    #[tokio::test]
+    async fn delete_follows_upload() {
+        // A delete must not treat the preceding upload's receipt as its own replay.
+        let fixture = policy_fixture(None).await;
+        let upload = Ulid::from_bytes([6; 16]);
+        store_receipt(&fixture.context, &pull_request(false), upload).await;
+
+        assert_eq!(
+            applied_version(&fixture.context, &pull_request(true)).await,
+            None
+        );
         // The upload itself still replays as the version it produced.
         assert_eq!(
             applied_version(&fixture.context, &pull_request(false)).await,
-            Some(Ulid::from_bytes([6; 16]))
+            Some(upload)
         );
     }
 
     #[tokio::test]
     async fn replayed_delete_settles() {
-        // A retried delete must answer with the marker it already produced; the
-        // source version on the marker is what makes it recognizable.
+        // A retried delete answers with the marker its receipt names, and only for the
+        // device version that receipt was written for.
         let fixture = policy_fixture(None).await;
         let request = pull_request(true);
-        let version_id = Ulid::from_bytes([7; 16]);
-        let mut marker = BlobVersion::deleted(SystemTime::UNIX_EPOCH, fixture.auth.user_id);
-        marker.metadata = HashMap::from([(
-            SYNC_VERSION_TAG.to_string(),
-            request.source.version.to_string(),
-        )]);
-        let key = VersionKey::new(&request.target_bucket, &request.target_key, version_id);
-        let _ = fixture
-            .context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: key.to_bytes().unwrap().into(),
-                value: marker.to_bytes().unwrap().into(),
-                txn_id: None,
-            })
-            .await;
+        let marker = Ulid::from_bytes([7; 16]);
+        store_receipt(&fixture.context, &request, marker).await;
 
         assert_eq!(
-            applied_version(&fixture.context, &request).await,
-            Some(version_id)
+            replayed(&fixture.context, &request).await,
+            Some(SyncPullAck {
+                version_id: marker,
+                already_applied: true,
+            })
         );
-        let newer = PullRequest {
+        let newer = SyncPull {
             source: VersionedObjectArn::new(
                 request.source.realm_id,
                 request.source.node_id,

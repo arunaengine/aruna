@@ -53,6 +53,6 @@ pub use synced_folder::{
     ActionKind, ActionOutcome, ActionScope, EntrySide, EntryState, FolderMode, FolderState,
     MAX_SYNC_PAGE, Observed, PendingMark, RemoteBinding, RemoteHead, ReplaceReason, SYNC_TRASH_DIR,
     SYNC_VERSION_TAG, SyncAction, SyncActionRecord, SyncBase, SyncListCursor, SyncPageLimit,
-    SyncPolicy, SyncPullAck, SyncRefusal, SyncVersionPage, SyncedBytes, SyncedFolder, WriteGuard,
-    decide,
+    SyncPolicy, SyncPull, SyncPullAck, SyncRefusal, SyncVersionPage, SyncedBytes, SyncedFolder,
+    WriteGuard, decide,
 };

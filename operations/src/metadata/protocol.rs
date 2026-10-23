@@ -22,10 +22,9 @@ use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
-use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{
     PathClaimRecord, PersistentIdFailure, PersistentIdMapping, SyncListCursor, SyncPageLimit,
-    SyncPullAck, SyncRefusal, SyncRelationship, SyncVersionPage,
+    SyncPull, SyncPullAck, SyncRefusal, SyncRelationship, SyncVersionPage,
 };
 use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
@@ -403,13 +402,7 @@ pub enum MetadataTransportMessage {
     /// own copy, so the device never pushes. Appended to keep indices stable.
     ForwardSyncPull {
         auth_token: AuthToken,
-        source: Box<VersionedObjectArn>,
-        blake3: Option<[u8; 32]>,
-        size: u64,
-        target_bucket: String,
-        target_key: String,
-        /// A local delete asks for a delete marker instead of a version.
-        deleted: bool,
+        pull: Box<SyncPull>,
     },
     ForwardedSyncPull {
         result: Result<SyncPullAck, SyncRefusal>,

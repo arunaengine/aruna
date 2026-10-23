@@ -310,6 +310,10 @@ pub const SYNC_UPLOAD_KEYSPACE: &str = "sync_upload_outbox";
 /// local bytes, keyed by `folder id || action id`.
 pub const SYNC_LOG_KEYSPACE: &str = "sync_action_log";
 
+/// The realm version a node committed for one device version, keyed by target bucket and
+/// key, source device and version, and the delete flag. Written with the version it names.
+pub const SYNC_RECEIPT_KEYSPACE: &str = "sync_pull_receipts";
+
 pub const SOURCE_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_SECRET_KEYSPACE: &str = "source_connector_secret";
 
@@ -556,6 +560,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SYNC_BASE_KEYSPACE,
     SYNC_UPLOAD_KEYSPACE,
     SYNC_LOG_KEYSPACE,
+    SYNC_RECEIPT_KEYSPACE,
     SOURCE_INDEX_KEYSPACE,
     SOURCE_SECRET_KEYSPACE,
     CONNECTOR_INDEX_KEYSPACE,

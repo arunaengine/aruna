@@ -13,12 +13,16 @@ use std::time::SystemTime;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::REPLICATION_OBLIGATION_KEYSPACE;
+use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, RemoteBinding, SyncBase,
-    SyncRefusal,
+    SyncPull, SyncRefusal,
 };
 use aruna_core::types::GroupId;
 use aruna_operations::device::sync::ReconcileFolderError;
@@ -30,12 +34,14 @@ use aruna_operations::device::sync::outbox::drain_sync_outbox;
 use aruna_operations::device::sync::reconcile_folder;
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::device_pull::apply_pull;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
 use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 use futures_util::StreamExt;
 use topology::{TestResult, Topology, wait_for_convergence};
@@ -58,6 +64,27 @@ async fn await_uploads(realm: &Topology) -> TestResult<()> {
         || async {
             drain_sync_outbox(&device.context).await;
             Ok(list_transfers(&device.context).await?.len())
+        },
+    )
+    .await
+}
+
+/// Waits until the realm node's replication drain has taken every live obligation.
+async fn await_drained(context: &DriverContext) -> TestResult<()> {
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "a committed pull never woke the replication drain",
+        || async {
+            let scan = StorageEffect::Iter {
+                key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1,
+                txn_id: None,
+            };
+            match context.storage_handle.send_storage_effect(scan).await {
+                Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values.len()),
+                other => Err(format!("the obligation scan failed: {other:?}").into()),
+            }
         },
     )
     .await
@@ -279,6 +306,113 @@ async fn syncs_both_directions() -> TestResult<()> {
             .entry,
         EntryState::RemoteDeleted { .. }
     ));
+    Ok(())
+}
+
+/// A pulled version and a pulled delete both wake continuous sync on the realm
+/// node, so neither waits for an unrelated write.
+#[tokio::test]
+async fn wakes_replication_drain() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    create_bucket(&server.context, group_id, realm.user_id).await?;
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("note.txt"), b"from the device")?;
+    let folder = bind(&realm, root.path(), group_id).await?;
+
+    reconcile_folder(&device.context, &folder).await?;
+    await_uploads(&realm).await?;
+    await_drained(&server.context).await?;
+
+    std::fs::remove_file(root.path().join("note.txt"))?;
+    assert_eq!(reconcile_folder(&device.context, &folder).await?.uploads, 1);
+    await_uploads(&realm).await?;
+    assert!(
+        read_object(&realm, &server.context, group_id, "note.txt")
+            .await
+            .is_err(),
+        "the local delete reached the realm"
+    );
+    await_drained(&server.context).await
+}
+
+/// Two pulls of one device version released together commit it once and answer alike,
+/// as when a device retries while its first pull still runs.
+#[tokio::test]
+async fn fences_overlapping_pulls() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    create_bucket(&server.context, group_id, realm.user_id).await?;
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("note.txt"), b"from the device")?;
+    let folder = bind(&realm, root.path(), group_id).await?;
+    reconcile_folder(&device.context, &folder).await?;
+    let upload = list_transfers(&device.context)
+        .await?
+        .pop()
+        .ok_or("the file is queued")?;
+    let pull = SyncPull {
+        source: VersionedObjectArn::new(
+            realm.realm_id,
+            device.node_id(),
+            folder.local_bucket.clone(),
+            upload.relative.clone(),
+            upload
+                .local_version
+                .ok_or("the upload names its local version")?,
+        )?,
+        blake3: upload.blake3,
+        size: upload.size,
+        target_bucket: REMOTE_BUCKET.to_string(),
+        target_key: folder.remote.remote_key(&upload.relative),
+        deleted: false,
+    };
+    let token = AuthToken::internal(AuthContext {
+        user_id: realm.user_id,
+        realm_id: realm.realm_id,
+        path_restrictions: None,
+        session: None,
+    });
+    let barrier = tokio::sync::Barrier::new(2);
+    let pull_once = || async {
+        barrier.wait().await;
+        apply_pull(
+            &server.context,
+            device.node_id(),
+            token.clone(),
+            pull.clone(),
+        )
+        .await
+    };
+    let (first, second) = tokio::join!(pull_once(), pull_once());
+    let (first, second) = (
+        first.map_err(|refusal| format!("{refusal:?}"))?,
+        second.map_err(|refusal| format!("{refusal:?}"))?,
+    );
+    assert_eq!(first.version_id, second.version_id);
+    assert!(first.already_applied || second.already_applied);
+
+    let versions = drive(
+        ListVersionsOperation::new(ListVersionsInput {
+            bucket: REMOTE_BUCKET.to_string(),
+            prefix: Some(pull.target_key.clone()),
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: None,
+        }),
+        &server.context,
+    )
+    .await?;
+    assert_eq!(
+        versions.items.len(),
+        1,
+        "one device version, one realm version"
+    );
     Ok(())
 }
 

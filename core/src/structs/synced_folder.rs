@@ -7,6 +7,7 @@ use crate::UserId;
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::execution::offered_directory::FileStat;
+use crate::structs::storage::replication::VersionedObjectArn;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -562,6 +563,32 @@ impl SyncActionRecord {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// One device version a synced folder asks its realm node to pull and commit as the owner.
+/// The realm node reads it back from the device and writes its own copy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncPull {
+    pub source: VersionedObjectArn,
+    pub blake3: Option<[u8; 32]>,
+    pub size: u64,
+    pub target_bucket: String,
+    pub target_key: String,
+    /// A local delete asks for a delete marker instead of a version.
+    pub deleted: bool,
+}
+
+impl SyncPull {
+    /// Key of the receipt a realm node keeps once this device version committed.
+    pub fn receipt_key(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&(
+            &self.target_bucket,
+            &self.target_key,
+            self.source.node_id.as_bytes(),
+            self.source.version,
+            self.deleted,
+        ))?)
     }
 }
 
