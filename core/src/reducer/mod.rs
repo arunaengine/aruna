@@ -41,11 +41,13 @@ use crate::user::validation::{
 };
 
 mod apply;
+mod distribution;
 mod paths;
 mod placement;
 mod revocation;
 mod targets;
 
+pub use distribution::distribution_change_path;
 pub use paths::*;
 use paths::{event_observes_dot, operation_paths, role_definition_value};
 pub use placement::*;
@@ -105,6 +107,8 @@ pub enum AdminDocumentError {
     JobFamilyChanged,
     #[error("job family placement strategy cannot be removed")]
     JobFamilyRemoved,
+    #[error(transparent)]
+    Distribution(#[from] crate::structs::storage::distribution::DistributionError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

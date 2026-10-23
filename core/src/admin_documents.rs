@@ -64,10 +64,23 @@ pub struct AdminDocumentDot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminDocumentTarget {
-    Group { group_id: GroupId },
-    Realm { realm_id: RealmId },
-    User { user_id: UserId },
-    RealmConfig { realm_id: RealmId },
+    Group {
+        group_id: GroupId,
+    },
+    Realm {
+        realm_id: RealmId,
+    },
+    User {
+        user_id: UserId,
+    },
+    RealmConfig {
+        realm_id: RealmId,
+    },
+    /// One distributed bucket's record; it rides the realm config topic to every realm node.
+    Distribution {
+        realm_id: RealmId,
+        set_id: Ulid,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +388,10 @@ pub enum AdminDocumentOperation {
     ConfigPortalSet {
         features: BTreeMap<String, bool>,
     },
+    /// One change of a distributed bucket's record, naming its set and predecessor revision.
+    DistributionChanged {
+        change: Box<crate::structs::storage::distribution::DistributionChange>,
+    },
 }
 
 impl AdminDocumentOperation {
@@ -637,6 +654,16 @@ mod tests {
             AdminDocumentOperation::GroupPoliciesSet {
                 policies: vec![request_policy("anonymous")],
             },
+            AdminDocumentOperation::DistributionChanged {
+                change: Box::new(crate::structs::storage::distribution::DistributionChange {
+                    set_id: Ulid::from_bytes([5; 16]),
+                    predecessor: Some(Default::default()),
+                    op: crate::structs::storage::distribution::DistributionOp::Admit {
+                        member_id: Ulid::from_bytes([6; 16]),
+                        incarnation: 7,
+                    },
+                }),
+            },
         ];
 
         for op in operations {
@@ -693,6 +720,10 @@ mod tests {
                 user_id: user_id(2),
             },
             AdminDocumentTarget::RealmConfig { realm_id },
+            AdminDocumentTarget::Distribution {
+                realm_id,
+                set_id: Ulid::from_bytes([5; 16]),
+            },
         ];
 
         for target in targets {

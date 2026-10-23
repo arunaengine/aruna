@@ -1342,9 +1342,9 @@ fn family_matches_targets(
 /// with the event actor's realm.
 fn validate_event_scope(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
     let target_realm = match &event.target {
-        AdminDocumentTarget::Realm { realm_id } | AdminDocumentTarget::RealmConfig { realm_id } => {
-            Some(*realm_id)
-        }
+        AdminDocumentTarget::Realm { realm_id }
+        | AdminDocumentTarget::RealmConfig { realm_id }
+        | AdminDocumentTarget::Distribution { realm_id, .. } => Some(*realm_id),
         AdminDocumentTarget::User { user_id } => Some(user_id.realm_id),
         AdminDocumentTarget::Group { .. } => None,
     };
@@ -1685,6 +1685,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::ConfigFederationSet { .. }
         | AdminDocumentOperation::ConfigPortalSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
+        AdminDocumentOperation::DistributionChanged { .. } => AdminOperationFamily::Distribution,
     };
 
     if !family_matches_targets(family, target, &event.target) {
@@ -1699,6 +1700,9 @@ pub(in crate::document_sync) async fn validate_admin_event(
         AdminOperationFamily::RealmAuthorization => validate_role_assignment(event),
         AdminOperationFamily::RealmConfig => validate_config_shape(event),
         AdminOperationFamily::User => Ok(()),
+        AdminOperationFamily::Distribution => {
+            Err("distribution changes are not admitted yet".into())
+        }
     };
     if let Err(reason) = shape {
         return reject(&reason);

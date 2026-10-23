@@ -66,6 +66,9 @@ impl AdminDocumentState {
             AdminDocumentTarget::Realm { .. } => self.apply_realm(event),
             AdminDocumentTarget::User { .. } => self.apply_user(event),
             AdminDocumentTarget::RealmConfig { realm_id } => self.apply_config(event, realm_id),
+            AdminDocumentTarget::Distribution { set_id, .. } => {
+                self.apply_distribution(event, set_id)
+            }
         }
     }
 }

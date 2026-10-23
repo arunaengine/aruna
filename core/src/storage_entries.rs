@@ -345,6 +345,13 @@ fn admin_target_bytes(target: &AdminDocumentTarget) -> Vec<u8> {
             bytes.extend_from_slice(realm_id.as_bytes());
             bytes
         }
+        AdminDocumentTarget::Distribution { realm_id, set_id } => {
+            let mut bytes = Vec::with_capacity(49);
+            bytes.push(b'd');
+            bytes.extend_from_slice(realm_id.as_bytes());
+            bytes.extend_from_slice(&set_id.to_bytes());
+            bytes
+        }
     }
 }
 
