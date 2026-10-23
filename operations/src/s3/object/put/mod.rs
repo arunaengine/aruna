@@ -47,6 +47,8 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ManagedCopyKey, VersionKey,
     WriteOwner,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
@@ -336,6 +338,8 @@ pub struct PutObjectOperation {
     /// Set when the preassigned version already existed and the put only handed it back.
     replayed: bool,
     row_fence: Option<RowFence>,
+    /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
+    pub(super) set_hint: Option<SetHint>,
 }
 
 impl PutObjectOperation {
@@ -395,6 +399,7 @@ impl PutObjectOperation {
             dedup_checked: false,
             replayed: false,
             row_fence: None,
+            set_hint: None,
         }
     }
 
@@ -650,6 +655,10 @@ impl PutObjectOperation {
             GatedBucket::observe(bucket.as_ref())
                 .stored_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
+        self.set_hint = bucket
+            .as_ref()
+            .and_then(|bucket| bucket.distribution.as_ref())
+            .map(DistributionBinding::hint);
         let group_id = bucket
             .as_ref()
             .map_or(self.config.group_id, |bucket| bucket.group_id);
@@ -1213,7 +1222,10 @@ impl PutObjectOperation {
     }
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
-        let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
+        let set_hint = self.set_hint;
+        let version_id = *self
+            .version_id
+            .get_or_insert_with(|| mint_version(set_hint));
         // An import may register a listed write's version before the write commits it.
         if self.keep_head || self.listed_write() {
             return self.read_history(version_id);

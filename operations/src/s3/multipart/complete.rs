@@ -47,6 +47,8 @@ use aruna_core::structs::storage::blob::{
     BlobVersion, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
     VersionKey, WriteOwner,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::{
@@ -318,6 +320,8 @@ pub struct CompleteUploadOperation {
     gated_bucket: Option<GatedBucket>,
     /// The bucket's compression when the gate read it; the composed object uses it.
     compression: Compression,
+    /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
+    set_hint: Option<SetHint>,
     /// The reset that returns the record to `Open` has already been taken, so
     /// no later cleanup step may take it a second time.
     reset_done: bool,
@@ -394,6 +398,7 @@ impl CompleteUploadOperation {
             gate: None,
             gated_bucket: None,
             compression: Compression::Off,
+            set_hint: None,
             reset_done: false,
             compose_share: None,
             selected_parts: HashMap::new(),
@@ -1014,6 +1019,10 @@ impl CompleteUploadOperation {
             .as_ref()
             .map(|bucket| bucket.compression)
             .unwrap_or_default();
+        self.set_hint = bucket
+            .as_ref()
+            .and_then(|bucket| bucket.distribution.as_ref())
+            .map(DistributionBinding::hint);
         let inherited = self
             .upload_record
             .as_ref()
@@ -1554,7 +1563,10 @@ impl CompleteUploadOperation {
     }
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
-        let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
+        let set_hint = self.set_hint;
+        let version_id = *self
+            .version_id
+            .get_or_insert_with(|| mint_version(set_hint));
         // An import may register a listed object's version before the finalize commits it; an
         // upload opened at a provider path stays one after its rule was removed.
         if self.plain.as_ref().is_some_and(|target| target.listed) || self.plain_upload().is_some()

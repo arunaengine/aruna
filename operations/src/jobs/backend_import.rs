@@ -29,6 +29,7 @@ use aruna_core::structs::storage::delete_audit::BlobAuditRecord;
 use aruna_core::structs::storage::discovery::{
     DiscoveryRule, FileIdentity, IdentityError, file_identity,
 };
+use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::structs::storage::format::{EncodingClass, StoredLayout};
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
@@ -484,9 +485,9 @@ async fn import_object(
     // The committed row stays until the new version replaces it in one transaction. A new
     // row records its key, so later rule changes never move the object. A new file is dated
     // by its modification time, as a second file of its key would be.
-    let version_id = match (&row, object.modified_ms) {
-        (None, Some(at)) => dated(at),
-        _ => Ulid::generate(),
+    let version_id = match &row {
+        None => import_version(run, object.modified_ms),
+        Some(_) => import_version(run, None),
     };
     let committed = ImportedObject {
         key: match row.as_ref() {
@@ -1318,6 +1319,16 @@ fn dated(at: u64) -> Ulid {
     Ulid::from_parts(at, Ulid::generate().random())
 }
 
+/// A version id dated `at`, or now; a distributed bucket always dates by mint time and adds
+/// its set hint, and the source time stays in the import row.
+fn import_version(run: &ImportRun, at: Option<u64>) -> Ulid {
+    match (run.bucket.distribution.as_ref(), at) {
+        (Some(binding), _) => mint_version(Some(binding.hint())),
+        (None, Some(at)) => dated(at),
+        (None, None) => Ulid::generate(),
+    }
+}
+
 /// A file with other bytes than every version of its key is another version of it, dated by
 /// its modification time: the newest version becomes current, an older one joins the history.
 async fn add_version(
@@ -1329,7 +1340,7 @@ async fn add_version(
     file: (BackendLocation, Option<String>),
 ) -> Result<Outcome, ItemError> {
     let rule = &run.rule;
-    let version_id = dated(object.modified_ms.unwrap_or_else(now_ms));
+    let version_id = import_version(run, Some(object.modified_ms.unwrap_or_else(now_ms)));
     let committed = ImportedObject {
         key: Some(key.to_string()),
         ..ImportedObject::new(version_id, object)

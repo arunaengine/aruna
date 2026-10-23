@@ -38,7 +38,9 @@ impl CompleteUploadOperation {
         if self.compression != Compression::Off || upload.backend_upload.is_some() {
             return None;
         }
-        let id = self.version_id.unwrap_or_else(Ulid::generate);
+        let id = self
+            .version_id
+            .unwrap_or_else(|| mint_version(self.set_hint));
         let (bucket, key) = (&self.input.bucket, &self.input.key);
         let target = self
             .routing

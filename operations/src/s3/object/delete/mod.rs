@@ -21,19 +21,20 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE,
-    DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE,
+    DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CopyOwner, CurrentVersionPointer, VersionKey, incarnation,
+    BucketInfo, CopyOwner, CurrentVersionPointer, VersionKey, incarnation,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::delete_audit::{
     BlobAuditKind, BlobAuditRecord, delete_audit_key, trail_key,
 };
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::usage::UsageDelta;
@@ -52,6 +53,8 @@ pub enum DeleteObjectState {
     Init,
     StartTransaction,
     CheckPurgeFence,
+    /// Reads the bucket record for the set hint a new delete marker carries.
+    ReadBucketBinding,
     ReadTargetVersion,
     ReadTargetLocation,
     ReadAllVersions,
@@ -209,6 +212,8 @@ pub struct DeleteObjectOperation {
     /// The bucket incarnation the delete is made in, read in its transaction for the trail.
     incarnation: Option<u128>,
     row_fence: Option<RowFence>,
+    /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
+    set_hint: Option<SetHint>,
 }
 
 impl DeleteObjectOperation {
@@ -244,6 +249,7 @@ impl DeleteObjectOperation {
             expected_head: None,
             incarnation: None,
             row_fence: None,
+            set_hint: None,
         }
     }
 
@@ -362,9 +368,33 @@ impl DeleteObjectOperation {
 
     fn fence_checked(&mut self, event: Event) -> Effects {
         match check_write_fence(event, &self.input.bucket, &self.input.key) {
-            Ok(()) => self.write_tombstone(),
+            Ok(()) => {
+                self.state = DeleteObjectState::ReadBucketBinding;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: S3_BUCKET_KEYSPACE.to_string(),
+                    key: self.input.bucket.as_bytes().into(),
+                    txn_id: self.txn_id,
+                })]
+            }
             Err(error) => self.emit_error(error.into()),
         }
+    }
+
+    fn binding_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let bucket = match value
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(bucket) => bucket,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        self.set_hint = bucket
+            .and_then(|bucket| bucket.distribution)
+            .map(|binding| binding.hint());
+        self.write_tombstone()
     }
 
     fn read_target_version(&mut self, version_id: Ulid) -> Effects {
@@ -1043,7 +1073,7 @@ impl DeleteObjectOperation {
     }
 
     fn write_tombstone(&mut self) -> Effects {
-        let version_id = Ulid::generate();
+        let version_id = mint_version(self.set_hint);
         self.version_id = Some(version_id);
         self.deleted_version_created = Some(SystemTime::now());
         self.read_current_lookup(version_id)
@@ -1172,6 +1202,7 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::Init => self.handle_init(),
             DeleteObjectState::StartTransaction => self.handle_transaction_started(event),
             DeleteObjectState::CheckPurgeFence => self.fence_checked(event),
+            DeleteObjectState::ReadBucketBinding => self.binding_read(event),
             DeleteObjectState::ReadTargetVersion => self.target_version_read(event),
             DeleteObjectState::ReadTargetLocation => self.target_location_read(event),
             DeleteObjectState::ReadAllVersions => self.versions_read(event),

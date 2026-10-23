@@ -33,6 +33,8 @@ use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPoli
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use std::time::SystemTime;
@@ -157,7 +159,6 @@ pub async fn write_reference_version(
     context: &DriverContext,
     write: ReferenceWrite,
 ) -> Result<(Ulid, bool), MaterializeReferenceError> {
-    let version_id = write.preassigned_version_id.unwrap_or_else(Ulid::generate);
     let now = SystemTime::now();
 
     let txn_id = match context
@@ -172,7 +173,7 @@ pub async fn write_reference_version(
 
     let result: Result<(Ulid, bool), MaterializeReferenceError> = async {
         guard_purge_fence(context, txn_id, &write.bucket, &write.key).await?;
-        let mut policies = guard_expected_bucket(
+        let (mut policies, set_hint) = guard_expected_bucket(
             context,
             txn_id,
             &write.bucket,
@@ -180,6 +181,9 @@ pub async fn write_reference_version(
             write.expected_bucket.as_ref(),
         )
         .await?;
+        let version_id = write
+            .preassigned_version_id
+            .unwrap_or_else(|| mint_version(set_hint));
         policies.extend(write.inherited_policies.iter().copied());
         if let Some((connector, fingerprint)) = write.connector_guard.as_ref() {
             guard_connector_unchanged(context, txn_id, connector, *fingerprint).await?;
@@ -548,7 +552,7 @@ async fn guard_expected_bucket(
     bucket: &str,
     group_id: GroupId,
     expected: Option<&BucketInfo>,
-) -> Result<Vec<PlacementPolicyRef>, MaterializeReferenceError> {
+) -> Result<(Vec<PlacementPolicyRef>, Option<SetHint>), MaterializeReferenceError> {
     let current = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -577,9 +581,16 @@ async fn guard_expected_bucket(
     if !unchanged {
         return Err(StorageError::TransactionConflict.into());
     }
-    Ok(current
-        .map(|bucket| bucket.placement_policies)
-        .unwrap_or_default())
+    let set_hint = current
+        .as_ref()
+        .and_then(|bucket| bucket.distribution.as_ref())
+        .map(DistributionBinding::hint);
+    Ok((
+        current
+            .map(|bucket| bucket.placement_policies)
+            .unwrap_or_default(),
+        set_hint,
+    ))
 }
 
 #[cfg(test)]

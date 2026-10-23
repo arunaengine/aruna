@@ -1780,3 +1780,53 @@ async fn bucket_rows_sum() {
         group
     );
 }
+
+#[test]
+fn marker_carries_hint() {
+    use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+    use aruna_core::structs::storage::format::Compression;
+
+    let marker = |binding: Option<DistributionBinding>| {
+        let mut operation = audit_op(None);
+        operation.state = DeleteObjectState::CheckPurgeFence;
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == S3_BUCKET_KEYSPACE
+        ));
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: test_user_id(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: binding,
+        };
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(info.to_bytes().unwrap().into()),
+        }));
+        assert_ne!(operation.state, DeleteObjectState::Error);
+        (
+            operation.version_id.expect("marker id minted"),
+            operation.set_hint,
+        )
+    };
+    let set_id = Ulid::from_bytes([7u8; 16]);
+    let (hinted, hint) = marker(Some(DistributionBinding {
+        set_id,
+        member_id: Ulid::from_bytes([8u8; 16]),
+        incarnation: 1,
+        revision: 1,
+    }));
+    assert_eq!(hint, Some(SetHint::of_set(set_id)));
+    assert_eq!(SetHint::of_version(hinted), SetHint::of_set(set_id));
+    assert_eq!(marker(None).1, None);
+}
