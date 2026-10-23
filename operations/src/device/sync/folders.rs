@@ -72,6 +72,8 @@ pub enum FolderError {
     RemoteUnreachable { node: NodeId, reason: String },
     #[error(transparent)]
     Offer(#[from] OfferedDirectoryError),
+    #[error("a download-only folder never propagates deletions")]
+    DownloadOnly,
 }
 
 /// How much of a folder still needs attention. Every counter is derived from
@@ -370,6 +372,77 @@ pub async fn set_folder_state(
     Ok(folder)
 }
 
+/// Turns the propagation of local deletions on or off for one folder.
+pub async fn set_propagate_deletes(
+    context: &Arc<DriverContext>,
+    folder_id: Ulid,
+    propagate_deletes: bool,
+) -> Result<SyncedFolder, FolderError> {
+    update_folder(context, folder_id, |current| match current.state {
+        FolderState::Deleting => Err(FolderError::NotFound),
+        _ if propagate_deletes && current.mode == FolderMode::DownloadOnly => {
+            Err(FolderError::DownloadOnly)
+        }
+        _ => Ok(SyncedFolder {
+            propagate_deletes,
+            ..current
+        }),
+    })
+    .await
+}
+
+/// Stores what one reconcile pass learned onto the current row, so an owner
+/// change made during the pass is kept and an unbound folder is not written back.
+pub(crate) async fn store_progress(
+    context: &Arc<DriverContext>,
+    progress: &SyncedFolder,
+) -> Result<SyncedFolder, FolderError> {
+    update_folder(context, progress.folder_id, |current| {
+        Ok(SyncedFolder {
+            last_reconcile_ms: progress.last_reconcile_ms,
+            last_error: progress.last_error.clone(),
+            last_error_ms: progress.last_error_ms,
+            observed_files: progress.observed_files,
+            list_cursor: progress.list_cursor.clone(),
+            ..current
+        })
+    })
+    .await
+}
+
+/// Rewrites one folder row from its stored value in one transaction.
+async fn update_folder(
+    context: &Arc<DriverContext>,
+    folder_id: Ulid,
+    change: impl FnOnce(SyncedFolder) -> Result<SyncedFolder, FolderError>,
+) -> Result<SyncedFolder, FolderError> {
+    let txn_id = start_txn(context).await.ok_or(FolderError::Unavailable)?;
+    let current = read_value(
+        context,
+        SYNCED_FOLDER_KEYSPACE,
+        folder_key(folder_id),
+        Some(txn_id),
+    )
+    .await
+    .and_then(|bytes| SyncedFolder::from_bytes(&bytes).ok());
+    let changed = current.ok_or(FolderError::NotFound).and_then(change);
+    let written = match &changed {
+        Ok(folder) => match folder_entry(folder) {
+            Ok(row) => write_rows(context, vec![row], Some(txn_id)).await,
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    if !written {
+        abort_txn(context, txn_id).await;
+        return changed.and(Err(FolderError::Unavailable));
+    }
+    match commit_txn(context, txn_id).await {
+        true => changed,
+        false => Err(FolderError::Unavailable),
+    }
+}
+
 pub(crate) async fn store_folder(
     context: &Arc<DriverContext>,
     folder: &SyncedFolder,
@@ -622,6 +695,66 @@ mod tests {
             .await
             .expect("the entries read");
         assert!(entries.is_empty());
+    }
+
+    // A reconcile pass that started before the owner's change keeps it, and a
+    // folder unbound meanwhile is not written back.
+    #[tokio::test]
+    async fn progress_keeps_settings() {
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let mut pass = bound_folder(FolderState::Active);
+        store_folder(&context, &pass).await.expect("row stored");
+
+        set_propagate_deletes(&context, pass.folder_id, false)
+            .await
+            .expect("the toggle applies");
+        pass.last_reconcile_ms = Some(5);
+        let stored = store_progress(&context, &pass)
+            .await
+            .expect("progress stored");
+        assert!(!stored.propagate_deletes);
+        assert_eq!(stored.last_reconcile_ms, Some(5));
+
+        assert!(
+            delete_rows(
+                &context,
+                vec![(
+                    SYNCED_FOLDER_KEYSPACE.to_string(),
+                    folder_key(pass.folder_id)
+                )],
+                None
+            )
+            .await
+        );
+        assert_eq!(
+            store_progress(&context, &pass).await,
+            Err(FolderError::NotFound)
+        );
+        assert_eq!(
+            read_bound(&context, pass.folder_id).await,
+            Err(FolderError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_refuses_deletes() {
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let mut folder = bound_folder(FolderState::Active);
+        folder.mode = FolderMode::DownloadOnly;
+        folder.propagate_deletes = false;
+        store_folder(&context, &folder).await.expect("row stored");
+        assert_eq!(
+            set_propagate_deletes(&context, folder.folder_id, true).await,
+            Err(FolderError::DownloadOnly)
+        );
+        assert!(
+            !read_bound(&context, folder.folder_id)
+                .await
+                .expect("still bound")
+                .propagate_deletes
+        );
     }
 
     // The binding survives until the cleanup is done, so a crash in the middle

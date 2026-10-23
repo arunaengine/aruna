@@ -32,7 +32,7 @@ use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::staging::offered_directory::{OfferDirectoryInput, OfferedDirectoryError};
 
-use folders::{list_folders, store_folder};
+use folders::{list_folders, store_progress};
 use materialize::apply_downloads;
 use reconcile::{ReconcileError, ReconcileFolderOperation, ReconcileInput, ReconcilePlan};
 use repository::SYNC_PAGE_SIZE;
@@ -196,7 +196,7 @@ pub async fn reconcile_folder(
             stored.last_error = None;
             stored.last_error_ms = None;
             stored.list_cursor = list_cursor;
-            store_folder(context, &stored)
+            store_progress(context, &stored)
                 .await
                 .map_err(|_| ReconcileFolderError::Unavailable)?;
             if plan.uploads > 0 {
@@ -207,7 +207,7 @@ pub async fn reconcile_folder(
         Err(error) => {
             stored.last_error = Some(error.describe(&folder.remote));
             stored.last_error_ms = Some(now_ms);
-            if let Err(store_error) = store_folder(context, &stored).await {
+            if let Err(store_error) = store_progress(context, &stored).await {
                 warn!(folder = %folder.folder_id, reason = %store_error, "Could not store the folder error");
             }
             Err(error)

@@ -341,6 +341,45 @@ async fn unbinds_folder() {
 }
 
 #[tokio::test]
+async fn toggles_deletes() {
+    let fixture = setup().await;
+    let id = Ulid::from_bytes([27u8; 16]);
+    seed_row(
+        &fixture.state,
+        folder_entry(&sample_folder(id, &fixture, "/data", FolderState::Active)).unwrap(),
+    )
+    .await;
+    let Json(updated) = update_synced_folder(
+        State(fixture.state.clone()),
+        Extension(Some(owner_auth(&fixture))),
+        Path(id.to_string()),
+        Json(UpdateFolderRequest {
+            propagate_deletes: false,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!updated.propagate_deletes);
+
+    let download = Ulid::from_bytes([28u8; 16]);
+    let mut folder = sample_folder(download, &fixture, "/other", FolderState::Active);
+    folder.mode = FolderMode::DownloadOnly;
+    folder.propagate_deletes = false;
+    seed_row(&fixture.state, folder_entry(&folder).unwrap()).await;
+    let refused = update_synced_folder(
+        State(fixture.state.clone()),
+        Extension(Some(owner_auth(&fixture))),
+        Path(download.to_string()),
+        Json(UpdateFolderRequest {
+            propagate_deletes: true,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.status_code(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn pause_resume() {
     let fixture = setup().await;
     let bad = pause_folder(
