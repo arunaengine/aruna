@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+use crate::device::sync::pull::forward_pull;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::store::{read_crate_status, read_job_record};
@@ -291,10 +292,6 @@ async fn pull_output(
     output: &OutputObject,
     key: String,
 ) -> Result<OutputObject, PublishRunError> {
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or_else(|| PublishRunError::Unavailable("metadata handle".to_string()))?;
     let source = VersionedObjectArn::new(
         auth.realm_id,
         output.node_id,
@@ -303,38 +300,30 @@ async fn pull_output(
         output.version_id,
     )
     .map_err(|error| PublishRunError::Unavailable(error.to_string()))?;
-    let message = MetadataTransportMessage::ForwardSyncPull {
-        auth_token: AuthToken::internal(auth.clone()),
-        pull: Box::new(SyncPull {
-            source,
-            blake3: output.digest.as_deref().and_then(parse_hash),
-            size: output.size,
-            target_bucket: target.bucket.clone(),
-            target_key: key.clone(),
-            deleted: false,
-        }),
+    let pull = SyncPull {
+        source,
+        blake3: output.digest.as_deref().and_then(parse_hash),
+        size: output.size,
+        target_bucket: target.bucket.clone(),
+        target_key: key.clone(),
+        deleted: false,
     };
-    match metadata
-        .request_forwarded_write(target.node_id, message)
-        .await
-    {
-        Ok(MetadataTransportMessage::ForwardedSyncPull { result: Ok(ack) }) => Ok(OutputObject {
+    let auth_token = AuthToken::internal(auth.clone());
+    match forward_pull(context, target.node_id, auth_token, pull, |_| async {}).await {
+        Ok(ack) => Ok(OutputObject {
             node_id: target.node_id,
             bucket: target.bucket.clone(),
             key,
             version_id: ack.version_id,
             ..output.clone()
         }),
-        Ok(MetadataTransportMessage::ForwardedSyncPull {
-            result: Err(refusal),
-        }) => Err(PublishRunError::Refused {
+        Err(SyncRefusal::Unavailable) => Err(PublishRunError::Unreachable(
+            "the realm node did not finish the copy".to_string(),
+        )),
+        Err(refusal) => Err(PublishRunError::Refused {
             key: output.key.clone(),
             refusal,
         }),
-        Ok(other) => Err(PublishRunError::Unreachable(
-            crate::metadata::transport_message_kind(&other).to_string(),
-        )),
-        Err(error) => Err(PublishRunError::Unreachable(error.to_string())),
     }
 }
 
