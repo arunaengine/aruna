@@ -4,7 +4,8 @@
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::connectors::repository::{
-    StorageReadError, parse_secret_read, read_secret_effect, source_connector_key,
+    StorageReadError, connector_reference_write, parse_secret_read, read_secret_effect,
+    source_connector_key,
 };
 use crate::connectors::resolver::secret_fingerprint;
 use crate::driver::{DriverContext, drive};
@@ -279,22 +280,28 @@ pub async fn write_reference_version(
         }
 
         let version_key = VersionKey::new(&write.bucket, &write.key, version_id);
+        let version = BlobVersion::reference(
+            write.version_source.clone(),
+            write.metadata.clone(),
+            now,
+            write.user_id,
+            now,
+        )
+        .with_policies(policies)?;
         apply_storage_effect(
             context,
-            write_version_effect(
-                &version_key,
-                &BlobVersion::reference(
-                    write.version_source.clone(),
-                    write.metadata.clone(),
-                    now,
-                    write.user_id,
-                    now,
-                )
-                .with_policies(policies)?,
-                Some(txn_id),
-            )?,
+            write_version_effect(&version_key, &version, Some(txn_id))?,
         )
         .await?;
+        if let Some((key_space, key, value)) = connector_reference_write(&version, &version_key)? {
+            let row = StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: Some(txn_id),
+            };
+            apply_storage_effect(context, Effect::Storage(row)).await?;
+        }
 
         let referenced_bytes = write.metadata.content_length;
         let mut usage_update = UsageCounterUpdate::for_group(

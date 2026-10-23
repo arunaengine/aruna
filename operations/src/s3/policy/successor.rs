@@ -8,6 +8,7 @@ use crate::blob::managed_copy::{
     register_entry, scan_effect, validate_registration, version_scope,
 };
 use crate::blob::records::HeadAliasContext;
+use crate::connectors::repository::connector_reference_write;
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
@@ -568,10 +569,12 @@ impl SuccessorMint {
             self.plan.auth_context.user_id,
         )
         .with_policies(self.effective_refs.clone())?;
-        let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(6);
+        let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(7);
+        let version_key = self.plan.version_key(version_id);
+        writes.extend(connector_reference_write(&successor, &version_key)?);
         writes.push((
             BLOB_VERSIONS_KEYSPACE.to_string(),
-            self.plan.version_key(version_id).to_bytes()?.into(),
+            version_key.to_bytes()?.into(),
             successor.to_bytes()?.into(),
         ));
         // The expected pointer makes this transaction advance exactly one generation.

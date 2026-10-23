@@ -9,6 +9,7 @@ use crate::blob::promote::{
     PromoteError, PromotePendingOperation, Promotion, drop_mismatch, reject_archive,
 };
 use crate::blob::records::blob_location_read;
+use crate::connectors::repository::connector_reference_write;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
@@ -1278,19 +1279,27 @@ impl GetObjectOperation {
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
 
+        let successor_key = VersionKey::new(&self.input.bucket, &self.input.key, new_version_id);
+        let connector_row = match connector_reference_write(&successor, &successor_key) {
+            Ok(row) => row,
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+        let mut writes = vec![
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                version_key,
+                version_value,
+            ),
+            (BLOB_HEAD_KEYSPACE.to_string(), head_key, head_value),
+            obligation_entry,
+        ];
+        writes.extend(connector_row);
+
         self.resolved_version_id = Some(new_version_id);
         self.reference_advance = Some(reference_advance);
         self.state = GetObjectState::WriteSuccessor;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    BLOB_VERSIONS_KEYSPACE.to_string(),
-                    version_key,
-                    version_value
-                ),
-                (BLOB_HEAD_KEYSPACE.to_string(), head_key, head_value),
-                obligation_entry,
-            ],
+            writes,
             txn_id: Some(txn_id),
         })]
     }
