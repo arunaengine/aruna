@@ -390,7 +390,6 @@ mod tests {
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{
         BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
-        SOURCE_INDEX_KEYSPACE,
     };
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
     use aruna_core::structs::execution::source_connector::{
