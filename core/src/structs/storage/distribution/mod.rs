@@ -224,3 +224,6 @@ impl DistributionRecord {
             .unwrap_or_else(|| member.strategy.default_behaviour())
     }
 }
+
+#[cfg(test)]
+mod tests;
