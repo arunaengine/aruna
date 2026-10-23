@@ -634,8 +634,20 @@ impl MigrateVersionOperation {
                 etag,
             }) => {
                 let old = self.old.as_ref();
+                let recorded = self.source_etag.as_deref();
+                // An empty file may be another write's reservation, so it proves nothing; a
+                // copy may also keep the old file's recorded multipart ETag.
                 let proved = |found: &BackendLocation| {
-                    old.is_some_and(|old| same_bytes(old, found.blob_size, etag.as_deref()))
+                    let size = found.blob_size;
+                    let kept = |old: &BackendLocation| {
+                        let unquoted = |etag: &str| etag.trim_matches('"').to_string();
+                        size == old.blob_size
+                            && recorded.is_some_and(|recorded| {
+                                etag.as_deref().map(unquoted) == Some(unquoted(recorded))
+                            })
+                    };
+                    let same = |old| same_bytes(old, size, etag.as_deref()) || kept(old);
+                    size > 0 && old.is_some_and(same)
                 };
                 (location.filter(proved), version)
             }
@@ -2270,11 +2282,24 @@ async fn abandon(
     let resolved = ResolvedBackend::new(intent.backend.clone(), None);
     let stat = BlobEffect::StatExternal {
         resolved,
-        path,
+        path: path.clone(),
         created_by: intent.created_by,
     };
-    // Nothing there releases nothing; without a backend version nothing names the bytes.
+    // Nothing there releases nothing; without a backend version nothing names the bytes. An
+    // empty file goes only as this write's own reservation.
     let (mut location, version, etag) = match blob_handle.send_blob_effect(stat).await {
+        Event::Blob(BlobEvent::ExternalStat {
+            location: Some(found),
+            ..
+        }) if found.blob_size == 0 => {
+            let drop = BlobEffect::DropReservation {
+                backend: intent.backend.clone(),
+                path,
+                version_id: intent.version_id,
+            };
+            let dropped = blob_handle.send_blob_effect(drop).await;
+            return Ok(matches!(dropped, Event::Blob(BlobEvent::DeleteFinished)));
+        }
         Event::Blob(BlobEvent::ExternalStat {
             location: Some(location),
             version: Some(version),
@@ -4259,7 +4284,7 @@ mod tests {
         /// The old file of `prefixed` with a known MD5, and the provider file `size` and `etag`
         /// found at the name a refused rename wanted.
         fn taken_name(
-            size: u64,
+            (old_size, size): (Option<u64>, u64),
             etag: &str,
         ) -> (
             MigrateVersionOperation,
@@ -4269,6 +4294,11 @@ mod tests {
         ) {
             let (version, mut old) = prefixed();
             old.hashes.insert(HASH_MD5.to_string(), vec![7; 16]);
+            if let Some(old_size) = old_size {
+                old.blob_size = old_size;
+                let md5 = md5::compute(b"").0.to_vec();
+                old.hashes.insert(HASH_MD5.to_string(), md5);
+            }
             let (mut operation, plain) = renaming(&version, &old, (Some(b"v1"), Some("e1")));
             let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
             let [Effect::Blob(BlobEffect::StatExternal { path, .. })] = effects.as_slice() else {
@@ -4294,11 +4324,16 @@ mod tests {
                 hex::encode([7; 16]),
                 format!("{:x}-1", md5::compute([7; 16])),
             );
+            // A provider copy may keep the old file's recorded ETag; an empty file may be
+            // another write's reservation, so it proves nothing, even for an empty old file.
+            let empty = hex::encode(md5::compute(b"").0);
             for (size, etag, adopted) in [
-                (size, single.as_str(), true),
-                (size, copied.as_str(), true),
-                (size, "0123", false),
-                (size + 1, copied.as_str(), false),
+                ((None, size), single.as_str(), true),
+                ((None, size), copied.as_str(), true),
+                ((None, size), "e1", true),
+                ((None, size), "0123", false),
+                ((None, size + 1), copied.as_str(), false),
+                ((Some(0), 0), empty.as_str(), false),
             ] {
                 let (mut operation, _, old, effects) = taken_name(size, etag);
                 if adopted {
