@@ -209,9 +209,9 @@ impl BlobHandler {
         }
     }
 
-    /// The provider copies the source version, or its current bytes, onto the reserved path: in
-    /// one request up to `COPY_WHOLE` bytes, else in parts. `None` asks for a streamed copy; a
-    /// failed copy drops its own empty reservation.
+    /// The provider copies the source version, or its current bytes, onto the reserved path: a
+    /// pinned source up to `COPY_WHOLE` bytes in one request, else in parts. `None` asks for a
+    /// streamed copy; a failed copy drops its own reservation where the storage keeps versions.
     async fn copy_inside(
         &self,
         resolved: ResolvedBackend,
