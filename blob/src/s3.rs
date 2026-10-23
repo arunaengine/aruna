@@ -386,34 +386,26 @@ impl NativeMultipart {
                 .version_id()
                 .filter(|id| *id != "null")
                 .map(Into::into),
-            etag: output.e_tag().map(str::to_string),
         }))
     }
 
-    /// Removes the empty reservation of `version` at `path` and never anything else: exactly
-    /// its object version where the storage keeps versions, else only with its ETag as the
-    /// delete's condition. Where neither holds, the reservation stays.
+    /// Removes the empty reservation of `version` at `path` and never anything else: only its
+    /// exact object version, where the storage keeps versions. Elsewhere the reservation stays,
+    /// as a foreign empty file has the same ETag.
     pub async fn unreserve(&self, path: &str, version: &str) -> Result<(), BlobError> {
         let found = self.reservation(path).await?;
-        let Some(found) = found.filter(|found| found.version == version) else {
+        let found = found.filter(|found| found.version == version);
+        let Some(id) = found.and_then(|found| found.object_version) else {
             return Ok(());
         };
         let delete = self.client.delete_object().bucket(&self.bucket);
-        let delete = delete.key(self.key(path));
-        let request = match (found.object_version, found.etag) {
-            (Some(id), _) => delete.version_id(id),
-            (None, Some(etag)) => delete.if_match(etag),
-            (None, None) => return Ok(()),
-        };
+        let request = delete.key(self.key(path)).version_id(id);
         let error = match request.send().boxed().await {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
         match status(&error) {
-            // Other bytes, or none, are at the path now; they stay. So does a reservation the
-            // storage cannot delete by its ETag alone.
-            Some(412 | 404 | 501) => Ok(()),
-            _ if error.code() == Some("NotImplemented") => Ok(()),
+            Some(404) => Ok(()),
             _ => Err(BlobError::DeleteError(format!(
                 "delete reservation: {}",
                 DisplayErrorContext(&error)
@@ -735,7 +727,6 @@ struct Reservation {
     version: String,
     /// The object version it is, where the storage keeps versions.
     object_version: Option<String>,
-    etag: Option<String>,
 }
 
 /// A part body the SDK sends as it arrives, without buffering it.

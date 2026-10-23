@@ -28,8 +28,6 @@ struct Fake {
     next: u64,
     /// A foreign write that lands at its key just before the next delete of that key.
     before_delete: Option<(String, Stored)>,
-    /// Refuses deletes with a condition, as a storage without conditional deletes does.
-    plain_deletes: bool,
     /// A foreign write that lands at its key right after a reservation of that key.
     after_reserve: Option<(String, Stored)>,
 }
@@ -257,9 +255,6 @@ async fn serve(
             if let Some((_, foreign)) = fake.before_delete.take_if(|(at, _)| *at == key) {
                 fake.objects.insert(key.clone(), foreign);
             }
-            if fake.plain_deletes && header("if-match").is_some() {
-                return refuse(StatusCode::NOT_IMPLEMENTED, "NotImplemented");
-            }
             let found = fake.objects.get(&key).map(|found| found.etag.clone());
             if let (Some(etag), Some(wanted)) = (found, header("if-match"))
                 && unquoted(wanted) != etag
@@ -440,14 +435,14 @@ async fn rename_reuses_reservation() {
 }
 
 #[tokio::test]
-async fn failed_copy_unreserves() {
-    // A copy that fails removes its own reservation, so the name is free again.
+async fn failed_copy_keeps() {
+    // Without versions a failed copy keeps its marked reservation, as no delete names only it.
     let (_context, handler, resolved, fake) = tenant().await;
     let old = source(&handler, &resolved, b"renamed bytes").await;
     let stale = Some("0123456789abcdef0123456789abcdef".to_string());
     let copied = handler.copy_plain(resolved, exact("raw/a.bin", Ulid::generate()), old, stale);
     assert!(matches!(copied.await, BlobEvent::Error(_)));
-    assert!(body(&fake, "tenant/raw/a.bin").is_none());
+    assert!(body(&fake, "tenant/raw/a.bin").unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -466,24 +461,12 @@ async fn unpinned_copy_streams() {
 
 #[tokio::test]
 async fn unreserve_keeps_replacement() {
-    // A write that replaced the reservation after it was looked at survives its removal.
+    // A foreign empty file that replaced the reservation after it was looked at has its ETag;
+    // without versions nothing is deleted, so it survives.
     let (_context, handler, resolved, fake) = tenant().await;
     let old = source(&handler, &resolved, b"renamed bytes").await;
-    let foreign = stored(b"foreign", &[]);
+    let foreign = stored(b"", &[]);
     fake.lock().unwrap().before_delete = Some(("tenant/raw/a.bin".to_string(), foreign));
-    let stale = Some("0123456789abcdef0123456789abcdef".to_string());
-    let plain = exact("raw/a.bin", Ulid::generate());
-    let copied = handler.copy_plain(resolved, plain, old, stale);
-    assert!(matches!(copied.await, BlobEvent::Error(_)));
-    assert_eq!(body(&fake, "tenant/raw/a.bin").unwrap(), &b"foreign"[..]);
-}
-
-#[tokio::test]
-async fn unreserve_needs_condition() {
-    // Without a conditional delete the reservation stays rather than risk another write.
-    let (_context, handler, resolved, fake) = tenant().await;
-    let old = source(&handler, &resolved, b"renamed bytes").await;
-    fake.lock().unwrap().plain_deletes = true;
     let stale = Some("0123456789abcdef0123456789abcdef".to_string());
     let plain = exact("raw/a.bin", Ulid::generate());
     let copied = handler.copy_plain(resolved, plain, old, stale);
@@ -632,7 +615,8 @@ async fn upload_late_write() {
 
 #[tokio::test]
 async fn upload_reuses_reservation() {
-    // A retried completion reuses its own reservation; an abort removes only its own.
+    // A retried completion reuses its own reservation; without versions an abort keeps every
+    // reservation.
     let (_context, handler, resolved, fake) = tenant().await;
     let (upload, part) = opened(&handler, &resolved, "raw/a.bin").await;
     let version = upload.location.ulid.to_string();
@@ -657,6 +641,6 @@ async fn upload_reuses_reservation() {
         handler.abort_upload(upload).await,
         BlobEvent::UploadAborted
     ));
-    assert!(body(&fake, "tenant/raw/b.bin").is_none());
+    assert!(body(&fake, "tenant/raw/b.bin").unwrap().is_empty());
     assert!(body(&fake, "tenant/raw/c.bin").is_some());
 }

@@ -157,8 +157,8 @@ impl BlobHandler {
         }
     }
 
-    /// Removes a failed write's own empty reservation. One left behind keeps the path in
-    /// progress through the write's intent, and a retry of the write reuses it.
+    /// Removes a failed write's own empty reservation where the storage keeps versions. One left
+    /// behind keeps the path in progress through the write's intent, and a retry reuses it.
     async fn unreserve(&self, held: Option<&Held>, location: &BackendLocation) {
         let (Some((native, version)), Ok(path)) = (held, self.object_path(location)) else {
             return;

@@ -4225,6 +4225,10 @@ async fn s3_copies_plain() {
         ),
         "{refused:?}"
     );
+    // A versioned storage names the refused copy's reservation exactly, so it is deleted.
+    let head = client.head_object().bucket(&bucket);
+    let gone = head.key("raw/a.bin~9").send().await;
+    assert!(gone.is_err_and(|error| error.into_service_error().is_not_found()));
     let held = handler
         .copy_plain(resolved, plain("raw/a.bin~10"), location.clone(), etag)
         .await;

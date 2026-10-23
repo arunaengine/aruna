@@ -763,8 +763,8 @@ impl BlobHandler {
             timeout(self.io_timeout(), native.abort(&path, &upload.upload_id))
                 .await
                 .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))??;
-            // A tenant path keeps what it holds but this upload's own empty reservation; only
-            // Aruna's own target is deleted.
+            // A tenant path keeps what it holds but this upload's own reservation where the storage
+            // keeps versions; only Aruna's own target is deleted.
             match upload.location.is_external() {
                 true => (native.unreserve(&path, &upload.location.ulid.to_string())).await?,
                 false => {
