@@ -690,28 +690,11 @@ pub fn has_wildcard(path: &str) -> bool {
     path.contains(WILDCARDS)
 }
 
-/// POSIX gives a run of `*` the meaning of a single `*`, so `**` must not turn
-/// into the recursive wildcard of the glob engine.
-fn collapse_stars(pattern: &str) -> String {
-    let mut collapsed = String::with_capacity(pattern.len());
-    let (mut escaped, mut star) = (false, false);
-    for character in pattern.chars() {
-        match character {
-            _ if escaped => (escaped, star) = (false, false),
-            '\\' => (escaped, star) = (true, false),
-            '*' if star => continue,
-            '*' => star = true,
-            _ => star = false,
-        }
-        collapsed.push(character);
-    }
-    collapsed
-}
-
-/// Brace alternatives such as `*.{bam,bai}` expand as in Nextflow's Java globs.
+/// Brace alternatives such as `*.{bam,bai}` expand and a `**` component spans
+/// directories, as in Nextflow's Java globs.
 fn build_glob(pattern: &str) -> Result<Glob, String> {
     // `literal_separator` keeps `*` and `?` inside one path component, as POSIX requires.
-    GlobBuilder::new(&collapse_stars(pattern))
+    GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()
         .map_err(|error| error.to_string())
@@ -984,8 +967,18 @@ mod tests {
         assert_eq!(matched("/out/[ab].txt"), vec!["/out/a.txt", "/out/b.txt"]);
         assert_eq!(matched("/out/sub/*.txt"), vec!["/out/sub/c.txt"]);
         assert!(matched("/out/*.md").is_empty());
-        // A repeated `*` stays one POSIX wildcard instead of recursing.
-        assert_eq!(matched("/out/**/*.txt"), vec!["/out/sub/c.txt"]);
+        // A `**` component spans any number of directories; inside a name it is one `*`.
+        assert_eq!(
+            matched("/out/**/*.txt"),
+            vec![
+                "/out/a.txt",
+                "/out/b.txt",
+                "/out/ab.txt",
+                "/out/sub/c.txt",
+                "/out/sub/deep/d.txt"
+            ]
+        );
+        assert_eq!(matched("/out/a**.txt"), vec!["/out/a.txt", "/out/ab.txt"]);
         assert!(output_glob("/out/[a.txt").is_err());
     }
 
