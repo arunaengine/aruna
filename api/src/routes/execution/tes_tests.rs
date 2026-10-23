@@ -654,9 +654,6 @@ fn rejects_unsupported_fields() {
     task.inputs[0].kind = TesFileType::Directory;
     assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
     task.inputs[0].kind = TesFileType::File;
-    task.outputs[0].kind = TesFileType::Directory;
-    assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
-    task.outputs[0].kind = TesFileType::File;
     task.executors[0].stdout = Some("/logs/out".to_string());
     assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
     task.executors[0].stdout = None;
@@ -682,6 +679,66 @@ fn maps_wildcard_output() {
 
     assert_eq!(spec.file_outputs[0].container_path, "/out/*.txt");
     assert_eq!(spec.file_outputs[0].path_prefix.as_deref(), Some("/out"));
+}
+
+#[test]
+fn maps_directory_output() {
+    // Nextflow sends `type: 'dir'` outputs as DIRECTORY with the directory url.
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    task.outputs[0].kind = TesFileType::Directory;
+    task.outputs[0].path = "/out/results".to_string();
+    task.outputs[0].url = Some("s3://dest/work/results".to_string());
+
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
+
+    assert_eq!(spec.file_outputs[0].container_path, "/out/results/*");
+    assert_eq!(
+        spec.file_outputs[0].path_prefix.as_deref(),
+        Some("/out/results")
+    );
+
+    // A pattern keeps its own prefix and already captures the directories it matches.
+    task.outputs[0].path = "/out/res_*".to_string();
+    task.outputs[0].path_prefix = Some("/out".to_string());
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
+    assert_eq!(spec.file_outputs[0].container_path, "/out/res_*");
+    assert_eq!(spec.file_outputs[0].path_prefix.as_deref(), Some("/out"));
+}
+
+#[test]
+fn adds_nextflow_output() {
+    // nf-ga4gh never declares `.command.env`, where Nextflow keeps eval and env outputs.
+    let env_glob = |task: &TesTask| {
+        let (spec, _) = map_execution_spec(task, None, ExecutionTarget::Realm).unwrap();
+        spec.file_outputs
+            .into_iter()
+            .find(|output| output.container_path == "/work/.command.{en[v],trac[e]}")
+    };
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    assert!(env_glob(&task).is_none());
+
+    task.outputs[0].path = "/work/.exitcode".to_string();
+    task.outputs[0].url = Some("s3://dest/work/ab/cd/.exitcode".to_string());
+    let output = env_glob(&task).expect("an exit code output marks a Nextflow task");
+    let glob = output_glob(&output.container_path).unwrap();
+    assert!(glob.is_match("/work/.command.env"));
+    assert!(glob.is_match("/work/.command.trace"));
+    assert!(!glob.is_match("/work/.command.sh"));
+    assert_eq!(output.path_prefix.as_deref(), Some("/work"));
+    assert_eq!(
+        output.destination,
+        OutputDestination::S3 {
+            bucket: "dest".to_string(),
+            key: "work/ab/cd".to_string()
+        }
+    );
+
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    task.inputs[0].path = "/work/.command.run".to_string();
+    task.inputs[0].url = Some("s3://src/work/ef/.command.run".to_string());
+    let output = env_glob(&task).expect("the wrapper input marks a Nextflow task");
+    let OutputDestination::S3 { key, .. } = output.destination;
+    assert_eq!(key, "work/ef");
 }
 
 #[test]
@@ -712,8 +769,10 @@ fn shares_glob_url() {
     let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
     assert_eq!(spec.file_outputs.len(), 2);
 
-    // Literal outputs still need their own url.
+    // A literal output still needs its own url, whichever comes first.
     task.outputs[1].path = "/out/report.zip".to_string();
+    assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
+    task.outputs.reverse();
     assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
 }
 

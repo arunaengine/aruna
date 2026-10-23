@@ -556,8 +556,14 @@ const NEXTFLOW_WORK: &str = "work/ab/task";
 const NEXTFLOW_WRAPPER: &str =
     "cd /work\nsh .command.sh > .command.out 2> .command.err\necho $? > .exitcode\n";
 // Like SEQTK_TRIM and MULTIQC: one glob also matches the staged input, one matches a directory.
+// `results` is a `type: 'dir'` output sent as DIRECTORY; `*.{bam,bai}` is a Java glob.
 const NEXTFLOW_SCRIPT: &str = "cp sample.fastq.gz trimmed.fastq.gz\nmkdir -p report_data/plots\n\
-    echo log > report_data/report.log\necho plot > report_data/plots/a.txt\n";
+    echo log > report_data/report.log\necho plot > report_data/plots/a.txt\n\
+    mkdir -p results/deep\necho table > results/deep/t.tsv\n\
+    echo bam > aln.bam\necho bai > aln.bai\n\
+    printf 'SEQTK=1.4\\n/SEQTK/=exit:0\\n' > .command.env\n";
+// What an `eval` output leaves in `.command.env`; no `.command.trace` is written.
+const EVAL_ENV: &str = "SEQTK=1.4\n/SEQTK/=exit:0\n";
 const READS: &str = "@read\nACGT\n+\nIIII\n";
 
 /// The body nf-ga4gh 1.5.0 builds: control files in and out, and every glob under the
@@ -597,21 +603,16 @@ fn nextflow_task(bucket: &str) -> Value {
             output(".command.log"),
             output(".exitcode"),
             pattern("*.fastq.gz"),
-            pattern("*_data")
+            pattern("*_data"),
+            pattern("*.{bam,bai}"),
+            json!({ "url": work("results"), "path": "/work/results", "type": "DIRECTORY" })
         ],
         "resources": { "cpu_cores": 1, "ram_gb": 0.25 }
     })
 }
 
-/// Polls one TES task on a lost-progress window until its state is terminal.
-async fn wait_task(
-    client: &reqwest::Client,
-    url: &str,
-    creds: &S3Credentials,
-    idle: Duration,
-) -> Value {
-    let mut progress = None;
-    let mut deadline = Instant::now() + idle;
+/// Polls one TES task until its state is terminal; the caller bounds the wait.
+async fn wait_task(client: &reqwest::Client, url: &str, creds: &S3Credentials) -> Value {
     loop {
         let task: Value = client
             .get(format!("{url}?view=FULL"))
@@ -629,13 +630,6 @@ async fn wait_task(
         ) {
             return task;
         }
-        if state != progress {
-            progress = state;
-            deadline = Instant::now() + idle;
-        }
-        if Instant::now() >= deadline {
-            panic!("task stopped progressing: {task}");
-        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -652,6 +646,13 @@ async fn runs_nextflow_task() -> TestResult<()> {
     let Some(backend) = docker_or_skip().await else {
         return Ok(());
     };
+    // One absolute cap over setup, every request and the polling keeps a hang under five minutes.
+    tokio::time::timeout(Duration::from_secs(240), check_nextflow_task(backend))
+        .await
+        .map_err(|_| "Nextflow task did not finish within 240 s")?
+}
+
+async fn check_nextflow_task(backend: DockerBackend) -> TestResult<()> {
     let registry = Arc::new(ExecutorRegistry::new().with_backend(Arc::new(backend)));
     let seed = spawn_compute_seed(registry).await?;
     let endpoint = seed.s3.clone().expect("full node exposes S3");
@@ -693,13 +694,7 @@ async fn runs_nextflow_task() -> TestResult<()> {
     let created: Value = created.json().await?;
     assert_eq!(status, reqwest::StatusCode::OK, "{created}");
     let id = created["id"].as_str().expect("task id");
-    let task = wait_task(
-        &client,
-        &format!("{tasks}/{id}"),
-        &creds,
-        Duration::from_secs(300),
-    )
-    .await;
+    let task = wait_task(&client, &format!("{tasks}/{id}"), &creds).await;
     assert_eq!(task["state"], "COMPLETE", "{task}");
 
     let read = |name: &str| read_object(&s3, &bucket, format!("{NEXTFLOW_WORK}/{name}"));
@@ -720,6 +715,21 @@ async fn runs_nextflow_task() -> TestResult<()> {
     assert_eq!(
         read("report_data/plots/a.txt").await.as_deref(),
         Some(&b"plot\n"[..])
+    );
+    assert_eq!(
+        read("results/deep/t.tsv").await.as_deref(),
+        Some(&b"table\n"[..])
+    );
+    assert_eq!(read("aln.bam").await.as_deref(), Some(&b"bam\n"[..]));
+    assert_eq!(read("aln.bai").await.as_deref(), Some(&b"bai\n"[..]));
+    assert_eq!(
+        read(".command.env").await.as_deref(),
+        Some(EVAL_ENV.as_bytes())
+    );
+    assert_eq!(
+        read(".command.trace").await,
+        None,
+        "an absent optional file"
     );
 
     seed.shutdown().await;

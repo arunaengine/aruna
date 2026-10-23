@@ -658,6 +658,7 @@ pub async fn capture_outputs(
     for declared in &spec.file_outputs {
         selections.extend(resolve_output(backend, fence, declared, &spec.inputs).await?);
     }
+    let selections = distinct_selections(selections)?;
     if selections.len() > MAX_EXECUTION_OUTPUTS {
         return Err(JobError::permanent(format!(
             "output manifest exceeds {MAX_EXECUTION_OUTPUTS} objects"
@@ -753,6 +754,31 @@ fn destination_of(selection: &OutputSelection) -> Result<(NodeId, String, String
         .destination_node_id
         .ok_or_else(|| JobError::permanent("output destination endpoint is missing"))?;
     Ok((node_id, bucket.clone(), key.clone()))
+}
+
+/// One selection per destination object: a file several globs match is captured once,
+/// and two files that would land on one object fail the job instead of losing one.
+fn distinct_selections(selections: Vec<OutputSelection>) -> Result<Vec<OutputSelection>, JobError> {
+    let mut sources: HashMap<(Option<NodeId>, String, String), String> = HashMap::new();
+    let mut distinct = Vec::with_capacity(selections.len());
+    for selection in selections {
+        let OutputDestination::S3 { bucket, key } = &selection.destination;
+        let target = (selection.destination_node_id, bucket.clone(), key.clone());
+        match sources.get(&target) {
+            Some(source) if *source == selection.container_path => {}
+            Some(source) => {
+                return Err(JobError::permanent(format!(
+                    "outputs `{source}` and `{}` both target {bucket}/{key}",
+                    selection.container_path
+                )));
+            }
+            None => {
+                sources.insert(target, selection.container_path.clone());
+                distinct.push(selection);
+            }
+        }
+    }
+    Ok(distinct)
 }
 
 /// Resolve one declared output into the concrete files to upload. A wildcard
@@ -2504,6 +2530,56 @@ mod tests {
 
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].container_path, "/out/trimmed.txt");
+    }
+
+    #[test]
+    fn counts_shared_matches() {
+        // Two globs over the same 600 files fill a manifest of 600, not 1,200.
+        let matched: Vec<String> = (0..600).map(|index| format!("/out/{index}.txt")).collect();
+        let mut selections =
+            expand_selection(&wildcard_output("/out/*.txt"), matched.clone(), &[]).unwrap();
+        selections
+            .extend(expand_selection(&wildcard_output("/out/*[0-9].txt"), matched, &[]).unwrap());
+
+        let distinct = distinct_selections(selections).unwrap();
+
+        assert_eq!(distinct.len(), 600);
+    }
+
+    #[test]
+    fn refuses_colliding_files() {
+        // Two files whose suffixes meet under one url must not overwrite each other.
+        let glob = |directory: &str| OutputSelection {
+            container_path: format!("{directory}/*.txt"),
+            path_prefix: Some(directory.to_string()),
+            ..wildcard_output("/out/*.txt")
+        };
+        let mut selections = expand_selection(
+            &glob("/work/a"),
+            vec!["/work/a/report.txt".to_string()],
+            &[],
+        )
+        .unwrap();
+        selections.extend(
+            expand_selection(
+                &glob("/work/b"),
+                vec!["/work/b/report.txt".to_string()],
+                &[],
+            )
+            .unwrap(),
+        );
+
+        let error = distinct_selections(selections).unwrap_err();
+
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
+        assert!(
+            error.message.contains("results/report.txt"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
