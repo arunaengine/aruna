@@ -52,6 +52,8 @@ pub(super) fn reference_metadata_refresh(
     bucket: String,
     key: String,
     result: &GetObjectResult,
+    node_id: aruna_core::NodeId,
+    auth_context: aruna_core::structs::identity::auth::AuthContext,
 ) -> Option<ReferenceRefresh> {
     if result.location.is_some() {
         return None;
@@ -63,6 +65,8 @@ pub(super) fn reference_metadata_refresh(
         version_id: result.resolved_version_id.or(result.version_id)?,
         metadata: result.source_metadata.clone()?,
         refreshed_at: result.last_refresh?,
+        node_id,
+        auth_context,
     })
 }
 

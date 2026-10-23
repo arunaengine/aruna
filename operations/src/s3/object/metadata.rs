@@ -27,7 +27,13 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::node::usage_stats::schedule_snapshot_publish;
+use crate::replication::queue::schedule_blob_drain;
+use crate::s3::object::refresh_mint::mint_successor;
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
+use crate::tasks::task_persistence::persist_task_effect;
+use aruna_core::id::NodeId;
+use aruna_core::structs::identity::auth::AuthContext;
 
 const REFRESH_SCAN_PAGE: usize = 512;
 const REFRESH_BATCH_SIZE: usize = 64;
@@ -41,6 +47,9 @@ pub struct ReferenceRefresh {
     pub version_id: Ulid,
     pub metadata: SourceMetadata,
     pub refreshed_at: SystemTime,
+    /// The node and caller a confirmed change is recorded and replicated for.
+    pub node_id: NodeId,
+    pub auth_context: AuthContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +305,7 @@ pub async fn refresh_with_context(
         other => return Err(format!("unexpected start transaction event: {other:?}")),
     };
 
+    let mut minted = false;
     let refreshed_value = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -315,6 +325,7 @@ pub async fn refresh_with_context(
                     return Err(err.to_string());
                 }
             };
+            let predecessor = version.clone();
             let BlobVersion {
                 created_at,
                 created_by,
@@ -334,11 +345,19 @@ pub async fn refresh_with_context(
                 abort_reference_refresh(context, txn_id).await;
                 return Ok(());
             };
-            // Only a confirmed observation counts as a refresh; fields under the version id
-            // never change, so a changed or unknown one leaves the version as it is.
-            if refresh.refreshed_at <= last_refresh
-                || cached_metadata.compare(&refresh.metadata) != ObservationMatch::Same
-            {
+            // Only a confirmed observation counts as a refresh; fields under the version id never
+            // change, so a confirmed change becomes a successor and an unknown one is dropped.
+            let comparison = cached_metadata.compare(&refresh.metadata);
+            if refresh.refreshed_at > last_refresh && comparison == ObservationMatch::Changed {
+                match mint_successor(context, txn_id, &refresh, &predecessor).await {
+                    Ok(written) => minted = written,
+                    Err(error) => {
+                        abort_reference_refresh(context, txn_id).await;
+                        return Err(error);
+                    }
+                }
+            }
+            if refresh.refreshed_at <= last_refresh || comparison != ObservationMatch::Same {
                 None
             } else {
                 Some(
@@ -409,7 +428,17 @@ pub async fn refresh_with_context(
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+            if minted {
+                // The dirty markers and the obligation committed above are the durable work.
+                for effect in [schedule_snapshot_publish(), schedule_blob_drain()] {
+                    if let Effect::Task(effect) = effect {
+                        schedule_task(context, effect).await;
+                    }
+                }
+            }
+            Ok(())
+        }
         Event::Storage(StorageEvent::Error { error }) => {
             abort_reference_refresh(context, txn_id).await;
             Err(error.to_string())
@@ -418,6 +447,18 @@ pub async fn refresh_with_context(
             abort_reference_refresh(context, txn_id).await;
             Err(format!("unexpected commit event: {other:?}"))
         }
+    }
+}
+
+async fn schedule_task(context: &DriverContext, effect: TaskEffect) {
+    if persist_task_effect(&context.storage_handle, &effect)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if let Some(task_handle) = &context.task_handle {
+        let _ = task_handle.send_effect(Effect::Task(effect)).await;
     }
 }
 
@@ -877,6 +918,13 @@ mod tests {
             version_id: test.version_id,
             metadata,
             refreshed_at,
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
+            user_id: Default::default(),
+            realm_id: aruna_core::structs::identity::realm::RealmId([9u8; 32]),
+            path_restrictions: None,
+            session: None,
+        },
         }
     }
 
@@ -1036,6 +1084,76 @@ mod tests {
         process_batch(&test.context).await.expect("drain succeeds");
 
         assert_reference_state(&test, &original, last_refresh).await;
+    }
+
+    // A confirmed change of the current version is recorded as a successor that becomes the
+    // head; the refreshed version keeps its fields.
+    #[tokio::test]
+    async fn change_mints_successor() {
+        use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, S3_BUCKET_KEYSPACE};
+        use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, CurrentVersionPointer};
+        let test = setup_state();
+        let original = source_metadata(10, "original");
+        write_reference_version(&test, original.clone(), SystemTime::UNIX_EPOCH, 0).await;
+        let bucket = BucketInfo {
+            group_id: Ulid::from_bytes([1; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: test.created_by,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: None,
+        };
+        let head_key = BlobHeadKey::new(&test.bucket, &test.key).to_bytes().unwrap();
+        let writes = vec![
+            (
+                BLOB_HEAD_KEYSPACE.to_string(),
+                head_key.clone().into(),
+                CurrentVersionPointer::new(test.version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                test.bucket.as_bytes().to_vec().into(),
+                bucket.to_bytes().unwrap().into(),
+            ),
+        ];
+        test.context
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+        let changed = source_metadata(20, "changed");
+        let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+
+        refresh_with_context(&test.context, refresh(&test, changed.clone(), refreshed_at))
+            .await
+            .unwrap();
+
+        assert_reference_state(&test, &original, SystemTime::UNIX_EPOCH).await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(head), ..
+        }) = test
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: head_key.into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("the head must exist");
+        };
+        let head = CurrentVersionPointer::from_bytes(&head).unwrap();
+        assert_ne!(head.version_id, test.version_id);
+        assert_eq!(head.generation, 2);
     }
 
     #[tokio::test]

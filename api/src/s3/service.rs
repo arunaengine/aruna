@@ -1586,7 +1586,14 @@ impl S3 for ArunaS3Service {
 
         let version_id = result.version_id;
         let resolved_range = result.resolved_range.clone();
-        let reference_refresh = reference_metadata_refresh(response_bucket, response_key, &result);
+        let reader = aruna_core::structs::identity::auth::AuthContext {
+            user_id: user_access.user_identity,
+            realm_id: self.realm_id,
+            path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
+        };
+        let reference_refresh =
+            reference_metadata_refresh(response_bucket, response_key, &result, self.node_id, reader);
         let response_fields = self.build_response_fields(
             result.location.as_ref(),
             Some(&result.info),

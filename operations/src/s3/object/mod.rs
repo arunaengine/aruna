@@ -12,6 +12,7 @@ mod lookup;
 pub mod metadata;
 pub mod placement;
 pub mod put;
+mod refresh_mint;
 pub mod search;
 mod verified;
 pub mod versions;
