@@ -389,7 +389,8 @@ mod tests {
     use crate::staging::descriptor::build_source_binding;
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{
-        BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, SOURCE_INDEX_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
+        SOURCE_INDEX_KEYSPACE,
     };
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
     use aruna_core::structs::execution::source_connector::{
@@ -690,14 +691,19 @@ mod tests {
             [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
                 if *commit_txn == txn_id
         ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted { txn_id }));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
         assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
         operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
             key: aruna_core::task::TaskKey::PruneConnectorReferences,
             after: std::time::Duration::ZERO,
         }));
 
-        assert_eq!(operation.finalize(), Err(DeleteSourceError::ReferencesPending));
+        assert_eq!(
+            operation.finalize(),
+            Err(DeleteSourceError::ReferencesPending)
+        );
     }
 
     #[test]

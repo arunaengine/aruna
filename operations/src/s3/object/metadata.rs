@@ -920,11 +920,11 @@ mod tests {
             refreshed_at,
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
             auth_context: aruna_core::structs::identity::auth::AuthContext {
-            user_id: Default::default(),
-            realm_id: aruna_core::structs::identity::realm::RealmId([9u8; 32]),
-            path_restrictions: None,
-            session: None,
-        },
+                user_id: Default::default(),
+                realm_id: aruna_core::structs::identity::realm::RealmId([9u8; 32]),
+                path_restrictions: None,
+                session: None,
+            },
         }
     }
 
@@ -1106,7 +1106,9 @@ mod tests {
             compression: aruna_core::structs::storage::format::Compression::Off,
             distribution: None,
         };
-        let head_key = BlobHeadKey::new(&test.bucket, &test.key).to_bytes().unwrap();
+        let head_key = BlobHeadKey::new(&test.bucket, &test.key)
+            .to_bytes()
+            .unwrap();
         let writes = vec![
             (
                 BLOB_HEAD_KEYSPACE.to_string(),

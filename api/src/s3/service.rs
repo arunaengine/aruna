@@ -1592,8 +1592,13 @@ impl S3 for ArunaS3Service {
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         };
-        let reference_refresh =
-            reference_metadata_refresh(response_bucket, response_key, &result, self.node_id, reader);
+        let reference_refresh = reference_metadata_refresh(
+            response_bucket,
+            response_key,
+            &result,
+            self.node_id,
+            reader,
+        );
         let response_fields = self.build_response_fields(
             result.location.as_ref(),
             Some(&result.info),

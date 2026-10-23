@@ -276,7 +276,11 @@ mod tests {
         let Ok(ScanStep::Next(queued)) = scan.step(deleted, txn()) else {
             panic!("expected the pruning to be queued");
         };
-        let [Effect::Storage(StorageEffect::Write { key_space, value, .. })] = queued.as_slice()
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = queued.as_slice()
         else {
             panic!("expected one queue write");
         };

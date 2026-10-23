@@ -782,14 +782,19 @@ mod tests {
             [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
                 if *commit_txn == txn_id
         ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted { txn_id }));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
         assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
         operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
             key: aruna_core::task::TaskKey::PruneConnectorReferences,
             after: std::time::Duration::ZERO,
         }));
 
-        assert_eq!(operation.finalize(), Err(ReplaceSourceError::ReferencesPending));
+        assert_eq!(
+            operation.finalize(),
+            Err(ReplaceSourceError::ReferencesPending)
+        );
     }
 
     #[test]
