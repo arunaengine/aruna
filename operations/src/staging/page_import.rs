@@ -285,3 +285,7 @@ impl Operation for PageImportOperation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "page_tests.rs"]
+mod tests;
