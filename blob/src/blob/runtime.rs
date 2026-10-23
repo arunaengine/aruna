@@ -452,8 +452,14 @@ impl BlobHandle {
             StagingSourceEffect::List { access, request } => {
                 self.handler.list_staging_source(access, request).await
             }
-            StagingSourceEffect::Read { access, range } => {
-                self.handler.read_staging_source(access, range).await
+            StagingSourceEffect::Read {
+                access,
+                range,
+                expected,
+            } => {
+                self.handler
+                    .read_staging_source(access, range, expected)
+                    .await
             }
         };
 

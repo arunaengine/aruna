@@ -7,7 +7,9 @@ use crate::opendal::{
     check_staging_source, head_staging_source, list_staging_source, read_staging_source,
 };
 use aruna_core::events::StagingSourceEvent;
-use aruna_core::structs::execution::source_access::{ListRequest, ResolvedSourceAccess};
+use aruna_core::structs::execution::source_access::{
+    ListRequest, ResolvedSourceAccess, SourceMetadata,
+};
 
 impl BlobHandler {
     pub(crate) async fn check_staging_source(
@@ -34,8 +36,9 @@ impl BlobHandler {
         &self,
         access: ResolvedSourceAccess,
         range: Option<std::ops::Range<u64>>,
+        expected: Option<SourceMetadata>,
     ) -> StagingSourceEvent {
-        match read_staging_source(&self.egress, &access, range).await {
+        match read_staging_source(&self.egress, &access, range, expected.as_ref()).await {
             Ok((metadata, stream)) => StagingSourceEvent::ReadResult { metadata, stream },
             Err(error) => StagingSourceEvent::Error { error },
         }

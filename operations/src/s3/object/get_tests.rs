@@ -457,12 +457,12 @@ fn reference_range_reads() {
     let metadata = SourceMetadata {
         content_length: 10,
         content_type: Some("text/plain".to_string()),
-        etag: None,
+        etag: Some("\"v1\"".to_string()),
         last_modified: None,
         source_version: None,
         digests: Default::default(),
     };
-    // Baseline matches the live head, so this undrifted read serves directly.
+    // Baseline matches the live head, so this undrifted read serves directly, bound to it.
     operation.reference_cached = Some(metadata.clone());
     let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
         metadata: metadata.clone(),
@@ -470,8 +470,13 @@ fn reference_range_reads() {
 
     assert!(matches!(
         effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read { access: emitted_access, range })]
+        [Effect::StagingSource(StagingSourceEffect::Read {
+            access: emitted_access,
+            range,
+            expected,
+        })]
             if emitted_access == &access && range == &Some(6..10)
+                && expected.as_ref() == Some(&metadata)
     ));
 
     let effects = operation.step(Event::StagingSource(StagingSourceEvent::ReadResult {

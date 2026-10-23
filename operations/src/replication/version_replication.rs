@@ -34,7 +34,9 @@ use aruna_core::keyspaces::{
     SYNC_REFERENCE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+use aruna_core::structs::execution::source_access::{
+    ObservationMatch, ResolvedSourceAccess, SourceMetadata,
+};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
@@ -1405,7 +1407,7 @@ impl ReplicateObjectOperation {
         else {
             return None;
         };
-        Some(cached_metadata.observation_fingerprint() == metadata.observation_fingerprint())
+        Some(cached_metadata.compare(metadata) == ObservationMatch::Same)
     }
 
     fn resolve_reference(&mut self, version: ReplicationVersion) -> Effects {
@@ -1725,10 +1727,17 @@ impl ReplicateObjectOperation {
         let Some(access) = self.reference_access.take() else {
             return self.fail(ReplicateObjectError::UnresolvedReferenceVersion);
         };
+        let expected = match self.replication_version.as_ref() {
+            Some(ReplicationVersion::Reference {
+                cached_metadata, ..
+            }) => Some(cached_metadata.clone()),
+            _ => None,
+        };
         self.state = ReplicateObjectState::ReadReferenceSource;
         smallvec![Effect::StagingSource(StagingSourceEffect::Read {
             access,
             range: None,
+            expected,
         })]
     }
 
@@ -4482,8 +4491,9 @@ mod tests {
         let effects = load_routing(&mut op);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::StagingSource(StagingSourceEffect::Read { access: emitted, range })]
+            [Effect::StagingSource(StagingSourceEffect::Read { access: emitted, range, expected })]
                 if emitted == &access && range.is_none()
+                    && expected.as_ref() == Some(&reference_cached_metadata())
         ));
 
         let effects = op.step(Event::StagingSource(StagingSourceEvent::ReadResult {

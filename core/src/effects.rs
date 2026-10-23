@@ -17,7 +17,7 @@ use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::WriteGuard;
 use crate::structs::execution::job::{JobRecordEnvelope, JobRecordKind, SubmissionId};
-use crate::structs::execution::source_access::{ListRequest, ResolvedSourceAccess};
+use crate::structs::execution::source_access::{ListRequest, ResolvedSourceAccess, SourceMetadata};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
@@ -436,6 +436,9 @@ pub enum StagingSourceEffect {
     Read {
         access: ResolvedSourceAccess,
         range: Option<Range<u64>>,
+        /// The registered observation the read must stay bound to: its ETag is sent as
+        /// `If-Match` without a fresh HEAD, and a failed condition is `ConditionFailed`.
+        expected: Option<SourceMetadata>,
     },
 }
 

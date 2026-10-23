@@ -191,7 +191,7 @@ impl Drop for SourceListener {
 async fn source_read_drift() {
     let source = SourceListener::bind(Some("\"v1\""), true).await;
 
-    let (_, mut stream) = read_staging_source(&test_guard(), &source.access(), None)
+    let (_, mut stream) = read_staging_source(&test_guard(), &source.access(), None, None)
         .await
         .unwrap();
 
@@ -208,7 +208,7 @@ async fn source_read_unpinned() {
     for etag in [None, Some("W/\"v1\"")] {
         let source = SourceListener::bind(etag, false).await;
 
-        let (_, stream) = read_staging_source(&test_guard(), &source.access(), None)
+        let (_, stream) = read_staging_source(&test_guard(), &source.access(), None, None)
             .await
             .unwrap();
         let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
@@ -224,7 +224,7 @@ async fn source_read_unpinned() {
 async fn source_read_range() {
     let source = SourceListener::bind(Some("\"v1\""), false).await;
 
-    let (_, stream) = read_staging_source(&test_guard(), &source.access(), Some(1..4))
+    let (_, stream) = read_staging_source(&test_guard(), &source.access(), Some(1..4), None)
         .await
         .unwrap();
     let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
@@ -233,6 +233,51 @@ async fn source_read_range() {
     let requests = source.requests.lock().await;
     assert!(requests[1].contains("if-match: \"v1\""));
     assert!(requests[1].contains("range: bytes=1-3"));
+}
+
+fn recorded(etag: &str) -> SourceMetadata {
+    SourceMetadata {
+        content_length: 5,
+        content_type: None,
+        etag: Some(etag.to_string()),
+        last_modified: None,
+        source_version: None,
+        digests: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn bound_read_skips_head() {
+    let source = SourceListener::bind(Some("\"v2\""), false).await;
+    let expected = recorded("\"v1\"");
+
+    let (metadata, stream) =
+        read_staging_source(&test_guard(), &source.access(), Some(1..4), Some(&expected))
+            .await
+            .unwrap();
+    let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
+
+    assert_eq!(chunks.concat(), b"ell");
+    assert_eq!(metadata, expected);
+    let requests = source.requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("get "));
+    assert!(requests[0].contains("if-match: \"v1\""));
+}
+
+#[tokio::test]
+async fn bound_read_fails_changed() {
+    let source = SourceListener::bind(Some("\"v2\""), true).await;
+
+    let result = read_staging_source(
+        &test_guard(),
+        &source.access(),
+        None,
+        Some(&recorded("\"v1\"")),
+    )
+    .await;
+
+    assert!(matches!(result, Err(StagingSourceError::ConditionFailed)));
 }
 
 #[tokio::test]

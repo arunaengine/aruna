@@ -38,7 +38,9 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::job::RoCrateLimits;
-use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+use aruna_core::structs::execution::source_access::{
+    ObservationMatch, ResolvedSourceAccess, SourceMetadata,
+};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
@@ -1036,29 +1038,39 @@ impl GetObjectOperation {
     pub fn reference_head_received(&mut self, event: Event) -> Effects {
         match event {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
-                let baseline = self
-                    .reference_cached
-                    .as_ref()
-                    .map(SourceMetadata::observation_fingerprint);
-                let drifted = baseline != Some(metadata.observation_fingerprint());
-
-                if drifted {
-                    // A pinned historical version cannot serve drifted bytes:
-                    // its bytes were never cached (#375 deferred).
+                let stored = self.reference_cached.clone();
+                let comparison = stored.as_ref().map_or(ObservationMatch::Changed, |stored| {
+                    stored.compare(&metadata)
+                });
+                if let (ObservationMatch::Same, Some(stored)) = (comparison, stored) {
+                    // Undrifted: serve the recorded observation, bound to its ETag.
+                    self.last_refresh = self.reference_last_refresh;
+                    let content_type = stored.content_type.clone().or(metadata.content_type);
+                    let served = SourceMetadata {
+                        content_type,
+                        ..stored
+                    };
+                    return self.serve_reference_source(served, true);
+                }
+                if comparison == ObservationMatch::Unknown {
+                    // Nothing proves the bytes unchanged: a pinned version is refused, and the
+                    // current one is served fresh without counting as refreshed.
                     if self.reference_explicit {
                         return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                     }
-                    // Current drift records a same-binding successor, but repeated
-                    // change fails rather than serving mismatched bytes.
-                    if self.drift_attempts < MAX_DRIFT_ATTEMPTS {
-                        return self.begin_reference_advance(metadata);
-                    }
-                    return self.emit_error(GetObjectError::ReferenceSourceChanged);
+                    return self.serve_reference_source(metadata, false);
                 }
-
-                // Undrifted: serve the recorded observation unchanged.
-                self.last_refresh = self.reference_last_refresh;
-                self.serve_reference_source(metadata)
+                // A pinned historical version cannot serve drifted bytes:
+                // its bytes were never cached (#375 deferred).
+                if self.reference_explicit {
+                    return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                }
+                // Current drift records a same-binding successor, but repeated
+                // change fails rather than serving mismatched bytes.
+                if self.drift_attempts < MAX_DRIFT_ATTEMPTS {
+                    return self.begin_reference_advance(metadata);
+                }
+                self.emit_error(GetObjectError::ReferenceSourceChanged)
             }
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
                 self.emit_error(error.into())
@@ -1071,9 +1083,9 @@ impl GetObjectOperation {
         }
     }
 
-    /// Issues the source read for the observation `metadata`, resolving the
-    /// requested range against its live content length.
-    fn serve_reference_source(&mut self, metadata: SourceMetadata) -> Effects {
+    /// Issues the source read for the observation `metadata`, resolving the requested range
+    /// against its content length; a `bound` read stays on that observation's ETag.
+    fn serve_reference_source(&mut self, metadata: SourceMetadata, bound: bool) -> Effects {
         let Some(access) = self.reference_access.clone() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
@@ -1087,11 +1099,13 @@ impl GetObjectOperation {
             },
             None => None,
         };
+        let expected = bound.then(|| metadata.clone());
         self.source_metadata = Some(metadata);
         self.state = GetObjectState::ReadReferenceSource;
         smallvec![Effect::StagingSource(StagingSourceEffect::Read {
             access,
-            range
+            range,
+            expected,
         })]
     }
 
@@ -1405,7 +1419,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
         self.last_refresh = Some(SystemTime::now());
-        self.serve_reference_source(observation)
+        self.serve_reference_source(observation, true)
     }
 
     /// Aborts an in-flight advance transaction and re-reads against the winner.
@@ -1522,7 +1536,7 @@ impl GetObjectOperation {
                 let Some(head_metadata) = self.source_metadata.as_ref() else {
                     return self.emit_error(GetObjectError::GetObjectFailed);
                 };
-                if head_metadata.observation_fingerprint() != metadata.observation_fingerprint() {
+                if head_metadata.compare(&metadata) == ObservationMatch::Changed {
                     if self.reference_explicit {
                         return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                     }
@@ -1534,6 +1548,9 @@ impl GetObjectOperation {
                 self.reference_stream = Some(stream);
                 self.finish_reference_output()
             }
+            Event::StagingSource(StagingSourceEvent::Error {
+                error: StagingSourceError::ConditionFailed,
+            }) => self.emit_error(GetObjectError::ReferenceSourceChanged),
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
                 self.emit_error(error.into())
             }

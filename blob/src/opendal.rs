@@ -12,7 +12,7 @@ use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::storage::blob::Backend;
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use opendal::layers::{LoggingLayer, RetryLayer};
 use opendal::{Builder, EntryMode, OperationContext, Operator, services};
 use std::collections::HashMap;
@@ -163,6 +163,7 @@ pub(crate) async fn read_staging_source(
     guard: &EgressGuard,
     access: &ResolvedSourceAccess,
     range: Option<std::ops::Range<u64>>,
+    expected: Option<&SourceMetadata>,
 ) -> Result<
     (
         SourceMetadata,
@@ -177,19 +178,21 @@ pub(crate) async fn read_staging_source(
         return crate::invenio::read_reference(guard, access, range).await;
     }
     let (operator, path, version) = build_source_operator(guard, access).await?;
-    let metadata = head_staging_source(guard, access).await?;
     let capability = operator.info().capability();
+    if let Some(expected) = expected
+        && let Some(etag) = strong_etag(expected.etag.as_deref())
+        && capability.read_with_if_match
+    {
+        return read_bound(&operator, path, version, range, expected, etag).await;
+    }
+    let metadata = head_staging_source(guard, access).await?;
     let mut reader = operator.reader_with(path);
     // Pinning is preferred, not required: an unpinnable source reads unpinned
     // with a warning so any source stays integrateable (user decision 2026-08-10).
     let pinned_version = version
         .or(metadata.source_version.as_deref())
         .filter(|version| !version.is_empty());
-    let strong_etag = metadata
-        .etag
-        .as_deref()
-        .map(str::trim)
-        .filter(|etag| !etag.is_empty() && !etag.starts_with("W/"));
+    let strong_etag = strong_etag(metadata.etag.as_deref());
     if let Some(version) = pinned_version.filter(|_| capability.read_with_version) {
         reader = reader.version(version);
     } else if let Some(etag) = strong_etag.filter(|_| capability.read_with_if_match) {
@@ -217,6 +220,60 @@ pub(crate) async fn read_staging_source(
     };
 
     Ok((metadata, BackendStream::new(stream)))
+}
+
+fn strong_etag(etag: Option<&str>) -> Option<&str> {
+    etag.map(str::trim)
+        .filter(|etag| !etag.is_empty() && !etag.starts_with("W/"))
+}
+
+/// Reads with the recorded ETag as `If-Match` and no HEAD first, so the bytes are the
+/// registered representation or the read fails with `ConditionFailed`.
+async fn read_bound(
+    operator: &Operator,
+    path: &str,
+    version: Option<&str>,
+    range: Option<std::ops::Range<u64>>,
+    expected: &SourceMetadata,
+    etag: &str,
+) -> Result<
+    (
+        SourceMetadata,
+        BackendStream<Result<Bytes, aruna_core::stream::StreamError>>,
+    ),
+    StagingSourceError,
+> {
+    let mut reader = operator.reader_with(path).if_match(etag);
+    if let Some(version) = version.filter(|_| operator.info().capability().read_with_version) {
+        reader = reader.version(version);
+    }
+    let reader = reader.await.map_err(|error| bound_read_error(&error))?;
+    let stream = match range {
+        Some(range) => reader.into_bytes_stream(range).await,
+        None => reader.into_bytes_stream(..).await,
+    }
+    .map_err(|error| bound_read_error(&error))?;
+    // The first chunk carries the provider's answer to the condition.
+    let mut stream = Box::pin(stream);
+    let first = stream.try_next().await.map_err(|error| {
+        match error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<opendal::Error>())
+        {
+            Some(inner) => bound_read_error(inner),
+            None => StagingSourceError::ReadError(error.to_string()),
+        }
+    })?;
+    let stream = futures::stream::iter(first.map(Ok)).chain(stream);
+    Ok((expected.clone(), BackendStream::new(stream)))
+}
+
+fn bound_read_error(error: &opendal::Error) -> StagingSourceError {
+    match error.kind() {
+        opendal::ErrorKind::ConditionNotMatch => StagingSourceError::ConditionFailed,
+        opendal::ErrorKind::NotFound => StagingSourceError::NotFound,
+        _ => StagingSourceError::ReadError(error.to_string()),
+    }
 }
 
 pub(crate) async fn list_staging_source(

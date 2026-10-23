@@ -110,6 +110,7 @@ impl ReadSourceOperation {
                         smallvec![Effect::StagingSource(StagingSourceEffect::Read {
                             access: resolved.access,
                             range: self.input.range.clone(),
+                            expected: None,
                         })]
                     }
                     Err(error) => self.emit_error(error.into()),
@@ -277,7 +278,7 @@ mod tests {
 
         assert!(matches!(
             effects.as_slice(),
-            [Effect::StagingSource(StagingSourceEffect::Read { access, range })]
+            [Effect::StagingSource(StagingSourceEffect::Read { access, range, expected: None })]
                 if access == &expected_access && range == &Some(5..11)
         ));
         assert_eq!(operation.state, ReadSourceState::ReadSource);

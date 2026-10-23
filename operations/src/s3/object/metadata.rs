@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REFRESH_JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -325,26 +325,28 @@ pub async fn refresh_with_context(
             } = version;
             let BlobVersionState::Reference {
                 source,
+                cached_metadata,
                 last_refresh,
                 advance_count,
-                ..
             } = state
             else {
                 abort_reference_refresh(context, txn_id).await;
                 return Ok(());
             };
-            if refresh.refreshed_at <= last_refresh {
+            // Only a confirmed observation counts as a refresh; fields under the version id
+            // never change, so a changed or unknown one leaves the version as it is.
+            if refresh.refreshed_at <= last_refresh
+                || cached_metadata.compare(&refresh.metadata) != ObservationMatch::Same
+            {
                 None
             } else {
-                // referenced_bytes usage on a size-changing refresh is accounted
-                // by the verified-reference arc that wires this path; no delta here.
                 Some(
                     match (BlobVersion {
                         published_by,
                         placement_policies,
                         ..BlobVersion::reference(
                             source,
-                            refresh.metadata,
+                            cached_metadata,
                             created_at,
                             created_by,
                             refresh.refreshed_at,
@@ -1014,23 +1016,50 @@ mod tests {
         assert_reference_state(&test, &original_metadata, last_refresh).await;
     }
 
+    // Fields under a version id never change: a changed observation is no refresh.
     #[tokio::test]
-    async fn newer_cache_updated() {
+    async fn changed_refresh_ignored() {
         let test = setup_state();
         let last_refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
         let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
-        let new_metadata = source_metadata(20, "newer");
-        write_reference_version(&test, source_metadata(10, "original"), last_refresh, 0).await;
+        let original = source_metadata(10, "original");
+        write_reference_version(&test, original.clone(), last_refresh, 0).await;
 
         crate::driver::drive(
-            QueueRefreshOperation::new(refresh(&test, new_metadata.clone(), refreshed_at)),
+            QueueRefreshOperation::new(refresh(&test, source_metadata(20, "newer"), refreshed_at)),
             &test.context,
         )
         .await
         .expect("queue succeeds");
         process_batch(&test.context).await.expect("drain succeeds");
 
-        assert_reference_state(&test, &new_metadata, refreshed_at).await;
+        assert_reference_state(&test, &original, last_refresh).await;
+    }
+
+    #[tokio::test]
+    async fn same_refresh_advances() {
+        let test = setup_state();
+        let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let original = source_metadata(10, "original");
+        write_reference_version(&test, original.clone(), SystemTime::UNIX_EPOCH, 0).await;
+        let mut unknown = original.clone();
+        unknown.etag = None;
+        let mut listed = original.clone();
+        listed.content_type = None;
+
+        for (observation, expected_refresh) in
+            [(unknown, SystemTime::UNIX_EPOCH), (listed, refreshed_at)]
+        {
+            crate::driver::drive(
+                QueueRefreshOperation::new(refresh(&test, observation, refreshed_at)),
+                &test.context,
+            )
+            .await
+            .expect("queue succeeds");
+            process_batch(&test.context).await.expect("drain succeeds");
+
+            assert_reference_state(&test, &original, expected_refresh).await;
+        }
     }
 
     // A metadata refresh is not a rebind, so it must not hand the binding a fresh
@@ -1039,24 +1068,18 @@ mod tests {
     async fn refresh_keeps_count() {
         let test = setup_state();
         let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
-        let new_metadata = source_metadata(20, "newer");
-        write_reference_version(
-            &test,
-            source_metadata(10, "original"),
-            SystemTime::UNIX_EPOCH,
-            7,
-        )
-        .await;
+        let original = source_metadata(10, "original");
+        write_reference_version(&test, original.clone(), SystemTime::UNIX_EPOCH, 7).await;
 
         crate::driver::drive(
-            QueueRefreshOperation::new(refresh(&test, new_metadata.clone(), refreshed_at)),
+            QueueRefreshOperation::new(refresh(&test, original.clone(), refreshed_at)),
             &test.context,
         )
         .await
         .expect("queue succeeds");
         process_batch(&test.context).await.expect("drain succeeds");
 
-        assert_reference_state(&test, &new_metadata, refreshed_at).await;
+        assert_reference_state(&test, &original, refreshed_at).await;
         assert_eq!(read_reference(&test).await.advance_count(), Some(7));
     }
 

@@ -156,6 +156,9 @@ pub enum StagingSourceError {
     SourceUnstable,
     #[error("Invalid listing request: {0}")]
     InvalidListing(String),
+    /// The source no longer holds the representation the read was bound to.
+    #[error("Source changed since its observation was recorded")]
+    ConditionFailed,
     #[error(transparent)]
     EgressDenied(#[from] crate::egress::EgressError),
 }

@@ -102,7 +102,9 @@ pub(crate) async fn send_native_effect(
 ) -> Event {
     let result = match effect {
         StagingSourceEffect::Head { access } => native_head(context, access).await,
-        StagingSourceEffect::Read { access, range } => native_read(context, access, range).await,
+        StagingSourceEffect::Read { access, range, .. } => {
+            native_read(context, access, range).await
+        }
         StagingSourceEffect::Check { .. } | StagingSourceEffect::List { .. } => Err(
             StagingSourceError::UnsupportedKind(SourceConnectorKind::ArunaNative.to_string()),
         ),
