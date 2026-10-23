@@ -6,15 +6,15 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::reference_scan::{ScanStep, parse_scan_page};
+use crate::connectors::reference_scan::{ReferenceScan, ScanStep};
 use crate::connectors::repository::{
     StorageReadError, delete_secret_effect, parse_connector_read, parse_secret_read,
-    read_connector_effect, read_secret_effect, reference_scan_effect, source_connector_key,
+    read_connector_effect, read_secret_effect, source_connector_key,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +76,7 @@ pub struct DeleteSourceOperation {
     state: DeleteSourceState,
     txn_id: Option<TxnId>,
     has_secret: bool,
+    scan: Option<ReferenceScan>,
     output: Option<Result<DeleteSourceResult, DeleteSourceError>>,
 }
 
@@ -86,6 +87,7 @@ impl DeleteSourceOperation {
             state: DeleteSourceState::Init,
             txn_id: None,
             has_secret: false,
+            scan: None,
             output: None,
         }
     }
@@ -129,7 +131,7 @@ impl DeleteSourceOperation {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                 self.txn_id = Some(txn_id);
                 if self.has_secret {
-                    self.scan_reference_versions(None)
+                    self.scan_reference_versions()
                 } else {
                     self.delete_records()
                 }
@@ -167,21 +169,27 @@ impl DeleteSourceOperation {
         }
     }
 
-    fn scan_reference_versions(&mut self, start_after: Option<Key>) -> Effects {
+    fn scan_reference_versions(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(StorageError::TransactionNotFound.into());
         };
 
         self.state = DeleteSourceState::ScanReferenceVersions;
-        smallvec![reference_scan_effect(start_after, Some(txn_id),)]
+        let mut scan = ReferenceScan::new(self.input.connector_id);
+        let effects = scan.start(None, txn_id);
+        self.scan = Some(scan);
+        effects
     }
 
     fn handle_scan_page(&mut self, event: Event) -> Effects {
-        match parse_scan_page(event, self.input.connector_id) {
+        let (Some(scan), Some(txn_id)) = (self.scan.as_mut(), self.txn_id) else {
+            return self.abort_with_error(StorageError::TransactionNotFound.into());
+        };
+        match scan.step(event, txn_id) {
             Ok(ScanStep::Referenced) => {
                 self.abort_with_error(DeleteSourceError::ReferencedObjectVersion)
             }
-            Ok(ScanStep::NextPage(start_after)) => self.scan_reference_versions(Some(start_after)),
+            Ok(ScanStep::Next(effects)) => effects,
             Ok(ScanStep::Complete) => self.delete_records(),
             Err(error) => self.abort_with_error(error.into()),
         }
@@ -350,6 +358,7 @@ mod tests {
     };
     use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
     use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
+    use aruna_core::types::Key;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;

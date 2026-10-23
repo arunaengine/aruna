@@ -5,9 +5,7 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
-use aruna_core::keyspaces::{
-    BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, SOURCE_INDEX_KEYSPACE,
-};
+use aruna_core::keyspaces::{CONNECTOR_REFERENCE_KEYSPACE, SOURCE_INDEX_KEYSPACE};
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
 use aruna_core::types::{GroupId, Key, TxnId, Value};
@@ -115,16 +113,6 @@ pub fn iter_connectors_effect(
     })
 }
 
-pub fn reference_scan_effect(start_after: Option<Key>, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-        prefix: None,
-        start: start_after.map(IterStart::After),
-        limit: REFERENCE_PAGE_SIZE,
-        txn_id,
-    })
-}
-
 pub fn parse_connector_read(event: Event) -> Result<Option<SourceConnector>, StorageReadError> {
     parse_storage_read(event, SourceConnector::from_bytes)
 }
@@ -144,12 +132,6 @@ pub fn parse_connector_iter(
     event: Event,
 ) -> Result<(Vec<SourceConnector>, Option<Key>), StorageReadError> {
     parse_storage_iter(event, SourceConnector::from_bytes)
-}
-
-pub fn parse_version_iter(
-    event: Event,
-) -> Result<(Vec<BlobVersion>, Option<Key>), StorageReadError> {
-    parse_storage_iter(event, BlobVersion::from_bytes)
 }
 
 pub fn references_connector(version: &BlobVersion, connector_id: Ulid) -> bool {

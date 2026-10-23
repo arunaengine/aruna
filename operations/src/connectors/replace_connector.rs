@@ -12,16 +12,15 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_connector::{
     SourceConnector, SourceConnectorKind, SourceConnectorSecret,
 };
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::reference_scan::{ScanStep, parse_scan_page};
+use crate::connectors::reference_scan::{ReferenceScan, ScanStep};
 use crate::connectors::repository::{
     StorageReadError, delete_secret_effect, parse_connector_read, parse_secret_read,
-    read_connector_effect, read_secret_effect, reference_scan_effect, source_connector_key,
-    write_secret_effect,
+    read_connector_effect, read_secret_effect, source_connector_key, write_secret_effect,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
@@ -111,6 +110,7 @@ pub struct ReplaceSourceOperation {
     replacement: Option<SourceConnector>,
     replacement_secret: Option<SourceConnectorSecret>,
     txn_id: Option<TxnId>,
+    scan: Option<ReferenceScan>,
     output: Option<Result<ReplaceSourceResult, ReplaceSourceError>>,
 }
 
@@ -122,6 +122,7 @@ impl ReplaceSourceOperation {
             replacement: None,
             replacement_secret: None,
             txn_id: None,
+            scan: None,
             output: None,
         }
     }
@@ -180,7 +181,7 @@ impl ReplaceSourceOperation {
         };
 
         if secret_config_changed(current_secret.as_ref(), self.replacement_secret.as_ref()) {
-            return self.scan_reference_versions(None);
+            return self.scan_reference_versions();
         }
 
         self.write_records()
@@ -230,21 +231,27 @@ impl ReplaceSourceOperation {
         }
     }
 
-    fn scan_reference_versions(&mut self, start_after: Option<Key>) -> Effects {
+    fn scan_reference_versions(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(StorageError::TransactionNotFound.into());
         };
 
         self.state = ReplaceSourceState::ScanReferenceVersions;
-        smallvec![reference_scan_effect(start_after, Some(txn_id),)]
+        let mut scan = ReferenceScan::new(self.input.connector_id);
+        let effects = scan.start(None, txn_id);
+        self.scan = Some(scan);
+        effects
     }
 
     fn handle_scan_page(&mut self, event: Event) -> Effects {
-        match parse_scan_page(event, self.input.connector_id) {
+        let (Some(scan), Some(txn_id)) = (self.scan.as_mut(), self.txn_id) else {
+            return self.abort_with_error(StorageError::TransactionNotFound.into());
+        };
+        match scan.step(event, txn_id) {
             Ok(ScanStep::Referenced) => {
                 self.abort_with_error(ReplaceSourceError::ReferencedObjectVersion)
             }
-            Ok(ScanStep::NextPage(start_after)) => self.scan_reference_versions(Some(start_after)),
+            Ok(ScanStep::Next(effects)) => effects,
             Ok(ScanStep::Complete) => self.write_records(),
             Err(error) => self.abort_with_error(error.into()),
         }
@@ -445,6 +452,7 @@ mod tests {
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
     use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
     use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
+    use aruna_core::types::Key;
     use aruna_storage::storage;
     use tempfile::{TempDir, tempdir};
 
