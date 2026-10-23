@@ -26,7 +26,6 @@ use crate::s3::object::lookup::{
     multipart_summary_read, summary_from_read,
 };
 use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
-use crate::s3::object::verified::verified;
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
@@ -39,8 +38,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::checksum::HASH_MD5;
+use aruna_core::structs::checksum::{ExpectedChecksum, unmatched_checksum};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::source_access::{
     ObservationMatch, ResolvedSourceAccess, SourceMetadata,
@@ -54,7 +53,7 @@ use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::abe_access::{KeyGrant, MAX_REQUESTS};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, CurrentVersionPointer, ManagedCopyKey, VersionKey,
+    BlobVersionState, CurrentVersionPointer, HiddenBlobKey, ManagedCopyKey, VersionKey,
 };
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease, TokenCredential,
@@ -76,6 +75,8 @@ use tracing::warn;
 
 /// Maximum successors attempted before a still-changing current read fails.
 const MAX_DRIFT_ATTEMPTS: u8 = 3;
+/// Hidden blob namespace of spooled reference reads; the hidden sweep removes old spools.
+const REFERENCE_SPOOL: Ulid = Ulid::from_bytes(*b"reference-spool!");
 /// Minimum age of the current reference version before a read may mint another
 /// successor. Rate-limits a READ-only caller pointing at a source they control.
 pub const MIN_ADVANCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -108,6 +109,10 @@ pub enum GetObjectState {
     ReadReferenceSource,
     /// The bound read failed its condition: a refresh is queued to observe the source.
     QueueChangedRefresh,
+    /// Unconfirmed bytes are spooled and checked against the recorded digests first.
+    SpoolReference,
+    ReadSpool,
+    DropSpool,
     /// A sealed copy waits for a read lease of its bucket key.
     AdmitRead,
     /// A plain copy of an encrypting bucket reads its settings, then waits for a bucket lease.
@@ -1062,9 +1067,9 @@ impl GetObjectOperation {
                     return self.serve_reference_source(served, true);
                 }
                 if comparison == ObservationMatch::Unknown {
-                    // Nothing proves the bytes unchanged. A complete read is checked against the
-                    // recorded digests at its end; without them a pinned version is refused, and
-                    // the current one is served fresh without counting as refreshed.
+                    // Nothing proves the bytes unchanged. The whole bytes are checked against the
+                    // recorded digests before any is served; without digests a pinned version is
+                    // refused, and the current one is served fresh without counting as refreshed.
                     let digests = self
                         .reference_cached
                         .as_ref()
@@ -1075,13 +1080,10 @@ impl GetObjectOperation {
                         ..metadata
                     };
                     let enforced = served.enforced_checksums();
-                    let complete = self.input.range.is_none();
-                    if self.reference_explicit && (enforced.is_empty() || !complete) {
+                    if self.reference_explicit && enforced.is_empty() {
                         return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                     }
-                    if complete {
-                        self.verify_digests = enforced;
-                    }
+                    self.verify_digests = enforced;
                     return self.serve_reference_source(served, false);
                 }
                 // A pinned historical version cannot serve drifted bytes:
@@ -1124,6 +1126,8 @@ impl GetObjectOperation {
             None => None,
         };
         let expected = bound.then(|| metadata.clone());
+        // Verified bytes are read whole and spooled; the range is cut from the spool.
+        let range = range.filter(|_| self.verify_digests.is_empty());
         self.source_metadata = Some(metadata);
         self.state = GetObjectState::ReadReferenceSource;
         smallvec![Effect::StagingSource(StagingSourceEffect::Read {
@@ -1578,10 +1582,14 @@ impl GetObjectOperation {
                 self.advance_observation = None;
                 // `last_refresh` was set by the head handler from the drift check.
                 let digests = head_metadata.digests.clone();
+                let size = metadata.content_length;
                 self.source_metadata = Some(SourceMetadata {
                     digests,
                     ..metadata
                 });
+                if !self.verify_digests.is_empty() {
+                    return self.spool_reference(stream, size);
+                }
                 self.reference_stream = Some(stream);
                 self.finish_reference_output()
             }
@@ -1631,15 +1639,61 @@ impl GetObjectOperation {
         self.emit_error(GetObjectError::ReferenceSourceChanged)
     }
 
+    /// Spools the whole source bytes to a hidden blob, so nothing is served before they match
+    /// the recorded digests. Memory stays bounded; the sweep removes spools left behind.
+    fn spool_reference(
+        &mut self,
+        stream: BackendStream<Result<Bytes, StreamError>>,
+        size: u64,
+    ) -> Effects {
+        self.state = GetObjectState::SpoolReference;
+        smallvec![Effect::Blob(BlobEffect::SpoolHidden {
+            namespace: REFERENCE_SPOOL,
+            name: "reference".to_string(),
+            created_by: self.input.user_identity,
+            max_bytes: Some(size),
+            deadline: None,
+            blob: stream,
+        })]
+    }
+
+    fn handle_reference_spooled(&mut self, event: Event) -> Effects {
+        let Event::Blob(BlobEvent::HiddenSpooled { location, size, .. }) = event else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        let expected = std::mem::take(&mut self.verify_digests);
+        if unmatched_checksum(&expected, &location.hashes).is_some() {
+            let Ok(key) = HiddenBlobKey::try_from(&location) else {
+                return self.emit_error(GetObjectError::ReferenceSourceChanged);
+            };
+            self.state = GetObjectState::DropSpool;
+            return smallvec![Effect::Blob(BlobEffect::DeleteHidden { key })];
+        }
+        let range = self
+            .resolved_range
+            .as_ref()
+            .map_or(0..size, |resolved| resolved.range.clone());
+        self.state = GetObjectState::ReadSpool;
+        smallvec![Effect::Blob(BlobEffect::ReadHiddenRange {
+            location,
+            range
+        })]
+    }
+
+    fn handle_spool_read(&mut self, event: Event) -> Effects {
+        let Event::Blob(BlobEvent::HiddenRead { blob, .. }) = event else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        self.reference_stream = Some(blob);
+        self.finish_reference_output()
+    }
+
     fn finish_reference_output(&mut self) -> Effects {
         let Some(mut blob) = self.reference_stream.take() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
         if let Some(lease) = self.reference_lease.take() {
             blob = leased(blob, lease);
-        }
-        if !self.verify_digests.is_empty() {
-            blob = verified(blob, std::mem::take(&mut self.verify_digests));
         }
         let Some(source_metadata) = self.source_metadata.clone() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
@@ -1717,6 +1771,10 @@ impl Operation for GetObjectOperation {
             GetObjectState::GetBlob => self.handle_received_blob(event),
             GetObjectState::ReadReferenceSource => self.reference_source_received(event),
             GetObjectState::QueueChangedRefresh => self.handle_refresh_queued(event),
+            GetObjectState::SpoolReference => self.handle_reference_spooled(event),
+            GetObjectState::ReadSpool => self.handle_spool_read(event),
+            // A spool that missed the digests is gone; the source changed behind the version.
+            GetObjectState::DropSpool => self.emit_error(GetObjectError::ReferenceSourceChanged),
             GetObjectState::AdmitRead => self.read_admitted(event),
             GetObjectState::ReadContentSettings => self.content_settings_read(event),
             GetObjectState::AdmitPlain => self.plain_admitted(event),

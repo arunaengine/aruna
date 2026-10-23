@@ -19,7 +19,7 @@ use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{ConversionError, StagingSourceError};
 use aruna_core::events::SubOperationEvent;
-use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     CONNECTOR_REFERENCE_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
@@ -1767,20 +1767,49 @@ fn historical_read_fails() {
     );
 }
 
-// An unknown observation is served fresh, but keeps the digests the version recorded, so a
-// copy of the bytes is still checked against them.
-#[test]
-fn unknown_keeps_digests() {
-    let mut operation = drifted_operation();
-    let mut stored = observation(9);
-    stored.digests.insert(
+/// A version observation whose digest is a recorded sha256 of `digest`.
+fn digested(content_length: u64, digest: u8) -> SourceMetadata {
+    let mut metadata = observation(content_length);
+    metadata.digests.insert(
         ChecksumAlgorithm::Sha256,
         SourceDigest {
-            digest: vec![7; 32],
+            digest: vec![digest; 32],
             scope: DigestScope::FullObject,
             origin: DigestOrigin::Manifest,
         },
     );
+    metadata
+}
+
+fn spooled(sha256: u8) -> Event {
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/tmp".to_string(),
+        storage_bucket: "aruna_test".to_string(),
+        backend_path: "_hidden/reference".to_string(),
+        ulid: Ulid::generate(),
+        format: StoredFormat::default(),
+        created_by: Default::default(),
+        created_at: SystemTime::UNIX_EPOCH,
+        staging: false,
+        partial: false,
+        blob_size: 9,
+        hashes: HashMap::from([(HASH_SHA256.to_string(), vec![sha256; 32])]),
+    };
+    Event::Blob(BlobEvent::HiddenSpooled {
+        location,
+        blake3: [0; 32],
+        size: 9,
+    })
+}
+
+// An unknown observation is checked against the version's recorded digests on the whole spooled
+// bytes before anything is served, and the result keeps those digests.
+#[test]
+fn unknown_keeps_digests() {
+    let mut operation = drifted_operation();
+    let stored = digested(9, 7);
     let mut fresh = observation(9);
     fresh.etag = None;
     operation.reference_cached = Some(stored.clone());
@@ -1796,45 +1825,50 @@ fn unknown_keeps_digests() {
             ..
         })]
     ));
-    operation.step(source_read(fresh));
+    assert!(matches!(
+        operation.step(source_read(fresh)).as_slice(),
+        [Effect::Blob(BlobEffect::SpoolHidden { .. })]
+    ));
+    assert!(matches!(
+        operation.step(spooled(7)).as_slice(),
+        [Effect::Blob(BlobEffect::ReadHiddenRange { range, .. })] if *range == (0..9)
+    ));
+    operation.step(Event::Blob(BlobEvent::HiddenRead {
+        blob: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(
+            Bytes::from_static(b"body"),
+        )])),
+        stream_size: 9,
+    }));
 
     let result = operation.finalize().unwrap();
     assert_eq!(result.source_metadata.unwrap().digests, stored.digests);
     assert_eq!(result.last_refresh, None);
 }
 
-// A pinned version without validators is served only as a complete read checked against its
-// recorded digests; bytes that miss them fail the stream at its end.
-#[tokio::test]
-async fn pinned_unknown_verified() {
-    use futures_util::StreamExt;
+// Bytes that miss the recorded digests are never served: the spool is dropped and the read fails.
+#[test]
+fn pinned_unknown_verified() {
     let mut operation = drifted_operation();
-    let mut stored = observation(9);
+    let mut stored = digested(9, 7);
     stored.etag = None;
-    stored.digests.insert(
-        ChecksumAlgorithm::Sha256,
-        SourceDigest {
-            digest: vec![7; 32],
-            scope: DigestScope::FullObject,
-            origin: DigestOrigin::Manifest,
-        },
-    );
     operation.reference_cached = Some(stored);
     operation.reference_explicit = true;
     operation.state = GetObjectState::HeadReferenceSource;
 
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
         metadata: observation(9),
     }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
-    ));
     operation.step(source_read(observation(9)));
+    assert!(matches!(
+        operation.step(spooled(8)).as_slice(),
+        [Effect::Blob(BlobEffect::DeleteHidden { .. })]
+    ));
+    operation.step(Event::Blob(BlobEvent::HiddenDeleted));
 
-    let result = operation.finalize().unwrap();
-    let items: Vec<_> = result.blob.collect().await;
-    assert!(items.last().is_some_and(Result::is_err));
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::ReferenceSourceChanged)
+    );
 }
 
 // A bound read whose condition fails queues a request to observe the source, which the refresh
