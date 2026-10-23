@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use crate::routes::routes_at;
 use aruna_core::compute::{
-    has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
+    directory_pattern, has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId, JobPayload,
@@ -173,7 +173,7 @@ pub struct TesOutput {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Destination URL; a directory prefix when `path` contains wildcards.
+    /// Destination URL; a directory prefix when `path` contains wildcards or names a `DIRECTORY`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Absolute container path, optionally with POSIX (IEEE Std 1003.1-2017,
@@ -577,8 +577,8 @@ naming a different one; a bearer token requires that tag.
 - An output path with POSIX wildcards additionally requires `path_prefix`, the literal ancestor
   stripped from each match before it is appended to the destination url. Such outputs may share
   one url. A pattern that matches a directory captures every file below it, and a staged input it
-  matches is never captured.
-- Unsupported: directory entries, inline input content, wildcards in an input path, volumes,
+  matches is never captured. A `DIRECTORY` output captures every file below its path under its url.
+- Unsupported: directory inputs, inline input content, wildcards in an input path, volumes,
   executor stdin/stdout/stderr redirection and resource zones."#,
     request_body(
         content = TesTask,
@@ -1483,18 +1483,21 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
 }
 
 fn map_output(output: &TesOutput) -> Result<OutputSelection, TesError> {
-    if output.kind != TesFileType::File {
-        return Err(TesError::bad_request("directory outputs are not supported"));
-    }
     validate_path(&output.path, "output path", false)?;
-    let path_prefix = output_prefix(output)?;
+    let mut path_prefix = output_prefix(output)?;
+    let mut container_path = output.path.clone();
+    // A literal directory is captured as every file below it, keyed under its url.
+    if output.kind == TesFileType::Directory && path_prefix.is_none() {
+        container_path = directory_pattern(&output.path);
+        path_prefix = Some(output.path.clone());
+    }
     let url = output
         .url
         .as_deref()
         .ok_or_else(|| TesError::bad_request("output url is required"))?;
     let (bucket, key) = parse_s3_url(url, "output")?;
     Ok(OutputSelection {
-        container_path: output.path.clone(),
+        container_path,
         path_prefix,
         destination_node_id: None,
         destination: OutputDestination::S3 { bucket, key },

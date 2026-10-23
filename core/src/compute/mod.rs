@@ -746,6 +746,11 @@ pub fn output_glob(pattern: &str) -> Result<GlobMatcher, String> {
     Ok(build_glob(pattern)?.compile_matcher())
 }
 
+/// The pattern that selects every file below the literal directory `path`.
+pub fn directory_pattern(path: &str) -> String {
+    format!("{}/*", globset::escape(path))
+}
+
 /// Deepest wildcard-free ancestor of a pattern, which is the directory a backend
 /// enumerates. A wildcard-free path yields itself.
 pub fn literal_prefix(pattern: &str) -> Result<PathBuf, String> {
@@ -1212,5 +1217,15 @@ mod tests {
         assert!(matcher.is_match("/work/multiqc_data/plots/a.txt"));
         assert!(!matcher.is_match("/work/multiqc_report.html"));
         assert!(!matcher.is_match("/other/multiqc_data/multiqc.log"));
+    }
+
+    #[test]
+    fn selects_directory_files() {
+        // A directory name keeps its glob characters literal.
+        let matcher = OutputMatcher::new([directory_pattern("/out/a{b,c}").as_str()]).unwrap();
+        assert!(matcher.is_match("/out/a{b,c}/report.txt"));
+        assert!(matcher.is_match("/out/a{b,c}/deep/plot.txt"));
+        assert!(!matcher.is_match("/out/ab/report.txt"));
+        assert!(!matcher.is_match("/out/a{b,c}"));
     }
 }

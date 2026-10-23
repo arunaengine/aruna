@@ -619,9 +619,6 @@ fn rejects_unsupported_fields() {
     task.inputs[0].kind = TesFileType::Directory;
     assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
     task.inputs[0].kind = TesFileType::File;
-    task.outputs[0].kind = TesFileType::Directory;
-    assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
-    task.outputs[0].kind = TesFileType::File;
     task.executors[0].stdout = Some("/logs/out".to_string());
     assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
     task.executors[0].stdout = None;
@@ -646,6 +643,30 @@ fn maps_wildcard_output() {
     let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
 
     assert_eq!(spec.file_outputs[0].container_path, "/out/*.txt");
+    assert_eq!(spec.file_outputs[0].path_prefix.as_deref(), Some("/out"));
+}
+
+#[test]
+fn maps_directory_output() {
+    // Nextflow sends `type: 'dir'` outputs as DIRECTORY with the directory url.
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    task.outputs[0].kind = TesFileType::Directory;
+    task.outputs[0].path = "/out/results".to_string();
+    task.outputs[0].url = Some("s3://dest/work/results".to_string());
+
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
+
+    assert_eq!(spec.file_outputs[0].container_path, "/out/results/*");
+    assert_eq!(
+        spec.file_outputs[0].path_prefix.as_deref(),
+        Some("/out/results")
+    );
+
+    // A pattern keeps its own prefix and already captures the directories it matches.
+    task.outputs[0].path = "/out/res_*".to_string();
+    task.outputs[0].path_prefix = Some("/out".to_string());
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
+    assert_eq!(spec.file_outputs[0].container_path, "/out/res_*");
     assert_eq!(spec.file_outputs[0].path_prefix.as_deref(), Some("/out"));
 }
 
