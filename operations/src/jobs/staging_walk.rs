@@ -630,7 +630,7 @@ fn join_target_prefix(prefix: &str, relative: &str) -> String {
     }
 }
 
-fn source_permission_path(spec: &StagingJobSpec, source_path: &str) -> String {
+pub(super) fn source_permission_path(spec: &StagingJobSpec, source_path: &str) -> String {
     let root = format!(
         "/{}/g/{}/data/{}/_sources/{}",
         spec.auth_context.realm_id, spec.group_id, spec.node_id, spec.connector_id

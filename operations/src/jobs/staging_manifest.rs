@@ -15,10 +15,14 @@ use byteview::ByteView;
 use futures_util::TryStreamExt;
 
 use super::executor::JobContext;
-use super::staging_walk::{PageFailure, canonical_walker_path, commit_rows, record_failure};
+use super::staging_walk::{
+    PageFailure, canonical_walker_path, commit_rows, record_failure, source_permission_path,
+};
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::read_source::{ReadSourceInput, ReadSourceOperation};
+use aruna_core::structs::identity::auth::Permission;
 
 /// Manifest bytes one chunk reads; a manifest line must fit into one chunk.
 const MANIFEST_CHUNK: u64 = 256 * 1024;
@@ -37,6 +41,22 @@ pub(super) async fn read_manifest_chunk(
     };
     let mut next = checkpoint.clone();
     next.manifest = None;
+    // Every chunk, a resumed one too, reads only what the submitter may read at this exact path.
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: spec.auth_context.clone(),
+            path: source_permission_path(spec, &manifest.source_path),
+            required_permission: Permission::READ,
+        }),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| PageFailure::Retry(error.to_string()))?;
+    if !allowed {
+        let message = "checksum manifest read denied".to_string();
+        record_failure(&mut next, &manifest.source_path, "", message);
+        return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
+    }
     let observation = match manifest.observation.clone() {
         Some(observation) => observation,
         None => match drive(
@@ -187,4 +207,125 @@ fn manifest_key(job_id: JobId, source_path: &str) -> Key {
     let mut key = job_id.to_bytes().to_vec();
     key.extend_from_slice(source_path.as_bytes());
     ByteView::from(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::DriverContext;
+    use crate::jobs::executor::ProgressReporter;
+    use aruna_core::structs::execution::job::{
+        JobClaim, JobPayload, JobProgress, JobRecord, StagingJobPhase, StagingJobPrefix,
+    };
+    use aruna_core::structs::execution::staging::StagingStrategy;
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    use ulid::Ulid;
+
+    fn spec() -> StagingJobSpec {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        StagingJobSpec {
+            auth_context: AuthContext {
+                user_id: aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm_id),
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            group_id: Ulid::from_bytes([3; 16]),
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            connector_id: Ulid::from_bytes([5; 16]),
+            bucket: "bucket".to_string(),
+            strategy: StagingStrategy::Reference,
+            items: Vec::new(),
+            prefixes: vec![StagingJobPrefix {
+                source_prefix: "data".to_string(),
+                target_prefix: String::new(),
+            }],
+            checksum_manifest: Some("MD5SUMS".to_string()),
+        }
+    }
+
+    fn checkpoint() -> StagingJobCheckpoint {
+        StagingJobCheckpoint {
+            phase: StagingJobPhase::Discovering,
+            flat: Some(true),
+            items_done: 0,
+            prefixes_done: 1,
+            walk: None,
+            manifest: Some(ManifestRead {
+                source_path: "data/MD5SUMS".to_string(),
+                offset: 4096,
+                observation: None,
+            }),
+            queue_head: 0,
+            queue_tail: 0,
+            items_current: 0,
+            items_succeeded: 0,
+            items_failed: 0,
+            items_total: None,
+            bytes_current: 0,
+            bytes_total: None,
+            bytes_discovered: 0,
+            current_path: None,
+            errors: Vec::new(),
+        }
+    }
+
+    // A resumed manifest read is authorized again on its own path before anything is read.
+    #[tokio::test]
+    async fn manifest_read_authorized() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            aruna_storage::storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let claim_token = Ulid::from_bytes([6; 16]);
+        let job_id = JobId::from_bytes([7; 16]);
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::Staging(spec()),
+            Default::default(),
+            node_id,
+            1,
+            1,
+            None,
+        );
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id,
+            claim_token,
+            lease_expires_ms: u64::MAX,
+        });
+        crate::jobs::store::insert_job(&storage_handle, &record)
+            .await
+            .unwrap();
+        let ctx = JobContext {
+            driver: Arc::new(DriverContext {
+                storage_handle,
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            }),
+            job_id,
+            owner_node_id: node_id,
+            claim_token,
+            final_attempt: false,
+            cancel: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
+            progress: ProgressReporter::from_progress(&JobProgress::new("items")),
+        };
+        let mut checkpoint = checkpoint();
+
+        assert!(
+            read_manifest_chunk(&ctx, &spec(), &mut checkpoint)
+                .await
+                .is_ok()
+        );
+
+        assert_eq!(checkpoint.manifest, None);
+        assert_eq!(checkpoint.items_failed, 1);
+        assert_eq!(checkpoint.errors[0].error, "checksum manifest read denied");
+    }
 }
