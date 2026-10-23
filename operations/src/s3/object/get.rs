@@ -1059,7 +1059,17 @@ impl GetObjectOperation {
                     if self.reference_explicit {
                         return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                     }
-                    return self.serve_reference_source(metadata, false);
+                    // The version's recorded digests still bind whoever keeps these bytes.
+                    let digests = self
+                        .reference_cached
+                        .as_ref()
+                        .map(|stored| stored.digests.clone())
+                        .unwrap_or_default();
+                    let served = SourceMetadata {
+                        digests,
+                        ..metadata
+                    };
+                    return self.serve_reference_source(served, false);
                 }
                 // A pinned historical version cannot serve drifted bytes:
                 // its bytes were never cached (#375 deferred).
@@ -1553,7 +1563,11 @@ impl GetObjectOperation {
                 }
                 self.advance_observation = None;
                 // `last_refresh` was set by the head handler from the drift check.
-                self.source_metadata = Some(metadata);
+                let digests = head_metadata.digests.clone();
+                self.source_metadata = Some(SourceMetadata {
+                    digests,
+                    ..metadata
+                });
                 self.reference_stream = Some(stream);
                 self.finish_reference_output()
             }

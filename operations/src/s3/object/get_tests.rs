@@ -26,8 +26,10 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::checksum::{HASH_MD5, HASH_SHA256};
-use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_MD5, HASH_SHA256};
+use aruna_core::structs::execution::source_access::{
+    DigestOrigin, DigestScope, ResolvedSourceAccess, SourceDigest, SourceMetadata,
+};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
@@ -1763,6 +1765,42 @@ fn historical_read_fails() {
         operation.finalize(),
         Err(GetObjectError::HistoricalReferenceUnavailable)
     );
+}
+
+// An unknown observation is served fresh, but keeps the digests the version recorded, so a
+// copy of the bytes is still checked against them.
+#[test]
+fn unknown_keeps_digests() {
+    let mut operation = drifted_operation();
+    let mut stored = observation(9);
+    stored.digests.insert(
+        ChecksumAlgorithm::Sha256,
+        SourceDigest {
+            digest: vec![7; 32],
+            scope: DigestScope::FullObject,
+            origin: DigestOrigin::Manifest,
+        },
+    );
+    let mut fresh = observation(9);
+    fresh.etag = None;
+    operation.reference_cached = Some(stored.clone());
+    operation.state = GetObjectState::HeadReferenceSource;
+
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: fresh.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read {
+            expected: None,
+            ..
+        })]
+    ));
+    operation.step(source_read(fresh));
+
+    let result = operation.finalize().unwrap();
+    assert_eq!(result.source_metadata.unwrap().digests, stored.digests);
+    assert_eq!(result.last_refresh, None);
 }
 
 // A matching read is served, and the stale promise is cleared with it.
