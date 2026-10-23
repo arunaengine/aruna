@@ -384,19 +384,24 @@ async fn list_operator(
         && let Some(entry) = probe_lower(operator, path, lower, request).await?
     {
         entries.push(entry);
+        // The probe takes one entry of the page budget.
+        if limit == 1 {
+            return Ok((entries, Some(ListCursor::After(lower.to_string()))));
+        }
     }
     let mut lister = operator
         .lister_with(path)
         .recursive(request.recursive)
-        .limit(limit);
+        .limit(limit - entries.len());
     if let Some(floor) = floor.as_deref() {
         lister = lister.start_after(floor);
     }
     let mut lister = lister.await.map_err(list_error)?;
     let mut highest = floor.clone();
+    let budget = limit - entries.len();
     let mut consumed = 0usize;
-    // A provider page holds `limit` entries, so stopping there never fetches a lookahead page.
-    while consumed < limit {
+    // A provider page holds `budget` entries, so stopping there never fetches a lookahead page.
+    while consumed < budget {
         let Some(entry) = lister.try_next().await.map_err(list_error)? else {
             return Ok((entries, None));
         };

@@ -809,6 +809,11 @@ struct ListingServer {
 
 impl ListingServer {
     async fn bind(keys: &'static [&'static str]) -> Self {
+        Self::bind_with(keys, false).await
+    }
+
+    /// `short` answers one entry less than asked for on every truncated page.
+    async fn bind_with(keys: &'static [&'static str], short: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let lists = Arc::new(AtomicUsize::new(0));
@@ -837,7 +842,7 @@ impl ListingServer {
                     }
                 } else {
                     counted.fetch_add(1, Ordering::SeqCst);
-                    let body = list_body(keys, &url);
+                    let body = list_body(keys, &url, short);
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -878,7 +883,7 @@ fn key_etag(key: &str) -> String {
     format!("{:x}", md5::compute(key))
 }
 
-fn list_body(keys: &[&str], url: &reqwest::Url) -> String {
+fn list_body(keys: &[&str], url: &reqwest::Url, short: bool) -> String {
     let query = |name: &str| {
         url.query_pairs()
             .find(|(key, _)| key == name)
@@ -886,21 +891,42 @@ fn list_body(keys: &[&str], url: &reqwest::Url) -> String {
             .unwrap_or_default()
     };
     let (prefix, after) = (query("prefix"), query("start-after"));
-    let token = query("continuation-token");
+    let (token, delimiter) = (query("continuation-token"), query("delimiter"));
     let max_keys = query("max-keys").parse::<usize>().unwrap_or(1000);
     let floor = after.max(token);
-    let mut matched = keys
-        .iter()
-        .filter(|key| key.starts_with(&prefix) && **key > floor.as_str());
-    let page: Vec<&&str> = matched.by_ref().take(max_keys).collect();
-    let truncated = matched.next().is_some();
+    // Keys below a delimiter roll up into one common prefix, as S3 does.
+    let mut items: Vec<(String, bool)> = Vec::new();
+    for key in keys.iter().filter(|key| key.starts_with(&prefix)) {
+        let rest = &key[prefix.len()..];
+        let item = match rest
+            .find(delimiter.as_str())
+            .filter(|_| !delimiter.is_empty())
+        {
+            Some(end) => (format!("{prefix}{}", &rest[..=end]), true),
+            None => (key.to_string(), false),
+        };
+        if item.0 > floor && items.last() != Some(&item) {
+            items.push(item);
+        }
+    }
+    let size = match (items.len() > max_keys, short) {
+        (true, true) => max_keys - 1,
+        _ => max_keys.min(items.len()),
+    };
+    let page = &items[..size];
+    let truncated = size < items.len();
     let mut body = format!("<ListBucketResult><IsTruncated>{truncated}</IsTruncated>");
-    if truncated && let Some(last) = page.last() {
+    if truncated && let Some((last, _)) = page.last() {
         body.push_str(&format!(
             "<NextContinuationToken>{last}</NextContinuationToken>"
         ));
     }
-    for key in page {
+    for (item, _) in page.iter().filter(|(_, rolled)| *rolled) {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{item}</Prefix></CommonPrefixes>"
+        ));
+    }
+    for (key, _) in page.iter().filter(|(_, rolled)| !*rolled) {
         body.push_str(&format!(
             "<Contents><Key>{key}</Key><LastModified>2026-01-02T03:04:05.678Z</LastModified>\
              <ETag>&quot;{}&quot;</ETag><Size>3</Size></Contents>",
@@ -909,6 +935,38 @@ fn list_body(keys: &[&str], url: &reqwest::Url) -> String {
     }
     body.push_str("</ListBucketResult>");
     body
+}
+
+/// Every page of a listing, as entry paths.
+async fn all_pages(operator: &Operator, path: &str, mut request: ListRequest) -> Vec<Vec<String>> {
+    let mut pages = Vec::new();
+    loop {
+        let (entries, cursor) = list_operator(operator, path, &request).await.unwrap();
+        pages.push(entries.into_iter().map(|entry| entry.path).collect());
+        match cursor {
+            Some(cursor) => request.cursor = Some(cursor),
+            None => return pages,
+        }
+    }
+}
+
+// The probed lower key takes one entry of the page, so a page never exceeds its limit.
+#[tokio::test]
+async fn probe_counts_once() {
+    let server = ListingServer::bind(LISTED_KEYS).await;
+    let lower = ListRequest {
+        lower: Some("a/2".to_string()),
+        ..list_request(2, true, true)
+    };
+
+    let pages = all_pages(&server.operator(), "a/", lower.clone()).await;
+    assert_eq!(pages, [vec!["a/2", "a/3"], vec!["a/4", "a/5"], vec![]]);
+    let (entries, cursor) =
+        list_operator(&server.operator(), "a/", &ListRequest { limit: 1, ..lower })
+            .await
+            .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(cursor, Some(ListCursor::After("a/2".to_string())));
 }
 
 const LISTED_KEYS: &[&str] = &["a/1", "a/2", "a/3", "a/4", "a/5", "b/1"];
