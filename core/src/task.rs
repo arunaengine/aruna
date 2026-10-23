@@ -84,6 +84,8 @@ pub enum TaskKey {
     PublishRegistration,
     /// Starts the backend imports whose schedule is due; re-armed to the next due time.
     RunBackendImports,
+    /// Prunes stale connector reference rows queued by a bounded dependency check.
+    PruneConnectorReferences,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
