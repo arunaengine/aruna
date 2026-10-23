@@ -26,6 +26,10 @@ struct Fake {
     objects: BTreeMap<String, Stored>,
     uploads: BTreeMap<String, BTreeMap<u16, Bytes>>,
     next: u64,
+    /// A foreign write that lands at its key just before the next delete of that key.
+    before_delete: Option<(String, Stored)>,
+    /// Refuses deletes with a condition, as a storage without conditional deletes does.
+    plain_deletes: bool,
 }
 
 type Shared = Arc<Mutex<Fake>>;
@@ -242,6 +246,12 @@ async fn serve(
             answer(StatusCode::NO_CONTENT, &[], "")
         }
         (Method::DELETE, None) => {
+            if let Some((_, foreign)) = fake.before_delete.take_if(|(at, _)| *at == key) {
+                fake.objects.insert(key.clone(), foreign);
+            }
+            if fake.plain_deletes && header("if-match").is_some() {
+                return refuse(StatusCode::NOT_IMPLEMENTED, "NotImplemented");
+            }
             let found = fake.objects.get(&key).map(|found| found.etag.clone());
             if let (Some(etag), Some(wanted)) = (found, header("if-match"))
                 && unquoted(wanted) != etag
@@ -418,6 +428,33 @@ async fn unpinned_copy_streams() {
     let plain = exact("raw/a.bin", Ulid::generate());
     let copied = handler.copy_plain(resolved, plain, old, None).await;
     assert!(matches!(copied, BlobEvent::Error(_)), "{copied:?}");
+}
+
+#[tokio::test]
+async fn unreserve_keeps_replacement() {
+    // A write that replaced the reservation after it was looked at survives its removal.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let old = source(&handler, &resolved, b"renamed bytes").await;
+    let foreign = stored(b"foreign", &[]);
+    fake.lock().unwrap().before_delete = Some(("tenant/raw/a.bin".to_string(), foreign));
+    let stale = Some("0123456789abcdef0123456789abcdef".to_string());
+    let plain = exact("raw/a.bin", Ulid::generate());
+    let copied = handler.copy_plain(resolved, plain, old, stale);
+    assert!(matches!(copied.await, BlobEvent::Error(_)));
+    assert_eq!(body(&fake, "tenant/raw/a.bin").unwrap(), &b"foreign"[..]);
+}
+
+#[tokio::test]
+async fn unreserve_needs_condition() {
+    // Without a conditional delete the reservation stays rather than risk another write.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let old = source(&handler, &resolved, b"renamed bytes").await;
+    fake.lock().unwrap().plain_deletes = true;
+    let stale = Some("0123456789abcdef0123456789abcdef".to_string());
+    let plain = exact("raw/a.bin", Ulid::generate());
+    let copied = handler.copy_plain(resolved, plain, old, stale);
+    assert!(matches!(copied.await, BlobEvent::Error(_)));
+    assert!(body(&fake, "tenant/raw/a.bin").unwrap().is_empty());
 }
 
 /// Opens a provider upload at the tenant path `path` and writes one part.

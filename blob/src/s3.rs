@@ -383,47 +383,31 @@ impl NativeMultipart {
         }))
     }
 
-    /// Removes the empty reservation of `version` at `path`, never anything else: exactly its
-    /// object version where the storage keeps versions, else only while its ETag matches where
-    /// the storage checks that.
+    /// Removes the empty reservation of `version` at `path` and never anything else: exactly
+    /// its object version where the storage keeps versions, else only with its ETag as the
+    /// delete's condition. Where neither holds, the reservation stays.
     pub async fn unreserve(&self, path: &str, version: &str) -> Result<(), BlobError> {
         let found = self.reservation(path).await?;
         let Some(found) = found.filter(|found| found.version == version) else {
             return Ok(());
         };
-        let delete = || {
-            self.client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(self.key(path))
-        };
-        let request = match found.object_version {
-            Some(id) => delete().version_id(id),
-            None => delete().set_if_match(found.etag),
+        let delete = self.client.delete_object().bucket(&self.bucket);
+        let delete = delete.key(self.key(path));
+        let request = match (found.object_version, found.etag) {
+            (Some(id), _) => delete.version_id(id),
+            (None, Some(etag)) => delete.if_match(etag),
+            (None, None) => return Ok(()),
         };
         let error = match request.send().boxed().await {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
         match status(&error) {
-            // Other bytes, or none, are at the path now; they stay.
-            Some(412 | 404) => Ok(()),
-            Some(501) => self.delete_unchecked(path).await,
-            _ if error.code() == Some("NotImplemented") => self.delete_unchecked(path).await,
+            // Other bytes, or none, are at the path now; they stay. So does a reservation the
+            // storage cannot delete by its ETag alone.
+            Some(412 | 404 | 501) => Ok(()),
+            _ if error.code() == Some("NotImplemented") => Ok(()),
             _ => Err(BlobError::DeleteError(format!(
-                "delete reservation: {}",
-                DisplayErrorContext(&error)
-            ))),
-        }
-    }
-
-    /// Deletes the reservation at `path` without a condition, on a storage that has none for
-    /// deletes; a write between the check before and this delete is the remaining risk.
-    async fn delete_unchecked(&self, path: &str) -> Result<(), BlobError> {
-        let delete = self.client.delete_object().bucket(&self.bucket);
-        match delete.key(self.key(path)).send().boxed().await {
-            Ok(_) => Ok(()),
-            Err(error) => Err(BlobError::DeleteError(format!(
                 "delete reservation: {}",
                 DisplayErrorContext(&error)
             ))),
