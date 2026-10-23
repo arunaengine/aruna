@@ -3386,6 +3386,14 @@ fn delete_marker_trace() {
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"obligation".to_vec().into(),
     }));
+    // The marker moves no group counter, but its bucket counts the new marker row.
+    assert_eq!(op.state, IncomingVersionState::UpdateUsage);
+    op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
+    op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
     assert_eq!(op.state, IncomingVersionState::CommitTransaction);
 
     op.step(Event::Storage(StorageEvent::TransactionCommitted {

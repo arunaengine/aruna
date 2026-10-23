@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::UsageCounterUpdate;
+use crate::node::usage_stats::{RowChange, UsageCounterUpdate};
 use crate::replication::bao_read::BaoReadError;
 use crate::replication::protocol::{BaoReadRefusal, ReferenceAdvance};
 use crate::replication::queue::LiveObligationRecord;
@@ -1685,7 +1685,7 @@ fn successor_charges_size() {
             ..Default::default()
         },
     )
-    .in_bucket(&operation.input.bucket);
+    .in_bucket(&operation.input.bucket, RowChange::AddedVersion);
     let _ = expected.start(txn_id);
     assert_eq!(operation.usage_update, Some(expected));
 }

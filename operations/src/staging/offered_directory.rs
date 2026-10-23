@@ -5,7 +5,7 @@
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
@@ -528,7 +528,7 @@ async fn observe(
             ..Default::default()
         },
     )
-    .in_bucket(&input.bucket);
+    .in_bucket(&input.bucket, RowChange::AddedVersion);
     if !usage.is_noop() {
         run_usage_update(context, txn_id, &mut usage).await?;
     }
@@ -669,7 +669,7 @@ async fn tombstone(
             ..Default::default()
         },
     )
-    .in_bucket(&scope.bucket);
+    .in_bucket(&scope.bucket, RowChange::AddedMarker);
     if !usage.is_noop() {
         run_usage_update(context, txn_id, &mut usage).await?;
     }

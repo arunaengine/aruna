@@ -4,7 +4,7 @@
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::store::iter_prefix_page;
-use crate::node::usage_stats::{QuotaGate, UsageCounterUpdate};
+use crate::node::usage_stats::{QuotaGate, RowChange, UsageCounterUpdate};
 use crate::realm::get_config::GetConfigOperation;
 use crate::s3::object::put::abe::{abe_reads, envelope_rows, parse_abe};
 use aruna_core::NodeId;
@@ -225,7 +225,7 @@ impl CopyEnvelopeOperation {
                     ..Default::default()
                 };
                 let usage = UsageCounterUpdate::for_group(group, delta);
-                self.usage = Some(usage.in_bucket(&self.version.bucket));
+                self.usage = Some(usage.in_bucket(&self.version.bucket, RowChange::Kept));
                 let ceiling = self.quota.as_ref().and_then(|(quota, realm, node)| {
                     let ceiling = quota.effective_group_ceiling(&group)?;
                     Some((ceiling, *realm, *node))

@@ -1020,7 +1020,7 @@ mod test {
     use aruna_core::structs::storage::blob::{BlobVersion, CurrentVersionPointer};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ArunaArn;
-    use aruna_core::structs::storage::usage::UsageCounters;
+    use aruna_core::structs::storage::usage::BucketCounters;
     use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot, sync_relationship_key};
     use aruna_storage::storage;
     use std::time::SystemTime;
@@ -1071,8 +1071,8 @@ mod test {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = counter().await else {
             panic!("missing read result");
         };
-        let row = UsageCounters::from_bytes(&value.expect("the bucket counter row")).unwrap();
-        assert_eq!(row, UsageCounters::default());
+        let row = BucketCounters::from_bytes(&value.expect("the bucket counter row")).unwrap();
+        assert_eq!(row, BucketCounters::default());
 
         drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
             .await

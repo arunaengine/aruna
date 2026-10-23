@@ -11,7 +11,7 @@ use crate::blob::records::{
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::load_group_inputs;
 use crate::node::usage_stats::{
-    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
+    QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
 use crate::placement::policy::{
@@ -348,6 +348,8 @@ pub struct IncomingVersionOperation {
     usage_update: Option<UsageCounterUpdate>,
     existing_blob_location: Option<BackendLocation>,
     replaced_version: Option<BlobVersion>,
+    /// The destination already held a row of this version id, which the write replaces.
+    version_existed: bool,
     advance_version_exists: bool,
     received_blob: Option<ReceivedBlob>,
     existing_current_pointer: Option<CurrentVersionPointer>,
@@ -420,6 +422,7 @@ impl IncomingVersionOperation {
             usage_update: None,
             existing_blob_location: None,
             replaced_version: None,
+            version_existed: false,
             advance_version_exists: false,
             received_blob: None,
             existing_current_pointer: None,
@@ -2155,9 +2158,15 @@ impl IncomingVersionOperation {
             Ok(delta) => delta,
             Err(error) => return self.fail(error),
         };
-        if self.manifest.kind == ReplicationItemKind::DeleteMarker {
+        let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
+        let row = match (self.version_existed, marker) {
+            (true, _) => RowChange::Kept,
+            (false, true) => RowChange::AddedMarker,
+            (false, false) => RowChange::AddedVersion,
+        };
+        if marker {
             let update = UsageCounterUpdate::for_group(group_id, group_delta)
-                .in_bucket(&self.manifest.bucket);
+                .in_bucket(&self.manifest.bucket, row);
             if update.is_noop() {
                 return self.commit_or_cleanup();
             }
@@ -2166,7 +2175,7 @@ impl IncomingVersionOperation {
         }
         if self.is_reference_item() {
             let update = UsageCounterUpdate::for_group(group_id, group_delta)
-                .in_bucket(&self.manifest.bucket);
+                .in_bucket(&self.manifest.bucket, row);
             if self.manifest.reference_advance.is_some() && update.is_noop() {
                 return self.commit_or_cleanup();
             }
@@ -2183,7 +2192,7 @@ impl IncomingVersionOperation {
                 None => return self.fail(IncomingVersionError::MissingBlobInfo),
             },
         };
-        self.usage_update = Some(update.in_bucket(&self.manifest.bucket));
+        self.usage_update = Some(update.in_bucket(&self.manifest.bucket, row));
         let Some(txn_id) = self.txn_id else {
             return self.fail(IncomingVersionError::StorageError(
                 StorageError::TransactionNotFound,
@@ -2568,6 +2577,7 @@ impl IncomingVersionOperation {
             kind = ?self.manifest.kind,
             "Loaded existing destination version metadata"
         );
+        self.version_existed = value.is_some();
 
         if let Some(value) = value {
             let existing = match BlobVersion::from_bytes(value.as_ref()) {

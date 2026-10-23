@@ -22,12 +22,13 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::usage::{
-    DIRTY_GLOBAL_KEY, DIRTY_PREFIX, GLOBAL_SHARD_COUNT, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
-    SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX,
-    UsageCounterError, UsageCounters, UsageDelta, dirty_group_id, dirty_group_key,
-    global_group_key, global_shard_index, global_shard_key, global_shard_keys, shard_for_archive,
-    shard_for_hash, usage_backend_key, usage_bucket_key, usage_global_key, usage_group_id,
-    usage_group_key, usage_group_prefix, usage_node_id, usage_snapshot_key, usage_summary_key,
+    BucketCounters, BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, GLOBAL_SHARD_COUNT,
+    NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY,
+    USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX, UsageCounterError, UsageCounters, UsageDelta,
+    dirty_group_id, dirty_group_key, global_group_key, global_shard_index, global_shard_key,
+    global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key, usage_bucket_key,
+    usage_global_key, usage_group_id, usage_group_key, usage_group_prefix, usage_node_id,
+    usage_snapshot_key, usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -65,8 +66,38 @@ enum UsageUpdatePhase {
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageCounterUpdate {
     entries: Vec<(Vec<u8>, UsageDelta)>,
+    /// The row of the bucket the change concerns, if it concerns one.
+    bucket: Option<(Vec<u8>, BucketDelta)>,
     dirty_group: Option<GroupId>,
     phase: UsageUpdatePhase,
+}
+
+/// What a write does to the version rows of its bucket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowChange {
+    /// No row is added or removed, as when a row is replaced in place.
+    Kept,
+    AddedVersion,
+    AddedMarker,
+    RemovedVersion,
+    RemovedMarker,
+}
+
+impl RowChange {
+    fn delta(self) -> BucketDelta {
+        let (versions, delete_markers) = match self {
+            Self::Kept => (0, 0),
+            Self::AddedVersion => (1, 0),
+            Self::AddedMarker => (0, 1),
+            Self::RemovedVersion => (-1, 0),
+            Self::RemovedMarker => (0, -1),
+        };
+        BucketDelta {
+            versions,
+            delete_markers,
+            ..Default::default()
+        }
+    }
 }
 
 /// One physical copy's contribution to the stored counters, booked against one shard.
@@ -156,6 +187,7 @@ impl UsageCounterUpdate {
                 (global_group_key(group_id), delta),
                 (usage_group_key(group_id), delta),
             ],
+            bucket: None,
             dirty_group: Some(group_id),
             phase: UsageUpdatePhase::Pending,
         }
@@ -174,24 +206,22 @@ impl UsageCounterUpdate {
         }
         Self {
             entries,
+            bucket: None,
             dirty_group: Some(group_id),
             phase: UsageUpdatePhase::Pending,
         }
     }
 
-    /// Also books the group delta, without its bucket count, on the row of `bucket`.
-    pub fn in_bucket(mut self, bucket: &str) -> Self {
+    /// Also books the group delta and the version `row` change on the row of `bucket`.
+    pub fn in_bucket(mut self, bucket: &str, row: RowChange) -> Self {
         let group = self.dirty_group.map(usage_group_key);
         let delta = self
             .entries
             .iter()
             .find(|(key, _)| Some(key) == group.as_ref());
         if let Some(&(_, delta)) = delta {
-            let delta = UsageDelta {
-                buckets: 0,
-                ..delta
-            };
-            merge_entry(&mut self.entries, usage_bucket_key(bucket), delta);
+            let delta = BucketDelta::from(delta).merge(row.delta());
+            self.bucket = Some((usage_bucket_key(bucket), delta));
         }
         self
     }
@@ -200,6 +230,7 @@ impl UsageCounterUpdate {
     pub fn for_stored(stored: StoredDelta) -> Self {
         Self {
             entries: stored.entries(),
+            bucket: None,
             dirty_group: None,
             phase: UsageUpdatePhase::Pending,
         }
@@ -226,7 +257,9 @@ impl UsageCounterUpdate {
     }
 
     pub fn is_noop(&self) -> bool {
+        let bucket = self.bucket.as_ref().map(|(_, delta)| *delta);
         self.entries.iter().all(|(_, delta)| delta.is_zero())
+            && bucket.is_none_or(|delta| delta == BucketDelta::default())
     }
 
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
@@ -236,6 +269,9 @@ impl UsageCounterUpdate {
             deltas: self
                 .entries
                 .iter()
+                .map(|(key, delta)| (key.clone().into(), *delta))
+                .collect(),
+            buckets: (self.bucket.iter())
                 .map(|(key, delta)| (key.clone().into(), *delta))
                 .collect(),
             txn_id,
@@ -660,7 +696,7 @@ pub struct RebuildStatsOperation {
     backend_shards: HashMap<Vec<u8>, UsageCounters>,
     groups: HashMap<GroupId, UsageCounters>,
     /// Rows of each bucket, an empty bucket included.
-    bucket_rows: HashMap<String, UsageCounters>,
+    bucket_rows: HashMap<String, BucketCounters>,
     existing_counter_keys: Vec<Vec<u8>>,
     stale_counter_deletes: Vec<(String, Key)>,
     /// Materialized versions whose blob location row is gone; their bytes
@@ -753,7 +789,13 @@ impl RebuildStatsOperation {
         self.group_entry(group_id).add(delta)?;
         self.global_shard_entry(group_id).add(delta)?;
         if let Some(row) = self.bucket_rows.get_mut(bucket) {
-            row.add(delta)?;
+            let share = BucketDelta {
+                objects: delta.objects.into(),
+                logical_bytes: delta.logical_bytes.into(),
+                referenced_bytes: delta.referenced_bytes.into(),
+                ..Default::default()
+            };
+            row.apply(&share)?;
         }
         Ok(())
     }
@@ -778,7 +820,7 @@ impl RebuildStatsOperation {
                     self.group_entry(info.group_id).add(&delta)?;
                     self.global_shard_entry(info.group_id).add(&delta)?;
                     self.bucket_rows
-                        .insert(bucket.clone(), UsageCounters::default());
+                        .insert(bucket.clone(), BucketCounters::default());
                     self.bucket_groups.insert(bucket, info.group_id);
                 }
             }
@@ -835,6 +877,14 @@ impl RebuildStatsOperation {
                 for (key, value) in values {
                     let version = BlobVersion::from_bytes(value.as_ref())?;
                     let version_key = VersionKey::from_bytes(key.as_ref())?;
+                    if let Some(row) = self.bucket_rows.get_mut(&version_key.bucket) {
+                        let marker = version.is_deleted();
+                        row.apply(&BucketDelta {
+                            versions: (!marker).into(),
+                            delete_markers: marker.into(),
+                            ..Default::default()
+                        })?;
+                    }
                     let object = (version_key.bucket.clone(), version_key.key.clone());
                     let current = self
                         .current_versions
@@ -2070,6 +2120,20 @@ mod tests {
         read_optional_counters(ctx, key).await.unwrap_or_default()
     }
 
+    async fn read_bucket(ctx: &DriverContext, bucket: &str) -> BucketCounters {
+        let read = StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: usage_bucket_key(bucket).into(),
+            txn_id: None,
+        };
+        match ctx.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => BucketCounters::from_bytes(&bytes).unwrap(),
+            other => panic!("expected the bucket row, got {other:?}"),
+        }
+    }
+
     async fn read_global_counters(ctx: &DriverContext) -> UsageCounters {
         let mut total = UsageCounters::default();
         for key in global_shard_keys() {
@@ -2159,37 +2223,43 @@ mod tests {
         let group_id = Ulid::generate();
         let delta = UsageDelta {
             buckets: 1,
-            objects: 1,
-            logical_bytes: 42,
+            objects: -1,
+            logical_bytes: -42,
             ..Default::default()
         };
-        let mut update = UsageCounterUpdate::for_group(group_id, delta).in_bucket("data");
+        let update = UsageCounterUpdate::for_group(group_id, delta);
+        let mut update = update.in_bucket("data", RowChange::RemovedVersion);
         let effects = update.start(Ulid::generate());
-        let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+        let [
+            Effect::Storage(StorageEffect::AddUsage {
+                deltas, buckets, ..
+            }),
+        ] = effects.as_slice()
+        else {
             panic!("expected the counter deltas, got {effects:?}");
         };
-        let bucket = UsageDelta {
-            buckets: 0,
-            ..delta
+        assert_eq!(deltas.len(), 2);
+        let bucket = BucketDelta {
+            objects: -1,
+            versions: -1,
+            logical_bytes: -42,
+            ..Default::default()
         };
-        assert_eq!(
-            deltas,
-            &vec![
-                (global_group_key(group_id).into(), delta),
-                (usage_group_key(group_id).into(), delta),
-                (usage_bucket_key("data").into(), bucket),
-            ]
-        );
+        assert_eq!(buckets, &vec![(usage_bucket_key("data").into(), bucket)]);
+
+        // A marker alone moves no group counter, yet the update still books it.
+        let update = UsageCounterUpdate::for_group(group_id, UsageDelta::default());
+        assert!(update.is_noop());
+        assert!(!update.in_bucket("data", RowChange::AddedMarker).is_noop());
 
         // The reclaim sweep's physical debit names no group, so no bucket row moves.
         let stored = StoredDelta::new([1; 32], BackendRef::node_default(), -1, -5);
-        let mut update = UsageCounterUpdate::for_stored(stored).in_bucket("data");
+        let mut update = UsageCounterUpdate::for_stored(stored).in_bucket("data", RowChange::Kept);
         let effects = update.start(Ulid::generate());
-        let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+        let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice() else {
             panic!("expected the counter deltas, got {effects:?}");
         };
-        let bucket_key = usage_bucket_key("data");
-        assert!(deltas.iter().all(|(key, _)| key.as_ref() != bucket_key));
+        assert!(buckets.is_empty());
     }
 
     #[tokio::test]
@@ -2489,17 +2559,22 @@ mod tests {
         assert_eq!(beta.logical_bytes, 80);
         assert_eq!(beta.referenced_bytes, 0);
 
-        // Each bucket row holds its bucket's share, without a bucket count.
-        let alpha_row = read_counters(&ctx, usage_bucket_key("alpha")).await;
-        let beta_row = read_counters(&ctx, usage_bucket_key("beta")).await;
-        assert_eq!(
-            alpha_row,
-            UsageCounters {
-                buckets: 0,
-                ..alpha
-            }
-        );
-        assert_eq!(beta_row, UsageCounters { buckets: 0, ..beta });
+        // Each bucket row holds its bucket's share and counts its rows.
+        let alpha_row = BucketCounters {
+            objects: 2,
+            versions: 3,
+            delete_markers: 1,
+            logical_bytes: 140,
+            referenced_bytes: 30,
+        };
+        assert_eq!(read_bucket(&ctx, "alpha").await, alpha_row);
+        let beta_row = BucketCounters {
+            objects: 1,
+            versions: 2,
+            logical_bytes: 80,
+            ..Default::default()
+        };
+        assert_eq!(read_bucket(&ctx, "beta").await, beta_row);
     }
 
     #[test]

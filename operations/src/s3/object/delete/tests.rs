@@ -318,8 +318,7 @@ fn delete_stages_debit() {
         logical_bytes: -34_788_022,
         ..Default::default()
     };
-    // The group shard, the group row and the bucket row take the same debit.
-    assert_eq!(deltas.len(), 3);
+    assert_eq!(deltas.len(), 2);
     assert!(deltas.iter().all(|(_, delta)| *delta == debit));
 
     let effects = op.handle_usage_update(Event::Storage(StorageEvent::BatchWriteResult {
@@ -1588,7 +1587,7 @@ async fn bucket_rows_sum() {
     use crate::s3::bucket::create::CreateBucketOperation;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::Compression;
-    use aruna_core::structs::storage::usage::{UsageCounters, usage_bucket_key, usage_group_key};
+    use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key, usage_group_key};
 
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
@@ -1689,24 +1688,38 @@ async fn bucket_rows_sum() {
     let z = put("two", "z", b"abc").await;
     delete("two", "z", Some(z.version_id)).await;
 
-    let row = |objects, logical_bytes| UsageCounters {
-        objects,
-        logical_bytes,
+    let bucket = async |name: &str| {
+        let row = read_value(
+            &context,
+            aruna_core::keyspaces::USAGE_STATS_KEYSPACE,
+            usage_bucket_key(name),
+        );
+        BucketCounters::from_bytes(&row.await.expect("the bucket row")).unwrap()
+    };
+    let (one, two) = (bucket("one").await, bucket("two").await);
+    // The marker hides x, whose two versions stay stored; z is gone.
+    let expected = BucketCounters {
+        versions: 2,
+        delete_markers: 1,
+        logical_bytes: 11,
         ..Default::default()
     };
-    let one = read_counters(&context, usage_bucket_key("one")).await;
-    let two = read_counters(&context, usage_bucket_key("two")).await;
-    // The marker hides x, whose two versions stay stored; z is gone.
-    assert_eq!((one, two), (row(0, 11), row(1, 7)));
+    assert_eq!(one, expected);
+    let expected = BucketCounters {
+        objects: 1,
+        versions: 1,
+        logical_bytes: 7,
+        ..Default::default()
+    };
+    assert_eq!(two, expected);
+    // The group row is the sum of its bucket rows.
     let group = read_counters(&context, usage_group_key(group_id)).await;
-    assert_eq!(
-        (group.buckets, group.objects, group.logical_bytes),
-        (2, 1, 18)
-    );
+    assert_eq!(group.buckets, 2);
+    assert_eq!(group.objects, one.objects + two.objects);
+    assert_eq!(group.logical_bytes, one.logical_bytes + two.logical_bytes);
 
     drive(RebuildStatsOperation::new(), &context).await.unwrap();
-    assert_eq!(read_counters(&context, usage_bucket_key("one")).await, one);
-    assert_eq!(read_counters(&context, usage_bucket_key("two")).await, two);
+    assert_eq!((bucket("one").await, bucket("two").await), (one, two));
     assert_eq!(
         read_counters(&context, usage_group_key(group_id)).await,
         group

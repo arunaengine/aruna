@@ -13,7 +13,7 @@ use crate::blob::records::{
 };
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
-    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
+    QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
 use crate::placement::policy::{
@@ -1510,7 +1510,7 @@ impl PutObjectOperation {
         };
         self.usage_update = Some(
             UsageCounterUpdate::with_stored(self.config.group_id, group_delta, stored)
-                .in_bucket(&self.config.request.bucket),
+                .in_bucket(&self.config.request.bucket, RowChange::AddedVersion),
         );
 
         // Enforce the hard quota before counters commit; only a
