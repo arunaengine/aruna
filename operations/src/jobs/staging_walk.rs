@@ -579,3 +579,64 @@ fn source_permission_path(spec: &StagingJobSpec, source_path: &str) -> String {
         format!("{root}/{source_path}")
     }
 }
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    fn walk(source_path: &str) -> StagingWalk {
+        StagingWalk {
+            source_path: source_path.to_string(),
+            target_prefix: "copy".to_string(),
+            cursor: None,
+            queue_row: None,
+        }
+    }
+
+    fn file(path: &str) -> SourceEntry {
+        SourceEntry {
+            name: path.rsplit('/').next().unwrap().to_string(),
+            path: path.to_string(),
+            kind: SourceEntryKind::File,
+            size: Some(4),
+            modified: None,
+            etag: Some("\"9e107d9d372bb6826bd81d3542a419d6\"".to_string()),
+            stat: None,
+        }
+    }
+
+    #[test]
+    fn directory_keeps_marker() {
+        let entry = SourceEntry {
+            name: "refseq".to_string(),
+            kind: SourceEntryKind::Directory,
+            size: None,
+            etag: None,
+            ..file("refseq/")
+        };
+
+        let MappedEntry::Directory(directory) = map_source_entry(&walk(""), entry, false).unwrap()
+        else {
+            panic!("expected directory")
+        };
+        assert_eq!(directory.source_path, "refseq/");
+        assert_eq!(directory.target_prefix, "copy/refseq");
+    }
+
+    #[test]
+    fn flat_maps_nested() {
+        let MappedEntry::File(mapped) =
+            map_source_entry(&walk("data/"), file("data/a/b.txt"), true).unwrap()
+        else {
+            panic!("expected file")
+        };
+        assert_eq!(mapped.target_key, "copy/a/b.txt");
+        let observation = mapped.observation.unwrap();
+        assert_eq!(observation.content_length, 4);
+        assert_eq!(observation.content_type, None);
+        assert_eq!(observation.digests.len(), 1);
+
+        assert!(map_source_entry(&walk("data/"), file("data/a/b.txt"), false).is_err());
+        assert!(map_source_entry(&walk("data/"), file("other/b.txt"), true).is_err());
+    }
+}

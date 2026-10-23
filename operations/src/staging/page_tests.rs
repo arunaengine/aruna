@@ -475,3 +475,73 @@ fn page_bounds_entries() {
         Err(PageImportError::TooManyEntries(MAX_PAGE_ENTRIES + 1))
     );
 }
+
+// Runs the page twice against real storage: the commit is atomic and the replay finds the
+// registered head, so usage and connector rows are counted once.
+#[tokio::test]
+async fn replay_charges_once() {
+    use crate::driver::drive;
+    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_core::effects::IterStart;
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let group_id = bucket().group_id;
+    let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
+    let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
+    crate::jobs::store::insert_job(&context.storage_handle, &record(token()))
+        .await
+        .unwrap();
+    let page = PageImportInput {
+        connector: connector.clone(),
+        expected_bucket,
+        ..input(vec![entry("a")])
+    };
+
+    let first = drive(PageImportOperation::new(page.clone()), context)
+        .await
+        .unwrap();
+    let second = drive(
+        PageImportOperation::new(PageImportInput {
+            checkpoint: first.checkpoint.clone(),
+            ..page
+        }),
+        context,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!((first.registered, second.unchanged), (1, 1));
+    assert_eq!(second.checkpoint.items_succeeded, 2);
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(usage), ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: usage_group_key(group_id).into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("group usage must exist");
+    };
+    let usage = UsageCounters::from_bytes(&usage).unwrap();
+    assert_eq!((usage.objects, usage.referenced_bytes), (1, 3));
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: CONNECTOR_REFERENCE_KEYSPACE.to_string(),
+            prefix: Some(ByteView::from(connector.connector_id.to_bytes().to_vec())),
+            start: None::<IterStart>,
+            limit: 10,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("reference rows must be readable");
+    };
+    assert_eq!(values.len(), 1);
+}
