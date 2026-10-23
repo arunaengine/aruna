@@ -322,6 +322,7 @@ pub async fn refresh_with_context(
                 metadata,
                 published_by,
                 placement_policies,
+                original_epoch,
             } = version;
             let BlobVersionState::Reference {
                 source,
@@ -344,6 +345,7 @@ pub async fn refresh_with_context(
                     match (BlobVersion {
                         published_by,
                         placement_policies,
+                        original_epoch,
                         ..BlobVersion::reference(
                             source,
                             cached_metadata,

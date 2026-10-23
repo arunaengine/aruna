@@ -7,6 +7,7 @@ use aruna_core::structs::storage::abe::{
     AbeEffect, AbeEvent, AbeParameters, EnvelopePlan, ObjectEnvelope, create_envelope,
     create_parameters,
 };
+use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
@@ -395,6 +396,7 @@ pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationMani
         reference_advance: None,
         reference_advance_count: None,
         placement_policies: Vec::new(),
+        original_epoch: Default::default(),
     }
 }
 
@@ -870,6 +872,34 @@ fn version_binds_publisher() {
     let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
     assert_eq!(version.published_by, Some(publisher));
     assert_eq!(version.created_by, forged);
+}
+
+#[test]
+fn epoch_only_when_bound() {
+    // An ordinary bucket orders by generation alone, whatever epoch a manifest claims.
+    let stored_epoch = |bound: bool| {
+        let mut manifest = make_reference_manifest();
+        manifest.writer_auth_context = None;
+        manifest.original_epoch = OriginalEpoch(4);
+        let mut op = IncomingVersionOperation::new(
+            Ulid::from_parts(12, 12),
+            iroh::SecretKey::from_bytes(&[70; 32]).public(),
+            test_realm_id(),
+            manifest,
+        )
+        .with_publisher_node(iroh::SecretKey::from_bytes(&[42u8; 32]).public());
+        op.txn_id = Some(Ulid::from_parts(13, 13));
+        op.destination_bound = bound;
+        let effects = op.write_blob_version();
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected reference version write")
+        };
+        BlobVersion::from_bytes(value.as_ref())
+            .unwrap()
+            .original_epoch
+    };
+    assert_eq!(stored_epoch(false), OriginalEpoch(0));
+    assert_eq!(stored_epoch(true), OriginalEpoch(4));
 }
 
 #[test]

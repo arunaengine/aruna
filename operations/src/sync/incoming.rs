@@ -1459,6 +1459,7 @@ mod tests {
             }),
             reference_advance_count: Some(0),
             placement_policies: Vec::new(),
+            original_epoch: Default::default(),
         };
 
         assert_eq!(
@@ -1955,6 +1956,7 @@ mod tests {
             reference_advance: None,
             reference_advance_count: None,
             placement_policies: Vec::new(),
+            original_epoch: Default::default(),
         });
         let summary = VersionReplicationMessage::LocationSummaryRequest(LocationSummaryRequest {
             realm_id: RealmId::from_bytes([8u8; 32]),

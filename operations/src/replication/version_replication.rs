@@ -48,6 +48,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
 };
+use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::{
@@ -1157,6 +1158,8 @@ pub struct ReplicateObjectOperation {
     reference_advance: Option<ReferenceAdvance>,
     /// Refs read from the stored version, carried onto the manifest unchanged.
     version_policies: Vec<PlacementPolicyRef>,
+    /// The stored version's original epoch, carried onto the manifest unchanged.
+    version_epoch: OriginalEpoch,
     pending_copy: Option<ManagedCopyKey>,
     /// Destination details of this node, evaluated before reference bytes are
     /// materialized locally.
@@ -1209,6 +1212,7 @@ impl ReplicateObjectOperation {
             writer_auth_context: None,
             reference_advance: None,
             version_policies: Vec::new(),
+            version_epoch: OriginalEpoch::default(),
             pending_copy: None,
             gate_context: None,
             gate: None,
@@ -2074,6 +2078,7 @@ impl ReplicateObjectOperation {
             reference_advance: self.reference_advance,
             reference_advance_count,
             placement_policies: self.version_policies.clone(),
+            original_epoch: self.version_epoch,
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -2332,8 +2337,10 @@ impl ReplicateObjectOperation {
             metadata,
             published_by: _,
             placement_policies,
+            original_epoch,
         } = version;
         self.version_policies = placement_policies;
+        self.version_epoch = original_epoch;
 
         match state {
             BlobVersionState::Materialized {

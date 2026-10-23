@@ -13,6 +13,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{MAX_REF_INPUT, PlacementPolicyRef, PlacementSubject};
 use aruna_core::structs::storage::blob::{BackendLocation, CopyOrigin};
+use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
 };
@@ -70,6 +71,8 @@ pub struct VersionReplicationManifest {
     /// Refs stored on the replicated version. The target reconstructs the same
     /// governed version, so replication never relaxes an attachment.
     pub placement_policies: Vec<PlacementPolicyRef>,
+    /// The version's original epoch; it orders heads and never changes in transit.
+    pub original_epoch: OriginalEpoch,
 }
 
 impl VersionReplicationManifest {
@@ -703,6 +706,7 @@ mod pure_tests {
             reference_advance: None,
             reference_advance_count: None,
             placement_policies: Vec::new(),
+            original_epoch: Default::default(),
         }
     }
 

@@ -55,6 +55,7 @@ use aruna_core::structs::storage::blob::{
     VersionKey, WriteOwner, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
@@ -342,6 +343,8 @@ pub struct IncomingVersionOperation {
     destination_rules: Vec<StorageRoutingRule>,
     /// The destination bucket's compression: the replica is stored with this node's setting.
     destination_compression: Compression,
+    /// Only a bucket bound to a distributed set orders its heads by original epoch.
+    destination_bound: bool,
     destination_inputs: GroupRoutingInputs,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
@@ -417,6 +420,7 @@ impl IncomingVersionOperation {
             destination_group_id: None,
             destination_rules: Vec::new(),
             destination_compression: Compression::Off,
+            destination_bound: false,
             destination_inputs: GroupRoutingInputs::default(),
             create_attempted: false,
             negotiation_result: None,
@@ -1834,7 +1838,8 @@ impl IncomingVersionOperation {
             let advanced = CurrentVersionPointer::new_with_generation(
                 self.manifest.version_id,
                 advance.generation,
-            );
+            )
+            .with_epoch(self.original_epoch());
             if self.advance_version_exists
                 && (advanced == pointer || pointer.generation > advance.generation)
             {
@@ -1862,7 +1867,8 @@ impl IncomingVersionOperation {
         let candidate = CurrentVersionPointer::new_with_generation(
             self.manifest.version_id,
             incoming_generation,
-        );
+        )
+        .with_epoch(self.original_epoch());
         let should_write = candidate.supersedes(existing_pointer.as_ref());
 
         self.existing_current_pointer = existing_pointer.clone();
@@ -1892,6 +1898,15 @@ impl IncomingVersionOperation {
 
     fn write_version(&mut self) -> Effects {
         self.write_blob_version()
+    }
+
+    /// The manifest's epoch inside a distributed bucket; an ordinary bucket keeps 0, so its
+    /// heads order by generation exactly as before.
+    fn original_epoch(&self) -> OriginalEpoch {
+        match self.destination_bound {
+            true => self.manifest.original_epoch,
+            false => OriginalEpoch::default(),
+        }
     }
 
     fn write_blob_version(&mut self) -> Effects {
@@ -1982,6 +1997,7 @@ impl IncomingVersionOperation {
             ),
         };
 
+        let version = version.with_epoch(self.original_epoch());
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),
@@ -2527,6 +2543,7 @@ impl IncomingVersionOperation {
         self.gated_bucket = Some(GatedBucket::observe(Some(&bucket_info)));
         self.destination_rules = bucket_info.storage_routing;
         self.destination_compression = bucket_info.compression;
+        self.destination_bound = bucket_info.distribution.is_some();
         let Some(key) = settings
             .active_key()
             .filter(|_| self.manifest.kind == ReplicationItemKind::Materialized)
@@ -3334,6 +3351,7 @@ impl IncomingVersionOperation {
         let incoming_generation = self.manifest.current_version_generation;
         let pointer_will_update = incoming_generation.is_some_and(|generation| {
             CurrentVersionPointer::new_with_generation(self.manifest.version_id, generation)
+                .with_epoch(self.original_epoch())
                 .supersedes(existing_pointer.as_ref())
         });
         debug!(
