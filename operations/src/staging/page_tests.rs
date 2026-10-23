@@ -99,8 +99,6 @@ fn checkpoint() -> StagingJobCheckpoint {
         walk: None,
         queue_head: 0,
         queue_tail: 0,
-        pending_items: Vec::new(),
-        pending_directories: Vec::new(),
         items_current: 0,
         items_succeeded: 0,
         items_failed: 0,
@@ -108,7 +106,6 @@ fn checkpoint() -> StagingJobCheckpoint {
         bytes_current: 0,
         bytes_total: None,
         bytes_discovered: 0,
-        unknown_sizes: 0,
         current_path: None,
         errors: Vec::new(),
     }

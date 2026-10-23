@@ -248,11 +248,11 @@ pub struct StagingJobError {
     pub error: String,
 }
 
+/// A directory waiting in a job's durable queue, for sources without flat listing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagingJobDirectory {
     pub source_path: String,
     pub target_prefix: String,
-    pub cursor: Option<crate::structs::execution::source_access::ListCursor>,
 }
 
 /// The listing a staging job is walking: a whole prefix when the source lists flat,
@@ -266,13 +266,8 @@ pub struct StagingWalk {
     pub queue_row: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StagingPendingItem {
-    pub source_path: String,
-    pub target_key: String,
-    pub size: Option<u64>,
-}
-
+/// Progress of a staging job. It stays small: positions and counters only, while directories
+/// still to list wait in the separately paginated queue.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagingJobCheckpoint {
     pub phase: StagingJobPhase,
@@ -286,8 +281,6 @@ pub struct StagingJobCheckpoint {
     /// Queue rows `[queue_head, queue_tail)` are directories still to list.
     pub queue_head: u64,
     pub queue_tail: u64,
-    pub pending_items: Vec<StagingPendingItem>,
-    pub pending_directories: Vec<StagingJobDirectory>,
     pub items_current: u64,
     pub items_succeeded: u64,
     pub items_failed: u64,
@@ -295,8 +288,8 @@ pub struct StagingJobCheckpoint {
     pub bytes_current: u64,
     pub bytes_total: Option<u64>,
     pub bytes_discovered: u64,
-    pub unknown_sizes: u64,
     pub current_path: Option<String>,
+    /// A bounded sample of per-item errors; `items_failed` counts every failure.
     pub errors: Vec<StagingJobError>,
 }
 

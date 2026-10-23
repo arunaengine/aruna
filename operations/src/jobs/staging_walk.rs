@@ -510,7 +510,6 @@ fn map_source_entry(
         SourceEntryKind::Directory => MappedEntry::Directory(StagingJobDirectory {
             source_path: directory_list_path(&entry_path),
             target_prefix: target,
-            cursor: None,
         }),
     })
 }
@@ -523,7 +522,7 @@ pub(super) fn directory_list_path(path: &str) -> String {
     }
 }
 
-pub(super) fn relative_entry_path(base: &str, entry: &str, nested: bool) -> Result<String, String> {
+fn relative_entry_path(base: &str, entry: &str, nested: bool) -> Result<String, String> {
     let base = base.trim_matches('/');
     let relative = if base.is_empty() {
         entry
@@ -539,7 +538,7 @@ pub(super) fn relative_entry_path(base: &str, entry: &str, nested: bool) -> Resu
     Ok(relative.to_string())
 }
 
-pub(super) fn canonical_walker_path(path: &str) -> Result<String, String> {
+fn canonical_walker_path(path: &str) -> Result<String, String> {
     let mut path = path.trim();
     while let Some(stripped) = path.strip_prefix("./") {
         path = stripped;
@@ -560,7 +559,7 @@ pub(super) fn canonical_walker_path(path: &str) -> Result<String, String> {
     Ok(path.to_string())
 }
 
-pub(super) fn join_target_prefix(prefix: &str, relative: &str) -> String {
+fn join_target_prefix(prefix: &str, relative: &str) -> String {
     let prefix = prefix.trim_matches('/');
     if prefix.is_empty() {
         relative.to_string()
@@ -569,7 +568,7 @@ pub(super) fn join_target_prefix(prefix: &str, relative: &str) -> String {
     }
 }
 
-pub(super) fn source_permission_path(spec: &StagingJobSpec, source_path: &str) -> String {
+fn source_permission_path(spec: &StagingJobSpec, source_path: &str) -> String {
     let root = format!(
         "/{}/g/{}/data/{}/_sources/{}",
         spec.auth_context.realm_id, spec.group_id, spec.node_id, spec.connector_id
