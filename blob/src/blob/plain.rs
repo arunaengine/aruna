@@ -5,6 +5,7 @@
 use super::BlobHandler;
 use super::backend::{key_fits, split_bucket};
 use super::io::{backend_version, compose_chunk};
+use crate::s3::NativeMultipart;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
@@ -36,14 +37,32 @@ pub(super) fn conditional(
     if operator.info().capability().write_with_if_not_exists || !plain.if_not_exists {
         return Ok(plain.if_not_exists);
     }
+    unconditional(location, plain).map(|()| false)
+}
+
+/// Sends a write that must find its path free, on a storage that cannot check that, to its
+/// tagged path; an exact one is refused.
+fn unconditional(location: &mut BackendLocation, plain: &PlainPath) -> Result<(), BlobError> {
     if plain.exact {
         return Err(BlobError::ConditionalUnsupported);
     }
     if !plain.path.ends_with(&format!("~{}", plain.ulid)) {
         location.backend_path = tagged_path(&plain.path, plain.ulid);
     }
-    Ok(false)
+    Ok(())
 }
+
+/// Bytes one provider copy request takes at most.
+const COPY_WHOLE: u64 = 5 << 30;
+
+/// The source of a provider copy: its client, its pinned version, the ETag it must still have
+/// without one, and the ETag recorded for it.
+type Source<'a> = (
+    &'a NativeMultipart,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+);
 
 impl BlobHandler {
     /// The location of `path` on `backend`; the empty storage bucket marks a tenant path.
@@ -95,11 +114,59 @@ impl BlobHandler {
         if plain.path.ends_with('/') {
             return self.write_folder(location, operator, blob).await;
         }
-        let conditional = match conditional(&operator, &mut location, &plain) {
-            Ok(conditional) => conditional,
-            Err(error) => return BlobEvent::Error(error),
+        let (conditional, reserved) =
+            match self.reserve_path(&operator, &mut location, &plain).await {
+                Ok(reserved) => reserved,
+                Err(error) => return BlobEvent::Error(error),
+            };
+        let target = location.clone();
+        let event = Box::pin(self.write_tenant(location, operator, blob, conditional)).await;
+        if matches!(event, BlobEvent::Error(_)) {
+            self.unreserve(reserved.as_ref(), &target, plain.version_id)
+                .await;
+        }
+        event
+    }
+
+    /// Holds the free path of a create-only write before any byte reaches it: on S3 with an
+    /// empty reservation for its version, as a storage may ignore the condition of a completion
+    /// or a copy. Answers whether the write must still be create-only, and the reservation.
+    async fn reserve_path(
+        &self,
+        operator: &Operator,
+        location: &mut BackendLocation,
+        plain: &PlainPath,
+    ) -> Result<(bool, Option<NativeMultipart>), BlobError> {
+        if !conditional(operator, location, plain)? {
+            return Ok((false, None));
+        }
+        let Some(native) = self.native_for(location)? else {
+            return Ok((true, None));
         };
-        Box::pin(self.write_tenant(location, operator, blob, conditional)).await
+        let path = self.object_path(location)?;
+        match native.reserve(&path, &plain.version_id.to_string()).await {
+            Ok(()) => Ok((false, Some(native))),
+            Err(BlobError::ConditionalUnsupported) => {
+                unconditional(location, plain).map(|()| (false, None))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Removes a failed write's own empty reservation. One left behind keeps the path in
+    /// progress through the write's intent, and a retry of the write reuses it.
+    async fn unreserve(
+        &self,
+        reserved: Option<&NativeMultipart>,
+        location: &BackendLocation,
+        version_id: ulid::Ulid,
+    ) {
+        let (Some(native), Ok(path)) = (reserved, self.object_path(location)) else {
+            return;
+        };
+        if let Err(error) = native.unreserve(&path, &version_id.to_string()).await {
+            tracing::warn!(%error, "The reservation of a failed write stays");
+        }
     }
 
     /// Copies `source` to `plain.path`: inside the provider where both lie on one S3 storage
@@ -126,12 +193,8 @@ impl BlobHandler {
         if let Some(native) = native {
             // Without a version the provider copies the source only while it keeps its ETag.
             let if_match = etag.as_deref().filter(|_| exact.is_none());
-            let copied = self.copy_inside(
-                resolved.clone(),
-                &plain,
-                &source,
-                (&native, exact.as_deref(), if_match),
-            );
+            let from = (&native, exact.as_deref(), if_match, etag.as_deref());
+            let copied = self.copy_inside(resolved.clone(), &plain, &source, from);
             match Box::pin(copied).await {
                 Ok(Some(event)) => return event,
                 Ok(None) => {}
@@ -147,25 +210,103 @@ impl BlobHandler {
         }
     }
 
-    /// The provider copies the source version, or its current bytes, in parts of at most
-    /// `COPY_PART` bytes and completes create-only where asked, and the size is checked. `None`
-    /// asks for a streamed copy: the storage cannot copy, or a one-part ETag is not the MD5.
+    /// The provider copies the source version, or its current bytes, onto the reserved path: in
+    /// one request up to `COPY_WHOLE` bytes, else in parts. `None` asks for a streamed copy; a
+    /// failed copy drops its own empty reservation.
     async fn copy_inside(
         &self,
         resolved: ResolvedBackend,
         plain: &PlainPath,
         source: &BackendLocation,
-        (native, version, if_match): (&crate::s3::NativeMultipart, Option<&str>, Option<&str>),
+        (native, version, if_match, recorded): Source<'_>,
     ) -> Result<Option<BlobEvent>, BlobError> {
         let class = resolved.storage_class.clone();
         let mut location =
             self.plain_location(resolved.backend, class, plain, source.created_by)?;
         let operator = self.operator_from_location(&location)?;
-        let if_not_exists = conditional(&operator, &mut location, plain)?;
-        let target = self.native_upload(&location)?;
-        let (path, source_path) = (self.object_path(&location)?, self.object_path(source)?);
         // The upload an interrupted try of this copy recorded goes first, and only that one.
         self.settle_upload(plain.ulid).await?;
+        let (_, reserved) = self.reserve_path(&operator, &mut location, plain).await?;
+        let target = location.clone();
+        let copied = match source.blob_size <= COPY_WHOLE {
+            true => {
+                let from = (native, version, if_match, recorded);
+                Box::pin(self.copy_whole((location, &operator), source, from)).await
+            }
+            false => {
+                let from = (native, version, if_match);
+                let copied = self.copy_parts((location, &operator), plain, source, from);
+                Box::pin(copied).await
+            }
+        };
+        if copied.is_err() {
+            self.unreserve(reserved.as_ref(), &target, plain.version_id)
+                .await;
+        }
+        copied
+    }
+
+    /// Copies `source` onto the reserved path in one request. An ETag equal to the source MD5
+    /// proves the bytes; a kept multipart or recorded ETag leaves the size to check, and any
+    /// other ETag sends the bytes through the node onto the same path.
+    async fn copy_whole(
+        &self,
+        (mut location, operator): (BackendLocation, &Operator),
+        source: &BackendLocation,
+        (native, version, if_match, recorded): Source<'_>,
+    ) -> Result<Option<BlobEvent>, BlobError> {
+        let target = self.native_upload(&location)?;
+        let (path, source_path) = (self.object_path(&location)?, self.object_path(source)?);
+        let from = (native, source_path.as_str(), version, if_match);
+        let (written, etag) = match target.copy_object(&path, from).await {
+            Ok(copied) => copied,
+            Err(BlobError::CopyUnsupported) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let unquoted = |etag: &str| etag.trim_matches('"').to_string();
+        let tag = etag.as_deref().map(unquoted);
+        let md5 = (source.hashes.get(aruna_core::structs::checksum::HASH_MD5)).map(hex::encode);
+        let proved = md5.is_some() && tag == md5;
+        let kept = (tag.as_deref())
+            .is_some_and(|tag| tag.contains('-') || recorded.map(unquoted).as_deref() == Some(tag));
+        if md5.is_some() && !proved && !kept {
+            tracing::warn!("A copy's ETag is not the source MD5; the bytes go through the node");
+            return match self.read_blob(source.clone()).await {
+                BlobEvent::ReadFinished { blob, .. } => {
+                    let written = self.write_tenant(location, operator.clone(), blob, false);
+                    Ok(Some(Box::pin(written).await))
+                }
+                other => Ok(Some(other)),
+            };
+        }
+        let versioned = operator.info().capability().read_with_version;
+        let written = written.filter(|version| versioned && version != "null");
+        if !proved {
+            let size = source.blob_size;
+            self.check_size(operator, &path, written.as_deref(), size)
+                .await?;
+        }
+        location.blob_size = source.blob_size;
+        location.hashes = source.hashes.clone();
+        Ok(Some(BlobEvent::PlainWritten {
+            location,
+            version: written,
+            etag: tag,
+        }))
+    }
+
+    /// The provider copies the source in parts of at most `COPY_PART` bytes and completes, and
+    /// the size is checked. `None` asks for a streamed copy: the storage cannot copy, or a
+    /// one-part ETag is not the MD5.
+    async fn copy_parts(
+        &self,
+        (mut location, operator): (BackendLocation, &Operator),
+        plain: &PlainPath,
+        source: &BackendLocation,
+        (native, version, if_match): (&NativeMultipart, Option<&str>, Option<&str>),
+    ) -> Result<Option<BlobEvent>, BlobError> {
+        let target = self.native_upload(&location)?;
+        let (path, source_path) = (self.object_path(&location)?, self.object_path(source)?);
         let size = source.blob_size;
         let ranges = copy_ranges(size);
         let upload_id = target.create(&path).await?;
@@ -217,9 +358,8 @@ impl BlobHandler {
         }
         // One part whose ETag is the source MD5 proves the bytes, and so their size.
         let proved = parts.len() == 1 && md5.is_some();
-        let completed = target
-            .complete(&path, &upload_id, &parts, if_not_exists)
-            .await;
+        // A create-only copy holds its path by its reservation, so no condition is needed.
+        let completed = target.complete(&path, &upload_id, &parts, false).await;
         let (written, etag) = match completed {
             Ok(completed) => completed,
             Err(error) => {
@@ -237,11 +377,24 @@ impl BlobHandler {
             version: written.clone(),
             etag: etag.map(|etag| etag.trim_matches('"').to_string()),
         };
-        if proved {
-            return Ok(Some(event));
+        if !proved {
+            self.check_size(operator, &path, written.as_deref(), size)
+                .await?;
         }
-        let stat = operator.stat_with(&path);
-        let stat = match written.as_deref() {
+        Ok(Some(event))
+    }
+
+    /// Fails unless the copy at `path`, at `version` where the storage reads versions, holds
+    /// `size` bytes.
+    async fn check_size(
+        &self,
+        operator: &Operator,
+        path: &str,
+        version: Option<&str>,
+        size: u64,
+    ) -> Result<(), BlobError> {
+        let stat = operator.stat_with(path);
+        let stat = match version {
             Some(version) if operator.info().capability().stat_with_version => {
                 stat.version(version)
             }
@@ -257,7 +410,7 @@ impl BlobHandler {
                 found.content_length()
             )));
         }
-        Ok(Some(event))
+        Ok(())
     }
 
     /// Aborts this copy's own provider upload and forgets it, then asks for a streamed copy. A
@@ -507,10 +660,12 @@ impl BlobHandler {
         };
         let total = parts.iter().map(|part| part.blob_size).sum();
         let chunk = compose_chunk(&backend_type, total, false);
-        let conditional = match conditional(&operator, &mut location, &plain) {
-            Ok(conditional) => conditional,
-            Err(error) => return BlobEvent::Error(error),
-        };
+        let (conditional, reserved) =
+            match self.reserve_path(&operator, &mut location, &plain).await {
+                Ok(reserved) => reserved,
+                Err(error) => return BlobEvent::Error(error),
+            };
+        let target = location.clone();
         let composed = self.compose_parts(
             location,
             operator,
@@ -519,7 +674,12 @@ impl BlobHandler {
             Compression::Off,
             conditional,
         );
-        Box::pin(composed).await
+        let event = Box::pin(composed).await;
+        if matches!(event, BlobEvent::Error(_)) {
+            self.unreserve(reserved.as_ref(), &target, plain.version_id)
+                .await;
+        }
+        event
     }
 
     pub(super) async fn stat_plain(&self, backend: BackendRef, path: String) -> BlobEvent {
@@ -556,6 +716,34 @@ impl BlobHandler {
             },
             Ok(Err(error)) => BlobEvent::Error(BlobError::ReadError(error.to_string())),
             Err(_) => BlobEvent::Error(BlobError::ReadError("timed out reading the path".into())),
+        }
+    }
+
+    /// Answers `DropReservation`; a storage without provider calls holds no reservations.
+    pub(super) async fn drop_reservation(
+        &self,
+        backend: BackendRef,
+        path: String,
+        version_id: ulid::Ulid,
+    ) -> BlobEvent {
+        let plain = PlainPath {
+            path,
+            ulid: version_id,
+            version_id,
+            if_not_exists: false,
+            exact: false,
+        };
+        let dropped = async {
+            let location = self.plain_location(backend, None, &plain, UserId::default())?;
+            let Some(native) = self.native_for(&location)? else {
+                return Ok(());
+            };
+            let path = self.object_path(&location)?;
+            native.unreserve(&path, &version_id.to_string()).await
+        };
+        match dropped.await {
+            Ok(()) => BlobEvent::DeleteFinished,
+            Err(error) => BlobEvent::Error(error),
         }
     }
 

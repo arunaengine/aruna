@@ -3943,6 +3943,7 @@ async fn s3_plain_upload() {
         let plain = PlainPath {
             path: "raw/a.bin".to_string(),
             ulid,
+            version_id: ulid,
             if_not_exists: true,
             exact: false,
         };
@@ -4149,6 +4150,7 @@ async fn s3_copies_plain() {
     let plain = |path: &str| PlainPath {
         path: path.to_string(),
         ulid: Ulid::generate(),
+        version_id: Ulid::generate(),
         if_not_exists: true,
         exact: true,
     };
@@ -4366,6 +4368,7 @@ fn copy_source(
     let plain = PlainPath {
         path: "raw/a.bin~7".to_string(),
         ulid: Ulid::generate(),
+        version_id: Ulid::generate(),
         if_not_exists: true,
         exact: true,
     };

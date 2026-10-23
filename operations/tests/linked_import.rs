@@ -277,6 +277,7 @@ async fn place(context: &TestContext, name: &str, bytes: &[u8]) {
     let plain = PlainPath {
         path: format!("{}/raw/{name}", context.folder),
         ulid: Ulid::generate(),
+        version_id: Ulid::generate(),
         if_not_exists: false,
         exact: false,
     };

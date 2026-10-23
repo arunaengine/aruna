@@ -167,7 +167,9 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
             push(&mut ids, &resolved.backend);
             push(&mut ids, &source.backend);
         }
-        BlobEffect::StatPlain { backend, .. } => push(&mut ids, backend),
+        BlobEffect::StatPlain { backend, .. } | BlobEffect::DropReservation { backend, .. } => {
+            push(&mut ids, backend)
+        }
         BlobEffect::StatExternal { resolved, .. } => push(&mut ids, &resolved.backend),
         BlobEffect::SettleCopy { upload, .. } => {
             if let Some((location, _)) = upload {

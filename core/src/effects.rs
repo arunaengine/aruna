@@ -385,6 +385,13 @@ pub enum BlobEffect {
         path: String,
         created_by: UserId,
     },
+    /// Removes the empty object that holds `path` on `backend` for the write of `version_id`,
+    /// never another object. Answers `DeleteFinished`, also when the path holds no such object.
+    DropReservation {
+        backend: BackendRef,
+        path: String,
+        version_id: Ulid,
+    },
     /// Deletes exactly backend `version` of a replaced tenant file at `location`; an empty one
     /// deletes it only while its size and full ETag equal `location` and `etag`. Answers
     /// `DeleteFinished`, also for a missing file, else `CleanupUnsupported` and keeps it.

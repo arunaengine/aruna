@@ -557,6 +557,7 @@ impl MigrateVersionOperation {
             self.plain_path = Some(PlainPath {
                 path,
                 ulid: self.attempt(),
+                version_id: self.version_key.version_id,
                 if_not_exists: true,
                 exact: true,
             });
@@ -595,6 +596,7 @@ impl MigrateVersionOperation {
         self.plain_path = Some(PlainPath {
             path,
             ulid: attempt,
+            version_id: self.version_key.version_id,
             if_not_exists,
             exact: self.renaming,
         });

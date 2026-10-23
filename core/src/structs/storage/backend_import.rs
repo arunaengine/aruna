@@ -510,6 +510,8 @@ impl RenameRequest {
 pub struct PlainPath {
     pub path: String,
     pub ulid: Ulid,
+    /// The version the write is for; an empty reservation of the path names it.
+    pub version_id: Ulid,
     /// Fails the write with `PathTaken` if a file is already at the path.
     pub if_not_exists: bool,
     /// Only `path` itself may take the file: a storage that cannot create a file only while

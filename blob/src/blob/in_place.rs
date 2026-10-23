@@ -583,6 +583,21 @@ impl BlobHandler {
                 Finished::Composed(composed) => return Ok((*composed, None, None)),
             }
         } else {
+            // A tenant path is reserved first, as a storage may ignore the completion's
+            // condition; the completion then replaces only that reservation.
+            let reserved = match if_not_exists && upload.location.is_external() {
+                true => match native
+                    .reserve(&path, &upload.location.ulid.to_string())
+                    .await
+                {
+                    Ok(()) => true,
+                    // A storage without conditional writes completes as it did before.
+                    Err(BlobError::ConditionalUnsupported) => false,
+                    Err(error) => return Err(error),
+                },
+                false => false,
+            };
+            let if_not_exists = if_not_exists && !reserved;
             let assembled =
                 self.assemble(&native, &path, upload, parts, etags.clone(), if_not_exists);
             match assembled.await {
@@ -737,10 +752,14 @@ impl BlobHandler {
             timeout(self.io_timeout(), native.abort(&path, &upload.upload_id))
                 .await
                 .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))??;
-            // A tenant path keeps what it holds; only Aruna's own target is deleted.
-            if !upload.location.is_external() {
-                let operator = self.operator_from_location(&upload.location)?;
-                self.delete_path(&operator, &path).await?;
+            // A tenant path keeps what it holds but this upload's own empty reservation; only
+            // Aruna's own target is deleted.
+            match upload.location.is_external() {
+                true => (native.unreserve(&path, &upload.location.ulid.to_string())).await?,
+                false => {
+                    let operator = self.operator_from_location(&upload.location)?;
+                    self.delete_path(&operator, &path).await?;
+                }
             }
             self.release_reservation(&upload.location).await?;
             // After the release, which removes the reservation row, so this work stays queued.

@@ -147,6 +147,7 @@ impl PutObjectOperation {
             plain: PlainPath {
                 path,
                 ulid,
+                version_id: ulid,
                 if_not_exists,
                 exact: false,
             },
