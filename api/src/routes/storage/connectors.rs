@@ -625,6 +625,11 @@ pub async fn get_source_connector(
             status = 409,
             description = "The credentials are still referenced by a stored object version, and stay so until those versions are gone",
             body = ErrorResponse
+        ),
+        (
+            status = 503,
+            description = "More reference records exist than one request checks; they are checked in the background and the request may be retried",
+            body = ErrorResponse
         )
     ),
     security(("bearer_auth" = []))
@@ -706,6 +711,11 @@ pub async fn replace_source_connector(
         (
             status = 409,
             description = "The credentials are still referenced by a stored object version, and stay so until those versions are gone",
+            body = ErrorResponse
+        ),
+        (
+            status = 503,
+            description = "More reference records exist than one request checks; they are checked in the background and the request may be retried",
             body = ErrorResponse
         )
     ),
@@ -1238,6 +1248,9 @@ fn map_replace_error(error: ReplaceSourceError) -> ServerError {
         ReplaceSourceError::ValidationError(_) => ServerError::BadRequest,
         ReplaceSourceError::NotFound => ServerError::NotFound,
         ReplaceSourceError::ReferencedObjectVersion => ServerError::Conflict(error.to_string()),
+        ReplaceSourceError::ReferencesPending => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
         _ => ServerError::InternalError(error.to_string()),
     }
 }
@@ -1246,6 +1259,9 @@ fn map_delete_error(error: DeleteSourceError) -> ServerError {
     match error {
         DeleteSourceError::NotFound => ServerError::NotFound,
         DeleteSourceError::ReferencedObjectVersion => ServerError::Conflict(error.to_string()),
+        DeleteSourceError::ReferencesPending => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
         _ => ServerError::InternalError(error.to_string()),
     }
 }

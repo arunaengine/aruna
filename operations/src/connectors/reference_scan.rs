@@ -1,10 +1,11 @@
-//! Pages through a connector's reference rows and confirms each against its version, shared by
-//! delete and replace. Rows whose version is gone or bound elsewhere are pruned in the same
-//! transaction; each calling operation still owns that transaction and its final mutation.
+//! Checks one bounded page of a connector's reference rows against their versions, shared by
+//! delete and replace. Stale rows of the page are pruned in the same transaction; when more rows
+//! follow, the rest is queued for background pruning and the caller is asked to retry.
+//! Each calling operation still owns that transaction and its final mutation.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE};
@@ -14,6 +15,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
 
+use crate::connectors::reference_prune::prune_queue_write;
 use crate::connectors::repository::{REFERENCE_PAGE_SIZE, StorageReadError, references_connector};
 
 /// Connector id bytes ahead of the version key in a reference row.
@@ -24,6 +26,8 @@ pub(crate) enum ScanStep {
     Referenced,
     Next(Effects),
     Complete,
+    /// The page was stale but more rows follow: commit the pruning queued here, then retry.
+    Deferred,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +35,7 @@ enum ScanPhase {
     Rows,
     Versions,
     Prune,
+    Queue,
 }
 
 #[derive(Debug, PartialEq)]
@@ -51,13 +56,13 @@ impl ReferenceScan {
         }
     }
 
-    /// Reads the next page of the connector's reference rows.
-    pub(crate) fn start(&mut self, start_after: Option<Key>, txn_id: TxnId) -> Effects {
+    /// Reads the first page of the connector's reference rows.
+    pub(crate) fn start(&mut self, txn_id: TxnId) -> Effects {
         self.phase = ScanPhase::Rows;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: CONNECTOR_REFERENCE_KEYSPACE.to_string(),
             prefix: Some(ByteView::from(self.connector_id.to_bytes().to_vec())),
-            start: start_after.map(IterStart::After),
+            start: None,
             limit: REFERENCE_PAGE_SIZE,
             txn_id: Some(txn_id),
         })]
@@ -123,10 +128,23 @@ impl ReferenceScan {
                 )]))
             }
             (ScanPhase::Prune, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                Ok(match self.next.take() {
-                    Some(start_after) => ScanStep::Next(self.start(Some(start_after), txn_id)),
-                    None => ScanStep::Complete,
-                })
+                let Some(cursor) = self.next.take() else {
+                    return Ok(ScanStep::Complete);
+                };
+                // More rows follow than one request checks: the rest is pruned in the background.
+                self.phase = ScanPhase::Queue;
+                let (key_space, key, value) = prune_queue_write(self.connector_id, cursor);
+                Ok(ScanStep::Next(smallvec![Effect::Storage(
+                    StorageEffect::Write {
+                        key_space,
+                        key,
+                        value,
+                        txn_id: Some(txn_id),
+                    }
+                )]))
+            }
+            (ScanPhase::Queue, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                Ok(ScanStep::Deferred)
             }
             (_, Event::Storage(StorageEvent::Error { error })) => {
                 Err(StorageReadError::Storage(error))
@@ -142,6 +160,7 @@ impl ReferenceScan {
 mod tests {
     use super::*;
     use crate::connectors::repository::connector_reference_key;
+    use aruna_core::keyspaces::CONNECTOR_PRUNE_KEYSPACE;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
@@ -200,7 +219,7 @@ mod tests {
         let connector_id = Ulid::from_bytes([2; 16]);
         let mut scan = ReferenceScan::new(connector_id);
         assert!(matches!(
-            scan.start(None, txn()).as_slice(),
+            scan.start(txn()).as_slice(),
             [Effect::Storage(StorageEffect::Iter { key_space, .. })]
                 if key_space == CONNECTOR_REFERENCE_KEYSPACE
         ));
@@ -229,7 +248,7 @@ mod tests {
     fn stale_rows_pruned() {
         let connector_id = Ulid::from_bytes([2; 16]);
         let mut scan = ReferenceScan::new(connector_id);
-        scan.start(None, txn());
+        scan.start(txn());
         let page = vec![row(connector_id, "gone"), row(connector_id, "rebound")];
         let next = page[1].clone();
         scan.step(rows(page, Some(next.clone())), txn()).ok();
@@ -253,17 +272,19 @@ mod tests {
         let deleted = Event::Storage(StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
         });
-        let Ok(ScanStep::Next(page)) = scan.step(deleted, txn()) else {
-            panic!("expected the next page");
+        // A request checks one page; the rest is queued for the background and retried.
+        let Ok(ScanStep::Next(queued)) = scan.step(deleted, txn()) else {
+            panic!("expected the pruning to be queued");
         };
-        assert!(matches!(
-            page.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { start: Some(IterStart::After(key)), .. })]
-                if *key == next
-        ));
-        assert!(matches!(
-            scan.step(rows(Vec::new(), None), txn()),
-            Ok(ScanStep::Complete)
-        ));
+        let [Effect::Storage(StorageEffect::Write { key_space, value, .. })] = queued.as_slice()
+        else {
+            panic!("expected one queue write");
+        };
+        assert_eq!(key_space, CONNECTOR_PRUNE_KEYSPACE);
+        assert_eq!(value.as_ref(), next.as_ref());
+        let written = Event::Storage(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        });
+        assert!(matches!(scan.step(written, txn()), Ok(ScanStep::Deferred)));
     }
 }
