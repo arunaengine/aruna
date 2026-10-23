@@ -556,8 +556,11 @@ const NEXTFLOW_WORK: &str = "work/ab/task";
 const NEXTFLOW_WRAPPER: &str =
     "cd /work\nsh .command.sh > .command.out 2> .command.err\necho $? > .exitcode\n";
 // Like SEQTK_TRIM and MULTIQC: one glob also matches the staged input, one matches a directory.
+// `results` is a `type: 'dir'` output sent as DIRECTORY; `*.{bam,bai}` is a Java glob.
 const NEXTFLOW_SCRIPT: &str = "cp sample.fastq.gz trimmed.fastq.gz\nmkdir -p report_data/plots\n\
-    echo log > report_data/report.log\necho plot > report_data/plots/a.txt\n";
+    echo log > report_data/report.log\necho plot > report_data/plots/a.txt\n\
+    mkdir -p results/deep\necho table > results/deep/t.tsv\n\
+    echo bam > aln.bam\necho bai > aln.bai\n";
 const READS: &str = "@read\nACGT\n+\nIIII\n";
 
 /// The body nf-ga4gh 1.5.0 builds: control files in and out, and every glob under the
@@ -597,7 +600,9 @@ fn nextflow_task(bucket: &str) -> Value {
             output(".command.log"),
             output(".exitcode"),
             pattern("*.fastq.gz"),
-            pattern("*_data")
+            pattern("*_data"),
+            pattern("*.{bam,bai}"),
+            json!({ "url": work("results"), "path": "/work/results", "type": "DIRECTORY" })
         ],
         "resources": { "cpu_cores": 1, "ram_gb": 0.25 }
     })
@@ -708,6 +713,12 @@ async fn check_nextflow_task(backend: DockerBackend) -> TestResult<()> {
         read("report_data/plots/a.txt").await.as_deref(),
         Some(&b"plot\n"[..])
     );
+    assert_eq!(
+        read("results/deep/t.tsv").await.as_deref(),
+        Some(&b"table\n"[..])
+    );
+    assert_eq!(read("aln.bam").await.as_deref(), Some(&b"bam\n"[..]));
+    assert_eq!(read("aln.bai").await.as_deref(), Some(&b"bai\n"[..]));
 
     seed.shutdown().await;
     Ok(())
