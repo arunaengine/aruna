@@ -1787,7 +1787,7 @@ fn spooled(sha256: u8) -> Event {
         storage_class: None,
         root: "/tmp".to_string(),
         storage_bucket: "aruna_test".to_string(),
-        backend_path: "_hidden/reference".to_string(),
+        backend_path: format!("_jobs/{}/reference_{}", Ulid::nil(), Ulid::nil()),
         ulid: Ulid::generate(),
         format: StoredFormat::default(),
         created_by: Default::default(),
