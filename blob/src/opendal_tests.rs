@@ -671,19 +671,24 @@ async fn list_applies_limit() {
     )
     .unwrap();
 
-    let (entries, truncated) = list_operator(&operator, "prefix/", 0, 1, false, false)
-        .await
-        .unwrap();
+    let mut request = list_request(1, false, false);
+    let (entries, cursor) = list_operator(&operator, "prefix/", &request).await.unwrap();
 
     assert_eq!(entries.len(), 1);
     assert!(entries[0].path.starts_with("prefix/"));
-    assert!(truncated);
+    assert_eq!(cursor, Some(ListCursor::Offset(1)));
 
-    let (entries, truncated) = list_operator(&operator, "prefix/", 1, 1, false, false)
-        .await
-        .unwrap();
+    request.cursor = cursor;
+    let (entries, cursor) = list_operator(&operator, "prefix/", &request).await.unwrap();
     assert_eq!(entries.len(), 1);
-    assert!(!truncated);
+    assert_eq!(cursor, None);
+
+    request.cursor = Some(ListCursor::After("prefix/a.txt".to_string()));
+    let refused = list_operator(&operator, "prefix/", &request).await;
+    assert!(matches!(
+        refused,
+        Err(StagingSourceError::InvalidListing(_))
+    ));
 }
 
 #[tokio::test]
@@ -701,13 +706,13 @@ async fn list_filters_directories() {
     )
     .unwrap();
 
-    let (entries, truncated) = list_operator(&operator, "prefix/", 0, 10, true, true)
+    let (entries, cursor) = list_operator(&operator, "prefix/", &list_request(10, true, true))
         .await
         .unwrap();
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path, "prefix/nested/file.txt");
-    assert!(!truncated);
+    assert_eq!(cursor, None);
 }
 
 #[tokio::test]
@@ -728,7 +733,7 @@ async fn recursive_list_truncates() {
     )
     .unwrap();
 
-    let (entries, truncated) = list_operator(&operator, "prefix/", 0, 1, true, true)
+    let (entries, cursor) = list_operator(&operator, "prefix/", &list_request(1, true, true))
         .await
         .unwrap();
 
@@ -738,7 +743,189 @@ async fn recursive_list_truncates() {
         entries[0].kind,
         aruna_core::structs::execution::source_access::SourceEntryKind::File
     );
-    assert!(truncated);
+    assert_eq!(cursor, Some(ListCursor::Offset(1)));
+}
+
+fn list_request(limit: usize, recursive: bool, files_only: bool) -> ListRequest {
+    ListRequest {
+        limit,
+        recursive,
+        files_only,
+        ..Default::default()
+    }
+}
+
+/// A ListObjectsV2 endpoint over fixed keys that counts its list requests.
+struct ListingServer {
+    endpoint: String,
+    lists: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ListingServer {
+    async fn bind(keys: &'static [&'static str]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let lists = Arc::new(AtomicUsize::new(0));
+        let counted = lists.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                let target = request.split(' ').nth(1).unwrap_or("/").to_string();
+                let url = reqwest::Url::parse(&format!("http://local{target}")).unwrap();
+                let response = if request.starts_with("HEAD ") {
+                    let key = url.path().trim_start_matches("/bucket/");
+                    match keys.contains(&key) {
+                        true => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"{}\"\r\nConnection: close\r\n\r\n",
+                            key_etag(key)
+                        ),
+                        false => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    }
+                } else {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let body = list_body(keys, &url);
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        Self {
+            endpoint,
+            lists,
+            task,
+        }
+    }
+
+    fn operator(&self) -> Operator {
+        build_service::<services::S3>(
+            s3_operator_config(HashMap::from([
+                ("bucket".to_string(), "bucket".to_string()),
+                ("endpoint".to_string(), self.endpoint.clone()),
+                ("region".to_string(), "us-east-1".to_string()),
+                ("skip_signature".to_string(), "true".to_string()),
+            ])),
+            None,
+        )
+        .unwrap()
+    }
+}
+
+impl Drop for ListingServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn key_etag(key: &str) -> String {
+    format!("{:x}", md5::compute(key))
+}
+
+fn list_body(keys: &[&str], url: &reqwest::Url) -> String {
+    let query = |name: &str| {
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.to_string())
+            .unwrap_or_default()
+    };
+    let (prefix, after) = (query("prefix"), query("start-after"));
+    let token = query("continuation-token");
+    let max_keys = query("max-keys").parse::<usize>().unwrap_or(1000);
+    let floor = after.max(token);
+    let mut matched = keys
+        .iter()
+        .filter(|key| key.starts_with(&prefix) && **key > floor.as_str());
+    let page: Vec<&&str> = matched.by_ref().take(max_keys).collect();
+    let truncated = matched.next().is_some();
+    let mut body = format!("<ListBucketResult><IsTruncated>{truncated}</IsTruncated>");
+    if truncated && let Some(last) = page.last() {
+        body.push_str(&format!(
+            "<NextContinuationToken>{last}</NextContinuationToken>"
+        ));
+    }
+    for key in page {
+        body.push_str(&format!(
+            "<Contents><Key>{key}</Key><LastModified>2026-01-02T03:04:05.678Z</LastModified>\
+             <ETag>&quot;{}&quot;</ETag><Size>3</Size></Contents>",
+            key_etag(key)
+        ));
+    }
+    body.push_str("</ListBucketResult>");
+    body
+}
+
+const LISTED_KEYS: &[&str] = &["a/1", "a/2", "a/3", "a/4", "a/5", "b/1"];
+
+#[tokio::test]
+async fn list_resumes_after() {
+    let server = ListingServer::bind(LISTED_KEYS).await;
+    let operator = server.operator();
+    let mut request = list_request(2, true, true);
+    let mut pages = Vec::new();
+    loop {
+        let (entries, cursor) = list_operator(&operator, "a/", &request).await.unwrap();
+        pages.push(
+            entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+        );
+        if let Some(entry) = entries.first() {
+            assert_eq!(
+                entry.etag.as_deref(),
+                Some(format!("\"{}\"", key_etag(&entry.path)).as_str())
+            );
+            assert_eq!(entry.size, Some(3));
+        }
+        match cursor {
+            Some(cursor) => request.cursor = Some(cursor),
+            None => break,
+        }
+    }
+
+    assert_eq!(pages, [vec!["a/1", "a/2"], vec!["a/3", "a/4"], vec!["a/5"]]);
+    // One provider request per page: a full page never fetches the next one ahead.
+    assert_eq!(server.lists.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn list_keeps_bounds() {
+    let server = ListingServer::bind(LISTED_KEYS).await;
+    let request = ListRequest {
+        lower: Some("a/2".to_string()),
+        stop: Some("a/4".to_string()),
+        ..list_request(10, true, true)
+    };
+
+    let (entries, cursor) = list_operator(&server.operator(), "a/", &request)
+        .await
+        .unwrap();
+
+    let paths: Vec<_> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    assert_eq!(paths, ["a/2", "a/3"]);
+    assert_eq!(cursor, None);
+
+    let flat = ListRequest {
+        recursive: false,
+        ..request
+    };
+    let refused = list_operator(&server.operator(), "a/", &flat).await;
+    assert!(matches!(
+        refused,
+        Err(StagingSourceError::InvalidListing(_))
+    ));
 }
 
 #[test]
