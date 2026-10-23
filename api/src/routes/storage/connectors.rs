@@ -948,7 +948,7 @@ path.
 - An `http` connector has no listing protocol, so its entries are parsed out of the server's HTML
   directory index and a server that serves none fails with 502.
 
-**Paging**
+**Limits**
 - `truncated` says more entries may follow; `next_cursor` is then set and passed back as `cursor`
   with the same `path` to read the next page. A page can be short or even empty while more follow.
 - S3 sources continue after the last listed key. Sources without a provider cursor (`http`,
