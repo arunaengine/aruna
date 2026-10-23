@@ -276,7 +276,7 @@ mod tests {
             set_id: Ulid::from_bytes([4; 16]),
             member_id: Ulid::from_bytes([5; 16]),
             incarnation: 6,
-            revision: 3,
+            revision: Default::default(),
         });
         assert!(accept_existing(&info, group_id, "b").is_err());
     }

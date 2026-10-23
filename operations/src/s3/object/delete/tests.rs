@@ -1824,7 +1824,7 @@ fn marker_carries_hint() {
         set_id,
         member_id: Ulid::from_bytes([8u8; 16]),
         incarnation: 1,
-        revision: 1,
+        revision: Default::default(),
     }));
     assert_eq!(hint, Some(SetHint::of_set(set_id)));
     assert_eq!(SetHint::of_version(hinted), SetHint::of_set(set_id));

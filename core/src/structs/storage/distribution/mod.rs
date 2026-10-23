@@ -52,8 +52,9 @@ pub struct DistributionBinding {
     pub member_id: Ulid,
     /// The local bucket incarnation this member admitted with.
     pub incarnation: u128,
-    /// The record revision the binding was last aligned with.
-    pub revision: u64,
+    /// The record revision the binding was last aligned with, digest included, so a binding
+    /// aligned with a losing branch is told apart from the winner.
+    pub revision: DistributionRevision,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
