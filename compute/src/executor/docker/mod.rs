@@ -2331,6 +2331,35 @@ mod tests {
     }
 
     #[test]
+    fn lists_matched_directory() {
+        // MultiQC's `*_data` names a directory, so the files below it are the outputs.
+        let bytes = make_archive(&[
+            (
+                "work/multiqc_data/multiqc.log",
+                tar::EntryType::Regular,
+                b"1",
+            ),
+            (
+                "work/multiqc_data/plots/a.txt",
+                tar::EntryType::Regular,
+                b"2",
+            ),
+            ("work/multiqc_report.html", tar::EntryType::Regular, b"3"),
+        ]);
+        let glob = OutputMatcher::new(["/work/*_data"]).unwrap();
+
+        let matched = list_archive(io::Cursor::new(bytes), Path::new("/"), &glob).unwrap();
+
+        assert_eq!(
+            matched,
+            vec![
+                "/work/multiqc_data/multiqc.log",
+                "/work/multiqc_data/plots/a.txt"
+            ]
+        );
+    }
+
+    #[test]
     fn skips_invalid_listing() {
         // A file whose name is not UTF-8 cannot be addressed as an output, but
         // it must not fail the capture of the files that can be.
