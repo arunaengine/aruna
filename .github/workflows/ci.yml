@@ -256,8 +256,8 @@ jobs:
       - name: Run the Docker backend cases
         run: >-
           cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=idempotent_submit) | test(=resubmit_after_removal) | test(=exit_code_capture) | test(=file_transfer) | test(=wildcard_outputs) | test(=chunked_transfer) | test(=cancelled_submit) | test(=cancel_stops) | test(=created_cancel_removes) | test(=reconcile_adopts) | test(=log_bounds) | test(=resource_limits) | test(=foreign_not_adopted) | test(=wait_is_observational)'
+          --test integration --locked --run-ignored all --no-tests fail
+          -E 'test(/^docker_backend::(idempotent_submit|resubmit_after_removal|exit_code_capture|file_transfer|wildcard_outputs|chunked_transfer|cancelled_submit|cancel_stops|created_cancel_removes|reconcile_adopts|log_bounds|resource_limits|foreign_not_adopted|wait_is_observational)$/)'
 
   # The compute and node manifests define the supported backend selections; an
   # all-feature build alone can hide a conditional-import mistake. The all-feature
