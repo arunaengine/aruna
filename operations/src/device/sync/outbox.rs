@@ -86,6 +86,11 @@ impl QueueDrain for UploadDrain<'_> {
         if folder.state == FolderState::Deleting {
             return ForwardOutcome::Settled;
         }
+        // A deletion the owner stopped propagating stays local; the next pass reports it.
+        if upload.deleted && !folder.propagate_deletes {
+            drop_upload(self.context, &upload).await;
+            return ForwardOutcome::Settled;
+        }
         let attempts = upload.attempts().saturating_add(1);
         if !claim_upload(self.context, &upload, attempts).await {
             return ForwardOutcome::Settled;
@@ -574,6 +579,35 @@ mod tests {
             stored(&context, &entry).await.state,
             UploadState::Pending { attempts: 1, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn drops_suppressed_delete() {
+        // Propagation was turned off after the deletion queued: it is never forwarded.
+        let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
+        let folder = folder(Ulid::generate());
+        store_folder(&context, &folder).await.unwrap();
+        let entry = SyncUpload {
+            deleted: true,
+            ..upload(folder.folder_id)
+        };
+        store(&context, &entry).await;
+
+        assert_eq!(
+            drain(&context).forward(entry.clone()).await,
+            ForwardOutcome::Settled
+        );
+        assert!(
+            read_value(
+                &context,
+                SYNC_UPLOAD_KEYSPACE,
+                base_key(entry.folder_id, &entry.relative),
+                None,
+            )
+            .await
+            .is_none()
+        );
     }
 
     #[tokio::test]
