@@ -101,6 +101,8 @@ pub const COMPRESSION_QUEUE_KEYSPACE: &str = "compression_migration_queue";
 /// Moves asked to rename linked files of earlier patterns: the start time of the move record
 /// they belong to, keyed by bucket name.
 pub const RENAME_MOVE_KEYSPACE: &str = "compression_migration_renames";
+/// The files a rename planned to rename, keyed by bucket name: a `RenameTotal`.
+pub const RENAME_TOTAL_KEYSPACE: &str = "compression_migration_totals";
 /// Where an ending storage move stands in handing its intents over, keyed by bucket name.
 pub const MOVE_HANDOVER_KEYSPACE: &str = "compression_migration_handovers";
 /// Where the next pass over the blob cleanup queue starts.
@@ -459,6 +461,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE,
     RENAME_MOVE_KEYSPACE,
+    RENAME_TOTAL_KEYSPACE,
     LINKED_JOB_KEYSPACE,
     CLEANUP_CURSOR_KEYSPACE,
     MOVE_HANDOVER_KEYSPACE,

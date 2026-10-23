@@ -915,6 +915,9 @@ restrictions are refused.
   place and counts as failed.
 - The move also moves the folder's other versions to where a new upload of their key goes, as
   `POST /data/buckets/{bucket}/storage/move` does. Progress shows in `GET` on this path.
+- The planned `count` of files to rename is stored with the move. It shows as the rename's
+  `total` in `GET /data/groups/{group_id}/storage/imports/{import_id}/organize/job` and in `job`
+  of `GET /data/groups/{group_id}/storage/buckets`.
 - A pattern change is refused while the rename runs, and a version that changed meanwhile
   keeps its file.
 
@@ -985,7 +988,7 @@ pub async fn start_renames(
     // Files written after the check are authorized one by one when the rename reaches them.
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
     let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms())
-        .renaming((auth.clone(), state.get_node_id()), grant)
+        .renaming((auth.clone(), state.get_node_id()), grant, checked.files)
         .with_guards(guards);
     let record = drive(operation, &state.get_ctx())
         .await

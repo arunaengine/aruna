@@ -8,11 +8,12 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
-    LINKED_JOB_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE,
+    LINKED_JOB_KEYSPACE, RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE,
+    TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::backend_import::{RenameRequest, TokenGrant};
+use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal, TokenGrant};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
@@ -134,8 +135,9 @@ pub struct StartMoveOperation {
     group_id: GroupId,
     prefix: String,
     now_ms: u64,
-    /// Also gives linked files of earlier patterns their current name, for this caller.
-    renaming: Option<(AuthContext, NodeId, TokenGrant)>,
+    /// Also gives linked files of earlier patterns their current name, for this caller, with
+    /// the files the rename plans to rename.
+    renaming: Option<(AuthContext, NodeId, TokenGrant, u64)>,
     /// Values read when the caller's access to the renamed files was checked; the move
     /// starts only while they are unchanged.
     guards: Vec<(String, Key, Option<Value>)>,
@@ -160,9 +162,15 @@ impl StartMoveOperation {
     }
 
     /// Asks the move to rename linked files of earlier patterns, each only while `auth` may
-    /// write its key; an ordinary move never renames.
-    pub fn renaming(mut self, (auth, node_id): (AuthContext, NodeId), grant: TokenGrant) -> Self {
-        self.renaming = Some((auth, node_id, grant));
+    /// write its key; an ordinary move never renames. `total` is the files the rename plans to
+    /// rename, stored with the request.
+    pub fn renaming(
+        mut self,
+        (auth, node_id): (AuthContext, NodeId),
+        grant: TokenGrant,
+        total: u64,
+    ) -> Self {
+        self.renaming = Some((auth, node_id, grant, total));
         self
     }
 
@@ -224,9 +232,10 @@ impl StartMoveOperation {
         )?;
         let record = move_record(stored, info.compression, &self.prefix, self.now_ms)?;
         let mut writes = move_rows(&self.bucket, &record)?;
-        if let Some((auth, node_id, grant)) = self.renaming.clone() {
+        if let Some((auth, node_id, grant, total)) = self.renaming.clone() {
+            let started_at_ms = record.started_at_ms;
             let request = RenameRequest {
-                started_at_ms: record.started_at_ms,
+                started_at_ms,
                 auth,
                 node_id,
                 grant,
@@ -235,7 +244,16 @@ impl StartMoveOperation {
             };
             let key: Key = self.bucket.as_bytes().to_vec().into();
             let value = request.to_bytes()?.into();
-            writes.push((RENAME_MOVE_KEYSPACE.to_string(), key, value));
+            writes.push((RENAME_MOVE_KEYSPACE.to_string(), key.clone(), value));
+            let total = RenameTotal {
+                started_at_ms,
+                total,
+            };
+            writes.push((
+                RENAME_TOTAL_KEYSPACE.to_string(),
+                key,
+                total.to_bytes()?.into(),
+            ));
         }
         self.output = Some(Ok(record));
         Ok(writes)
@@ -397,7 +415,7 @@ mod tests {
         for renaming in [false, true] {
             let mut operation = StartMoveOperation::new("b".into(), group_id, "in/".into(), 7);
             if renaming {
-                operation = operation.renaming((asker(), node()), grant());
+                operation = operation.renaming((asker(), node()), grant(), 3);
             }
             let info = Some(info.to_bytes().unwrap().into());
             let values = vec![(Key::from(vec![]), info), (vec![].into(), None)];
@@ -417,6 +435,16 @@ mod tests {
                 aborted_at_ms: None,
             };
             assert_eq!(asked, renaming.then_some(expected));
+            // The planned total belongs to the same move.
+            let total = writes
+                .iter()
+                .find(|(space, ..)| space == RENAME_TOTAL_KEYSPACE)
+                .map(|(_, _, value)| RenameTotal::from_bytes(value).unwrap());
+            let planned = RenameTotal {
+                started_at_ms: 7,
+                total: 3,
+            };
+            assert_eq!(total, renaming.then_some(planned));
         }
     }
 
@@ -430,7 +458,7 @@ mod tests {
             Some(Value::from(vec![2])),
         );
         let mut operation = StartMoveOperation::new("b".into(), group_id, "in/".into(), 7)
-            .renaming((asker(), node()), grant())
+            .renaming((asker(), node()), grant(), 0)
             .with_guards(vec![guard]);
         operation.start();
         let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
