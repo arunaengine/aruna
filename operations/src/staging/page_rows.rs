@@ -270,8 +270,8 @@ pub(crate) fn version_reads(
     Ok(reads)
 }
 
-/// A head of this connector's file with the same observation is kept as it is; any other
-/// head written after the job started is a newer write the import must not replace.
+/// A head of this connector's file with the same observation is kept as it is. Any other head
+/// written after the job started, the same file's included, is newer than the listing.
 fn plan_entry(
     input: &PageImportInput,
     job_created_ms: u64,
@@ -282,26 +282,21 @@ fn plan_entry(
     let (Some(head), Some(version)) = (head, version) else {
         return EntryPlan::Register;
     };
-    let BlobVersionState::Reference {
+    if let BlobVersionState::Reference {
         source,
         cached_metadata,
         ..
     } = &version.state
-    else {
-        return match head.version_id.timestamp_ms() >= job_created_ms {
-            true => EntryPlan::Kept,
-            false => EntryPlan::Register,
-        };
-    };
-    let same_source = source.connector_id == Some(input.connector.connector_id)
-        && source.descriptor.source_path == entry.source_path;
-    if same_source && cached_metadata.compare(&entry.observation) == ObservationMatch::Same {
+        && source.connector_id == Some(input.connector.connector_id)
+        && source.descriptor.source_path == entry.source_path
+        && cached_metadata.compare(&entry.observation) == ObservationMatch::Same
+    {
         return EntryPlan::Unchanged;
     }
-    if !same_source && head.version_id.timestamp_ms() >= job_created_ms {
-        return EntryPlan::Kept;
+    match head.version_id.timestamp_ms() >= job_created_ms {
+        true => EntryPlan::Kept,
+        false => EntryPlan::Register,
     }
-    EntryPlan::Register
 }
 
 /// Builds the page's rows: versions, heads and connector reference rows of new entries,

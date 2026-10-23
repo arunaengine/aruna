@@ -379,6 +379,28 @@ fn newer_write_kept() {
     assert_eq!(result.checkpoint.errors[0].target_key, newer.target_key);
 }
 
+// A drift successor of the same file written after the job started is newer than the listing.
+#[test]
+fn newer_same_kept() {
+    let first = entry("a");
+    let mut operation = PageImportOperation::new(input(vec![first.clone()]));
+    let held = reference(&first.source_path, observation("drifted"), true);
+
+    let writes = run_to_writes(
+        &mut operation,
+        vec![head(Ulid::from_parts(JOB_CREATED_MS + 1, 1))],
+        Some(vec![held]),
+    );
+
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 0);
+    operation.step(written());
+    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: txn(),
+    }));
+    let result = operation.finalize().unwrap();
+    assert_eq!((result.registered, result.kept), (0, 1));
+}
+
 #[test]
 fn guards_abort_page() {
     let fence = StoragePurgeFence {
