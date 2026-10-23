@@ -288,10 +288,12 @@ pub async fn route_metadata_update(
             MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
         })?;
     // On a device a selected or read document is edited locally and queued; a holder sees the
-    // change set when the intake drain forwards it. Only a holder can check an expected revision.
+    // change set when the intake drain forwards it. Only a holder can check an expected revision
+    // or change visibility, so those always go to a holder and fail while none answers.
     let by_owner =
         node_kind(&config, actor.node_id).and_then(|kind| kind.owner()) == Some(actor.user_id);
     if expected_revision.is_none()
+        && public.is_none()
         && let Some(replica) =
             device_replica(context, &config, Some(actor.node_id), document_id).await
         && accepts_edits(&replica, by_owner)

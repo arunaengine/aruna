@@ -499,6 +499,69 @@ mod tests {
         assert!(accepts_edits(&replica(&record), false));
     }
 
+    // A visibility change only a holder can apply is never queued as a local edit: offline it
+    // fails, while a plain edit of the same read copy still queues.
+    #[tokio::test]
+    async fn forwards_visibility_change() {
+        use crate::metadata::forward::route_metadata_update;
+        use aruna_core::document::DocumentTarget;
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+
+        let (_dir, context, record) = device().await;
+        let owner = UserId::local(Ulid::generate(), record.realm_id);
+        let actor = Actor {
+            node_id: node(1),
+            user_id: owner,
+            realm_id: record.realm_id,
+        };
+        let mut config = RealmConfigDocument::new(record.realm_id, Vec::new(), 1);
+        config.ensure_node(node(1), RealmNodeKind::User { owner });
+        let target = DocumentTarget::RealmConfig {
+            realm_id: record.realm_id,
+        };
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let mut read = replica(&record);
+        read.selected = false;
+        read.displayed_jsonld = r#"{"@graph":[]}"#.to_string();
+        assert!(crate::device::replica::store_replica(&context, &read).await);
+        let update = |public: Option<bool>| {
+            route_metadata_update(
+                &context,
+                actor.clone(),
+                None,
+                record.document_id,
+                public,
+                contact("ada"),
+                None,
+                None,
+                None,
+            )
+        };
+
+        assert!(update(Some(false)).await.is_err());
+        assert!(
+            crate::device::sync_status::read_publish_entries(&context)
+                .await
+                .is_empty()
+        );
+        update(None).await.expect("a plain edit queues locally");
+        assert_eq!(
+            crate::device::sync_status::read_publish_entries(&context)
+                .await
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn edits_share_actor() {
         // Reusing the device's actor keeps clocks small; its dots must stay ordered.
