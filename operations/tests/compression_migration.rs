@@ -210,7 +210,7 @@ async fn migrates_bucket_copies() {
     let second = put(&context, "b.txt", &shared).await;
     // More versions than one page, so the run has to resume from stored progress.
     let mut small = Vec::new();
-    for index in 0..70 {
+    for index in 0..260 {
         let key = format!("small/{index:03}");
         small.push((key.clone(), put(&context, &key, key.as_bytes()).await));
     }
@@ -229,7 +229,7 @@ async fn migrates_bucket_copies() {
     assert!(partial.cursor.is_some() && partial.finished_at_ms.is_none());
     assert!(run(&context).await.is_none());
     let done = progress(&context).await;
-    assert_eq!((done.migrated, done.failed), (72, 0));
+    assert_eq!((done.migrated, done.failed), (262, 0));
     assert!(done.finished_at_ms.is_some());
 
     let class = EncodingClass::Zstd { level: 3 };

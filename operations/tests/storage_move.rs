@@ -237,7 +237,7 @@ async fn moves_bucket_copies() {
     let kept = put(&context, "other/b.txt", b"kept research data").await;
     // More versions than one page, so the move has to resume from stored progress.
     let mut small = Vec::new();
-    for index in 0..70 {
+    for index in 0..260 {
         let key = format!("data/{index:03}");
         small.push((key.clone(), put(&context, &key, key.as_bytes()).await));
     }
@@ -249,7 +249,7 @@ async fn moves_bucket_copies() {
     let counted = count_misplaced(&context.driver, BUCKET, "", None)
         .await
         .unwrap();
-    assert_eq!((counted.count, counted.complete), (71, true));
+    assert_eq!((counted.count, counted.complete), (261, true));
 
     let start = StartMoveOperation::new(BUCKET.to_string(), context.group_id, "data/".into(), 1);
     drive(start, &context.driver).await.unwrap();
@@ -259,7 +259,7 @@ async fn moves_bucket_copies() {
     assert!(partial.cursor.is_some() && partial.finished_at_ms.is_none());
     assert!(run(&context).await.is_none());
     let done = progress(&context).await;
-    assert_eq!((done.migrated, done.failed, done.skipped), (71, 0, 1));
+    assert_eq!((done.migrated, done.failed, done.skipped), (261, 0, 1));
 
     let moved = version(&context, "data/a.txt", first).await;
     assert_eq!(moved.location_key().unwrap().backend, cold());

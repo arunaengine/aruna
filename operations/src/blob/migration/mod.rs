@@ -1582,9 +1582,14 @@ const RULE_PAGE: usize = 128;
 
 /// Versions one task run handles per bucket before it yields to other timers.
 const MIGRATION_PAGE: usize = 64;
+/// Versions with work one migration run handles per bucket before it stores its progress;
+/// the next run follows at once, so this only sets how often progress is saved.
+const MIGRATION_WORK: usize = 256;
+/// Version rows one migration run passes over before it stores its progress, likewise.
+const MIGRATION_ROWS: usize = 4096;
 /// Queued buckets one task run advances; the next run continues after the last one.
 const BUCKET_PAGE: usize = 16;
-/// Delay between task runs while a migration still has versions left.
+/// Delay between task runs while hand-overs, storage checks or encryption transitions go on.
 pub const MIGRATION_CONTINUE: Duration = Duration::from_secs(1);
 /// Passes started again after a pass with failures, before the migration ends with them.
 const MIGRATION_RETRIES: u32 = 10;
@@ -1779,12 +1784,16 @@ async fn migrate_page(
         BLOB_VERSIONS_KEYSPACE,
         Some(prefix.into()),
         record.cursor.clone().map(Into::into),
-        MIGRATION_PAGE,
+        MIGRATION_ROWS,
         None,
     )
     .await?;
-    let mut stopped = false;
+    let (mut stopped, mut worked, mut more) = (false, 0usize, next.is_some());
     for (key, _) in &versions {
+        if worked == MIGRATION_WORK {
+            more = true;
+            break;
+        }
         // A pause or an abort of the rename stops it before the next version.
         if request.is_some() && rename_stopped(context, bucket, &record).await? {
             stopped = true;
@@ -1814,6 +1823,7 @@ async fn migrate_page(
         }
         let moved = crate::driver::drive(operation, context).await;
         let broken = moved.is_err() && moving && is_broken(context, key).await;
+        worked += usize::from(!matches!(moved, Ok(MigrateOutcome::Skipped)));
         match moved {
             Ok(MigrateOutcome::Migrated) => record.migrated += 1,
             Ok(MigrateOutcome::Skipped) => record.skipped += 1,
@@ -1841,8 +1851,9 @@ async fn migrate_page(
         );
     }
     let now = crate::effect_adapters::routing::now_ms();
-    let after = match (next.is_some(), record.failed > 0) {
-        (true, _) => Some(MIGRATION_CONTINUE),
+    let after = match (more, record.failed > 0) {
+        // This run moved the cursor, so the rows left can go on at once.
+        (true, _) => Some(Duration::ZERO),
         // Successful versions are already in the target, so a retry pass reads no blob for them.
         (false, true) if record.retries < MIGRATION_RETRIES => {
             let wait = retry_delay(record.retries);
@@ -2851,6 +2862,58 @@ mod tests {
         expired.grant.expires_at_secs = 1;
         let access = rename_access(&context, &expired, &routing, "b").await;
         assert!(access.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn passes_skipped_versions() {
+        // Versions with nothing to do do not use up a run; only the others count toward it, and
+        // rows left go on at once while a failure pass waits for its retry.
+        let temp = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let context = crate::tests::s3::test_context(storage.clone());
+        let record = CompressionMigration::new(ZSTD, 1);
+        let put = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        let progress = record.to_bytes().unwrap();
+        let seeded = put(COMPRESSION_MIGRATION_KEYSPACE, b"b".to_vec(), progress);
+        storage.send_storage_effect(seeded).await;
+        let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+        let row =
+            |index: usize| VersionKey::new("b", format!("k{index:03}"), Ulid::from_parts(1, 1));
+        for index in 0..200 + MIGRATION_WORK + 44 {
+            // Deleted versions are skipped; the later rows cannot be read and fail.
+            let value = match index < 200 {
+                true => deleted.to_bytes().unwrap(),
+                false => b"unreadable".to_vec(),
+            };
+            let write = put(
+                BLOB_VERSIONS_KEYSPACE,
+                row(index).to_bytes().unwrap(),
+                value,
+            );
+            storage.send_storage_effect(write).await;
+        }
+
+        let after = migrate_page(&context, "b", record).await.unwrap();
+
+        assert_eq!(after, Some(Duration::ZERO));
+        let key: Key = b"b".to_vec().into();
+        let stored = read_progress(&context, &key).await.unwrap().unwrap();
+        assert_eq!(
+            (stored.skipped, stored.failed),
+            (200, MIGRATION_WORK as u64)
+        );
+        let last = row(200 + MIGRATION_WORK - 1).to_bytes().unwrap();
+        assert_eq!(stored.cursor, Some(last));
+        let after = migrate_page(&context, "b", stored).await.unwrap();
+        assert_eq!(after, Some(retry_delay(0)));
+        let stored = read_progress(&context, &key).await.unwrap().unwrap();
+        assert_eq!(stored.failed, MIGRATION_WORK as u64 + 44);
+        assert!(stored.retry_at_ms.is_some());
     }
 
     #[tokio::test]
