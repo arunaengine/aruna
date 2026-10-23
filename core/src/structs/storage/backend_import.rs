@@ -25,6 +25,10 @@ pub const DEFAULT_PATTERN: &str = "{dir}{name}~{id}";
 /// Write pattern of a provider bucket linked to a bucket: the bucket key, unchanged.
 pub const PLAIN_PATTERN: &str = "{dir}{name}";
 
+/// Bytes one provider copy part takes at most; the provider limit is 5 GiB. A larger file
+/// without a provider version is copied through the node.
+pub const COPY_PART: u64 = 1 << 30;
+
 /// Registers the objects under `backend_prefix` of a group backend in `bucket` under
 /// `key_prefix`. The bytes stay where they are and Aruna never deletes them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

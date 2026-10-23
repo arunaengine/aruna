@@ -12,7 +12,9 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle as _;
 use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path, version_key};
+use aruna_core::structs::storage::backend_import::{
+    COPY_PART, PlainPath, tagged_path, version_key,
+};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, ResolvedBackend,
 };
@@ -101,22 +103,23 @@ impl BlobHandler {
     }
 
     /// Copies `source` to `plain.path`: inside the provider where both lie on one S3 storage
-    /// and the source has a recorded version, else through the node.
+    /// and the source has a recorded version or fits one part with a known MD5, else through
+    /// the node.
     pub(super) async fn copy_plain(
         &self,
         resolved: ResolvedBackend,
         plain: PlainPath,
         source: BackendLocation,
     ) -> BlobEvent {
-        // Without a version the node streams the newest bytes; the caller checks their hash.
+        // Without a version or MD5 proof the node streams the bytes; the caller checks their hash.
         let exact = match self.read_version(&source).await {
             Ok(version) => version,
             Err(error) => return BlobEvent::Error(error),
         };
         let inside = resolved.backend == source.backend && !is_folder(&source);
-        let native = match (inside, exact.as_deref()) {
-            (true, Some(_)) => self.native_for(&source).ok().flatten(),
-            _ => None,
+        let native = match inside && (exact.is_some() || provable(&source)) {
+            true => self.native_for(&source).ok().flatten(),
+            false => None,
         };
         if let Some(native) = native {
             let copied = self.copy_inside(
@@ -140,9 +143,10 @@ impl BlobHandler {
         }
     }
 
-    /// The provider copies the exact source version in parts of at most `COPY_PART` bytes and
-    /// completes create-only where asked, and the size is checked. `None` asks for a streamed
-    /// copy: the provider refused a part, or a one-part copy's ETag is not the source MD5.
+    /// The provider copies the source version, or its current bytes, in parts of at most
+    /// `COPY_PART` bytes and completes create-only where asked, and the size is checked. `None`
+    /// asks for a streamed copy: the provider refused a part, or a one-part copy's ETag is not
+    /// the source MD5.
     async fn copy_inside(
         &self,
         resolved: ResolvedBackend,
@@ -705,8 +709,12 @@ fn conditional_unsupported(error: &opendal::Error) -> bool {
     }
 }
 
-/// Bytes one copied part takes at most; the provider limit is 5 GiB.
-const COPY_PART: u64 = 1 << 30;
+/// Whether a copy without a provider version proves its bytes: one part, whose ETag must
+/// be the source MD5.
+fn provable(source: &BackendLocation) -> bool {
+    let md5 = aruna_core::structs::checksum::HASH_MD5;
+    source.blob_size <= COPY_PART && source.hashes.contains_key(md5)
+}
 
 /// The inclusive byte ranges of a copy; `None` copies an object of one part whole.
 fn copy_ranges(size: u64) -> Vec<Option<(u64, u64)>> {
@@ -757,6 +765,32 @@ mod tests {
         )
         .with_context("uri", "https://s3/b/01M5G_NotImplementedError.py");
         assert!(!conditional_unsupported(&uri));
+    }
+
+    #[test]
+    fn proves_unversioned_copies() {
+        // Without a provider version only one part with a known MD5 proves its copy.
+        let mut source = BackendLocation {
+            backend: BackendRef::Group(ulid::Ulid::nil()),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: "raw/a.faa.gz".to_string(),
+            ulid: ulid::Ulid::nil(),
+            format: StoredFormat::default(),
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: COPY_PART,
+            hashes: HashMap::new(),
+        };
+        assert!(!provable(&source));
+        let md5 = aruna_core::structs::checksum::HASH_MD5.to_string();
+        source.hashes.insert(md5, vec![0; 16]);
+        assert!(provable(&source));
+        source.blob_size = COPY_PART + 1;
+        assert!(!provable(&source));
     }
 
     #[test]
