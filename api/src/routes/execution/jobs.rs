@@ -1147,7 +1147,8 @@ additionally need WRITE on that bucket, which must belong to the same group.
 - A local run stages inputs the device holds, each pinned to the version it resolves to at accept
   time. An input naming `source_node_id` and `version_id` is read at that exact version, so an
   unreachable holder fails the run rather than the submission.
-- A local run's outputs stay node-local until the owner publishes them. A mounted input and
+- A local run's outputs stay node-local until the owner publishes them with
+  `POST /device/compute/runs/{job_id}/publish`. A mounted input and
   `workspace.mode` `existing` are both refused: a device stages files, exposes no S3 endpoint a
   container could reach, and names no workspace bucket.
 

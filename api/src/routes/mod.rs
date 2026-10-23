@@ -436,6 +436,7 @@ pub(crate) mod tests {
         ("POST", "/data/sync/relationships"),
         ("POST", "/data/sync/relationships/{id}/run"),
         ("POST", "/device/drafts"),
+        ("POST", "/device/compute/runs/{job_id}/publish"),
         ("POST", "/device/drafts/preview"),
         ("POST", "/device/folders"),
         ("POST", "/device/folders/{folder_id}/actions"),
