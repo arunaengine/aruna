@@ -12,10 +12,10 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     COMPRESSION_MIGRATION_KEYSPACE, LINKED_JOB_KEYSPACE, PURGE_FENCE_KEYSPACE,
-    RENAME_MOVE_KEYSPACE, STORAGE_CHECK_KEYSPACE, TRANSITION_KEYSPACE,
+    RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, STORAGE_CHECK_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::storage::backend_import::{BackendImport, RenameRequest};
+use aruna_core::structs::storage::backend_import::{BackendImport, RenameRequest, RenameTotal};
 use aruna_core::structs::storage::broken::StorageCheck;
 use aruna_core::structs::storage::format::CompressionMigration;
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState, LinkedTask};
@@ -49,6 +49,8 @@ pub struct ActiveJob {
     /// Items the job finished so far, changed or left as they are.
     pub done: u64,
     pub failed: u64,
+    /// The files a rename planned to rename, where its start stored them.
+    pub total: Option<u64>,
 }
 
 impl ActiveJob {
@@ -58,14 +60,16 @@ impl ActiveJob {
             paused: false,
             done,
             failed,
+            total: None,
         }
     }
 }
 
 /// The job rows kept per bucket, in the order `Rows::parse` takes them.
-const SPACES: [&str; 6] = [
+const SPACES: [&str; 7] = [
     COMPRESSION_MIGRATION_KEYSPACE,
     RENAME_MOVE_KEYSPACE,
+    RENAME_TOTAL_KEYSPACE,
     LINKED_JOB_KEYSPACE,
     TRANSITION_KEYSPACE,
     STORAGE_CHECK_KEYSPACE,
@@ -76,6 +80,7 @@ const SPACES: [&str; 6] = [
 struct Rows {
     migration: Option<CompressionMigration>,
     rename: Option<RenameRequest>,
+    total: Option<RenameTotal>,
     linked: Option<LinkedJob>,
     transition: Option<EncryptionTransition>,
     check: Option<StorageCheck>,
@@ -94,6 +99,7 @@ impl Rows {
                 .as_deref()
                 .map(RenameRequest::from_bytes)
                 .transpose()?,
+            total: next().as_deref().map(RenameTotal::from_bytes).transpose()?,
             linked: next().as_deref().map(LinkedJob::from_bytes).transpose()?,
             transition: (next().as_deref())
                 .map(EncryptionTransition::from_bytes)
@@ -124,8 +130,10 @@ impl Rows {
             let paused =
                 rename.is_some_and(|request| request.paused && request.aborted_at_ms.is_none());
             let done = record.migrated.saturating_add(record.skipped);
+            let total = rename.and(self.total);
             return Some(ActiveJob {
                 paused,
+                total: total.and_then(|row| row.for_move(record.started_at_ms)),
                 ..ActiveJob::running(kind, done, record.failed)
             });
         }
@@ -291,6 +299,16 @@ mod tests {
         record.moving = true;
         rows.migration = Some(record.clone());
         assert_eq!(rows.active(), job(JobKind::Rename, true, 5, 1));
+        // A rename shows the total its start stored, never one of an older move.
+        let total = |started_at_ms| RenameTotal {
+            started_at_ms,
+            total: 9,
+        };
+        rows.total = Some(total(6));
+        assert_eq!(rows.active().and_then(|job| job.total), None);
+        rows.total = Some(total(7));
+        assert_eq!(rows.active().and_then(|job| job.total), Some(9));
+        rows.total = None;
         // An aborted rename runs until its move ends; a request of another move is not its own.
         rows.rename = rows.rename.map(|request| RenameRequest {
             aborted_at_ms: Some(9),

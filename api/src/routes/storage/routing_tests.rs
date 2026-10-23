@@ -281,9 +281,10 @@ async fn lists_readable_buckets() {
 #[tokio::test]
 async fn lists_bucket_jobs() {
     use aruna_core::keyspaces::{
-        COMPRESSION_MIGRATION_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE,
+        COMPRESSION_MIGRATION_KEYSPACE, RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE,
+        S3_BUCKET_KEYSPACE,
     };
-    use aruna_core::structs::storage::backend_import::{RenameRequest, TokenGrant};
+    use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal, TokenGrant};
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::{Compression, CompressionMigration};
     let test = setup_state().await;
@@ -330,18 +331,20 @@ async fn lists_bucket_jobs() {
     for (space, value) in rows {
         crate::tests::routes::write_doc(&context, space, key(&test.bucket), value.into()).await;
     }
-    let Json(page) = list_group_buckets(
-        State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
-        Path(test.group_id.to_string()),
-        axum::extract::Query(BucketPageQuery {
+    let list = || async {
+        let query = BucketPageQuery {
             limit: None,
             after: None,
-        }),
-    )
-    .await
-    .unwrap();
-    let page = serde_json::to_value(page).unwrap();
+        };
+        let listed = list_group_buckets(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(test.group_id.to_string()),
+            axum::extract::Query(query),
+        );
+        serde_json::to_value(listed.await.unwrap().0).unwrap()
+    };
+    let page = list().await;
     assert_eq!(page["buckets"][0]["bucket"], "quiet");
     assert!(page["buckets"][0].get("job").is_none());
     assert_eq!(page["buckets"][1]["bucket"], test.bucket.as_str());
@@ -349,4 +352,17 @@ async fn lists_bucket_jobs() {
         page["buckets"][1]["job"],
         serde_json::json!({"kind": "rename", "state": "paused", "done": 5, "failed": 2})
     );
+    // A total stored for an older move stays unknown; the move's own shows.
+    for (started_at_ms, shown) in [(6, None), (7, Some(9))] {
+        let total = RenameTotal {
+            started_at_ms,
+            total: 9,
+        };
+        let row = total.to_bytes().unwrap().into();
+        crate::tests::routes::write_doc(&context, RENAME_TOTAL_KEYSPACE, key(&test.bucket), row)
+            .await;
+        let page = list().await;
+        let total = page["buckets"][1]["job"].get("total");
+        assert_eq!(total.and_then(serde_json::Value::as_u64), shown);
+    }
 }

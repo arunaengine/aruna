@@ -99,6 +99,9 @@ pub struct BucketJob {
     /// Items finished so far, changed or left as they are.
     pub done: u64,
     pub failed: u64,
+    /// The files a rename planned to rename; absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
 }
 
 impl From<ActiveJob> for BucketJob {
@@ -123,6 +126,7 @@ impl From<ActiveJob> for BucketJob {
             state,
             done: job.done,
             failed: job.failed,
+            total: job.total,
         }
     }
 }
@@ -730,6 +734,8 @@ pub async fn put_group_routing(
   stays `running` until its move ends.
 - `done` counts items finished: versions or keys changed or left as they are, versions checked or
   removed, files imported or skipped. A purge counts no `failed`.
+- `total` is the planned count of files a `rename` renames, stored at its start; absent otherwise.
+  `done` also counts the folder's other versions, so it can pass `total`.
 
 **Limits**
 - 1 to 500 buckets per page, 200 by default; pass `next` as `after` for the next page.
@@ -745,7 +751,9 @@ pub async fn put_group_routing(
                 "bucket": "genes", "backend_id": "01JBCKND0123456789ABCDEFGH",
                 "provider_bucket": "genes", "folder": "genes/", "shared": false,
                 "import_id": "01JMPRT0123456789ABCDEFGHJ", "write_pattern": "{dir}{name}",
-                "job": {"kind": "rename", "state": "paused", "done": 1200, "failed": 3}
+                "job": {
+                    "kind": "rename", "state": "paused", "done": 1200, "failed": 3, "total": 4000
+                }
             }],
             "next": null
         })),
