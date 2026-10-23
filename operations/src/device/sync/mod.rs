@@ -158,7 +158,8 @@ pub async fn reconcile_folder(
             .collect();
         let view = match folder.mode {
             aruna_core::structs::FolderMode::UploadOnly => RemoteView::default(),
-            aruna_core::structs::FolderMode::TwoWay => fetch_heads(context, folder).await?,
+            aruna_core::structs::FolderMode::TwoWay
+            | aruna_core::structs::FolderMode::DownloadOnly => fetch_heads(context, folder).await?,
         };
 
         let mut keys: Vec<String> = local

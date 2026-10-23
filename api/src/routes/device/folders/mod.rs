@@ -68,10 +68,11 @@ pub struct BindFolderRequest {
     /// Key prefix inside the remote bucket. Empty binds the whole bucket.
     #[serde(default)]
     pub remote_prefix: String,
-    /// `two_way` (default) or `upload_only`.
+    /// `two_way` (default), `upload_only` or `download_only`.
     #[serde(default)]
     pub mode: Option<super::dto::FolderModeName>,
-    /// Whether a local delete becomes a realm delete marker. Default true.
+    /// Whether a local delete becomes a realm delete marker. Default true; always false for
+    /// `download_only`.
     #[serde(default)]
     pub propagate_deletes: Option<bool>,
 }
@@ -270,7 +271,8 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
 - `create_bucket` creates a missing remote bucket through the node plane before the listing probe.
 - The directory is walked once and every file becomes one read-only object of that bucket; no byte
   is copied into this node's blob store.
-- `two_way` syncs both directions; `upload_only` never writes to disk.
+- `two_way` syncs both directions; `upload_only` never writes to disk; `download_only` never
+  publishes: local edits and deletions stay local, and `propagate_deletes` is always false.
 - Local data always wins locally: a file is replaced automatically only while its fingerprint and
   its blake3 still equal the recorded synced base. Anything else is preserved and reported, the
   incoming version lands beside it as a conflicted copy, and replacing or removing local bytes is an
@@ -343,6 +345,11 @@ async fn bind_synced_folder(
     let node_id = NodeId::from_str(&request.remote_node_id).map_err(|_| {
         ServerError::BadRequestReason("remote_node_id is not a node id".to_string())
     })?;
+    let mode = match request.mode {
+        Some(super::dto::FolderModeName::UploadOnly) => FolderMode::UploadOnly,
+        Some(super::dto::FolderModeName::DownloadOnly) => FolderMode::DownloadOnly,
+        _ => FolderMode::TwoWay,
+    };
     let folder = bind_folder(
         &state.get_ctx(),
         BindFolderInput {
@@ -355,11 +362,10 @@ async fn bind_synced_folder(
                 prefix: request.remote_prefix,
             },
             create_bucket: request.create_bucket,
-            mode: match request.mode {
-                Some(super::dto::FolderModeName::UploadOnly) => FolderMode::UploadOnly,
-                _ => FolderMode::TwoWay,
-            },
-            propagate_deletes: request.propagate_deletes.unwrap_or(true),
+            mode,
+            // A download-only folder never publishes, so it propagates no deletion either.
+            propagate_deletes: mode != FolderMode::DownloadOnly
+                && request.propagate_deletes.unwrap_or(true),
             realm_id: state.get_realm_id(),
             node_id: state.get_node_id(),
             user_id: auth.user_id,
@@ -829,7 +835,8 @@ for.
 **Behavior**
 - `replace_local` writes the remote version over the local file, but only while the file still
   carries exactly the bytes `expected` names.
-- `keep_local` publishes the local bytes as the next realm version and clears the pending state.
+- `keep_local` publishes the local bytes as the next realm version and clears the pending state;
+  in a `download_only` folder it only clears the pending state.
 - `remove_local` moves the file into the folder's `.aruna/trash/` directory; nothing is ever
   unlinked.
 - `resolve` accepts the current state without touching either side.

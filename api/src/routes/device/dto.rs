@@ -32,6 +32,7 @@ pub enum EntryStateName {
 pub enum FolderModeName {
     TwoWay,
     UploadOnly,
+    DownloadOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -328,6 +329,7 @@ pub fn folder_view(folder: SyncedFolder, counters: FolderCounters) -> SyncedFold
         mode: match folder.mode {
             FolderMode::TwoWay => FolderModeName::TwoWay,
             FolderMode::UploadOnly => FolderModeName::UploadOnly,
+            FolderMode::DownloadOnly => FolderModeName::DownloadOnly,
         },
         propagate_deletes: folder.propagate_deletes,
         state,
