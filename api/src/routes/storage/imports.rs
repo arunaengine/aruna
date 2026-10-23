@@ -905,7 +905,8 @@ restrictions are refused.
 - Each file is copied to its new name inside the provider where it can, and created only
   while that name is free. The copy holds the old file's recorded provider version or ETag, or
   its MD5 is checked. Its version then names the new file, together with the rule's record of
-  the file; the old file is deleted after that.
+  the file. The old file is deleted after that at its provider version; without one only while
+  its name carries the version's id and its size and recorded ETag still match, else it stays.
 - A copy an interrupted rename left at the new name is used again when its size and ETag prove
   the same bytes; no file is read to compare. Another file at the new name keeps the old file in
   place and counts as failed.

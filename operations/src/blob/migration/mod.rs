@@ -1319,9 +1319,13 @@ impl MigrateVersionOperation {
             self.version_key.to_bytes()?.into(),
             migrated.to_bytes()?.into(),
         ));
-        // The old file goes only after this commit makes the version name the new one.
-        let release = (self.plain.as_ref(), self.source_version.clone());
-        if let (true, (Some(plain), Some(version))) = (self.renaming && !unchanged, release) {
+        // The old file goes only after this commit makes the version name the new one; without
+        // a provider version only while its size and recorded ETag still match.
+        let version = (self.source_version.clone())
+            .or_else(|| self.source_etag.as_ref().map(|_| String::new()));
+        if let (true, (Some(plain), Some(version))) =
+            (self.renaming && !unchanged, (self.plain.as_ref(), version))
+        {
             let work = BlobCleanupWork::ReleaseRenamed {
                 location: old.clone(),
                 import_id: plain.import_id,
@@ -4052,7 +4056,7 @@ mod tests {
         fn named(
             version: &BlobVersion,
             old: &BackendLocation,
-            source: Option<&[u8]>,
+            (source, etag): (Option<&[u8]>, Option<&str>),
         ) -> MigrateVersionOperation {
             let earlier = Earlier::from([(IMPORT, vec!["{dir}{id}_{name}".to_string()])]);
             let mut operation = operation("in/x/one.csv", vec![rule()]).with_earlier(earlier);
@@ -4066,7 +4070,8 @@ mod tests {
                 panic!("expected the reads of the old file, got {effects:?}")
             };
             let id = operation.version_key.version_id;
-            let row = ImportedObject::written(id, "in/x/one.csv".to_string(), 4, Some("e1".into()));
+            let etag = etag.map(str::to_string);
+            let row = ImportedObject::written(id, "in/x/one.csv".to_string(), 4, etag);
             let values = vec![
                 (
                     reads[0].1.clone(),
@@ -4083,9 +4088,9 @@ mod tests {
         fn renaming(
             version: &BlobVersion,
             old: &BackendLocation,
-            source: Option<&[u8]>,
+            (source, recorded): (Option<&[u8]>, Option<&str>),
         ) -> (MigrateVersionOperation, PlainPath) {
-            let mut operation = named(version, old, source);
+            let mut operation = named(version, old, (source, recorded));
             // Nothing records the new name for another key, and no provider is asked first.
             let effects = operation.step(read_result(None));
             let effects = past_intent(&mut operation, effects);
@@ -4101,7 +4106,7 @@ mod tests {
                 panic!("expected the copy to the new name, got {effects:?}")
             };
             assert_eq!(**copied, *old);
-            assert_eq!(etag.as_deref(), Some("e1"));
+            assert_eq!(etag.as_deref(), recorded);
             // A rename takes its exact new name or nothing.
             assert!(plain.if_not_exists && plain.exact);
             let name = format!("raw/x/one.csv~{}", Ulid::from_bytes([2; 16]));
@@ -4113,7 +4118,7 @@ mod tests {
         fn keeps_recorded_name() {
             // A new name the rule records for another key is taken before any provider request.
             let (version, old) = prefixed();
-            let mut operation = named(&version, &old, Some(b"v1"));
+            let mut operation = named(&version, &old, (Some(b"v1"), Some("e1")));
             let id = Ulid::from_bytes([9; 16]);
             let other = ImportedObject::written(id, "in/x/other.csv".to_string(), 4, None);
             let effects = operation.step(read_result(Some(other.to_bytes().unwrap())));
@@ -4126,7 +4131,7 @@ mod tests {
         fn refuses_unconditional_rename() {
             // A storage that cannot create only a free name refuses the rename; no intent stays.
             let (version, old) = prefixed();
-            let (mut operation, plain) = renaming(&version, &old, Some(b"v1"));
+            let (mut operation, plain) = renaming(&version, &old, (Some(b"v1"), Some("e1")));
             let refused = || BlobError::ConditionalUnsupported;
             let effects = operation.step(Event::Blob(BlobEvent::Error(refused())));
             // Such a storage may hold an earlier attempt at the tagged name.
@@ -4156,7 +4161,7 @@ mod tests {
 
         /// Drives a rename to its publication rows.
         fn renamed(
-            source: Option<&[u8]>,
+            source: (Option<&[u8]>, Option<&str>),
         ) -> (Vec<(String, Key, Value)>, PlainPath, BackendLocation) {
             let (version, old) = prefixed();
             let (mut operation, plain) = renaming(&version, &old, source);
@@ -4173,7 +4178,7 @@ mod tests {
         #[test]
         fn renames_linked_file() {
             // The version names the new file; the old one goes only through the cleanup queue.
-            let (writes, plain, old) = renamed(Some(b"v1"));
+            let (writes, plain, old) = renamed((Some(b"v1"), Some("e1")));
             let find = |space: &str| writes.iter().find(|(found, ..)| found == space).unwrap();
             let moved = BlobVersion::from_bytes(&find(BLOB_VERSIONS_KEYSPACE).2).unwrap();
             let encoding = EncodingClass::Plain {
@@ -4199,16 +4204,23 @@ mod tests {
                 (old, IMPORT, "v1".to_string())
             );
             assert_eq!(version_id, Ulid::from_bytes([2; 16]));
-            // Without the old file's backend version nothing names its bytes, so it stays.
+            // Without a backend version the old file goes only while its recorded ETag holds.
+            let release = |writes: &[(String, Key, Value)]| {
+                let found = writes
+                    .iter()
+                    .find(|(space, ..)| space == BLOB_CLEANUP_KEYSPACE);
+                found.map(|(.., work)| BlobCleanupWork::from_bytes(work).unwrap())
+            };
             for source in [None, Some(&b"null"[..])] {
-                let (writes, ..) = renamed(source);
-                assert!(
-                    !writes
-                        .iter()
-                        .any(|(space, ..)| space == BLOB_CLEANUP_KEYSPACE)
-                );
+                let (writes, ..) = renamed((source, Some("e1")));
+                let Some(BlobCleanupWork::ReleaseRenamed { version, .. }) = release(&writes) else {
+                    panic!("expected the release of the old file")
+                };
+                assert_eq!(version, "");
             }
-            let (writes, ..) = renamed(None);
+            // Without a recorded ETag nothing proves which bytes are there, so the file stays.
+            let (writes, ..) = renamed((None, None));
+            assert!(release(&writes).is_none());
             assert!(
                 writes
                     .iter()
@@ -4229,7 +4241,7 @@ mod tests {
         ) {
             let (version, mut old) = prefixed();
             old.hashes.insert(HASH_MD5.to_string(), vec![7; 16]);
-            let (mut operation, plain) = renaming(&version, &old, Some(b"v1"));
+            let (mut operation, plain) = renaming(&version, &old, (Some(b"v1"), Some("e1")));
             let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
             let [Effect::Blob(BlobEffect::StatExternal { path, .. })] = effects.as_slice() else {
                 panic!("expected the stat of the taken name, got {effects:?}")
@@ -4302,7 +4314,7 @@ mod tests {
             // A copy at the new name whose backend version a release deleted is not adopted.
             let (version, mut old) = prefixed();
             old.hashes.insert(HASH_MD5.to_string(), vec![7; 16]);
-            let (mut operation, plain) = renaming(&version, &old, Some(b"v1"));
+            let (mut operation, plain) = renaming(&version, &old, (Some(b"v1"), Some("e1")));
             operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
             let mut found = on_storage(location(false));
             (found.storage_bucket, found.backend_path) = (String::new(), plain.path.clone());
