@@ -13,6 +13,7 @@ use std::time::SystemTime;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::REPLICATION_OBLIGATION_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
@@ -58,6 +59,27 @@ async fn await_uploads(realm: &Topology) -> TestResult<()> {
         || async {
             drain_sync_outbox(&device.context).await;
             Ok(list_transfers(&device.context).await?.len())
+        },
+    )
+    .await
+}
+
+/// Waits until the realm node's replication drain has taken every live obligation.
+async fn await_drained(context: &DriverContext) -> TestResult<()> {
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "a committed pull never woke the replication drain",
+        || async {
+            let scan = StorageEffect::Iter {
+                key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1,
+                txn_id: None,
+            };
+            match context.storage_handle.send_storage_effect(scan).await {
+                Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values.len()),
+                other => Err(format!("the obligation scan failed: {other:?}").into()),
+            }
         },
     )
     .await
@@ -280,6 +302,35 @@ async fn syncs_both_directions() -> TestResult<()> {
         EntryState::RemoteDeleted { .. }
     ));
     Ok(())
+}
+
+/// A pulled version and a pulled delete both wake continuous sync on the realm
+/// node, so neither waits for an unrelated write.
+#[tokio::test]
+async fn wakes_replication_drain() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    create_bucket(&server.context, group_id, realm.user_id).await?;
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("note.txt"), b"from the device")?;
+    let folder = bind(&realm, root.path(), group_id).await?;
+
+    reconcile_folder(&device.context, &folder).await?;
+    await_uploads(&realm).await?;
+    await_drained(&server.context).await?;
+
+    std::fs::remove_file(root.path().join("note.txt"))?;
+    assert_eq!(reconcile_folder(&device.context, &folder).await?.uploads, 1);
+    await_uploads(&realm).await?;
+    assert!(
+        read_object(&realm, &server.context, group_id, "note.txt")
+            .await
+            .is_err(),
+        "the local delete reached the realm"
+    );
+    await_drained(&server.context).await
 }
 
 #[tokio::test]

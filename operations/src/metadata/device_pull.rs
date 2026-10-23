@@ -33,6 +33,7 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use crate::replication::queue::{complete_put, queue_live};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
@@ -273,6 +274,16 @@ async fn delete_target(
         debug!(error = %error, "A forwarded sync delete failed");
         SyncRefusal::Unavailable
     })?;
+    queue_live(
+        context,
+        node_id,
+        auth.clone(),
+        request.target_bucket.clone(),
+        request.target_key.clone(),
+        result.version_id,
+        result.delete_marker,
+    )
+    .await;
     Ok(SyncPullAck {
         version_id: result.version_id,
         already_applied: false,
@@ -340,6 +351,18 @@ async fn commit_pull(
         debug!(error = %error, "A forwarded sync pull could not be written");
         SyncRefusal::Unavailable
     })?;
+    complete_put(
+        context,
+        auth.realm_id,
+        node_id,
+        auth.clone(),
+        bucket.group_id,
+        request.target_bucket,
+        request.target_key,
+        result.version_id,
+        result.location.blob_size,
+    )
+    .await;
     Ok(SyncPullAck {
         version_id: result.version_id,
         already_applied: false,

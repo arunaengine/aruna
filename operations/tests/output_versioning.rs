@@ -35,6 +35,7 @@ use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
@@ -52,6 +53,7 @@ use aruna_operations::s3::object::versions::{
     ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
 use aruna_storage::storage;
+use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use futures_util::StreamExt;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -64,6 +66,9 @@ const INPUT_PATH: &str = "/in/data.csv";
 const RESULTS: &str = "results";
 const OUTPUT_PATH: &str = "/out/report.txt";
 const OUTPUT_BYTES: &[u8] = b"captured-report";
+
+/// Detects a wakeup that never arrives, not a slow machine.
+const WAKEUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 struct Harness {
     _temp_dir: TempDir,
@@ -756,6 +761,40 @@ async fn captures_without_workspace() {
         buckets.iter().all(|bucket| !bucket.starts_with("ws-")),
         "{buckets:?}"
     );
+}
+
+/// Reports every timer key the scheduler fires.
+struct Fired(tokio::sync::mpsc::UnboundedSender<TaskKey>);
+
+#[async_trait::async_trait]
+impl InboundTaskHandler for Fired {
+    async fn handle_timer(&self, key: TaskKey) {
+        let _ = self.0.send(key);
+    }
+}
+
+#[tokio::test]
+async fn output_wakes_replication() {
+    // A captured output is a committed write, so continuous sync must not wait for another one.
+    let mut harness = setup().await;
+    seed_auth(&harness).await;
+    create_bucket(&harness, RESULTS).await;
+    let (sender, mut fired) = tokio::sync::mpsc::unbounded_channel();
+    let task = TaskHandle::new();
+    task.set_inbound_handler(Arc::new(Fired(sender))).await;
+    harness.driver.task_handle = Some(task);
+
+    run_capture(&harness, InputMode::Snapshot, "report.txt", None).await;
+    let woke = tokio::time::timeout(WAKEUP_LIMIT, async {
+        while let Some(key) = fired.recv().await {
+            if key == TaskKey::DrainReplicationQueue {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(matches!(woke, Ok(true)), "the replication drain never woke");
 }
 
 #[tokio::test]
