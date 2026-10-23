@@ -19,6 +19,10 @@ use byteview::ByteView;
 use tracing::warn;
 
 use super::executor::{JobContext, JobRunOutcome};
+use super::staging_walk::{
+    canonical_walker_path, directory_list_path, join_target_prefix, relative_entry_path,
+    source_permission_path,
+};
 use super::store::{put_job_rows, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
@@ -518,7 +522,7 @@ fn map_source_entry(
     entry: SourceEntry,
 ) -> Result<MappedEntry, String> {
     let entry_path = canonical_walker_path(&entry.path)?;
-    let relative = relative_entry_path(&directory.source_path, &entry_path)?;
+    let relative = relative_entry_path(&directory.source_path, &entry_path, false)?;
     let target = join_target_prefix(&directory.target_prefix, &relative);
     Ok(match entry.kind {
         SourceEntryKind::File => MappedEntry::File(StagingPendingItem {
@@ -532,72 +536,6 @@ fn map_source_entry(
             cursor: None,
         }),
     })
-}
-
-fn directory_list_path(path: &str) -> String {
-    if path.is_empty() || path.ends_with('/') {
-        path.to_string()
-    } else {
-        format!("{path}/")
-    }
-}
-
-fn relative_entry_path(base: &str, entry: &str) -> Result<String, String> {
-    let base = base.trim_matches('/');
-    let relative = if base.is_empty() {
-        entry
-    } else {
-        entry
-            .strip_prefix(base)
-            .and_then(|suffix| suffix.strip_prefix('/'))
-            .ok_or_else(|| "source listing returned an entry outside its directory".to_string())?
-    };
-    if relative.is_empty() || relative.contains('/') {
-        return Err("source listing returned a non-child entry".to_string());
-    }
-    Ok(relative.to_string())
-}
-
-fn canonical_walker_path(path: &str) -> Result<String, String> {
-    let mut path = path.trim();
-    while let Some(stripped) = path.strip_prefix("./") {
-        path = stripped;
-    }
-    let path = path.trim_end_matches('/');
-    if path.is_empty() {
-        return Err("source listing returned an empty entry path".to_string());
-    }
-    if path
-        .split('/')
-        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-        || Path::new(path)
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err("source listing returned an invalid entry path".to_string());
-    }
-    Ok(path.to_string())
-}
-
-fn join_target_prefix(prefix: &str, relative: &str) -> String {
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty() {
-        relative.to_string()
-    } else {
-        format!("{prefix}/{relative}")
-    }
-}
-
-fn source_permission_path(spec: &StagingJobSpec, source_path: &str) -> String {
-    let root = format!(
-        "/{}/g/{}/data/{}/_sources/{}",
-        spec.auth_context.realm_id, spec.group_id, spec.node_id, spec.connector_id
-    );
-    if source_path.is_empty() {
-        root
-    } else {
-        format!("{root}/{source_path}")
-    }
 }
 
 pub(super) fn sync_progress(ctx: &JobContext, checkpoint: &StagingJobCheckpoint) {
