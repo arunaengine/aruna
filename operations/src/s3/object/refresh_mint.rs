@@ -32,6 +32,9 @@ use crate::s3::object::get::MAX_AUTO_ADVANCES;
 use crate::s3::object::metadata::ReferenceRefresh;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 
+/// One storage row a successor writes.
+type Row = (KeySpace, Key, Value);
+
 #[derive(Debug, Error, PartialEq)]
 pub enum MintError {
     #[error(transparent)]
@@ -126,7 +129,7 @@ impl MintSuccessorOperation {
     fn successor_rows(
         &mut self,
         values: Vec<(Key, Option<Value>)>,
-    ) -> Result<Option<Vec<(KeySpace, Key, Value)>>, MintError> {
+    ) -> Result<Option<Vec<Row>>, MintError> {
         let mut values = values.into_iter().map(|(_, value)| value);
         let pointer = values
             .next()
