@@ -30,6 +30,7 @@ use aruna_core::keyspaces::{
     MOVE_HANDOVER_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, PlainPath, RenameRequest, WriteIntent, claim_key, import_key,
     intent_key, intent_prefix, object_key, tagged_path, version_key,
@@ -61,7 +62,6 @@ pub enum MigrateState {
     ReadLocation,
     FindTarget,
     ProbeTarget,
-    HashTarget,
     /// Settles the provider upload an earlier attempt recorded before its copy is adopted.
     SettleCopy,
     ReadSource,
@@ -74,6 +74,8 @@ pub enum MigrateState {
     /// Syncs that intent to disk.
     SyncIntent,
     WriteBlob,
+    /// Reads what holds the name a refused rename wanted, which may be its own earlier copy.
+    CheckTaken,
     /// Deletes the intents of a write the storage refused, then syncs that delete.
     DropIntent,
     SyncDroppedIntent,
@@ -158,8 +160,8 @@ pub struct MigrateVersionOperation {
     plain_owned: bool,
     /// The backend's id of the bytes a plain write stored.
     backend_version: Option<String>,
-    /// A rename looked at its tagged path too before writing.
-    tag_checked: bool,
+    /// The ETag the rule recorded for the renamed file; an unversioned copy must find it.
+    source_etag: Option<String>,
     /// The delete claim of the file a rename adopts, which its publication must not find.
     adopt_claim: Option<Key>,
     /// The start of the storage move this run belongs to, which owns its write intents.
@@ -209,7 +211,7 @@ impl MigrateVersionOperation {
             source_version: None,
             plain_owned: false,
             backend_version: None,
-            tag_checked: false,
+            source_etag: None,
             adopt_claim: None,
             mover: None,
             fence: None,
@@ -362,11 +364,19 @@ impl MigrateVersionOperation {
         let source = version_key(old.ulid);
         self.old = Some(old);
         if self.renaming {
+            let (Some(plain), Some(old)) = (self.plain.as_ref(), self.old.as_ref()) else {
+                return self.fail(MigrateVersionError::NotFinished);
+            };
+            // The rule's record of the old file names the ETag an unversioned copy needs.
+            let row = object_key(plain.import_id, &old.backend_path);
+            let reads = vec![
+                (BACKEND_VERSION_KEYSPACE.to_string(), source),
+                (IMPORTED_OBJECT_KEYSPACE.to_string(), row),
+            ];
             self.state = MigrateState::ReadSource;
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BACKEND_VERSION_KEYSPACE.to_string(),
-                key: source,
-                txn_id: None,
+            return smallvec![Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: None
             })];
         }
         // A copy already on the rule's backend only needs its file in the linked folder.
@@ -383,9 +393,11 @@ impl MigrateVersionOperation {
 
     /// The version of the old file, fixed when it was written, names the bytes a release deletes.
     fn handle_source(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected(event);
         };
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let (value, row) = (values.next().flatten(), values.next().flatten());
         let version = value
             .map(|value| String::from_utf8(value.to_vec()))
             .transpose();
@@ -393,6 +405,16 @@ impl MigrateVersionOperation {
         match version {
             Ok(version) => self.source_version = version.filter(|version| version != "null"),
             Err(error) => return self.fail(ConversionError::from(error).into()),
+        }
+        // Only the record of this version's write names its bytes.
+        let id = self.version_key.version_id;
+        match row.map(|row| ImportedObject::from_bytes(&row)).transpose() {
+            Ok(row) => {
+                self.source_etag = row
+                    .filter(|row| row.version_id == id)
+                    .and_then(|row| row.etag)
+            }
+            Err(error) => return self.fail(error.into()),
         }
         self.find_target()
     }
@@ -480,6 +502,9 @@ impl MigrateVersionOperation {
     }
 
     fn handle_owner(&mut self, event: Event) -> Effects {
+        if self.renaming {
+            return self.check_name(event);
+        }
         match owns_path(event, &self.version_key.key) {
             Ok(owned) => {
                 self.plain_owned = owned;
@@ -489,7 +514,54 @@ impl MigrateVersionOperation {
         }
     }
 
+    /// A new name the rule records for another key or version is taken, so the rename asks
+    /// the provider nothing.
+    fn check_name(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected(event);
+        };
+        let row = match value
+            .map(|value| ImportedObject::from_bytes(&value))
+            .transpose()
+        {
+            Ok(row) => row,
+            Err(error) => return self.fail(error.into()),
+        };
+        let (Some(plain), Some(routing)) = (self.plain.as_ref(), self.routing.as_ref()) else {
+            return self.fail(MigrateVersionError::NotFinished);
+        };
+        let rule = (routing.imports.iter()).find(|rule| rule.import_id == plain.import_id);
+        // An older record without a key keeps the rule's own mapping.
+        let holder = row.map(|row| {
+            let key = row
+                .key
+                .or_else(|| rule.and_then(|rule| rule.aruna_key(&plain.path)));
+            (key, row.version_id)
+        });
+        let ours = (
+            Some(self.version_key.key.clone()),
+            self.version_key.version_id,
+        );
+        match holder {
+            Some(holder) if holder != ours => self.fail(BlobError::PathTaken.into()),
+            _ => self.stat_plain(),
+        }
+    }
+
     fn stat_plain(&mut self) -> Effects {
+        // A rename creates its exact name only while free; a refused copy shows what holds it.
+        if self.renaming
+            && let Some(plain) = self.plain.as_ref()
+        {
+            let path = plain.path.clone();
+            self.plain_path = Some(PlainPath {
+                path,
+                ulid: self.attempt(),
+                if_not_exists: true,
+                exact: true,
+            });
+            return self.read_blob();
+        }
         if let Some(plain) = self.plain.as_ref() {
             self.state = MigrateState::StatPlain;
             return smallvec![Effect::Blob(BlobEffect::StatPlain {
@@ -518,33 +590,6 @@ impl MigrateVersionOperation {
             return self.fail(MigrateVersionError::NotFinished);
         };
         let attempt = self.attempt();
-        // A rename never tags or replaces a taken name; it adopts only an earlier copy of its own.
-        // A storage without conditional writes puts it at the tagged path, so that is checked too.
-        let fallback = tagged_path(&plain.path, attempt);
-        if self.renaming && (exists || !self.tag_checked) {
-            let Some(old) = self.old.as_ref() else {
-                return self.fail(MigrateVersionError::NotFinished);
-            };
-            let (backend, path) = (plain.backend.clone(), plain.path.clone());
-            let checked = std::mem::replace(&mut self.tag_checked, true);
-            if !exists {
-                self.state = MigrateState::StatPlain;
-                return smallvec![Effect::Blob(BlobEffect::StatPlain {
-                    backend,
-                    path: fallback,
-                })];
-            }
-            let resolved = ResolvedBackend::new(old.backend.clone(), old.storage_class.clone());
-            self.state = MigrateState::HashTarget;
-            return smallvec![Effect::Blob(BlobEffect::HashExternal {
-                resolved,
-                path: match checked {
-                    true => fallback,
-                    false => path,
-                },
-                created_by: old.created_by,
-            })];
-        }
         let versioned = plain.same_name && version.is_some() && self.plain_owned;
         let (path, if_not_exists) = same_name_path(&plain.path, attempt, exists, versioned);
         self.plain_path = Some(PlainPath {
@@ -556,21 +601,49 @@ impl MigrateVersionOperation {
         self.read_blob()
     }
 
-    /// The file at the new name is a copy an interrupted rename left, if its bytes match.
-    fn handle_hashed(&mut self, event: Event) -> Effects {
-        let (mut location, version) = match event {
-            Event::Blob(BlobEvent::ExternalHashed {
-                location, version, ..
-            }) => (location, version),
-            Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
+    /// A refused rename looks at what holds its name: the new name, or on a storage without
+    /// create-only writes the tagged one an earlier attempt may have used.
+    fn stat_taken(&mut self, refusal: BlobError) -> Effects {
+        let (Some(old), Some(plain)) = (self.old.as_ref(), self.plain_path.as_ref()) else {
+            return self.fail(MigrateVersionError::NotFinished);
+        };
+        let path = match refusal {
+            BlobError::ConditionalUnsupported => tagged_path(&plain.path, plain.ulid),
+            _ => plain.path.clone(),
+        };
+        let resolved = ResolvedBackend::new(old.backend.clone(), old.storage_class.clone());
+        let created_by = old.created_by;
+        self.refusal = Some(refusal);
+        self.state = MigrateState::CheckTaken;
+        smallvec![Effect::Blob(BlobEffect::StatExternal {
+            resolved,
+            path,
+            created_by,
+        })]
+    }
+
+    /// The file there is a copy an earlier attempt left when its size and ETag prove the old
+    /// file's bytes; any other file, or one its checksums cannot decide, keeps the name taken.
+    fn handle_taken(&mut self, event: Event) -> Effects {
+        let (found, version) = match event {
+            Event::Blob(BlobEvent::ExternalStat {
+                location,
+                version,
+                etag,
+            }) => {
+                let old = self.old.as_ref();
+                let proved = |found: &BackendLocation| {
+                    old.is_some_and(|old| same_bytes(old, found.blob_size, etag.as_deref()))
+                };
+                (location.filter(proved), version)
+            }
+            Event::Blob(BlobEvent::Error(_)) => (None, None),
             other => return self.unexpected(other),
         };
-        let same = self.old.as_ref().is_some_and(|old| {
-            old.get_blake3() == location.get_blake3() && old.blob_size == location.blob_size
-        });
-        if !same {
-            return self.fail(BlobError::PathTaken.into());
-        }
+        let (Some(mut location), Some(old)) = (found, self.old.as_ref()) else {
+            return self.drop_intents();
+        };
+        location.hashes = old.hashes.clone();
         location.format.layout = StoredLayout::Plain(location.ulid);
         // An adopted file whose backend version a release deleted is no copy to take.
         self.adopt_claim = match version
@@ -581,6 +654,7 @@ impl MigrateVersionOperation {
             Some(Err(error)) => return self.fail(error.into()),
             None => None,
         };
+        self.refusal = None;
         self.backend_version = version;
         self.new = Some(location);
         // An earlier attempt left this copy and its intents; the publication retires them,
@@ -591,6 +665,16 @@ impl MigrateVersionOperation {
             attempt: self.attempt(),
             upload: None,
         })]
+    }
+
+    /// A refused write moved no byte, so its intents go before the move fails with it.
+    fn drop_intents(&mut self) -> Effects {
+        if self.written_intent.is_empty() {
+            let refusal = self.refusal.take().unwrap_or(BlobError::PathTaken);
+            return self.fail(refusal.into());
+        }
+        self.state = MigrateState::DropIntent;
+        smallvec![intent_deletes(&self.written_intent)]
     }
 
     fn handle_settled(&mut self, event: Event) -> Effects {
@@ -616,6 +700,7 @@ impl MigrateVersionOperation {
                 resolved,
                 plain,
                 source: Box::new(old),
+                etag: self.source_etag.clone(),
             })];
             return self.intent_first(copy, created_by);
         }
@@ -783,13 +868,16 @@ impl MigrateVersionOperation {
                 self.backend_etag = etag;
                 location
             }
+            // A refused rename may meet its own earlier copy.
+            Event::Blob(BlobEvent::Error(
+                error @ (BlobError::PathTaken | BlobError::ConditionalUnsupported),
+            )) if self.renaming => return self.stat_taken(error),
             // A refused write moved no byte; its intents go before the move fails with it.
             Event::Blob(BlobEvent::Error(
                 error @ (BlobError::PathTaken | BlobError::ConditionalUnsupported),
             )) if !self.written_intent.is_empty() => {
                 self.refusal = Some(error);
-                self.state = MigrateState::DropIntent;
-                return smallvec![intent_deletes(&self.written_intent)];
+                return self.drop_intents();
             }
             // The adapter keeps a copy with an unclear outcome for reconciliation.
             Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
@@ -1365,7 +1453,7 @@ impl Operation for MigrateVersionOperation {
             MigrateState::ReadLocation => self.handle_location(event),
             MigrateState::FindTarget => self.handle_found(event),
             MigrateState::ProbeTarget => self.handle_probe(event),
-            MigrateState::HashTarget => self.handle_hashed(event),
+            MigrateState::CheckTaken => self.handle_taken(event),
             MigrateState::SettleCopy => self.handle_settled(event),
             MigrateState::ReadSource => self.handle_source(event),
             MigrateState::CheckLinked => self.handle_linked(event),
@@ -1487,6 +1575,17 @@ pub fn renames(
         && location.backend == plain.backend
         && matches!(location.format.layout, StoredLayout::Plain(_))
         && target.as_deref() == Some(plain.path.as_str())
+}
+
+/// Whether a provider file of `size` with `etag` holds the bytes of `old`: the ETag is the
+/// MD5 of one upload, or of the one part a provider copy wrote.
+fn same_bytes(old: &BackendLocation, size: u64, etag: Option<&str>) -> bool {
+    let (Some(md5), Some(etag)) = (old.hashes.get(HASH_MD5), etag) else {
+        return false;
+    };
+    let etag = etag.trim_matches('"');
+    let copied = format!("{:x}-1", md5::compute(md5));
+    size == old.blob_size && (etag == hex::encode(md5) || etag == copied)
 }
 
 /// The rename request of the move `record` of `bucket`, if it was started to rename files.
@@ -1822,7 +1921,9 @@ async fn migrate_page(
                 .with_mover(record.started_at_ms);
         }
         let moved = crate::driver::drive(operation, context).await;
-        let broken = moved.is_err() && moving && is_broken(context, key).await;
+        // A taken name says nothing about the old copy, so the provider is not asked about it.
+        let taken = matches!(moved, Err(MigrateVersionError::Blob(BlobError::PathTaken)));
+        let broken = moved.is_err() && moving && !taken && is_broken(context, key).await;
         worked += usize::from(!matches!(moved, Ok(MigrateOutcome::Skipped)));
         match moved {
             Ok(MigrateOutcome::Migrated) => record.migrated += 1,
@@ -3946,8 +4047,9 @@ mod tests {
             (version, old)
         }
 
-        /// A move that knows the rule's earlier prefix pattern, up to the stat of the new name.
-        fn renaming(
+        /// A move that knows the rule's earlier prefix pattern, up to the read of the rule's
+        /// record at the new name.
+        fn named(
             version: &BlobVersion,
             old: &BackendLocation,
             source: Option<&[u8]>,
@@ -3956,39 +4058,87 @@ mod tests {
             let mut operation = operation("in/x/one.csv", vec![rule()]).with_earlier(earlier);
             operation.start();
             operation.step(read_result(Some(version.to_bytes().unwrap())));
-            operation.step(read_result(Some(old.to_bytes().unwrap())));
-            // The old file's backend version binds a later delete to the renamed bytes.
-            operation.step(read_result(source.map(<[u8]>::to_vec)));
-            operation.step(read_result(None));
-            // Nothing records the new name for another key.
-            let effects = operation.step(read_result(None));
-            let [Effect::Blob(BlobEffect::StatPlain { path, .. })] = effects.as_slice() else {
-                panic!("expected the stat of the new name, got {effects:?}")
+            let effects = operation.step(read_result(Some(old.to_bytes().unwrap())));
+            // The old file's backend version binds a later delete to the renamed bytes, and the
+            // rule's record of the file names the ETag an unversioned copy needs.
+            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
+            else {
+                panic!("expected the reads of the old file, got {effects:?}")
             };
-            assert_eq!(
-                path,
-                &format!("raw/x/one.csv~{}", Ulid::from_bytes([2; 16]))
-            );
+            let id = operation.version_key.version_id;
+            let row = ImportedObject::written(id, "in/x/one.csv".to_string(), 4, Some("e1".into()));
+            let values = vec![
+                (
+                    reads[0].1.clone(),
+                    source.map(|source| source.to_vec().into()),
+                ),
+                (reads[1].1.clone(), Some(row.to_bytes().unwrap().into())),
+            ];
+            operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+            operation.step(read_result(None));
             operation
+        }
+
+        /// A move that knows the rule's earlier prefix pattern, up to its copy to the new name.
+        fn renaming(
+            version: &BlobVersion,
+            old: &BackendLocation,
+            source: Option<&[u8]>,
+        ) -> (MigrateVersionOperation, PlainPath) {
+            let mut operation = named(version, old, source);
+            // Nothing records the new name for another key, and no provider is asked first.
+            let effects = operation.step(read_result(None));
+            let effects = past_intent(&mut operation, effects);
+            let [
+                Effect::Blob(BlobEffect::CopyPlain {
+                    plain,
+                    source: copied,
+                    etag,
+                    ..
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("expected the copy to the new name, got {effects:?}")
+            };
+            assert_eq!(**copied, *old);
+            assert_eq!(etag.as_deref(), Some("e1"));
+            // A rename takes its exact new name or nothing.
+            assert!(plain.if_not_exists && plain.exact);
+            let name = format!("raw/x/one.csv~{}", Ulid::from_bytes([2; 16]));
+            assert_eq!(plain.path, name);
+            (operation, plain.clone())
+        }
+
+        #[test]
+        fn keeps_recorded_name() {
+            // A new name the rule records for another key is taken before any provider request.
+            let (version, old) = prefixed();
+            let mut operation = named(&version, &old, Some(b"v1"));
+            let id = Ulid::from_bytes([9; 16]);
+            let other = ImportedObject::written(id, "in/x/other.csv".to_string(), 4, None);
+            let effects = operation.step(read_result(Some(other.to_bytes().unwrap())));
+            assert!(effects.is_empty());
+            let error = MigrateVersionError::Blob(BlobError::PathTaken);
+            assert_eq!(operation.finalize(), Err(error));
         }
 
         #[test]
         fn refuses_unconditional_rename() {
             // A storage that cannot create only a free name refuses the rename; no intent stays.
             let (version, old) = prefixed();
-            let mut operation = renaming(&version, &old, Some(b"v1"));
-            let absent = || {
-                Event::Blob(BlobEvent::PlainStat {
-                    exists: false,
-                    version: None,
-                })
-            };
-            operation.step(absent());
-            // A rename copies the old file instead of reading it.
-            let effects = operation.step(absent());
-            past_intent(&mut operation, effects);
+            let (mut operation, plain) = renaming(&version, &old, Some(b"v1"));
             let refused = || BlobError::ConditionalUnsupported;
             let effects = operation.step(Event::Blob(BlobEvent::Error(refused())));
+            // Such a storage may hold an earlier attempt at the tagged name.
+            let [Effect::Blob(BlobEffect::StatExternal { path, .. })] = effects.as_slice() else {
+                panic!("expected the stat of the tagged name, got {effects:?}")
+            };
+            assert_eq!(path, &tagged_path(&plain.path, plain.ulid));
+            let effects = operation.step(Event::Blob(BlobEvent::ExternalStat {
+                location: None,
+                version: None,
+                etag: None,
+            }));
             assert!(matches!(
                 effects.as_slice(),
                 [Effect::Storage(StorageEffect::BatchDelete { .. })]
@@ -4009,30 +4159,7 @@ mod tests {
             source: Option<&[u8]>,
         ) -> (Vec<(String, Key, Value)>, PlainPath, BackendLocation) {
             let (version, old) = prefixed();
-            let mut operation = renaming(&version, &old, source);
-            let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
-                exists: false,
-                version: None,
-            }));
-            // A storage without conditional writes may have put an earlier attempt there.
-            let [Effect::Blob(BlobEffect::StatPlain { path, .. })] = effects.as_slice() else {
-                panic!("expected the stat of the tagged name, got {effects:?}")
-            };
-            let attempt = Ulid::from(u128::from(old.ulid) ^ 1);
-            assert!(path.ends_with(&format!("~{attempt}")));
-            let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
-                exists: false,
-                version: None,
-            }));
-            let effects = past_intent(&mut operation, effects);
-            let [Effect::Blob(BlobEffect::CopyPlain { plain, source, .. })] = effects.as_slice()
-            else {
-                panic!("expected the copy to the new file, got {effects:?}")
-            };
-            assert_eq!(**source, old);
-            // A rename takes its exact new name or nothing.
-            assert!(plain.if_not_exists && plain.exact);
-            let plain = plain.clone();
+            let (mut operation, plain) = renaming(&version, &old, source);
             after_write(&mut operation, plain_written(&plain));
             operation.step(Event::Storage(StorageEvent::TransactionStarted {
                 txn_id: TxnId::default(),
@@ -4089,28 +4216,51 @@ mod tests {
             );
         }
 
+        /// The old file of `prefixed` with a known MD5, and the provider file `size` and `etag`
+        /// found at the name a refused rename wanted.
+        fn taken_name(
+            size: u64,
+            etag: &str,
+        ) -> (
+            MigrateVersionOperation,
+            BlobVersion,
+            BackendLocation,
+            Effects,
+        ) {
+            let (version, mut old) = prefixed();
+            old.hashes.insert(HASH_MD5.to_string(), vec![7; 16]);
+            let (mut operation, plain) = renaming(&version, &old, Some(b"v1"));
+            let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
+            let [Effect::Blob(BlobEffect::StatExternal { path, .. })] = effects.as_slice() else {
+                panic!("expected the stat of the taken name, got {effects:?}")
+            };
+            assert_eq!(path, &plain.path);
+            let mut found = on_storage(location(false));
+            (found.storage_bucket, found.backend_path) = (String::new(), path.clone());
+            (found.blob_size, found.hashes) = (size, HashMap::new());
+            let effects = operation.step(Event::Blob(BlobEvent::ExternalStat {
+                location: Some(found),
+                version: None,
+                etag: Some(format!("\"{etag}\"")),
+            }));
+            (operation, version, old, effects)
+        }
+
         #[test]
         fn resumes_taken_name() {
-            // An interrupted rename left its copy at the new name; matching bytes are adopted.
-            let (version, old) = prefixed();
-            for (hash, adopted) in [(4u8, true), (5u8, false)] {
-                let mut operation = renaming(&version, &old, Some(b"v1"));
-                let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
-                    exists: true,
-                    version: None,
-                }));
-                let [Effect::Blob(BlobEffect::HashExternal { path, .. })] = effects.as_slice()
-                else {
-                    panic!("expected the hash of the taken name, got {effects:?}")
-                };
-                let mut found = on_storage(location(false));
-                (found.storage_bucket, found.backend_path) = (String::new(), path.clone());
-                found.hashes = HashMap::from([(HASH_BLAKE3.to_string(), vec![hash; 32])]);
-                let effects = operation.step(Event::Blob(BlobEvent::ExternalHashed {
-                    location: found,
-                    version: None,
-                    etag: None,
-                }));
+            // An interrupted rename left its copy at the new name; only checksums decide.
+            let size = prefixed().1.blob_size;
+            let (single, copied) = (
+                hex::encode([7; 16]),
+                format!("{:x}-1", md5::compute([7; 16])),
+            );
+            for (size, etag, adopted) in [
+                (size, single.as_str(), true),
+                (size, copied.as_str(), true),
+                (size, "0123", false),
+                (size + 1, copied.as_str(), false),
+            ] {
+                let (mut operation, _, old, effects) = taken_name(size, etag);
                 if adopted {
                     // The upload the earlier attempt recorded is settled before the adoption.
                     let attempt = Ulid::from(u128::from(old.ulid) ^ 1);
@@ -4127,13 +4277,21 @@ mod tests {
                         [Effect::Storage(StorageEffect::StartTransaction { .. })]
                     ));
                     // The intents the earlier attempt stored go with the publication.
-                    let attempt = Ulid::from(u128::from(old.ulid) ^ 1);
                     assert_eq!(operation.written_intent, operation.intent_keys(attempt));
                     assert_eq!(operation.written_intent.len(), 2);
+                    // The proved copy names the old file's hashes.
+                    assert_eq!(operation.new.as_ref().unwrap().hashes, old.hashes);
                     continue;
                 }
-                // Another file at the new name is never replaced or renamed around.
-                assert!(effects.is_empty());
+                // Another file at the new name keeps it; the intents go before the move fails.
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::BatchDelete { .. })]
+                ));
+                operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+                    entries: Vec::new(),
+                }));
+                operation.step(Event::Storage(StorageEvent::SyncAllFinished));
                 let error = MigrateVersionError::Blob(BlobError::PathTaken);
                 assert_eq!(operation.finalize(), Err(error));
             }
@@ -4142,22 +4300,17 @@ mod tests {
         #[test]
         fn skips_deleted_version() {
             // A copy at the new name whose backend version a release deleted is not adopted.
-            let (version, old) = prefixed();
-            let mut operation = renaming(&version, &old, Some(b"v1"));
-            let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
-                exists: true,
-                version: None,
-            }));
-            let [Effect::Blob(BlobEffect::HashExternal { path, .. })] = effects.as_slice() else {
-                panic!("expected the hash of the taken name, got {effects:?}")
-            };
+            let (version, mut old) = prefixed();
+            old.hashes.insert(HASH_MD5.to_string(), vec![7; 16]);
+            let (mut operation, plain) = renaming(&version, &old, Some(b"v1"));
+            operation.step(Event::Blob(BlobEvent::Error(BlobError::PathTaken)));
             let mut found = on_storage(location(false));
-            (found.storage_bucket, found.backend_path) = (String::new(), path.clone());
-            found.hashes = HashMap::from([(HASH_BLAKE3.to_string(), vec![4; 32])]);
-            operation.step(Event::Blob(BlobEvent::ExternalHashed {
-                location: found,
+            (found.storage_bucket, found.backend_path) = (String::new(), plain.path.clone());
+            found.blob_size = old.blob_size;
+            operation.step(Event::Blob(BlobEvent::ExternalStat {
+                location: Some(found),
                 version: Some("p9".to_string()),
-                etag: None,
+                etag: Some(hex::encode([7; 16])),
             }));
             operation.step(Event::Blob(BlobEvent::UploadAborted));
             operation.step(Event::Storage(StorageEvent::TransactionStarted {

@@ -662,6 +662,7 @@ dependencies = [
  "irokle",
  "jsonwebtoken",
  "lru 0.18.5",
+ "md5",
  "opentelemetry",
  "oxrdf",
  "oxttl",
