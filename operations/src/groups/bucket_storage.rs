@@ -60,6 +60,9 @@ pub async fn list_bucket_storage(
         .await
         .map_err(|error| error.to_string())?;
     let encrypted = encrypted_buckets(context, &page.buckets).await?;
+    // Jobs show for every rule, also one whose write storage routing leaves out.
+    let rules = crate::groups::imports::list_imports(context, group_id).await;
+    let rules = rules.map_err(|error| error.to_string())?;
     let mut snapshot = node_routing(context)
         .snapshot(group_id)
         .with_group_inputs(inputs);
@@ -77,7 +80,7 @@ pub async fn list_bucket_storage(
             let record = record.map_err(|error| error.to_string())?;
             entry.insert(record.filter(|record| record.group_id == group_id));
         }
-        let job = active_job(context, &bucket, &snapshot.imports).await?;
+        let job = active_job(context, &bucket, &rules).await?;
         found.push(BucketStorage {
             job,
             ..named(destination, &storages)
