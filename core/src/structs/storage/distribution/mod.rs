@@ -10,9 +10,11 @@ use crate::NodeId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::types::GroupId;
 
+pub mod hint;
 pub mod presets;
 pub mod validate;
 
+pub use hint::{HintIndex, SetHint};
 pub use validate::DistributionError;
 
 /// At most this many key ranges per set (scale rules).
