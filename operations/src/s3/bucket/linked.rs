@@ -11,11 +11,11 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, LINKED_JOB_KEYSPACE,
-    RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::storage::backend_import::RenameRequest;
+use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::CompressionMigration;
@@ -397,6 +397,28 @@ pub async fn read_bucket_job(
         (None, Some((migration, request))) => Some(BucketJob::Rename(migration, request)),
         (None, None) => None,
     })
+}
+
+/// The files the rename of the move started at `started_at_ms` planned to rename; `None` when
+/// none was stored for that move.
+pub async fn rename_total(
+    context: &DriverContext,
+    bucket: &str,
+    started_at_ms: u64,
+) -> Result<Option<u64>, String> {
+    let read = StorageEffect::Read {
+        key_space: RENAME_TOTAL_KEYSPACE.to_string(),
+        key: bucket.as_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+        context.storage_handle.send_storage_effect(read).await
+    else {
+        return Err("could not read the rename total".to_string());
+    };
+    let row = value.as_deref().map(RenameTotal::from_bytes).transpose();
+    let row = row.map_err(|error| error.to_string())?;
+    Ok(row.and_then(|row| row.for_move(started_at_ms)))
 }
 
 /// What one job page did; a waiting page keeps its cursor.

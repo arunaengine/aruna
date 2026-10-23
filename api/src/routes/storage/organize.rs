@@ -17,7 +17,7 @@ use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::groups::imports::discovery::bucket_access;
 use aruna_operations::groups::imports::last_run;
 use aruna_operations::s3::bucket::linked::{
-    BucketJob, BucketJobOperation, LinkedAction, LinkedError, read_bucket_job,
+    BucketJob, BucketJobOperation, LinkedAction, LinkedError, read_bucket_job, rename_total,
 };
 use aruna_operations::s3::bucket::remap::{self, RemapScope};
 use axum::extract::{Path, State};
@@ -145,7 +145,8 @@ pub struct OrganizeJob {
     pub done: u64,
     pub skipped: u64,
     pub failed: u64,
-    /// Keys selected at the start; a lower bound while `counted` is false; 0 for a rename.
+    /// Keys selected at the start, or the files a rename planned to rename; a lower bound while
+    /// `counted` is false, and 0 for a rename whose start stored no total.
     pub total: u64,
     pub counted: bool,
     /// Why the job waits before its next step, such as a running import.
@@ -632,7 +633,11 @@ pub async fn start_duplicates(
     summary = "Show the long job of the rule's bucket",
     description = r#"Shows the running job of the rule's bucket on this node, else the one started last: a move of keys, a duplicate cleanup or a rename of linked files. `null` before any.
 
-**Authentication**: as the previews."#,
+**Authentication**: as the previews.
+
+**Behavior**
+- A rename shows the files its start planned to rename as `total`, with `counted` true. A rename
+  whose start stored no total for its move shows `total` 0 and `counted` false."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule"),
         ("import_id" = String, Path, description = "Rule whose bucket is organized")
@@ -654,10 +659,22 @@ pub async fn get_job(
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<Option<OrganizeJob>>> {
     let (rule, ..) = caller(&state, auth, (&group_id, &import_id)).await?;
-    let job = read_bucket_job(&state.get_ctx(), &rule.bucket)
+    let context = state.get_ctx();
+    let job = read_bucket_job(&context, &rule.bucket)
         .await
         .map_err(ServerError::InternalError)?;
-    Ok(Json(job.map(Into::into)))
+    let total = match &job {
+        Some(BucketJob::Rename(record, _)) => {
+            let total = rename_total(&context, &rule.bucket, record.started_at_ms).await;
+            total.map_err(ServerError::InternalError)?
+        }
+        _ => None,
+    };
+    let mut job: Option<OrganizeJob> = job.map(Into::into);
+    if let (Some(job), Some(total)) = (job.as_mut(), total) {
+        (job.total, job.counted) = (total, true);
+    }
+    Ok(Json(job))
 }
 
 #[utoipa::path(
