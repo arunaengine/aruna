@@ -24,6 +24,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
+use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -552,6 +553,7 @@ impl LocationSummaryOperation {
         };
         self.delete_marker = version.is_deleted();
         self.version_refs = version.placement_policies.clone();
+        self.summary.origin_device = version.metadata.get(ORIGIN_DEVICE_TAG).cloned();
         match version.location_key() {
             Some(key) => {
                 self.blake3 = Some(key.blake3_hash);
@@ -934,6 +936,29 @@ mod pure_tests {
                 storage_class: Some("cold".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn names_origin_device() {
+        // The device a version came from is answered under the same READ as its bytes.
+        let version_id = Ulid::from_bytes([3u8; 16]);
+        let mut version = materialized();
+        version.metadata.insert(
+            aruna_core::structs::ORIGIN_DEVICE_TAG.to_string(),
+            "device-ada".to_string(),
+        );
+        let mut operation = authorized(Some(version_id));
+        operation.step(read_result(Some(version.to_bytes().unwrap())));
+        operation.step(read_result(Some(
+            location(BackendRef::node_default(), None)
+                .to_bytes()
+                .unwrap(),
+        )));
+        operation.step(read_result(None));
+        verify(&mut operation);
+
+        let summary = operation.finalize().unwrap().summary;
+        assert_eq!(summary.origin_device.as_deref(), Some("device-ada"));
     }
 
     fn hashed_location() -> BackendLocation {

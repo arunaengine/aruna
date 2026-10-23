@@ -57,6 +57,7 @@ fn hides_backend_name() {
             group_id: None,
             blob_size: None,
             hashes: Default::default(),
+            origin_device: None,
         },
     );
 
@@ -85,6 +86,7 @@ fn names_group_backend() {
             group_id: None,
             blob_size: None,
             hashes: Default::default(),
+            origin_device: None,
         },
     );
 
@@ -113,6 +115,7 @@ fn reports_unstored_version() {
             group_id: None,
             blob_size: None,
             hashes: Default::default(),
+            origin_device: None,
         },
     );
 
@@ -144,6 +147,7 @@ fn lists_quarantined_copy() {
             group_id: None,
             blob_size: None,
             hashes: Default::default(),
+            origin_device: None,
         },
     );
 

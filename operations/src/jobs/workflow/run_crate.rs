@@ -11,8 +11,8 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
-    ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
-    RunCrateStatus,
+    CapturedInput, ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord,
+    JobResultPayload, JobState, RunCrateStatus,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -44,6 +44,8 @@ use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
+use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
+use crate::replication::protocol::LocationSummaryRequest;
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
@@ -294,44 +296,94 @@ fn is_transient(error: &MetadataWriteError) -> bool {
     crate::jobs::metadata_class::metadata_is_transient(error)
 }
 
-/// RO-Crate 1.2 JSON-LD conforming to the Process Run Crate 0.5 profile. No
-/// secrets are included (spec 16.10).
-/// The device each input version on this node was published from, by input destination key.
-/// A version that is gone names no device; any other read failure retries the crate.
+/// The device each input version was published from, by input destination key. A version on
+/// another node is asked of that node as the job owner. A version that is gone or not readable
+/// names no device; any other read failure retries the crate.
 async fn input_devices(
     context: &DriverContext,
     record: &JobRecord,
     spec: &ExecutionSpec,
     node_id: NodeId,
-) -> Result<BTreeMap<String, String>, HeadObjectError> {
+) -> Result<BTreeMap<String, String>, String> {
     let mut devices = BTreeMap::new();
     for input in &spec.inputs {
         let InputSource::S3 { bucket, key, .. } = &input.source;
-        let captured = record.captured_inputs.iter().find(|captured| {
-            captured.destination_key == input.dest_key && captured.source_node_id == node_id
-        });
-        let Some(captured) = captured else {
+        let Some(captured) = record
+            .captured_inputs
+            .iter()
+            .find(|captured| captured.destination_key == input.dest_key)
+        else {
             continue;
         };
-        let head = HeadObjectOperation::new(HeadObjectInput {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id: Some(captured.version_id),
-        });
-        let metadata = match drive(head, context).await {
-            Ok(head) => head.metadata,
-            Err(
-                HeadObjectError::NoSuchKey
-                | HeadObjectError::NoSuchVersion
-                | HeadObjectError::DeleteMarker,
-            ) => continue,
-            Err(error) => return Err(error),
+        let device = match captured.source_node_id == node_id {
+            true => local_device(context, bucket, key, captured.version_id).await?,
+            false => remote_device(context, record, bucket, key, captured).await?,
         };
-        if let Some(device) = metadata.get(ORIGIN_DEVICE_TAG) {
-            devices.insert(input.dest_key.clone(), device.clone());
+        if let Some(device) = device {
+            devices.insert(input.dest_key.clone(), device);
         }
     }
     Ok(devices)
+}
+
+async fn local_device(
+    context: &DriverContext,
+    bucket: &str,
+    key: &str,
+    version_id: Ulid,
+) -> Result<Option<String>, String> {
+    let head = HeadObjectOperation::new(HeadObjectInput {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id: Some(version_id),
+    });
+    match drive(head, context).await {
+        Ok(head) => Ok(head.metadata.get(ORIGIN_DEVICE_TAG).cloned()),
+        Err(
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker,
+        ) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Asks the node an input was captured from, under the owner's own READ, which device its
+/// exact version came from.
+async fn remote_device(
+    context: &DriverContext,
+    record: &JobRecord,
+    bucket: &str,
+    key: &str,
+    captured: &CapturedInput,
+) -> Result<Option<String>, String> {
+    let realm_id = context.serving_realm(record.created_by.realm_id);
+    let summary = drive(
+        RemoteLocationOperation::new(
+            captured.source_node_id,
+            LocationSummaryRequest {
+                realm_id,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: Some(captured.version_id),
+                auth_context: AuthContext {
+                    user_id: record.created_by,
+                    realm_id,
+                    path_restrictions: None,
+                    session: None,
+                },
+            },
+        ),
+        context,
+    )
+    .await;
+    match summary {
+        Ok(summary) if summary.version_id == Some(captured.version_id) => Ok(summary.origin_device),
+        Ok(_) | Err(LocationSummaryError::Denied | LocationSummaryError::BucketNotFound) => {
+            Ok(None)
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// The contextual entity id of one device an input came from.
@@ -339,6 +391,8 @@ fn device_entity(device: &str) -> String {
     format!("#device-{device}")
 }
 
+/// RO-Crate 1.2 JSON-LD conforming to the Process Run Crate 0.5 profile. No
+/// secrets are included (spec 16.10).
 fn build_crate_jsonld(
     record: &JobRecord,
     spec: &ExecutionSpec,
