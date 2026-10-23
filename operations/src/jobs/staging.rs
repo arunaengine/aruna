@@ -19,7 +19,7 @@ use byteview::ByteView;
 use tracing::warn;
 
 use super::executor::{JobContext, JobRunOutcome};
-use super::store::{put_state, read_state};
+use super::store::{put_job_rows, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
 use crate::realm::get_config::GetConfigOperation;
@@ -29,6 +29,7 @@ use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::list_source::{ListStagingInput, ListStagingOperation};
 use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob};
 use crate::staging::snapshot::{MaterializeSnapshotInput, stage_snapshot_blob};
+use aruna_core::types::{Key, KeySpace, Value};
 
 const STAGING_PAGE_SIZE: usize = 500;
 
@@ -110,7 +111,7 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
                 }
             }
 
-            let result = stage_item(ctx, spec, &item).await;
+            let result = stage_item(ctx, spec, &item.source_path, &item.target_key).await;
             checkpoint.pending_items.remove(0);
             checkpoint.items_current = checkpoint.items_current.saturating_add(1);
             match result {
@@ -290,11 +291,17 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
     }
 }
 
-async fn stage_item(
+pub(super) async fn stage_item(
     ctx: &JobContext,
     spec: &StagingJobSpec,
-    item: &StagingPendingItem,
+    source_path: &str,
+    target_key: &str,
 ) -> Result<u64, ItemFailure> {
+    let item = &StagingPendingItem {
+        source_path: source_path.to_string(),
+        target_key: target_key.to_string(),
+        size: None,
+    };
     let expected_bucket = ensure_item_permission(ctx, spec, item).await?;
     let (size, version_id) = match spec.strategy {
         StagingStrategy::Reference => stage_reference_blob(
@@ -431,7 +438,7 @@ async fn ensure_item_permission(
     Ok(bucket_info)
 }
 
-async fn load_live_bucket(
+pub(super) async fn load_live_bucket(
     ctx: &JobContext,
     bucket: &str,
 ) -> Result<aruna_core::structs::storage::blob::BucketInfo, ItemFailure> {
@@ -593,7 +600,7 @@ fn source_permission_path(spec: &StagingJobSpec, source_path: &str) -> String {
     }
 }
 
-fn sync_progress(ctx: &JobContext, checkpoint: &StagingJobCheckpoint) {
+pub(super) fn sync_progress(ctx: &JobContext, checkpoint: &StagingJobCheckpoint) {
     ctx.progress.set_current(checkpoint.items_current);
     if let Some(total) = checkpoint.items_total {
         ctx.progress.set_total(total);
@@ -621,7 +628,37 @@ fn staging_checkpoint_key(job_id: JobId) -> ByteView {
     ByteView::from(job_id.to_bytes().to_vec())
 }
 
-enum ItemFailure {
+/// Writes the checkpoint and the given job rows in one claim-guarded transaction.
+pub(super) async fn persist_rows(
+    ctx: &JobContext,
+    checkpoint: &StagingJobCheckpoint,
+    mut writes: Vec<(KeySpace, Key, Value)>,
+    deletes: Vec<(KeySpace, Key)>,
+) -> Result<(), String> {
+    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
+    writes.push((
+        STAGING_STATE_KEYSPACE.to_string(),
+        staging_checkpoint_key(ctx.job_id),
+        ByteView::from(value),
+    ));
+    put_job_rows(
+        &ctx.driver.storage_handle,
+        ctx.job_id,
+        ctx.claim_token,
+        writes,
+        deletes,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub(super) fn queue_key(job_id: JobId, position: u64) -> Key {
+    let mut key = job_id.to_bytes().to_vec();
+    key.extend_from_slice(&position.to_be_bytes());
+    ByteView::from(key)
+}
+
+pub(super) enum ItemFailure {
     Denied(String),
     Stage(String),
     System(String),
