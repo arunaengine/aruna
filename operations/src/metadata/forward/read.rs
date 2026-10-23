@@ -223,10 +223,7 @@ pub async fn get_metadata_routed(
     {
         return replica_record(context, realm_id, &request, replica).await;
     }
-    let owner = local_node
-        .and_then(|node| node_kind(&config, node))
-        .and_then(|kind| kind.owner());
-    let reader = request.auth.clone();
+    let keeps = owner_reads(&config, local_node, request.auth.as_ref());
     let routed = read_routed(
         context,
         realm_id,
@@ -238,10 +235,7 @@ pub async fn get_metadata_routed(
     .await;
     match (routed, cached) {
         (Ok(record), _) => {
-            // Only the owner's own unrestricted read fills the owner's cache.
-            if reader.is_some_and(|auth| {
-                Some(auth.user_id) == owner && auth.path_restrictions.is_none() && !auth.federated()
-            }) {
+            if keeps {
                 keep_read(context, &record).await;
             }
             Ok(record)
@@ -252,6 +246,20 @@ pub async fn get_metadata_routed(
         }
         (result, _) => result,
     }
+}
+
+/// Whether a read fills this device's cache: only the owner's own unrestricted read does.
+fn owner_reads(
+    config: &RealmConfigDocument,
+    local_node: Option<NodeId>,
+    auth: Option<&AuthContext>,
+) -> bool {
+    let owner = local_node
+        .and_then(|node| node_kind(config, node))
+        .and_then(|kind| kind.owner());
+    auth.is_some_and(|auth| {
+        Some(auth.user_id) == owner && auth.path_restrictions.is_none() && !auth.federated()
+    })
 }
 
 /// The registry record a device replica holds, after the caller's own READ check.
@@ -547,6 +555,7 @@ pub async fn export_rocrate_routed(
     let pinned = cached
         .as_ref()
         .is_some_and(|replica| replica.selected || replica.pending_edits > 0);
+    let keeps = owner_reads(&config, local_node, request.auth.as_ref());
     let routed = match pinned {
         true => Err(MetadataApiError::ServiceUnavailable),
         false => {
@@ -563,6 +572,16 @@ pub async fn export_rocrate_routed(
         }
     };
     match (routed, cached) {
+        (Ok(export), _) => {
+            if keeps {
+                let (ExportMetadataResult::Full { record, .. }
+                | ExportMetadataResult::Summary { record, .. }
+                | ExportMetadataResult::Page { record, .. }
+                | ExportMetadataResult::Raw { record, .. }) = &export;
+                keep_read(context, record).await;
+            }
+            Ok(export)
+        }
         (Err(MetadataApiError::ServiceUnavailable), Some(replica)) => {
             touch_replica(context, request.document_id).await;
             let export = device_export(context, replica, &request).await?;
