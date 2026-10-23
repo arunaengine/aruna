@@ -2254,9 +2254,10 @@ fn release_key(intent_row: &[u8], version: &str) -> Vec<u8> {
     [intent_row, &[1], version.as_bytes()].concat()
 }
 
-/// Queues the release of the file at `path` if it holds the bytes `intent` recorded and has a
-/// backend version, keyed by the intent and that version so a replay queues it once; `false`
-/// when the storage cannot be asked yet.
+/// Queues the release of the file at `path` if its size and ETag prove the bytes `intent`
+/// recorded and it has a backend version, keyed by the intent and that version so a replay
+/// queues it once; any file that cannot be proven stays. `false` when the storage cannot be
+/// asked yet.
 async fn abandon(
     context: &crate::driver::DriverContext,
     (intent_row, intent, import_id): (&[u8], &WriteIntent, Ulid),
@@ -2265,36 +2266,29 @@ async fn abandon(
     let Some(blob_handle) = context.blob_handle.as_ref() else {
         return Ok(false);
     };
-    let stat = BlobEffect::StatPlain {
-        backend: intent.backend.clone(),
-        path: path.clone(),
-    };
-    match blob_handle.send_blob_effect(stat).await {
-        Event::Blob(BlobEvent::PlainStat { exists: true, .. }) => {}
-        // Nothing there: nothing to release.
-        Event::Blob(BlobEvent::PlainStat { .. }) => return Ok(true),
-        _ => return Ok(false),
-    }
     let resolved = ResolvedBackend::new(intent.backend.clone(), None);
-    let hash = BlobEffect::HashExternal {
+    let stat = BlobEffect::StatExternal {
         resolved,
         path,
         created_by: intent.created_by,
     };
-    // Only the backend version whose bytes were hashed may go; without one the file stays.
-    let (mut location, version) = match blob_handle.send_blob_effect(hash).await {
-        Event::Blob(BlobEvent::ExternalHashed {
-            location,
+    // Nothing there releases nothing; without a backend version nothing names the bytes.
+    let (mut location, version, etag) = match blob_handle.send_blob_effect(stat).await {
+        Event::Blob(BlobEvent::ExternalStat {
+            location: Some(location),
             version: Some(version),
-            ..
-        }) => (location, version),
-        Event::Blob(BlobEvent::ExternalHashed { version: None, .. }) => return Ok(true),
+            etag,
+        }) => (location, version, etag),
+        Event::Blob(BlobEvent::ExternalStat { .. }) => return Ok(true),
         _ => return Ok(false),
     };
-    let written = intent.written.map(|hash| hash.to_vec());
-    if location.get_blake3().map(<[u8]>::to_vec) != written {
+    let Some(source) = stored_copy(context, intent.written).await? else {
+        return Ok(true);
+    };
+    if !same_bytes(&source, location.blob_size, etag.as_deref()) {
         return Ok(true);
     }
+    location.hashes = source.hashes;
     location.format.layout = StoredLayout::Plain(location.ulid);
     let key = release_key(intent_row, &version);
     let work = BlobCleanupWork::ReleaseRenamed {
@@ -2313,6 +2307,39 @@ async fn abandon(
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(true),
         other => Err(format!("could not queue the abandoned copy: {other:?}")),
+    }
+}
+
+/// A stored copy of the bytes with the BLAKE3 `hash` that records their MD5.
+async fn stored_copy(
+    context: &crate::driver::DriverContext,
+    hash: Option<[u8; 32]>,
+) -> Result<Option<BackendLocation>, String> {
+    let Some(hash) = hash else {
+        return Ok(None);
+    };
+    let mut after = None;
+    loop {
+        let (rows, next) = crate::jobs::store::iter_prefix_page(
+            &context.storage_handle,
+            BLOB_LOCATIONS_KEYSPACE,
+            Some(hash.to_vec().into()),
+            after,
+            RULE_PAGE,
+            None,
+        )
+        .await?;
+        for (_, value) in rows {
+            let location =
+                BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
+            if location.hashes.contains_key(HASH_MD5) {
+                return Ok(Some(location));
+            }
+        }
+        match next {
+            Some(next) => after = Some(next),
+            None => return Ok(None),
+        }
     }
 }
 
