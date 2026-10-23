@@ -227,7 +227,10 @@ impl BlobHandler {
         self.settle_upload(plain.ulid).await?;
         let (_, reserved) = self.reserve_path(&operator, &mut location, plain).await?;
         let target = location.clone();
-        let copied = match source.blob_size <= COPY_WHOLE {
+        // Only a source pinned by its version or ETag is copied in one request; any other is
+        // proved by its part's ETag before its copy replaces the reservation.
+        let pinned = version.is_some() || if_match.is_some();
+        let copied = match pinned && source.blob_size <= COPY_WHOLE {
             true => {
                 let from = (native, version, if_match, recorded);
                 Box::pin(self.copy_whole((location, &operator), source, from)).await
@@ -257,6 +260,7 @@ impl BlobHandler {
         let target = self.native_upload(&location)?;
         let (path, source_path) = (self.object_path(&location)?, self.object_path(source)?);
         let from = (native, source_path.as_str(), version, if_match);
+        // Accepted window: a foreign write after the reservation is replaced by this copy.
         let (written, etag) = match target.copy_object(&path, from).await {
             Ok(copied) => copied,
             Err(BlobError::CopyUnsupported) => return Ok(None),
@@ -274,6 +278,7 @@ impl BlobHandler {
             });
         if md5.is_some() && !proved && !kept {
             tracing::warn!("A copy's ETag is not the source MD5; the bytes go through the node");
+            // Accepted window: a foreign write while the bytes stream is replaced by this write.
             return match self.read_blob(source.clone()).await {
                 BlobEvent::ReadFinished { blob, .. } => {
                     let written =
@@ -363,6 +368,7 @@ impl BlobHandler {
         // One part whose ETag is the source MD5 proves the bytes, and so their size.
         let proved = parts.len() == 1 && md5.is_some();
         // A create-only copy holds its path by its reservation, which must still be its own.
+        // Accepted window: a foreign write after this check is replaced by the completion.
         if let Some((native, version)) = held {
             let holds = native.holds(&path, version).await;
             if !matches!(holds, Ok(true)) {

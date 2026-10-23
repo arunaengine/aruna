@@ -4425,9 +4425,11 @@ async fn retries_transient_copies() {
         "{event:?}"
     );
     let seen = seen.lock().unwrap().clone();
-    // The copy's own reservation goes, and nothing reads the source.
+    // The upload goes but, without versions, not the reservation; nothing reads the source.
+    let aborted = |line: &String| line.starts_with("DELETE") && line.contains("uploadId");
+    let unreserved = |line: &String| line.starts_with("DELETE") && !line.contains("uploadId");
     assert!(
-        seen.iter().any(|line| line.starts_with("DELETE")),
+        seen.iter().any(aborted) && !seen.iter().any(unreserved),
         "{seen:?}"
     );
     let read = |line: &String| line.starts_with("GET") || line.contains("7_a.bin");
@@ -4436,13 +4438,14 @@ async fn retries_transient_copies() {
 
 #[tokio::test]
 async fn copies_without_reading() {
-    // A copy whose part ETag is the source MD5 asks for the copy alone, never a read.
+    // A copy of a source pinned by its ETag that answers the source MD5 asks for the copy
+    // alone, never a read.
     let context = setup_two_backends().await;
     let md5 = hex::encode(md5::compute(b"renamed bytes").0);
-    let (endpoint, seen) = copying_storage(Some(md5)).await;
+    let (endpoint, seen) = copying_storage(Some(md5.clone())).await;
     let (handler, resolved, source, plain) = copy_source(&context, &endpoint);
     let event = handler
-        .copy_plain(resolved, plain, source.clone(), None)
+        .copy_plain(resolved, plain, source.clone(), Some(md5))
         .await;
     let BlobEvent::PlainWritten { location, .. } = event else {
         panic!("copy failed: {event:?}")

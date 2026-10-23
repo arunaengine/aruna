@@ -740,6 +740,8 @@ impl BlobHandler {
                 )
                 .await?;
         }
+        // The path must still hold the upload's reservation. Accepted window: a foreign write
+        // after this check is replaced by the completion.
         if let Some(version) = held
             && !native.holds(path, version).await?
         {

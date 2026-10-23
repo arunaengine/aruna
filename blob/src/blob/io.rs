@@ -734,6 +734,7 @@ impl BlobHandler {
         }
 
         // A reserved tenant path must still hold this write's own reservation as it completes.
+        // Accepted window: a foreign write after this check is replaced by the completion.
         if let Some((native, version)) = held.as_ref() {
             match native.holds(&storage_path, version).await {
                 Ok(true) => {}
@@ -1644,6 +1645,7 @@ impl BlobHandler {
                 layout = Some(framed);
             }
             // A reserved tenant path must still hold this write's own reservation as it completes.
+            // Accepted window: a foreign write after this check is replaced by the completion.
             if let Some((native, version)) = held
                 && !native.holds(&storage_path, version).await?
             {

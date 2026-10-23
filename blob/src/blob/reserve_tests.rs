@@ -452,8 +452,8 @@ async fn failed_copy_keeps() {
 
 #[tokio::test]
 async fn unpinned_copy_streams() {
-    // A source pinned by neither version nor ETag proves its copy only by its MD5. A kept
-    // multipart ETag sends the bytes through the node, where changed bytes fail their hash.
+    // A source pinned by neither version nor ETag proves its copied part by its MD5 before the
+    // copy lands; changed bytes leave no copy at the new name and fail their hash in the node.
     let (_context, handler, resolved, fake) = tenant().await;
     let old = source(&handler, &resolved, b"renamed bytes").await;
     let mut changed = stored(b"changed bytes", &[]);
@@ -462,6 +462,7 @@ async fn unpinned_copy_streams() {
     let plain = exact("raw/a.bin", Ulid::generate());
     let copied = handler.copy_plain(resolved, plain, old, None).await;
     assert!(matches!(copied, BlobEvent::Error(_)), "{copied:?}");
+    assert!(body(&fake, "tenant/raw/a.bin").unwrap().is_empty());
 }
 
 #[tokio::test]
