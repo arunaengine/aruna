@@ -16,7 +16,9 @@ use utoipa_axum::routes;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::device::replica::{ReplicaOrigin, ReplicaRecord, list_replicas};
+use aruna_operations::device::replica::{
+    ReplicaOrigin, ReplicaRecord, cache_budget, list_replicas, replica_size,
+};
 use aruna_operations::device::selection::{SelectionError, deselect_document, select_document};
 
 use crate::auth::require_owner;
@@ -49,6 +51,10 @@ pub struct DeviceDocument {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceDocumentList {
     pub documents: Vec<DeviceDocument>,
+    /// Bytes of replicas this device keeps before it evicts unselected ones.
+    pub cache_budget_bytes: u64,
+    /// Bytes the listed replicas take now; pinned ones may push it above the budget.
+    pub cache_used_bytes: u64,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -78,7 +84,6 @@ fn map_selection_error(error: SelectionError) -> ServerError {
     match error {
         SelectionError::NotFound => ServerError::NotFound,
         SelectionError::PendingEdits => ServerError::Conflict(error.to_string()),
-        SelectionError::TooManyReplicas { .. } => ServerError::Conflict(error.to_string()),
         SelectionError::Refused(reason) => ServerError::BadRequestReason(reason),
         SelectionError::Unavailable => ServerError::ServiceUnavailableReason(
             "the realm has not served this document to this device yet".to_string(),
@@ -97,10 +102,15 @@ fn map_selection_error(error: SelectionError) -> ServerError {
 for.
 
 **Behavior**
-- A document is here because it was created on this device, selected for offline use, or edited
-  here.
-- Reads and edits of a listed document are answered by this device alone, so they keep working while
-  the realm is unreachable."#,
+- A document is here because it was created on this device, selected for offline use, edited here,
+  or read here by the owner while the realm was reachable.
+- Reads and edits of a selected or edited document are answered by this device alone, so they keep
+  working while the realm is unreachable.
+- A document the owner only read is a cache: while the realm answers, reads go to the realm and
+  refresh the copy; while it does not, the copy answers.
+- `cacheBudgetBytes` is the owner's `ARUNA_DEVICE_CACHE_BYTES` setting, 2 GB (2,000,000,000 bytes)
+  by default. Above it, unselected documents without unpublished edits are evicted, least recently
+  used first. Selected and edited documents are never evicted and never refused for space."#,
     responses(
         (status = 200, description = "Every replica this device holds, selected or not", body = DeviceDocumentList,
             example = json!({
@@ -112,7 +122,9 @@ for.
                     "origin": "device",
                     "localClockSize": 2,
                     "realmClockSize": 1
-                }]
+                }],
+                "cacheBudgetBytes": 2000000000_i64,
+                "cacheUsedBytes": 48213
             })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -130,6 +142,8 @@ async fn list_documents(
         .await
         .ok_or(ServerError::ServiceUnavailable)?;
     Ok(Json(DeviceDocumentList {
+        cache_budget_bytes: cache_budget(),
+        cache_used_bytes: replicas.iter().map(replica_size).sum(),
         documents: replicas.into_iter().map(DeviceDocument::from).collect(),
     }))
 }
@@ -173,7 +187,7 @@ for.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such document, or this node is not a user node", body = ErrorResponse),
-        (status = 409, description = "The document has unpublished edits, or the offline limit is reached", body = ErrorResponse),
+        (status = 409, description = "The document has unpublished edits", body = ErrorResponse),
         (status = 503, description = "The realm has not served this document to this device yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

@@ -13,6 +13,7 @@ use aruna_api::server::{Server, ServerConfig};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::auth::NodeCapabilities;
+use aruna_operations::device::replica::{DEFAULT_CACHE_BYTES, set_cache_budget};
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
@@ -80,6 +81,17 @@ fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
         std::path::PathBuf::from(&config.blob_root),
     ]);
     (crate::config::outermost_roots(&roots), unsupported)
+}
+
+/// The owner's replica cache budget from `ARUNA_DEVICE_CACHE_BYTES`, or the default.
+fn device_cache_env() -> u64 {
+    let Ok(value) = dotenvy::var("ARUNA_DEVICE_CACHE_BYTES") else {
+        return DEFAULT_CACHE_BYTES;
+    };
+    value.trim().parse().unwrap_or_else(|_| {
+        warn!(value = %value, "ARUNA_DEVICE_CACHE_BYTES is not a byte count; using the default");
+        DEFAULT_CACHE_BYTES
+    })
 }
 
 /// The filesystem roots a wipe has to visit, and the backends it cannot erase.
@@ -232,6 +244,9 @@ async fn bind_all(
             ),
             rocrate_limits: config.rocrate_limits.clone(),
         });
+    if matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
+        set_cache_budget(device_cache_env());
+    }
     let device_wipe = match matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
         true => {
             let (roots, unsupported) = wipe_plan(config);
