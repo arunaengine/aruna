@@ -17,7 +17,7 @@ use aruna_blob::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
-use aruna_core::errors::ConversionError;
+use aruna_core::errors::{ConversionError, StagingSourceError};
 use aruna_core::events::SubOperationEvent;
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
@@ -1835,6 +1835,35 @@ async fn pinned_unknown_verified() {
     let result = operation.finalize().unwrap();
     let items: Vec<_> = result.blob.collect().await;
     assert!(items.last().is_some_and(Result::is_err));
+}
+
+// A bound read whose condition fails observes the source again and queues a refresh, which
+// records the change; the read itself fails as changed.
+#[test]
+fn failed_condition_refreshes() {
+    let mut operation = drifted_operation();
+    operation.source_metadata = Some(observation(9));
+    operation.state = GetObjectState::ReadReferenceSource;
+
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
+        error: StagingSourceError::ConditionFailed,
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Head { .. })]
+    ));
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(10),
+    }));
+    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    operation.step(Event::SubOperation(SubOperationEvent::RefreshQueued {
+        result: Ok(()),
+    }));
+
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::ReferenceSourceChanged)
+    );
 }
 
 // A matching read is served, and the stale promise is cleared with it.

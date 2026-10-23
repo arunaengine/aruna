@@ -25,6 +25,7 @@ use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
 };
+use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
 use crate::s3::object::verified::verified;
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
@@ -105,6 +106,9 @@ pub enum GetObjectState {
     RestartReference,
     GetBlob,
     ReadReferenceSource,
+    /// The bound read failed its condition: the source is observed again for a refresh.
+    ProbeChangedSource,
+    QueueChangedRefresh,
     /// A sealed copy waits for a read lease of its bucket key.
     AdmitRead,
     /// A plain copy of an encrypting bucket reads its settings, then waits for a bucket lease.
@@ -1584,7 +1588,7 @@ impl GetObjectOperation {
             }
             Event::StagingSource(StagingSourceEvent::Error {
                 error: StagingSourceError::ConditionFailed,
-            }) => self.emit_error(GetObjectError::ReferenceSourceChanged),
+            }) => self.probe_changed_source(),
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
                 self.emit_error(error.into())
             }
@@ -1594,6 +1598,49 @@ impl GetObjectOperation {
                 received: other,
             }),
         }
+    }
+
+    /// Observes a source whose bound read failed, so a refresh records the change; the read
+    /// itself fails with "source changed".
+    fn probe_changed_source(&mut self) -> Effects {
+        let Some(access) = self.reference_access.clone() else {
+            return self.emit_error(GetObjectError::ReferenceSourceChanged);
+        };
+        self.state = GetObjectState::ProbeChangedSource;
+        smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
+    }
+
+    fn handle_changed_probe(&mut self, event: Event) -> Effects {
+        let Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) = event else {
+            return self.emit_error(GetObjectError::ReferenceSourceChanged);
+        };
+        let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
+            return self.emit_error(GetObjectError::ReferenceSourceChanged);
+        };
+        let refresh = ReferenceRefresh {
+            bucket: self.input.bucket.clone(),
+            key: self.input.key.clone(),
+            version_id,
+            metadata,
+            refreshed_at: self.now_override.unwrap_or_else(SystemTime::now),
+            node_id: self.input.node_id,
+            auth_context: self.auth_context(),
+        };
+        self.state = GetObjectState::QueueChangedRefresh;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            QueueRefreshOperation::new(refresh),
+            |result| Event::SubOperation(SubOperationEvent::RefreshQueued {
+                result: result.map(|_| ()).map_err(|error| error.to_string()),
+            }),
+        ))]
+    }
+
+    fn handle_refresh_queued(&mut self, event: Event) -> Effects {
+        if let Event::SubOperation(SubOperationEvent::RefreshQueued { result: Err(error) }) = &event
+        {
+            warn!(error = %error, "Changed reference source refresh was not queued");
+        }
+        self.emit_error(GetObjectError::ReferenceSourceChanged)
     }
 
     fn finish_reference_output(&mut self) -> Effects {
@@ -1681,6 +1728,8 @@ impl Operation for GetObjectOperation {
             GetObjectState::RestartReference => self.handle_restart_reference(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
             GetObjectState::ReadReferenceSource => self.reference_source_received(event),
+            GetObjectState::ProbeChangedSource => self.handle_changed_probe(event),
+            GetObjectState::QueueChangedRefresh => self.handle_refresh_queued(event),
             GetObjectState::AdmitRead => self.read_admitted(event),
             GetObjectState::ReadContentSettings => self.content_settings_read(event),
             GetObjectState::AdmitPlain => self.plain_admitted(event),

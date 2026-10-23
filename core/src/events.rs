@@ -88,6 +88,9 @@ pub enum SubOperationEvent {
     LiveReplicationQueued {
         result: Result<(), String>,
     },
+    RefreshQueued {
+        result: Result<(), String>,
+    },
     BucketCreated {
         result: Result<(), String>,
     },
