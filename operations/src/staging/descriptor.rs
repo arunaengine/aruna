@@ -101,6 +101,7 @@ mod pure_tests {
             etag: Some("etag-1".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         }
     }
 

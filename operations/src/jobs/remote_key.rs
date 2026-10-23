@@ -971,6 +971,7 @@ mod tests {
             etag: None,
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         };
         let epoch = std::time::SystemTime::UNIX_EPOCH;
         let reference = BlobVersion::reference(source, metadata, epoch, owner, epoch);

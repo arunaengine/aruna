@@ -719,6 +719,7 @@ async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
             etag: Some("etag-1".to_string()),
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         },
         UNIX_EPOCH,
         owner,

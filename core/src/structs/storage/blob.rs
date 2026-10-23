@@ -1643,6 +1643,7 @@ mod tests {
                 etag: None,
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             };
             let now = SystemTime::UNIX_EPOCH;
             BlobVersion::reference(source, metadata, now, UserId::default(), now)
@@ -1917,6 +1918,7 @@ mod tests {
             etag: Some("etag".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         };
 
         let versions = vec![

@@ -460,6 +460,7 @@ fn reference_range_reads() {
         etag: None,
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     };
     // Baseline matches the live head, so this undrifted read serves directly.
     operation.reference_cached = Some(metadata.clone());
@@ -505,6 +506,7 @@ fn range_drift_restarts() {
         etag: None,
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     });
     operation.resolved_range = Some(
         ObjectRangeRequest::StartEnd { start: 1, end: 3 }
@@ -520,6 +522,7 @@ fn range_drift_restarts() {
             etag: None,
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         },
         stream: aruna_core::stream::BackendStream::new(stream::iter(vec![
             Ok::<_, std::io::Error>(Bytes::from_static(b"bad")),
@@ -999,6 +1002,7 @@ async fn bound_connector_used() {
         etag: Some("etag-123".to_string()),
         last_modified: Some(SystemTime::UNIX_EPOCH),
         source_version: None,
+        digests: Default::default(),
     };
     let source = VersionSourceBinding {
         strategy: StagingStrategy::Reference,
@@ -1216,6 +1220,7 @@ async fn drift_creates_successor() {
                     etag: Some("stale-etag".to_string()),
                     last_modified: None,
                     source_version: None,
+                    digests: Default::default(),
                 },
                 SystemTime::UNIX_EPOCH,
                 Default::default(),
@@ -1347,6 +1352,7 @@ fn observation(content_length: u64) -> SourceMetadata {
         etag: Some(format!("etag-{content_length}")),
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     }
 }
 
@@ -1955,6 +1961,7 @@ async fn historical_drift_fails() {
                     etag: Some("stale-etag".to_string()),
                     last_modified: None,
                     source_version: None,
+                    digests: Default::default(),
                 },
                 SystemTime::UNIX_EPOCH,
                 Default::default(),

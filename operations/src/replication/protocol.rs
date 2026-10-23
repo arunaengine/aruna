@@ -729,6 +729,7 @@ mod pure_tests {
             etag: None,
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         });
         manifest.origin = Some(SyncOrigin {
             relationship_id: Ulid::from_parts(4, 4),
@@ -819,6 +820,7 @@ mod pure_tests {
                 etag: Some("etag-1".to_string()),
                 last_modified: Some(SystemTime::UNIX_EPOCH),
                 source_version: None,
+                digests: Default::default(),
             },
         );
         manifest

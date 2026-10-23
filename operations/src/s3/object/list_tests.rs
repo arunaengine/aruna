@@ -393,6 +393,7 @@ async fn reference_object_lists() {
         etag: Some("ref-etag-1".to_string()),
         last_modified: Some(UNIX_EPOCH + Duration::from_secs(10)),
         source_version: None,
+        digests: Default::default(),
     };
 
     let version = BlobVersion::reference(
@@ -793,6 +794,7 @@ async fn hydration_preserves_order() {
         etag: Some("ref-etag-1".to_string()),
         last_modified: Some(UNIX_EPOCH + Duration::from_secs(10)),
         source_version: None,
+        digests: Default::default(),
     };
     let reference = BlobVersion::reference(
         VersionSourceBinding {

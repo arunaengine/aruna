@@ -1248,6 +1248,7 @@ mod tests {
                 etag: None,
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             },
             inherited_policies: Vec::new(),
             connector_guard: None,

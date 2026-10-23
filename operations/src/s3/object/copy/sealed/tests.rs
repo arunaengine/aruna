@@ -196,6 +196,7 @@ async fn copy_releases_observation() {
         etag: None,
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     };
     let observation = BlobVersion::reference(binding, metadata, now, UserId::default(), now);
     let head_id = Ulid::generate();

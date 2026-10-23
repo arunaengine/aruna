@@ -96,6 +96,7 @@ pub(crate) async fn head_local(
             etag: Some(weak_fingerprint(&entry_stat(&metadata))),
             last_modified: metadata.modified().ok().map(|time| time.into_std()),
             source_version: None,
+            digests: Default::default(),
         })
     })
     .await
@@ -401,6 +402,7 @@ fn file_metadata(metadata: &std::fs::Metadata) -> SourceMetadata {
         etag: Some(weak_fingerprint(&FileStat::from_metadata(metadata))),
         last_modified: modified,
         source_version: None,
+        digests: Default::default(),
     }
 }
 

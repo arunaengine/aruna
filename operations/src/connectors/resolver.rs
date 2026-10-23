@@ -910,6 +910,7 @@ mod tests {
                 etag: None,
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             },
             "run-1/data.txt".to_string(),
             None,

@@ -241,6 +241,7 @@ mod tests {
             etag: Some("etag-2".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         }
     }
 

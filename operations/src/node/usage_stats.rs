@@ -2597,6 +2597,7 @@ mod tests {
                     etag: None,
                     last_modified: None,
                     source_version: None,
+                    digests: Default::default(),
                 },
                 now,
                 user,
@@ -2811,6 +2812,7 @@ mod tests {
                 etag: None,
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             },
             SystemTime::UNIX_EPOCH,
             Default::default(),
@@ -2866,6 +2868,7 @@ mod tests {
                 etag: None,
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             };
             let now = SystemTime::UNIX_EPOCH;
             let version = BlobVersion::reference(source, metadata, now, Default::default(), now);

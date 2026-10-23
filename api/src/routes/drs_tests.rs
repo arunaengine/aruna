@@ -449,6 +449,7 @@ fn canonical_response_complete() {
             etag: Some("etag-from-materialized".to_string()),
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         }),
     };
 
@@ -504,6 +505,7 @@ fn content_response_aliases() {
             etag: Some("etag-from-materialized".to_string()),
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         }),
     };
 

@@ -297,6 +297,7 @@ impl<'a> InvenioClient<'a> {
                     .and_then(|value| chrono::DateTime::parse_from_rfc2822(value).ok())
                     .map(Into::into),
                 source_version: None,
+                digests: Default::default(),
             },
         )
     }

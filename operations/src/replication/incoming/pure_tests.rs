@@ -430,6 +430,7 @@ pub(super) fn make_reference_manifest() -> VersionReplicationManifest {
         etag: None,
         last_modified: Some(manifest.created_at),
         source_version: None,
+        digests: Default::default(),
     });
     manifest.reference_advance_count = Some(0);
     manifest
@@ -1750,6 +1751,7 @@ fn head_releases_observation() {
         etag: None,
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     };
     let now = fixed_created_at();
     let head = BlobVersion::reference(source, metadata, now, test_user_id(), now);

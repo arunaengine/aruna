@@ -12,7 +12,7 @@ pub const HASH_CRC32: &str = "crc32";
 pub const HASH_CRC32C: &str = "crc32c";
 pub const HASH_CRC64NVME: &str = "crc64nvme";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum ChecksumAlgorithm {
     Md5,
     Sha1,

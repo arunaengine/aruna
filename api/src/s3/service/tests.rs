@@ -184,6 +184,7 @@ fn reference_fields_present() {
         etag: None,
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     };
 
     let fields =
@@ -1000,6 +1001,7 @@ fn source_metadata(content_length: u64, etag: &str) -> SourceMetadata {
         etag: Some(etag.to_string()),
         last_modified: Some(UNIX_EPOCH + Duration::from_secs(content_length)),
         source_version: None,
+        digests: Default::default(),
     }
 }
 
@@ -2916,6 +2918,7 @@ async fn reference_returns_metadata() {
         etag: Some("ref-etag-value".to_string()),
         last_modified: Some(UNIX_EPOCH + Duration::from_secs(10)),
         source_version: None,
+        digests: Default::default(),
     };
 
     let version_id = Ulid::generate();
@@ -2996,6 +2999,7 @@ async fn bare_reference_head() {
         etag: None,
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     };
     write_reference_metadata(
         &service.state.storage_handle,

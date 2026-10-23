@@ -1885,6 +1885,7 @@ impl ReplicateObjectOperation {
                         etag: None,
                         last_modified: Some(created_at),
                         source_version: None,
+                        digests: Default::default(),
                     };
                     Ok(ManifestVersionParts {
                         kind: ReplicationItemKind::Materialized,
@@ -3294,6 +3295,7 @@ mod tests {
             etag: Some("etag-1".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         }
     }
 
@@ -4150,6 +4152,7 @@ mod tests {
                 etag: None,
                 last_modified: Some(created_at),
                 source_version: None,
+                digests: Default::default(),
             })
         );
         // A native version exported as a reference is a fresh binding at the target.
@@ -4197,6 +4200,7 @@ mod tests {
             etag: None,
             last_modified: Some(created_at),
             source_version: Some(version_id.to_string()),
+            digests: Default::default(),
         };
         let replicated = op
             .manifest

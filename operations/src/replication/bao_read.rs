@@ -1758,6 +1758,7 @@ mod pure_tests {
                 etag: etag.map(ToOwned::to_owned),
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             },
             SystemTime::UNIX_EPOCH,
             UserId::nil(test_realm()),

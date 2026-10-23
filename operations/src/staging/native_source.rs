@@ -506,6 +506,7 @@ fn result_metadata(
             etag: None,
             last_modified: result.info.version_created_at,
             source_version: None,
+            digests: Default::default(),
         }
     } else {
         return Err(NativeReferenceReject::Unavailable(
@@ -529,6 +530,7 @@ fn head_metadata(
             etag: None,
             last_modified: result.version_created_at,
             source_version: None,
+            digests: Default::default(),
         }
     } else {
         return Err(NativeReferenceReject::Unavailable(
@@ -648,6 +650,7 @@ mod tests {
             etag: Some("etag".to_string()),
             last_modified: Some(std::time::SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         });
         let bytes = postcard::to_allocvec(&response).unwrap();
         assert_eq!(

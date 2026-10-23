@@ -153,6 +153,7 @@ pub(crate) async fn head_staging_source(
         etag: metadata.etag().map(ToOwned::to_owned),
         last_modified: metadata.last_modified().map(Into::into),
         source_version: metadata.version().map(ToOwned::to_owned),
+        digests: Default::default(),
     })
 }
 

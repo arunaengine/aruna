@@ -1200,6 +1200,7 @@ mod test {
             etag: Some("ref-etag".to_string()),
             last_modified: Some(UNIX_EPOCH + Duration::from_secs(10)),
             source_version: None,
+            digests: Default::default(),
         };
         seed_version(
             &storage_handle,

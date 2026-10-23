@@ -321,6 +321,7 @@ fn reference_counts_content() {
             etag: None,
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         },
         SystemTime::UNIX_EPOCH,
         Default::default(),

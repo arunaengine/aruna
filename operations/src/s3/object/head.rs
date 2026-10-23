@@ -1026,6 +1026,7 @@ mod tests {
             etag: Some("cached".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         };
         let refreshed_metadata = SourceMetadata {
             content_length: 17,
@@ -1033,6 +1034,7 @@ mod tests {
             etag: Some("current".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: Some(version_id.to_string()),
+            digests: Default::default(),
         };
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
@@ -1149,6 +1151,7 @@ mod tests {
             etag: Some("etag-123".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         };
         let last_refresh = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(17);
         let source = VersionSourceBinding {

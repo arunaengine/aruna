@@ -343,6 +343,7 @@ fn entry_metadata(entry: &SourceEntry) -> SourceMetadata {
         etag: Some(entry_fingerprint(entry)),
         last_modified: entry.modified,
         source_version: None,
+        digests: Default::default(),
     }
 }
 

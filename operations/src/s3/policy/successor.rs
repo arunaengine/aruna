@@ -1891,6 +1891,7 @@ mod pure_tests {
                 etag: None,
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             },
             UNIX_EPOCH,
             user_id(),

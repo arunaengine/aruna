@@ -858,6 +858,7 @@ mod tests {
             etag: Some(etag.to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(content_length)),
             source_version: None,
+            digests: Default::default(),
         }
     }
 
