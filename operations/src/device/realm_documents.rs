@@ -26,7 +26,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{Key, Value};
-use aruna_net::streams::MEMBERSHIP_CLOSE;
+use aruna_net::streams::{ADMISSION_CLOSE, MEMBERSHIP_CLOSE};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -165,9 +165,12 @@ async fn fetch_with_plan(
     (installed, refused)
 }
 
-/// Whether a request error is a peer closing the connection for realm membership.
+/// Whether a request error is a peer closing the connection because its realm does not admit
+/// this device: a new connection is refused at admission, an open one on a membership change.
 fn membership_refused(error: &str) -> bool {
-    error.contains(&format!("closed by peer: {MEMBERSHIP_CLOSE}"))
+    [ADMISSION_CLOSE, MEMBERSHIP_CLOSE]
+        .iter()
+        .any(|reason| error.contains(&format!("closed by peer: {reason}")))
 }
 
 /// Counts fetches that every realm peer refused for realm membership; a fetch that installed
@@ -948,7 +951,10 @@ mod tests {
         assert!(membership_refused(
             "connection lost: closed by peer: realm membership (code 0)"
         ));
-        assert!(!membership_refused("connection lost"));
+        assert!(membership_refused(
+            "connection lost: closed by peer: realm admission (code 0)"
+        ));
+        assert!(!membership_refused("connection lost: closed"));
 
         note_membership(&context, realm(), true, false).await;
         assert!(!realm_removed(&context, realm()).await);

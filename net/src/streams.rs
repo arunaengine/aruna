@@ -28,8 +28,11 @@ use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
 use crate::telemetry::{duration_ms, record_duration_ms, warn_iroh_phase, warn_iroh_request};
 
-/// Reason a node closes a connection from a peer its realm configuration does not admit.
+/// Reason a node closes an open connection once its realm configuration stops admitting the peer.
 pub const MEMBERSHIP_CLOSE: &str = "realm membership";
+
+/// Reason a node refuses a new connection from a peer its realm configuration does not admit.
+pub const ADMISSION_CLOSE: &str = "realm admission";
 
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const INBOUND_CONNECTION_LIMIT: usize = 256;
@@ -822,7 +825,7 @@ pub async fn run_accept_loop(
                             node_id = %peer_id,
                             "Dropping inbound Iroh connection: realm admission rejected"
                         );
-                        conn.close(0u32.into(), b"realm admission");
+                        conn.close(0u32.into(), ADMISSION_CLOSE.as_bytes());
                         return;
                     }
                     if !inbound_admission.allows_alpn(peer_id, alpn) {
