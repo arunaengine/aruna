@@ -11,7 +11,8 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    USAGE_STATS_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -21,13 +22,15 @@ use aruna_core::structs::storage::blob::{
     BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::format::StoredLayout;
+use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::{
-    DIRTY_GLOBAL_KEY, DIRTY_PREFIX, GLOBAL_SHARD_COUNT, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
-    SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX,
-    UsageCounterError, UsageCounters, UsageDelta, dirty_group_id, dirty_group_key,
-    global_group_key, global_shard_index, global_shard_key, global_shard_keys, shard_for_archive,
-    shard_for_hash, usage_backend_key, usage_global_key, usage_group_id, usage_group_key,
-    usage_group_prefix, usage_node_id, usage_snapshot_key, usage_summary_key,
+    BucketCounters, BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, GLOBAL_SHARD_COUNT,
+    NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY,
+    USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX, UsageCounterError, UsageCounters, UsageDelta,
+    dirty_group_id, dirty_group_key, global_group_key, global_shard_index, global_shard_key,
+    global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key, usage_bucket_key,
+    usage_global_key, usage_group_id, usage_group_key, usage_group_prefix, usage_node_id,
+    usage_snapshot_key, usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -65,8 +68,55 @@ enum UsageUpdatePhase {
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageCounterUpdate {
     entries: Vec<(Vec<u8>, UsageDelta)>,
+    /// The row of the bucket the change concerns, if it concerns one.
+    bucket: Option<(Vec<u8>, BucketDelta)>,
     dirty_group: Option<GroupId>,
     phase: UsageUpdatePhase,
+}
+
+/// What a write does to the version rows of its bucket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowChange {
+    /// No row is added or removed, as when a row is replaced in place.
+    Kept,
+    AddedVersion,
+    AddedMarker,
+    RemovedVersion,
+    RemovedMarker,
+    /// A marker row replaced in place by a version row of the same id.
+    MarkerToVersion,
+    VersionToMarker,
+}
+
+impl RowChange {
+    /// Writing a row, a delete marker or not, where the version id may already have one;
+    /// `existing` says whether that row is a delete marker.
+    pub fn written(existing: Option<bool>, marker: bool) -> Self {
+        match (existing, marker) {
+            (None, false) => Self::AddedVersion,
+            (None, true) => Self::AddedMarker,
+            (Some(true), false) => Self::MarkerToVersion,
+            (Some(false), true) => Self::VersionToMarker,
+            (Some(_), _) => Self::Kept,
+        }
+    }
+
+    fn delta(self) -> BucketDelta {
+        let (versions, delete_markers) = match self {
+            Self::Kept => (0, 0),
+            Self::AddedVersion => (1, 0),
+            Self::AddedMarker => (0, 1),
+            Self::RemovedVersion => (-1, 0),
+            Self::RemovedMarker => (0, -1),
+            Self::MarkerToVersion => (1, -1),
+            Self::VersionToMarker => (-1, 1),
+        };
+        BucketDelta {
+            versions,
+            delete_markers,
+            ..Default::default()
+        }
+    }
 }
 
 /// One physical copy's contribution to the stored counters, booked against one shard.
@@ -149,6 +199,21 @@ fn merge_entry(entries: &mut Vec<(Vec<u8>, UsageDelta)>, key: Vec<u8>, delta: Us
     }
 }
 
+/// Books one multipart upload record of `bucket` created (`1`) or removed (`-1`) in `txn_id`;
+/// storage answers with `BatchWriteResult`.
+pub fn count_upload(bucket: &str, uploads: i128, txn_id: TxnId) -> Effect {
+    let delta = BucketDelta {
+        open_uploads: uploads,
+        ..Default::default()
+    };
+    Effect::Storage(StorageEffect::AddUsage {
+        key_space: USAGE_STATS_KEYSPACE.to_string(),
+        deltas: Vec::new(),
+        buckets: vec![(usage_bucket_key(bucket).into(), delta)],
+        txn_id,
+    })
+}
+
 impl UsageCounterUpdate {
     pub fn for_group(group_id: GroupId, delta: UsageDelta) -> Self {
         Self {
@@ -156,6 +221,7 @@ impl UsageCounterUpdate {
                 (global_group_key(group_id), delta),
                 (usage_group_key(group_id), delta),
             ],
+            bucket: None,
             dirty_group: Some(group_id),
             phase: UsageUpdatePhase::Pending,
         }
@@ -174,15 +240,31 @@ impl UsageCounterUpdate {
         }
         Self {
             entries,
+            bucket: None,
             dirty_group: Some(group_id),
             phase: UsageUpdatePhase::Pending,
         }
+    }
+
+    /// Also books the group delta and the version `row` change on the row of `bucket`.
+    pub fn in_bucket(mut self, bucket: &str, row: RowChange) -> Self {
+        let group = self.dirty_group.map(usage_group_key);
+        let delta = self
+            .entries
+            .iter()
+            .find(|(key, _)| Some(key) == group.as_ref());
+        if let Some(&(_, delta)) = delta {
+            let delta = BucketDelta::from(delta).merge(row.delta());
+            self.bucket = Some((usage_bucket_key(bucket), delta));
+        }
+        self
     }
 
     /// The reclaim sweep's debit: physical bytes leave, no group counter moves.
     pub fn for_stored(stored: StoredDelta) -> Self {
         Self {
             entries: stored.entries(),
+            bucket: None,
             dirty_group: None,
             phase: UsageUpdatePhase::Pending,
         }
@@ -209,7 +291,9 @@ impl UsageCounterUpdate {
     }
 
     pub fn is_noop(&self) -> bool {
+        let bucket = self.bucket.as_ref().map(|(_, delta)| *delta);
         self.entries.iter().all(|(_, delta)| delta.is_zero())
+            && bucket.is_none_or(|delta| delta == BucketDelta::default())
     }
 
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
@@ -219,6 +303,9 @@ impl UsageCounterUpdate {
             deltas: self
                 .entries
                 .iter()
+                .map(|(key, delta)| (key.clone().into(), *delta))
+                .collect(),
+            buckets: (self.bucket.iter())
                 .map(|(key, delta)| (key.clone().into(), *delta))
                 .collect(),
             txn_id,
@@ -595,6 +682,7 @@ pub enum RebuildStatsState {
     ScanArchives,
     ScanEnvelopeVersions,
     ScanCopies,
+    ScanUploads,
     ScanCounters,
     StartWriteTransaction,
     WriteCounters,
@@ -642,6 +730,8 @@ pub struct RebuildStatsOperation {
     global_shards: Vec<UsageCounters>,
     backend_shards: HashMap<Vec<u8>, UsageCounters>,
     groups: HashMap<GroupId, UsageCounters>,
+    /// Rows of each bucket, an empty bucket included.
+    bucket_rows: HashMap<String, BucketCounters>,
     existing_counter_keys: Vec<Vec<u8>>,
     stale_counter_deletes: Vec<(String, Key)>,
     /// Materialized versions whose blob location row is gone; their bytes
@@ -673,6 +763,7 @@ impl RebuildStatsOperation {
             global_shards: vec![UsageCounters::default(); GLOBAL_SHARD_COUNT],
             backend_shards: HashMap::new(),
             groups: HashMap::new(),
+            bucket_rows: HashMap::new(),
             existing_counter_keys: Vec::new(),
             stale_counter_deletes: Vec::new(),
             orphan_versions: 0,
@@ -707,6 +798,7 @@ impl RebuildStatsOperation {
             RebuildStatsState::ScanArchives => Some(ABE_ARCHIVE_KEYSPACE),
             RebuildStatsState::ScanEnvelopeVersions => Some(ABE_VERSION_KEYSPACE),
             RebuildStatsState::ScanCopies => Some(ABE_COPY_KEYSPACE),
+            RebuildStatsState::ScanUploads => Some(UPLOAD_KEYSPACE),
             RebuildStatsState::ScanCounters => Some(USAGE_STATS_KEYSPACE),
             _ => None,
         }
@@ -718,6 +810,30 @@ impl RebuildStatsOperation {
 
     fn global_shard_entry(&mut self, group_id: GroupId) -> &mut UsageCounters {
         &mut self.global_shards[global_shard_index(group_id)]
+    }
+
+    /// Books an object-level delta on its bucket's group, global shard and bucket rows.
+    fn book_bucket(
+        &mut self,
+        bucket: &str,
+        delta: &UsageCounters,
+    ) -> Result<(), RebuildStatsError> {
+        let Some(group_id) = self.bucket_groups.get(bucket).copied() else {
+            self.global_shards[0].add(delta)?;
+            return Ok(());
+        };
+        self.group_entry(group_id).add(delta)?;
+        self.global_shard_entry(group_id).add(delta)?;
+        if let Some(row) = self.bucket_rows.get_mut(bucket) {
+            let share = BucketDelta {
+                objects: delta.objects.into(),
+                logical_bytes: delta.logical_bytes.into(),
+                referenced_bytes: delta.referenced_bytes.into(),
+                ..Default::default()
+            };
+            row.apply(&share)?;
+        }
+        Ok(())
     }
 
     fn backend_entry(&mut self, backend: &BackendRef, shard: usize) -> &mut UsageCounters {
@@ -739,6 +855,8 @@ impl RebuildStatsOperation {
                     self.global.add(&delta)?;
                     self.group_entry(info.group_id).add(&delta)?;
                     self.global_shard_entry(info.group_id).add(&delta)?;
+                    self.bucket_rows
+                        .insert(bucket.clone(), BucketCounters::default());
                     self.bucket_groups.insert(bucket, info.group_id);
                 }
             }
@@ -795,6 +913,14 @@ impl RebuildStatsOperation {
                 for (key, value) in values {
                     let version = BlobVersion::from_bytes(value.as_ref())?;
                     let version_key = VersionKey::from_bytes(key.as_ref())?;
+                    if let Some(row) = self.bucket_rows.get_mut(&version_key.bucket) {
+                        let marker = version.is_deleted();
+                        row.apply(&BucketDelta {
+                            versions: (!marker).into(),
+                            delete_markers: marker.into(),
+                            ..Default::default()
+                        })?;
+                    }
                     let object = (version_key.bucket.clone(), version_key.key.clone());
                     let current = self
                         .current_versions
@@ -806,13 +932,7 @@ impl RebuildStatsOperation {
                             ..Default::default()
                         };
                         self.global.add(&delta)?;
-                        if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied()
-                        {
-                            self.group_entry(group_id).add(&delta)?;
-                            self.global_shard_entry(group_id).add(&delta)?;
-                        } else {
-                            self.global_shards[0].add(&delta)?;
-                        }
+                        self.book_bucket(&version_key.bucket, &delta)?;
                     }
 
                     // An offered directory is charged only for its current observations.
@@ -848,12 +968,7 @@ impl RebuildStatsOperation {
                         ..Default::default()
                     };
                     self.global.add(&delta)?;
-                    if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied() {
-                        self.group_entry(group_id).add(&delta)?;
-                        self.global_shard_entry(group_id).add(&delta)?;
-                    } else {
-                        self.global_shards[0].add(&delta)?;
-                    }
+                    self.book_bucket(&version_key.bucket, &delta)?;
                 }
             }
             RebuildStatsState::ScanEnvelopes | RebuildStatsState::ScanArchives => {
@@ -885,11 +1000,18 @@ impl RebuildStatsOperation {
                         ..Default::default()
                     };
                     self.global.add(&delta)?;
-                    if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied() {
-                        self.group_entry(group_id).add(&delta)?;
-                        self.global_shard_entry(group_id).add(&delta)?;
-                    } else {
-                        self.global_shards[0].add(&delta)?;
+                    self.book_bucket(&version_key.bucket, &delta)?;
+                }
+            }
+            RebuildStatsState::ScanUploads => {
+                for (_, value) in values {
+                    // Like the stale sweep, an undecodable record is left out, as no flow ends it.
+                    let Ok(upload) = MultipartUpload::from_bytes(value.as_ref()) else {
+                        warn!("rebuilt usage skips an undecodable multipart upload");
+                        continue;
+                    };
+                    if let Some(row) = self.bucket_rows.get_mut(&upload.bucket) {
+                        row.open_uploads = row.open_uploads.saturating_add(1);
                     }
                 }
             }
@@ -920,7 +1042,8 @@ impl RebuildStatsOperation {
             RebuildStatsState::ScanEnvelopes => RebuildStatsState::ScanArchives,
             RebuildStatsState::ScanArchives => RebuildStatsState::ScanEnvelopeVersions,
             RebuildStatsState::ScanEnvelopeVersions => RebuildStatsState::ScanCopies,
-            RebuildStatsState::ScanCopies => RebuildStatsState::ScanCounters,
+            RebuildStatsState::ScanCopies => RebuildStatsState::ScanUploads,
+            RebuildStatsState::ScanUploads => RebuildStatsState::ScanCounters,
             RebuildStatsState::ScanCounters => {
                 self.state = RebuildStatsState::StartWriteTransaction;
                 return smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -988,6 +1111,15 @@ impl RebuildStatsOperation {
         }
         for (group_id, counters) in &self.groups {
             let key = usage_group_key(*group_id);
+            let bytes = match counters.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(err) => return self.emit_error(err.into()),
+            };
+            write_keys.insert(key.clone());
+            writes.push((USAGE_STATS_KEYSPACE.to_string(), key.into(), bytes.into()));
+        }
+        for (bucket, counters) in &self.bucket_rows {
+            let key = usage_bucket_key(bucket);
             let bytes = match counters.to_bytes() {
                 Ok(bytes) => bytes,
                 Err(err) => return self.emit_error(err.into()),
@@ -1097,6 +1229,7 @@ impl Operation for RebuildStatsOperation {
             | RebuildStatsState::ScanArchives
             | RebuildStatsState::ScanEnvelopeVersions
             | RebuildStatsState::ScanCopies
+            | RebuildStatsState::ScanUploads
             | RebuildStatsState::ScanCounters => self.handle_page(event),
             RebuildStatsState::StartWriteTransaction => self.handle_write_started(event),
             RebuildStatsState::WriteCounters => self.handle_counters_written(event),
@@ -1854,6 +1987,7 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::{FrameLayout, StoredFormat, StoredLayout};
+    use aruna_core::structs::storage::multipart::MultipartUploadStatus;
     use aruna_core::structs::storage::usage::global_shard_keys;
     use aruna_core::structs::storage::usage::usage_hash_key;
     use std::time::SystemTime;
@@ -2037,6 +2171,20 @@ mod tests {
         read_optional_counters(ctx, key).await.unwrap_or_default()
     }
 
+    async fn read_bucket(ctx: &DriverContext, bucket: &str) -> BucketCounters {
+        let read = StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: usage_bucket_key(bucket).into(),
+            txn_id: None,
+        };
+        match ctx.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => BucketCounters::from_bytes(&bytes).unwrap(),
+            other => panic!("expected the bucket row, got {other:?}"),
+        }
+    }
+
     async fn read_global_counters(ctx: &DriverContext) -> UsageCounters {
         let mut total = UsageCounters::default();
         for key in global_shard_keys() {
@@ -2119,6 +2267,80 @@ mod tests {
             .unwrap();
         assert!(done.is_none());
         assert!(update.is_done());
+    }
+
+    #[test]
+    fn bucket_books_delta() {
+        let group_id = Ulid::generate();
+        let delta = UsageDelta {
+            buckets: 1,
+            objects: -1,
+            logical_bytes: -42,
+            ..Default::default()
+        };
+        let update = UsageCounterUpdate::for_group(group_id, delta);
+        let mut update = update.in_bucket("data", RowChange::RemovedVersion);
+        let effects = update.start(Ulid::generate());
+        let [
+            Effect::Storage(StorageEffect::AddUsage {
+                deltas, buckets, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the counter deltas, got {effects:?}");
+        };
+        assert_eq!(deltas.len(), 2);
+        let bucket = BucketDelta {
+            objects: -1,
+            versions: -1,
+            logical_bytes: -42,
+            ..Default::default()
+        };
+        assert_eq!(buckets, &vec![(usage_bucket_key("data").into(), bucket)]);
+
+        // A marker alone moves no group counter, yet the update still books it.
+        let update = UsageCounterUpdate::for_group(group_id, UsageDelta::default());
+        assert!(update.is_noop());
+        assert!(!update.in_bucket("data", RowChange::AddedMarker).is_noop());
+
+        // The reclaim sweep's physical debit names no group, so no bucket row moves.
+        let stored = StoredDelta::new([1; 32], BackendRef::node_default(), -1, -5);
+        let mut update = UsageCounterUpdate::for_stored(stored).in_bucket("data", RowChange::Kept);
+        let effects = update.start(Ulid::generate());
+        let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice() else {
+            panic!("expected the counter deltas, got {effects:?}");
+        };
+        assert!(buckets.is_empty());
+    }
+
+    #[test]
+    fn rows_follow_replacement() {
+        // A replay replaces a row of its own kind; another kind moves one count to the other.
+        let cases = [
+            (None, false, RowChange::AddedVersion, (1, 0)),
+            (None, true, RowChange::AddedMarker, (0, 1)),
+            (Some(true), false, RowChange::MarkerToVersion, (1, -1)),
+            (Some(false), true, RowChange::VersionToMarker, (-1, 1)),
+            (Some(true), true, RowChange::Kept, (0, 0)),
+            (Some(false), false, RowChange::Kept, (0, 0)),
+        ];
+        let group_id = Ulid::generate();
+        for (existing, marker, row, (versions, delete_markers)) in cases {
+            assert_eq!(RowChange::written(existing, marker), row);
+            let update = UsageCounterUpdate::for_group(group_id, UsageDelta::default());
+            let mut update = update.in_bucket("data", row);
+            let effects = update.start(Ulid::generate());
+            let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice()
+            else {
+                panic!("expected the counter deltas, got {effects:?}");
+            };
+            let delta = BucketDelta {
+                versions,
+                delete_markers,
+                ..Default::default()
+            };
+            assert_eq!(buckets, &vec![(usage_bucket_key("data").into(), delta)]);
+        }
     }
 
     #[tokio::test]
@@ -2387,6 +2609,38 @@ mod tests {
         write_head("alpha", "gone.txt", alpha_gone_head).await;
         write_head("alpha", "ref.txt", alpha_ref_head).await;
         write_head("beta", "shared.bin", beta_head).await;
+        // One upload record in alpha, being completed, and one of a bucket that is gone.
+        for (bucket, status) in [
+            ("alpha", MultipartUploadStatus::Completing),
+            ("gone", MultipartUploadStatus::Open),
+        ] {
+            let upload = MultipartUpload {
+                upload_id: Ulid::generate(),
+                backend: BackendRef::node_default(),
+                storage_class: None,
+                bucket: bucket.to_string(),
+                key: "part.bin".to_string(),
+                group_id: group_a,
+                created_by: user,
+                created_at: now,
+                status,
+                checksum_hint: None,
+                metadata: Default::default(),
+                placement_policies: Vec::new(),
+                subject_generation: 0,
+                completing_since_ms: None,
+                backend_upload: None,
+                encryption: None,
+            };
+            ctx.storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: UPLOAD_KEYSPACE.to_string(),
+                    key: upload.upload_id.to_bytes().to_vec().into(),
+                    value: upload.to_bytes().unwrap().into(),
+                    txn_id: Some(txn_id),
+                })
+                .await;
+        }
 
         ctx.storage_handle
             .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
@@ -2417,6 +2671,24 @@ mod tests {
         assert_eq!(beta.objects, 1);
         assert_eq!(beta.logical_bytes, 80);
         assert_eq!(beta.referenced_bytes, 0);
+
+        // Each bucket row holds its bucket's share and counts its rows.
+        let alpha_row = BucketCounters {
+            objects: 2,
+            versions: 3,
+            delete_markers: 1,
+            logical_bytes: 140,
+            referenced_bytes: 30,
+            open_uploads: 1,
+        };
+        assert_eq!(read_bucket(&ctx, "alpha").await, alpha_row);
+        let beta_row = BucketCounters {
+            objects: 1,
+            versions: 2,
+            logical_bytes: 80,
+            ..Default::default()
+        };
+        assert_eq!(read_bucket(&ctx, "beta").await, beta_row);
     }
 
     #[test]

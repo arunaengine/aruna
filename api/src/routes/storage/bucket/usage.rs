@@ -6,14 +6,11 @@ use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_operations::driver::drive;
-use aruna_operations::s3::bucket::usage::{
-    BucketUsageInput, BucketUsageOperation, BucketUsageOutput,
-};
-use axum::extract::{Path, Query, State};
+use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
+use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -22,22 +19,12 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
 
-const DEFAULT_USAGE_LIMIT: usize = 10_000;
-const MAX_USAGE_LIMIT: usize = 100_000;
-
 #[derive(OpenApi)]
 #[openapi()]
 pub struct BucketUsageDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(BucketUsageDoc::openapi()).routes(routes!(get_bucket_usage))
-}
-
-#[derive(Debug, Clone, Deserialize, IntoParams)]
-pub struct BucketUsageQuery {
-    /// Scan bound for both inventories, 1 to 100000, default 10000.
-    #[serde(default)]
-    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -49,22 +36,25 @@ pub struct BucketUsageResponse {
     pub versions: u64,
     pub delete_markers: u64,
     pub open_multipart_uploads: u64,
-    /// Bytes over all stored versions counted above.
+    /// Bytes of all stored versions, the group quota basis.
     pub logical_bytes: u64,
-    /// False means the scan hit its bound and every number is a lower bound.
+    /// Bytes reachable only through external references.
+    pub referenced_bytes: u64,
+    /// Always true: every number is counted in full.
     pub complete: bool,
 }
 
 impl BucketUsageResponse {
-    fn new(bucket: String, totals: BucketUsageOutput) -> Self {
+    fn new(bucket: String, counters: BucketCounters) -> Self {
         Self {
             bucket,
-            objects: totals.objects,
-            versions: totals.versions,
-            delete_markers: totals.delete_markers,
-            open_multipart_uploads: totals.open_multipart_uploads,
-            logical_bytes: totals.logical_bytes,
-            complete: totals.complete,
+            objects: counters.objects,
+            versions: counters.versions,
+            delete_markers: counters.delete_markers,
+            open_multipart_uploads: counters.open_uploads,
+            logical_bytes: counters.logical_bytes,
+            referenced_bytes: counters.referenced_bytes,
+            complete: true,
         }
     }
 }
@@ -80,19 +70,17 @@ impl BucketUsageResponse {
 objects.
 
 **Behavior**
-- There is no maintained per-bucket counter, so the numbers come from a bounded scan of this node's
-  own rows and cost grows with the bucket.
-- `complete` false means the scan hit `limit`: every number is then a lower bound.
-- `objects` counts current heads that are not delete markers, `versions` counts every stored
-  version including noncurrent ones, and `logical_bytes` sums the bytes of those versions.
-- Bytes this node may not describe, such as a governed copy it holds no registration for, count as
-  zero rather than failing the request.
-
-**Limits**
-- `limit` accepts 1 to 100000 and defaults to 10000."#,
+- Every number comes from this node's counter of the bucket, kept up to date in the same
+  transaction as each write, delete, upload start, completion and abort, so the answer costs one
+  read however large the bucket is.
+- `objects` counts current heads that are not delete markers, `versions` every stored version
+  including noncurrent ones, and `logical_bytes` the bytes of those versions, as the group quota
+  does. `referenced_bytes` sums the sizes of versions that only point to external data.
+- `open_multipart_uploads` counts uploads not yet completed or aborted, including one a
+  completion or abort is finishing.
+- `complete` is always true."#,
     params(
-        ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash"),
-        BucketUsageQuery
+        ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")
     ),
     responses(
         (
@@ -106,10 +94,10 @@ objects.
                 "delete_markers": 3,
                 "open_multipart_uploads": 1,
                 "logical_bytes": 84291337,
+                "referenced_bytes": 0,
                 "complete": true
             })
         ),
-        (status = 400, description = "The limit is outside the accepted range", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
@@ -120,13 +108,8 @@ pub async fn get_bucket_usage(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(bucket): Path<String>,
-    Query(query): Query<BucketUsageQuery>,
 ) -> ServerResult<Json<BucketUsageResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    let limit = query.limit.unwrap_or(DEFAULT_USAGE_LIMIT);
-    if !(1..=MAX_USAGE_LIMIT).contains(&limit) {
-        return Err(ServerError::BadRequest);
-    }
     let info = bucket_info(&state, &bucket).await?;
     ensure_permission(
         &state,
@@ -140,14 +123,34 @@ pub async fn get_bucket_usage(
         Permission::READ,
     )
     .await?;
-    let totals = drive(
-        BucketUsageOperation::new(BucketUsageInput {
-            bucket: bucket.clone(),
-            limit,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    Ok(Json(BucketUsageResponse::new(bucket, totals)))
+    let counters = bucket_counters(&state, &bucket).await?;
+    Ok(Json(BucketUsageResponse::new(bucket, counters)))
+}
+
+/// The bucket's counter row; a bucket without one holds nothing yet.
+async fn bucket_counters(state: &ServerState, bucket: &str) -> ServerResult<BucketCounters> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+
+    let read = StorageEffect::Read {
+        key_space: USAGE_STATS_KEYSPACE.to_string(),
+        key: usage_bucket_key(bucket).into(),
+        txn_id: None,
+    };
+    let value = match state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(read)
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        other => {
+            let error = format!("could not read the bucket counter: {other:?}");
+            return Err(ServerError::InternalError(error));
+        }
+    };
+    let counters = value.as_deref().map(BucketCounters::from_bytes).transpose();
+    let counters = counters.map_err(|error| ServerError::InternalError(error.to_string()))?;
+    Ok(counters.unwrap_or_default())
 }

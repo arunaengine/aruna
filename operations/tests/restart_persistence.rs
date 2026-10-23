@@ -2,9 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Fresh builds overflow the default query depth in nested async layouts.
-#![recursion_limit = "256"]
-
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,7 +31,7 @@ use ulid::Ulid;
 const CHILD_MODE_ENV: &str = "ARUNA_METADATA_RESTART_PERSISTENCE_CHILD";
 const STORAGE_PATH_ENV: &str = "ARUNA_METADATA_RESTART_STORAGE_PATH";
 const METADATA_PATH_ENV: &str = "ARUNA_METADATA_RESTART_METADATA_PATH";
-const CHILD_TEST_NAME: &str = "child_writes_flushes";
+const CHILD_TEST_NAME: &str = "restart_persistence::child_writes_flushes";
 
 #[tokio::test]
 async fn restart_persists_flush() -> Result<(), Box<dyn std::error::Error>> {

@@ -279,7 +279,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "ahash",
  "aruna-blob",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aruna-core",
  "aruna-kpabe",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "rustix",
  "serde_json",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aes-gcm 0.11.1",
  "aruna-kpabe",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "ahash",
  "aruna",
@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aes-gcm 0.11.1",
  "bls12_381_plus",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe-wasm"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aruna-kpabe",
  "blake3",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -662,6 +662,7 @@ dependencies = [
  "irokle",
  "jsonwebtoken",
  "lru 0.18.5",
+ "md5",
  "opentelemetry",
  "oxrdf",
  "oxttl",
@@ -692,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-registry"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -713,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -730,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.131"
+version = "3.0.0-alpha.132"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -2400,9 +2401,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
  "subtle",

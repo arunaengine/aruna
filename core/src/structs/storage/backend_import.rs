@@ -5,10 +5,11 @@
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::id::NodeId;
+use crate::structs::checksum::HASH_MD5;
 use crate::structs::execution::job::JobId;
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
-use crate::structs::storage::blob::BackendRef;
+use crate::structs::storage::blob::{BackendLocation, BackendRef};
 use crate::structs::storage::group_backend::path_bucket;
 use crate::types::{GroupId, Key};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,15 @@ pub const DEFAULT_PATTERN: &str = "{dir}{name}~{id}";
 
 /// Write pattern of a provider bucket linked to a bucket: the bucket key, unchanged.
 pub const PLAIN_PATTERN: &str = "{dir}{name}";
+
+/// Bytes one provider copy part takes at most; the provider limit is 5 GiB.
+pub const COPY_PART: u64 = 1 << 30;
+
+/// Whether a provider copy of `source` without a provider version or recorded ETag still
+/// proves its bytes: one part, whose ETag must be the stored MD5.
+pub fn copy_provable(source: &BackendLocation) -> bool {
+    source.blob_size <= COPY_PART && source.hashes.contains_key(HASH_MD5)
+}
 
 /// Registers the objects under `backend_prefix` of a group backend in `bucket` under
 /// `key_prefix`. The bytes stay where they are and Aruna never deletes them.

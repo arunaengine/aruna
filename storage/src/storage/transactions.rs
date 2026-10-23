@@ -5,7 +5,9 @@
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
-use aruna_core::structs::storage::usage::{UsageCounters, UsageDelta};
+use aruna_core::structs::storage::usage::{
+    BucketCounters, BucketDelta, CounterShortfall, UsageCounters, UsageDelta,
+};
 use byteview::ByteView;
 use fjall::Readable;
 use tracing::warn;
@@ -15,17 +17,36 @@ use crate::compaction::{DELETE_THRESHOLD, compactable};
 
 use super::{CleanupEntry, CleanupKind, FjallStorage, MAX_TRANSACTION_CLEANUP, Txn};
 
+/// A transaction's pending change of one counter row.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CounterChange {
+    Usage(UsageDelta),
+    Bucket(BucketDelta),
+}
+
+impl CounterChange {
+    /// Folds two changes of one row; rows of one key always hold the same kind.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Usage(left), Self::Usage(right)) => Self::Usage(left.merge(right)),
+            (Self::Bucket(left), Self::Bucket(right)) => Self::Bucket(left.merge(right)),
+            (_, other) => other,
+        }
+    }
+}
+
 impl FjallStorage {
     #[tracing::instrument(
         name = "storage.add_usage",
         level = "debug",
-        skip(self, deltas),
+        skip(self, deltas, buckets),
         fields(key_space = %key_space, delta_count = deltas.len(), txn_id = %txn_id)
     )]
     pub(super) fn add_usage(
         &mut self,
         key_space: String,
         deltas: Vec<(ByteView, UsageDelta)>,
+        buckets: Vec<(ByteView, BucketDelta)>,
         txn_id: Ulid,
     ) -> StorageEvent {
         if let Err(error) = self.store.resolve_keyspace(&key_space) {
@@ -37,15 +58,21 @@ impl FjallStorage {
             };
         }
         let pending = self.txn_usage.entry(txn_id).or_default();
-        let mut entries = Vec::with_capacity(deltas.len());
-        for (key, delta) in deltas {
+        let mut entries = Vec::with_capacity(deltas.len() + buckets.len());
+        let usage = deltas
+            .into_iter()
+            .map(|(key, delta)| (key, CounterChange::Usage(delta)));
+        let rows = buckets
+            .into_iter()
+            .map(|(key, delta)| (key, CounterChange::Bucket(delta)));
+        for (key, change) in usage.chain(rows) {
             entries.push((key_space.clone(), key.clone()));
             match pending
                 .iter_mut()
                 .find(|(space, existing, _)| *space == key_space && *existing == key)
             {
-                Some((_, _, existing)) => *existing = existing.merge(delta),
-                None => pending.push((key_space.clone(), key, delta)),
+                Some((_, _, existing)) => *existing = existing.merge(change),
+                None => pending.push((key_space.clone(), key, change)),
             }
         }
         StorageEvent::BatchWriteResult { entries }
@@ -62,31 +89,28 @@ impl FjallStorage {
             return Ok(());
         };
         let snapshot = self.store.db.read_tx();
-        for (key_space, key, delta) in pending {
+        let failed = |error: &dyn std::fmt::Display| StorageError::WriteError(error.to_string());
+        for (key_space, key, change) in pending {
             let keyspace = self.store.resolve_keyspace(&key_space)?;
             let stored = snapshot
                 .get(&keyspace, &key)
                 .map_err(|error| StorageError::ReadError(error.to_string()))?;
-            let mut counters = match stored {
-                Some(bytes) => UsageCounters::from_bytes(&bytes)
-                    .map_err(|error| StorageError::WriteError(error.to_string()))?,
-                None => UsageCounters::default(),
+            let stored = stored.as_deref();
+            let (value, shortfalls) = match change {
+                CounterChange::Usage(delta) => {
+                    let counters = stored.map(UsageCounters::from_bytes).transpose();
+                    let mut counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
+                    let shortfalls = counters.apply(&delta).map_err(|e| failed(&e))?;
+                    (counters.to_bytes().map_err(|e| failed(&e))?, shortfalls)
+                }
+                CounterChange::Bucket(delta) => {
+                    let counters = stored.map(BucketCounters::from_bytes).transpose();
+                    let mut counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
+                    let shortfalls = counters.apply(&delta).map_err(|e| failed(&e))?;
+                    (counters.to_bytes().map_err(|e| failed(&e))?, shortfalls)
+                }
             };
-            let shortfalls = counters
-                .apply(&delta)
-                .map_err(|error| StorageError::WriteError(error.to_string()))?;
-            for shortfall in shortfalls {
-                warn!(
-                    event = "storage.usage.clamped",
-                    field = shortfall.field,
-                    key = hex::encode(&key),
-                    shortfall = shortfall.missing,
-                    "usage counter decrement clamped at zero"
-                );
-            }
-            let value = counters
-                .to_bytes()
-                .map_err(|error| StorageError::WriteError(error.to_string()))?;
+            warn_clamped(&key, shortfalls);
             txn.insert(keyspace, key, value);
         }
         Ok(())
@@ -320,5 +344,17 @@ impl FjallStorage {
                 self.note_deletes(&key_space, count);
             }
         }
+    }
+}
+
+fn warn_clamped(key: &[u8], shortfalls: Vec<CounterShortfall>) {
+    for shortfall in shortfalls {
+        warn!(
+            event = "storage.usage.clamped",
+            field = shortfall.field,
+            key = hex::encode(key),
+            shortfall = shortfall.missing,
+            "usage counter decrement clamped at zero"
+        );
     }
 }

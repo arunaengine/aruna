@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::node::usage_stats::count_upload;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::write_cleanup::{WriteCleanup, delete_records_effect};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -28,6 +29,9 @@ pub enum AbortUploadState {
     AbortBackendUpload,
     ReadUploadParts,
     StartDeleteTransaction,
+    /// Reads the record in the delete transaction, so only the delete that finds it counts.
+    ReadUploadRecord,
+    CountUpload,
     DeleteUploadRecords,
     WriteCleanupRecords,
     CommitDeleteTransaction,
@@ -309,6 +313,43 @@ impl AbortUploadOperation {
     }
 
     fn delete_upload_records(&mut self) -> Effects {
+        self.state = AbortUploadState::ReadUploadRecord;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: UPLOAD_KEYSPACE.to_string(),
+            key: self.input.upload_id.to_bytes().to_vec().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// A concurrent delete of the record conflicts with this read, so a record is counted
+    /// closed once.
+    fn upload_record_read(&mut self, event: Event) -> Effects {
+        let value = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            Event::Storage(StorageEvent::Error { error }) => {
+                return self.schedule_error(error.into());
+            }
+            _ => return self.schedule_error(AbortUploadError::InvalidOperationState),
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.schedule_error(AbortUploadError::NoTransactionFound);
+        };
+        if value.is_none() {
+            return self.delete_records();
+        }
+        self.state = AbortUploadState::CountUpload;
+        smallvec![count_upload(&self.input.bucket, -1, txn_id)]
+    }
+
+    fn upload_counted(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.delete_records(),
+            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
+            _ => self.schedule_error(AbortUploadError::InvalidOperationState),
+        }
+    }
+
+    fn delete_records(&mut self) -> Effects {
         let effect =
             match delete_records_effect(self.input.upload_id, &self.upload_parts, self.txn_id) {
                 Ok(effect) => effect,
@@ -478,6 +519,8 @@ impl Operation for AbortUploadOperation {
             AbortUploadState::AbortBackendUpload => self.backend_aborted(event),
             AbortUploadState::ReadUploadParts => self.upload_parts_read(event),
             AbortUploadState::StartDeleteTransaction => self.delete_started(event),
+            AbortUploadState::ReadUploadRecord => self.upload_record_read(event),
+            AbortUploadState::CountUpload => self.upload_counted(event),
             AbortUploadState::DeleteUploadRecords => self.records_deleted(event),
             AbortUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             AbortUploadState::CommitDeleteTransaction => self.handle_delete_committed(event),
@@ -737,6 +780,44 @@ mod pure_tests {
     }
 
     #[test]
+    fn counts_found_record() {
+        // Only a delete that still finds the record in its transaction counts the upload closed.
+        for found in [true, false] {
+            let mut operation = AbortUploadOperation::new(input());
+            operation.txn_id = Some(TxnId::from_bytes([5u8; 16]));
+            let effects = operation.delete_upload_records();
+            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
+            else {
+                panic!("expected the record read, got {effects:?}")
+            };
+            assert_eq!(key_space, UPLOAD_KEYSPACE);
+            let value = found.then(|| vec![1u8].into());
+            let mut effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: Vec::new().into(),
+                value,
+            }));
+            if found {
+                let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice()
+                else {
+                    panic!("expected the upload count, got {effects:?}")
+                };
+                let uploads: Vec<_> = buckets
+                    .iter()
+                    .map(|(_, delta)| delta.open_uploads)
+                    .collect();
+                assert_eq!(uploads, [-1]);
+                effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: Vec::new(),
+                }));
+            }
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::BatchDelete { .. })]
+            ));
+        }
+    }
+
+    #[test]
     fn delete_batches_records() {
         // The abort removes every part row, the upload record and its pending envelope in one
         // batch inside the delete transaction.
@@ -751,7 +832,7 @@ mod pure_tests {
         let txn_id = TxnId::from_bytes([5u8; 16]);
         operation.txn_id = Some(txn_id);
 
-        let effects = operation.delete_upload_records();
+        let effects = operation.delete_records();
 
         let [
             Effect::Storage(StorageEffect::BatchDelete {

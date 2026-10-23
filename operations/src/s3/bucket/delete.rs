@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     GROUP_ENCRYPTED_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_REMOVAL_KEYSPACE,
     KEY_COPY_KEYSPACE, LINKED_JOB_KEYSPACE, NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
     RELATIONSHIP_OUT_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
-    UPLOAD_KEYSPACE,
+    UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -25,7 +25,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRecord};
 use aruna_core::structs::storage::group_backend::{BUCKET_DELETING, BUCKET_STATE, GroupStorage};
 use aruna_core::structs::storage::multipart::MultipartUpload;
-use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::structs::storage::usage::{UsageDelta, usage_bucket_key};
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -581,6 +581,10 @@ impl DeleteBucketOperation {
             (RENAME_MOVE_KEYSPACE.to_string(), bucket.clone().into()),
             (LINKED_JOB_KEYSPACE.to_string(), bucket.clone().into()),
             (BUCKET_CREATION_KEYSPACE.to_string(), bucket.into()),
+            (
+                USAGE_STATS_KEYSPACE.to_string(),
+                usage_bucket_key(&self.bucket).into(),
+            ),
         ];
         if let Some(group_id) = self.group_id {
             let key = crate::s3::bucket::key::rows::group_bucket_key(group_id, &self.bucket);
@@ -1016,6 +1020,7 @@ mod test {
     use aruna_core::structs::storage::blob::{BlobVersion, CurrentVersionPointer};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ArunaArn;
+    use aruna_core::structs::storage::usage::BucketCounters;
     use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot, sync_relationship_key};
     use aruna_storage::storage;
     use std::time::SystemTime;
@@ -1055,11 +1060,28 @@ mod test {
         )
         .await
         .unwrap();
+        let counter = || {
+            storage_handle.send_storage_effect(StorageEffect::Read {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                key: usage_bucket_key(&bucket).into(),
+                txn_id: None,
+            })
+        };
+        // A new bucket starts with an empty counter row, and its delete removes the row.
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = counter().await else {
+            panic!("missing read result");
+        };
+        let row = BucketCounters::from_bytes(&value.expect("the bucket counter row")).unwrap();
+        assert_eq!(row, BucketCounters::default());
 
         drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
             .await
             .unwrap();
 
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = counter().await else {
+            panic!("missing read result");
+        };
+        assert!(value.is_none());
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: S3_BUCKET_KEYSPACE.to_string(),

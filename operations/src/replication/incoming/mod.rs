@@ -11,7 +11,7 @@ use crate::blob::records::{
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::load_group_inputs;
 use crate::node::usage_stats::{
-    QuotaGate, QuotaGateError, StoredDelta, UsageCounterUpdate, UsageUpdateError,
+    QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
 use crate::placement::policy::{
@@ -116,6 +116,8 @@ enum IncomingVersionState {
     VerifyExistingBlob,
     WriteBlobLocation,
     ReadObjectLookup,
+    /// Reads the head of a key whose row a historical item replaces with the other kind.
+    ReadNamedHead,
     ReadCurrentVersion,
     ApplyHeadTransition,
     WriteBlobVersion,
@@ -348,6 +350,9 @@ pub struct IncomingVersionOperation {
     usage_update: Option<UsageCounterUpdate>,
     existing_blob_location: Option<BackendLocation>,
     replaced_version: Option<BlobVersion>,
+    /// Whether the row this version id already had at the destination is a delete marker;
+    /// `None` without such a row. The write replaces it.
+    existing_marker: Option<bool>,
     advance_version_exists: bool,
     received_blob: Option<ReceivedBlob>,
     existing_current_pointer: Option<CurrentVersionPointer>,
@@ -420,6 +425,7 @@ impl IncomingVersionOperation {
             usage_update: None,
             existing_blob_location: None,
             replaced_version: None,
+            existing_marker: None,
             advance_version_exists: false,
             received_blob: None,
             existing_current_pointer: None,
@@ -582,6 +588,7 @@ impl Operation for IncomingVersionOperation {
             IncomingVersionState::VerifyExistingBlob => self.accept_verified_blob(event),
             IncomingVersionState::WriteBlobLocation => self.accept_blob_location(event),
             IncomingVersionState::ReadObjectLookup => self.accept_object_lookup(event),
+            IncomingVersionState::ReadNamedHead => self.accept_named_head(event),
             IncomingVersionState::ReadCurrentVersion => self.accept_current_version(event),
             IncomingVersionState::ApplyHeadTransition => self.accept_head_progress(event),
             IncomingVersionState::WriteBlobVersion => self.accept_blob_version(event),
@@ -701,6 +708,7 @@ impl IncomingVersionOperation {
             IncomingVersionState::VerifyExistingBlob => "VerifyExistingBlob",
             IncomingVersionState::WriteBlobLocation => "WriteBlobLocation",
             IncomingVersionState::ReadObjectLookup => "ReadObjectLookup",
+            IncomingVersionState::ReadNamedHead => "ReadNamedHead",
             IncomingVersionState::ReadCurrentVersion => "ReadCurrentVersion",
             IncomingVersionState::ApplyHeadTransition => "ApplyHeadTransition",
             IncomingVersionState::WriteBlobVersion => "WriteBlobVersion",
@@ -1721,13 +1729,24 @@ impl IncomingVersionOperation {
 
     fn write_object_lookup(&mut self) -> Effects {
         if !self.manifest.current_version {
+            // The head may still name the replaced row, whose liveness then changes.
+            let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
+            if self
+                .existing_marker
+                .is_some_and(|existing| existing != marker)
+            {
+                return self.read_head(IncomingVersionState::ReadNamedHead);
+            }
             return self.write_version();
         }
         if self.manifest.current_version_generation.is_none() {
             return self.fail(IncomingVersionError::MissingVersionGeneration);
         }
+        self.read_head(IncomingVersionState::ReadObjectLookup)
+    }
 
-        self.state = IncomingVersionState::ReadObjectLookup;
+    fn read_head(&mut self, state: IncomingVersionState) -> Effects {
+        self.state = state;
         let key = match BlobHeadKey::new(&self.manifest.bucket, &self.manifest.key).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
@@ -1753,6 +1772,37 @@ impl IncomingVersionOperation {
             key: key.into(),
             txn_id: self.txn_id,
         })]
+    }
+
+    /// The liveness change of a replaced row the head names while the head stays: a version
+    /// replaced by a marker deletes the object, the reverse revives it.
+    fn named_head_delta(&self, head: Option<&CurrentVersionPointer>) -> i128 {
+        let names = head.is_some_and(|head| head.version_id == self.manifest.version_id);
+        match self.existing_marker.filter(|_| names) {
+            Some(was_marker) => {
+                let live = self.manifest.kind == ReplicationItemKind::Materialized;
+                i128::from(u8::from(live)) - i128::from(u8::from(!was_marker))
+            }
+            None => 0,
+        }
+    }
+
+    fn accept_named_head(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(IncomingVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let head = value.as_deref().map(CurrentVersionPointer::from_bytes);
+        match head.transpose() {
+            Ok(head) => {
+                self.object_delta = self.named_head_delta(head.as_ref());
+                self.write_version()
+            }
+            Err(error) => self.fail(error.into()),
+        }
     }
 
     fn apply_liveness(&mut self, previous_live: bool) -> Effects {
@@ -1822,6 +1872,7 @@ impl IncomingVersionOperation {
             });
         } else {
             self.pending_head = None;
+            self.object_delta = self.named_head_delta(existing_pointer.as_ref());
         }
         self.resume_head_transition()
     }
@@ -2155,8 +2206,11 @@ impl IncomingVersionOperation {
             Ok(delta) => delta,
             Err(error) => return self.fail(error),
         };
-        if self.manifest.kind == ReplicationItemKind::DeleteMarker {
-            let update = UsageCounterUpdate::for_group(group_id, group_delta);
+        let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
+        let row = RowChange::written(self.existing_marker, marker);
+        if marker {
+            let update = UsageCounterUpdate::for_group(group_id, group_delta)
+                .in_bucket(&self.manifest.bucket, row);
             if update.is_noop() {
                 return self.commit_or_cleanup();
             }
@@ -2164,7 +2218,8 @@ impl IncomingVersionOperation {
             return self.start_usage_update();
         }
         if self.is_reference_item() {
-            let update = UsageCounterUpdate::for_group(group_id, group_delta);
+            let update = UsageCounterUpdate::for_group(group_id, group_delta)
+                .in_bucket(&self.manifest.bucket, row);
             if self.manifest.reference_advance.is_some() && update.is_noop() {
                 return self.commit_or_cleanup();
             }
@@ -2174,13 +2229,14 @@ impl IncomingVersionOperation {
         let Some(blob) = self.manifest.blob.as_ref() else {
             return self.fail(IncomingVersionError::MissingBlobInfo);
         };
-        self.usage_update = Some(match self.received_blob.as_ref() {
+        let update = match self.received_blob.as_ref() {
             None => UsageCounterUpdate::for_group(group_id, group_delta),
             Some(received) => match StoredDelta::for_location(&received.location, true) {
                 Some(stored) => UsageCounterUpdate::with_stored(group_id, group_delta, stored),
                 None => return self.fail(IncomingVersionError::MissingBlobInfo),
             },
-        });
+        };
+        self.usage_update = Some(update.in_bucket(&self.manifest.bucket, row));
         let Some(txn_id) = self.txn_id else {
             return self.fail(IncomingVersionError::StorageError(
                 StorageError::TransactionNotFound,
@@ -2571,6 +2627,7 @@ impl IncomingVersionOperation {
                 Ok(existing) => existing,
                 Err(error) => return self.fail(error.into()),
             };
+            self.existing_marker = Some(existing.is_deleted());
             if self.manifest.reference_advance.is_some() {
                 let incoming = match self.reference_version() {
                     Ok(incoming) => incoming,

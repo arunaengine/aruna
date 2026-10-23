@@ -2,9 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Fresh builds overflow the default query depth in nested async layouts.
-#![recursion_limit = "256"]
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,7 +67,7 @@ use tempfile::TempDir;
 use tokio::time::sleep;
 use ulid::Ulid;
 
-mod convergence;
+use crate::convergence;
 use convergence::wait_for_convergence;
 
 /// Retries of a write that lost a commit race to background work; 20 ms apart.

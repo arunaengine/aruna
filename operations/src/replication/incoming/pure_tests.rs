@@ -3314,6 +3314,220 @@ fn materialized_trace() {
     assert_eq!(result.group_id, Some(group_id));
 }
 
+/// The existing row of the version id is read with its marker status, which the bucket's
+/// version and marker counts follow when the incoming row replaces it.
+#[test]
+fn replaced_row_kind() {
+    use crate::node::usage_stats::RowChange;
+
+    let group_id = test_group_id();
+    type Row = fn(&VersionReplicationManifest) -> BlobVersion;
+    let marker: Row = |manifest| BlobVersion::deleted(manifest.created_at, manifest.created_by);
+    let version: Row = |manifest| {
+        BlobVersion::materialized(
+            [3; 32],
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            manifest.created_at,
+            manifest.created_by,
+            None,
+        )
+    };
+    let cases = [
+        (
+            ReplicationItemKind::DeleteMarker,
+            version,
+            RowChange::VersionToMarker,
+        ),
+        (
+            ReplicationItemKind::Materialized,
+            marker,
+            RowChange::MarkerToVersion,
+        ),
+        (ReplicationItemKind::DeleteMarker, marker, RowChange::Kept),
+        (ReplicationItemKind::Materialized, version, RowChange::Kept),
+    ];
+    for (kind, existing, expected) in cases {
+        let manifest = make_manifest(kind.clone());
+        let existing = existing(&manifest);
+        let mut op = IncomingVersionOperation::new(
+            trace_stream_id(),
+            iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
+            test_realm_id(),
+            manifest,
+        );
+        op.manifest_policy = Some(op.target_authorization_path(group_id));
+        op.writer_policy = Some(op.target_authorization_path(group_id));
+        op.start();
+        op.step(bucket_read(Some(
+            make_bucket_info(group_id).to_bytes().unwrap().into(),
+        )));
+        op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+            result: Ok(GroupRoutingInputs::default()),
+        }));
+        assert_eq!(op.state, IncomingVersionState::ReadExistingVersion);
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing.to_bytes().unwrap().into()),
+        }));
+        let incoming = kind == ReplicationItemKind::DeleteMarker;
+        assert_eq!(op.existing_marker, Some(existing.is_deleted()));
+        assert_eq!(RowChange::written(op.existing_marker, incoming), expected);
+
+        // The commit books the version and marker change of the replacement.
+        op.destination_group_id = Some(group_id);
+        op.txn_id = Some(trace_txn_id());
+        let effects = op.start_commit_quota();
+        // A replacement of the same kind may book nothing at all.
+        let booked = match effects.as_slice() {
+            [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] => buckets.as_slice(),
+            _ => &[],
+        };
+        let booked = booked
+            .iter()
+            .fold((0, 0), |(versions, markers), (_, delta)| {
+                (versions + delta.versions, markers + delta.delete_markers)
+            });
+        let wanted = match expected {
+            RowChange::VersionToMarker => (-1, 1),
+            RowChange::MarkerToVersion => (1, -1),
+            _ => (0, 0),
+        };
+        assert_eq!(booked, wanted, "{expected:?}: {effects:?}");
+    }
+}
+
+/// An incoming operation that replaces the row of its version id, which was a marker or not.
+fn replacing(
+    kind: ReplicationItemKind,
+    current: bool,
+    was_marker: bool,
+) -> IncomingVersionOperation {
+    let mut manifest = make_manifest(kind);
+    manifest.current_version = current;
+    let mut op = IncomingVersionOperation::new(
+        trace_stream_id(),
+        iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
+        test_realm_id(),
+        manifest,
+    );
+    op.existing_marker = Some(was_marker);
+    op.txn_id = Some(trace_txn_id());
+    op
+}
+
+fn head(version_id: Ulid, generation: u64) -> Vec<u8> {
+    let pointer = CurrentVersionPointer::new_with_generation(version_id, generation);
+    pointer.to_bytes().unwrap()
+}
+
+/// A historical item that turns the head's row into the other kind moves the object count,
+/// though the head stays; a row the head does not name moves nothing.
+#[test]
+fn historical_replacement_liveness() {
+    let other = Ulid::from_parts(9, 9);
+    let cases = [
+        (
+            ReplicationItemKind::DeleteMarker,
+            false,
+            trace_version_id(),
+            -1,
+        ),
+        (
+            ReplicationItemKind::Materialized,
+            true,
+            trace_version_id(),
+            1,
+        ),
+        (ReplicationItemKind::DeleteMarker, false, other, 0),
+    ];
+    for (kind, was_marker, named, delta) in cases {
+        let mut op = replacing(kind, false, was_marker);
+        let effects = op.write_object_lookup();
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the head read, got {effects:?}");
+        };
+        assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
+        assert_eq!(op.state, IncomingVersionState::ReadNamedHead);
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(head(named, 3).into()),
+        }));
+        assert_eq!(op.object_delta, delta);
+    }
+    // A row of the same kind changes no liveness, so the head is not read.
+    let mut op = replacing(ReplicationItemKind::DeleteMarker, false, true);
+    op.write_object_lookup();
+    assert_ne!(op.state, IncomingVersionState::ReadNamedHead);
+    assert_eq!(op.object_delta, 0);
+}
+
+/// A current item stale against a newer head generation leaves the head, yet still moves the
+/// object count when the head names the replaced row; a replay at the head's own generation
+/// rewrites the head and books the change from the old row it reads.
+#[test]
+fn stalled_head_liveness() {
+    let other = Ulid::from_parts(9, 9);
+    let stale = [
+        (
+            ReplicationItemKind::DeleteMarker,
+            false,
+            trace_version_id(),
+            -1,
+        ),
+        (
+            ReplicationItemKind::Materialized,
+            true,
+            trace_version_id(),
+            1,
+        ),
+        (ReplicationItemKind::DeleteMarker, false, other, 0),
+        (
+            ReplicationItemKind::DeleteMarker,
+            true,
+            trace_version_id(),
+            0,
+        ),
+    ];
+    for (kind, was_marker, named, delta) in stale {
+        let mut op = replacing(kind, true, was_marker);
+        op.write_compared_object(Some(&head(named, 5)));
+        assert!(op.pending_head.is_none());
+        assert_eq!(op.object_delta, delta);
+        assert_eq!(op.usage_delta().unwrap().objects, delta);
+    }
+    let replayed = [
+        (ReplicationItemKind::DeleteMarker, false, -1),
+        (ReplicationItemKind::Materialized, true, 1),
+    ];
+    for (kind, was_marker, delta) in replayed {
+        let mut op = replacing(kind, true, was_marker);
+        let effects = op.write_compared_object(Some(&head(trace_version_id(), 1)));
+        assert!(op.pending_head.is_some());
+        assert_eq!(op.state, IncomingVersionState::ReadCurrentVersion);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        let old = match was_marker {
+            true => BlobVersion::deleted(fixed_created_at(), test_user_id()),
+            false => BlobVersion::materialized(
+                [3; 32],
+                BackendRef::node_default(),
+                EncodingClass::Raw,
+                fixed_created_at(),
+                test_user_id(),
+                None,
+            ),
+        };
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(old.to_bytes().unwrap().into()),
+        }));
+        assert_eq!(op.object_delta, delta);
+    }
+}
+
 /// Constructor-to-finalize trace of a delete marker: no blob is
 /// transferred, the head is cleared and the apply acknowledgement closes
 /// the stream.
@@ -3385,6 +3599,14 @@ fn delete_marker_trace() {
 
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"obligation".to_vec().into(),
+    }));
+    // The marker moves no group counter, but its bucket counts the new marker row.
+    assert_eq!(op.state, IncomingVersionState::UpdateUsage);
+    op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
+    op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
     }));
     assert_eq!(op.state, IncomingVersionState::CommitTransaction);
 

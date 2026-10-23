@@ -3,11 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Fresh builds overflow the default query depth in nested async layouts.
-#![recursion_limit = "512"]
 #![cfg(feature = "docker")]
 
-mod shared;
+use crate::shared;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -11,7 +11,7 @@ use crate::blob::promote::{
 use crate::blob::records::blob_location_read;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReferenceAdvance,
@@ -1305,7 +1305,8 @@ impl GetObjectOperation {
                 referenced_bytes,
                 ..Default::default()
             },
-        );
+        )
+        .in_bucket(&self.input.bucket, RowChange::AddedVersion);
         if update.is_noop() {
             self.state = GetObjectState::CommitAdvance;
             return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];

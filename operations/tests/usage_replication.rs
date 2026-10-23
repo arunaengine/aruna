@@ -2,9 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Fresh builds overflow the default query depth in nested async layouts.
-#![recursion_limit = "256"]
-
 use aruna_core::structs::storage::format::Compression;
 use std::sync::Arc;
 
@@ -36,7 +33,7 @@ use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-mod convergence;
+use crate::convergence;
 use convergence::wait_for_convergence;
 
 struct TestNode {

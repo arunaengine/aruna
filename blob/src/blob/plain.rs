@@ -12,7 +12,9 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle as _;
 use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path, version_key};
+use aruna_core::structs::storage::backend_import::{
+    COPY_PART, PlainPath, copy_provable, tagged_path, version_key,
+};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, ResolvedBackend,
 };
@@ -101,29 +103,34 @@ impl BlobHandler {
     }
 
     /// Copies `source` to `plain.path`: inside the provider where both lie on one S3 storage
-    /// and the source has a recorded version, else through the node.
+    /// and the source has a recorded version or `etag`, or fits one part with a known MD5,
+    /// else through the node.
     pub(super) async fn copy_plain(
         &self,
         resolved: ResolvedBackend,
         plain: PlainPath,
         source: BackendLocation,
+        etag: Option<String>,
     ) -> BlobEvent {
-        // Without a version the node streams the newest bytes; the caller checks their hash.
+        // Without a version, ETag or MD5 the node streams the bytes; the caller checks their hash.
         let exact = match self.read_version(&source).await {
             Ok(version) => version,
             Err(error) => return BlobEvent::Error(error),
         };
         let inside = resolved.backend == source.backend && !is_folder(&source);
-        let native = match (inside, exact.as_deref()) {
-            (true, Some(_)) => self.native_for(&source).ok().flatten(),
-            _ => None,
+        let proved = exact.is_some() || etag.is_some() || copy_provable(&source);
+        let native = match inside && proved {
+            true => self.native_for(&source).ok().flatten(),
+            false => None,
         };
         if let Some(native) = native {
+            // Without a version the provider copies the source only while it keeps its ETag.
+            let if_match = etag.as_deref().filter(|_| exact.is_none());
             let copied = self.copy_inside(
                 resolved.clone(),
                 &plain,
                 &source,
-                (&native, exact.as_deref()),
+                (&native, exact.as_deref(), if_match),
             );
             match Box::pin(copied).await {
                 Ok(Some(event)) => return event,
@@ -140,15 +147,15 @@ impl BlobHandler {
         }
     }
 
-    /// The provider copies the exact source version in parts of at most `COPY_PART` bytes and
-    /// completes create-only where asked, and the size is checked. `None` asks for a streamed
-    /// copy: the provider refused a part, or a one-part copy's ETag is not the source MD5.
+    /// The provider copies the source version, or its current bytes, in parts of at most
+    /// `COPY_PART` bytes and completes create-only where asked, and the size is checked. `None`
+    /// asks for a streamed copy: the storage cannot copy, or a one-part ETag is not the MD5.
     async fn copy_inside(
         &self,
         resolved: ResolvedBackend,
         plain: &PlainPath,
         source: &BackendLocation,
-        (native, version): (&crate::s3::NativeMultipart, Option<&str>),
+        (native, version, if_match): (&crate::s3::NativeMultipart, Option<&str>, Option<&str>),
     ) -> Result<Option<BlobEvent>, BlobError> {
         let class = resolved.storage_class.clone();
         let mut location =
@@ -175,7 +182,7 @@ impl BlobHandler {
             let Ok(number) = u16::try_from(index + 1) else {
                 return self.settle(target, (&path, &upload_id), plain.ulid).await;
             };
-            let from = (native, source_path.as_str(), version);
+            let from = (native, source_path.as_str(), version, if_match);
             match target
                 .copy_range(&path, &upload_id, (number, *range), from)
                 .await
@@ -190,9 +197,15 @@ impl BlobHandler {
                         return Err(error);
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "Provider copy refused; the bytes are streamed");
+                // Only a storage that cannot copy at all gets the bytes through the node.
+                Err(BlobError::CopyUnsupported) => {
+                    tracing::warn!("The storage cannot copy inside itself; the bytes are streamed");
                     return self.settle(target, (&path, &upload_id), plain.ulid).await;
+                }
+                // Any other refusal, like a changed source or a busy storage, is retried later.
+                Err(error) => {
+                    self.settle(target, (&path, &upload_id), plain.ulid).await?;
+                    return Err(error);
                 }
             }
         }
@@ -202,6 +215,8 @@ impl BlobHandler {
         {
             return self.settle(target, (&path, &upload_id), plain.ulid).await;
         }
+        // One part whose ETag is the source MD5 proves the bytes, and so their size.
+        let proved = parts.len() == 1 && md5.is_some();
         let completed = target
             .complete(&path, &upload_id, &parts, if_not_exists)
             .await;
@@ -215,6 +230,16 @@ impl BlobHandler {
         self.record_upload(plain.ulid, None).await?;
         let versioned = operator.info().capability().read_with_version;
         let written = written.filter(|version| versioned && version != "null");
+        location.blob_size = size;
+        location.hashes = source.hashes.clone();
+        let event = BlobEvent::PlainWritten {
+            location,
+            version: written.clone(),
+            etag: etag.map(|etag| etag.trim_matches('"').to_string()),
+        };
+        if proved {
+            return Ok(Some(event));
+        }
         let stat = operator.stat_with(&path);
         let stat = match written.as_deref() {
             Some(version) if operator.info().capability().stat_with_version => {
@@ -232,13 +257,7 @@ impl BlobHandler {
                 found.content_length()
             )));
         }
-        location.blob_size = size;
-        location.hashes = source.hashes.clone();
-        Ok(Some(BlobEvent::PlainWritten {
-            location,
-            version: written,
-            etag: etag.map(|etag| etag.trim_matches('"').to_string()),
-        }))
+        Ok(Some(event))
     }
 
     /// Aborts this copy's own provider upload and forgets it, then asks for a streamed copy. A
@@ -705,9 +724,6 @@ fn conditional_unsupported(error: &opendal::Error) -> bool {
     }
 }
 
-/// Bytes one copied part takes at most; the provider limit is 5 GiB.
-const COPY_PART: u64 = 1 << 30;
-
 /// The inclusive byte ranges of a copy; `None` copies an object of one part whole.
 fn copy_ranges(size: u64) -> Vec<Option<(u64, u64)>> {
     if size <= COPY_PART {
@@ -757,6 +773,32 @@ mod tests {
         )
         .with_context("uri", "https://s3/b/01M5G_NotImplementedError.py");
         assert!(!conditional_unsupported(&uri));
+    }
+
+    #[test]
+    fn proves_unversioned_copies() {
+        // Without a provider version or ETag only one part with a known MD5 proves its copy.
+        let mut source = BackendLocation {
+            backend: BackendRef::Group(ulid::Ulid::nil()),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: "raw/a.faa.gz".to_string(),
+            ulid: ulid::Ulid::nil(),
+            format: StoredFormat::default(),
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: COPY_PART,
+            hashes: HashMap::new(),
+        };
+        assert!(!copy_provable(&source));
+        let md5 = aruna_core::structs::checksum::HASH_MD5.to_string();
+        source.hashes.insert(md5, vec![0; 16]);
+        assert!(copy_provable(&source));
+        source.blob_size = COPY_PART + 1;
+        assert!(!copy_provable(&source));
     }
 
     #[test]

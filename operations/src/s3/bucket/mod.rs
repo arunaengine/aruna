@@ -24,7 +24,6 @@ pub mod search;
 pub mod storage_check;
 pub mod storage_move;
 pub mod token_list;
-pub mod usage;
 
 pub use key::{
     extend as key_extend, grant as key_grant, install as key_install, lock as key_lock,

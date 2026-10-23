@@ -46,6 +46,8 @@ pub enum BlobError {
     CleanupUnsupported,
     #[error("The storage cannot create a file only while its name is free")]
     ConditionalUnsupported,
+    #[error("The storage cannot copy a file inside itself")]
+    CopyUnsupported,
     #[error("Failed to send message")]
     SendError,
     #[error("Invalid effect type")]
