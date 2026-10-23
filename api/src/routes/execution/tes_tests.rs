@@ -671,6 +671,42 @@ fn maps_directory_output() {
 }
 
 #[test]
+fn adds_nextflow_output() {
+    // nf-ga4gh never declares `.command.env`, where Nextflow keeps eval and env outputs.
+    let env_glob = |task: &TesTask| {
+        let (spec, _) = map_execution_spec(task, None, ExecutionTarget::Realm).unwrap();
+        spec.file_outputs
+            .into_iter()
+            .find(|output| output.container_path == "/work/.command.{en[v],trac[e]}")
+    };
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    assert!(env_glob(&task).is_none());
+
+    task.outputs[0].path = "/work/.exitcode".to_string();
+    task.outputs[0].url = Some("s3://dest/work/ab/cd/.exitcode".to_string());
+    let output = env_glob(&task).expect("an exit code output marks a Nextflow task");
+    let glob = output_glob(&output.container_path).unwrap();
+    assert!(glob.is_match("/work/.command.env"));
+    assert!(glob.is_match("/work/.command.trace"));
+    assert!(!glob.is_match("/work/.command.sh"));
+    assert_eq!(output.path_prefix.as_deref(), Some("/work"));
+    assert_eq!(
+        output.destination,
+        OutputDestination::S3 {
+            bucket: "dest".to_string(),
+            key: "work/ab/cd".to_string()
+        }
+    );
+
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    task.inputs[0].path = "/work/.command.run".to_string();
+    task.inputs[0].url = Some("s3://src/work/ef/.command.run".to_string());
+    let output = env_glob(&task).expect("the wrapper input marks a Nextflow task");
+    let OutputDestination::S3 { key, .. } = output.destination;
+    assert_eq!(key, "work/ef");
+}
+
+#[test]
 fn accepts_input_match() {
     // Nextflow's SEQTK_TRIM globs `*.fastq.gz` beside its staged reads; capture skips the input.
     let mut task = sample_task(Ulid::from_bytes([5u8; 16]));

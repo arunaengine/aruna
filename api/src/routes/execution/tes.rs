@@ -1360,7 +1360,7 @@ fn map_task_outputs(
         return Err(TesError::bad_request("too many task outputs"));
     }
     let mut file_outputs: Vec<OutputSelection> = Vec::with_capacity(task.outputs.len());
-    for output in &task.outputs {
+    for output in task.outputs.iter().chain(&nextflow_output(task)) {
         let output = map_output(output)?;
         if file_outputs
             .iter()
@@ -1408,6 +1408,30 @@ fn map_task_outputs(
     }
 
     Ok(file_outputs)
+}
+
+/// Nextflow keeps eval and env outputs in `.command.env` and metrics in `.command.trace`, which
+/// its TES plugin never declares; a Nextflow task gets them as one optional glob.
+fn nextflow_output(task: &TesTask) -> Option<TesOutput> {
+    let exitcode = task
+        .outputs
+        .iter()
+        .find(|output| output.path == "/work/.exitcode");
+    let wrapper = task
+        .inputs
+        .iter()
+        .find(|input| input.path == "/work/.command.run");
+    let url = exitcode.and_then(|output| output.url.as_deref());
+    let (directory, _) = url
+        .or_else(|| wrapper.and_then(|input| input.url.as_deref()))?
+        .rsplit_once('/')?;
+    // The one-letter classes make it a pattern, so a file the task never wrote is no error.
+    Some(TesOutput {
+        url: Some(directory.to_string()),
+        path: "/work/.command.{en[v],trac[e]}".to_string(),
+        path_prefix: Some("/work".to_string()),
+        ..Default::default()
+    })
 }
 
 fn map_task_resources(task: &TesTask) -> Result<ComputeResources, TesError> {
