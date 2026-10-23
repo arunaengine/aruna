@@ -1112,7 +1112,10 @@ pub async fn test_put_object() {
     )
     .await
     .unwrap();
-    assert_eq!(retry, result);
+    assert_eq!(retry.location, result.location);
+    assert_eq!(retry.version_id, result.version_id);
+    // Only the first put committed; the retry hands the same version back.
+    assert!(!result.replayed && retry.replayed);
     assert_eq!(
         read_to_string(retry.location.get_full_path().unwrap()).unwrap(),
         String::from_utf8_lossy(&data[..]).to_string()

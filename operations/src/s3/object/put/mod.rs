@@ -248,6 +248,8 @@ pub struct PutObjectConfig {
 pub struct PutObjectResult {
     pub location: BackendLocation,
     pub version_id: Ulid,
+    /// The preassigned version already existed, so this put committed nothing new.
+    pub replayed: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -326,6 +328,8 @@ pub struct PutObjectOperation {
     /// The written linked file the version gives up for the current version's identical one.
     dedup: Option<BackendLocation>,
     dedup_checked: bool,
+    /// Set when the preassigned version already existed and the put only handed it back.
+    replayed: bool,
 }
 
 impl PutObjectOperation {
@@ -383,6 +387,7 @@ impl PutObjectOperation {
             readers: sharing::ReaderScan::default(),
             dedup: None,
             dedup_checked: false,
+            replayed: false,
         }
     }
 
@@ -575,6 +580,7 @@ impl PutObjectOperation {
 
     fn finish_replay(&mut self, location: BackendLocation) -> Effects {
         self.output = Some(Ok(location));
+        self.replayed = true;
         self.state = PutObjectState::Finish;
         smallvec![]
     }
@@ -2050,6 +2056,7 @@ impl Operation for PutObjectOperation {
             .map(|version_id| PutObjectResult {
                 location,
                 version_id,
+                replayed: self.replayed,
             })
             .ok_or(PutObjectError::PutObjectFailed)
     }

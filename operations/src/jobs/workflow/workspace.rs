@@ -973,7 +973,8 @@ async fn put_file_output(
             result.version_id,
         ))
         .await?;
-    } else {
+    } else if !result.replayed {
+        // A retried capture hands back a committed version; its write was already announced.
         let auth = AuthContext {
             user_id: record.created_by,
             realm_id: context.serving_realm(record.created_by.realm_id),
