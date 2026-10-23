@@ -204,10 +204,15 @@ pub(crate) fn validate_execution(
         .workspace_outputs
         .iter()
         .filter_map(|output| workspace_bucket.map(|bucket| (bucket, output.dest_key.as_str())));
-    let explicit = spec.file_outputs.iter().map(|output| {
-        let OutputDestination::S3 { bucket, key } = &output.destination;
-        (bucket.as_str(), key.as_str())
-    });
+    // A glob's url is the directory its matches are written below, so globs may share it.
+    let explicit = spec
+        .file_outputs
+        .iter()
+        .filter(|output| !aruna_core::compute::has_wildcard(&output.container_path))
+        .map(|output| {
+            let OutputDestination::S3 { bucket, key } = &output.destination;
+            (bucket.as_str(), key.as_str())
+        });
     for (bucket, key) in explicit.chain(workspace) {
         if !destinations.insert((bucket, key)) {
             return Err(SubmitJobError::InvalidWorkspace(format!(
@@ -1709,6 +1714,14 @@ mod tests {
             matches!(error, SubmitJobError::InvalidWorkspace(message) if message.contains("shared/result.txt"))
         );
         spec.workspace_outputs[0].dest_key = "other.txt".to_string();
+        assert!(validate_execution(&mut spec, WorkspaceMode::Existing, Some("shared")).is_ok());
+
+        // Nextflow sends every glob with the task directory as its url.
+        let mut glob = spec.file_outputs[0].clone();
+        glob.container_path = "/out/*.html".to_string();
+        glob.path_prefix = Some("/out".to_string());
+        spec.file_outputs = vec![glob.clone(), glob];
+        spec.file_outputs[1].container_path = "/out/*.zip".to_string();
         assert!(validate_execution(&mut spec, WorkspaceMode::Existing, Some("shared")).is_ok());
     }
 

@@ -581,7 +581,9 @@ naming a different one; a bearer token requires that tag.
   may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound
   the immutable output record carries.
 - An output path with POSIX wildcards additionally requires `path_prefix`, the literal ancestor
-  stripped from each match before it is appended to the destination url.
+  stripped from each match before it is appended to the destination url. Such outputs may share
+  one url. A pattern that matches a directory captures every file below it, and a staged input it
+  matches is never captured.
 - Unsupported: directory entries, inline input content, wildcards in an input path, volumes,
   executor stdin/stdout/stderr redirection and resource zones."#,
     request_body(
@@ -1369,9 +1371,11 @@ fn map_task_outputs(
         {
             return Err(TesError::bad_request("duplicate output path"));
         }
-        if file_outputs
-            .iter()
-            .any(|existing| existing.destination == output.destination)
+        // Globs share their url, the directory each match is written below.
+        if output.path_prefix.is_none()
+            && file_outputs
+                .iter()
+                .any(|existing| existing.destination == output.destination)
         {
             return Err(TesError::bad_request("duplicate output destination"));
         }
@@ -1380,11 +1384,7 @@ fn map_task_outputs(
     for output in &file_outputs {
         // A pattern is captured under its literal prefix, which is the directory
         // the container must be able to write.
-        let pattern = has_wildcard(&output.container_path)
-            .then(|| output_glob(&output.container_path))
-            .transpose()
-            .map_err(|_| TesError::bad_request("invalid output path"))?;
-        let parent = if pattern.is_some() {
+        let parent = if has_wildcard(&output.container_path) {
             literal_prefix(&output.container_path)
                 .map_err(|_| TesError::bad_request("invalid output parent path"))?
         } else {
@@ -1399,10 +1399,10 @@ fn map_task_outputs(
         if parent == "/" {
             return Err(TesError::bad_request("root output parent is forbidden"));
         }
+        // A glob may match a staged input; capture skips it, as Nextflow globs its work dir.
         for input in inputs {
             if let Some(path) = input.container_path.as_deref()
                 && (path == output.container_path
-                    || pattern.as_ref().is_some_and(|glob| glob.is_match(path))
                     || paths_overlap(path, parent)
                         .map_err(|_| TesError::bad_request("invalid input or output path"))?)
             {

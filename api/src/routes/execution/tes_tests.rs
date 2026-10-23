@@ -685,16 +685,36 @@ fn maps_wildcard_output() {
 }
 
 #[test]
-fn rejects_input_match() {
-    // An input the pattern would select must not be captured as an output.
+fn accepts_input_match() {
+    // Nextflow's SEQTK_TRIM globs `*.fastq.gz` beside its staged reads; capture skips the input.
     let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
     task.inputs[0].path = "/in/data.csv".to_string();
     task.outputs[0].path = "/in/*.csv".to_string();
     task.outputs[0].path_prefix = Some("/in".to_string());
 
-    let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
 
-    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(spec.file_outputs[0].container_path, "/in/*.csv");
+}
+
+#[test]
+fn shares_glob_url() {
+    // Nextflow sends every glob with the task work directory as its url.
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    let glob = |path: &str| TesOutput {
+        url: Some("s3://dest/work/ab".to_string()),
+        path: path.to_string(),
+        path_prefix: Some("/out".to_string()),
+        ..Default::default()
+    };
+    task.outputs = vec![glob("/out/*.html"), glob("/out/*.zip")];
+
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
+    assert_eq!(spec.file_outputs.len(), 2);
+
+    // Literal outputs still need their own url.
+    task.outputs[1].path = "/out/report.zip".to_string();
+    assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
 }
 
 #[test]

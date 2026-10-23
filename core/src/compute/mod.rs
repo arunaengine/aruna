@@ -773,7 +773,7 @@ pub fn output_suffix(path: &str, prefix: &str) -> Option<String> {
 }
 
 /// The declared outputs of one attempt: a wildcard path selects every file it
-/// matches, a wildcard-free path only itself.
+/// matches or that lies below a directory it matches, a wildcard-free path only itself.
 #[derive(Debug)]
 pub struct OutputMatcher {
     literals: Vec<String>,
@@ -799,7 +799,10 @@ impl OutputMatcher {
     }
 
     pub fn is_match(&self, path: &str) -> bool {
-        self.literals.iter().any(|literal| literal == path) || self.patterns.is_match(path)
+        self.literals.iter().any(|literal| literal == path)
+            || Path::new(path)
+                .ancestors()
+                .any(|ancestor| self.patterns.is_match(ancestor))
     }
 }
 
@@ -1199,5 +1202,15 @@ mod tests {
         assert!(matcher.is_match("/out/report.csv"));
         assert!(!matcher.is_match("/out/sub/report.csv"));
         assert!(!matcher.is_match("/out/other.txt"));
+    }
+
+    #[test]
+    fn matches_directory_files() {
+        // A pattern naming a directory, like Nextflow's `*_data`, selects every file below it.
+        let matcher = OutputMatcher::new(["/work/*_data"]).unwrap();
+        assert!(matcher.is_match("/work/multiqc_data/multiqc.log"));
+        assert!(matcher.is_match("/work/multiqc_data/plots/a.txt"));
+        assert!(!matcher.is_match("/work/multiqc_report.html"));
+        assert!(!matcher.is_match("/other/multiqc_data/multiqc.log"));
     }
 }
