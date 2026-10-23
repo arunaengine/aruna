@@ -30,6 +30,8 @@ struct Fake {
     before_delete: Option<(String, Stored)>,
     /// Refuses deletes with a condition, as a storage without conditional deletes does.
     plain_deletes: bool,
+    /// A foreign write that lands at its key right after a reservation of that key.
+    after_reserve: Option<(String, Stored)>,
 }
 
 type Shared = Arc<Mutex<Fake>>;
@@ -154,7 +156,9 @@ async fn serve(
                 Some(found) => {
                     let size = found.body.len();
                     match range(header("x-amz-copy-source-range"), size) {
-                        Some((first, last)) => found.body.slice(first..=last),
+                        Some((first, last)) => {
+                            found.body.slice(first.min(size)..(last + 1).min(size))
+                        }
                         None => found.body.clone(),
                     }
                 }
@@ -197,7 +201,10 @@ async fn serve(
             };
             let etag = format!("\"{}\"", written.etag);
             let copy = source.is_some();
-            fake.objects.insert(key, written);
+            fake.objects.insert(key.clone(), written);
+            if let Some((_, foreign)) = fake.after_reserve.take_if(|(at, _)| *at == key) {
+                fake.objects.insert(key, foreign);
+            }
             match copy {
                 true => xml(format!(
                     "<CopyObjectResult><ETag>{etag}</ETag></CopyObjectResult>"
@@ -457,6 +464,40 @@ async fn unreserve_needs_condition() {
     assert!(body(&fake, "tenant/raw/a.bin").unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn late_write_survives() {
+    // A file that replaces a write's reservation before the write completes is never replaced,
+    // whether the write streams through the node or copies large files in parts.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let late = |key: &str| {
+        let foreign = stored(b"foreign", &[]);
+        fake.lock().unwrap().after_reserve = Some((key.to_string(), foreign));
+    };
+    late("tenant/raw/a.bin");
+    let plain = PlainPath {
+        exact: false,
+        ..exact("raw/a.bin", Ulid::generate())
+    };
+    let blob = stream_from_bytes(b"uploaded bytes");
+    let written = handler.write_plain(resolved.clone(), plain, test_user_id(), blob);
+    assert!(matches!(
+        written.await,
+        BlobEvent::Error(BlobError::PathTaken)
+    ));
+    assert_eq!(body(&fake, "tenant/raw/a.bin").unwrap(), &b"foreign"[..]);
+    let mut old = source(&handler, &resolved, b"renamed bytes").await;
+    let etag = Some(md5_hex(b"renamed bytes"));
+    old.blob_size = 6 << 30;
+    late("tenant/raw/b.bin");
+    let plain = exact("raw/b.bin", Ulid::generate());
+    let copied = handler.copy_plain(resolved, plain, old, etag);
+    assert!(matches!(
+        copied.await,
+        BlobEvent::Error(BlobError::PathTaken)
+    ));
+    assert_eq!(body(&fake, "tenant/raw/b.bin").unwrap(), &b"foreign"[..]);
+}
+
 /// Opens a provider upload at the tenant path `path` and writes one part.
 async fn opened(
     handler: &BlobHandler,
@@ -506,6 +547,35 @@ async fn upload_keeps_taken() {
         BlobEvent::UploadAborted
     ));
     assert_eq!(body(&fake, "tenant/raw/a.bin").unwrap(), &b"foreign"[..]);
+}
+
+#[tokio::test]
+async fn upload_late_write() {
+    // A file that replaces the reservation before the completion stays; a retried completion
+    // that finds its own completed object finishes from it.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let (upload, part) = opened(&handler, &resolved, "raw/a.bin").await;
+    let foreign = stored(b"foreign", &[]);
+    fake.lock().unwrap().after_reserve = Some(("tenant/raw/a.bin".to_string(), foreign));
+    let parts = vec![part.clone()];
+    let completed = handler.complete_upload(upload, parts, &[], Compression::Off, true);
+    assert!(matches!(
+        completed.await,
+        BlobEvent::Error(BlobError::PathTaken)
+    ));
+    assert_eq!(body(&fake, "tenant/raw/a.bin").unwrap(), &b"foreign"[..]);
+    let (upload, part) = opened(&handler, &resolved, "raw/b.bin").await;
+    for _ in 0..2 {
+        let parts = vec![part.clone()];
+        let completed = handler.complete_upload(upload.clone(), parts, &[], Compression::Off, true);
+        let BlobEvent::PlainWritten { location, .. } = completed.await else {
+            panic!("the completion did not finish")
+        };
+        assert_eq!(
+            location.hashes,
+            crate::hash::Hasher::new_with_bytes(b"uploaded bytes").to_map()
+        );
+    }
 }
 
 #[tokio::test]

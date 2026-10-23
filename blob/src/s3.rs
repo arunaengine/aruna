@@ -358,6 +358,13 @@ impl NativeMultipart {
         }
     }
 
+    /// Whether `path` still holds the empty reservation of `version`, checked right before the
+    /// request that replaces it.
+    pub async fn holds(&self, path: &str, version: &str) -> Result<bool, BlobError> {
+        let found = self.reservation(path).await?;
+        Ok(found.is_some_and(|found| found.version == version))
+    }
+
     /// The empty reservation `path` holds now, if it holds one.
     async fn reservation(&self, path: &str) -> Result<Option<Reservation>, BlobError> {
         let head = self.client.head_object().bucket(&self.bucket);

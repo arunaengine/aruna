@@ -2179,7 +2179,7 @@ async fn compose_part_sizes() {
                     parts.clone(),
                     None,
                     Compression::Off,
-                    false,
+                    (false, None),
                 )
                 .await;
             assert!(matches!(
@@ -2229,7 +2229,7 @@ async fn compose_streams_chunks() {
             parts,
             Some(chunk),
             Compression::Off,
-            false,
+            (false, None),
         )
         .await;
 
@@ -2300,7 +2300,7 @@ async fn compose_timeout_deletes() {
             vec![part],
             None,
             Compression::Off,
-            false,
+            (false, None),
         )
         .await;
 
@@ -2356,7 +2356,7 @@ async fn compose_close_fails() {
             vec![part],
             None,
             Compression::Off,
-            false,
+            (false, None),
         )
         .await;
 
@@ -2418,7 +2418,7 @@ async fn compose_cleanup_error() {
             Vec::new(),
             None,
             Compression::Off,
-            false,
+            (false, None),
         )
         .await;
 

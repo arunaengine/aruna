@@ -55,6 +55,10 @@ fn unconditional(location: &mut BackendLocation, plain: &PlainPath) -> Result<()
 /// Bytes one provider copy request takes at most.
 const COPY_WHOLE: u64 = 5 << 30;
 
+/// The reservation a write to a tenant path holds: the client that made it and the version it
+/// names.
+pub(super) type Held = (NativeMultipart, String);
+
 /// The source of a provider copy: its client, its pinned version, the ETag it must still have
 /// without one, and the ETag recorded for it.
 type Source<'a> = (
@@ -120,10 +124,10 @@ impl BlobHandler {
                 Err(error) => return BlobEvent::Error(error),
             };
         let target = location.clone();
-        let event = Box::pin(self.write_tenant(location, operator, blob, conditional)).await;
+        let condition = (conditional, reserved.clone());
+        let event = Box::pin(self.write_tenant(location, operator, blob, condition)).await;
         if matches!(event, BlobEvent::Error(_)) {
-            self.unreserve(reserved.as_ref(), &target, plain.version_id)
-                .await;
+            self.unreserve(reserved.as_ref(), &target).await;
         }
         event
     }
@@ -136,16 +140,16 @@ impl BlobHandler {
         operator: &Operator,
         location: &mut BackendLocation,
         plain: &PlainPath,
-    ) -> Result<(bool, Option<NativeMultipart>), BlobError> {
+    ) -> Result<(bool, Option<Held>), BlobError> {
         if !conditional(operator, location, plain)? {
             return Ok((false, None));
         }
         let Some(native) = self.native_for(location)? else {
             return Ok((true, None));
         };
-        let path = self.object_path(location)?;
-        match native.reserve(&path, &plain.version_id.to_string()).await {
-            Ok(()) => Ok((false, Some(native))),
+        let (path, version) = (self.object_path(location)?, plain.version_id.to_string());
+        match native.reserve(&path, &version).await {
+            Ok(()) => Ok((false, Some((native, version)))),
             Err(BlobError::ConditionalUnsupported) => {
                 unconditional(location, plain).map(|()| (false, None))
             }
@@ -155,16 +159,11 @@ impl BlobHandler {
 
     /// Removes a failed write's own empty reservation. One left behind keeps the path in
     /// progress through the write's intent, and a retry of the write reuses it.
-    async fn unreserve(
-        &self,
-        reserved: Option<&NativeMultipart>,
-        location: &BackendLocation,
-        version_id: ulid::Ulid,
-    ) {
-        let (Some(native), Ok(path)) = (reserved, self.object_path(location)) else {
+    async fn unreserve(&self, held: Option<&Held>, location: &BackendLocation) {
+        let (Some((native, version)), Ok(path)) = (held, self.object_path(location)) else {
             return;
         };
-        if let Err(error) = native.unreserve(&path, &version_id.to_string()).await {
+        if let Err(error) = native.unreserve(&path, version).await {
             tracing::warn!(%error, "The reservation of a failed write stays");
         }
     }
@@ -235,13 +234,13 @@ impl BlobHandler {
             }
             false => {
                 let from = (native, version, if_match);
-                let copied = self.copy_parts((location, &operator), plain, source, from);
+                let held = reserved.as_ref();
+                let copied = self.copy_parts((location, &operator), (plain, held), source, from);
                 Box::pin(copied).await
             }
         };
         if copied.is_err() {
-            self.unreserve(reserved.as_ref(), &target, plain.version_id)
-                .await;
+            self.unreserve(reserved.as_ref(), &target).await;
         }
         copied
     }
@@ -277,7 +276,8 @@ impl BlobHandler {
             tracing::warn!("A copy's ETag is not the source MD5; the bytes go through the node");
             return match self.read_blob(source.clone()).await {
                 BlobEvent::ReadFinished { blob, .. } => {
-                    let written = self.write_tenant(location, operator.clone(), blob, false);
+                    let written =
+                        self.write_tenant(location, operator.clone(), blob, (false, None));
                     Ok(Some(Box::pin(written).await))
                 }
                 other => Ok(Some(other)),
@@ -299,13 +299,13 @@ impl BlobHandler {
         }))
     }
 
-    /// The provider copies the source in parts of at most `COPY_PART` bytes and completes, and
-    /// the size is checked. `None` asks for a streamed copy: the storage cannot copy, or a
-    /// one-part ETag is not the MD5.
+    /// The provider copies the source in parts of at most `COPY_PART` bytes and completes while
+    /// the path still holds the copy's reservation, and the size is checked. `None` asks for a
+    /// streamed copy: the storage cannot copy, or a one-part ETag is not the MD5.
     async fn copy_parts(
         &self,
         (mut location, operator): (BackendLocation, &Operator),
-        plain: &PlainPath,
+        (plain, held): (&PlainPath, Option<&Held>),
         source: &BackendLocation,
         (native, version, if_match): (&NativeMultipart, Option<&str>, Option<&str>),
     ) -> Result<Option<BlobEvent>, BlobError> {
@@ -362,7 +362,14 @@ impl BlobHandler {
         }
         // One part whose ETag is the source MD5 proves the bytes, and so their size.
         let proved = parts.len() == 1 && md5.is_some();
-        // A create-only copy holds its path by its reservation, so no condition is needed.
+        // A create-only copy holds its path by its reservation, which must still be its own.
+        if let Some((native, version)) = held {
+            let holds = native.holds(&path, version).await;
+            if !matches!(holds, Ok(true)) {
+                self.settle(target, (&path, &upload_id), plain.ulid).await?;
+                return Err(holds.err().unwrap_or(BlobError::PathTaken));
+            }
+        }
         let completed = target.complete(&path, &upload_id, &parts, false).await;
         let (written, etag) = match completed {
             Ok(completed) => completed,
@@ -676,12 +683,11 @@ impl BlobHandler {
             parts,
             chunk,
             Compression::Off,
-            conditional,
+            (conditional, reserved.as_ref()),
         );
         let event = Box::pin(composed).await;
         if matches!(event, BlobEvent::Error(_)) {
-            self.unreserve(reserved.as_ref(), &target, plain.version_id)
-                .await;
+            self.unreserve(reserved.as_ref(), &target).await;
         }
         event
     }

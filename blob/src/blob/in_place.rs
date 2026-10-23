@@ -584,23 +584,28 @@ impl BlobHandler {
             }
         } else {
             // A tenant path is reserved first, as a storage may ignore the completion's
-            // condition; the completion then replaces only that reservation.
+            // condition; the completion then replaces only that reservation. A taken path may
+            // hold this upload's own completed object, which the recovery below proves.
+            let reserved_for = upload.location.ulid.to_string();
             let reserved = match if_not_exists && upload.location.is_external() {
-                true => match native
-                    .reserve(&path, &upload.location.ulid.to_string())
-                    .await
-                {
-                    Ok(()) => true,
-                    // A storage without conditional writes completes as it did before.
-                    Err(BlobError::ConditionalUnsupported) => false,
-                    Err(error) => return Err(error),
-                },
-                false => false,
+                true => native.reserve(&path, &reserved_for).await.map(|()| true),
+                false => Ok(false),
             };
-            let if_not_exists = if_not_exists && !reserved;
-            let assembled =
-                self.assemble(&native, &path, upload, parts, etags.clone(), if_not_exists);
-            match assembled.await {
+            let condition = match reserved {
+                Ok(true) => Ok((false, Some(reserved_for.as_str()))),
+                // A storage without conditional writes completes as it did before.
+                Ok(false) | Err(BlobError::ConditionalUnsupported) => Ok((if_not_exists, None)),
+                Err(error) => Err(error),
+            };
+            let assembled = match condition {
+                Ok(condition) => {
+                    let etags = etags.clone();
+                    self.assemble(&native, &path, upload, parts, etags, condition)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match assembled {
                 Ok((id, tag)) => {
                     let versioned = operator.info().capability().read_with_version;
                     version = id.filter(|id| versioned && id != "null");
@@ -708,7 +713,8 @@ impl BlobHandler {
         })
     }
 
-    /// Copies staged replacements into the provider upload, then completes it.
+    /// Copies staged replacements into the provider upload, then completes it while the path
+    /// still holds the reservation of `held`, if one is held.
     async fn assemble(
         &self,
         native: &NativeMultipart,
@@ -716,7 +722,7 @@ impl BlobHandler {
         upload: &BackendUpload,
         parts: &[MultipartPart],
         mut etags: Vec<(u16, String)>,
-        if_not_exists: bool,
+        (if_not_exists, held): (bool, Option<&str>),
     ) -> Result<(Option<String>, Option<String>), BlobError> {
         for (slot, part) in etags.iter_mut().zip(parts) {
             if part.location.partial {
@@ -733,6 +739,11 @@ impl BlobHandler {
                     &source_path,
                 )
                 .await?;
+        }
+        if let Some(version) = held
+            && !native.holds(path, version).await?
+        {
+            return Err(BlobError::PathTaken);
         }
         native
             .complete(path, &upload.upload_id, &etags, if_not_exists)
