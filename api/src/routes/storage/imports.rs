@@ -725,8 +725,8 @@ pub struct RenamePageQuery {
 pub struct RenamePlanResponse {
     /// Bytes of the `count` files.
     pub bytes: u64,
-    /// Of them, files over 1 GiB and their bytes; without a provider version they are copied
-    /// through the node, the others inside the provider.
+    /// Of them, files over 1 GiB and their bytes; they pass through the node only when neither
+    /// a provider version nor a recorded ETag holds them, all others are copied in the provider.
     pub large_files: u64,
     pub large_bytes: u64,
     /// Of them, files whose new name another file of the rule already holds; they fail.
@@ -772,9 +772,10 @@ key the caller may read are counted and listed.
 - The plan reads only the rule's own record of its files, never the provider. A file counts
   when an earlier pattern of the rule named it for exactly the version recorded for it. Files
   a user put there, and files with their current name, count as `unchanged_files`.
-- `plan` splits the counted files: `large_files` over 1 GiB, which are copied through the node
-  when the provider keeps no versions; `taken_files` whose new name another file of the rule
-  holds; `withheld_files` the caller may not write, which make `POST` answer 403.
+- `plan` splits the counted files: `large_files` over 1 GiB, which pass through the node only
+  when neither a provider version nor a recorded ETag holds them; `taken_files` whose new name
+  the rule records for another file; `withheld_files` the caller may not write, which make
+  `POST` answer 403.
 - Each listed file is also checked against its version; a file whose version changed is not
   listed, and a rename leaves it in place.
 - A filter limits the plan and the pages alike.
@@ -901,11 +902,13 @@ bucket and on the key of every file to rename, including request policies. Token
 restrictions are refused.
 
 **Behavior**
-- Each file is copied to its new name, never over a file that is already there. Only when the
-  copy has the same bytes does its version name the new file, together with the rule's record of
+- Each file is copied to its new name inside the provider where it can, and created only
+  while that name is free. The copy holds the old file's recorded provider version or ETag, or
+  its MD5 is checked. Its version then names the new file, together with the rule's record of
   the file; the old file is deleted after that.
-- A copy an interrupted rename left at the new name is used again when its bytes match. Another
-  file at the new name keeps the old file in place and counts as failed.
+- A copy an interrupted rename left at the new name is used again when its size and ETag prove
+  the same bytes; no file is read to compare. Another file at the new name keeps the old file in
+  place and counts as failed.
 - The move also moves the folder's other versions to where a new upload of their key goes, as
   `POST /data/buckets/{bucket}/storage/move` does. Progress shows in `GET` on this path.
 - A pattern change is refused while the rename runs, and a version that changed meanwhile
@@ -918,8 +921,8 @@ restrictions are refused.
   change between that check and the start answers 409 `rule_changed`; once the rename runs,
   pattern changes are refused.
 - A storage that cannot create a file only while its name is free renames nothing: each such
-  file keeps its name and counts as failed. A copy an earlier rename left at the new name is
-  still used when its bytes match.
+  file keeps its name and counts as failed. A copy an earlier rename left at its tagged name is
+  still used when its size and ETag prove the same bytes.
 - The rename runs as the caller: a file is renamed only while the caller may still write its
   key when the rename reaches it, including files written after the start. Others keep their
   name. Once the caller's token expires, is revoked or is cut off, the rename renames nothing
