@@ -4,7 +4,6 @@
 
 use crate::device::replica::ReplicaRecord;
 use crate::device::replica::read_replica;
-use crate::device::replica::touch_replica;
 use crate::device::selection::keep_read;
 use crate::driver::DriverContext;
 use crate::metadata::api::ExportMetadataRequest;
@@ -241,7 +240,6 @@ pub async fn get_metadata_routed(
             Ok(record)
         }
         (Err(MetadataApiError::ServiceUnavailable), Some(replica)) => {
-            touch_replica(context, request.document_id).await;
             replica_record(context, realm_id, &request, replica).await
         }
         (result, _) => result,
@@ -583,7 +581,6 @@ pub async fn export_rocrate_routed(
             Ok(export)
         }
         (Err(MetadataApiError::ServiceUnavailable), Some(replica)) => {
-            touch_replica(context, request.document_id).await;
             let export = device_export(context, replica, &request).await?;
             ensure_export_limit(&export, metadata_bytes)?;
             Ok(export)

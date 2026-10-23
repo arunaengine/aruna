@@ -294,9 +294,9 @@ pub const SYNC_STATE_KEYSPACE: &str = "device_sync_state";
 /// how far this device has synced each replica.
 pub const DEVICE_REPLICA_KEYSPACE: &str = "device_replica";
 
-/// When each device replica was last read or installed, keyed like `device_replica`. Over the
-/// cache budget, the least recently used unselected replica is evicted first.
-pub const DEVICE_REPLICA_USE_KEYSPACE: &str = "device_replica_use";
+/// Bytes of the local graph each device replica installed, keyed like `device_replica`. The
+/// graph stays when its replica row goes, so its bytes stay counted against the cache budget.
+pub const DEVICE_GRAPH_KEYSPACE: &str = "device_graph_size";
 
 /// Device-local bindings of a directory to a realm bucket prefix, keyed by
 /// folder id. Never replicated: the root path must not leave the machine.
@@ -556,7 +556,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     REALM_REMOVAL_KEYSPACE,
     SYNC_STATE_KEYSPACE,
     DEVICE_REPLICA_KEYSPACE,
-    DEVICE_REPLICA_USE_KEYSPACE,
+    DEVICE_GRAPH_KEYSPACE,
     SYNCED_FOLDER_KEYSPACE,
     SYNC_BASE_KEYSPACE,
     SYNC_UPLOAD_KEYSPACE,

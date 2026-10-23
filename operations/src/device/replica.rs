@@ -3,15 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DEVICE_REPLICA_KEYSPACE, DEVICE_REPLICA_USE_KEYSPACE};
+use aruna_core::keyspaces::{DEVICE_GRAPH_KEYSPACE, DEVICE_REPLICA_KEYSPACE};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use craqle::VectorClock;
@@ -23,8 +21,8 @@ use crate::driver::DriverContext;
 
 use super::publish_queue::{PublishEntry, PublishState};
 
-/// Bytes of replica records a device keeps before it evicts unselected ones, unless the owner
-/// set another budget.
+/// Bytes of replica records and graphs past which a device keeps no further document it only
+/// read, unless the owner set another budget.
 pub const DEFAULT_CACHE_BYTES: u64 = 2_000_000_000;
 
 static CACHE_BUDGET: OnceLock<u64> = OnceLock::new();
@@ -248,21 +246,13 @@ pub async fn delete_replica(context: &Arc<DriverContext>, document_id: Ulid) -> 
     matches!(
         context
             .storage_handle
-            .send_storage_effect(StorageEffect::BatchDelete {
-                deletes: vec![
-                    (
-                        DEVICE_REPLICA_KEYSPACE.to_string(),
-                        replica_key(document_id)
-                    ),
-                    (
-                        DEVICE_REPLICA_USE_KEYSPACE.to_string(),
-                        replica_key(document_id)
-                    ),
-                ],
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
+                key: replica_key(document_id),
                 txn_id: None,
             })
             .await,
-        Event::Storage(StorageEvent::BatchDeleteResult { .. })
+        Event::Storage(StorageEvent::DeleteResult { .. })
     )
 }
 
@@ -283,64 +273,27 @@ pub fn replica_size(replica: &ReplicaRecord) -> u64 {
         .unwrap_or(0)
 }
 
-/// Records that the owner just used one replica.
-pub async fn touch_replica(context: &Arc<DriverContext>, document_id: Ulid) {
+/// Records how many bytes the graph installed for one document takes.
+pub async fn record_graph(context: &Arc<DriverContext>, document_id: Ulid, bytes: u64) {
     if let Event::Storage(StorageEvent::Error { error }) = context
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
-            key_space: DEVICE_REPLICA_USE_KEYSPACE.to_string(),
+            key_space: DEVICE_GRAPH_KEYSPACE.to_string(),
             key: replica_key(document_id),
-            value: ByteView::from(unix_timestamp_millis().to_be_bytes().to_vec()),
+            value: ByteView::from(bytes.to_be_bytes().to_vec()),
             txn_id: None,
         })
         .await
     {
-        warn!(%document_id, error = %error, "Failed to record a replica use");
+        warn!(%document_id, error = %error, "Failed to record a graph size");
     }
 }
 
-/// The unselected replicas without unpublished edits to drop, least recently used first,
-/// until the cache fits `budget`. Selected and edited ones always stay.
-pub fn evictions(
-    replicas: &[ReplicaRecord],
-    last_used: &HashMap<Ulid, u64>,
-    budget: u64,
-) -> Vec<Ulid> {
-    let mut used: u64 = replicas.iter().map(replica_size).sum();
-    let mut candidates: Vec<&ReplicaRecord> = replicas
-        .iter()
-        .filter(|replica| !replica.selected && replica.pending_edits == 0)
-        .collect();
-    candidates.sort_by_key(|replica| last_used.get(&replica.document_id).copied().unwrap_or(0));
-    let mut evicted = Vec::new();
-    for replica in candidates {
-        if used <= budget {
-            break;
-        }
-        used = used.saturating_sub(replica_size(replica));
-        evicted.push(replica.document_id);
-    }
-    evicted
-}
-
-/// Evicts unselected replicas until the cache fits the owner's budget.
-pub async fn enforce_budget(context: &Arc<DriverContext>) {
-    let Some(replicas) = list_replicas(context).await else {
-        return;
-    };
-    let Some(last_used) = read_uses(context).await else {
-        return;
-    };
-    for document_id in evictions(&replicas, &last_used, cache_budget()) {
-        if !delete_replica(context, document_id).await {
-            warn!(%document_id, "Failed to evict a device replica");
-        }
-    }
-}
-
-/// When each replica was last used. `None` means the scan failed.
-async fn read_uses(context: &Arc<DriverContext>) -> Option<HashMap<Ulid, u64>> {
-    let mut uses = HashMap::new();
+/// The bytes this device's replicas and their installed graphs take. A graph whose replica
+/// row is gone still counts: nothing removes it locally yet. `None` means a scan failed.
+pub async fn cache_usage(context: &Arc<DriverContext>) -> Option<u64> {
+    let rows: u64 = list_replicas(context).await?.iter().map(replica_size).sum();
+    let mut graphs = 0u64;
     let mut cursor: Option<Key> = None;
     loop {
         let Event::Storage(StorageEvent::IterResult {
@@ -349,7 +302,7 @@ async fn read_uses(context: &Arc<DriverContext>) -> Option<HashMap<Ulid, u64>> {
         }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Iter {
-                key_space: DEVICE_REPLICA_USE_KEYSPACE.to_string(),
+                key_space: DEVICE_GRAPH_KEYSPACE.to_string(),
                 prefix: None,
                 start: cursor.map(IterStart::After),
                 limit: REPLICA_PAGE_SIZE,
@@ -359,18 +312,14 @@ async fn read_uses(context: &Arc<DriverContext>) -> Option<HashMap<Ulid, u64>> {
         else {
             return None;
         };
-        for (key, value) in values {
-            let (Ok(id), Ok(at)) = (
-                <[u8; 16]>::try_from(key.as_ref()),
-                <[u8; 8]>::try_from(value.as_ref()),
-            ) else {
-                continue;
-            };
-            uses.insert(Ulid::from_bytes(id), u64::from_be_bytes(at));
+        for (_, value) in values {
+            if let Ok(bytes) = <[u8; 8]>::try_from(value.as_ref()) {
+                graphs = graphs.saturating_add(u64::from_be_bytes(bytes));
+            }
         }
         match next_start_after {
             Some(next) => cursor = Some(next),
-            None => return Some(uses),
+            None => return Some(rows.saturating_add(graphs)),
         }
     }
 }
@@ -505,40 +454,21 @@ mod pure_tests {
         assert_eq!(document_state(&replica, &[]), DocumentState::LocalOnly);
     }
 
-    // Over budget, unselected replicas go least recently used first; pinned and
-    // edited ones stay even when the cache cannot fit them.
-    #[test]
-    fn evicts_least_used() {
-        let cached = |seed: u8, selected: bool, pending: u32| {
-            let mut replica = ReplicaRecord::new(
-                Ulid::from_bytes([seed; 16]),
-                Ulid::from_bytes([1u8; 16]),
-                "notes".to_string(),
-                ReplicaOrigin::Realm,
-            );
-            replica.selected = selected;
-            replica.pending_edits = pending;
-            replica.displayed_jsonld = "x".repeat(1_000);
-            replica
-        };
-        let replicas = vec![
-            cached(1, false, 0),
-            cached(2, false, 0),
-            cached(3, true, 0),
-            cached(4, false, 2),
-        ];
-        let size = replica_size(&replicas[0]);
-        let last_used =
-            HashMap::from([(replicas[0].document_id, 20), (replicas[1].document_id, 10)]);
-        assert!(evictions(&replicas, &last_used, 4 * size).is_empty());
+    // A graph stays counted after its replica row goes: nothing removes it locally yet.
+    #[tokio::test]
+    async fn counts_installed_graphs() {
+        let (_dir, context) = crate::tests::device::context().await;
+        let context = Arc::new(context);
+        let mut held = replica();
+        held.displayed_jsonld = "x".repeat(100);
+        assert!(store_replica(&context, &held).await);
+        record_graph(&context, held.document_id, 4_000).await;
         assert_eq!(
-            evictions(&replicas, &last_used, 3 * size),
-            vec![replicas[1].document_id]
+            cache_usage(&context).await,
+            Some(replica_size(&held) + 4_000)
         );
-        assert_eq!(
-            evictions(&replicas, &last_used, 0),
-            vec![replicas[1].document_id, replicas[0].document_id]
-        );
+        assert!(delete_replica(&context, held.document_id).await);
+        assert_eq!(cache_usage(&context).await, Some(4_000));
     }
 
     #[test]
