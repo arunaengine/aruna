@@ -6,6 +6,7 @@
 use std::path::{Component, Path};
 use std::time::SystemTime;
 
+use aruna_core::errors::StagingSourceError;
 use aruna_core::keyspaces::{STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::execution::job::{
@@ -32,7 +33,9 @@ use super::store::{batch_delete, iter_prefix_page, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
-use crate::staging::list_source::{ListStagingInput, ListStagingOperation, ListStagingResult};
+use crate::staging::list_source::{
+    ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
+};
 use crate::staging::page_import::{
     PageEntry, PageImportError, PageImportInput, PageImportOperation,
 };
@@ -339,7 +342,23 @@ async fn list_page(
         &ctx.driver,
     )
     .await
-    .map_err(|error| ItemFailure::Stage(error.to_string()))
+    .map_err(list_failure)
+}
+
+/// A source that refuses the path skips it; any other listing error retries the page, so one
+/// transient failure never abandons the rest of a large walk.
+fn list_failure(error: ListStagingError) -> ItemFailure {
+    match error {
+        ListStagingError::Resolve(_)
+        | ListStagingError::Staging(
+            StagingSourceError::NotFound
+            | StagingSourceError::AccessDenied
+            | StagingSourceError::UnsupportedKind(_)
+            | StagingSourceError::InvalidListing(_)
+            | StagingSourceError::EgressDenied(_),
+        ) => ItemFailure::Stage(error.to_string()),
+        error => ItemFailure::System(error.to_string()),
+    }
 }
 
 /// Registers a page's files as references with listing metadata, in one transaction with the
