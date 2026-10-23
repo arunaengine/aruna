@@ -267,6 +267,10 @@ pub const OFFERED_DIRECTORY_KEYSPACE: &str = "offered_directories";
 /// realm state only when the drain forwards it as an ordinary create.
 pub const DEVICE_INTAKE_KEYSPACE: &str = "device_intake";
 
+/// Issue time of the token that authored each queued draft, keyed like `device_intake`.
+/// The drain sends it along, so a holder can apply the owner's token cutoff.
+pub const DEVICE_FENCE_KEYSPACE: &str = "device_intake_fence";
+
 /// The realm-config clock the realm documents this device holds were copied at,
 /// keyed by realm id. It is what keeps a later copy from rolling the device
 /// back, and it is never replicated.
@@ -538,6 +542,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     MANAGEMENT_URL_KEYSPACE,
     SYNC_STATE_KEYSPACE,
     DEVICE_REPLICA_KEYSPACE,
+    DEVICE_FENCE_KEYSPACE,
     SYNCED_FOLDER_KEYSPACE,
     SYNC_BASE_KEYSPACE,
     SYNC_UPLOAD_KEYSPACE,
