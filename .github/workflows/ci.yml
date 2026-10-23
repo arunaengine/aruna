@@ -164,7 +164,7 @@ jobs:
         run: >-
           cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --run-ignored only --no-tests fail
-          -E 'binary(restart_traffic) & test(/offline_scale_/)'
+          -E 'package(aruna-operations) & binary(integration) & test(/^restart_traffic::offline_scale_/)'
 
   s3-backend:
     needs: test-build
@@ -225,9 +225,9 @@ jobs:
           | test(=blob::tests::framed::s3_framed_fallback) | test(=blob::tests::framed::s3_omitted_part)
           | test(=blob::tests::framed::s3_completion_budget)
           | test(=blob::tests::framed::s3_bucketless_framed))
-          | (package(aruna-operations) & binary(multipart)
-          & (test(=s3_provider_flow) | test(=s3_framed_completion)))
-          | (package(aruna-operations) & binary(linked_import))'
+          | (package(aruna-operations) & binary(integration)
+          & (test(=multipart::s3_provider_flow) | test(=multipart::s3_framed_completion)))
+          | (package(aruna-operations) & binary(integration) & test(/^linked_import::/))'
 
   docker-backend:
     runs-on: ubuntu-latest

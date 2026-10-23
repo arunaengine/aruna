@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-#![recursion_limit = "256"]
-
 use aruna_core::structs::storage::format::Compression;
 use std::collections::HashMap;
 use std::sync::Arc;

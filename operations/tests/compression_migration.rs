@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-#![recursion_limit = "256"]
-
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};

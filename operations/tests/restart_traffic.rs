@@ -2,9 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Fresh builds overflow the default query depth in nested async layouts.
-#![recursion_limit = "512"]
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,7 +39,7 @@ use ulid::Ulid;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-mod convergence;
+use crate::convergence;
 use convergence::{HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence, wait_storage_released};
 
 const PROJECTION_BATCH: usize = 32;
@@ -656,7 +653,7 @@ const SEMANTIC_RECORDS: usize = 2 * INCIDENT_METADATA_RECORDS;
 // With both co-holders unavailable, the scale fixture parks after one exact
 // invocation cap without asking the convergence test to replay the scale data.
 #[test]
-#[ignore = "large incident bound proof; run with --ignored --exact offline_scale_bound"]
+#[ignore = "large incident bound proof; run with --ignored --exact restart_traffic::offline_scale_bound"]
 fn offline_scale_bound() -> Result<(), BoxError> {
     let runtime = make_runtime()?;
     let result = runtime.block_on(offline_bound_body());
@@ -690,7 +687,7 @@ async fn offline_bound_body() -> Result<(), BoxError> {
 // The three-node incident path parks a bounded pass, restores both peers, and
 // then proves full drain, revision order, and convergence on the same queue.
 #[test]
-#[ignore = "large incident convergence proof; run with --ignored --exact offline_scale_converges"]
+#[ignore = "large incident convergence proof; run with --ignored --exact restart_traffic::offline_scale_converges"]
 fn offline_scale_converges() -> Result<(), BoxError> {
     let runtime = make_runtime()?;
     let result = runtime.block_on(recovery_converges(INCIDENT_RECORDS, true));
