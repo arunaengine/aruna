@@ -348,6 +348,7 @@ fn prefix_expands_paths() {
             kind: SourceEntryKind::File,
             size: Some(4),
             modified: None,
+            etag: None,
             stat: None,
         }],
         "folder/",

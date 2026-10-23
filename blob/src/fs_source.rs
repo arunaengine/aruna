@@ -185,6 +185,7 @@ fn list_entries(
                 kind,
                 size: (kind == SourceEntryKind::File).then_some(metadata.len()),
                 modified: metadata.modified().ok().map(|time| time.into_std()),
+                etag: None,
                 // The listing carries the same stat the serve path reads, so an
                 // observation and a later read agree on one identity.
                 stat: Some(entry_stat(&metadata)),

@@ -17,7 +17,7 @@ use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::WriteGuard;
 use crate::structs::execution::job::{JobRecordEnvelope, JobRecordKind, SubmissionId};
-use crate::structs::execution::source_access::ResolvedSourceAccess;
+use crate::structs::execution::source_access::{ListRequest, ResolvedSourceAccess};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
@@ -431,10 +431,7 @@ pub enum StagingSourceEffect {
     },
     List {
         access: ResolvedSourceAccess,
-        offset: usize,
-        limit: usize,
-        recursive: bool,
-        files_only: bool,
+        request: ListRequest,
     },
     Read {
         access: ResolvedSourceAccess,

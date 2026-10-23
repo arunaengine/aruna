@@ -18,7 +18,7 @@ use aruna_core::structs::execution::job::{
     JobPayload, JobRecord, JobState, StagingJobCheckpoint, StagingJobItem, StagingJobPhase,
     StagingJobPrefix, StagingJobSpec,
 };
-use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
+use aruna_core::structs::execution::source_access::{ListRequest, SourceEntry, SourceEntryKind};
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
@@ -464,17 +464,20 @@ pub async fn stage_batch(
                 group_id,
                 connector_id,
                 source_path: source_prefix.clone(),
-                offset: 0,
-                limit: remaining,
-                recursive: true,
-                files_only: true,
+                // One spare entry: a listing that fits ends before the page is full.
+                request: ListRequest {
+                    limit: remaining + 1,
+                    recursive: true,
+                    files_only: true,
+                    ..Default::default()
+                },
             }),
             &state.get_ctx(),
         )
         .await
         {
             Ok(result) => {
-                if result.truncated {
+                if result.next_cursor.is_some() || result.entries.len() > remaining {
                     return Err(ServerError::BadRequestReason(format!(
                         "batch expands beyond {BATCH_LIMIT} items"
                     )));

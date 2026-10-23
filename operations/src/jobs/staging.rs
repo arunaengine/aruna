@@ -9,7 +9,9 @@ use aruna_core::structs::execution::job::{
     JobError, JobId, JobResultPayload, StagingJobCheckpoint, StagingJobDirectory, StagingJobError,
     StagingJobPhase, StagingJobSpec, StagingPendingItem,
 };
-use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
+use aruna_core::structs::execution::source_access::{
+    ListCursor, ListRequest, SourceEntry, SourceEntryKind,
+};
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
@@ -151,14 +153,14 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
             match discover_page(ctx, spec, &directory).await {
                 Ok(page) => {
                     checkpoint.pending_directories.remove(0);
-                    if let Some(next_offset) = page.next_offset {
-                        if next_offset <= directory.offset || page.entries.is_empty() {
+                    if let Some(next_cursor) = page.next_cursor {
+                        if directory.cursor.as_ref() == Some(&next_cursor) {
                             return permanent_error("source listing pagination made no progress");
                         }
                         checkpoint.pending_directories.insert(
                             0,
                             StagingJobDirectory {
-                                offset: next_offset,
+                                cursor: Some(next_cursor),
                                 ..directory.clone()
                             },
                         );
@@ -255,7 +257,7 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
         .map(|prefix| StagingJobDirectory {
             source_path: directory_list_path(&prefix.source_prefix),
             target_prefix: prefix.target_prefix.clone(),
-            offset: 0,
+            cursor: None,
         })
         .collect::<Vec<_>>();
     let unknown_sizes = if spec.strategy == StagingStrategy::Snapshot {
@@ -451,7 +453,7 @@ async fn current_quota(
 
 struct DiscoveryPage {
     entries: Vec<SourceEntry>,
-    next_offset: Option<usize>,
+    next_cursor: Option<ListCursor>,
 }
 
 async fn discover_page(
@@ -477,17 +479,18 @@ async fn discover_page(
             group_id: spec.group_id,
             connector_id: spec.connector_id,
             source_path: directory.source_path.clone(),
-            offset: directory.offset,
-            limit: STAGING_PAGE_SIZE,
-            recursive: false,
-            files_only: false,
+            request: ListRequest {
+                cursor: directory.cursor.clone(),
+                limit: STAGING_PAGE_SIZE,
+                ..Default::default()
+            },
         }),
         &ctx.driver,
     )
     .await
     .map(|result| DiscoveryPage {
         entries: result.entries,
-        next_offset: result.next_offset,
+        next_cursor: result.next_cursor,
     })
     .map_err(|error| ItemFailure::Stage(error.to_string()))
 }
@@ -513,7 +516,7 @@ fn map_source_entry(
         SourceEntryKind::Directory => MappedEntry::Directory(StagingJobDirectory {
             source_path: directory_list_path(&entry_path),
             target_prefix: target,
-            offset: 0,
+            cursor: None,
         }),
     })
 }
@@ -636,7 +639,7 @@ mod pure_tests {
         let root = StagingJobDirectory {
             source_path: String::new(),
             target_prefix: String::new(),
-            offset: 0,
+            cursor: None,
         };
         let entry = SourceEntry {
             name: "refseq".to_string(),
@@ -644,6 +647,7 @@ mod pure_tests {
             kind: SourceEntryKind::Directory,
             size: None,
             modified: None,
+            etag: None,
             stat: None,
         };
 

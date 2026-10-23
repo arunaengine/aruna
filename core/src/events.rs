@@ -13,7 +13,7 @@ use crate::metadata::MetadataEvent;
 use crate::node_vault::VaultEntry;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::execution::source_access::{
-    ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
+    ListCursor, ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::VaultRecords;
@@ -300,7 +300,8 @@ pub enum StagingSourceEvent {
     },
     ListResult {
         entries: Vec<SourceEntry>,
-        truncated: bool,
+        /// `None` once the listing is exhausted or reached its stop key.
+        next_cursor: Option<ListCursor>,
     },
     ReadResult {
         metadata: SourceMetadata,

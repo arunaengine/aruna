@@ -245,6 +245,28 @@ pub enum SourceEntryKind {
     Directory,
 }
 
+/// Where a source listing page continues.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ListCursor {
+    /// Provider key: the next page starts after it.
+    After(String),
+    /// Entries to skip, for a source whose provider cannot start after a key.
+    Offset(u64),
+}
+
+/// One bounded page of a source listing. Key bounds need a flat recursive listing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ListRequest {
+    pub cursor: Option<ListCursor>,
+    /// Inclusive lowest key, probed on the first page only.
+    pub lower: Option<String>,
+    /// Exclusive upper key: the listing ends before it.
+    pub stop: Option<String>,
+    pub limit: usize,
+    pub recursive: bool,
+    pub files_only: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceEntry {
     pub name: String,
@@ -252,10 +274,35 @@ pub struct SourceEntry {
     pub kind: SourceEntryKind,
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
+    pub etag: Option<String>,
     /// Full stat values, for a source that has them. A listing and a later stat
     /// of the same file must derive one identity, so the local lister fills
     /// this in and every other source leaves it absent.
     pub stat: Option<crate::structs::execution::offered_directory::FileStat>,
+}
+
+impl SourceEntry {
+    /// The observation a listing gives for a file: content type is unknown evidence and the
+    /// ETag digest is evidence only. `None` without a size.
+    pub fn observation(&self) -> Option<SourceMetadata> {
+        if self.kind != SourceEntryKind::File {
+            return None;
+        }
+        let digests = self
+            .etag
+            .as_deref()
+            .and_then(etag_digest)
+            .into_iter()
+            .collect();
+        Some(SourceMetadata {
+            content_length: self.size?,
+            content_type: None,
+            etag: self.etag.clone(),
+            last_modified: self.modified,
+            source_version: None,
+            digests,
+        })
+    }
 }
 
 #[cfg(test)]

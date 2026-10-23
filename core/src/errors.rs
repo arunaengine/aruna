@@ -154,6 +154,8 @@ pub enum StagingSourceError {
     /// representation. Retryable, and never an identity.
     #[error("Source changed during the read")]
     SourceUnstable,
+    #[error("Invalid listing request: {0}")]
+    InvalidListing(String),
     #[error(transparent)]
     EgressDenied(#[from] crate::egress::EgressError),
 }

@@ -252,7 +252,7 @@ pub struct StagingJobError {
 pub struct StagingJobDirectory {
     pub source_path: String,
     pub target_prefix: String,
-    pub offset: usize,
+    pub cursor: Option<crate::structs::execution::source_access::ListCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

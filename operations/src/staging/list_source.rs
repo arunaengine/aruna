@@ -8,7 +8,8 @@ use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::source_access::SourceEntry;
+use aruna_core::structs::execution::source_access::{ListCursor, ListRequest, SourceEntry};
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -19,17 +20,17 @@ pub struct ListStagingInput {
     pub group_id: GroupId,
     pub connector_id: Ulid,
     pub source_path: String,
-    pub offset: usize,
-    pub limit: usize,
-    pub recursive: bool,
-    pub files_only: bool,
+    pub request: ListRequest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListStagingResult {
     pub entries: Vec<SourceEntry>,
-    pub truncated: bool,
-    pub next_offset: Option<usize>,
+    /// `None` once the listing is exhausted or reached its stop key.
+    pub next_cursor: Option<ListCursor>,
+    /// The connector as resolved for this page, for writes that re-check it at commit.
+    pub connector: SourceConnector,
+    pub secret_fingerprint: Option<[u8; 16]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +61,7 @@ pub enum ListStagingError {
 #[derive(Debug, PartialEq)]
 pub struct ListStagingOperation {
     input: ListStagingInput,
+    resolved: Option<(SourceConnector, Option<[u8; 16]>)>,
     state: ListStagingState,
     output: Option<Result<ListStagingResult, ListStagingError>>,
 }
@@ -68,6 +70,7 @@ impl ListStagingOperation {
     pub fn new(input: ListStagingInput) -> Self {
         Self {
             input,
+            resolved: None,
             state: ListStagingState::Init,
             output: None,
         }
@@ -102,26 +105,30 @@ impl Operation for ListStagingOperation {
             ) => match *result {
                 Ok(resolved) => {
                     self.state = ListStagingState::List;
+                    self.resolved = Some((resolved.connector, resolved.secret_fingerprint));
                     smallvec![Effect::StagingSource(StagingSourceEffect::List {
                         access: resolved.access,
-                        offset: self.input.offset,
-                        limit: self.input.limit,
-                        recursive: self.input.recursive,
-                        files_only: self.input.files_only,
+                        request: self.input.request.clone(),
                     })]
                 }
                 Err(error) => self.emit_error(error.into()),
             },
             (
                 ListStagingState::List,
-                Event::StagingSource(StagingSourceEvent::ListResult { entries, truncated }),
+                Event::StagingSource(StagingSourceEvent::ListResult {
+                    entries,
+                    next_cursor,
+                }),
             ) => {
+                let Some((connector, secret_fingerprint)) = self.resolved.take() else {
+                    return self.emit_error(ListStagingError::ListFailed);
+                };
                 self.state = ListStagingState::Finish;
-                let next_offset = truncated.then_some(self.input.offset + entries.len());
                 self.output = Some(Ok(ListStagingResult {
                     entries,
-                    truncated,
-                    next_offset,
+                    next_cursor,
+                    connector,
+                    secret_fingerprint,
                 }));
                 smallvec![]
             }
@@ -176,10 +183,12 @@ mod pure_tests {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id: Ulid::from_bytes([2u8; 16]),
             source_path: "prefix".to_string(),
-            offset: 0,
-            limit: 20,
-            recursive: true,
-            files_only: true,
+            request: ListRequest {
+                limit: 20,
+                recursive: true,
+                files_only: true,
+                ..Default::default()
+            },
         }
     }
 
@@ -218,13 +227,9 @@ mod pure_tests {
 
         assert!(matches!(
             effects.as_slice(),
-            [Effect::StagingSource(StagingSourceEffect::List {
-                limit: 20,
-                offset: 0,
-                recursive: true,
-                files_only: true,
-                ..
-            })]
+            [Effect::StagingSource(StagingSourceEffect::List { request, .. })]
+                if request.limit == 20 && request.recursive && request.files_only
+                    && request.cursor.is_none()
         ));
     }
 
@@ -244,7 +249,7 @@ mod pure_tests {
     }
 
     #[test]
-    fn list_preserves_truncation() {
+    fn list_returns_cursor() {
         let mut operation = ListStagingOperation::new(sample_input());
         operation.start();
         operation.step(Event::SubOperation(
@@ -253,18 +258,14 @@ mod pure_tests {
             },
         ));
 
+        let cursor = Some(ListCursor::After("prefix/a".to_string()));
         operation.step(Event::StagingSource(StagingSourceEvent::ListResult {
             entries: Vec::new(),
-            truncated: true,
+            next_cursor: cursor.clone(),
         }));
 
-        assert_eq!(
-            operation.finalize(),
-            Ok(ListStagingResult {
-                entries: Vec::new(),
-                truncated: true,
-                next_offset: Some(0),
-            })
-        );
+        let result = operation.finalize().unwrap();
+        assert_eq!(result.next_cursor, cursor);
+        assert_eq!(result.connector, sample_connector().connector);
     }
 }

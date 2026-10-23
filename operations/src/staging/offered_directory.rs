@@ -19,7 +19,7 @@ use aruna_core::structs::execution::offered_directory::{
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };
 use aruna_core::structs::execution::source_access::{
-    ResolvedSourceAccess, SourceEntry, SourceMetadata,
+    ListCursor, ListRequest, ResolvedSourceAccess, SourceEntry, SourceMetadata,
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{
@@ -277,17 +277,17 @@ async fn walk_root(
     root: &str,
 ) -> Result<Vec<SourceEntry>, OfferedDirectoryError> {
     let mut entries = Vec::new();
-    let mut offset = 0usize;
+    let mut cursor = None;
     loop {
-        let (page, truncated) = list_page(context, root, offset).await?;
+        let (page, next_cursor) = list_page(context, root, cursor).await?;
         if over_cap(entries.len(), page.len()) {
             return Err(OfferedDirectoryError::TooManyFiles(MAX_OFFERED_FILES));
         }
-        offset += page.len().max(1);
         entries.extend(page);
-        if !truncated {
+        if next_cursor.is_none() {
             return Ok(entries);
         }
+        cursor = next_cursor;
     }
 }
 
@@ -377,21 +377,27 @@ pub(crate) async fn check_root(
 async fn list_page(
     context: &DriverContext,
     root: &str,
-    offset: usize,
-) -> Result<(Vec<SourceEntry>, bool), OfferedDirectoryError> {
+    cursor: Option<ListCursor>,
+) -> Result<(Vec<SourceEntry>, Option<ListCursor>), OfferedDirectoryError> {
     let event = send_source_effect(
         context,
         StagingSourceEffect::List {
             access: local_access(root, ""),
-            offset,
-            limit: LIST_PAGE,
-            recursive: true,
-            files_only: true,
+            request: ListRequest {
+                cursor,
+                limit: LIST_PAGE,
+                recursive: true,
+                files_only: true,
+                ..Default::default()
+            },
         },
     )
     .await?;
     match event {
-        StagingSourceEvent::ListResult { entries, truncated } => Ok((entries, truncated)),
+        StagingSourceEvent::ListResult {
+            entries,
+            next_cursor,
+        } => Ok((entries, next_cursor)),
         StagingSourceEvent::Error { error } => Err(error.into()),
         _ => Err(StagingSourceError::InvalidEffect.into()),
     }

@@ -7,7 +7,7 @@ use crate::opendal::{
     check_staging_source, head_staging_source, list_staging_source, read_staging_source,
 };
 use aruna_core::events::StagingSourceEvent;
-use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+use aruna_core::structs::execution::source_access::{ListRequest, ResolvedSourceAccess};
 
 impl BlobHandler {
     pub(crate) async fn check_staging_source(
@@ -44,14 +44,13 @@ impl BlobHandler {
     pub(crate) async fn list_staging_source(
         &self,
         access: ResolvedSourceAccess,
-        offset: usize,
-        limit: usize,
-        recursive: bool,
-        files_only: bool,
+        request: ListRequest,
     ) -> StagingSourceEvent {
-        match list_staging_source(&self.egress, &access, offset, limit, recursive, files_only).await
-        {
-            Ok((entries, truncated)) => StagingSourceEvent::ListResult { entries, truncated },
+        match list_staging_source(&self.egress, &access, &request).await {
+            Ok((entries, next_cursor)) => StagingSourceEvent::ListResult {
+                entries,
+                next_cursor,
+            },
             Err(error) => StagingSourceEvent::Error { error },
         }
     }

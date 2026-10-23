@@ -10,7 +10,9 @@ use crate::auth::{parse_group_id, require_realm_auth, require_unrestricted_auth}
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::SourceResolutionError;
-use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceEntryKind};
+use aruna_core::structs::execution::source_access::{
+    ListRequest, ResolvedSourceAccess, SourceEntryKind,
+};
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::connectors::create_connector::{
@@ -1029,10 +1031,10 @@ pub async fn list_connector_entries(
             group_id,
             connector_id,
             source_path,
-            offset: 0,
-            limit: limit.min(MAX_ENTRY_LIMIT),
-            recursive: false,
-            files_only: false,
+            request: ListRequest {
+                limit: limit.min(MAX_ENTRY_LIMIT),
+                ..Default::default()
+            },
         }),
         &state.get_ctx(),
     )
@@ -1059,7 +1061,7 @@ pub async fn list_connector_entries(
                 }),
             })
             .collect(),
-        truncated: result.truncated,
+        truncated: result.next_cursor.is_some(),
     }))
 }
 
