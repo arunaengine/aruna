@@ -11,7 +11,7 @@ use crate::blob::records::{
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
-    schedule_snapshot_publish,
+    count_upload, schedule_snapshot_publish,
 };
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
@@ -108,6 +108,9 @@ pub enum CompleteUploadState {
     WriteCopyOwner,
     RegisterManagedCopy,
     WriteObjectMetadata,
+    /// Reads the record in the finalize transaction, so only the delete that finds it counts.
+    ReadUploadRecord,
+    CountUpload,
     DeleteUploadRecords,
     /// Reads the import rule a plain object's import row belongs to.
     ReadImportRule,
@@ -1839,6 +1842,38 @@ impl CompleteUploadOperation {
     }
 
     fn delete_upload_records(&mut self) -> Effects {
+        self.state = CompleteUploadState::ReadUploadRecord;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: UPLOAD_KEYSPACE.to_string(),
+            key: self.input.upload_id.to_bytes().to_vec().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// A concurrent delete of the record conflicts with this read, so a record is counted
+    /// closed once.
+    fn upload_record_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.schedule_error(CompleteUploadError::NoTransactionFound);
+        };
+        if value.is_none() {
+            return self.delete_records();
+        }
+        self.state = CompleteUploadState::CountUpload;
+        smallvec![count_upload(&self.input.bucket, -1, txn_id)]
+    }
+
+    fn upload_counted(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        self.delete_records()
+    }
+
+    fn delete_records(&mut self) -> Effects {
         let effect =
             match delete_records_effect(self.input.upload_id, &self.upload_parts, self.txn_id) {
                 Ok(effect) => effect,
@@ -2408,6 +2443,8 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteCopyOwner => self.owner_written(event),
             CompleteUploadState::RegisterManagedCopy => self.handle_copy_registered(event),
             CompleteUploadState::WriteObjectMetadata => self.metadata_written(event),
+            CompleteUploadState::ReadUploadRecord => self.upload_record_read(event),
+            CompleteUploadState::CountUpload => self.upload_counted(event),
             CompleteUploadState::DeleteUploadRecords => self.records_deleted(event),
             CompleteUploadState::ReadImportRule => self.import_rule_read(event),
             CompleteUploadState::ReadReaders => self.readers_read(event),

@@ -931,7 +931,7 @@ mod tests {
         );
         // The same bytes registered by an import: only the upload is cleared, then committed.
         let (mut operation, _) = found(Some([7u8; 32]), false);
-        assert_eq!(operation.state, CompleteUploadState::DeleteUploadRecords);
+        assert_eq!(operation.state, CompleteUploadState::ReadUploadRecord);
         // A location the upload staged for that file goes, so the file counts once.
         let (mut staged, effects) = found(Some([7u8; 32]), true);
         let [Effect::Storage(StorageEffect::Delete { key_space, .. })] = effects.as_slice() else {
@@ -941,7 +941,7 @@ mod tests {
         staged.step(Event::Storage(StorageEvent::DeleteResult {
             key: Vec::new().into(),
         }));
-        assert_eq!(staged.state, CompleteUploadState::DeleteUploadRecords);
+        assert_eq!(staged.state, CompleteUploadState::ReadUploadRecord);
         let effects = operation.write_obligation();
         assert!(matches!(
             effects.as_slice(),

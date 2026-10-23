@@ -11,7 +11,8 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+    USAGE_STATS_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -21,6 +22,7 @@ use aruna_core::structs::storage::blob::{
     BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::format::StoredLayout;
+use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::{
     BucketCounters, BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, GLOBAL_SHARD_COUNT,
     NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY,
@@ -195,6 +197,21 @@ fn merge_entry(entries: &mut Vec<(Vec<u8>, UsageDelta)>, key: Vec<u8>, delta: Us
         Some((_, existing)) => *existing = existing.merge(delta),
         None => entries.push((key, delta)),
     }
+}
+
+/// Books one multipart upload record of `bucket` created (`1`) or removed (`-1`) in `txn_id`;
+/// storage answers with `BatchWriteResult`.
+pub fn count_upload(bucket: &str, uploads: i128, txn_id: TxnId) -> Effect {
+    let delta = BucketDelta {
+        open_uploads: uploads,
+        ..Default::default()
+    };
+    Effect::Storage(StorageEffect::AddUsage {
+        key_space: USAGE_STATS_KEYSPACE.to_string(),
+        deltas: Vec::new(),
+        buckets: vec![(usage_bucket_key(bucket).into(), delta)],
+        txn_id,
+    })
 }
 
 impl UsageCounterUpdate {
@@ -665,6 +682,7 @@ pub enum RebuildStatsState {
     ScanArchives,
     ScanEnvelopeVersions,
     ScanCopies,
+    ScanUploads,
     ScanCounters,
     StartWriteTransaction,
     WriteCounters,
@@ -780,6 +798,7 @@ impl RebuildStatsOperation {
             RebuildStatsState::ScanArchives => Some(ABE_ARCHIVE_KEYSPACE),
             RebuildStatsState::ScanEnvelopeVersions => Some(ABE_VERSION_KEYSPACE),
             RebuildStatsState::ScanCopies => Some(ABE_COPY_KEYSPACE),
+            RebuildStatsState::ScanUploads => Some(UPLOAD_KEYSPACE),
             RebuildStatsState::ScanCounters => Some(USAGE_STATS_KEYSPACE),
             _ => None,
         }
@@ -984,6 +1003,18 @@ impl RebuildStatsOperation {
                     self.book_bucket(&version_key.bucket, &delta)?;
                 }
             }
+            RebuildStatsState::ScanUploads => {
+                for (_, value) in values {
+                    // Like the stale sweep, an undecodable record is left out, as no flow ends it.
+                    let Ok(upload) = MultipartUpload::from_bytes(value.as_ref()) else {
+                        warn!("rebuilt usage skips an undecodable multipart upload");
+                        continue;
+                    };
+                    if let Some(row) = self.bucket_rows.get_mut(&upload.bucket) {
+                        row.open_uploads = row.open_uploads.saturating_add(1);
+                    }
+                }
+            }
             RebuildStatsState::ScanCounters => {
                 self.existing_counter_keys
                     .extend(values.iter().map(|(key, _)| key.to_vec()));
@@ -1011,7 +1042,8 @@ impl RebuildStatsOperation {
             RebuildStatsState::ScanEnvelopes => RebuildStatsState::ScanArchives,
             RebuildStatsState::ScanArchives => RebuildStatsState::ScanEnvelopeVersions,
             RebuildStatsState::ScanEnvelopeVersions => RebuildStatsState::ScanCopies,
-            RebuildStatsState::ScanCopies => RebuildStatsState::ScanCounters,
+            RebuildStatsState::ScanCopies => RebuildStatsState::ScanUploads,
+            RebuildStatsState::ScanUploads => RebuildStatsState::ScanCounters,
             RebuildStatsState::ScanCounters => {
                 self.state = RebuildStatsState::StartWriteTransaction;
                 return smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -1197,6 +1229,7 @@ impl Operation for RebuildStatsOperation {
             | RebuildStatsState::ScanArchives
             | RebuildStatsState::ScanEnvelopeVersions
             | RebuildStatsState::ScanCopies
+            | RebuildStatsState::ScanUploads
             | RebuildStatsState::ScanCounters => self.handle_page(event),
             RebuildStatsState::StartWriteTransaction => self.handle_write_started(event),
             RebuildStatsState::WriteCounters => self.handle_counters_written(event),
@@ -1954,6 +1987,7 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::{FrameLayout, StoredFormat, StoredLayout};
+    use aruna_core::structs::storage::multipart::MultipartUploadStatus;
     use aruna_core::structs::storage::usage::global_shard_keys;
     use aruna_core::structs::storage::usage::usage_hash_key;
     use std::time::SystemTime;
@@ -2575,6 +2609,38 @@ mod tests {
         write_head("alpha", "gone.txt", alpha_gone_head).await;
         write_head("alpha", "ref.txt", alpha_ref_head).await;
         write_head("beta", "shared.bin", beta_head).await;
+        // One upload record in alpha, being completed, and one of a bucket that is gone.
+        for (bucket, status) in [
+            ("alpha", MultipartUploadStatus::Completing),
+            ("gone", MultipartUploadStatus::Open),
+        ] {
+            let upload = MultipartUpload {
+                upload_id: Ulid::generate(),
+                backend: BackendRef::node_default(),
+                storage_class: None,
+                bucket: bucket.to_string(),
+                key: "part.bin".to_string(),
+                group_id: group_a,
+                created_by: user,
+                created_at: now,
+                status,
+                checksum_hint: None,
+                metadata: Default::default(),
+                placement_policies: Vec::new(),
+                subject_generation: 0,
+                completing_since_ms: None,
+                backend_upload: None,
+                encryption: None,
+            };
+            ctx.storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: UPLOAD_KEYSPACE.to_string(),
+                    key: upload.upload_id.to_bytes().to_vec().into(),
+                    value: upload.to_bytes().unwrap().into(),
+                    txn_id: Some(txn_id),
+                })
+                .await;
+        }
 
         ctx.storage_handle
             .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
@@ -2613,6 +2679,7 @@ mod tests {
             delete_markers: 1,
             logical_bytes: 140,
             referenced_bytes: 30,
+            open_uploads: 1,
         };
         assert_eq!(read_bucket(&ctx, "alpha").await, alpha_row);
         let beta_row = BucketCounters {

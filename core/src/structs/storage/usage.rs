@@ -289,6 +289,8 @@ pub struct BucketCounters {
     /// As [`UsageCounters::logical_bytes`], for this bucket's versions.
     pub logical_bytes: u64,
     pub referenced_bytes: u64,
+    /// Multipart upload records not yet removed by a completion or an abort.
+    pub open_uploads: u64,
 }
 
 impl BucketCounters {
@@ -315,17 +317,20 @@ impl BucketCounters {
             self.referenced_bytes,
             delta.referenced_bytes,
         )?;
+        let uploads = apply_delta("open_uploads", self.open_uploads, delta.open_uploads)?;
         self.objects = objects.0;
         self.versions = versions.0;
         self.delete_markers = markers.0;
         self.logical_bytes = logical_bytes.0;
         self.referenced_bytes = referenced_bytes.0;
+        self.open_uploads = uploads.0;
         Ok([
             objects.1,
             versions.1,
             markers.1,
             logical_bytes.1,
             referenced_bytes.1,
+            uploads.1,
         ]
         .into_iter()
         .flatten()
@@ -341,6 +346,7 @@ pub struct BucketDelta {
     pub delete_markers: i128,
     pub logical_bytes: i128,
     pub referenced_bytes: i128,
+    pub open_uploads: i128,
 }
 
 impl BucketDelta {
@@ -351,6 +357,7 @@ impl BucketDelta {
             delete_markers: self.delete_markers.saturating_add(other.delete_markers),
             logical_bytes: self.logical_bytes.saturating_add(other.logical_bytes),
             referenced_bytes: self.referenced_bytes.saturating_add(other.referenced_bytes),
+            open_uploads: self.open_uploads.saturating_add(other.open_uploads),
         }
     }
 }

@@ -1229,7 +1229,7 @@ fn omitted_parts_deleted() {
     op.upload_parts = vec![part_record(1, 10), part_record(2, 20)];
     op.resolved_parts = vec![op.upload_parts[0].clone()];
 
-    let effects = op.delete_upload_records();
+    let effects = op.delete_records();
 
     let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice() else {
         panic!("expected batch delete effect");
