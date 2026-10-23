@@ -626,7 +626,9 @@ async fn ensure_usage_counters(
                 )
                 .into());
             }
-            if values.iter().any(|(_, value)| value.is_none()) {
+            if values.iter().any(|(_, value)| value.is_none())
+                || bucket_rows_missing(driver_ctx).await?
+            {
                 drive(RebuildStatsOperation::new(), driver_ctx).await?;
                 return Ok(true);
             }
@@ -639,6 +641,42 @@ async fn ensure_usage_counters(
         }
     }
     Ok(false)
+}
+
+/// A first bucket without a counter row means bucket rows were never built.
+async fn bucket_rows_missing(
+    driver_ctx: &DriverContext,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
+    use aruna_core::structs::storage::usage::usage_bucket_key;
+
+    let storage = &driver_ctx.storage_handle;
+    let first = StorageEffect::Iter {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: 1,
+        txn_id: None,
+    };
+    let bucket = match storage.send_storage_effect(first).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => match values.first() {
+            Some((bucket, _)) => bucket.to_vec(),
+            None => return Ok(false),
+        },
+        other => return Err(format!("bucket probe received unexpected event: {other:?}").into()),
+    };
+    let bucket = String::from_utf8(bucket)?;
+    let read = StorageEffect::Read {
+        key_space: USAGE_STATS_KEYSPACE.to_string(),
+        key: usage_bucket_key(&bucket).into(),
+        txn_id: None,
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_none()),
+        other => Err(format!("bucket counter probe received unexpected event: {other:?}").into()),
+    }
 }
 
 #[cfg(test)]
@@ -704,6 +742,55 @@ mod tests {
                 UsageCounters::default()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn counters_rebuild_buckets() {
+        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+        use aruna_core::structs::storage::blob::BucketInfo;
+        use aruna_core::structs::storage::format::Compression;
+        use aruna_core::structs::storage::usage::usage_bucket_key;
+
+        let temp = tempdir().expect("temp dir");
+        let storage_handle = open_storage(&temp);
+        let driver_ctx = test_driver_ctx(storage_handle.clone());
+        assert!(ensure_usage_counters(&driver_ctx).await.unwrap());
+        // A bucket from before bucket rows existed has shards but no row of its own.
+        let info = BucketInfo {
+            group_id: ulid::Ulid::from_bytes([3; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: b"older".to_vec().into(),
+                value: info.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        assert!(
+            ensure_usage_counters(&driver_ctx).await.unwrap(),
+            "a bucket without a row must report a rebuild"
+        );
+        let event = storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                key: usage_bucket_key("older").into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+        ));
+        assert!(!ensure_usage_counters(&driver_ctx).await.unwrap());
     }
 
     #[tokio::test]
