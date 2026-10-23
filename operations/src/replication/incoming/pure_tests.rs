@@ -968,6 +968,23 @@ fn valid_advance() {
     assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
 }
 
+#[test]
+fn advance_replay_orders() {
+    // A head written at a later epoch already supersedes a replayed advance, whatever its
+    // generation; comparing generations alone would refuse the replay as invalid lineage.
+    let (mut manifest, _, publisher) = advance_fixture();
+    manifest.original_epoch = OriginalEpoch(1);
+    let mut op = advance_operation(manifest, publisher);
+    op.destination_bound = true;
+    op.advance_version_exists = true;
+    let later = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([30u8; 16]), 1)
+        .with_epoch(OriginalEpoch(2));
+    op.write_compared_object(Some(&later.to_bytes().unwrap()));
+    assert_eq!(op.state, IncomingVersionState::WriteLiveObligation);
+    assert_eq!(op.existing_current_pointer, Some(later));
+    assert_eq!(op.pending_head, None);
+}
+
 // One advance mints exactly one successor: a repeated, skipped or overflowing
 // count would let a publisher reset the cap by replaying advances.
 #[test]

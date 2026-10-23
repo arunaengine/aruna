@@ -1841,7 +1841,7 @@ impl IncomingVersionOperation {
             )
             .with_epoch(self.original_epoch());
             if self.advance_version_exists
-                && (advanced == pointer || pointer.generation > advance.generation)
+                && (advanced == pointer || pointer.order() > advanced.order())
             {
                 self.existing_current_pointer = Some(pointer);
                 self.object_delta = 0;
