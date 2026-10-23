@@ -13,6 +13,7 @@ pub mod data_identity;
 pub mod dataset_location;
 pub mod delete_audit;
 pub mod discovery;
+pub mod distribution;
 pub mod encryption;
 pub mod format;
 pub mod glob;
