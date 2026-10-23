@@ -26,8 +26,8 @@ use aruna_core::structs::storage::usage::{
     SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX,
     UsageCounterError, UsageCounters, UsageDelta, dirty_group_id, dirty_group_key,
     global_group_key, global_shard_index, global_shard_key, global_shard_keys, shard_for_archive,
-    shard_for_hash, usage_backend_key, usage_global_key, usage_group_id, usage_group_key,
-    usage_group_prefix, usage_node_id, usage_snapshot_key, usage_summary_key,
+    shard_for_hash, usage_backend_key, usage_bucket_key, usage_global_key, usage_group_id,
+    usage_group_key, usage_group_prefix, usage_node_id, usage_snapshot_key, usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -177,6 +177,23 @@ impl UsageCounterUpdate {
             dirty_group: Some(group_id),
             phase: UsageUpdatePhase::Pending,
         }
+    }
+
+    /// Also books the group delta, without its bucket count, on the row of `bucket`.
+    pub fn in_bucket(mut self, bucket: &str) -> Self {
+        let group = self.dirty_group.map(usage_group_key);
+        let delta = self
+            .entries
+            .iter()
+            .find(|(key, _)| Some(key) == group.as_ref());
+        if let Some(&(_, delta)) = delta {
+            let delta = UsageDelta {
+                buckets: 0,
+                ..delta
+            };
+            merge_entry(&mut self.entries, usage_bucket_key(bucket), delta);
+        }
+        self
     }
 
     /// The reclaim sweep's debit: physical bytes leave, no group counter moves.
@@ -642,6 +659,8 @@ pub struct RebuildStatsOperation {
     global_shards: Vec<UsageCounters>,
     backend_shards: HashMap<Vec<u8>, UsageCounters>,
     groups: HashMap<GroupId, UsageCounters>,
+    /// Rows of each bucket, an empty bucket included.
+    bucket_rows: HashMap<String, UsageCounters>,
     existing_counter_keys: Vec<Vec<u8>>,
     stale_counter_deletes: Vec<(String, Key)>,
     /// Materialized versions whose blob location row is gone; their bytes
@@ -673,6 +692,7 @@ impl RebuildStatsOperation {
             global_shards: vec![UsageCounters::default(); GLOBAL_SHARD_COUNT],
             backend_shards: HashMap::new(),
             groups: HashMap::new(),
+            bucket_rows: HashMap::new(),
             existing_counter_keys: Vec::new(),
             stale_counter_deletes: Vec::new(),
             orphan_versions: 0,
@@ -720,6 +740,24 @@ impl RebuildStatsOperation {
         &mut self.global_shards[global_shard_index(group_id)]
     }
 
+    /// Books an object-level delta on its bucket's group, global shard and bucket rows.
+    fn book_bucket(
+        &mut self,
+        bucket: &str,
+        delta: &UsageCounters,
+    ) -> Result<(), RebuildStatsError> {
+        let Some(group_id) = self.bucket_groups.get(bucket).copied() else {
+            self.global_shards[0].add(delta)?;
+            return Ok(());
+        };
+        self.group_entry(group_id).add(delta)?;
+        self.global_shard_entry(group_id).add(delta)?;
+        if let Some(row) = self.bucket_rows.get_mut(bucket) {
+            row.add(delta)?;
+        }
+        Ok(())
+    }
+
     fn backend_entry(&mut self, backend: &BackendRef, shard: usize) -> &mut UsageCounters {
         self.backend_shards
             .entry(usage_backend_key(backend, shard))
@@ -739,6 +777,8 @@ impl RebuildStatsOperation {
                     self.global.add(&delta)?;
                     self.group_entry(info.group_id).add(&delta)?;
                     self.global_shard_entry(info.group_id).add(&delta)?;
+                    self.bucket_rows
+                        .insert(bucket.clone(), UsageCounters::default());
                     self.bucket_groups.insert(bucket, info.group_id);
                 }
             }
@@ -806,13 +846,7 @@ impl RebuildStatsOperation {
                             ..Default::default()
                         };
                         self.global.add(&delta)?;
-                        if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied()
-                        {
-                            self.group_entry(group_id).add(&delta)?;
-                            self.global_shard_entry(group_id).add(&delta)?;
-                        } else {
-                            self.global_shards[0].add(&delta)?;
-                        }
+                        self.book_bucket(&version_key.bucket, &delta)?;
                     }
 
                     // An offered directory is charged only for its current observations.
@@ -848,12 +882,7 @@ impl RebuildStatsOperation {
                         ..Default::default()
                     };
                     self.global.add(&delta)?;
-                    if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied() {
-                        self.group_entry(group_id).add(&delta)?;
-                        self.global_shard_entry(group_id).add(&delta)?;
-                    } else {
-                        self.global_shards[0].add(&delta)?;
-                    }
+                    self.book_bucket(&version_key.bucket, &delta)?;
                 }
             }
             RebuildStatsState::ScanEnvelopes | RebuildStatsState::ScanArchives => {
@@ -885,12 +914,7 @@ impl RebuildStatsOperation {
                         ..Default::default()
                     };
                     self.global.add(&delta)?;
-                    if let Some(group_id) = self.bucket_groups.get(&version_key.bucket).copied() {
-                        self.group_entry(group_id).add(&delta)?;
-                        self.global_shard_entry(group_id).add(&delta)?;
-                    } else {
-                        self.global_shards[0].add(&delta)?;
-                    }
+                    self.book_bucket(&version_key.bucket, &delta)?;
                 }
             }
             RebuildStatsState::ScanCounters => {
@@ -988,6 +1012,15 @@ impl RebuildStatsOperation {
         }
         for (group_id, counters) in &self.groups {
             let key = usage_group_key(*group_id);
+            let bytes = match counters.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(err) => return self.emit_error(err.into()),
+            };
+            write_keys.insert(key.clone());
+            writes.push((USAGE_STATS_KEYSPACE.to_string(), key.into(), bytes.into()));
+        }
+        for (bucket, counters) in &self.bucket_rows {
+            let key = usage_bucket_key(bucket);
             let bytes = match counters.to_bytes() {
                 Ok(bytes) => bytes,
                 Err(err) => return self.emit_error(err.into()),
@@ -2121,6 +2154,44 @@ mod tests {
         assert!(update.is_done());
     }
 
+    #[test]
+    fn bucket_books_delta() {
+        let group_id = Ulid::generate();
+        let delta = UsageDelta {
+            buckets: 1,
+            objects: 1,
+            logical_bytes: 42,
+            ..Default::default()
+        };
+        let mut update = UsageCounterUpdate::for_group(group_id, delta).in_bucket("data");
+        let effects = update.start(Ulid::generate());
+        let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+            panic!("expected the counter deltas, got {effects:?}");
+        };
+        let bucket = UsageDelta {
+            buckets: 0,
+            ..delta
+        };
+        assert_eq!(
+            deltas,
+            &vec![
+                (global_group_key(group_id).into(), delta),
+                (usage_group_key(group_id).into(), delta),
+                (usage_bucket_key("data").into(), bucket),
+            ]
+        );
+
+        // The reclaim sweep's physical debit names no group, so no bucket row moves.
+        let stored = StoredDelta::new([1; 32], BackendRef::node_default(), -1, -5);
+        let mut update = UsageCounterUpdate::for_stored(stored).in_bucket("data");
+        let effects = update.start(Ulid::generate());
+        let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+            panic!("expected the counter deltas, got {effects:?}");
+        };
+        let bucket_key = usage_bucket_key("data");
+        assert!(deltas.iter().all(|(key, _)| key.as_ref() != bucket_key));
+    }
+
     #[tokio::test]
     async fn bucket_maintains_usage() {
         let temp = tempdir().unwrap();
@@ -2417,6 +2488,18 @@ mod tests {
         assert_eq!(beta.objects, 1);
         assert_eq!(beta.logical_bytes, 80);
         assert_eq!(beta.referenced_bytes, 0);
+
+        // Each bucket row holds its bucket's share, without a bucket count.
+        let alpha_row = read_counters(&ctx, usage_bucket_key("alpha")).await;
+        let beta_row = read_counters(&ctx, usage_bucket_key("beta")).await;
+        assert_eq!(
+            alpha_row,
+            UsageCounters {
+                buckets: 0,
+                ..alpha
+            }
+        );
+        assert_eq!(beta_row, UsageCounters { buckets: 0, ..beta });
     }
 
     #[test]

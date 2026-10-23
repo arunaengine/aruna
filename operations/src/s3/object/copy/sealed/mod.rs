@@ -660,7 +660,8 @@ impl SealedCopyOperation {
             referenced_bytes: -i128::from(self.released_bytes),
             ..Default::default()
         };
-        self.usage = Some(UsageCounterUpdate::for_group(self.input.group_id, delta));
+        let usage = UsageCounterUpdate::for_group(self.input.group_id, delta);
+        self.usage = Some(usage.in_bucket(&self.input.bucket));
         match self.input.quota_ceiling.filter(|_| added > 0) {
             Some(ceiling) => {
                 let mut gate = QuotaGate::new_for_realm(

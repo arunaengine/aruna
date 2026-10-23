@@ -867,7 +867,8 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::NoTransactionFound);
         };
         let delta = self.usage_delta();
-        let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta);
+        let mut update =
+            UsageCounterUpdate::for_group(self.input.group_id, delta).in_bucket(&self.input.bucket);
         if update.is_noop() {
             return self.write_delete_audit();
         }

@@ -652,7 +652,8 @@ impl SuccessorMint {
         let released = predecessor.offered_size(&self.plan.context.bucket, &self.plan.context.key);
         delta.referenced_bytes -= i128::from(released.unwrap_or(0));
         self.quota_bytes = u64::try_from(delta.logical_bytes).unwrap_or_default();
-        self.usage = Some(UsageCounterUpdate::for_group(group_id, delta));
+        let usage = UsageCounterUpdate::for_group(group_id, delta);
+        self.usage = Some(usage.in_bucket(&self.plan.context.bucket));
         self.outcome = Some(SuccessorOutcome::Minted {
             version_id,
             refs: self.effective_refs.clone(),

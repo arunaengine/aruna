@@ -1508,11 +1508,10 @@ impl PutObjectOperation {
         let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
             return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
         };
-        self.usage_update = Some(UsageCounterUpdate::with_stored(
-            self.config.group_id,
-            group_delta,
-            stored,
-        ));
+        self.usage_update = Some(
+            UsageCounterUpdate::with_stored(self.config.group_id, group_delta, stored)
+                .in_bucket(&self.config.request.bucket),
+        );
 
         // Enforce the hard quota before counters commit; only a
         // positive logical delta can breach it, so deletes pass.

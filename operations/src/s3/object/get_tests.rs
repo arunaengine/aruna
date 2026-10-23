@@ -1684,7 +1684,8 @@ fn successor_charges_size() {
             referenced_bytes: 9,
             ..Default::default()
         },
-    );
+    )
+    .in_bucket(&operation.input.bucket);
     let _ = expected.start(txn_id);
     assert_eq!(operation.usage_update, Some(expected));
 }

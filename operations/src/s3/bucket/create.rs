@@ -358,7 +358,8 @@ impl CreateBucketOperation {
                 buckets: 1,
                 ..Default::default()
             },
-        );
+        )
+        .in_bucket(&self.bucket);
         self.state = CreateBucketState::UpdateUsage;
         let effects = update.start(txn_id);
         self.usage_update = Some(update);

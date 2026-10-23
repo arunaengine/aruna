@@ -224,7 +224,8 @@ impl CopyEnvelopeOperation {
                     logical_bytes: added,
                     ..Default::default()
                 };
-                self.usage = Some(UsageCounterUpdate::for_group(group, delta));
+                let usage = UsageCounterUpdate::for_group(group, delta);
+                self.usage = Some(usage.in_bucket(&self.version.bucket));
                 let ceiling = self.quota.as_ref().and_then(|(quota, realm, node)| {
                     let ceiling = quota.effective_group_ceiling(&group)?;
                     Some((ceiling, *realm, *node))

@@ -2012,11 +2012,10 @@ impl CompleteUploadOperation {
         let Some(stored) = stored else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
-        self.usage_update = Some(UsageCounterUpdate::with_stored(
-            group_id,
-            group_delta,
-            stored,
-        ));
+        self.usage_update = Some(
+            UsageCounterUpdate::with_stored(group_id, group_delta, stored)
+                .in_bucket(&self.input.bucket),
+        );
 
         // Enforce the hard group quota before the counters commit. Only a positive
         // logical-bytes delta can push a group over its ceiling.

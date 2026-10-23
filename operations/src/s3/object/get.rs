@@ -1305,7 +1305,8 @@ impl GetObjectOperation {
                 referenced_bytes,
                 ..Default::default()
             },
-        );
+        )
+        .in_bucket(&self.input.bucket);
         if update.is_noop() {
             self.state = GetObjectState::CommitAdvance;
             return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];

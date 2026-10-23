@@ -302,7 +302,8 @@ pub async fn write_reference_version(
                 referenced_bytes: i128::from(referenced_bytes) - i128::from(released.unwrap_or(0)),
                 ..Default::default()
             },
-        );
+        )
+        .in_bucket(&write.bucket);
         if !usage_update.is_noop() {
             run_usage_update(context, txn_id, &mut usage_update).await?;
         }

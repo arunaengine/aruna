@@ -341,11 +341,14 @@ impl RewriteVersionOperation {
             logical_bytes: added,
             ..Default::default()
         };
+        let bucket = &self.version_key.bucket;
         match (self.charge.map(|(group, _)| group), stored) {
             (Some(group), Some(stored)) => {
-                Some(UsageCounterUpdate::with_stored(group, delta, stored))
+                Some(UsageCounterUpdate::with_stored(group, delta, stored).in_bucket(bucket))
             }
-            (Some(group), None) => Some(UsageCounterUpdate::for_group(group, delta)),
+            (Some(group), None) => {
+                Some(UsageCounterUpdate::for_group(group, delta).in_bucket(bucket))
+            }
             (None, stored) => stored.map(UsageCounterUpdate::for_stored),
         }
     }

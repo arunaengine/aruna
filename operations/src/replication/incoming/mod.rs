@@ -2156,7 +2156,8 @@ impl IncomingVersionOperation {
             Err(error) => return self.fail(error),
         };
         if self.manifest.kind == ReplicationItemKind::DeleteMarker {
-            let update = UsageCounterUpdate::for_group(group_id, group_delta);
+            let update = UsageCounterUpdate::for_group(group_id, group_delta)
+                .in_bucket(&self.manifest.bucket);
             if update.is_noop() {
                 return self.commit_or_cleanup();
             }
@@ -2164,7 +2165,8 @@ impl IncomingVersionOperation {
             return self.start_usage_update();
         }
         if self.is_reference_item() {
-            let update = UsageCounterUpdate::for_group(group_id, group_delta);
+            let update = UsageCounterUpdate::for_group(group_id, group_delta)
+                .in_bucket(&self.manifest.bucket);
             if self.manifest.reference_advance.is_some() && update.is_noop() {
                 return self.commit_or_cleanup();
             }
@@ -2174,13 +2176,14 @@ impl IncomingVersionOperation {
         let Some(blob) = self.manifest.blob.as_ref() else {
             return self.fail(IncomingVersionError::MissingBlobInfo);
         };
-        self.usage_update = Some(match self.received_blob.as_ref() {
+        let update = match self.received_blob.as_ref() {
             None => UsageCounterUpdate::for_group(group_id, group_delta),
             Some(received) => match StoredDelta::for_location(&received.location, true) {
                 Some(stored) => UsageCounterUpdate::with_stored(group_id, group_delta, stored),
                 None => return self.fail(IncomingVersionError::MissingBlobInfo),
             },
-        });
+        };
+        self.usage_update = Some(update.in_bucket(&self.manifest.bucket));
         let Some(txn_id) = self.txn_id else {
             return self.fail(IncomingVersionError::StorageError(
                 StorageError::TransactionNotFound,

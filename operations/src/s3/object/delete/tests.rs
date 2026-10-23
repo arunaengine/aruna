@@ -318,7 +318,8 @@ fn delete_stages_debit() {
         logical_bytes: -34_788_022,
         ..Default::default()
     };
-    assert_eq!(deltas.len(), 2);
+    // The group shard, the group row and the bucket row take the same debit.
+    assert_eq!(deltas.len(), 3);
     assert!(deltas.iter().all(|(_, delta)| *delta == debit));
 
     let effects = op.handle_usage_update(Event::Storage(StorageEvent::BatchWriteResult {
@@ -1577,4 +1578,137 @@ fn marker_needs_head() {
         Some(Err(DeleteObjectError::VersionChanged))
     ));
     assert!(marked(head).is_none());
+}
+
+/// Puts, an overwrite, a delete marker and a version delete in two buckets keep each bucket row
+/// exact and the group row their sum, and a rebuild finds the same rows.
+#[tokio::test]
+async fn bucket_rows_sum() {
+    use crate::node::usage_stats::RebuildStatsOperation;
+    use crate::s3::bucket::create::CreateBucketOperation;
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_bucket_key, usage_group_key};
+
+    let temp_handle = tempdir().unwrap();
+    let temp_root = temp_handle.path().to_str().unwrap();
+    let blob_root = format!("{temp_root}/blobstore");
+    std::fs::create_dir_all(&blob_root).unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100000),
+            multipart_bucket: Some("multipart".to_string()),
+            root: blob_root,
+            service_config: HashMap::new(),
+            timeouts: Default::default(),
+        },
+        storage_handle.clone(),
+        net_handle.clone(),
+    )
+    .await
+    .unwrap();
+    let node_id = net_handle.node_id();
+    let context = DriverContext {
+        storage_handle,
+        net_handle: Some(net_handle),
+        blob_handle: Some(blob_handle),
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let group_id = Ulid::generate();
+    for bucket in ["one", "two"] {
+        let info = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::now(),
+            created_by: user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+        };
+        drive(
+            CreateBucketOperation::new(bucket.to_string(), info),
+            &context,
+        )
+        .await
+        .unwrap();
+    }
+    let put = async |bucket: &str, key: &str, body: &'static [u8]| {
+        let request = PutObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            content_length: Some(body.len() as u64),
+            body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(body))),
+        };
+        let config = PutObjectConfig {
+            user_id,
+            group_id,
+            realm_id,
+            node_id,
+            request,
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        };
+        drive(PutObjectOperation::new(config), &context)
+            .await
+            .unwrap()
+    };
+    let delete = async |bucket: &str, key: &str, version_id: Option<Ulid>| {
+        let input = DeleteObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id,
+            group_id,
+            realm_id,
+            node_id,
+            deleted_by: user_id,
+        };
+        drive(DeleteObjectOperation::new(input), &context)
+            .await
+            .unwrap();
+    };
+    put("one", "x", b"hello").await;
+    put("one", "x", b"hello!").await;
+    delete("one", "x", None).await;
+    put("two", "y", b"1234567").await;
+    let z = put("two", "z", b"abc").await;
+    delete("two", "z", Some(z.version_id)).await;
+
+    let row = |objects, logical_bytes| UsageCounters {
+        objects,
+        logical_bytes,
+        ..Default::default()
+    };
+    let one = read_counters(&context, usage_bucket_key("one")).await;
+    let two = read_counters(&context, usage_bucket_key("two")).await;
+    // The marker hides x, whose two versions stay stored; z is gone.
+    assert_eq!((one, two), (row(0, 11), row(1, 7)));
+    let group = read_counters(&context, usage_group_key(group_id)).await;
+    assert_eq!(
+        (group.buckets, group.objects, group.logical_bytes),
+        (2, 1, 18)
+    );
+
+    drive(RebuildStatsOperation::new(), &context).await.unwrap();
+    assert_eq!(read_counters(&context, usage_bucket_key("one")).await, one);
+    assert_eq!(read_counters(&context, usage_bucket_key("two")).await, two);
+    assert_eq!(
+        read_counters(&context, usage_group_key(group_id)).await,
+        group
+    );
 }

@@ -13,6 +13,8 @@ use ulid::Ulid;
 pub const USAGE_GLOBAL_KEY: &[u8] = b"global";
 pub const GLOBAL_SHARD_COUNT: usize = 64;
 pub const USAGE_BACKEND_PREFIX: &str = "backend/";
+/// Node-local rows of one bucket's `objects`, `logical_bytes` and `referenced_bytes`.
+pub const USAGE_BUCKET_PREFIX: &str = "bucket/";
 
 /// Usage keys group fixed binary node snapshots by node or group for prefix scans.
 /// Local `dirty/` and `summary/` text keys cannot collide with snapshot prefixes.
@@ -151,6 +153,10 @@ pub fn usage_backend_keys(backend: &BackendRef) -> Vec<Vec<u8>> {
     (0..GLOBAL_SHARD_COUNT)
         .map(|shard| usage_backend_key(backend, shard))
         .collect()
+}
+
+pub fn usage_bucket_key(bucket: &str) -> Vec<u8> {
+    [USAGE_BUCKET_PREFIX.as_bytes(), bucket.as_bytes()].concat()
 }
 
 pub fn usage_group_key(group_id: GroupId) -> Vec<u8> {

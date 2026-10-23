@@ -527,7 +527,8 @@ async fn observe(
                 - i128::from(released.unwrap_or(0)),
             ..Default::default()
         },
-    );
+    )
+    .in_bucket(&input.bucket);
     if !usage.is_noop() {
         run_usage_update(context, txn_id, &mut usage).await?;
     }
@@ -667,7 +668,8 @@ async fn tombstone(
             referenced_bytes: -i128::from(live.offered_size(&scope.bucket, key).unwrap_or(0)),
             ..Default::default()
         },
-    );
+    )
+    .in_bucket(&scope.bucket);
     if !usage.is_noop() {
         run_usage_update(context, txn_id, &mut usage).await?;
     }
