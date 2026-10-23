@@ -7,6 +7,7 @@ pub mod actions;
 pub mod folders;
 pub mod materialize;
 pub mod outbox;
+pub(crate) mod pull;
 pub mod reconcile;
 pub mod repository;
 

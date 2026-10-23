@@ -24,7 +24,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::{
     PathClaimRecord, PersistentIdFailure, PersistentIdMapping, SyncListCursor, SyncPageLimit,
-    SyncPull, SyncPullAck, SyncRefusal, SyncRelationship, SyncVersionPage,
+    SyncPull, SyncPullStatus, SyncRefusal, SyncRelationship, SyncVersionPage,
 };
 use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
@@ -404,8 +404,9 @@ pub enum MetadataTransportMessage {
         auth_token: AuthToken,
         pull: Box<SyncPull>,
     },
+    /// Answers a pull request and each poll of it.
     ForwardedSyncPull {
-        result: Result<SyncPullAck, SyncRefusal>,
+        status: SyncPullStatus,
     },
     /// Bounded listing of the current heads under one bucket prefix, served as
     /// a routed read with the requesting owner's authority.
@@ -514,6 +515,11 @@ pub enum MetadataTransportMessage {
     /// An empty answer means this holder has no records, never that the vault is absent.
     FetchedVaultRecords {
         result: Result<aruna_core::structs::identity::user::vault::VaultRecords, MetadataReadError>,
+    },
+    /// Asks how far an accepted sync pull has come; answered by `ForwardedSyncPull`.
+    ForwardSyncPullStatus {
+        auth_token: AuthToken,
+        pull: Box<SyncPull>,
     },
 }
 

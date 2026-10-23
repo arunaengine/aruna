@@ -231,8 +231,7 @@ pub struct DeviceTransfer {
     pub key: String,
     pub state: TransferState,
     pub bytes_total: u64,
-    /// Bytes already moved. The realm node pulls in one pass, so this is 0
-    /// until the transfer settles.
+    /// Bytes the realm node has received so far for a running upload; 0 otherwise.
     pub bytes_done: u64,
     pub attempts: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,6 +379,10 @@ pub fn action_view(record: SyncActionRecord) -> ActionRecordView {
 /// One queued upload as a transfer. A row only exists while the realm node has
 /// not confirmed the pull, so a listed upload is always still owed.
 pub fn transfer_view(upload: SyncUpload, bucket: String, key: String) -> DeviceTransfer {
+    let bytes_done = match upload.state {
+        UploadState::Transferring { bytes_done, .. } => bytes_done,
+        _ => 0,
+    };
     let (state, attempts, next_attempt_ms, message) = match upload.state {
         UploadState::Pending {
             due_at_ms,
@@ -397,6 +400,9 @@ pub fn transfer_view(upload: SyncUpload, bucket: String, key: String) -> DeviceT
             last_error,
         ),
         UploadState::Failed { reason, .. } => (TransferState::Failed, 0, None, Some(reason)),
+        UploadState::Transferring { attempts, .. } => {
+            (TransferState::Running, attempts, None, None)
+        }
     };
     DeviceTransfer {
         id: format!("{}:{}", upload.folder_id, upload.relative),
@@ -407,7 +413,7 @@ pub fn transfer_view(upload: SyncUpload, bucket: String, key: String) -> DeviceT
         key,
         state,
         bytes_total: upload.size,
-        bytes_done: 0,
+        bytes_done,
         attempts,
         next_attempt_ms,
         message,

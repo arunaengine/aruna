@@ -22,7 +22,7 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, RemoteBinding, SyncBase,
-    SyncPull, SyncRefusal,
+    SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal,
 };
 use aruna_core::types::GroupId;
 use aruna_operations::device::sync::ReconcileFolderError;
@@ -34,7 +34,7 @@ use aruna_operations::device::sync::outbox::drain_sync_outbox;
 use aruna_operations::device::sync::reconcile_folder;
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::device_pull::apply_pull;
+use aruna_operations::metadata::device_pull::{accept_pull, pull_status};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
 use aruna_operations::s3::bucket::get::GetBucketOperation;
@@ -44,7 +44,7 @@ use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObje
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 use futures_util::StreamExt;
-use topology::{TestResult, Topology, wait_for_convergence};
+use topology::{TestResult, Topology, hang_cap, wait_for_convergence};
 use ulid::Ulid;
 
 const MANAGEMENT_NODES: usize = 2;
@@ -338,8 +338,30 @@ async fn wakes_replication_drain() -> TestResult<()> {
     await_drained(&server.context).await
 }
 
-/// Two pulls of one device version released together commit it once and answer alike,
-/// as when a device retries while its first pull still runs.
+/// Polls an accepted pull until the realm node answers for good.
+async fn pull_done(
+    context: &std::sync::Arc<DriverContext>,
+    peer: aruna_core::NodeId,
+    token: &AuthToken,
+    pull: &SyncPull,
+    mut status: SyncPullStatus,
+) -> TestResult<SyncPullAck> {
+    hang_cap("a sync pull never finished", async {
+        loop {
+            match status {
+                SyncPullStatus::Done(ack) => return Ok(ack),
+                SyncPullStatus::Pending { .. } => {}
+                other => return Err(format!("the pull ended without a version: {other:?}").into()),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            status = pull_status(context, peer, token.clone(), pull).await;
+        }
+    })
+    .await
+}
+
+/// Two pulls of one device version released together run once, commit it once and answer
+/// alike, as when a device asks again while its first pull still runs.
 #[tokio::test]
 async fn fences_overlapping_pulls() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
@@ -377,24 +399,21 @@ async fn fences_overlapping_pulls() -> TestResult<()> {
         path_restrictions: None,
         session: None,
     });
+    let peer = device.node_id();
+    // A pull this node never accepted is unknown, never pending.
+    assert_eq!(
+        pull_status(&server.context, peer, token.clone(), &pull).await,
+        SyncPullStatus::Unknown
+    );
     let barrier = tokio::sync::Barrier::new(2);
     let pull_once = || async {
         barrier.wait().await;
-        apply_pull(
-            &server.context,
-            device.node_id(),
-            token.clone(),
-            pull.clone(),
-        )
-        .await
+        let accepted = accept_pull(&server.context, peer, token.clone(), pull.clone()).await;
+        pull_done(&server.context, peer, &token, &pull, accepted).await
     };
     let (first, second) = tokio::join!(pull_once(), pull_once());
-    let (first, second) = (
-        first.map_err(|refusal| format!("{refusal:?}"))?,
-        second.map_err(|refusal| format!("{refusal:?}"))?,
-    );
+    let (first, second) = (first?, second?);
     assert_eq!(first.version_id, second.version_id);
-    assert!(first.already_applied || second.already_applied);
 
     let versions = drive(
         ListVersionsOperation::new(ListVersionsInput {

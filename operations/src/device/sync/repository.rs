@@ -30,7 +30,8 @@ pub const SYNC_PAGE_SIZE: usize = 256;
 /// converges over several passes instead of blocking one.
 pub const MAX_HASH_BATCH: usize = 256;
 
-/// Pull attempts before a still-retryable upload parks for the owner.
+/// Pull attempts before a still-retryable upload parks for the owner. A refusal, a failed
+/// request or a stalled pull spends one; a pull that keeps receiving bytes never does.
 pub const MAX_UPLOAD_ATTEMPTS: u32 = 8;
 
 /// One local version waiting for its realm node to pull it. The row is keyed by
@@ -60,6 +61,12 @@ pub enum UploadState {
     Failed {
         reason: String,
         retryable: bool,
+    },
+    /// The realm node accepted the pull and the device polls it until it ends. A row left in
+    /// this state by a stopped drain is due at once and asks the node again.
+    Transferring {
+        attempts: u32,
+        bytes_done: u64,
     },
 }
 

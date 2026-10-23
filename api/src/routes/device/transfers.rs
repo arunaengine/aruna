@@ -41,8 +41,8 @@ for.
 - `uploads` are local versions no realm node has pulled yet. A row disappears once the pull is
   acknowledged, so every listed upload is still owed.
 - `downloads` are remote versions a folder has decided to fetch but has not written to disk yet.
-- `bytes_done` stays 0 until a transfer settles: a pull moves the bytes in one pass, so there is no
-  partial progress to report.
+- A `running` upload is being pulled by its realm node; `bytes_done` counts the bytes that node has
+  received so far. Queued, retrying and failed uploads and all downloads report 0.
 - The list is node-local and answers while the realm is unreachable."#,
     responses(
         (status = 200, description = "The uploads not yet pulled and the downloads not yet written", body = DeviceTransferList,
