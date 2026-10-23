@@ -2254,10 +2254,9 @@ fn release_key(intent_row: &[u8], version: &str) -> Vec<u8> {
     [intent_row, &[1], version.as_bytes()].concat()
 }
 
-/// Queues the release of the file at `path` if its size and ETag prove the bytes `intent`
-/// recorded and it has a backend version, keyed by the intent and that version so a replay
-/// queues it once; any file that cannot be proven stays. `false` when the storage cannot be
-/// asked yet.
+/// Queues the release of the file at `path`, once per intent and version, if it has a backend
+/// version and its size and ETag prove the bytes `intent` recorded; others stay. `false` when
+/// the storage cannot be asked yet.
 async fn abandon(
     context: &crate::driver::DriverContext,
     (intent_row, intent, import_id): (&[u8], &WriteIntent, Ulid),
