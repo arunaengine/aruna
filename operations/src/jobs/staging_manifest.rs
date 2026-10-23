@@ -20,8 +20,9 @@ use super::staging_walk::{
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
-use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
-use crate::staging::read_source::{ReadSourceInput, ReadSourceOperation};
+use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
+use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
+use aruna_core::errors::StagingSourceError;
 use aruna_core::structs::identity::auth::Permission;
 
 /// Manifest bytes one chunk reads; a manifest line must fit into one chunk.
@@ -70,11 +71,13 @@ pub(super) async fn read_manifest_chunk(
         .await
         {
             Ok(head) => head.metadata,
-            Err(error) => {
+            Err(error) if lasting_head(&error) => {
                 let message = format!("checksum manifest unavailable: {error}");
                 record_failure(&mut next, &manifest.source_path, "", message);
                 return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
             }
+            // A transient failure keeps the manifest and its offset for the job's retry.
+            Err(error) => return Err(PageFailure::Retry(error.to_string())),
         },
     };
     let end = manifest
@@ -95,28 +98,28 @@ pub(super) async fn read_manifest_chunk(
         &ctx.driver,
     )
     .await;
-    let bytes = match read {
-        Ok(read) if read.metadata.compare(&observation) == ObservationMatch::Changed => {
-            Err("the manifest changed while it was read".to_string())
+    let read = match read {
+        Ok(read) if read.metadata.compare(&observation) != ObservationMatch::Changed => read,
+        Ok(_) | Err(ReadSourceError::Staging(StagingSourceError::ConditionFailed)) => {
+            let message = "the checksum manifest changed while it was read".to_string();
+            record_failure(&mut next, &manifest.source_path, "", message);
+            return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
         }
-        Ok(read) => read
-            .stream
-            .try_fold(Vec::new(), |mut bytes, chunk| async move {
-                bytes.extend_from_slice(&chunk);
-                Ok(bytes)
-            })
-            .await
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error.to_string()),
-    };
-    let bytes = match bytes {
-        Ok(bytes) => bytes,
-        Err(error) => {
+        Err(error) if lasting_read(&error) => {
             let message = format!("checksum manifest read failed: {error}");
             record_failure(&mut next, &manifest.source_path, "", message);
             return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
         }
+        Err(error) => return Err(PageFailure::Retry(error.to_string())),
     };
+    let bytes = read
+        .stream
+        .try_fold(Vec::new(), |mut bytes, chunk| async move {
+            bytes.extend_from_slice(&chunk);
+            Ok(bytes)
+        })
+        .await
+        .map_err(|error| PageFailure::Retry(error.to_string()))?;
     let complete = end == observation.content_length;
     let used = match (complete, bytes.iter().rposition(|byte| *byte == b'\n')) {
         (true, _) => bytes.len(),
@@ -160,6 +163,33 @@ pub(super) async fn read_manifest_chunk(
         });
     }
     commit_rows(ctx, checkpoint, next, writes, Vec::new()).await
+}
+
+/// Errors that stay on a retry: the manifest is then skipped instead of retried.
+fn lasting_head(error: &HeadSourceError) -> bool {
+    match error {
+        HeadSourceError::Resolve(_) => true,
+        HeadSourceError::Staging(error) => lasting_source(error),
+        HeadSourceError::UnexpectedEvent { .. } | HeadSourceError::HeadSourceFailed => false,
+    }
+}
+
+fn lasting_read(error: &ReadSourceError) -> bool {
+    match error {
+        ReadSourceError::Resolve(_) => true,
+        ReadSourceError::Staging(error) => lasting_source(error),
+        ReadSourceError::UnexpectedEvent { .. } | ReadSourceError::ReadSourceFailed => false,
+    }
+}
+
+fn lasting_source(error: &StagingSourceError) -> bool {
+    matches!(
+        error,
+        StagingSourceError::NotFound
+            | StagingSourceError::AccessDenied
+            | StagingSourceError::UnsupportedKind(_)
+            | StagingSourceError::EgressDenied(_)
+    )
 }
 
 /// The manifest digests of a page's files, by one batched point read.
@@ -271,6 +301,31 @@ mod tests {
             current_path: None,
             errors: Vec::new(),
         }
+    }
+
+    // Transient failures keep the manifest for a retry; only lasting ones skip it.
+    #[test]
+    fn transient_errors_retry() {
+        let transient = || {
+            [
+                StagingSourceError::ReadError("reset".to_string()),
+                StagingSourceError::HandleMissing,
+                StagingSourceError::StatError("timeout".to_string()),
+            ]
+        };
+        assert!(transient().into_iter().all(|error| !lasting_source(&error)));
+        for error in transient() {
+            assert!(!lasting_read(&ReadSourceError::Staging(error)));
+        }
+        for error in transient() {
+            assert!(!lasting_head(&HeadSourceError::Staging(error)));
+        }
+        assert!(lasting_read(&ReadSourceError::Staging(
+            StagingSourceError::NotFound
+        )));
+        assert!(lasting_head(&HeadSourceError::Staging(
+            StagingSourceError::AccessDenied
+        )));
     }
 
     // A resumed manifest read is authorized again on its own path before anything is read.
