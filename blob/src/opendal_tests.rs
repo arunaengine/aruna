@@ -1077,3 +1077,34 @@ fn native_signs_alike() {
         config.get("region").map(String::as_str)
     );
 }
+
+// Local listings re-walk from the start as well, so they are capped like remote ones.
+#[tokio::test]
+async fn local_skip_capped() {
+    use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_ROOT;
+    let dir = tempdir().unwrap();
+    tokio::fs::write(dir.path().join("a.txt"), b"a")
+        .await
+        .unwrap();
+    let access = ResolvedSourceAccess::OpenDal {
+        kind: SourceConnectorKind::LocalDirectory,
+        config: HashMap::from([(
+            OFFERED_DIRECTORY_ROOT.to_string(),
+            dir.path().to_str().unwrap().to_string(),
+        )]),
+        path: String::new(),
+        version: None,
+    };
+    let mut request = list_request(10, true, true);
+
+    let (entries, _) = list_staging_source(&test_guard(), &access, &request)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    request.cursor = Some(ListCursor::Offset(FALLBACK_SKIP_LIMIT as u64 + 1));
+    let refused = list_staging_source(&test_guard(), &access, &request).await;
+    assert!(matches!(
+        refused,
+        Err(StagingSourceError::InvalidListing(_))
+    ));
+}

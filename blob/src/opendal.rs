@@ -282,7 +282,7 @@ pub(crate) async fn list_staging_source(
     request: &ListRequest,
 ) -> Result<(Vec<SourceEntry>, Option<ListCursor>), StagingSourceError> {
     if crate::fs_source::is_local_access(access) {
-        let offset = fallback_offset(request, usize::MAX)?;
+        let offset = fallback_offset(request, FALLBACK_SKIP_LIMIT)?;
         let (entries, truncated) = crate::fs_source::list_local(
             access,
             offset,
