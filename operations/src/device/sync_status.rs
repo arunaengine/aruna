@@ -43,6 +43,8 @@ const SYNC_STATE_KEY: [u8; 1] = [0];
 /// is in flight.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSyncState {
+    /// When the realm last answered. A failed contact attempt clears it, so the device shows
+    /// disconnected at once and connected again after the next answer.
     pub last_contact_ms: Option<u64>,
     pub last_sync_ms: Option<u64>,
     pub run_started_ms: Option<u64>,
@@ -288,6 +290,14 @@ pub async fn note_contact(context: &Arc<DriverContext>) {
     let mut state = read_sync_state(context).await;
     state.last_contact_ms = Some(unix_timestamp_millis());
     write_sync_state(context, &state).await;
+}
+
+/// Records that the realm did not answer this device's last contact attempt.
+pub async fn note_failure(context: &Arc<DriverContext>) {
+    let mut state = read_sync_state(context).await;
+    if state.last_contact_ms.take().is_some() {
+        write_sync_state(context, &state).await;
+    }
 }
 
 /// Records that a sync pass finished, which also ends the run it belonged to.
@@ -598,6 +608,28 @@ mod tests {
             matches!(woke, Ok(true)),
             "the folder beat kept its later deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn drops_failed_contact() {
+        // The first failed attempt shows the realm as unreachable; the next answer restores it.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        note_contact(&context).await;
+        let now = unix_timestamp_millis();
+        assert!(read_sync_state(&context).await.realm_reachable(now));
+        note_failure(&context).await;
+        assert!(!read_sync_state(&context).await.realm_reachable(now));
+        note_contact(&context).await;
+        assert!(read_sync_state(&context).await.realm_reachable(now));
     }
 
     #[tokio::test]

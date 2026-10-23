@@ -703,8 +703,9 @@ impl OperationsTaskHandler {
             REALM_DOCUMENTS_BUDGET,
         )
         .await;
-        if fetched {
-            crate::device::sync_status::note_contact(&self.context).await;
+        match fetched {
+            true => crate::device::sync_status::note_contact(&self.context).await,
+            false => crate::device::sync_status::note_failure(&self.context).await,
         }
         let mut state = self
             .realm_documents
