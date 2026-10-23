@@ -413,6 +413,7 @@ async fn import_page(
             realm_id: spec.auth_context.realm_id,
             group_id: spec.group_id,
             user_id: spec.auth_context.user_id,
+            auth_context: spec.auth_context.clone(),
             node_id: spec.node_id,
             bucket: spec.bucket.clone(),
             expected_bucket: bucket,

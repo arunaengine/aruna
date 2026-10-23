@@ -10,7 +10,7 @@ use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
-    STAGING_STATE_KEYSPACE,
+    REPLICATION_OBLIGATION_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     JobClaim, JobId, JobPayload, JobRecord, StagingJobCheckpoint, StagingJobPhase,
@@ -20,11 +20,12 @@ use aruna_core::structs::execution::source_connector::{
     SourceConnector, SourceConnectorKind, SourceConnectorSecret,
 };
 use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, CurrentVersionPointer};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
-use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use std::collections::HashMap;
@@ -120,6 +121,12 @@ fn input(entries: Vec<PageEntry>) -> PageImportInput {
         realm_id: RealmId::from_bytes([3; 32]),
         group_id: bucket().group_id,
         user_id: UserId::default(),
+        auth_context: AuthContext {
+            user_id: UserId::default(),
+            realm_id: RealmId::from_bytes([3; 32]),
+            path_restrictions: None,
+            session: None,
+        },
         node_id: node(),
         bucket: "imports".to_string(),
         expected_bucket: bucket(),
@@ -189,6 +196,13 @@ fn no_secret() -> Event {
     Event::Storage(StorageEvent::VaultResult {
         entry: SourceConnectorSecret::vault_entry(connector().connector_id),
         secret: None,
+    })
+}
+
+fn scheduled(key: TaskKey) -> Event {
+    Event::Task(TaskEvent::TimerScheduled {
+        key,
+        after: Duration::ZERO,
     })
 }
 
@@ -272,6 +286,7 @@ fn page_registers_atomically() {
     assert_eq!(rows_in(&writes, BLOB_HEAD_KEYSPACE), 2);
     assert_eq!(rows_in(&writes, CONNECTOR_REFERENCE_KEYSPACE), 2);
     assert_eq!(rows_in(&writes, STAGING_STATE_KEYSPACE), 1);
+    assert_eq!(rows_in(&writes, REPLICATION_OBLIGATION_KEYSPACE), 2);
     let effects = operation.step(written());
     let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
         panic!("expected one usage update, got {effects:?}");
@@ -294,10 +309,16 @@ fn page_registers_atomically() {
             .as_slice(),
         [Effect::Task(_)]
     ));
-    operation.step(Event::Task(TaskEvent::TimerScheduled {
-        key: TaskKey::PublishUsageSnapshots,
-        after: Duration::from_secs(1),
-    }));
+    assert!(matches!(
+        operation
+            .step(scheduled(TaskKey::PublishUsageSnapshots))
+            .as_slice(),
+        [Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::DrainReplicationQueue,
+            ..
+        })]
+    ));
+    operation.step(scheduled(TaskKey::DrainReplicationQueue));
 
     let result = operation.finalize().unwrap();
     assert_eq!(
@@ -369,10 +390,8 @@ fn newer_write_kept() {
     operation.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id: txn(),
     }));
-    operation.step(Event::Task(TaskEvent::TimerScheduled {
-        key: TaskKey::PublishUsageSnapshots,
-        after: Duration::from_secs(1),
-    }));
+    operation.step(scheduled(TaskKey::PublishUsageSnapshots));
+    operation.step(scheduled(TaskKey::DrainReplicationQueue));
     let result = operation.finalize().unwrap();
     assert_eq!((result.registered, result.kept), (1, 1));
     assert_eq!(result.checkpoint.items_failed, 1);

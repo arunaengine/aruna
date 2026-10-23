@@ -5,6 +5,7 @@
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
 use crate::jobs::store::decode_job_record;
 use crate::node::usage_stats::UsageUpdateError;
+use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::staging::descriptor::build_source_binding;
 use crate::storage_read::StorageReadError;
@@ -21,6 +22,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
@@ -57,6 +59,8 @@ pub struct PageImportInput {
     pub realm_id: RealmId,
     pub group_id: GroupId,
     pub user_id: UserId,
+    /// The submitter, under whom the page's live replication obligations run.
+    pub auth_context: AuthContext,
     pub node_id: NodeId,
     pub bucket: String,
     pub expected_bucket: BucketInfo,
@@ -95,6 +99,7 @@ pub enum PageImportState {
     UpdateUsage,
     Commit,
     Schedule,
+    ScheduleDrain,
     Abort,
     Finish,
     Error,
@@ -407,7 +412,7 @@ fn register_rows(
     let version_key = VersionKey::new(&input.bucket, &entry.target_key, version_id);
     let pointer = CurrentVersionPointer::next_for(head, version_id)?;
     let head_key = BlobHeadKey::new(&input.bucket, &entry.target_key);
-    let mut rows = Vec::with_capacity(3);
+    let mut rows = Vec::with_capacity(4);
     rows.extend(connector_reference_write(&version, &version_key)?);
     rows.push((
         BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -419,5 +424,16 @@ fn register_rows(
         head_key.to_bytes()?.into(),
         pointer.to_bytes()?.into(),
     ));
+    // The durable obligation commits with the version, so sync targets learn of it even when
+    // the drain is not reached.
+    let obligation = LiveObligationRecord::new(
+        input.node_id,
+        input.auth_context.clone(),
+        input.bucket.clone(),
+        entry.target_key.clone(),
+        version_id,
+        false,
+    );
+    rows.push(live_obligation_entry(&obligation)?);
     Ok(rows)
 }

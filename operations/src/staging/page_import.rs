@@ -5,6 +5,7 @@
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::node::usage_stats::{UsageCounterUpdate, schedule_snapshot_publish};
+use crate::replication::queue::schedule_blob_drain;
 use crate::staging::page_rows::{
     MAX_PAGE_ENTRIES, PageGuards, check_guards, guard_reads, page_rows, version_reads,
 };
@@ -200,16 +201,20 @@ impl PageImportOperation {
                 if self.usage.is_none() {
                     return Ok(self.finish());
                 }
-                // The dirty markers committed above are the durable publication work.
+                // The dirty markers and obligations committed above are the durable work.
                 self.state = PageImportState::Schedule;
                 Ok(smallvec![schedule_snapshot_publish()])
+            }
+            (PageImportState::Schedule, Event::Task(_)) => {
+                self.state = PageImportState::ScheduleDrain;
+                Ok(smallvec![schedule_blob_drain()])
             }
             (PageImportState::Commit, Event::Storage(StorageEvent::Error { error })) => {
                 // A failed commit leaves no transaction to abort.
                 self.txn_id = None;
                 Err(error.into())
             }
-            (PageImportState::Schedule, Event::Task(_)) => Ok(self.finish()),
+            (PageImportState::ScheduleDrain, Event::Task(_)) => Ok(self.finish()),
             (PageImportState::Abort, Event::Storage(_)) => {
                 self.state = PageImportState::Error;
                 Ok(smallvec![])
@@ -236,7 +241,7 @@ fn expected_event(state: PageImportState) -> &'static str {
         PageImportState::WriteRows | PageImportState::UpdateUsage => "BatchWriteResult",
         PageImportState::DeleteRows => "BatchDeleteResult",
         PageImportState::Commit => "TransactionCommitted",
-        PageImportState::Schedule => "Task",
+        PageImportState::Schedule | PageImportState::ScheduleDrain => "Task",
         PageImportState::Abort => "TransactionAborted",
         PageImportState::Init | PageImportState::Finish | PageImportState::Error => "no event",
     }
