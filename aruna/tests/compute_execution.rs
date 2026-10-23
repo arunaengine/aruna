@@ -560,7 +560,10 @@ const NEXTFLOW_WRAPPER: &str =
 const NEXTFLOW_SCRIPT: &str = "cp sample.fastq.gz trimmed.fastq.gz\nmkdir -p report_data/plots\n\
     echo log > report_data/report.log\necho plot > report_data/plots/a.txt\n\
     mkdir -p results/deep\necho table > results/deep/t.tsv\n\
-    echo bam > aln.bam\necho bai > aln.bai\n";
+    echo bam > aln.bam\necho bai > aln.bai\n\
+    printf 'SEQTK=1.4\\n/SEQTK/=exit:0\\n' > .command.env\n";
+// What an `eval` output leaves in `.command.env`; no `.command.trace` is written.
+const EVAL_ENV: &str = "SEQTK=1.4\n/SEQTK/=exit:0\n";
 const READS: &str = "@read\nACGT\n+\nIIII\n";
 
 /// The body nf-ga4gh 1.5.0 builds: control files in and out, and every glob under the
@@ -719,6 +722,15 @@ async fn check_nextflow_task(backend: DockerBackend) -> TestResult<()> {
     );
     assert_eq!(read("aln.bam").await.as_deref(), Some(&b"bam\n"[..]));
     assert_eq!(read("aln.bai").await.as_deref(), Some(&b"bai\n"[..]));
+    assert_eq!(
+        read(".command.env").await.as_deref(),
+        Some(EVAL_ENV.as_bytes())
+    );
+    assert_eq!(
+        read(".command.trace").await,
+        None,
+        "an absent optional file"
+    );
 
     seed.shutdown().await;
     Ok(())
