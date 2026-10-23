@@ -9,6 +9,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+# Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
+autotests = false
 
 [dependencies]
 aruna-core = { workspace = true }
@@ -35,3 +37,7 @@ ulid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/main.rs"
