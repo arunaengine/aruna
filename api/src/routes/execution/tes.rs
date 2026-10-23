@@ -1368,12 +1368,11 @@ fn map_task_outputs(
         {
             return Err(TesError::bad_request("duplicate output path"));
         }
-        // Globs share their url, the directory each match is written below.
-        if output.path_prefix.is_none()
-            && file_outputs
-                .iter()
-                .any(|existing| existing.destination == output.destination)
-        {
+        // Globs share their url, the directory each match is written below; a literal never does.
+        if file_outputs.iter().any(|existing| {
+            existing.destination == output.destination
+                && (existing.path_prefix.is_none() || output.path_prefix.is_none())
+        }) {
             return Err(TesError::bad_request("duplicate output destination"));
         }
         file_outputs.push(output);

@@ -698,8 +698,10 @@ fn shares_glob_url() {
     let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
     assert_eq!(spec.file_outputs.len(), 2);
 
-    // Literal outputs still need their own url.
+    // A literal output still needs its own url, whichever comes first.
     task.outputs[1].path = "/out/report.zip".to_string();
+    assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
+    task.outputs.reverse();
     assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
 }
 
