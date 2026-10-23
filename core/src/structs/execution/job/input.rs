@@ -208,6 +208,8 @@ pub struct StagingJobSpec {
     pub node_id: NodeId,
     pub connector_id: Ulid,
     pub bucket: String,
+    /// The destination bucket as submitted; a bucket recreated under the name ends the job.
+    pub bucket_identity: crate::structs::storage::blob::BucketIdentity,
     pub strategy: StagingStrategy,
     pub items: Vec<StagingJobItem>,
     pub prefixes: Vec<StagingJobPrefix>,

@@ -707,6 +707,7 @@ pub async fn submit_staging(
             node_id,
             connector_id,
             bucket: request.bucket,
+            bucket_identity: bucket_info.identity(),
             strategy: match request.strategy {
                 ApiStagingStrategy::Snapshot => StagingStrategy::Snapshot,
                 ApiStagingStrategy::Reference => StagingStrategy::Reference,

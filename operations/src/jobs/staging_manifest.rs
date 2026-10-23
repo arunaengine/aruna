@@ -267,6 +267,11 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
             connector_id: Ulid::from_bytes([5; 16]),
             bucket: "bucket".to_string(),
+            bucket_identity: (
+                Ulid::nil(),
+                std::time::SystemTime::UNIX_EPOCH,
+                Default::default(),
+            ),
             strategy: StagingStrategy::Reference,
             items: Vec::new(),
             prefixes: vec![StagingJobPrefix {

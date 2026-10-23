@@ -26,7 +26,7 @@ use tracing::warn;
 
 use super::executor::{JobContext, JobRunOutcome};
 use super::staging::{
-    ItemFailure, load_live_bucket, persist_rows, queue_key, stage_item, sync_progress,
+    ItemFailure, persist_rows, pinned_bucket, queue_key, stage_item, sync_progress,
 };
 use super::staging_manifest::{ManifestDigest, manifest_digests};
 use super::store::{batch_delete, iter_prefix_page, read_state};
@@ -201,6 +201,7 @@ pub(super) async fn walk_page(
             None
         }
         Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
+        Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
     };
     let next_cursor = page.as_ref().and_then(|page| page.next_cursor.clone());
     if next_cursor.is_some() && next_cursor == walk.cursor {
@@ -371,15 +372,14 @@ async fn import_page(
     rows: PageRows,
     page: ListStagingResult,
 ) -> Result<(), PageFailure> {
-    let bucket = match load_live_bucket(ctx, &spec.bucket).await {
-        Ok(bucket) if bucket.group_id == spec.group_id => bucket,
-        Ok(_) => {
-            return Err(PageFailure::Permanent(
-                "destination bucket group changed after job submission".to_string(),
-            ));
-        }
+    let bucket = match pinned_bucket(ctx, spec).await {
+        Ok(bucket) => bucket,
         Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
-        Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
+        Err(
+            ItemFailure::Denied(message)
+            | ItemFailure::Stage(message)
+            | ItemFailure::Lasting(message),
+        ) => {
             return Err(PageFailure::Permanent(message));
         }
     };
@@ -403,6 +403,7 @@ async fn import_page(
                 record_failure(&mut next, &file.source_path, &file.target_key, message)
             }
             Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
+            Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
         }
     }
     let result = drive(
@@ -468,6 +469,7 @@ async fn snapshot_page(
                 record_failure(&mut next, &file.source_path, &file.target_key, message)
             }
             Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
+            Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
         }
         ctx.progress.set_current(next.items_current);
     }

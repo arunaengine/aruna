@@ -99,6 +99,9 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
                     message,
                 ),
                 Err(ItemFailure::System(message)) => return retryable_error(message),
+                Err(ItemFailure::Lasting(message)) => {
+                    return finish_failed(ctx, permanent_error(message)).await;
+                }
             }
             checkpoint.items_done += 1;
             sync_progress(ctx, &checkpoint);
@@ -259,13 +262,22 @@ async fn ensure_item_permission(
     source_path: &str,
     target_key: &str,
 ) -> Result<BucketInfo, ItemFailure> {
+    let bucket_info = pinned_bucket(ctx, spec).await?;
+    check_access(ctx, spec, source_path, target_key).await?;
+    Ok(bucket_info)
+}
+
+/// The live destination bucket, only while it is still the one the job was submitted for.
+pub(super) async fn pinned_bucket(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+) -> Result<BucketInfo, ItemFailure> {
     let bucket_info = load_live_bucket(ctx, &spec.bucket).await?;
-    if bucket_info.group_id != spec.group_id {
-        return Err(ItemFailure::Stage(
-            "destination bucket group changed after job submission".to_string(),
+    if bucket_info.identity() != spec.bucket_identity {
+        return Err(ItemFailure::Lasting(
+            "destination bucket was replaced after job submission".to_string(),
         ));
     }
-    check_access(ctx, spec, source_path, target_key).await?;
     Ok(bucket_info)
 }
 
@@ -340,6 +352,8 @@ pub(super) enum ItemFailure {
     Denied(String),
     Stage(String),
     System(String),
+    /// Ends the whole job, such as a replaced destination bucket.
+    Lasting(String),
 }
 
 fn retryable_error(message: impl Into<String>) -> JobRunOutcome {
@@ -357,10 +371,9 @@ mod pure_tests {
     use crate::staging::page_rows::MAX_ERROR_SAMPLE;
     use ulid::Ulid;
 
-    #[test]
-    fn checkpoint_stays_small() {
+    fn test_spec() -> StagingJobSpec {
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
-        let spec = StagingJobSpec {
+        StagingJobSpec {
             auth_context: aruna_core::structs::identity::auth::AuthContext {
                 user_id: aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm_id),
                 realm_id,
@@ -371,6 +384,11 @@ mod pure_tests {
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
             connector_id: Ulid::from_bytes([5; 16]),
             bucket: "bucket".to_string(),
+            bucket_identity: (
+                Ulid::nil(),
+                std::time::SystemTime::UNIX_EPOCH,
+                Default::default(),
+            ),
             strategy: StagingStrategy::Reference,
             items: Vec::new(),
             prefixes: vec![aruna_core::structs::execution::job::StagingJobPrefix {
@@ -378,7 +396,12 @@ mod pure_tests {
                 target_prefix: String::new(),
             }],
             checksum_manifest: None,
-        };
+        }
+    }
+
+    #[test]
+    fn checkpoint_stays_small() {
+        let spec = test_spec();
         let mut checkpoint = initial_checkpoint(&spec);
         for _ in 0..1000 {
             record_failure(&mut checkpoint, "a", "b", "denied".to_string());
@@ -392,5 +415,45 @@ mod pure_tests {
             directory_list_path(&spec.prefixes[0].source_prefix),
             "refseq/"
         );
+    }
+
+    // A bucket recreated under the submitted name ends the job instead of receiving its files.
+    #[tokio::test]
+    async fn replaced_bucket_ends() {
+        use crate::jobs::executor::ProgressReporter;
+        use crate::tests::staging::{create_test_bucket, setup_driver_context};
+        use aruna_core::structs::execution::job::JobProgress;
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        let test = setup_driver_context().await;
+        let spec = test_spec();
+        let bucket = create_test_bucket(
+            &test.driver_context,
+            spec.group_id,
+            spec.auth_context.user_id,
+            &spec.bucket,
+        )
+        .await;
+        let ctx = JobContext {
+            driver: Arc::new(test.driver_context),
+            job_id: JobId::from_bytes([7; 16]),
+            owner_node_id: spec.node_id,
+            claim_token: Ulid::from_bytes([6; 16]),
+            final_attempt: false,
+            cancel: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
+            progress: ProgressReporter::from_progress(&JobProgress::new("items")),
+        };
+
+        let pinned = StagingJobSpec {
+            bucket_identity: bucket.identity(),
+            ..spec.clone()
+        };
+        assert!(pinned_bucket(&ctx, &pinned).await.is_ok());
+        assert!(matches!(
+            pinned_bucket(&ctx, &spec).await,
+            Err(ItemFailure::Lasting(_))
+        ));
     }
 }
