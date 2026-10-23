@@ -3336,6 +3336,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumes_without_gap() {
+        // The version a run left unfinished is deleted during the pause; the two versions of one
+        // key it finished after it now open the next run and still count once.
+        let temp = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let context = crate::tests::s3::test_context(storage.clone());
+        let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+        let row = |at: u64| VersionKey::new("b", "k1", Ulid::from_parts(at, 1));
+        let write = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        for at in [1, 2] {
+            let version = row(at).to_bytes().unwrap();
+            let effect = write(BLOB_VERSIONS_KEYSPACE, version, deleted.to_bytes().unwrap());
+            storage.send_storage_effect(effect).await;
+        }
+        let mut record = CompressionMigration::new(ZSTD, 1);
+        record.skipped = 2;
+        let ahead = MigrationAhead {
+            started_at_ms: 1,
+            rows: [1, 2].map(|at| row(at).to_bytes().unwrap()).to_vec(),
+            ..MigrationAhead::default()
+        };
+        let writes = [
+            (MIGRATION_AHEAD_KEYSPACE, ahead.to_bytes().unwrap()),
+            (COMPRESSION_MIGRATION_KEYSPACE, record.to_bytes().unwrap()),
+        ];
+        for (key_space, value) in writes {
+            storage
+                .send_storage_effect(write(key_space, b"b".to_vec(), value))
+                .await;
+        }
+        let after = migrate_page(&context, "b", record, Duration::MAX).await;
+        assert_eq!(after.unwrap(), None);
+        let key: Key = b"b".to_vec().into();
+        let stored = read_progress(&context, &key).await.unwrap().unwrap();
+        assert_eq!(stored.skipped, 2);
+        assert_eq!(read_ahead(&context, "b").await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn ends_aborted_rename() {
         // An aborted rename ends its move with its counts and keeps the request as the abort.
         let temp = tempfile::tempdir().unwrap();

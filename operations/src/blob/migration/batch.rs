@@ -67,9 +67,14 @@ impl Batch {
         key == other_key || (name.is_some() && name == other_name)
     }
 
-    /// Marks `row` as finished by an earlier run, so it neither runs nor counts again.
+    /// Marks `row` as finished by an earlier run, so it neither runs nor counts again. A waiting
+    /// row hands its turn to the next unfinished row of its key.
     pub(super) fn passed(&mut self, row: usize) {
         self.finished[row] = true;
+        if self.waiting.remove(&row) {
+            let next = (row + 1..self.key_end(row)).find(|later| !self.finished[*later]);
+            self.waiting.extend(next);
+        }
         self.pass_finished();
     }
 
@@ -243,6 +248,20 @@ mod tests {
         );
         rows.finish(2);
         assert_eq!(rows.done(), 4);
+    }
+
+    #[test]
+    fn passes_whole_keys() {
+        // Rows of a key an earlier run finished never run again, also once the rows before them
+        // are gone; the key's next unfinished row still runs.
+        let mut rows = batch(&["a", "a"]);
+        rows.passed(0);
+        rows.passed(1);
+        assert_eq!((rows.ready(), rows.done()), (None, 2));
+        let mut rows = batch(&["a", "a", "a"]);
+        rows.passed(0);
+        rows.passed(1);
+        assert_eq!(rows.ready(), Some(2));
     }
 
     #[tokio::test]
