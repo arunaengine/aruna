@@ -6,12 +6,14 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aruna_core::StructuredId;
+use aruna_core::UserId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::execution::job::{
     ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
     RunCrateStatus,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_core::structs::storage::data_identity::{
     DataEntity, ObjectLocation, normalized_id, parse_hash,
@@ -38,7 +40,8 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
-use crate::replication::bao_read::local_is_user;
+use crate::realm::get_config::GetConfigOperation;
+use crate::realm::mutate_placement::node_kind;
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
 /// records a durable status and never fails the parent; this internal job succeeds
@@ -87,12 +90,16 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         });
     };
     // A device run stays local: its crate is written when the owner publishes it.
-    if local_is_user(
+    let device = match node_owner(
         context,
         ctx.driver.serving_realm(parent.created_by.realm_id),
     )
     .await
     {
+        Ok(owner) => owner.is_some(),
+        Err(reason) => return JobRunOutcome::Deferred(JobError::retryable(reason)),
+    };
+    if device {
         if saved_id.is_none()
             && let Err(error) = put_crate_status(storage, for_job, &RunCrateStatus::Local).await
         {
@@ -105,6 +112,21 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         });
     }
     record_crate(&ctx.driver, for_job, &parent, spec, saved_id).await
+}
+
+/// The owner this node is bound to, `None` for realm infrastructure. A node the stored realm
+/// configuration does not name is undecided, so no crate leaves it before that is known.
+async fn node_owner(context: &DriverContext, realm_id: RealmId) -> Result<Option<UserId>, String> {
+    // Without a net handle nothing can be forwarded; the crate write fails retryably instead.
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return Ok(None);
+    };
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .map_err(|error| format!("run crate needs the realm configuration: {error}"))?;
+    node_kind(&config, net_handle.node_id())
+        .map(|kind| kind.owner())
+        .ok_or_else(|| "the realm configuration does not name this node yet".to_string())
 }
 
 /// Mints, authorizes and writes the crate of one finished execution, then records the outcome.

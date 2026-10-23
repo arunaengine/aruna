@@ -9,6 +9,8 @@ mod topology;
 
 use std::time::{Duration, SystemTime};
 
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::StorageEffect;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::RemoteBinding;
 use aruna_core::structs::execution::job::{
@@ -22,11 +24,16 @@ use aruna_core::types::GroupId;
 use aruna_operations::device::publish_run::{PublishRunInput, publish_run};
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::store::{insert_job, put_crate_status, read_crate_status};
+use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
+use aruna_operations::jobs::store::{
+    insert_job, put_crate_status, read_crate_status, read_job_record,
+};
+use aruna_operations::jobs::workflow::run_crate::write_run_crate;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
 use topology::{TestResult, Topology};
 use ulid::Ulid;
 
@@ -95,7 +102,26 @@ async fn write_output(realm: &Topology, group_id: GroupId) -> TestResult<Ulid> {
 }
 
 /// A succeeded local run whose crate waits for the owner, as the device records it.
-async fn finished_run(realm: &Topology, group_id: GroupId, version_id: Ulid) -> TestResult<JobId> {
+/// The output a local run captured at `version_id` in the device bucket.
+fn output(realm: &Topology, version_id: Ulid) -> OutputObject {
+    OutputObject {
+        node_id: realm.user_node().node_id(),
+        bucket: LOCAL_BUCKET.to_string(),
+        key: "contigs.fasta".to_string(),
+        version_id,
+        execution_id: Ulid::from(9u128),
+        container_path: "/out/contigs.fasta".to_string(),
+        size: OUTPUT.len() as u64,
+        digest: Some(blake3::hash(OUTPUT).to_hex().to_string()),
+    }
+}
+
+async fn finished_run(
+    realm: &Topology,
+    group_id: GroupId,
+    outputs: Vec<OutputObject>,
+    status: RunCrateStatus,
+) -> TestResult<JobId> {
     let device = realm.user_node();
     let job_id = JobId::from_bytes([0xC3; 16]);
     let spec = ExecutionSpec {
@@ -130,23 +156,14 @@ async fn finished_run(realm: &Topology, group_id: GroupId, version_id: Ulid) -> 
     record.result = Some(JobResultPayload::Execution {
         exit_code: Some(0),
         workspace_bucket: None,
-        outputs: vec![OutputObject {
-            node_id: device.node_id(),
-            bucket: LOCAL_BUCKET.to_string(),
-            key: "contigs.fasta".to_string(),
-            version_id,
-            execution_id: Ulid::from(9u128),
-            container_path: "/out/contigs.fasta".to_string(),
-            size: OUTPUT.len() as u64,
-            digest: Some(blake3::hash(OUTPUT).to_hex().to_string()),
-        }],
+        outputs,
         stdout: String::new(),
         stderr: String::new(),
         output_digest: None,
     });
     let storage = &device.context.storage_handle;
     insert_job(storage, &record).await?;
-    put_crate_status(storage, job_id, &RunCrateStatus::Local).await?;
+    put_crate_status(storage, job_id, &status).await?;
     Ok(job_id)
 }
 
@@ -186,7 +203,13 @@ async fn publishes_local_run() -> TestResult<()> {
     create_bucket(&server.context, REMOTE_BUCKET, group_id, &realm).await?;
     create_bucket(&device.context, LOCAL_BUCKET, group_id, &realm).await?;
     let version_id = write_output(&realm, group_id).await?;
-    let job_id = finished_run(&realm, group_id, version_id).await?;
+    let job_id = finished_run(
+        &realm,
+        group_id,
+        vec![output(&realm, version_id)],
+        RunCrateStatus::Local,
+    )
+    .await?;
     let input = || PublishRunInput {
         job_id,
         owner: realm.user_id,
@@ -220,6 +243,60 @@ async fn publishes_local_run() -> TestResult<()> {
     assert_eq!(
         read_crate_status(&device.context.storage_handle, job_id).await?,
         Some(published.run_crate)
+    );
+    Ok(())
+}
+
+/// The crate job itself keeps a device run local, and waits while the realm configuration
+/// cannot tell what this node is instead of forwarding anything.
+#[tokio::test]
+async fn crate_stays_local() -> TestResult<()> {
+    let realm = Topology::spawn(2, 1, 1).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let storage = &device.context.storage_handle;
+    let job_id = finished_run(&realm, group_id, Vec::new(), RunCrateStatus::Pending).await?;
+    let record = read_job_record(storage, job_id, None)
+        .await?
+        .ok_or("the run is stored")?;
+    let context = || JobContext {
+        driver: device.context.clone(),
+        job_id,
+        owner_node_id: device.node_id(),
+        claim_token: Ulid::from(1u128),
+        final_attempt: false,
+        cancel: CancellationToken::new(),
+        shutdown: CancellationToken::new(),
+        progress: ProgressReporter::from_progress(&record.progress),
+    };
+
+    assert!(matches!(
+        write_run_crate(&context(), job_id).await,
+        JobRunOutcome::Succeeded(JobResultPayload::RunCrate { ref resource }) if resource == "local"
+    ));
+    assert_eq!(
+        read_crate_status(storage, job_id).await?,
+        Some(RunCrateStatus::Local)
+    );
+
+    put_crate_status(storage, job_id, &RunCrateStatus::Pending).await?;
+    let target = DocumentTarget::RealmConfig {
+        realm_id: realm.realm_id,
+    };
+    storage
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        write_run_crate(&context(), job_id).await,
+        JobRunOutcome::Deferred(_)
+    ));
+    assert_eq!(
+        read_crate_status(storage, job_id).await?,
+        Some(RunCrateStatus::Pending)
     );
     Ok(())
 }
