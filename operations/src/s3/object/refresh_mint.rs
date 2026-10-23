@@ -7,12 +7,15 @@ use std::time::SystemTime;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::placement::policy::PlacementPolicyError;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
@@ -26,6 +29,7 @@ use crate::replication::protocol::ReferenceAdvance;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::object::get::MAX_AUTO_ADVANCES;
 use crate::s3::object::metadata::ReferenceRefresh;
+use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum MintError {
@@ -37,6 +41,8 @@ pub enum MintError {
     Policy(#[from] PlacementPolicyError),
     #[error(transparent)]
     Usage(#[from] UsageUpdateError),
+    #[error(transparent)]
+    Purge(#[from] PurgeFenceError),
     #[error("unexpected event in state {state:?}: {received}")]
     UnexpectedEvent { state: MintState, received: String },
 }
@@ -96,6 +102,10 @@ impl MintSuccessorOperation {
         let reads = vec![
             (BLOB_HEAD_KEYSPACE.to_string(), self.head_key()?.into()),
             (S3_BUCKET_KEYSPACE.to_string(), bucket),
+            (
+                PURGE_FENCE_KEYSPACE.to_string(),
+                fence_key(&self.refresh.bucket),
+            ),
         ];
         self.state = MintState::ReadRows;
         Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -120,6 +130,14 @@ impl MintSuccessorOperation {
             .flatten()
             .map(|value| BucketInfo::from_bytes(value.as_ref()))
             .transpose()?;
+        // A suspended key fails the refresh, so its queue retries it after the purge.
+        let fence = values
+            .next()
+            .flatten()
+            .map(|value| StoragePurgeFence::from_bytes(value.as_ref()))
+            .transpose()
+            .map_err(|_| PurgeFenceError::Invalid)?;
+        check_decoded_fence(fence.as_ref(), &self.refresh.bucket, &self.refresh.key)?;
         let (Some(pointer), Some(bucket)) = (pointer, bucket) else {
             return Ok(None);
         };
@@ -341,6 +359,44 @@ mod tests {
             compression: aruna_core::structs::storage::format::Compression::Off,
             distribution: None,
         }
+    }
+
+    // A key under a permanent purge gets no successor; the refresh fails and is retried.
+    #[test]
+    fn purge_fence_suspends() {
+        use aruna_core::structs::execution::job::JobId;
+        use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
+        let version_id = Ulid::from_bytes([2; 16]);
+        let mut operation = mint(version_id);
+        operation.start();
+        let fence = StoragePurgeFence {
+            job_id: JobId::from_bytes([6; 16]),
+            scope: StoragePurgeScope::Bucket {
+                bucket: "bucket".to_string(),
+            },
+        };
+        let head = CurrentVersionPointer::new(version_id);
+        let values = vec![
+            (
+                Key::from(b"head".to_vec()),
+                Some(head.to_bytes().unwrap().into()),
+            ),
+            (
+                Key::from(b"bucket".to_vec()),
+                Some(bucket().to_bytes().unwrap().into()),
+            ),
+            (
+                Key::from(b"fence".to_vec()),
+                Some(fence.to_bytes().unwrap().into()),
+            ),
+        ];
+
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+
+        assert_eq!(
+            operation.finalize(),
+            Err(MintError::Purge(PurgeFenceError::Suspended))
+        );
     }
 
     // A refreshed version that is no longer the head gets no successor.
