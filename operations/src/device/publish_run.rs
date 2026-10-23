@@ -18,7 +18,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::data_identity::parse_hash;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::{RemoteBinding, SyncRefusal};
+use aruna_core::structs::{RemoteBinding, SyncPull, SyncRefusal};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -305,12 +305,14 @@ async fn pull_output(
     .map_err(|error| PublishRunError::Unavailable(error.to_string()))?;
     let message = MetadataTransportMessage::ForwardSyncPull {
         auth_token: AuthToken::internal(auth.clone()),
-        source: Box::new(source),
-        blake3: output.digest.as_deref().and_then(parse_hash),
-        size: output.size,
-        target_bucket: target.bucket.clone(),
-        target_key: key.clone(),
-        deleted: false,
+        pull: Box::new(SyncPull {
+            source,
+            blake3: output.digest.as_deref().and_then(parse_hash),
+            size: output.size,
+            target_bucket: target.bucket.clone(),
+            target_key: key.clone(),
+            deleted: false,
+        }),
     };
     match metadata
         .request_forwarded_write(target.node_id, message)
