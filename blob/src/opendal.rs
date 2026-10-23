@@ -400,11 +400,19 @@ async fn list_operator(
     let mut highest = floor.clone();
     let budget = limit - entries.len();
     let mut consumed = 0usize;
+    let mut seen_file = false;
     // A provider page holds `budget` entries, so stopping there never fetches a lookahead page.
     while consumed < budget {
         let Some(entry) = lister.try_next().await.map_err(list_error)? else {
             return Ok((entries, None));
         };
+        // Pages list directories before files, so a directory after a file opens the next
+        // page; the cursor then stays at the end of the page that was read completely.
+        let directory = entry.metadata().is_dir();
+        if !request.recursive && directory && seen_file {
+            break;
+        }
+        seen_file |= !directory;
         consumed += 1;
         let entry_path = entry.path();
         if request

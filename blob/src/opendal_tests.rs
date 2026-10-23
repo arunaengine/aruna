@@ -950,6 +950,21 @@ async fn all_pages(operator: &Operator, path: &str, mut request: ListRequest) ->
     }
 }
 
+// A provider page answering short lists files below directories of the next page; the cursor
+// must not move past them.
+#[tokio::test]
+async fn browse_keeps_files() {
+    const KEYS: &[&str] = &["d/a.txt", "d/b/1", "d/c.txt", "d/f.txt", "d/x/1"];
+    let server = ListingServer::bind_with(KEYS, true).await;
+
+    let pages = all_pages(&server.operator(), "d/", list_request(4, false, false)).await;
+
+    let mut listed: Vec<String> = pages.concat();
+    listed.sort();
+    assert_eq!(listed, ["d/a.txt", "d/b", "d/c.txt", "d/f.txt", "d/x"]);
+    assert_eq!(pages[0], ["d/b", "d/a.txt", "d/c.txt"]);
+}
+
 // The probed lower key takes one entry of the page, so a page never exceeds its limit.
 #[tokio::test]
 async fn probe_counts_once() {
