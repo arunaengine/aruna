@@ -217,8 +217,7 @@ fn map_publish_error(error: PublishRunError) -> ServerError {
     path = "/device/compute/runs/{job_id}/publish",
     tag = "device",
     summary = "Publish a finished local run to the realm",
-    description = r#"Copies the outputs of one finished local run into a realm bucket and writes the
-run's crate there.
+    description = r#"Copies the outputs of one finished local run into a realm bucket and writes its crate there.
 
 **Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
 for.
