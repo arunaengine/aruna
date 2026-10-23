@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod encryption;
 pub mod format;
 pub mod glob;
+pub mod global_id;
 pub mod group_backend;
 pub mod holders;
 pub mod key_audit;

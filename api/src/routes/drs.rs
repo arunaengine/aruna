@@ -12,6 +12,7 @@ use crate::server::state::{RestInterfaceRuntime, ServerState};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendLocation, object_permission_path};
+use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
@@ -1107,6 +1108,12 @@ fn parse_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
         {
             W3idIdentifier::ContentHash(hash) => Ok(RequestedObjectId::CanonicalW3id(hash)),
             W3idIdentifier::VersionedObject(arn) => Ok(RequestedObjectId::VersionedObject(arn)),
+            W3idIdentifier::Global(GlobalId::Set { .. }) => Err(DrsError::bad_request(
+                "bucket and prefix ids name no object; use a version id or a content hash",
+            )),
+            W3idIdentifier::Global(GlobalId::Version { .. }) => Err(DrsError::bad_request(
+                "distributed bucket version ids are not resolvable on this node yet",
+            )),
         };
     }
 
