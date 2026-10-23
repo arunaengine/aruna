@@ -267,6 +267,12 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
     };
     StagingJobCheckpoint {
         phase: StagingJobPhase::Queued,
+        flat: None,
+        items_done: 0,
+        prefixes_done: 0,
+        walk: None,
+        queue_head: 0,
+        queue_tail: 0,
         items_total: pending_directories
             .is_empty()
             .then_some(pending_items.len() as u64),

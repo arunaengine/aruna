@@ -255,6 +255,17 @@ pub struct StagingJobDirectory {
     pub cursor: Option<crate::structs::execution::source_access::ListCursor>,
 }
 
+/// The listing a staging job is walking: a whole prefix when the source lists flat,
+/// otherwise one directory, with the provider cursor of the next page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingWalk {
+    pub source_path: String,
+    pub target_prefix: String,
+    pub cursor: Option<crate::structs::execution::source_access::ListCursor>,
+    /// The queue row this directory came from, deleted with the walk's last page.
+    pub queue_row: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagingPendingItem {
     pub source_path: String,
@@ -265,6 +276,16 @@ pub struct StagingPendingItem {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagingJobCheckpoint {
     pub phase: StagingJobPhase,
+    /// Whether the source lists a prefix flat; decided from the connector kind on first run.
+    pub flat: Option<bool>,
+    /// Explicit items of the spec already handled.
+    pub items_done: u64,
+    /// Spec prefixes already started.
+    pub prefixes_done: u64,
+    pub walk: Option<StagingWalk>,
+    /// Queue rows `[queue_head, queue_tail)` are directories still to list.
+    pub queue_head: u64,
+    pub queue_tail: u64,
     pub pending_items: Vec<StagingPendingItem>,
     pub pending_directories: Vec<StagingJobDirectory>,
     pub items_current: u64,

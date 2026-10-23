@@ -93,6 +93,12 @@ fn entry(path: &str) -> PageEntry {
 fn checkpoint() -> StagingJobCheckpoint {
     StagingJobCheckpoint {
         phase: StagingJobPhase::Registering,
+        flat: Some(true),
+        items_done: 0,
+        prefixes_done: 1,
+        walk: None,
+        queue_head: 0,
+        queue_tail: 0,
         pending_items: Vec::new(),
         pending_directories: Vec::new(),
         items_current: 0,

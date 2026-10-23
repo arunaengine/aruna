@@ -29,6 +29,12 @@ pub enum SourceConnectorKind {
 }
 
 impl SourceConnectorKind {
+    /// Whether the source lists a whole prefix flat and resumes after a key, so an import walks
+    /// it with one provider cursor instead of a directory queue.
+    pub const fn lists_flat(self) -> bool {
+        matches!(self, Self::S3)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Http => "http",

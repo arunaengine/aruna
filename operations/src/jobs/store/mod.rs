@@ -574,6 +574,18 @@ async fn put_job_checkpoint(
     key: Key,
     value: Value,
 ) -> Result<(), JobMutationError> {
+    let writes = vec![(key_space.to_string(), key, value)];
+    put_job_rows(storage, job_id, token, writes, Vec::new()).await
+}
+
+/// Writes and deletes a running job's own rows in one transaction, guarded by its claim token.
+pub(crate) async fn put_job_rows(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    writes: Vec<(KeySpace, Key, Value)>,
+    deletes: Vec<(KeySpace, Key)>,
+) -> Result<(), JobMutationError> {
     for attempt in 0..MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
@@ -584,13 +596,12 @@ async fn put_job_checkpoint(
                 .map_err(JobMutationError::Storage)?
                 .ok_or(JobMutationError::NotFound)?;
             guard_token(&record, token)?;
-            batch_write(
-                storage,
-                vec![(key_space.to_string(), key.clone(), value.clone())],
-                Some(txn_id),
-            )
-            .await
-            .map_err(JobMutationError::Storage)
+            batch_write(storage, writes.clone(), Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)?;
+            batch_delete(storage, deletes.clone(), Some(txn_id))
+                .await
+                .map_err(JobMutationError::Storage)
         }
         .await;
         match result {
