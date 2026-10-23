@@ -359,6 +359,8 @@ route, and sending `prefixes` additionally requires READ on the group's data pat
 **Limits**
 - Named and expanded objects together may not exceed 1000, and a prefix that would expand past that
   limit fails the entire request rather than truncating.
+- A prefix is listed in at most 8 pages; a prefix that needs more fails the request with 400 and
+  belongs in a staging job.
 - `node_id`, when given, must be this node: staging always runs where the request lands.
 - `checksum_manifest` is refused with 400; manifests are read by staging jobs only."#,
     request_body(
@@ -469,7 +471,12 @@ pub async fn stage_batch(
         };
         let remaining = BATCH_LIMIT - items.len();
         match list_prefix(&state, group_id, connector_id, &source_prefix, remaining).await {
-            Ok(entries) => {
+            Ok(None) => {
+                return Err(ServerError::BadRequestReason(format!(
+                    "prefix {source_prefix} lists more than a batch examines; submit it as a staging job"
+                )));
+            }
+            Ok(Some(entries)) => {
                 if entries.len() > remaining {
                     return Err(ServerError::BadRequestReason(format!(
                         "batch expands beyond {BATCH_LIMIT} items"
@@ -510,17 +517,21 @@ pub async fn stage_batch(
     Ok((StatusCode::OK, Json(StageBatchResponse { results })))
 }
 
+/// Listing pages one batch prefix may examine; a larger prefix belongs in a staging job.
+const BATCH_LIST_PAGES: usize = 8;
+
 /// Lists the files below a prefix page by page, stopping once more than `remaining` are found.
+/// `None` when the prefix needs more than [`BATCH_LIST_PAGES`] pages.
 async fn list_prefix(
     state: &ServerState,
     group_id: aruna_core::types::GroupId,
     connector_id: ulid::Ulid,
     source_prefix: &str,
     remaining: usize,
-) -> Result<Vec<SourceEntry>, ListStagingError> {
+) -> Result<Option<Vec<SourceEntry>>, ListStagingError> {
     let mut entries = Vec::new();
     let mut cursor = None;
-    loop {
+    for _ in 0..BATCH_LIST_PAGES {
         let page = drive(
             ListStagingOperation::new(ListStagingInput {
                 group_id,
@@ -541,9 +552,10 @@ async fn list_prefix(
         entries.extend(page.entries);
         match page.next_cursor {
             Some(next) if entries.len() <= remaining => cursor = Some(next),
-            _ => return Ok(entries),
+            _ => return Ok(Some(entries)),
         }
     }
+    Ok(None)
 }
 
 #[utoipa::path(
