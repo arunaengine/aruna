@@ -34,7 +34,7 @@ const COPY_SOURCE: &AsciiSet = &NON_ALPHANUMERIC
 // AWS rejects CreateBucket requests that name us-east-1 explicitly.
 const IMPLICIT_REGION: &str = "us-east-1";
 /// User metadata naming the version whose write an empty reservation holds a path for.
-const RESERVATION: &str = "aruna-reservation";
+pub(crate) const RESERVATION: &str = "aruna-reservation";
 
 pub async fn create_s3_client(
     endpoint: &str,

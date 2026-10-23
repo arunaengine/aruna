@@ -331,7 +331,7 @@ pub enum BlobEffect {
     },
     Abe(Box<crate::structs::storage::abe::AbeEffect>),
     /// Lists at most `limit` objects under `prefix` of `backend`, in key order after
-    /// `start_after`. Answers `ExternalListed`.
+    /// `start_after`, leaving out the empty reservations of writes. Answers `ExternalListed`.
     ListExternal {
         backend: BackendRef,
         prefix: String,
@@ -379,7 +379,8 @@ pub enum BlobEffect {
         path: String,
     },
     /// Answers `ExternalStat` with the size, ETag and backend version the provider reports for
-    /// the file at `path` on `resolved`, reading none of its bytes.
+    /// the file at `path` on `resolved`, reading none of its bytes; a write's empty reservation
+    /// counts as no file.
     StatExternal {
         resolved: ResolvedBackend,
         path: String,

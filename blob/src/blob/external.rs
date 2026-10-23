@@ -5,6 +5,7 @@
 use super::BlobHandler;
 use super::io::backend_version;
 use crate::hash::Hasher;
+use crate::s3::RESERVATION;
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
@@ -19,6 +20,12 @@ use ulid::Ulid;
 
 fn list_error(error: impl ToString) -> BlobError {
     BlobError::ListError(error.to_string())
+}
+
+/// Whether the object is the empty reservation a write holds its path with, not a file.
+fn reservation(metadata: &opendal::Metadata) -> bool {
+    let marked = metadata.user_metadata();
+    metadata.content_length() == 0 && marked.is_some_and(|marked| marked.get(RESERVATION).is_some())
 }
 
 impl BlobHandler {
@@ -77,6 +84,17 @@ impl BlobHandler {
             let metadata = entry.metadata();
             if !metadata.is_file() || start_after.is_some_and(|after| entry.path() <= after) {
                 continue;
+            }
+            // A listing tells no user metadata, so an empty file is looked at for the marker.
+            if metadata.content_length() == 0 {
+                let stat = timeout(self.io_timeout(), operator.stat(entry.path())).await;
+                let stat = stat.map_err(|_| list_error("timed out reading an empty file"))?;
+                match stat {
+                    Ok(found) if reservation(&found) => continue,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == opendal::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(list_error(error)),
+                }
             }
             let modified_ms = metadata
                 .last_modified()
@@ -155,7 +173,8 @@ impl BlobHandler {
             .unwrap_or_else(BlobEvent::Error)
     }
 
-    /// The size, ETag and version the provider reports for the file, without reading it.
+    /// The size, ETag and version the provider reports for the file, without reading it. A
+    /// write's empty reservation counts as no file.
     async fn external_stat(
         &self,
         resolved: ResolvedBackend,
@@ -172,7 +191,14 @@ impl BlobHandler {
         }
         let stat = timeout(self.io_timeout(), operator.stat(&storage_path)).await;
         let metadata = match stat {
-            Ok(Ok(metadata)) => metadata,
+            Ok(Ok(metadata)) if !reservation(&metadata) => metadata,
+            Ok(Ok(_)) => {
+                return Ok(BlobEvent::ExternalStat {
+                    location: None,
+                    version: None,
+                    etag: None,
+                });
+            }
             Ok(Err(error)) if error.kind() == opendal::ErrorKind::NotFound => {
                 return Ok(BlobEvent::ExternalStat {
                     location: None,

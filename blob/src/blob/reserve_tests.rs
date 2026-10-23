@@ -119,6 +119,7 @@ async fn serve(
     let copied = copied.flatten();
     let head = method == Method::HEAD;
     match (method, param("uploadId")) {
+        (Method::GET, _) if param("list-type").is_some() => listed(&fake, &key, param("prefix")),
         (Method::HEAD | Method::GET, _) => {
             let Some(found) = fake.objects.get(&key) else {
                 return refuse(StatusCode::NOT_FOUND, "NoSuchKey");
@@ -270,6 +271,32 @@ async fn serve(
         }
         _ => refuse(StatusCode::NOT_IMPLEMENTED, "NotImplemented"),
     }
+}
+
+/// One page with every object of `bucket` under `prefix`, as ListObjectsV2 answers.
+fn listed(fake: &Fake, bucket: &str, prefix: Option<String>) -> Response {
+    let scope = format!("{}/", bucket.trim_end_matches('/'));
+    let prefix = prefix.unwrap_or_default();
+    let mut contents = String::new();
+    for (key, found) in &fake.objects {
+        let Some(key) = key
+            .strip_prefix(&scope)
+            .filter(|key| key.starts_with(&prefix))
+        else {
+            continue;
+        };
+        let size = found.body.len();
+        let modified = "2026-10-23T00:00:00.000Z";
+        contents.push_str(&format!(
+            "<Contents><Key>{key}</Key><Size>{size}</Size><ETag>\"{}\"</ETag>\
+             <LastModified>{modified}</LastModified></Contents>",
+            found.etag
+        ));
+    }
+    let truncated = "<IsTruncated>false</IsTruncated>";
+    xml(format!(
+        "<ListBucketResult>{truncated}{contents}</ListBucketResult>"
+    ))
 }
 
 /// Serves the fake storage on an ephemeral port.
@@ -496,6 +523,31 @@ async fn late_write_survives() {
         BlobEvent::Error(BlobError::PathTaken)
     ));
     assert_eq!(body(&fake, "tenant/raw/b.bin").unwrap(), &b"foreign"[..]);
+}
+
+#[tokio::test]
+async fn hides_marked_reservations() {
+    // A write's empty reservation is no file to a listing or a stat, whatever intents say; a
+    // genuine empty file still is one.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let marked = stored(b"", &[("aruna-reservation", "01K8")]);
+    place(&fake, "tenant/raw/a.bin", stored(b"bytes", &[]));
+    place(&fake, "tenant/raw/b.bin", marked);
+    place(&fake, "tenant/raw/c.bin", stored(b"", &[]));
+    let backend = resolved.backend.clone();
+    let listed = handler.list_external(&backend, "raw/", None, 10).await;
+    let BlobEvent::ExternalListed { objects, .. } = listed else {
+        panic!("the listing failed: {listed:?}")
+    };
+    let keys: Vec<&str> = objects.iter().map(|object| object.key.as_str()).collect();
+    assert_eq!(keys, ["raw/a.bin", "raw/c.bin"]);
+    for (path, file) in [("raw/b.bin", false), ("raw/c.bin", true)] {
+        let found = handler.stat_external(resolved.clone(), path.to_string(), test_user_id());
+        let BlobEvent::ExternalStat { location, .. } = found.await else {
+            panic!("the stat failed")
+        };
+        assert_eq!(location.is_some(), file, "{path}");
+    }
 }
 
 /// Opens a provider upload at the tenant path `path` and writes one part.
