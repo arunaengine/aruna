@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aruna_core::effects::{IterStart, StorageEffect};
@@ -29,8 +29,8 @@ use crate::device::backlog::{
 };
 use crate::device::drain::DrainOutcome;
 use crate::driver::DriverContext;
-use crate::metadata::protocol::MetadataTransportMessage;
 
+use super::pull::forward_pull;
 use super::repository::{
     MAX_UPLOAD_ATTEMPTS, SYNC_PAGE_SIZE, SyncUpload, UploadState, abort_txn, base_entry, base_key,
     commit_txn, folder_key, read_value, start_txn, upload_entry, write_rows,
@@ -68,6 +68,37 @@ struct UploadDrain<'a> {
     node_id: aruna_core::NodeId,
 }
 
+impl UploadDrain<'_> {
+    /// The pull that asks the folder's realm node for this upload's exact local version.
+    fn pull_of(&self, folder: &SyncedFolder, upload: &SyncUpload) -> Result<SyncPull, String> {
+        let source = VersionedObjectArn::new(
+            self.realm_id,
+            self.node_id,
+            folder.local_bucket.clone(),
+            upload.relative.clone(),
+            upload.local_version.unwrap_or_default(),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(SyncPull {
+            source,
+            blake3: upload.blake3,
+            size: upload.size,
+            target_bucket: folder.remote.bucket.clone(),
+            target_key: folder.remote.remote_key(&upload.relative),
+            deleted: upload.deleted,
+        })
+    }
+
+    fn owner_token(&self, folder: &SyncedFolder) -> AuthToken {
+        AuthToken::internal(AuthContext {
+            user_id: folder.created_by,
+            realm_id: self.realm_id,
+            path_restrictions: None,
+            session: None,
+        })
+    }
+}
+
 impl QueueDrain for UploadDrain<'_> {
     type Entry = SyncUpload;
 
@@ -91,79 +122,51 @@ impl QueueDrain for UploadDrain<'_> {
             drop_upload(self.context, &upload).await;
             return ForwardOutcome::Settled;
         }
-        let attempts = upload.attempts().saturating_add(1);
-        if !claim_upload(self.context, &upload, attempts).await {
-            return ForwardOutcome::Settled;
-        }
-        // Only a claimed entry keeps the drain awake.
-        let source = match VersionedObjectArn::new(
-            self.realm_id,
-            self.node_id,
-            folder.local_bucket.clone(),
-            upload.relative.clone(),
-            upload.local_version.unwrap_or_default(),
-        ) {
-            Ok(source) => source,
-            Err(error) => {
-                park(self.context, &upload, error.to_string(), false).await;
+        let pull = match self.pull_of(&folder, &upload) {
+            Ok(pull) => pull,
+            Err(reason) => {
+                park(self.context, &upload, reason, false).await;
                 return ForwardOutcome::Recheck;
             }
         };
-        forward_upload(self.context, &folder, &upload, source, attempts).await;
+        let Some(claimed) = claim_upload(self.context, &upload).await else {
+            return ForwardOutcome::Settled;
+        };
+        // The row follows the bytes the realm node has, so the transfer list shows them.
+        let current = Mutex::new(claimed);
+        let progress = |bytes_done| record_progress(self.context, &current, bytes_done);
+        let node_id = folder.remote.node_id;
+        let auth_token = self.owner_token(&folder);
+        let result = forward_pull(self.context, node_id, auth_token, pull, progress).await;
+        let current = current
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner());
+        match result {
+            Ok(ack) => settle_upload(self.context, &current, &ack).await,
+            Err(refusal) if permanent(&refusal) => {
+                park(self.context, &current, format!("{refusal:?}"), false).await;
+            }
+            Err(refusal) => retry(self.context, &current, format!("{refusal:?}")).await,
+        }
         ForwardOutcome::Recheck
     }
 }
 
-async fn forward_upload(
-    context: &Arc<DriverContext>,
-    folder: &SyncedFolder,
-    upload: &SyncUpload,
-    source: VersionedObjectArn,
-    attempts: u32,
-) {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return;
+/// Stores the bytes a running pull has received, while the row is still the one claimed.
+async fn record_progress(context: &Arc<DriverContext>, current: &Mutex<SyncUpload>, bytes: u64) {
+    let row = current
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let next = UploadState::Transferring {
+        attempts: row.attempts(),
+        bytes_done: bytes,
     };
-    let auth = AuthContext {
-        user_id: folder.created_by,
-        realm_id: source.realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    let message = MetadataTransportMessage::ForwardSyncPull {
-        auth_token: AuthToken::internal(auth),
-        pull: Box::new(SyncPull {
-            source,
-            blake3: upload.blake3,
-            size: upload.size,
-            target_bucket: folder.remote.bucket.clone(),
-            target_key: folder.remote.remote_key(&upload.relative),
-            deleted: upload.deleted,
-        }),
-    };
-    match metadata
-        .request_forwarded_write(folder.remote.node_id, message)
-        .await
-    {
-        Ok(MetadataTransportMessage::ForwardedSyncPull { result: Ok(ack) }) => {
-            settle_upload(context, upload, &ack).await;
-        }
-        Ok(MetadataTransportMessage::ForwardedSyncPull {
-            result: Err(refusal),
-        }) => match permanent(&refusal) {
-            true => park(context, upload, format!("{refusal:?}"), false).await,
-            false => retry(context, upload, format!("{refusal:?}"), attempts).await,
-        },
-        Ok(other) => {
-            retry(
-                context,
-                upload,
-                crate::metadata::transport_message_kind(&other).to_string(),
-                attempts,
-            )
-            .await;
-        }
-        Err(error) => retry(context, upload, error.to_string(), attempts).await,
+    if store_state(context, &row, next.clone(), true).await {
+        current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .state = next;
     }
 }
 
@@ -288,18 +291,24 @@ fn settled_base(upload: &SyncUpload, ack: &SyncPullAck, current: Option<SyncBase
     }
 }
 
-/// Stores the next state only while the row still carries the state the scan
-/// read, so a concurrent unbind or a newer version wins instead of coming back.
-async fn claim_upload(context: &Arc<DriverContext>, upload: &SyncUpload, attempts: u32) -> bool {
-    let next = UploadState::Pending {
-        due_at_ms: retry_due_ms(attempts),
-        attempts,
-        last_error: None,
+/// Stores the running state only while the row still carries the state the scan read, so a
+/// concurrent unbind or a newer version wins instead of coming back.
+async fn claim_upload(context: &Arc<DriverContext>, upload: &SyncUpload) -> Option<SyncUpload> {
+    let claimed = SyncUpload {
+        state: UploadState::Transferring {
+            attempts: upload.attempts(),
+            bytes_done: 0,
+        },
+        ..upload.clone()
     };
-    store_state(context, upload, next, true).await
+    store_state(context, upload, claimed.state.clone(), true)
+        .await
+        .then_some(claimed)
 }
 
-async fn retry(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String, attempts: u32) {
+/// Spends one attempt and backs off, parking the row once the attempts are spent.
+async fn retry(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String) {
+    let attempts = upload.attempts().saturating_add(1);
     let next = match exhausted(attempts, MAX_UPLOAD_ATTEMPTS) {
         true => UploadState::Failed {
             reason,
@@ -311,7 +320,7 @@ async fn retry(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String
             last_error: Some(reason),
         },
     };
-    store_state(context, upload, next, false).await;
+    store_state(context, upload, next, true).await;
 }
 
 async fn park(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String, retryable: bool) {
@@ -319,9 +328,54 @@ async fn park(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String,
         context,
         upload,
         UploadState::Failed { reason, retryable },
-        false,
+        true,
     )
     .await;
+}
+
+/// Makes every backed-off upload due now and re-arms retryable failures, for an explicit
+/// owner-requested sync. A running pull keeps its polls.
+pub(crate) async fn requeue_uploads(context: &Arc<DriverContext>, now_ms: u64) {
+    let mut cursor: Option<Key> = None;
+    loop {
+        let Some((uploads, next)) = read_page(context, cursor).await else {
+            return;
+        };
+        for upload in uploads {
+            if let Some(state) = requeued(&upload.state, now_ms) {
+                store_state(context, &upload, state, true).await;
+            }
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return,
+        }
+    }
+}
+
+/// The state an explicit sync gives one upload: a backed-off one is due now with its
+/// attempts kept, a retryable failure starts over, and anything else stays.
+fn requeued(state: &UploadState, now_ms: u64) -> Option<UploadState> {
+    match state {
+        UploadState::Pending {
+            due_at_ms,
+            attempts,
+            last_error,
+        } if *due_at_ms > now_ms => Some(UploadState::Pending {
+            due_at_ms: now_ms,
+            attempts: *attempts,
+            last_error: last_error.clone(),
+        }),
+        UploadState::Failed {
+            reason,
+            retryable: true,
+        } => Some(UploadState::Pending {
+            due_at_ms: now_ms,
+            attempts: 0,
+            last_error: Some(reason.clone()),
+        }),
+        _ => None,
+    }
 }
 
 /// Writes one upload row under a new state. `guarded` refuses the write when
@@ -450,6 +504,7 @@ mod tests {
 
     use super::{
         ForwardOutcome, QueueDrain, SyncUpload, UploadDrain, UploadState, drain_sync_outbox,
+        requeued,
     };
     use crate::device::drain::DrainOutcome;
     use crate::device::sync::folders::store_folder;
@@ -564,8 +619,8 @@ mod tests {
 
     #[tokio::test]
     async fn claims_before_forward() {
-        // The claim is stored before the forward, so a crash mid-forward
-        // resumes from the claimed state rather than the old one.
+        // The claim is stored before the forward; a forward that reaches no
+        // realm node spends one attempt and backs off.
         let (_tempdir, context) = context().await;
         let context = Arc::new(context);
         let folder = folder(Ulid::generate());
@@ -636,5 +691,45 @@ mod tests {
             ForwardOutcome::Settled
         );
         assert_eq!(stored(&context, &newer).await.state, newer.state);
+    }
+
+    #[test]
+    fn requeues_on_request() {
+        // An explicit sync runs backed-off and retryable uploads now, nothing else.
+        let backed_off = UploadState::Pending {
+            due_at_ms: 50,
+            attempts: 3,
+            last_error: Some("unreachable".to_string()),
+        };
+        assert_eq!(
+            requeued(&backed_off, 10),
+            Some(UploadState::Pending {
+                due_at_ms: 10,
+                attempts: 3,
+                last_error: Some("unreachable".to_string()),
+            })
+        );
+        let retryable = UploadState::Failed {
+            reason: "unreachable".to_string(),
+            retryable: true,
+        };
+        assert!(matches!(
+            requeued(&retryable, 10),
+            Some(UploadState::Pending {
+                due_at_ms: 10,
+                attempts: 0,
+                ..
+            })
+        ));
+        let refused = UploadState::Failed {
+            reason: "Forbidden".to_string(),
+            retryable: false,
+        };
+        assert_eq!(requeued(&refused, 10), None);
+        let running = UploadState::Transferring {
+            attempts: 1,
+            bytes_done: 5,
+        };
+        assert_eq!(requeued(&running, 10), None);
     }
 }

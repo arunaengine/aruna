@@ -1246,8 +1246,12 @@ pub async fn test_put_object() {
         })
         .create_only()
     };
-    let replay = drive(create(preassigned_version_id), &context).await;
-    assert_eq!(replay.unwrap(), result);
+    let replay = drive(create(preassigned_version_id), &context)
+        .await
+        .unwrap();
+    assert_eq!(replay.location, result.location);
+    assert_eq!(replay.version_id, result.version_id);
+    assert!(replay.replayed);
     let other = drive(create(Ulid::generate()), &context).await;
     assert!(matches!(other, Err(PutObjectError::ObjectExists)));
 }

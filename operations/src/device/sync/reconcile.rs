@@ -411,8 +411,10 @@ impl ReconcileFolderOperation {
             .get(index)
             .and_then(Option::as_ref)
             .is_some_and(|queued| {
-                matches!(&queued.state, UploadState::Pending { .. })
-                    && queued.deleted == upload.deleted
+                matches!(
+                    &queued.state,
+                    UploadState::Pending { .. } | UploadState::Transferring { .. }
+                ) && queued.deleted == upload.deleted
                     && queued.local_version == upload.local_version
             })
         {
@@ -700,8 +702,10 @@ impl ReconcileFolderOperation {
             .get(index)
             .and_then(Option::as_ref)
             .is_some_and(|queued| {
-                matches!(&queued.state, UploadState::Pending { .. })
-                    && !queued.deleted
+                matches!(
+                    &queued.state,
+                    UploadState::Pending { .. } | UploadState::Transferring { .. }
+                ) && !queued.deleted
                     && queued.local_version == Some(version)
             })
     }

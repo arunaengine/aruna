@@ -275,6 +275,7 @@ struct MetadataInner {
     profile_validation_disabled: bool,
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
     peer_contacts: PeerContacts,
+    sync_pulls: crate::metadata::device_pull::PullRegistry,
 }
 
 #[derive(Clone)]
@@ -545,9 +546,15 @@ impl MetadataHandle {
                 profile_validation_disabled: metadata_options.profile_validation_disabled,
                 profile_shacl,
                 peer_contacts: PeerContacts::default(),
+                sync_pulls: Default::default(),
             }),
             storage_priority: StoragePriority::Foreground,
         })
+    }
+
+    /// The device pulls this node is running.
+    pub(crate) fn sync_pulls(&self) -> &crate::metadata::device_pull::PullRegistry {
+        &self.inner.sync_pulls
     }
 
     /// A handle whose own storage reads dispatch on the bulk lane.

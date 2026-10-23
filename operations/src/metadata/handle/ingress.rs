@@ -880,6 +880,12 @@ impl MetadataHandle {
                 })
                 .await
             }
+            poll @ MetadataTransportMessage::ForwardSyncPullStatus { .. } => {
+                Box::pin(async {
+                    super::super::device_pull::serve_pull_status(context, peer, poll).await
+                })
+                .await
+            }
             listing @ MetadataTransportMessage::ForwardListVersions { .. } => {
                 Box::pin(async {
                     super::super::device_pull::serve_list_versions(context, peer, listing).await
@@ -1040,6 +1046,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardJobSubmission { .. }
             | MetadataTransportMessage::ForwardCreatePolicy { .. }
             | MetadataTransportMessage::ForwardSyncPull { .. }
+            | MetadataTransportMessage::ForwardSyncPullStatus { .. }
             | MetadataTransportMessage::ForwardListVersions { .. }
             | MetadataTransportMessage::ForwardCreateBucket { .. }
             | MetadataTransportMessage::ForwardCheckBucket { .. }

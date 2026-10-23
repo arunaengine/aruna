@@ -4,19 +4,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNC_RECEIPT_KEYSPACE;
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::{
     RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull, SyncPullAck,
-    SyncRefusal, SyncVersionPage,
+    SyncPullStatus, SyncRefusal, SyncVersionPage,
 };
 use aruna_core::types::{GroupId, Key, Value};
+use futures_util::StreamExt;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -35,6 +38,71 @@ use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 
+/// Pulls this node is running, by receipt key. The registry lives as long as the process, so a
+/// restart forgets a running pull and the device asks for it again.
+#[derive(Debug, Default)]
+pub(crate) struct PullRegistry(Mutex<HashMap<Key, PullTask>>);
+
+#[derive(Debug)]
+enum PullTask {
+    Running {
+        bytes_done: Arc<AtomicU64>,
+        total: u64,
+    },
+    /// Kept until the device asks once, so it learns why the pull ended.
+    Refused(SyncRefusal),
+}
+
+impl PullRegistry {
+    fn pulls(&self) -> std::sync::MutexGuard<'_, HashMap<Key, PullTask>> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Claims `key` for a new run, or answers with the run that already holds it.
+    fn claim(&self, key: Key, total: u64) -> Result<Arc<AtomicU64>, SyncPullStatus> {
+        let mut pulls = self.pulls();
+        if let Some(PullTask::Running { bytes_done, total }) = pulls.get(&key) {
+            let bytes_done = bytes_done.load(Ordering::Relaxed);
+            return Err(SyncPullStatus::Pending {
+                bytes_done,
+                total: *total,
+            });
+        }
+        let bytes_done = Arc::new(AtomicU64::new(0));
+        let running = PullTask::Running {
+            bytes_done: bytes_done.clone(),
+            total,
+        };
+        pulls.insert(key, running);
+        Ok(bytes_done)
+    }
+
+    /// Ends a run. A commit is answered by its receipt from now on, a refusal by its entry.
+    fn finish(&self, key: Key, result: &Result<SyncPullAck, SyncRefusal>) {
+        let mut pulls = self.pulls();
+        match result {
+            Ok(_) => pulls.remove(&key),
+            Err(refusal) => pulls.insert(key, PullTask::Refused(refusal.clone())),
+        };
+    }
+
+    /// The run `key` names. A refusal is handed out once.
+    fn status(&self, key: &Key) -> Option<SyncPullStatus> {
+        let mut pulls = self.pulls();
+        if let PullTask::Running { bytes_done, total } = pulls.get(key)? {
+            let bytes_done = bytes_done.load(Ordering::Relaxed);
+            return Some(SyncPullStatus::Pending {
+                bytes_done,
+                total: *total,
+            });
+        }
+        match pulls.remove(key) {
+            Some(PullTask::Refused(refusal)) => Some(SyncPullStatus::Refused(refusal)),
+            _ => None,
+        }
+    }
+}
+
 /// Serves one forwarded sync pull.
 pub async fn serve_sync_pull(
     context: &Arc<DriverContext>,
@@ -44,45 +112,141 @@ pub async fn serve_sync_pull(
     let MetadataTransportMessage::ForwardSyncPull { auth_token, pull } = message else {
         return MetadataTransportMessage::Reject("unexpected metadata control message".to_string());
     };
-    let bucket = pull.target_bucket.clone();
-    let result = apply_pull(context, peer, auth_token, *pull).await;
-    if let Err(refusal) = &result {
-        warn!(peer = %peer, bucket = %bucket, refusal = refusal_kind(refusal), "Refused a synced-folder pull");
-    }
-    MetadataTransportMessage::ForwardedSyncPull { result }
+    let status = accept_pull(context, peer, auth_token, *pull).await;
+    MetadataTransportMessage::ForwardedSyncPull { status }
 }
 
-/// Pulls one device version of `peer` and commits it as the owner's write, or answers with
-/// the version an earlier pull of the same device version already committed.
-pub async fn apply_pull(
+/// Serves one poll of an accepted sync pull.
+pub async fn serve_pull_status(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let MetadataTransportMessage::ForwardSyncPullStatus { auth_token, pull } = message else {
+        return MetadataTransportMessage::Reject("unexpected metadata control message".to_string());
+    };
+    let status = pull_status(context, peer, auth_token, &pull).await;
+    MetadataTransportMessage::ForwardedSyncPull { status }
+}
+
+/// Starts pulling one device version of `peer` and answers at once: a replay with its
+/// receipt, a refusal with its reason, otherwise the running pull, which the device polls.
+pub async fn accept_pull(
     context: &Arc<DriverContext>,
     peer: NodeId,
     auth_token: aruna_core::metadata::AuthToken,
     request: SyncPull,
-) -> Result<SyncPullAck, SyncRefusal> {
-    let auth = authorize_peer(context, peer, auth_token).await?;
-    // The device may only ask for a version it serves itself: a peer must not
-    // make this node read another node's object under its own authority.
-    if request.source.node_id != peer {
-        return Err(SyncRefusal::Invalid(
-            "a sync pull must name the requesting device".to_string(),
-        ));
-    }
-    let node_id = local_node(context)?;
-    let bucket = read_bucket(context, &request.target_bucket).await?;
-    ensure_write(context, &auth, node_id, &bucket, &request).await?;
-
+) -> SyncPullStatus {
+    let admitted = match admit_pull(context, peer, auth_token, &request).await {
+        Ok(admitted) => admitted,
+        Err(refusal) => return refused(peer, &request, refusal),
+    };
     // A replay of either kind answers with the version it already produced.
     if let Some(ack) = replayed(context, &request).await {
+        return SyncPullStatus::Done(ack);
+    }
+    let (Some(metadata), Ok(key)) = (context.metadata_handle.as_ref(), receipt_of(&request)) else {
+        return refused(peer, &request, SyncRefusal::Unavailable);
+    };
+    let bytes_done = match metadata.sync_pulls().claim(key.clone(), request.size) {
+        Ok(bytes_done) => bytes_done,
+        Err(running) => return running,
+    };
+    let total = request.size;
+    let context = context.clone();
+    tokio::spawn(async move {
+        let (auth, node_id, bucket) = admitted;
+        let result = run_pull(&context, &auth, node_id, &bucket, &request, &bytes_done).await;
+        if let Err(refusal) = &result {
+            let bucket = &request.target_bucket;
+            warn!(peer = %peer, bucket = %bucket, refusal = refusal_kind(refusal), "A synced-folder pull failed");
+        }
+        if let Some(metadata) = context.metadata_handle.as_ref() {
+            metadata.sync_pulls().finish(key, &result);
+        }
+    });
+    SyncPullStatus::Pending {
+        bytes_done: 0,
+        total,
+    }
+}
+
+/// Where the pull of one device version of `peer` stands on this node.
+pub async fn pull_status(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: aruna_core::metadata::AuthToken,
+    request: &SyncPull,
+) -> SyncPullStatus {
+    let checked = authorize_peer(context, peer, auth_token)
+        .await
+        .and_then(|_| own_source(peer, request))
+        .and_then(|()| receipt_of(request));
+    let key = match checked {
+        Ok(key) => key,
+        Err(refusal) => return SyncPullStatus::Refused(refusal),
+    };
+    let pulls = context.metadata_handle.as_ref().map(|m| m.sync_pulls());
+    if let Some(status) = pulls.and_then(|pulls| pulls.status(&key)) {
+        return status;
+    }
+    match replayed(context, request).await {
+        Some(ack) => SyncPullStatus::Done(ack),
+        None => SyncPullStatus::Unknown,
+    }
+}
+
+fn refused(peer: NodeId, request: &SyncPull, refusal: SyncRefusal) -> SyncPullStatus {
+    let bucket = &request.target_bucket;
+    warn!(peer = %peer, bucket = %bucket, refusal = refusal_kind(&refusal), "Refused a synced-folder pull");
+    SyncPullStatus::Refused(refusal)
+}
+
+/// The device may only ask for a version it serves itself: a peer must not
+/// make this node read another node's object under its own authority.
+fn own_source(peer: NodeId, request: &SyncPull) -> Result<(), SyncRefusal> {
+    match request.source.node_id == peer {
+        true => Ok(()),
+        false => Err(SyncRefusal::Invalid(
+            "a sync pull must name the requesting device".to_string(),
+        )),
+    }
+}
+
+/// The owner, this node and the target bucket of a pull the owner may write.
+async fn admit_pull(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: aruna_core::metadata::AuthToken,
+    request: &SyncPull,
+) -> Result<(AuthContext, NodeId, BucketInfo), SyncRefusal> {
+    let auth = authorize_peer(context, peer, auth_token).await?;
+    own_source(peer, request)?;
+    let node_id = local_node(context)?;
+    let bucket = read_bucket(context, &request.target_bucket).await?;
+    ensure_write(context, &auth, node_id, &bucket, request).await?;
+    Ok((auth, node_id, bucket))
+}
+
+/// Commits one admitted pull, counting the bytes that arrive into `bytes_done`.
+async fn run_pull(
+    context: &Arc<DriverContext>,
+    auth: &AuthContext,
+    node_id: NodeId,
+    bucket: &BucketInfo,
+    request: &SyncPull,
+    bytes_done: &Arc<AtomicU64>,
+) -> Result<SyncPullAck, SyncRefusal> {
+    if let Some(ack) = replayed(context, request).await {
         return Ok(ack);
     }
     let result = match request.deleted {
-        true => delete_target(context, &auth, node_id, &bucket, &request).await,
-        false => commit_pull(context, &auth, node_id, &bucket, &request).await,
+        true => delete_target(context, auth, node_id, bucket, request).await,
+        false => commit_pull(context, auth, node_id, bucket, request, bytes_done).await,
     };
     // An overlapping pull of the same version committed first; its receipt is the answer.
     match result {
-        Err(refusal) => replayed(context, &request).await.ok_or(refusal),
+        Err(refusal) => replayed(context, request).await.ok_or(refusal),
         ok => ok,
     }
 }
@@ -275,6 +439,7 @@ async fn commit_pull(
     node_id: NodeId,
     bucket: &BucketInfo,
     request: &SyncPull,
+    bytes_done: &Arc<AtomicU64>,
 ) -> Result<SyncPullAck, SyncRefusal> {
     let (guards, receipts) = pull_fence(request)?;
     let read = BaoReadRequest {
@@ -287,7 +452,7 @@ async fn commit_pull(
         known_refs: Vec::new(),
     };
     let blob = match managed_read(context, request.source.node_id, read).await {
-        Ok(BaoReadOutput::Stream { blob, .. }) => blob,
+        Ok(BaoReadOutput::Stream { blob, .. }) => counted(blob, bytes_done.clone()),
         // A metadata-only answer to a full read is a broken exchange, not an
         // absent object: parking the upload on it would lose the file.
         Ok(BaoReadOutput::Metadata { .. }) => return Err(SyncRefusal::Unavailable),
@@ -348,6 +513,18 @@ async fn commit_pull(
         already_applied: false,
     })
 }
+
+/// The device's bytes as the write consumes them, adding each chunk to `bytes_done`.
+fn counted(blob: PullBody, bytes_done: Arc<AtomicU64>) -> PullBody {
+    let chunks = blob.0.inspect(move |chunk| {
+        if let Ok(chunk) = chunk {
+            bytes_done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        }
+    });
+    BackendStream(Box::pin(chunks))
+}
+
+type PullBody = BackendStream<Result<bytes::Bytes, StreamError>>;
 
 /// Why a device read failed. Bytes that do not answer for the hash the upload
 /// named are the request's own fault: retrying re-reads the same mismatch, so

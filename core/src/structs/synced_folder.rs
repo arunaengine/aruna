@@ -610,6 +610,21 @@ pub enum SyncRefusal {
     Unavailable,
 }
 
+/// Where a realm node stands with one sync pull. A pull is accepted at once and polled until
+/// it is done, so its length is bounded by progress, not by one exchange.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SyncPullStatus {
+    /// Running; `bytes_done` of the device's `total` bytes have arrived.
+    Pending {
+        bytes_done: u64,
+        total: u64,
+    },
+    Done(SyncPullAck),
+    Refused(SyncRefusal),
+    /// The node runs no such pull and holds no receipt for it, as after a restart.
+    Unknown,
+}
+
 /// Opaque continuation of a bounded head listing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncListCursor {
