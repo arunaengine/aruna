@@ -663,6 +663,26 @@ fn accepts_input_match() {
 }
 
 #[test]
+fn shares_glob_url() {
+    // Nextflow sends every glob with the task work directory as its url.
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    let glob = |path: &str| TesOutput {
+        url: Some("s3://dest/work/ab".to_string()),
+        path: path.to_string(),
+        path_prefix: Some("/out".to_string()),
+        ..Default::default()
+    };
+    task.outputs = vec![glob("/out/*.html"), glob("/out/*.zip")];
+
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
+    assert_eq!(spec.file_outputs.len(), 2);
+
+    // Literal outputs still need their own url.
+    task.outputs[1].path = "/out/report.zip".to_string();
+    assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
+}
+
+#[test]
 fn rejects_missing_prefix() {
     let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
     task.outputs[0].path = "/out/*.txt".to_string();

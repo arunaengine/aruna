@@ -575,7 +575,9 @@ naming a different one; a bearer token requires that tag.
   may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound
   the immutable output record carries.
 - An output path with POSIX wildcards additionally requires `path_prefix`, the literal ancestor
-  stripped from each match before it is appended to the destination url.
+  stripped from each match before it is appended to the destination url. Such outputs may share
+  one url. A pattern that matches a directory captures every file below it, and a staged input it
+  matches is never captured.
 - Unsupported: directory entries, inline input content, wildcards in an input path, volumes,
   executor stdin/stdout/stderr redirection and resource zones."#,
     request_body(
@@ -1363,9 +1365,11 @@ fn map_task_outputs(
         {
             return Err(TesError::bad_request("duplicate output path"));
         }
-        if file_outputs
-            .iter()
-            .any(|existing| existing.destination == output.destination)
+        // Globs share their url, the directory each match is written below.
+        if output.path_prefix.is_none()
+            && file_outputs
+                .iter()
+                .any(|existing| existing.destination == output.destination)
         {
             return Err(TesError::bad_request("duplicate output destination"));
         }
