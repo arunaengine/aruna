@@ -638,8 +638,8 @@ impl MigrateVersionOperation {
             }) => {
                 let old = self.old.as_ref();
                 let recorded = self.source_etag.as_deref();
-                // An empty file may be another write's reservation, so it proves nothing; a
-                // copy may also keep the old file's recorded multipart ETag.
+                // A copy may keep the old file's recorded multipart ETag. A write's empty
+                // reservation is never found here: a stat shows it as no file.
                 let proved = |found: &BackendLocation| {
                     let size = found.blob_size;
                     let kept = |old: &BackendLocation| {
@@ -650,7 +650,7 @@ impl MigrateVersionOperation {
                             })
                     };
                     let same = |old| same_bytes(old, size, etag.as_deref()) || kept(old);
-                    size > 0 && old.is_some_and(same)
+                    old.is_some_and(same)
                 };
                 (location.filter(proved), version)
             }
@@ -2332,13 +2332,10 @@ async fn abandon(
         path: path.clone(),
         created_by: intent.created_by,
     };
-    // Nothing there releases nothing; without a backend version nothing names the bytes. An
-    // empty file goes only as this write's own reservation.
+    // Nothing there releases nothing but this write's own reservation, which a stat does not
+    // show as a file; without a backend version nothing names the bytes.
     let (mut location, version, etag) = match blob_handle.send_blob_effect(stat).await {
-        Event::Blob(BlobEvent::ExternalStat {
-            location: Some(found),
-            ..
-        }) if found.blob_size == 0 => {
+        Event::Blob(BlobEvent::ExternalStat { location: None, .. }) => {
             let drop = BlobEffect::DropReservation {
                 backend: intent.backend.clone(),
                 path,
@@ -4410,8 +4407,8 @@ mod tests {
                 hex::encode([7; 16]),
                 format!("{:x}-1", md5::compute([7; 16])),
             );
-            // A provider copy may keep the old file's recorded ETag; an empty file may be
-            // another write's reservation, so it proves nothing, even for an empty old file.
+            // A provider copy may keep the old file's recorded ETag, and an empty old file's
+            // copy is proved like any other; a reservation never shows here as a file.
             let empty = hex::encode(md5::compute(b"").0);
             for (size, etag, adopted) in [
                 ((None, size), single.as_str(), true),
@@ -4419,7 +4416,7 @@ mod tests {
                 ((None, size), "e1", true),
                 ((None, size), "0123", false),
                 ((None, size + 1), copied.as_str(), false),
-                ((Some(0), 0), empty.as_str(), false),
+                ((Some(0), 0), empty.as_str(), true),
             ] {
                 let (mut operation, _, old, effects) = taken_name(size, etag);
                 if adopted {
