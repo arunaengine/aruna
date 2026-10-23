@@ -12,6 +12,7 @@ use std::time::Duration;
 use aruna_core::StructuredId;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::device::replica::read_replica;
+use aruna_operations::device::selection::select_document;
 use aruna_operations::metadata::api::{
     ExportMetadataRequest, GetVisibleRequest, RoCrateExportView,
 };
@@ -104,5 +105,33 @@ async fn keeps_owner_exports() -> TestResult<()> {
         .await
         .ok_or("the owner's export left no copy on the device")?;
     assert!(!replica.selected);
+    Ok(())
+}
+
+/// Selecting a document for offline use installs a usable copy of a scaffold document too.
+#[tokio::test]
+async fn keeps_selected_document() -> TestResult<()> {
+    let realm = Topology::spawn(2, 1, 1).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    let path = "datasets/selected";
+    let origin = realm.leading_node(group_id, path);
+    let document_id =
+        mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
+    realm
+        .create_document(origin, group_id, document_id, path, "notes")
+        .await?;
+    let select = || async {
+        select_document(&device.context, document_id)
+            .await
+            .is_ok_and(|replica| replica.selected && replica.serves_reads())
+    };
+    wait_until(
+        "the owner's selection installs a copy",
+        device.node_id(),
+        select,
+    )
+    .await?;
     Ok(())
 }

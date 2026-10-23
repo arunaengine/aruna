@@ -360,14 +360,31 @@ pub(super) async fn read_graph_state(
     };
     let raw = load_raw_view(context.as_ref(), document_id, None)
         .await
-        .map_err(|_| SyncRefusal::Unavailable)?
-        .ok_or(SyncRefusal::NotFound)?;
+        .map_err(|_| SyncRefusal::Unavailable)?;
+    // A document created as a scaffold has no authored text yet; its graph is what it shows.
+    let (displayed_jsonld, dataset_digest, findings) = match raw {
+        Some(raw) => (
+            raw.revision.jsonld,
+            raw.revision.dataset_digest,
+            raw.revision.merged.map_or(0, |merged| merged.findings),
+        ),
+        None => {
+            let jsonld = metadata
+                .export_rocrate_jsonld(record.graph_iri.clone())
+                .await
+                .map_err(|_| SyncRefusal::Unavailable)?;
+            let digest = craqle::canonicalize_jsonld(&jsonld)
+                .ok()
+                .map(|canonical| canonical.digest);
+            (jsonld, digest, 0)
+        }
+    };
     Ok(GraphState {
         record,
         snapshot,
-        displayed_jsonld: raw.revision.jsonld,
-        dataset_digest: raw.revision.dataset_digest,
-        findings: raw.revision.merged.map_or(0, |merged| merged.findings),
+        displayed_jsonld,
+        dataset_digest,
+        findings,
     })
 }
 
