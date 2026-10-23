@@ -4234,8 +4234,8 @@ async fn s3_copies_plain() {
     assert_eq!(read_back(&handler, copy).await, b"renamed bytes");
 }
 
-/// An S3 storage that records each request line. A part copy answers with `copied` as its
-/// ETag, or without one as a storage too busy for now.
+/// An S3 storage that records each request line. It takes a reservation and shows it back,
+/// and a copy answers with `copied` as its ETag, or without one as a storage too busy for now.
 async fn copying_storage(copied: Option<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4243,6 +4243,7 @@ async fn copying_storage(copied: Option<String>) -> (String, Arc<std::sync::Mute
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = seen.clone();
     tokio::spawn(async move {
+        let mut reserved = None::<String>;
         while let Ok((mut stream, _)) = listener.accept().await {
             let (mut request, mut buffer) = (Vec::new(), [0u8; 8192]);
             // The head, then as many body bytes as it announces.
@@ -4272,12 +4273,38 @@ async fn copying_storage(copied: Option<String>) -> (String, Arc<std::sync::Mute
             }
             let line = text.lines().next().unwrap_or_default().to_string();
             log.lock().unwrap().push(line.clone());
+            let lower = text.to_lowercase();
+            let copy = lower.contains("x-amz-copy-source:");
+            let marker = text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                let named = name.eq_ignore_ascii_case("x-amz-meta-aruna-reservation");
+                named.then(|| value.trim().to_string())
+            });
             let started = "<InitiateMultipartUploadResult><UploadId>u1</UploadId>\
                            </InitiateMultipartUploadResult>";
+            let mut extra = String::new();
             let (status, body) = match (line.split_once(' '), &copied) {
                 (Some(("POST", target)), _) if target.contains("uploads") => {
                     ("200 OK", started.to_string())
                 }
+                (Some(("PUT", _)), _) if !copy => {
+                    reserved = marker;
+                    ("200 OK", String::new())
+                }
+                (Some(("HEAD", _)), _) => match reserved.as_ref() {
+                    Some(version) => {
+                        let tag = hex::encode(md5::compute(b"").0);
+                        extra = format!(
+                            "ETag: \"{tag}\"\r\nx-amz-meta-aruna-reservation: {version}\r\n"
+                        );
+                        ("200 OK", String::new())
+                    }
+                    None => ("404 Not Found", String::new()),
+                },
+                (Some(("PUT", target)), Some(etag)) if !target.contains("uploadId") => (
+                    "200 OK",
+                    format!("<CopyObjectResult><ETag>\"{etag}\"</ETag></CopyObjectResult>"),
+                ),
                 (Some(("PUT", _)), Some(etag)) => (
                     "200 OK",
                     format!("<CopyPartResult><ETag>\"{etag}\"</ETag></CopyPartResult>"),
@@ -4292,11 +4319,14 @@ async fn copying_storage(copied: Option<String>) -> (String, Arc<std::sync::Mute
                      </CompleteMultipartUploadResult>"
                         .to_string(),
                 ),
-                (Some(("DELETE", _)), _) => ("204 No Content", String::new()),
+                (Some(("DELETE", _)), _) => {
+                    reserved = None;
+                    ("204 No Content", String::new())
+                }
                 _ => ("500 Internal Server Error", String::new()),
             };
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n\
+                "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n{extra}\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
@@ -4381,7 +4411,7 @@ fn copy_source(
 
 #[tokio::test]
 async fn retries_transient_copies() {
-    // A part copy the storage refuses for now is retried later; no byte passes the node.
+    // A copy the storage refuses for now is retried later; no byte passes the node.
     let context = setup_two_backends().await;
     let (endpoint, seen) = copying_storage(None).await;
     let (handler, resolved, source, plain) = copy_source(&context, &endpoint);
@@ -4391,12 +4421,12 @@ async fn retries_transient_copies() {
         "{event:?}"
     );
     let seen = seen.lock().unwrap().clone();
-    // The upload goes, and nothing reads the source.
+    // The copy's own reservation goes, and nothing reads the source.
     assert!(
         seen.iter().any(|line| line.starts_with("DELETE")),
         "{seen:?}"
     );
-    let read = |line: &String| line.starts_with("GET") || line.starts_with("HEAD");
+    let read = |line: &String| line.starts_with("GET") || line.contains("7_a.bin");
     assert!(!seen.iter().any(read), "{seen:?}");
 }
 
@@ -4419,5 +4449,6 @@ async fn copies_without_reading() {
         .iter()
         .filter_map(|line| line.split(' ').next())
         .collect();
-    assert_eq!(methods, ["POST", "PUT", "POST"], "{seen:?}");
+    // The reservation, then the copy in one request.
+    assert_eq!(methods, ["PUT", "PUT"], "{seen:?}");
 }
