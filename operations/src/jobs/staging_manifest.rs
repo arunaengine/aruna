@@ -253,9 +253,9 @@ fn manifest_key(job_id: JobId, source_path: &str) -> Key {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::errors::StorageError;
     use crate::driver::DriverContext;
     use crate::jobs::executor::ProgressReporter;
+    use aruna_core::errors::StorageError;
     use aruna_core::structs::execution::job::{
         JobClaim, JobPayload, JobProgress, JobRecord, StagingJobPhase, StagingJobPrefix,
     };
