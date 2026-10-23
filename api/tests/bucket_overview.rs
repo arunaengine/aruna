@@ -66,6 +66,28 @@ async fn write_value(state: &ServerState, key_space: &str, key: Vec<u8>, value: 
     ));
 }
 
+/// An open multipart upload of `data`.
+fn open_upload(group_id: Ulid, created_by: UserId) -> MultipartUpload {
+    MultipartUpload {
+        upload_id: Ulid::from_bytes([15u8; 16]),
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        bucket: "data".to_string(),
+        key: "reads/pending.fastq".to_string(),
+        group_id,
+        created_by,
+        created_at: UNIX_EPOCH,
+        status: MultipartUploadStatus::Open,
+        completing_since_ms: None,
+        checksum_hint: None,
+        metadata: HashMap::new(),
+        placement_policies: Vec::new(),
+        subject_generation: 0,
+        backend_upload: None,
+        encryption: None,
+    }
+}
+
 /// One bucket with two stored versions of a key, one delete marker and one open
 /// multipart upload, plus a viewer who only holds group data read.
 async fn setup() -> Fixture {
@@ -244,31 +266,13 @@ async fn setup() -> Fixture {
         )
         .await;
     }
-    let upload_id = Ulid::from_bytes([15u8; 16]);
+    let upload = open_upload(group_id, owner);
+    let upload_key = upload.upload_id.to_bytes().to_vec();
     write_value(
         &state,
         UPLOAD_KEYSPACE,
-        upload_id.to_bytes().to_vec(),
-        MultipartUpload {
-            upload_id,
-            backend: BackendRef::node_default(),
-            storage_class: None,
-            bucket: "data".to_string(),
-            key: "reads/pending.fastq".to_string(),
-            group_id,
-            created_by: owner,
-            created_at: UNIX_EPOCH,
-            status: MultipartUploadStatus::Open,
-            completing_since_ms: None,
-            checksum_hint: None,
-            metadata: HashMap::new(),
-            placement_policies: Vec::new(),
-            subject_generation: 0,
-            backend_upload: None,
-            encryption: None,
-        }
-        .to_bytes()
-        .unwrap(),
+        upload_key,
+        upload.to_bytes().unwrap(),
     )
     .await;
     // The rows above were seeded without counters, so the counters are rebuilt from them.
@@ -308,6 +312,27 @@ async fn usage_counts_inventory() {
     assert_eq!(usage.logical_bytes, 84);
     assert_eq!(usage.referenced_bytes, 0);
     assert!(usage.complete);
+
+    // An upload record written past the counter stays unseen: the route reads no upload rows.
+    let upload_id = Ulid::from_bytes([16u8; 16]);
+    let mut record = open_upload(Ulid::from_bytes([10u8; 16]), fixture.reader.user_id);
+    record.upload_id = upload_id;
+    let value = record.to_bytes().unwrap();
+    write_value(
+        &fixture.state,
+        UPLOAD_KEYSPACE,
+        upload_id.to_bytes().to_vec(),
+        value,
+    )
+    .await;
+    let Json(usage) = get_bucket_usage(
+        State(fixture.state.clone()),
+        Extension(Some(fixture.reader.clone())),
+        Path("data".to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(usage.open_multipart_uploads, 1);
 }
 
 #[tokio::test]

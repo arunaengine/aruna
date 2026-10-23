@@ -7,8 +7,6 @@ use std::sync::Arc;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
-use aruna_operations::driver::drive;
-use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -47,13 +45,13 @@ pub struct BucketUsageResponse {
 }
 
 impl BucketUsageResponse {
-    fn new(bucket: String, counters: BucketCounters, uploads: u64) -> Self {
+    fn new(bucket: String, counters: BucketCounters) -> Self {
         Self {
             bucket,
             objects: counters.objects,
             versions: counters.versions,
             delete_markers: counters.delete_markers,
-            open_multipart_uploads: uploads,
+            open_multipart_uploads: counters.open_uploads,
             logical_bytes: counters.logical_bytes,
             referenced_bytes: counters.referenced_bytes,
             complete: true,
@@ -72,14 +70,14 @@ impl BucketUsageResponse {
 objects.
 
 **Behavior**
-- Every number except `open_multipart_uploads` comes from this node's counter of the bucket,
-  kept up to date in the same transaction as each write and delete, so the answer costs one read
-  however large the bucket is.
+- Every number comes from this node's counter of the bucket, kept up to date in the same
+  transaction as each write, delete, upload start, completion and abort, so the answer costs one
+  read however large the bucket is.
 - `objects` counts current heads that are not delete markers, `versions` every stored version
   including noncurrent ones, and `logical_bytes` the bytes of those versions, as the group quota
   does. `referenced_bytes` sums the sizes of versions that only point to external data.
-- `open_multipart_uploads` is counted by a full pass over this node's open uploads, read in short
-  batches.
+- `open_multipart_uploads` counts uploads not yet completed or aborted, including one a
+  completion or abort is finishing.
 - `complete` is always true."#,
     params(
         ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")
@@ -126,22 +124,7 @@ pub async fn get_bucket_usage(
     )
     .await?;
     let counters = bucket_counters(&state, &bucket).await?;
-    let input = ListUploadsInput {
-        bucket: bucket.clone(),
-        prefix: None,
-        delimiter: None,
-        key_marker: None,
-        upload_id_marker: None,
-        max_uploads: usize::MAX,
-    };
-    let uploads = drive(
-        ListUploadsOperation::new(input).complete_scan(),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    let uploads = uploads.uploads.len() as u64;
-    Ok(Json(BucketUsageResponse::new(bucket, counters, uploads)))
+    Ok(Json(BucketUsageResponse::new(bucket, counters)))
 }
 
 /// The bucket's counter row; a bucket without one holds nothing yet.
