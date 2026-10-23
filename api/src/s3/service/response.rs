@@ -63,7 +63,7 @@ pub(super) fn reference_metadata_refresh(
         bucket,
         key,
         version_id: result.resolved_version_id.or(result.version_id)?,
-        metadata: result.source_metadata.clone()?,
+        metadata: Some(result.source_metadata.clone()?),
         refreshed_at: result.last_refresh?,
         node_id,
         auth_context,

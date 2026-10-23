@@ -11,6 +11,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::placement::policy::PlacementPolicyError;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
@@ -63,6 +64,7 @@ pub enum MintState {
 pub(crate) struct MintSuccessorOperation {
     txn_id: TxnId,
     refresh: ReferenceRefresh,
+    observation: SourceMetadata,
     predecessor: BlobVersion,
     state: MintState,
     usage: Option<UsageCounterUpdate>,
@@ -70,10 +72,16 @@ pub(crate) struct MintSuccessorOperation {
 }
 
 impl MintSuccessorOperation {
-    pub(crate) fn new(txn_id: TxnId, refresh: ReferenceRefresh, predecessor: BlobVersion) -> Self {
+    pub(crate) fn new(
+        txn_id: TxnId,
+        refresh: ReferenceRefresh,
+        observation: SourceMetadata,
+        predecessor: BlobVersion,
+    ) -> Self {
         Self {
             txn_id,
             refresh,
+            observation,
             predecessor,
             state: MintState::Init,
             usage: None,
@@ -157,7 +165,7 @@ impl MintSuccessorOperation {
         let version_id = Ulid::generate();
         let successor = BlobVersion::reference(
             source.clone(),
-            refresh.metadata.clone(),
+            self.observation.clone(),
             now,
             self.predecessor.created_by,
             now,
@@ -199,7 +207,7 @@ impl MintSuccessorOperation {
             .offered_size(&refresh.bucket, &refresh.key)
             .unwrap_or(0);
         let delta = UsageDelta {
-            referenced_bytes: i128::from(refresh.metadata.content_length) - i128::from(released),
+            referenced_bytes: i128::from(self.observation.content_length) - i128::from(released),
             ..Default::default()
         };
         self.usage = Some(UsageCounterUpdate::for_group(bucket.group_id, delta));
@@ -334,7 +342,7 @@ mod tests {
             bucket: "bucket".to_string(),
             key: "key".to_string(),
             version_id,
-            metadata: observation(2),
+            metadata: Some(observation(2)),
             refreshed_at: now,
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
             auth_context: AuthContext {
@@ -344,7 +352,12 @@ mod tests {
                 session: None,
             },
         };
-        MintSuccessorOperation::new(Ulid::from_bytes([1; 16]), refresh, predecessor)
+        MintSuccessorOperation::new(
+            Ulid::from_bytes([1; 16]),
+            refresh,
+            observation(2),
+            predecessor,
+        )
     }
 
     fn bucket() -> BucketInfo {

@@ -13,6 +13,7 @@ pub mod metadata;
 pub mod placement;
 pub mod put;
 mod refresh_mint;
+mod refresh_observe;
 pub mod search;
 mod verified;
 pub mod versions;

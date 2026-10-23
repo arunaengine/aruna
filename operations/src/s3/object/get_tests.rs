@@ -1837,8 +1837,8 @@ async fn pinned_unknown_verified() {
     assert!(items.last().is_some_and(Result::is_err));
 }
 
-// A bound read whose condition fails observes the source again and queues a refresh, which
-// records the change; the read itself fails as changed.
+// A bound read whose condition fails queues a request to observe the source, which the refresh
+// worker retries until it records the change; the read itself fails as changed.
 #[test]
 fn failed_condition_refreshes() {
     let mut operation = drifted_operation();
@@ -1847,13 +1847,6 @@ fn failed_condition_refreshes() {
 
     let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
         error: StagingSourceError::ConditionFailed,
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Head { .. })]
-    ));
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(10),
     }));
     assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
     operation.step(Event::SubOperation(SubOperationEvent::RefreshQueued {

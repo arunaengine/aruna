@@ -735,7 +735,7 @@ async fn refresh_failure_hidden() {
         bucket: "bucket".to_string(),
         key: "reference".to_string(),
         version_id: Ulid::generate(),
-        metadata: source_metadata(2, "etag"),
+        metadata: Some(source_metadata(2, "etag")),
         refreshed_at: UNIX_EPOCH.checked_sub(Duration::from_secs(1)).unwrap(),
         node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
         auth_context: aruna_core::structs::identity::auth::AuthContext {
@@ -991,7 +991,7 @@ fn refresh(
         bucket: test.bucket.clone(),
         key: test.key.clone(),
         version_id: test.version_id,
-        metadata,
+        metadata: Some(metadata),
         refreshed_at,
         node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
         auth_context: aruna_core::structs::identity::auth::AuthContext {

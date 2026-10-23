@@ -106,8 +106,7 @@ pub enum GetObjectState {
     RestartReference,
     GetBlob,
     ReadReferenceSource,
-    /// The bound read failed its condition: the source is observed again for a refresh.
-    ProbeChangedSource,
+    /// The bound read failed its condition: a refresh is queued to observe the source.
     QueueChangedRefresh,
     /// A sealed copy waits for a read lease of its bucket key.
     AdmitRead,
@@ -1588,7 +1587,7 @@ impl GetObjectOperation {
             }
             Event::StagingSource(StagingSourceEvent::Error {
                 error: StagingSourceError::ConditionFailed,
-            }) => self.probe_changed_source(),
+            }) => self.queue_changed_refresh(),
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
                 self.emit_error(error.into())
             }
@@ -1600,20 +1599,9 @@ impl GetObjectOperation {
         }
     }
 
-    /// Observes a source whose bound read failed, so a refresh records the change; the read
-    /// itself fails with "source changed".
-    fn probe_changed_source(&mut self) -> Effects {
-        let Some(access) = self.reference_access.clone() else {
-            return self.emit_error(GetObjectError::ReferenceSourceChanged);
-        };
-        self.state = GetObjectState::ProbeChangedSource;
-        smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
-    }
-
-    fn handle_changed_probe(&mut self, event: Event) -> Effects {
-        let Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) = event else {
-            return self.emit_error(GetObjectError::ReferenceSourceChanged);
-        };
+    /// Queues a request to observe a source whose bound read failed, so the refresh worker
+    /// records the change and retries the observation until it succeeds; the read fails.
+    fn queue_changed_refresh(&mut self) -> Effects {
         let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
             return self.emit_error(GetObjectError::ReferenceSourceChanged);
         };
@@ -1621,7 +1609,7 @@ impl GetObjectOperation {
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             version_id,
-            metadata,
+            metadata: None,
             refreshed_at: self.now_override.unwrap_or_else(SystemTime::now),
             node_id: self.input.node_id,
             auth_context: self.auth_context(),
@@ -1728,7 +1716,6 @@ impl Operation for GetObjectOperation {
             GetObjectState::RestartReference => self.handle_restart_reference(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
             GetObjectState::ReadReferenceSource => self.reference_source_received(event),
-            GetObjectState::ProbeChangedSource => self.handle_changed_probe(event),
             GetObjectState::QueueChangedRefresh => self.handle_refresh_queued(event),
             GetObjectState::AdmitRead => self.read_admitted(event),
             GetObjectState::ReadContentSettings => self.content_settings_read(event),

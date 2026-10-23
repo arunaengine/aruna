@@ -31,6 +31,7 @@ use crate::driver::drive;
 use crate::node::usage_stats::schedule_snapshot_publish;
 use crate::replication::queue::schedule_blob_drain;
 use crate::s3::object::refresh_mint::MintSuccessorOperation;
+use crate::s3::object::refresh_observe::ObserveSourceOperation;
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::id::NodeId;
@@ -46,7 +47,8 @@ pub struct ReferenceRefresh {
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
-    pub metadata: SourceMetadata,
+    /// `None` asks the worker to observe the source first.
+    pub metadata: Option<SourceMetadata>,
     pub refreshed_at: SystemTime,
     /// The node and caller a confirmed change is recorded and replicated for.
     pub node_id: NodeId,
@@ -348,9 +350,18 @@ pub async fn refresh_with_context(
             };
             // Only a confirmed observation counts as a refresh; fields under the version id never
             // change, so a confirmed change becomes a successor and an unknown one is dropped.
-            let comparison = cached_metadata.compare(&refresh.metadata);
+            let Some(observation) = refresh.metadata.clone() else {
+                abort_reference_refresh(context, txn_id).await;
+                return Err("the refresh carries no observation".to_string());
+            };
+            let comparison = cached_metadata.compare(&observation);
             if refresh.refreshed_at > last_refresh && comparison == ObservationMatch::Changed {
-                let mint = MintSuccessorOperation::new(txn_id, refresh.clone(), predecessor);
+                let mint = MintSuccessorOperation::new(
+                    txn_id,
+                    refresh.clone(),
+                    observation.clone(),
+                    predecessor,
+                );
                 match drive(mint, context).await {
                     Ok(written) => minted = written,
                     Err(error) => {
@@ -452,6 +463,23 @@ pub async fn refresh_with_context(
     }
 }
 
+/// Observes the source first when the refresh carries no observation; a failed observation
+/// fails the job, which the queue retries later.
+async fn observe_and_refresh(
+    context: &DriverContext,
+    mut refresh: ReferenceRefresh,
+) -> Result<(), String> {
+    if refresh.metadata.is_none() {
+        let version_key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id);
+        let observed = drive(ObserveSourceOperation::new(version_key), context)
+            .await
+            .map_err(|error| error.to_string())?;
+        refresh.metadata = Some(observed);
+        refresh.refreshed_at = SystemTime::now().max(refresh.refreshed_at);
+    }
+    refresh_with_context(context, refresh).await
+}
+
 async fn schedule_task(context: &DriverContext, effect: TaskEffect) {
     if persist_task_effect(&context.storage_handle, &effect)
         .await
@@ -540,7 +568,7 @@ pub async fn process_batch(
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     for (job_key, job) in scan.jobs {
-        match refresh_with_context(context, job.refresh.clone()).await {
+        match observe_and_refresh(context, job.refresh.clone()).await {
             Ok(()) => {
                 delete_job(&context.storage_handle, job_key).await?;
                 succeeded = succeeded.saturating_add(1);
@@ -918,7 +946,7 @@ mod tests {
             bucket: test.bucket.clone(),
             key: test.key.clone(),
             version_id: test.version_id,
-            metadata,
+            metadata: Some(metadata),
             refreshed_at,
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
             auth_context: aruna_core::structs::identity::auth::AuthContext {
@@ -1158,6 +1186,23 @@ mod tests {
         let head = CurrentVersionPointer::from_bytes(&head).unwrap();
         assert_ne!(head.version_id, test.version_id);
         assert_eq!(head.generation, 2);
+    }
+
+    // A request without an observation keeps its job until the worker can observe the source.
+    #[tokio::test]
+    async fn observation_request_retried() {
+        let test = setup_state();
+        let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let mut request = refresh(&test, source_metadata(1, "unused"), refreshed_at);
+        request.metadata = None;
+        crate::driver::drive(QueueRefreshOperation::new(request), &test.context)
+            .await
+            .expect("queue succeeds");
+
+        let result = process_batch(&test.context).await.expect("drain runs");
+
+        assert_eq!((result.succeeded, result.failed), (0, 1));
+        assert_eq!(read_jobs(&test.context.storage_handle).await.len(), 1);
     }
 
     #[tokio::test]
