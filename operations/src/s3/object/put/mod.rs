@@ -23,6 +23,7 @@ use crate::placement::policy::{
 use crate::replication::dht_registration::dht_registration_effect;
 use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::row_fence::{FenceError, RowFence};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -52,7 +53,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{Effects, GroupId};
+use aruna_core::types::{Effects, GroupId, Key, Value};
 use bytes::Bytes;
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -105,6 +106,8 @@ pub enum PutObjectState {
     EnforceQuota,
     QuotaRejectAbort,
     UpdateUsage,
+    /// Reads the row fence's guards or writes its receipts in the version transaction.
+    RowFence,
     CommitTransaction,
     ReleaseReservation,
     RegisterBlobDht,
@@ -211,6 +214,8 @@ pub enum PutObjectError {
     VersionExists,
     #[error("the version or the current object of its key was deleted and is not restored")]
     HistoryDeleted,
+    #[error("a guarded row changed before the version committed")]
+    FenceTaken,
 }
 
 #[derive(Debug, PartialEq)]
@@ -330,6 +335,7 @@ pub struct PutObjectOperation {
     dedup_checked: bool,
     /// Set when the preassigned version already existed and the put only handed it back.
     replayed: bool,
+    row_fence: Option<RowFence>,
 }
 
 impl PutObjectOperation {
@@ -388,6 +394,7 @@ impl PutObjectOperation {
             dedup: None,
             dedup_checked: false,
             replayed: false,
+            row_fence: None,
         }
     }
 
@@ -476,6 +483,17 @@ impl PutObjectOperation {
 
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Refuses the write with `FenceTaken` unless the version transaction still reads each
+    /// guard as given; each receipt key then records the version id in that transaction.
+    pub fn with_fence(
+        mut self,
+        guards: Vec<(String, Key, Option<Value>)>,
+        receipts: Vec<(String, Key)>,
+    ) -> Self {
+        self.row_fence = Some(RowFence::new(guards, receipts));
         self
     }
 
@@ -1633,6 +1651,15 @@ impl PutObjectOperation {
     }
 
     fn write_cleanup_row(&mut self, txn_id: Ulid) -> Effects {
+        let next = match (self.row_fence.as_mut(), self.version_id) {
+            (Some(fence), Some(version_id)) => fence.next(txn_id, version_id),
+            (Some(_), None) => return self.emit_error(PutObjectError::InvalidOperationState),
+            (None, _) => None,
+        };
+        if let Some(effect) = next {
+            self.state = PutObjectState::RowFence;
+            return smallvec![effect];
+        }
         if let Some(effects) = self.plain_records(txn_id) {
             return effects;
         }
@@ -1659,6 +1686,20 @@ impl PutObjectOperation {
             value: value.into(),
             txn_id: Some(txn_id),
         })]
+    }
+
+    fn fence_answered(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(PutObjectError::NoTransactionFound);
+        };
+        match self.row_fence.as_mut().map(|fence| fence.answer(event)) {
+            Some(Ok(())) => self.write_cleanup_row(txn_id),
+            Some(Err(FenceError::Taken)) => self.emit_error(PutObjectError::FenceTaken),
+            Some(Err(FenceError::Storage(error))) => self.emit_error(error.into()),
+            Some(Err(FenceError::Unexpected)) | None => {
+                self.emit_error(PutObjectError::InvalidOperationState)
+            }
+        }
     }
 
     fn handle_cleanup_row(&mut self, event: Event) -> Effects {
@@ -1732,6 +1773,9 @@ impl PutObjectOperation {
         }
         self.readers = sharing::ReaderScan::default();
         (self.dedup, self.dedup_checked) = (None, false);
+        if let Some(fence) = self.row_fence.as_mut() {
+            fence.restart();
+        }
         self.state = PutObjectState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -2033,6 +2077,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::EnforceQuota => self.handle_enforce_quota(event),
             PutObjectState::QuotaRejectAbort => self.abort_quota_reject(event),
             PutObjectState::UpdateUsage => self.handle_usage_update(event),
+            PutObjectState::RowFence => self.fence_answered(event),
             PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
             PutObjectState::ReleaseReservation => self.handle_release(event),
             PutObjectState::RegisterBlobDht => self.blob_registered(event),

@@ -12,6 +12,7 @@ pub mod object;
 pub mod policy;
 pub mod purge_fence;
 pub mod restart_notice;
+mod row_fence;
 pub mod session;
 pub mod unlock_limit;
 mod write_cleanup;
