@@ -27,9 +27,10 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::node::usage_stats::schedule_snapshot_publish;
 use crate::replication::queue::schedule_blob_drain;
-use crate::s3::object::refresh_mint::mint_successor;
+use crate::s3::object::refresh_mint::MintSuccessorOperation;
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::id::NodeId;
@@ -349,11 +350,12 @@ pub async fn refresh_with_context(
             // change, so a confirmed change becomes a successor and an unknown one is dropped.
             let comparison = cached_metadata.compare(&refresh.metadata);
             if refresh.refreshed_at > last_refresh && comparison == ObservationMatch::Changed {
-                match mint_successor(context, txn_id, &refresh, &predecessor).await {
+                let mint = MintSuccessorOperation::new(txn_id, refresh.clone(), predecessor);
+                match drive(mint, context).await {
                     Ok(written) => minted = written,
                     Err(error) => {
                         abort_reference_refresh(context, txn_id).await;
-                        return Err(error);
+                        return Err(error.to_string());
                     }
                 }
             }

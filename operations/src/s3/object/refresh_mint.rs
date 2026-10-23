@@ -5,165 +5,367 @@
 use std::time::SystemTime;
 
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::structs::placement::policy::PlacementPolicyError;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
+use smallvec::smallvec;
+use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::connector_reference_write;
-use crate::driver::DriverContext;
-use crate::node::usage_stats::UsageCounterUpdate;
+use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::replication::protocol::ReferenceAdvance;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::object::get::MAX_AUTO_ADVANCES;
 use crate::s3::object::metadata::ReferenceRefresh;
 
-/// Writes, in `txn_id`, the successor carrying the refresh's observation when the refreshed
-/// version is still the head. `false` when nothing was written.
-pub(crate) async fn mint_successor(
-    context: &DriverContext,
+#[derive(Debug, Error, PartialEq)]
+pub enum MintError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Policy(#[from] PlacementPolicyError),
+    #[error(transparent)]
+    Usage(#[from] UsageUpdateError),
+    #[error("unexpected event in state {state:?}: {received}")]
+    UnexpectedEvent { state: MintState, received: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MintState {
+    Init,
+    ReadRows,
+    WriteRows,
+    UpdateUsage,
+    Finish,
+    Error,
+}
+
+/// Writes, in the caller's transaction, the successor carrying the refresh's observation while
+/// the refreshed version is the head. Outputs whether a successor was written.
+#[derive(Debug, PartialEq)]
+pub(crate) struct MintSuccessorOperation {
     txn_id: TxnId,
-    refresh: &ReferenceRefresh,
-    predecessor: &BlobVersion,
-) -> Result<bool, String> {
-    let BlobVersionState::Reference {
-        source,
-        advance_count,
-        ..
-    } = &predecessor.state
-    else {
-        return Ok(false);
-    };
-    if *advance_count >= MAX_AUTO_ADVANCES {
-        return Ok(false);
-    }
-    let head_key = BlobHeadKey::new(&refresh.bucket, &refresh.key)
-        .to_bytes()
-        .map_err(|error| error.to_string())?;
-    let pointer = read_row(context, txn_id, BLOB_HEAD_KEYSPACE, head_key.clone().into())
-        .await?
-        .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let Some(pointer) = pointer.filter(|pointer| pointer.version_id == refresh.version_id) else {
-        return Ok(false);
-    };
-    let bucket_key = ByteView::from(refresh.bucket.as_bytes().to_vec());
-    let Some(bucket) = read_row(context, txn_id, S3_BUCKET_KEYSPACE, bucket_key)
-        .await?
-        .map(|value| BucketInfo::from_bytes(value.as_ref()))
-        .transpose()
-        .map_err(|error| error.to_string())?
-    else {
-        return Ok(false);
-    };
+    refresh: ReferenceRefresh,
+    predecessor: BlobVersion,
+    state: MintState,
+    usage: Option<UsageCounterUpdate>,
+    output: Option<Result<bool, MintError>>,
+}
 
-    let now = SystemTime::now();
-    let version_id = Ulid::generate();
-    let successor = BlobVersion::reference(
-        source.clone(),
-        refresh.metadata.clone(),
-        now,
-        predecessor.created_by,
-        now,
-    )
-    .with_metadata(predecessor.metadata.clone())
-    .with_advance_count(advance_count + 1)
-    .with_policies(predecessor.placement_policies.clone())
-    .map_err(|error| error.to_string())?;
-    let version_key = VersionKey::new(&refresh.bucket, &refresh.key, version_id);
-    let next = CurrentVersionPointer::next_for(Some(&pointer), version_id)
-        .map_err(|error| error.to_string())?;
-    let obligation = LiveObligationRecord::new(
-        refresh.node_id,
-        refresh.auth_context.clone(),
-        refresh.bucket.clone(),
-        refresh.key.clone(),
-        version_id,
-        false,
-    )
-    .with_reference_advance(ReferenceAdvance {
-        generation: next.generation,
-        predecessor: pointer.version_id,
-    });
-    let encode = |error: aruna_core::errors::ConversionError| error.to_string();
-    let mut writes = vec![
-        (
-            BLOB_VERSIONS_KEYSPACE.to_string(),
-            version_key.to_bytes().map_err(encode)?.into(),
-            successor.to_bytes().map_err(encode)?.into(),
-        ),
-        (
-            BLOB_HEAD_KEYSPACE.to_string(),
-            head_key.into(),
-            next.to_bytes().map_err(encode)?.into(),
-        ),
-        live_obligation_entry(&obligation).map_err(encode)?,
-    ];
-    writes.extend(connector_reference_write(&successor, &version_key).map_err(encode)?);
-    match send(
-        context,
-        StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        },
-    )
-    .await?
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        other => return Err(format!("unexpected successor write event: {other:?}")),
-    }
-
-    // The successor books its own size; an offered directory observation is released.
-    let released = predecessor
-        .offered_size(&refresh.bucket, &refresh.key)
-        .unwrap_or(0);
-    let delta = UsageDelta {
-        referenced_bytes: i128::from(refresh.metadata.content_length) - i128::from(released),
-        ..Default::default()
-    };
-    let mut update = UsageCounterUpdate::for_group(bucket.group_id, delta);
-    if !update.is_noop() {
-        let mut effects = update.start(txn_id);
-        while let Some(Effect::Storage(effect)) = effects.pop() {
-            let event = send(context, effect).await?;
-            match update
-                .step(event, txn_id)
-                .map_err(|error| error.to_string())?
-            {
-                Some(next) => effects = next,
-                None => break,
-            }
+impl MintSuccessorOperation {
+    pub(crate) fn new(txn_id: TxnId, refresh: ReferenceRefresh, predecessor: BlobVersion) -> Self {
+        Self {
+            txn_id,
+            refresh,
+            predecessor,
+            state: MintState::Init,
+            usage: None,
+            output: None,
         }
     }
-    Ok(true)
-}
 
-async fn read_row(
-    context: &DriverContext,
-    txn_id: TxnId,
-    key_space: &str,
-    key: Key,
-) -> Result<Option<Value>, String> {
-    let read = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key,
-        txn_id: Some(txn_id),
-    };
-    match send(context, read).await? {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        other => Err(format!("unexpected read event: {other:?}")),
+    fn finish(&mut self, written: bool) -> Effects {
+        self.state = MintState::Finish;
+        self.output = Some(Ok(written));
+        smallvec![]
+    }
+
+    fn fail(&mut self, error: MintError) -> Effects {
+        self.state = MintState::Error;
+        self.output = Some(Err(error));
+        smallvec![]
+    }
+
+    fn head_key(&self) -> Result<Vec<u8>, ConversionError> {
+        BlobHeadKey::new(&self.refresh.bucket, &self.refresh.key).to_bytes()
+    }
+
+    fn read_rows(&mut self) -> Result<Effects, MintError> {
+        let bucket = ByteView::from(self.refresh.bucket.as_bytes().to_vec());
+        let reads = vec![
+            (BLOB_HEAD_KEYSPACE.to_string(), self.head_key()?.into()),
+            (S3_BUCKET_KEYSPACE.to_string(), bucket),
+        ];
+        self.state = MintState::ReadRows;
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(self.txn_id),
+        })])
+    }
+
+    /// The successor's rows once the head is still the refreshed version; `None` otherwise.
+    fn successor_rows(
+        &mut self,
+        values: Vec<(Key, Option<Value>)>,
+    ) -> Result<Option<Vec<(KeySpace, Key, Value)>>, MintError> {
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let pointer = values
+            .next()
+            .flatten()
+            .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+            .transpose()?;
+        let bucket = values
+            .next()
+            .flatten()
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()?;
+        let (Some(pointer), Some(bucket)) = (pointer, bucket) else {
+            return Ok(None);
+        };
+        let BlobVersionState::Reference {
+            source,
+            advance_count,
+            ..
+        } = &self.predecessor.state
+        else {
+            return Ok(None);
+        };
+        if pointer.version_id != self.refresh.version_id {
+            return Ok(None);
+        }
+        let refresh = &self.refresh;
+        let now = SystemTime::now();
+        let version_id = Ulid::generate();
+        let successor = BlobVersion::reference(
+            source.clone(),
+            refresh.metadata.clone(),
+            now,
+            self.predecessor.created_by,
+            now,
+        )
+        .with_metadata(self.predecessor.metadata.clone())
+        .with_advance_count(advance_count + 1)
+        .with_policies(self.predecessor.placement_policies.clone())?;
+        let version_key = VersionKey::new(&refresh.bucket, &refresh.key, version_id);
+        let next = CurrentVersionPointer::next_for(Some(&pointer), version_id)?;
+        let obligation = LiveObligationRecord::new(
+            refresh.node_id,
+            refresh.auth_context.clone(),
+            refresh.bucket.clone(),
+            refresh.key.clone(),
+            version_id,
+            false,
+        )
+        .with_reference_advance(ReferenceAdvance {
+            generation: next.generation,
+            predecessor: pointer.version_id,
+        });
+        let mut writes = vec![
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                version_key.to_bytes()?.into(),
+                successor.to_bytes()?.into(),
+            ),
+            (
+                BLOB_HEAD_KEYSPACE.to_string(),
+                self.head_key()?.into(),
+                next.to_bytes()?.into(),
+            ),
+            live_obligation_entry(&obligation)?,
+        ];
+        writes.extend(connector_reference_write(&successor, &version_key)?);
+        // The successor books its own size; an offered directory observation is released.
+        let released = self
+            .predecessor
+            .offered_size(&refresh.bucket, &refresh.key)
+            .unwrap_or(0);
+        let delta = UsageDelta {
+            referenced_bytes: i128::from(refresh.metadata.content_length) - i128::from(released),
+            ..Default::default()
+        };
+        self.usage = Some(UsageCounterUpdate::for_group(bucket.group_id, delta));
+        Ok(Some(writes))
+    }
+
+    fn step_inner(&mut self, event: Event) -> Result<Effects, MintError> {
+        match (self.state, event) {
+            (MintState::ReadRows, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                let Some(writes) = self.successor_rows(values)? else {
+                    return Ok(self.finish(false));
+                };
+                self.state = MintState::WriteRows;
+                Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                    writes,
+                    txn_id: Some(self.txn_id),
+                })])
+            }
+            (MintState::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                match self.usage.as_mut().filter(|usage| !usage.is_noop()) {
+                    Some(usage) => {
+                        self.state = MintState::UpdateUsage;
+                        Ok(usage.start(self.txn_id))
+                    }
+                    None => Ok(self.finish(true)),
+                }
+            }
+            (MintState::UpdateUsage, event @ Event::Storage(_)) => {
+                let txn_id = self.txn_id;
+                let usage = self.usage.as_mut().ok_or(StorageError::InvalidEffect)?;
+                match usage.step(event, txn_id)? {
+                    Some(effects) => Ok(effects),
+                    None => Ok(self.finish(true)),
+                }
+            }
+            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (state, event) => Err(MintError::UnexpectedEvent {
+                state,
+                received: format!("{event:?}"),
+            }),
+        }
     }
 }
 
-async fn send(context: &DriverContext, effect: StorageEffect) -> Result<Event, String> {
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        event => Ok(event),
+impl Operation for MintSuccessorOperation {
+    type Output = bool;
+    type Error = MintError;
+
+    fn start(&mut self) -> Effects {
+        let exhausted = match &self.predecessor.state {
+            BlobVersionState::Reference { advance_count, .. } => {
+                *advance_count >= MAX_AUTO_ADVANCES
+            }
+            _ => true,
+        };
+        if exhausted {
+            return self.finish(false);
+        }
+        match self.read_rows() {
+            Ok(effects) => effects,
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if matches!(self.state, MintState::Finish | MintState::Error) {
+            return smallvec![];
+        }
+        match self.step_inner(event) {
+            Ok(effects) => effects,
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, MintState::Finish | MintState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(MintError::UnexpectedEvent {
+            state: self.state,
+            received: "no output".to_string(),
+        }))
+    }
+
+    /// The transaction belongs to the caller, which aborts it.
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::realm::RealmId;
+    use std::collections::HashMap;
+
+    fn observation(content_length: u64) -> SourceMetadata {
+        SourceMetadata {
+            content_length,
+            content_type: None,
+            etag: Some(format!("etag-{content_length}")),
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        }
+    }
+
+    fn mint(version_id: Ulid) -> MintSuccessorOperation {
+        let binding = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::new(),
+                source_path: "a".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: None,
+        };
+        let now = SystemTime::UNIX_EPOCH;
+        let predecessor =
+            BlobVersion::reference(binding, observation(1), now, Default::default(), now);
+        let refresh = ReferenceRefresh {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id,
+            metadata: observation(2),
+            refreshed_at: now,
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            auth_context: AuthContext {
+                user_id: Default::default(),
+                realm_id: RealmId([9; 32]),
+                path_restrictions: None,
+                session: None,
+            },
+        };
+        MintSuccessorOperation::new(Ulid::from_bytes([1; 16]), refresh, predecessor)
+    }
+
+    fn bucket() -> BucketInfo {
+        BucketInfo {
+            group_id: Ulid::from_bytes([5; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: None,
+        }
+    }
+
+    // A refreshed version that is no longer the head gets no successor.
+    #[test]
+    fn stale_head_skipped() {
+        let mut operation = mint(Ulid::from_bytes([2; 16]));
+        assert!(matches!(
+            operation.start().as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { .. })]
+        ));
+        let newer = CurrentVersionPointer::new(Ulid::from_bytes([3; 16]));
+        let values = vec![
+            (
+                Key::from(b"head".to_vec()),
+                Some(newer.to_bytes().unwrap().into()),
+            ),
+            (
+                Key::from(b"bucket".to_vec()),
+                Some(bucket().to_bytes().unwrap().into()),
+            ),
+        ];
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+
+        assert!(effects.is_empty());
+        assert_eq!(operation.finalize(), Ok(false));
     }
 }
