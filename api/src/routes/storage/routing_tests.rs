@@ -277,3 +277,76 @@ async fn lists_readable_buckets() {
     // The cursor never names a bucket the caller may not see.
     assert!(page.buckets.is_empty() && page.next.is_none());
 }
+
+#[tokio::test]
+async fn lists_bucket_jobs() {
+    use aruna_core::keyspaces::{
+        COMPRESSION_MIGRATION_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
+    use aruna_core::structs::storage::backend_import::{RenameRequest, TokenGrant};
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::format::{Compression, CompressionMigration};
+    let test = setup_state().await;
+    let context = test.state.get_ctx();
+    let key = |bucket: &str| bucket.as_bytes().to_vec().into();
+    let quiet = BucketInfo {
+        group_id: test.group_id,
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: test.auth.user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+    };
+    let quiet = quiet.to_bytes().unwrap().into();
+    crate::tests::routes::write_doc(&context, S3_BUCKET_KEYSPACE, key("quiet"), quiet).await;
+    // A paused rename: the move record and the rename request of the same move.
+    let mut record = CompressionMigration::new(Compression::Off, 7);
+    (
+        record.moving,
+        record.migrated,
+        record.skipped,
+        record.failed,
+    ) = (true, 4, 1, 2);
+    let request = RenameRequest {
+        started_at_ms: 7,
+        auth: test.auth.clone(),
+        node_id: test.state.get_node_id(),
+        grant: TokenGrant {
+            token_hash: "token".to_string(),
+            issuer: test.state.get_realm_id(),
+            issued_at_secs: 1,
+            expires_at_secs: u64::MAX,
+            via: None,
+        },
+        paused: true,
+        aborted_at_ms: None,
+    };
+    let rows = [
+        (COMPRESSION_MIGRATION_KEYSPACE, record.to_bytes().unwrap()),
+        (RENAME_MOVE_KEYSPACE, request.to_bytes().unwrap()),
+    ];
+    for (space, value) in rows {
+        crate::tests::routes::write_doc(&context, space, key(&test.bucket), value.into()).await;
+    }
+    let Json(page) = list_group_buckets(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Path(test.group_id.to_string()),
+        axum::extract::Query(BucketPageQuery {
+            limit: None,
+            after: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let page = serde_json::to_value(page).unwrap();
+    assert_eq!(page["buckets"][0]["bucket"], "quiet");
+    assert!(page["buckets"][0].get("job").is_none());
+    assert_eq!(page["buckets"][1]["bucket"], test.bucket.as_str());
+    assert_eq!(
+        page["buckets"][1]["job"],
+        serde_json::json!({"kind": "rename", "state": "paused", "done": 5, "failed": 2})
+    );
+}
