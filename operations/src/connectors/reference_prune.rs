@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
 };
@@ -93,7 +94,11 @@ async fn queued(storage: &StorageHandle, limit: usize) -> Result<Vec<(Key, Value
 
 /// Prunes one page of stale rows after `cursor`. A live reference ends the pruning: the next
 /// check meets it at once. `true` while the connector stays queued.
-async fn prune_page(context: &DriverContext, connector_id: Ulid, cursor: Value) -> Result<bool, String> {
+async fn prune_page(
+    context: &DriverContext,
+    connector_id: Ulid,
+    cursor: Value,
+) -> Result<bool, String> {
     let txn_id = match send(context, StorageEffect::StartTransaction { read: false }).await? {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         other => return Err(format!("unexpected transaction event: {other:?}")),
@@ -141,7 +146,15 @@ async fn prune_rows(
             )
         })
         .collect();
-    let versions = match send(context, StorageEffect::BatchRead { reads, txn_id: Some(txn_id) }).await? {
+    let versions = match send(
+        context,
+        StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        },
+    )
+    .await?
+    {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         other => return Err(format!("unexpected version read event: {other:?}")),
     };
