@@ -267,6 +267,10 @@ pub const OFFERED_DIRECTORY_KEYSPACE: &str = "offered_directories";
 /// realm state only when the drain forwards it as an ordinary create.
 pub const DEVICE_INTAKE_KEYSPACE: &str = "device_intake";
 
+/// Issue time of the token that authored each queued draft, keyed like `device_intake`.
+/// The drain sends it along, so a holder can apply the owner's token cutoff.
+pub const DEVICE_FENCE_KEYSPACE: &str = "device_intake_fence";
+
 /// The realm-config clock the realm documents this device holds were copied at,
 /// keyed by realm id. It is what keeps a later copy from rolling the device
 /// back, and it is never replicated.
@@ -285,6 +289,10 @@ pub const SYNC_STATE_KEYSPACE: &str = "device_sync_state";
 /// by document id. Never replicated: it records what the owner selected and
 /// how far this device has synced each replica.
 pub const DEVICE_REPLICA_KEYSPACE: &str = "device_replica";
+
+/// When each device replica was last read or installed, keyed like `device_replica`. Over the
+/// cache budget, the least recently used unselected replica is evicted first.
+pub const DEVICE_REPLICA_USE_KEYSPACE: &str = "device_replica_use";
 
 /// Device-local bindings of a directory to a realm bucket prefix, keyed by
 /// folder id. Never replicated: the root path must not leave the machine.
@@ -330,6 +338,10 @@ pub const JOB_INDEX_KEYSPACE: &str = "job_owner_index";
 pub const ACTIVE_USER_KEYSPACE: &str = "job_active_user";
 pub const DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const RUN_CRATE_KEYSPACE: &str = "job_run_crate";
+
+/// The realm target a device froze for publishing one local run, and the copies it made,
+/// keyed like `job_run_crate`. Device-local and never replicated.
+pub const RUN_PUBLISH_KEYSPACE: &str = "job_run_publish";
 pub const ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
 /// Signed immutable output records, keyed by ExecutionId.
 pub const OUTPUT_RECORD_KEYSPACE: &str = "job_output_records";
@@ -534,10 +546,12 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     IMPORT_DISCOVERY_KEYSPACE,
     OFFERED_DIRECTORY_KEYSPACE,
     DEVICE_INTAKE_KEYSPACE,
+    DEVICE_FENCE_KEYSPACE,
     REALM_MARKER_KEYSPACE,
     MANAGEMENT_URL_KEYSPACE,
     SYNC_STATE_KEYSPACE,
     DEVICE_REPLICA_KEYSPACE,
+    DEVICE_REPLICA_USE_KEYSPACE,
     SYNCED_FOLDER_KEYSPACE,
     SYNC_BASE_KEYSPACE,
     SYNC_UPLOAD_KEYSPACE,
@@ -560,6 +574,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ACTIVE_USER_KEYSPACE,
     DEDUP_INDEX_KEYSPACE,
     RUN_CRATE_KEYSPACE,
+    RUN_PUBLISH_KEYSPACE,
     ATTEMPT_CONTROL_KEYSPACE,
     OUTPUT_RECORD_KEYSPACE,
     JOB_ENTRY_KEYSPACE,

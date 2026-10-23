@@ -886,6 +886,12 @@ impl MetadataHandle {
                 })
                 .await
             }
+            check @ MetadataTransportMessage::ForwardCheckBucket { .. } => {
+                Box::pin(async {
+                    crate::s3::bucket::forward::check_bucket_write(context, peer, check).await
+                })
+                .await
+            }
             create @ MetadataTransportMessage::ForwardCreateBucket { .. } => {
                 Box::pin(async {
                     crate::s3::bucket::forward::apply_bucket_create(context, peer, create).await
@@ -1036,6 +1042,7 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardSyncPull { .. }
             | MetadataTransportMessage::ForwardListVersions { .. }
             | MetadataTransportMessage::ForwardCreateBucket { .. }
+            | MetadataTransportMessage::ForwardCheckBucket { .. }
             | MetadataTransportMessage::FetchRealmDocuments { .. }
             | MetadataTransportMessage::FetchGraphState { .. }
             | MetadataTransportMessage::ForwardApplyBatch { .. }

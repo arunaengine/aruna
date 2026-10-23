@@ -3,14 +3,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use aruna_core::StructuredId;
+use aruna_core::UserId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::execution::job::{
     ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
     RunCrateStatus,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_core::structs::storage::data_identity::{
     DataEntity, ObjectLocation, normalized_id, parse_hash,
@@ -29,7 +32,7 @@ const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket"
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{put_crate_status, read_crate_status, read_job_record};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::drive;
+use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
@@ -37,6 +40,8 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
+use crate::realm::get_config::GetConfigOperation;
+use crate::realm::mutate_placement::node_kind;
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
 /// records a durable status and never fails the parent; this internal job succeeds
@@ -84,7 +89,56 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
             resource: "not-execution".to_string(),
         });
     };
+    // A device run stays local: its crate is written when the owner publishes it.
+    let device = match node_owner(
+        context,
+        ctx.driver.serving_realm(parent.created_by.realm_id),
+    )
+    .await
+    {
+        Ok(owner) => owner.is_some(),
+        Err(reason) => return JobRunOutcome::Deferred(JobError::retryable(reason)),
+    };
+    if device {
+        if saved_id.is_none()
+            && let Err(error) = put_crate_status(storage, for_job, &RunCrateStatus::Local).await
+        {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "run crate status write failed: {error}"
+            )));
+        }
+        return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
+            resource: RunCrateStatus::Local.name().to_string(),
+        });
+    }
+    record_crate(&ctx.driver, for_job, &parent, spec, saved_id).await
+}
 
+/// The owner this node is bound to, `None` for realm infrastructure. A node the stored realm
+/// configuration does not name is undecided, so no crate leaves it before that is known.
+async fn node_owner(context: &DriverContext, realm_id: RealmId) -> Result<Option<UserId>, String> {
+    // Without a net handle nothing can be forwarded; the crate write fails retryably instead.
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return Ok(None);
+    };
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .map_err(|error| format!("run crate needs the realm configuration: {error}"))?;
+    node_kind(&config, net_handle.node_id())
+        .map(|kind| kind.owner())
+        .ok_or_else(|| "the realm configuration does not name this node yet".to_string())
+}
+
+/// Mints, authorizes and writes the crate of one finished execution, then records the outcome.
+pub(crate) async fn record_crate(
+    driver: &Arc<DriverContext>,
+    for_job: JobId,
+    parent: &JobRecord,
+    spec: &ExecutionSpec,
+    saved_id: Option<Ulid>,
+) -> JobRunOutcome {
+    let context = driver.as_ref();
+    let storage = &context.storage_handle;
     let Some(net_handle) = context.net_handle.as_ref() else {
         return JobRunOutcome::Failed(JobError::retryable("run crate needs a net handle"));
     };
@@ -93,7 +147,7 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
     let actor = Actor {
         node_id,
         user_id: parent.created_by,
-        realm_id: ctx.driver.serving_realm(parent.created_by.realm_id),
+        realm_id: driver.serving_realm(parent.created_by.realm_id),
     };
     // Persist the first minted id before create so retries survive policy changes.
     let document_id = match saved_id {
@@ -119,12 +173,12 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
                 user_id: parent.created_by,
-                realm_id: ctx.driver.serving_realm(parent.created_by.realm_id),
+                realm_id: driver.serving_realm(parent.created_by.realm_id),
                 path_restrictions: None,
                 session: None,
             },
             path: MetadataRegistryRecord::permission_path_for(
-                &ctx.driver.serving_realm(parent.created_by.realm_id),
+                &driver.serving_realm(parent.created_by.realm_id),
                 spec.group_id,
                 &document_path,
                 document_id,
@@ -162,7 +216,7 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         });
     }
 
-    let jsonld = build_crate_jsonld(&parent, spec, document_id);
+    let jsonld = build_crate_jsonld(parent, spec, document_id);
 
     let (status, resource) = match route_metadata_create(
         CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
@@ -173,10 +227,10 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
             public: false,
             payload: CreateDocumentPayload::RoCrate { jsonld },
         }),
-        ctx.driver.clone(),
+        driver.clone(),
         Some(AuthToken::internal(AuthContext {
             user_id: parent.created_by,
-            realm_id: ctx.driver.serving_realm(parent.created_by.realm_id),
+            realm_id: driver.serving_realm(parent.created_by.realm_id),
             path_restrictions: None,
             session: None,
         })),
@@ -186,8 +240,8 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         Ok(result) => {
             let resource = result.record.document_id.to_string();
             emit_metadata_created(
-                &ctx.driver,
-                ctx.driver.serving_realm(parent.created_by.realm_id),
+                driver,
+                driver.serving_realm(parent.created_by.realm_id),
                 parent.created_by,
                 result.record.group_id,
                 result.record.document_id,

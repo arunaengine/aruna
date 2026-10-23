@@ -12,8 +12,8 @@ use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ActionKind, ActionOutcome, ActionScope, EntryState, SyncActionRecord, SyncBase, SyncedFolder,
-    WriteGuard,
+    ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, SyncActionRecord, SyncBase,
+    SyncedFolder, WriteGuard,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -214,7 +214,10 @@ async fn keep_local(
         base_entry(folder.folder_id, relative, &cleared).map_err(|_| ActionError::Unavailable)?,
         action_entry(&record).map_err(|_| ActionError::Unavailable)?,
     ];
-    if let Some(upload) = queued_upload(folder.folder_id, relative, base) {
+    // A download-only folder keeps the owner's bytes without publishing them.
+    if folder.mode != FolderMode::DownloadOnly
+        && let Some(upload) = queued_upload(folder.folder_id, relative, base)
+    {
         rows.push(upload_entry(&upload).map_err(|_| ActionError::Unavailable)?);
     }
     if !write_rows(context, rows, None).await {

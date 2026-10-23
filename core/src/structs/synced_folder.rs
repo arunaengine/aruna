@@ -27,6 +27,8 @@ pub enum FolderMode {
     /// The device publishes its files and never writes to disk.
     UploadOnly,
     TwoWay,
+    /// The device takes the realm's files and never publishes; local edits stay local.
+    DownloadOnly,
 }
 
 /// Whether a folder currently reconciles.
@@ -381,6 +383,29 @@ pub fn decide(
     match policy.mode {
         FolderMode::UploadOnly => decide_upload(policy, local, base),
         FolderMode::TwoWay => decide_two_way(policy, local, base, remote),
+        FolderMode::DownloadOnly => decide_download(policy, local, base, remote),
+    }
+}
+
+/// A download-only folder decides like a two-way one that never publishes: a
+/// local change or deletion stays local, and a remote change beside it becomes a sibling.
+fn decide_download(
+    policy: SyncPolicy,
+    local: Option<&Observed>,
+    base: Option<&SyncBase>,
+    remote: Option<&RemoteHead>,
+) -> SyncAction {
+    let policy = SyncPolicy {
+        propagate_deletes: false,
+        ..policy
+    };
+    match decide_two_way(policy, local, base, remote) {
+        SyncAction::Upload { .. } => SyncAction::Nothing,
+        SyncAction::ConflictCopy { remote_version, .. } => SyncAction::ConflictCopy {
+            remote_version,
+            upload: false,
+        },
+        action => action,
     }
 }
 
@@ -938,6 +963,62 @@ mod tests {
         assert_eq!(
             decide(policy, Some(&local), None, Some(&remote)),
             SyncAction::Upload { deleted: false }
+        );
+    }
+
+    #[test]
+    fn download_never_publishes() {
+        let policy = SyncPolicy {
+            mode: FolderMode::DownloadOnly,
+            propagate_deletes: true,
+        };
+        let synced = Ulid::from_bytes([2u8; 16]);
+        let base = base("4-1", 9, Some(synced));
+        let edited = observed("4-2", Some(8));
+        let newer = head(Ulid::from_bytes([3u8; 16]), Some(7), false);
+        // A local edit or a new local file stays local.
+        assert_eq!(
+            decide(
+                policy,
+                Some(&edited),
+                Some(&base),
+                Some(&head(synced, Some(9), false))
+            ),
+            SyncAction::Nothing
+        );
+        assert_eq!(
+            decide(policy, Some(&edited), None, None),
+            SyncAction::Nothing
+        );
+        // A local deletion is reported, never propagated.
+        assert_eq!(
+            decide(
+                policy,
+                None,
+                Some(&base),
+                Some(&head(synced, Some(9), false))
+            ),
+            SyncAction::Report(EntryState::LocalDeleted)
+        );
+        // A remote update replaces only the unchanged base, else lands beside the edit.
+        assert_eq!(
+            decide(
+                policy,
+                Some(&observed("4-1", Some(9))),
+                Some(&base),
+                Some(&newer)
+            ),
+            SyncAction::Materialize {
+                remote_version: newer.version_id,
+                guard: base.synced.as_ref().expect("synced").guard(),
+            }
+        );
+        assert_eq!(
+            decide(policy, Some(&edited), Some(&base), Some(&newer)),
+            SyncAction::ConflictCopy {
+                remote_version: newer.version_id,
+                upload: false,
+            }
         );
     }
 

@@ -427,10 +427,20 @@ impl JobResultPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunCrateStatus {
     Pending,
-    Minted { document_id: Ulid },
-    Written { resource: String },
-    Denied { message: String },
-    Failed { message: String },
+    Minted {
+        document_id: Ulid,
+    },
+    Written {
+        resource: String,
+    },
+    Denied {
+        message: String,
+    },
+    Failed {
+        message: String,
+    },
+    /// A device run: its crate is written only when the owner publishes the run.
+    Local,
 }
 
 impl RunCrateStatus {
@@ -441,6 +451,7 @@ impl RunCrateStatus {
             RunCrateStatus::Written { .. } => "written",
             RunCrateStatus::Denied { .. } => "denied",
             RunCrateStatus::Failed { .. } => "failed",
+            RunCrateStatus::Local => "local",
         }
     }
 
@@ -465,6 +476,7 @@ impl RunCrateStatus {
             RunCrateStatus::Failed { message } => {
                 serde_json::json!({ "status": "failed", "message": message })
             }
+            RunCrateStatus::Local => serde_json::json!({ "status": "local" }),
         }
     }
 }

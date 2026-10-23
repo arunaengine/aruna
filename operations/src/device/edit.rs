@@ -51,6 +51,7 @@ pub async fn apply_local_edit(
     node_id: NodeId,
     replica: &ReplicaRecord,
     mutation: UpdateDocumentMutation,
+    token_issued_at_secs: u64,
 ) -> Result<MetadataRegistryRecord, DeviceEditError> {
     let record = replica
         .record
@@ -78,7 +79,9 @@ pub async fn apply_local_edit(
     actor.strip(&mut batch.base_clock);
     let entry = PublishEntry::edit(draft_id, owner, &record, batch.clone(), authored);
     drive(
-        EnqueueDraftOperation::new(EnqueueDraftInput { entry }).with_actor(actor),
+        EnqueueDraftOperation::new(EnqueueDraftInput { entry })
+            .with_actor(actor)
+            .with_fence(token_issued_at_secs),
         context.as_ref(),
     )
     .await
@@ -485,9 +488,16 @@ mod tests {
         let (_dir, context, record) = device().await;
         let owner = UserId::local(Ulid::generate(), record.realm_id);
         for name in ["ada", "grace"] {
-            apply_local_edit(&context, owner, node(1), &replica(&record), contact(name))
-                .await
-                .expect("edit applies");
+            apply_local_edit(
+                &context,
+                owner,
+                node(1),
+                &replica(&record),
+                contact(name),
+                0,
+            )
+            .await
+            .expect("edit applies");
         }
         let batches: Vec<MetadataBatch> =
             crate::device::sync_status::read_publish_entries(&context)
@@ -564,6 +574,7 @@ mod tests {
                 crate::metadata::update_document::UpdateDocumentMutation::UpsertContextualEntity {
                     jsonld: r##"{"@id":"#ada","@type":"Person","name":"Ada"}"##.to_string(),
                 },
+                0,
             )
             .await,
             Err(DeviceEditError::QueueFull {

@@ -19,6 +19,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::storage::blob::group_permission_path;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::auth::bearer_token::realm_user_cutoff;
 use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
@@ -560,6 +561,10 @@ naming a different one; a bearer token requires that tag.
   bucket its `s3://` url names, which must belong to the execution group and grant the owner WRITE;
   the run's own workspace bucket holds the staged inputs. Nothing about it is forwarded or
   replicated.
+- An input url may instead be a versioned object ARN,
+  `arn:aruna:<realm>:<node>:s3/<bucket>/<key>@<version>`. A local task then copies that exact
+  version from the named realm node while staging; an unreachable node fails the run, not the
+  submission. The task reports such an input by its bucket and key.
 - A realm task reads every input from the bucket its `s3://` url names, at the version resolved
   when the task was accepted, so a later write to the source key never changes what a running task
   reads. Each declared output is written to the bucket its own url names. No bucket is created for
@@ -571,7 +576,8 @@ naming a different one; a bearer token requires that tag.
   `aruna-engine.org/job-id`, `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind`
   and `aruna-engine.org/estimated-transfer-bytes`; naming one is refused with error code
   `reserved_tag`.
-- Input and output urls must be `s3://bucket/key`; container paths must be absolute, canonical and
+- Input urls must be `s3://bucket/key` or a versioned object ARN, output urls `s3://bucket/key`;
+  container paths must be absolute, canonical and
   may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound
   the immutable output record carries.
 - An output path with POSIX wildcards additionally requires `path_prefix`, the literal ancestor
@@ -1459,7 +1465,7 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
         .url
         .as_deref()
         .ok_or_else(|| TesError::bad_request("input url is required"))?;
-    let (bucket, key) = parse_s3_url(url, "input")?;
+    let (source, source_node_id) = parse_input_url(url)?;
     validate_path(&input.path, "input path", false)?;
     // TES 1.1 defines wildcards for outputs only; an input path is one file.
     if has_wildcard(&input.path) {
@@ -1468,12 +1474,8 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
         ));
     }
     Ok(InputSelection {
-        source: InputSource::S3 {
-            bucket,
-            key,
-            version_id: None,
-        },
-        source_node_id: None,
+        source,
+        source_node_id,
         dest_key: input.path[1..].to_string(),
         mode,
         container_path: Some(input.path.clone()),
@@ -1529,6 +1531,29 @@ fn output_prefix(output: &TesOutput) -> Result<Option<String>, TesError> {
         )));
     }
     Ok(Some(prefix.to_string()))
+}
+
+/// An input url is `s3://bucket/key` on this node, or a versioned object ARN naming the node
+/// that holds the exact version to read.
+fn parse_input_url(url: &str) -> Result<(InputSource, Option<aruna_core::NodeId>), TesError> {
+    if !url.starts_with("arn:") {
+        let (bucket, key) = parse_s3_url(url, "input")?;
+        let source = InputSource::S3 {
+            bucket,
+            key,
+            version_id: None,
+        };
+        return Ok((source, None));
+    }
+    let arn = VersionedObjectArn::parse(url).map_err(|_| {
+        TesError::bad_request("an input arn must name a node, bucket, key and version")
+    })?;
+    let source = InputSource::S3 {
+        bucket: arn.bucket,
+        key: arn.key,
+        version_id: Some(arn.version.to_string()),
+    };
+    Ok((source, Some(arn.node_id)))
 }
 
 fn parse_s3_url(url: &str, role: &str) -> Result<(String, String), TesError> {
