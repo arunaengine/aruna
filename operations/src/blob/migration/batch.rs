@@ -111,9 +111,9 @@ impl Batch {
     fn finish(&mut self, row: usize) {
         self.running.retain(|running| *running != row);
         self.finished[row] = true;
-        if row + 1 < self.next && self.rows[row + 1].0 == self.rows[row].0 {
-            self.waiting.insert(row + 1);
-        }
+        // The key's next unfinished row; one an earlier run finished never runs again.
+        let next = (row + 1..self.key_end(row)).find(|later| !self.finished[*later]);
+        self.waiting.extend(next);
         while self.finished.get(self.done) == Some(&true) {
             self.done += 1;
         }
@@ -262,6 +262,24 @@ mod tests {
         rows.passed(0);
         rows.passed(1);
         assert_eq!(rows.ready(), Some(2));
+    }
+
+    #[test]
+    fn skips_counted_successor() {
+        // A version that appeared before one an earlier run finished: once it finishes, the
+        // finished one does not run again, but a later unfinished version of the key does.
+        let mut rows = batch(&["a", "b", "b", "b"]);
+        rows.passed(2);
+        for row in [0, 1] {
+            assert_eq!(rows.ready(), Some(row));
+            rows.start(row);
+        }
+        rows.finish(1);
+        assert_eq!(rows.ready(), Some(3));
+        rows.start(3);
+        rows.finish(3);
+        rows.finish(0);
+        assert_eq!((rows.ready(), rows.done()), (None, 4));
     }
 
     #[tokio::test]
