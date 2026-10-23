@@ -412,7 +412,7 @@ async fn copies_plain_files() {
 
     // A storage without provider copies streams the bytes and hashes them again.
     let event = handler
-        .copy_plain(resolved, plain.clone(), location.clone())
+        .copy_plain(resolved, plain.clone(), location.clone(), None)
         .await;
     let (BlobEvent::WriteFinished { location: copy }
     | BlobEvent::PlainWritten { location: copy, .. }) = event
@@ -614,7 +614,7 @@ async fn copies_missing_source() {
         if_not_exists: true,
         exact: true,
     };
-    let event = handler.copy_plain(resolved, plain, location).await;
+    let event = handler.copy_plain(resolved, plain, location, None).await;
     assert!(
         !matches!(
             event,

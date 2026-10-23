@@ -118,16 +118,16 @@ impl BlobHandler {
             .unwrap_or_else(BlobEvent::Error)
     }
 
-    /// The location names the exact key with an empty storage bucket, which marks it as
-    /// external; its hashes describe the bytes as they were read.
-    async fn external_hash(
+    /// The location of the exact key with an empty storage bucket, which marks it as external;
+    /// it has no size or hashes yet.
+    fn external_location(
         &self,
         resolved: ResolvedBackend,
         path: String,
         created_by: UserId,
-    ) -> Result<BlobEvent, BlobError> {
+    ) -> Result<BackendLocation, BlobError> {
         let root = self.registry.config_for(&resolved.backend)?.root;
-        let location = BackendLocation {
+        Ok(BackendLocation {
             backend: resolved.backend,
             storage_class: resolved.storage_class,
             root,
@@ -141,7 +141,65 @@ impl BlobHandler {
             partial: false,
             blob_size: 0,
             hashes: HashMap::new(),
+        })
+    }
+
+    pub(super) async fn stat_external(
+        &self,
+        resolved: ResolvedBackend,
+        path: String,
+        created_by: UserId,
+    ) -> BlobEvent {
+        self.external_stat(resolved, path, created_by)
+            .await
+            .unwrap_or_else(BlobEvent::Error)
+    }
+
+    /// The size, ETag and version the provider reports for the file, without reading it.
+    async fn external_stat(
+        &self,
+        resolved: ResolvedBackend,
+        path: String,
+        created_by: UserId,
+    ) -> Result<BlobEvent, BlobError> {
+        let mut location = self.external_location(resolved, path, created_by)?;
+        let operator = self.operator_from_location(&location)?;
+        let storage_path = self.object_path(&location)?;
+        // OpenDAL trims and drops empty parts, so `raw//a.txt` would stat `raw/a.txt`.
+        if opendal::raw::normalize_path(&storage_path) != storage_path {
+            let message = "the backend cannot read this key exactly".to_string();
+            return Err(BlobError::Unreadable(message));
+        }
+        let stat = timeout(self.io_timeout(), operator.stat(&storage_path)).await;
+        let metadata = match stat {
+            Ok(Ok(metadata)) => metadata,
+            Ok(Err(error)) if error.kind() == opendal::ErrorKind::NotFound => {
+                return Ok(BlobEvent::ExternalStat {
+                    location: None,
+                    version: None,
+                    etag: None,
+                });
+            }
+            Ok(Err(error)) => return Err(BlobError::ReadError(error.to_string())),
+            Err(_) => return Err(BlobError::ReadError("timed out reading the object".into())),
         };
+        location.blob_size = metadata.content_length();
+        Ok(BlobEvent::ExternalStat {
+            version: backend_version(&operator, &metadata),
+            etag: metadata.etag().map(str::to_string),
+            location: Some(location),
+        })
+    }
+
+    /// The location names the exact key with an empty storage bucket, which marks it as
+    /// external; its hashes describe the bytes as they were read.
+    async fn external_hash(
+        &self,
+        resolved: ResolvedBackend,
+        path: String,
+        created_by: UserId,
+    ) -> Result<BlobEvent, BlobError> {
+        let location = self.external_location(resolved, path, created_by)?;
         let operator = self.operator_from_location(&location)?;
         let storage_path = self.object_path(&location)?;
         let read_error = |error: &str| BlobError::ReadError(error.to_string());

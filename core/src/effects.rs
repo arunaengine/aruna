@@ -355,11 +355,12 @@ pub enum BlobEffect {
     },
     /// Copies `source`, at its recorded backend version, raw to `plain.path` on `resolved` and
     /// answers `PlainWritten` with its hashes. S3 copies inside the provider, unversioned only
-    /// one part checked by MD5; other copies stream through the node and hash the bytes.
+    /// while it keeps its recorded `etag` or one part proves its MD5; others stream and hash.
     CopyPlain {
         resolved: ResolvedBackend,
         plain: PlainPath,
         source: Box<BackendLocation>,
+        etag: Option<String>,
     },
     /// Aborts the provider upload a copy `attempt` recorded, or exactly `upload` when given,
     /// and forgets the record only while it still names that upload; answers `UploadAborted`.
@@ -376,6 +377,13 @@ pub enum BlobEffect {
     StatPlain {
         backend: BackendRef,
         path: String,
+    },
+    /// Answers `ExternalStat` with the size, ETag and backend version the provider reports for
+    /// the file at `path` on `resolved`, reading none of its bytes.
+    StatExternal {
+        resolved: ResolvedBackend,
+        path: String,
+        created_by: UserId,
     },
     /// Deletes exactly backend `version` of a replaced tenant file at `location`; an empty one
     /// deletes it only while its size and full ETag equal `location` and `etag`. Answers

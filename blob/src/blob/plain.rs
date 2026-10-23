@@ -103,30 +103,34 @@ impl BlobHandler {
     }
 
     /// Copies `source` to `plain.path`: inside the provider where both lie on one S3 storage
-    /// and the source has a recorded version or fits one part with a known MD5, else through
-    /// the node.
+    /// and the source has a recorded version or `etag`, or fits one part with a known MD5,
+    /// else through the node.
     pub(super) async fn copy_plain(
         &self,
         resolved: ResolvedBackend,
         plain: PlainPath,
         source: BackendLocation,
+        etag: Option<String>,
     ) -> BlobEvent {
-        // Without a version or MD5 proof the node streams the bytes; the caller checks their hash.
+        // Without a version, ETag or MD5 the node streams the bytes; the caller checks their hash.
         let exact = match self.read_version(&source).await {
             Ok(version) => version,
             Err(error) => return BlobEvent::Error(error),
         };
         let inside = resolved.backend == source.backend && !is_folder(&source);
-        let native = match inside && (exact.is_some() || provable(&source)) {
+        let proved = exact.is_some() || etag.is_some() || provable(&source);
+        let native = match inside && proved {
             true => self.native_for(&source).ok().flatten(),
             false => None,
         };
         if let Some(native) = native {
+            // Without a version the provider copies the source only while it keeps its ETag.
+            let if_match = etag.as_deref().filter(|_| exact.is_none());
             let copied = self.copy_inside(
                 resolved.clone(),
                 &plain,
                 &source,
-                (&native, exact.as_deref()),
+                (&native, exact.as_deref(), if_match),
             );
             match Box::pin(copied).await {
                 Ok(Some(event)) => return event,
@@ -152,7 +156,7 @@ impl BlobHandler {
         resolved: ResolvedBackend,
         plain: &PlainPath,
         source: &BackendLocation,
-        (native, version): (&crate::s3::NativeMultipart, Option<&str>),
+        (native, version, if_match): (&crate::s3::NativeMultipart, Option<&str>, Option<&str>),
     ) -> Result<Option<BlobEvent>, BlobError> {
         let class = resolved.storage_class.clone();
         let mut location =
@@ -179,7 +183,7 @@ impl BlobHandler {
             let Ok(number) = u16::try_from(index + 1) else {
                 return self.settle(target, (&path, &upload_id), plain.ulid).await;
             };
-            let from = (native, source_path.as_str(), version);
+            let from = (native, source_path.as_str(), version, if_match);
             match target
                 .copy_range(&path, &upload_id, (number, *range), from)
                 .await
@@ -194,6 +198,11 @@ impl BlobHandler {
                         return Err(error);
                     }
                 }
+                // A source without its recorded ETag changed, so it is not copied at all.
+                Err(error @ BlobError::IntegrityCheckFailed(_)) => {
+                    self.settle(target, (&path, &upload_id), plain.ulid).await?;
+                    return Err(error);
+                }
                 Err(error) => {
                     tracing::warn!(%error, "Provider copy refused; the bytes are streamed");
                     return self.settle(target, (&path, &upload_id), plain.ulid).await;
@@ -206,6 +215,8 @@ impl BlobHandler {
         {
             return self.settle(target, (&path, &upload_id), plain.ulid).await;
         }
+        // One part whose ETag is the source MD5 proves the bytes, and so their size.
+        let proved = parts.len() == 1 && md5.is_some();
         let completed = target
             .complete(&path, &upload_id, &parts, if_not_exists)
             .await;
@@ -219,6 +230,16 @@ impl BlobHandler {
         self.record_upload(plain.ulid, None).await?;
         let versioned = operator.info().capability().read_with_version;
         let written = written.filter(|version| versioned && version != "null");
+        location.blob_size = size;
+        location.hashes = source.hashes.clone();
+        let event = BlobEvent::PlainWritten {
+            location,
+            version: written.clone(),
+            etag: etag.map(|etag| etag.trim_matches('"').to_string()),
+        };
+        if proved {
+            return Ok(Some(event));
+        }
         let stat = operator.stat_with(&path);
         let stat = match written.as_deref() {
             Some(version) if operator.info().capability().stat_with_version => {
@@ -236,13 +257,7 @@ impl BlobHandler {
                 found.content_length()
             )));
         }
-        location.blob_size = size;
-        location.hashes = source.hashes.clone();
-        Ok(Some(BlobEvent::PlainWritten {
-            location,
-            version: written,
-            etag: etag.map(|etag| etag.trim_matches('"').to_string()),
-        }))
+        Ok(Some(event))
     }
 
     /// Aborts this copy's own provider upload and forgets it, then asks for a streamed copy. A

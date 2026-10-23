@@ -4154,7 +4154,9 @@ async fn s3_copies_plain() {
     };
     let blob = stream_from_bytes(b"renamed bytes");
     let BlobEvent::PlainWritten {
-        location, version, ..
+        location,
+        version,
+        etag,
     } = handler
         .write_plain(resolved.clone(), plain("raw/7_a.bin"), test_user_id(), blob)
         .await
@@ -4174,7 +4176,7 @@ async fn s3_copies_plain() {
         handler.storage.send_storage_effect(mark).await;
         let target = plain(target);
         let event = handler
-            .copy_plain(resolved.clone(), target.clone(), location.clone())
+            .copy_plain(resolved.clone(), target.clone(), location.clone(), None)
             .await;
         let BlobEvent::PlainWritten {
             location: copy,
@@ -4201,4 +4203,28 @@ async fn s3_copies_plain() {
             })
         ));
     }
+    // Without a version the provider copies the source only while it keeps its ETag.
+    let stale = Some("0123456789abcdef0123456789abcdef".to_string());
+    let refused = handler
+        .copy_plain(
+            resolved.clone(),
+            plain("raw/a.bin~9"),
+            location.clone(),
+            stale,
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            BlobEvent::Error(BlobError::IntegrityCheckFailed(_))
+        ),
+        "{refused:?}"
+    );
+    let held = handler
+        .copy_plain(resolved, plain("raw/a.bin~10"), location.clone(), etag)
+        .await;
+    let BlobEvent::PlainWritten { location: copy, .. } = held else {
+        panic!("copy failed: {held:?}")
+    };
+    assert_eq!(read_back(&handler, copy).await, b"renamed bytes");
 }

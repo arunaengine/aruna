@@ -236,18 +236,23 @@ impl NativeMultipart {
         source_path: &str,
     ) -> Result<String, BlobError> {
         let part = (part_number, None);
-        self.copy_range(path, upload_id, part, (source, source_path, None))
+        self.copy_range(path, upload_id, part, (source, source_path, None, None))
             .await
     }
 
     /// Copies `range` (inclusive), or all, of one provider `version` of a source object into
-    /// one part.
+    /// one part; without a version only while the source has the ETag `if_match`.
     pub async fn copy_range(
         &self,
         path: &str,
         upload_id: &str,
         (part_number, range): (u16, Option<(u64, u64)>),
-        (source, source_path, version): (&NativeMultipart, &str, Option<&str>),
+        (source, source_path, version, if_match): (
+            &NativeMultipart,
+            &str,
+            Option<&str>,
+            Option<&str>,
+        ),
     ) -> Result<String, BlobError> {
         let key = source.key(source_path);
         let encoded = utf8_percent_encode(&key, COPY_SOURCE);
@@ -268,10 +273,16 @@ impl NativeMultipart {
             .part_number(i32::from(part_number))
             .copy_source(copy_source)
             .set_copy_source_range(range)
+            .set_copy_source_if_match(
+                if_match.map(|etag| format!("\"{}\"", etag.trim_matches('"'))),
+            )
             .send()
             .boxed()
             .await
-            .map_err(|error| write_error("copy part", error))?;
+            .map_err(|error| match status(&error) {
+                Some(412) => BlobError::IntegrityCheckFailed("the source lost its ETag".into()),
+                _ => write_error("copy part", error),
+            })?;
         output
             .copy_part_result()
             .and_then(|result| result.e_tag())
