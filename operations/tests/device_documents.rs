@@ -321,7 +321,7 @@ async fn device_learns_removal() -> TestResult<()> {
 /// A device removed while it was away is refused at admission on its first contact, and
 /// learns its removal from that alone.
 #[tokio::test]
-async fn offline_device_learns_removal() -> TestResult<()> {
+async fn offline_learns_removal() -> TestResult<()> {
     let realm = Topology::spawn(MANAGEMENT_NODES, 0, REPLICATION_FACTOR).await?;
     let device = join_device(&realm).await?;
     set_listed(&realm, &device, false).await?;
