@@ -1132,6 +1132,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, JobState::Cancelled);
+        // Cleanup follows the stored terminal state, so it may still be running here.
+        for _ in 0..1000 {
+            if !marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(!marker.exists(), "cleanup hook must remove the marker");
     }
 

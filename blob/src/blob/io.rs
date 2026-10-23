@@ -9,6 +9,7 @@ use super::backend::{
 };
 use super::group::GROUP_WRITE_CHUNK;
 use super::pithos::{ArchiveEncoder, Share, working_set};
+use super::plain::Held;
 use crate::codec::{FrameEncoder, Guard};
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
@@ -56,6 +57,8 @@ struct WriteLimits {
     chunk: Option<usize>,
     /// Fails the write with `PathTaken` when a file is already at the path.
     if_not_exists: bool,
+    /// The reservation of the path, which must still be the write's own as it completes.
+    held: Option<Held>,
 }
 
 /// Turns original bytes into stored bytes: zstd frames, or one Pithos archive of a bucket key.
@@ -472,16 +475,18 @@ impl BlobHandler {
         Box::pin(self.write_stream_limit(location, operator, blob, limits, None, None)).await
     }
 
-    /// Raw bytes to a tenant path; `if_not_exists` fails the write with `PathTaken`.
+    /// Raw bytes to a tenant path; `if_not_exists` fails the write with `PathTaken`, and so does
+    /// a reservation `held` that is no longer the write's own when it completes.
     pub(super) async fn write_tenant(
         &self,
         location: BackendLocation,
         operator: Operator,
         blob: BackendStream<Result<Bytes, StreamError>>,
-        if_not_exists: bool,
+        (if_not_exists, held): (bool, Option<Held>),
     ) -> BlobEvent {
         let limits = WriteLimits {
             if_not_exists,
+            held,
             ..WriteLimits::default()
         };
         Box::pin(self.write_stream_limit(location, operator, blob, limits, None, None)).await
@@ -590,6 +595,7 @@ impl BlobHandler {
             deadline,
             chunk,
             if_not_exists,
+            held,
         } = limits;
         let mut plain = HiddenReservation::new(self.clone());
         let reservation = reservation.unwrap_or(&mut plain);
@@ -727,6 +733,18 @@ impl BlobHandler {
             reservation.set_location(location.clone());
         }
 
+        // A reserved tenant path must still hold this write's own reservation as it completes.
+        // Accepted window: a foreign write after this check is replaced by the completion.
+        if let Some((native, version)) = held.as_ref() {
+            match native.holds(&storage_path, version).await {
+                Ok(true) => {}
+                Ok(false) => return reservation.path_taken().await,
+                Err(error) => {
+                    reservation.path_taken().await;
+                    return BlobEvent::Error(error);
+                }
+            }
+        }
         reservation.mark_abandoned();
         let close = match reservation.writer_mut() {
             Some(writer) => match deadline {
@@ -857,6 +875,7 @@ impl BlobHandler {
                     deadline,
                     chunk: None,
                     if_not_exists: false,
+                    held: None,
                 },
                 None,
                 Some(&mut reservation),
@@ -1460,7 +1479,7 @@ impl BlobHandler {
             parts,
             chunk,
             resolved.compression,
-            false,
+            (false, None),
             guard,
         );
         match Box::pin(composed).await {
@@ -1492,7 +1511,7 @@ impl BlobHandler {
         parts: Vec<BackendLocation>,
         chunk: Option<usize>,
         compression: Compression,
-        if_not_exists: bool,
+        (if_not_exists, held): (bool, Option<&Held>),
     ) -> BlobEvent {
         let parts = parts
             .into_iter()
@@ -1507,7 +1526,7 @@ impl BlobHandler {
             parts,
             chunk,
             compression,
-            if_not_exists,
+            (if_not_exists, held),
             None,
         );
         Box::pin(composed).await
@@ -1521,7 +1540,7 @@ impl BlobHandler {
         parts: Vec<(BackendLocation, Range<u64>)>,
         chunk: Option<usize>,
         compression: Compression,
-        if_not_exists: bool,
+        (if_not_exists, held): (bool, Option<&Held>),
         guard: Option<Guard>,
     ) -> BlobEvent {
         let mut encoder = match (compression, guard.clone()) {
@@ -1624,6 +1643,13 @@ impl BlobHandler {
                 self.compose_write(&mut writer, pieces, &mut abandoned)
                     .await?;
                 layout = Some(framed);
+            }
+            // A reserved tenant path must still hold this write's own reservation as it completes.
+            // Accepted window: a foreign write after this check is replaced by the completion.
+            if let Some((native, version)) = held
+                && !native.holds(&storage_path, version).await?
+            {
+                return Err(BlobError::PathTaken);
             }
             let metadata = timeout(self.transfer_idle_timeout(), writer.close())
                 .await

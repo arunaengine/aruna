@@ -457,6 +457,10 @@ pub async fn preview_discovery(
         let path = object.key.clone();
         let names = (rule, earlier.as_slice(), rules);
         let open = intents.get(&path).map_or(&[][..], Vec::as_slice);
+        // An empty file of an open write is its reservation, as a run finds too.
+        if object.size == 0 && !open.is_empty() {
+            continue;
+        }
         let file = match row {
             // A literal import whose name encodes a version is recovered as that version.
             Some(row)

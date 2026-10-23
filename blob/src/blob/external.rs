@@ -5,6 +5,7 @@
 use super::BlobHandler;
 use super::io::backend_version;
 use crate::hash::Hasher;
+use crate::s3::RESERVATION;
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
@@ -19,6 +20,12 @@ use ulid::Ulid;
 
 fn list_error(error: impl ToString) -> BlobError {
     BlobError::ListError(error.to_string())
+}
+
+/// Whether the object is the empty reservation a write holds its path with, not a file.
+fn reservation(metadata: &opendal::Metadata) -> bool {
+    let marked = metadata.user_metadata();
+    metadata.content_length() == 0 && marked.is_some_and(|marked| marked.get(RESERVATION).is_some())
 }
 
 impl BlobHandler {
@@ -77,6 +84,17 @@ impl BlobHandler {
             let metadata = entry.metadata();
             if !metadata.is_file() || start_after.is_some_and(|after| entry.path() <= after) {
                 continue;
+            }
+            // A listing tells no user metadata, so an empty file is looked at for the marker.
+            if metadata.content_length() == 0 {
+                let stat = timeout(self.io_timeout(), operator.stat(entry.path())).await;
+                let stat = stat.map_err(|_| list_error("timed out reading an empty file"))?;
+                match stat {
+                    Ok(found) if reservation(&found) => continue,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == opendal::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(list_error(error)),
+                }
             }
             let modified_ms = metadata
                 .last_modified()
@@ -155,7 +173,8 @@ impl BlobHandler {
             .unwrap_or_else(BlobEvent::Error)
     }
 
-    /// The size, ETag and version the provider reports for the file, without reading it.
+    /// The size, ETag and version the provider reports for the file, without reading it. A
+    /// write's empty reservation counts as no file.
     async fn external_stat(
         &self,
         resolved: ResolvedBackend,
@@ -172,7 +191,14 @@ impl BlobHandler {
         }
         let stat = timeout(self.io_timeout(), operator.stat(&storage_path)).await;
         let metadata = match stat {
-            Ok(Ok(metadata)) => metadata,
+            Ok(Ok(metadata)) if !reservation(&metadata) => metadata,
+            Ok(Ok(_)) => {
+                return Ok(BlobEvent::ExternalStat {
+                    location: None,
+                    version: None,
+                    etag: None,
+                });
+            }
             Ok(Err(error)) if error.kind() == opendal::ErrorKind::NotFound => {
                 return Ok(BlobEvent::ExternalStat {
                     location: None,
@@ -192,7 +218,8 @@ impl BlobHandler {
     }
 
     /// The location names the exact key with an empty storage bucket, which marks it as
-    /// external; its hashes describe the bytes as they were read.
+    /// external; its hashes describe the bytes as they were read. A write's empty reservation
+    /// is no file and unreadable.
     async fn external_hash(
         &self,
         resolved: ResolvedBackend,
@@ -203,6 +230,7 @@ impl BlobHandler {
         let operator = self.operator_from_location(&location)?;
         let storage_path = self.object_path(&location)?;
         let read_error = |error: &str| BlobError::ReadError(error.to_string());
+        let reserved = || BlobError::Unreadable("the path holds a write's reservation".into());
         let open_error = |error: opendal::Error| match error.kind() {
             opendal::ErrorKind::NotFound => BlobError::Unreadable(error.to_string()),
             _ => read_error(&error.to_string()),
@@ -217,6 +245,9 @@ impl BlobHandler {
             .await
             .map_err(|_| read_error("timed out reading the object"))?
             .map_err(open_error)?;
+        if reservation(&metadata) {
+            return Err(reserved());
+        }
         let version = backend_version(&operator, &metadata);
         let etag = metadata.etag().map(str::to_string);
         // Without a version the read names the stated ETag where the storage can, so the hash
@@ -237,9 +268,9 @@ impl BlobHandler {
             .map_err(|_| read_error("timed out starting the object read"))?
             .map_err(|error| read_error(&error.to_string()))?;
         // The ETag is the one of the response hashed; a storage that reports none has none.
-        let etag = match timeout(self.io_timeout(), stream.metadata()).await {
-            Ok(Ok(read)) => read.etag().map(str::to_string),
-            Ok(Err(error)) if error.kind() == opendal::ErrorKind::Unsupported => None,
+        let (etag, marked) = match timeout(self.io_timeout(), stream.metadata()).await {
+            Ok(Ok(read)) => (read.etag().map(str::to_string), reservation(&read)),
+            Ok(Err(error)) if error.kind() == opendal::ErrorKind::Unsupported => (None, false),
             Ok(Err(error)) => return Err(read_error(&error.to_string())),
             Err(_) => return Err(read_error("timed out opening the object read")),
         };
@@ -253,6 +284,10 @@ impl BlobHandler {
             let chunk = chunk.map_err(|error| read_error(&error.to_string()))?;
             size = size.saturating_add(chunk.len() as u64);
             hasher.update(&chunk);
+        }
+        // An empty file shares a reservation's ETag, so the read may find one the stat did not.
+        if marked && size == 0 {
+            return Err(reserved());
         }
         Ok(BlobEvent::ExternalHashed {
             location: BackendLocation {

@@ -346,6 +346,35 @@ impl CompressionMigration {
     }
 }
 
+/// Version rows a migration run finished after its first unfinished row, already counted in
+/// its progress. The next run of the same pass that resumes at `cursor` passes over them.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationAhead {
+    pub started_at_ms: u64,
+    pub retries: u32,
+    pub cursor: Option<Vec<u8>>,
+    pub rows: Vec<Vec<u8>>,
+}
+
+impl MigrationAhead {
+    /// The rows, only for the pass of `record` that resumes at its cursor.
+    pub fn rows_for(self, record: &CompressionMigration) -> Vec<Vec<u8>> {
+        let same = (self.started_at_ms, self.retries) == (record.started_at_ms, record.retries);
+        match same && self.cursor == record.cursor {
+            true => self.rows,
+            false => Vec::new(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

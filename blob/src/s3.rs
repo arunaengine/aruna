@@ -33,6 +33,8 @@ const COPY_SOURCE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/');
 // AWS rejects CreateBucket requests that name us-east-1 explicitly.
 const IMPLICIT_REGION: &str = "us-east-1";
+/// User metadata naming the version whose write an empty reservation holds a path for.
+pub(crate) const RESERVATION: &str = "aruna-reservation";
 
 pub async fn create_s3_client(
     endpoint: &str,
@@ -254,15 +256,6 @@ impl NativeMultipart {
             Option<&str>,
         ),
     ) -> Result<String, BlobError> {
-        let key = source.key(source_path);
-        let encoded = utf8_percent_encode(&key, COPY_SOURCE);
-        let copy_source = match version {
-            Some(version) => {
-                let version = utf8_percent_encode(version, COPY_SOURCE);
-                format!("{}/{encoded}?versionId={version}", source.bucket)
-            }
-            None => format!("{}/{encoded}", source.bucket),
-        };
         let range = range.map(|(first, last)| format!("bytes={first}-{last}"));
         let output = self
             .client
@@ -271,7 +264,7 @@ impl NativeMultipart {
             .key(self.key(path))
             .upload_id(upload_id)
             .part_number(i32::from(part_number))
-            .copy_source(copy_source)
+            .copy_source(source.copy_source(source_path, version))
             .set_copy_source_range(range)
             .set_copy_source_if_match(
                 if_match.map(|etag| format!("\"{}\"", etag.trim_matches('"'))),
@@ -279,18 +272,145 @@ impl NativeMultipart {
             .send()
             .boxed()
             .await
-            .map_err(|error| match status(&error) {
-                Some(412) => BlobError::IntegrityCheckFailed("the source lost its ETag".into()),
-                // Only a refusal of the call itself says the storage cannot copy.
-                Some(501) => BlobError::CopyUnsupported,
-                _ if error.code() == Some("NotImplemented") => BlobError::CopyUnsupported,
-                _ => write_error("copy part", error),
-            })?;
+            .map_err(|error| copy_error("copy part", error))?;
         output
             .copy_part_result()
             .and_then(|result| result.e_tag())
             .map(str::to_string)
             .ok_or_else(|| BlobError::WriteError("backend returned no copied part ETag".into()))
+    }
+
+    /// Copies one provider `version` of a source object, or its current bytes while it has the
+    /// ETag `if_match`, onto `path` in one request; answers the copy's version id and ETag.
+    pub async fn copy_object(
+        &self,
+        path: &str,
+        (source, source_path, version, if_match): (
+            &NativeMultipart,
+            &str,
+            Option<&str>,
+            Option<&str>,
+        ),
+    ) -> Result<(Option<String>, Option<String>), BlobError> {
+        let output = self
+            .client
+            .copy_object()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .copy_source(source.copy_source(source_path, version))
+            .set_copy_source_if_match(
+                if_match.map(|etag| format!("\"{}\"", etag.trim_matches('"'))),
+            )
+            .send()
+            .boxed()
+            .await
+            .map_err(|error| copy_error("copy object", error))?;
+        let etag = output
+            .copy_object_result()
+            .and_then(|result| result.e_tag());
+        let version = output.version_id().map(str::to_string);
+        Ok((version, etag.map(str::to_string)))
+    }
+
+    /// The copy source naming `path` of this bucket, at `version` when one is given.
+    fn copy_source(&self, path: &str, version: Option<&str>) -> String {
+        let key = self.key(path);
+        let encoded = utf8_percent_encode(&key, COPY_SOURCE);
+        match version {
+            Some(version) => {
+                let version = utf8_percent_encode(version, COPY_SOURCE);
+                format!("{}/{encoded}?versionId={version}", self.bucket)
+            }
+            None => format!("{}/{encoded}", self.bucket),
+        }
+    }
+
+    /// Creates an empty object at `path` for the write of `version` only while the path is
+    /// free, the one create-only request every S3 storage honors; completions and copies may
+    /// ignore their conditions. This version's own reservation there counts as reserved.
+    pub async fn reserve(&self, path: &str, version: &str) -> Result<(), BlobError> {
+        let put = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.key(path))
+            .if_none_match("*")
+            .metadata(RESERVATION, version)
+            .body(ByteStream::from_static(b""))
+            .send()
+            .boxed()
+            .await;
+        let Err(error) = put else {
+            return Ok(());
+        };
+        match status(&error) {
+            // 409 answers a conditional write of the same key still under way.
+            Some(412 | 409) => match self.reservation(path).await? {
+                Some(found) if found.version == version => Ok(()),
+                _ => Err(BlobError::PathTaken),
+            },
+            Some(501) => Err(BlobError::ConditionalUnsupported),
+            _ if error.code() == Some("NotImplemented") => Err(BlobError::ConditionalUnsupported),
+            _ => Err(BlobError::WriteError(format!(
+                "reserve the path: {}",
+                DisplayErrorContext(&error)
+            ))),
+        }
+    }
+
+    /// Whether `path` still holds the empty reservation of `version`, checked right before the
+    /// request that replaces it.
+    pub async fn holds(&self, path: &str, version: &str) -> Result<bool, BlobError> {
+        let found = self.reservation(path).await?;
+        Ok(found.is_some_and(|found| found.version == version))
+    }
+
+    /// The empty reservation `path` holds now, if it holds one.
+    async fn reservation(&self, path: &str) -> Result<Option<Reservation>, BlobError> {
+        let head = self.client.head_object().bucket(&self.bucket);
+        let output = match head.key(self.key(path)).send().boxed().await {
+            Ok(output) => output,
+            Err(error) if status(&error) == Some(404) => return Ok(None),
+            Err(error) => {
+                let message = format!("head object: {}", DisplayErrorContext(&error));
+                return Err(BlobError::ReadError(message));
+            }
+        };
+        let version = output.metadata().and_then(|found| found.get(RESERVATION));
+        let (Some(version), Some(0)) = (version, output.content_length()) else {
+            return Ok(None);
+        };
+        Ok(Some(Reservation {
+            version: version.clone(),
+            object_version: output
+                .version_id()
+                .filter(|id| *id != "null")
+                .map(Into::into),
+        }))
+    }
+
+    /// Removes the empty reservation of `version` at `path` and never anything else: only its
+    /// exact object version, where the storage keeps versions. Elsewhere the reservation stays,
+    /// as a foreign empty file has the same ETag.
+    pub async fn unreserve(&self, path: &str, version: &str) -> Result<(), BlobError> {
+        let found = self.reservation(path).await?;
+        let found = found.filter(|found| found.version == version);
+        let Some(id) = found.and_then(|found| found.object_version) else {
+            return Ok(());
+        };
+        let delete = self.client.delete_object().bucket(&self.bucket);
+        let request = delete.key(self.key(path)).version_id(id);
+        let error = match request.send().boxed().await {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        match status(&error) {
+            Some(404) => Ok(()),
+            _ => Err(BlobError::DeleteError(format!(
+                "delete reservation: {}",
+                DisplayErrorContext(&error)
+            ))),
+        }
     }
 
     /// Assembles the listed parts, in order, under the backend ETags recorded for them, and
@@ -586,6 +706,27 @@ where
         "{call} multipart upload: {}",
         DisplayErrorContext(&error)
     ))
+}
+
+/// A refused copy: a source that lost its ETag, a storage that cannot copy, or another error.
+fn copy_error<E>(call: &str, error: aws_sdk_s3::error::SdkError<E>) -> BlobError
+where
+    E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
+{
+    match status(&error) {
+        Some(412) => BlobError::IntegrityCheckFailed("the source lost its ETag".into()),
+        // Only a refusal of the call itself says the storage cannot copy.
+        Some(501) => BlobError::CopyUnsupported,
+        _ if error.code() == Some("NotImplemented") => BlobError::CopyUnsupported,
+        _ => write_error(call, error),
+    }
+}
+
+/// An empty object holding a path for the write of `version`.
+struct Reservation {
+    version: String,
+    /// The object version it is, where the storage keeps versions.
+    object_version: Option<String>,
 }
 
 /// A part body the SDK sends as it arrives, without buffering it.

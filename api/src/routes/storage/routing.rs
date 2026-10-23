@@ -10,6 +10,7 @@ use aruna_core::structs::storage::blob::{BackendRef, bucket_permission_path};
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule, target_warnings};
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::groups::backends::query::GetBackendOperation;
+use aruna_operations::groups::bucket_jobs::{ActiveJob, JobKind};
 use aruna_operations::groups::default_rule::PutDefaultOperation;
 use aruna_operations::groups::storage_routing::{
     GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
@@ -65,6 +66,69 @@ pub struct BucketStorageResponse {
     /// The rule that links the whole bucket.
     pub import_id: Option<String>,
     pub write_pattern: Option<String>,
+    /// The job that runs or is paused on the bucket; absent while none does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<BucketJob>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketJobKind {
+    Rename,
+    Move,
+    Compression,
+    Encryption,
+    Duplicates,
+    KeyMove,
+    Check,
+    Purge,
+    Import,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketJobState {
+    Running,
+    Paused,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct BucketJob {
+    pub kind: BucketJobKind,
+    pub state: BucketJobState,
+    /// Items finished so far, changed or left as they are.
+    pub done: u64,
+    pub failed: u64,
+    /// The files a rename planned to rename; absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+}
+
+impl From<ActiveJob> for BucketJob {
+    fn from(job: ActiveJob) -> Self {
+        let kind = match job.kind {
+            JobKind::Rename => BucketJobKind::Rename,
+            JobKind::Move => BucketJobKind::Move,
+            JobKind::Compression => BucketJobKind::Compression,
+            JobKind::Encryption => BucketJobKind::Encryption,
+            JobKind::Duplicates => BucketJobKind::Duplicates,
+            JobKind::KeyMove => BucketJobKind::KeyMove,
+            JobKind::Check => BucketJobKind::Check,
+            JobKind::Purge => BucketJobKind::Purge,
+            JobKind::Import => BucketJobKind::Import,
+        };
+        let state = match job.paused {
+            true => BucketJobState::Paused,
+            false => BucketJobState::Running,
+        };
+        Self {
+            kind,
+            state,
+            done: job.done,
+            failed: job.failed,
+            total: job.total,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -664,6 +728,14 @@ pub async fn put_group_routing(
   Aruna storage on this node.
 - Rules for single folders of a bucket are not shown, nor buckets the caller may not read; `next`
   names only a returned bucket. 8 listing pages of only hidden buckets answer 409.
+- `job` is the job running or paused on the bucket, absent while none is. Of several it shows the
+  first of: a storage move (`rename`, `move`) or `compression` change, a `key_move` or `duplicates`
+  cleanup, an `encryption` change, a storage `check`, a `purge`, an `import` run. An aborted rename
+  stays `running` until its move ends.
+- `done` counts items finished: versions or keys changed or left as they are, versions checked or
+  removed, files imported or skipped. A purge counts no `failed`.
+- `total` is the planned count of files a `rename` renames, stored at its start; absent otherwise.
+  A `rename` counts in `done` only the files it gave a new name or moved into the folder.
 
 **Limits**
 - 1 to 500 buckets per page, 200 by default; pass `next` as `after` for the next page.
@@ -678,7 +750,10 @@ pub async fn put_group_routing(
             "buckets": [{
                 "bucket": "genes", "backend_id": "01JBCKND0123456789ABCDEFGH",
                 "provider_bucket": "genes", "folder": "genes/", "shared": false,
-                "import_id": "01JMPRT0123456789ABCDEFGHJ", "write_pattern": "{dir}{name}"
+                "import_id": "01JMPRT0123456789ABCDEFGHJ", "write_pattern": "{dir}{name}",
+                "job": {
+                    "kind": "rename", "state": "paused", "done": 1200, "failed": 3, "total": 4000
+                }
             }],
             "next": null
         })),
@@ -752,6 +827,7 @@ pub async fn list_group_buckets(
             shared: found.shared,
             import_id: id(found.import_id),
             write_pattern: found.write_pattern,
+            job: found.job.map(Into::into),
         })
         .collect();
     Ok(Json(BucketStoragePage { buckets, next }))

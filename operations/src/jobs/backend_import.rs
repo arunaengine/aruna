@@ -394,6 +394,10 @@ async fn import_object(
     if rule.aruna_key(&object.key).is_none() || run.backend.is_reserved(&object.key) {
         return Ok(Outcome::Ignored);
     }
+    // An empty file a write's intent names is that write's reservation, in progress.
+    if object.size == 0 && reserved(rule, run.intents.get(&object.key)) {
+        return Ok(Outcome::Skipped);
+    }
     if page_skip(
         (rule, &run.earlier),
         &run.page,
@@ -570,6 +574,13 @@ struct Identity {
 
 /// One stored intent of a write to the file's path, and whether its version committed.
 type Claim = (Key, WriteIntent, bool);
+
+/// Whether a write to the rule's backend holds an intent for the path; its empty file there
+/// is the reservation of a write still in progress, not a file to register.
+fn reserved(rule: &BackendImport, intents: Option<&Vec<(Key, WriteIntent)>>) -> bool {
+    let backend = BackendRef::Group(rule.backend_id);
+    intents.is_some_and(|intents| intents.iter().any(|(_, intent)| intent.backend == backend))
+}
 
 /// Prefers the one write whose version never committed; else the path itself. Several open
 /// writes or a path that does not tell the folder of its key are reported, never guessed.
