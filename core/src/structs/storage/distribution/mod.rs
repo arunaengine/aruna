@@ -10,10 +10,12 @@ use crate::NodeId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::types::GroupId;
 
+pub mod change;
 pub mod hint;
 pub mod presets;
 pub mod validate;
 
+pub use change::{DistributionChange, DistributionOp, TransferRole};
 pub use hint::{HintIndex, SetHint};
 pub use validate::DistributionError;
 
