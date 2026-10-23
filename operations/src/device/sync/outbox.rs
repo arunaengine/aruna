@@ -14,7 +14,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{
-    EntrySide, EntryState, FolderState, SyncBase, SyncPullAck, SyncRefusal, SyncedBytes,
+    EntrySide, EntryState, FolderState, SyncBase, SyncPull, SyncPullAck, SyncRefusal, SyncedBytes,
     SyncedFolder,
 };
 use aruna_core::task::TaskKey;
@@ -127,12 +127,14 @@ async fn forward_upload(
     };
     let message = MetadataTransportMessage::ForwardSyncPull {
         auth_token: AuthToken::internal(auth),
-        source: Box::new(source),
-        blake3: upload.blake3,
-        size: upload.size,
-        target_bucket: folder.remote.bucket.clone(),
-        target_key: folder.remote.remote_key(&upload.relative),
-        deleted: upload.deleted,
+        pull: Box::new(SyncPull {
+            source,
+            blake3: upload.blake3,
+            size: upload.size,
+            target_bucket: folder.remote.bucket.clone(),
+            target_key: folder.remote.remote_key(&upload.relative),
+            deleted: upload.deleted,
+        }),
     };
     match metadata
         .request_forwarded_write(folder.remote.node_id, message)
