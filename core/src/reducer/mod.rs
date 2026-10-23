@@ -47,7 +47,7 @@ mod placement;
 mod revocation;
 mod targets;
 
-pub use distribution::distribution_change_path;
+pub use distribution::{FINALITY_WINDOW, MAX_PENDING};
 pub use paths::*;
 use paths::{event_observes_dot, operation_paths, role_definition_value};
 pub use placement::*;

@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::admin_documents::AdminDocumentTarget;
+use crate::reducer::{FINALITY_WINDOW, MAX_PENDING};
 use crate::structs::storage::distribution::presets::replica_layout;
 use crate::structs::storage::distribution::{
     DistributionChange, DistributionConfig, DistributionError, DistributionOp,
@@ -269,5 +270,105 @@ fn foreign_create_refused() {
             .config
             .owner_group,
         group_id()
+    );
+}
+
+fn stored(state: &AdminDocumentState) -> usize {
+    state
+        .user_subject_ids
+        .keys()
+        .filter(|path| path.starts_with("distribution.changes."))
+        .count()
+}
+
+#[test]
+fn foreign_admit_cannot_shadow() {
+    // A foreign admission seen before the create must not hide the member's own one.
+    let create = change_event(10, 1, 1, None, DistributionOp::Create { config: config() });
+    let mut scratch = state();
+    scratch.apply(&create).unwrap();
+    let created = revision(&scratch);
+    let op = DistributionOp::Admit {
+        member_id: Ulid::from_bytes([2; 16]),
+        incarnation: 2,
+    };
+    let foreign = change_event(11, 3, 1, created, op.clone());
+    let own = change_event(12, 2, 1, created, op);
+
+    let mut early = state();
+    early.apply(&foreign).unwrap();
+    early.apply(&create).unwrap();
+    early.apply(&own).unwrap();
+
+    let mut ordered = state();
+    ordered.apply(&create).unwrap();
+    assert!(ordered.apply(&foreign).is_err());
+    ordered.apply(&own).unwrap();
+
+    let record = ordered.materialized_distribution().unwrap();
+    let member = record.member(Ulid::from_bytes([2; 16])).unwrap();
+    assert_eq!(member.incarnation, Some(2));
+    assert_eq!(early.materialized_distribution(), Some(record));
+    assert_eq!(stored(&early), stored(&ordered));
+}
+
+#[test]
+fn pending_is_bounded() {
+    let mut state = state();
+    let unknown = |seed: u8| DistributionRevision {
+        number: 5,
+        digest: [seed; 32],
+    };
+    for seed in 0..MAX_PENDING as u8 {
+        let event = change_event(
+            20 + seed,
+            5,
+            u64::from(seed) + 1,
+            Some(unknown(seed)),
+            public(true),
+        );
+        state.apply(&event).unwrap();
+    }
+    let over = change_event(60, 5, 60, Some(unknown(60)), public(true));
+    assert_eq!(
+        state.apply(&over),
+        Err(DistributionError::TooManyPending.into())
+    );
+    let other = change_event(61, 6, 1, Some(unknown(61)), public(true));
+    assert_eq!(state.apply(&other), Ok(AdminApplyStatus::Applied));
+}
+
+#[test]
+fn history_is_bounded() {
+    let mut state = state();
+    state
+        .apply(&change_event(
+            10,
+            1,
+            1,
+            None,
+            DistributionOp::Create { config: config() },
+        ))
+        .unwrap();
+    let early = revision(&state);
+    for step in 0..40u8 {
+        let event = change_event(
+            100 + step,
+            1,
+            u64::from(step) + 2,
+            revision(&state),
+            public(step % 2 == 0),
+        );
+        state.apply(&event).unwrap();
+    }
+    let record = state.materialized_distribution().unwrap();
+    assert_eq!(record.revision.number, 41);
+    assert!(!record.config.settings.public);
+    assert!(stored(&state) <= FINALITY_WINDOW);
+    // A change on a revision folded into the checkpoint can no longer win.
+    let late = change_event(1, 2, 1, early, public(true));
+    assert_eq!(
+        state.apply(&late),
+        Err(DistributionError::StaleRevision.into())
     );
 }
