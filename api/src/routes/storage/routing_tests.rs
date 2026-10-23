@@ -350,7 +350,7 @@ async fn lists_bucket_jobs() {
     assert_eq!(page["buckets"][1]["bucket"], test.bucket.as_str());
     assert_eq!(
         page["buckets"][1]["job"],
-        serde_json::json!({"kind": "rename", "state": "paused", "done": 5, "failed": 2})
+        serde_json::json!({"kind": "rename", "state": "paused", "done": 4, "failed": 2})
     );
     // A total stored for an older move stays unknown; the move's own shows.
     for (started_at_ms, shown) in [(6, None), (7, Some(9))] {

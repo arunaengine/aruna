@@ -129,7 +129,11 @@ impl Rows {
             // An aborted rename shows as running until its move ends.
             let paused =
                 rename.is_some_and(|request| request.paused && request.aborted_at_ms.is_none());
-            let done = record.migrated.saturating_add(record.skipped);
+            // A rename counts the files it moved, as its own job shows, never versions that stay.
+            let done = match rename {
+                Some(_) => record.migrated,
+                None => record.migrated.saturating_add(record.skipped),
+            };
             let total = rename.and(self.total);
             return Some(ActiveJob {
                 paused,
@@ -305,7 +309,7 @@ mod tests {
         assert_eq!(rows.active(), job(JobKind::Compression, false, 5, 1));
         record.moving = true;
         rows.migration = Some(record.clone());
-        assert_eq!(rows.active(), job(JobKind::Rename, true, 5, 1));
+        assert_eq!(rows.active(), job(JobKind::Rename, true, 3, 1));
         // A rename shows the total its start stored, never one of an older move.
         let total = |started_at_ms| RenameTotal {
             started_at_ms,
@@ -321,7 +325,7 @@ mod tests {
             aborted_at_ms: Some(9),
             ..request
         });
-        assert_eq!(rows.active(), job(JobKind::Rename, false, 5, 1));
+        assert_eq!(rows.active(), job(JobKind::Rename, false, 3, 1));
         rows.rename = Some(rename(6));
         assert_eq!(rows.active(), job(JobKind::Move, false, 5, 1));
         // A finished move leaves the paused duplicate cleanup.

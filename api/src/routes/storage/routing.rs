@@ -735,7 +735,7 @@ pub async fn put_group_routing(
 - `done` counts items finished: versions or keys changed or left as they are, versions checked or
   removed, files imported or skipped. A purge counts no `failed`.
 - `total` is the planned count of files a `rename` renames, stored at its start; absent otherwise.
-  `done` also counts the folder's other versions, so it can pass `total`.
+  A `rename` counts in `done` only the files it gave a new name or moved into the folder.
 
 **Limits**
 - 1 to 500 buckets per page, 200 by default; pass `next` as `after` for the next page.
