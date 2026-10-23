@@ -359,15 +359,21 @@ mod tests {
         crate::jobs::store::insert_job(&storage_handle, &record)
             .await
             .unwrap();
+        let driver = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        // The submitter may read the source, except the manifest's own path.
+        let mut spec = spec();
+        let denied = source_permission_path(&spec, "data/MD5SUMS");
+        let scope = (spec.auth_context.realm_id, spec.group_id, spec.node_id);
+        spec.auth_context = crate::tests::access::seed_access(&driver, scope, &denied).await;
         let ctx = JobContext {
-            driver: Arc::new(DriverContext {
-                storage_handle,
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: None,
-                compute_handle: None,
-            }),
+            driver: Arc::new(driver),
             job_id,
             owner_node_id: node_id,
             claim_token,
@@ -378,11 +384,11 @@ mod tests {
         };
         let mut checkpoint = checkpoint();
 
-        assert!(
-            read_manifest_chunk(&ctx, &spec(), &mut checkpoint)
-                .await
-                .is_ok()
-        );
+        if let Err(PageFailure::Retry(message) | PageFailure::Permanent(message)) =
+            read_manifest_chunk(&ctx, &spec, &mut checkpoint).await
+        {
+            panic!("the manifest step failed: {message}");
+        }
 
         assert_eq!(checkpoint.manifest, None);
         assert_eq!(checkpoint.items_failed, 1);
