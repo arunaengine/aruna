@@ -247,8 +247,8 @@ impl BlobHandler {
     }
 
     /// Copies `source` onto the reserved path in one request. An ETag equal to the source MD5
-    /// proves the bytes; a kept multipart or recorded ETag leaves the size to check, and any
-    /// other ETag sends the bytes through the node onto the same path.
+    /// proves the bytes; a pinned source's kept multipart or recorded ETag leaves the size to
+    /// check, and any other ETag sends the bytes through the node onto the same path.
     async fn copy_whole(
         &self,
         (mut location, operator): (BackendLocation, &Operator),
@@ -267,8 +267,12 @@ impl BlobHandler {
         let tag = etag.as_deref().map(unquoted);
         let md5 = (source.hashes.get(aruna_core::structs::checksum::HASH_MD5)).map(hex::encode);
         let proved = md5.is_some() && tag == md5;
-        let kept = (tag.as_deref())
-            .is_some_and(|tag| tag.contains('-') || recorded.map(unquoted).as_deref() == Some(tag));
+        // Only a source pinned by its version or ETag makes a kept ETag name these bytes.
+        let pinned = version.is_some() || if_match.is_some();
+        let kept = pinned
+            && (tag.as_deref()).is_some_and(|tag| {
+                tag.contains('-') || recorded.map(unquoted).as_deref() == Some(tag)
+            });
         if md5.is_some() && !proved && !kept {
             tracing::warn!("A copy's ETag is not the source MD5; the bytes go through the node");
             return match self.read_blob(source.clone()).await {

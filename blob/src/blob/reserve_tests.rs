@@ -92,7 +92,7 @@ async fn serve(
     let param = |name: &str| {
         let prefix = format!("{name}=");
         let found = query.split('&').find_map(|pair| pair.strip_prefix(&prefix));
-        found.map(|value| decoded(value))
+        found.map(decoded)
     };
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     let unquoted = |etag: &str| etag.trim_matches('"').to_string();
@@ -404,6 +404,20 @@ async fn failed_copy_unreserves() {
     let copied = handler.copy_plain(resolved, exact("raw/a.bin", Ulid::generate()), old, stale);
     assert!(matches!(copied.await, BlobEvent::Error(_)));
     assert!(body(&fake, "tenant/raw/a.bin").is_none());
+}
+
+#[tokio::test]
+async fn unpinned_copy_streams() {
+    // A source pinned by neither version nor ETag proves its copy only by its MD5. A kept
+    // multipart ETag sends the bytes through the node, where changed bytes fail their hash.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let old = source(&handler, &resolved, b"renamed bytes").await;
+    let mut changed = stored(b"changed bytes", &[]);
+    changed.etag = "0123456789abcdef0123456789abcdef-2".to_string();
+    place(&fake, "tenant/raw/7_a.bin", changed);
+    let plain = exact("raw/a.bin", Ulid::generate());
+    let copied = handler.copy_plain(resolved, plain, old, None).await;
+    assert!(matches!(copied, BlobEvent::Error(_)), "{copied:?}");
 }
 
 /// Opens a provider upload at the tenant path `path` and writes one part.
