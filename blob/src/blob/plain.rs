@@ -13,7 +13,7 @@ use aruna_core::handle::Handle as _;
 use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::storage::backend_import::{
-    COPY_PART, PlainPath, tagged_path, version_key,
+    COPY_PART, PlainPath, copy_provable, tagged_path, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, ResolvedBackend,
@@ -118,7 +118,7 @@ impl BlobHandler {
             Err(error) => return BlobEvent::Error(error),
         };
         let inside = resolved.backend == source.backend && !is_folder(&source);
-        let proved = exact.is_some() || etag.is_some() || provable(&source);
+        let proved = exact.is_some() || etag.is_some() || copy_provable(&source);
         let native = match inside && proved {
             true => self.native_for(&source).ok().flatten(),
             false => None,
@@ -724,13 +724,6 @@ fn conditional_unsupported(error: &opendal::Error) -> bool {
     }
 }
 
-/// Whether a copy without a provider version proves its bytes: one part, whose ETag must
-/// be the source MD5.
-fn provable(source: &BackendLocation) -> bool {
-    let md5 = aruna_core::structs::checksum::HASH_MD5;
-    source.blob_size <= COPY_PART && source.hashes.contains_key(md5)
-}
-
 /// The inclusive byte ranges of a copy; `None` copies an object of one part whole.
 fn copy_ranges(size: u64) -> Vec<Option<(u64, u64)>> {
     if size <= COPY_PART {
@@ -784,7 +777,7 @@ mod tests {
 
     #[test]
     fn proves_unversioned_copies() {
-        // Without a provider version only one part with a known MD5 proves its copy.
+        // Without a provider version or ETag only one part with a known MD5 proves its copy.
         let mut source = BackendLocation {
             backend: BackendRef::Group(ulid::Ulid::nil()),
             storage_class: None,
@@ -800,12 +793,12 @@ mod tests {
             blob_size: COPY_PART,
             hashes: HashMap::new(),
         };
-        assert!(!provable(&source));
+        assert!(!copy_provable(&source));
         let md5 = aruna_core::structs::checksum::HASH_MD5.to_string();
         source.hashes.insert(md5, vec![0; 16]);
-        assert!(provable(&source));
+        assert!(copy_provable(&source));
         source.blob_size = COPY_PART + 1;
-        assert!(!provable(&source));
+        assert!(!copy_provable(&source));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, COPY_PART, ImportedObject, object_key, object_prefix,
+    BackendImport, ImportedObject, copy_provable, object_key, object_prefix,
 };
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::structs::storage::routing::RoutingSnapshot;
@@ -201,9 +201,9 @@ pub struct RenamePlan {
     /// Files an earlier pattern named for their version, and their bytes.
     pub files: u64,
     pub bytes: u64,
-    /// Of them, files over one provider copy part, which may be copied through the node.
-    pub large_files: u64,
-    pub large_bytes: u64,
+    /// Of them, files whose copy passes through the node unless the provider keeps a version.
+    pub streamed_files: u64,
+    pub streamed_bytes: u64,
     /// Of them, files whose new name another file of the rule already holds.
     pub taken_files: u64,
     /// Of them, files the caller may not write; they keep their name.
@@ -290,16 +290,17 @@ pub async fn rename_page(
         let mut renames = Vec::new();
         for ((row_key, key, path, row, to), found) in candidates.into_iter().zip(found) {
             let plan = &mut page.plan;
-            if !found {
+            let Some(location) = found else {
                 plan.unchanged_files += 1;
                 plan.unchanged_bytes += row.size;
                 continue;
-            }
+            };
             plan.files += 1;
             plan.bytes += row.size;
-            if row.size > COPY_PART {
-                plan.large_files += 1;
-                plan.large_bytes += row.size;
+            // As the copy decides: a recorded ETag or a one-part MD5 keeps it in the provider.
+            if row.etag.is_none() && !copy_provable(&location) {
+                plan.streamed_files += 1;
+                plan.streamed_bytes += row.size;
             }
             plan.withheld_files += u64::from(!writable(&key));
             let listed = after
@@ -339,14 +340,14 @@ fn row_parts(
     Ok((key, path, row))
 }
 
-/// Whether each candidate's version still reads its file there and a rename gives that file
-/// the candidate's new name; the versions and their locations are read in one batch each.
+/// The location of each candidate whose version still reads its file there and whose file a
+/// rename gives the candidate's new name; versions and locations are read in one batch each.
 async fn confirmed(
     context: &DriverContext,
     (routing, earlier): (&RoutingSnapshot, &super::Earlier),
     bucket: &str,
     candidates: &[(Key, String, String, ImportedObject, String)],
-) -> Result<Vec<bool>, String> {
+) -> Result<Vec<Option<BackendLocation>>, String> {
     let keys: Vec<VersionKey> = (candidates.iter())
         .map(|(_, key, _, row, _)| VersionKey::new(bucket, key, row.version_id))
         .collect();
@@ -379,16 +380,17 @@ async fn confirmed(
         })
         .collect();
     let locations = batch(context, reads).await?;
-    let mut found = vec![false; candidates.len()];
+    let mut found = vec![None; candidates.len()];
     for ((index, plain, _), value) in places.into_iter().zip(locations) {
         let Some(value) = value else {
             continue;
         };
         let location = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
         let (_, _, path, _, to) = &candidates[index];
-        found[index] = location.backend_path == *path
+        let renamed = location.backend_path == *path
             && plain.path == *to
             && renames(routing, earlier, &plain, &location, &keys[index]);
+        found[index] = renamed.then_some(location);
     }
     Ok(found)
 }
@@ -446,8 +448,8 @@ mod tests {
     use aruna_core::keyspaces::{
         BACKEND_INDEX_KEYSPACE, IMPORT_PATTERN_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
-    use aruna_core::structs::checksum::HASH_BLAKE3;
-    use aruna_core::structs::storage::backend_import::write_patterns;
+    use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
+    use aruna_core::structs::storage::backend_import::{COPY_PART, write_patterns};
     use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
     use aruna_core::structs::storage::format::{
         Compression, EncodingClass, StoredFormat, StoredLayout,
@@ -523,7 +525,11 @@ mod tests {
             staging: false,
             partial: false,
             blob_size: size,
-            hashes: [(HASH_BLAKE3.to_string(), hash.to_vec())].into(),
+            hashes: [
+                (HASH_BLAKE3.to_string(), hash.to_vec()),
+                (HASH_MD5.to_string(), hash[..16].to_vec()),
+            ]
+            .into(),
         };
         let row = location.location_key().unwrap().to_bytes();
         put(
@@ -618,8 +624,8 @@ mod tests {
         let plan = RenamePlan {
             files: 3,
             bytes: 8 + large,
-            large_files: 1,
-            large_bytes: large,
+            streamed_files: 1,
+            streamed_bytes: large,
             taken_files: 1,
             withheld_files: 1,
             unchanged_files: 5,

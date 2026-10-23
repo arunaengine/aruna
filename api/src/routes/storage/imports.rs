@@ -725,10 +725,10 @@ pub struct RenamePageQuery {
 pub struct RenamePlanResponse {
     /// Bytes of the `count` files.
     pub bytes: u64,
-    /// Of them, files over 1 GiB and their bytes; they pass through the node only when neither
-    /// a provider version nor a recorded ETag holds them, all others are copied in the provider.
-    pub large_files: u64,
-    pub large_bytes: u64,
+    /// Of them, files without a recorded ETag that are over 1 GiB or have no stored MD5, and their
+    /// bytes; they pass through the node unless the provider keeps a version of them.
+    pub streamed_files: u64,
+    pub streamed_bytes: u64,
     /// Of them, files whose new name another file of the rule already holds; they fail.
     pub taken_files: u64,
     /// Of them, files the caller may read but not write; they keep their name.
@@ -772,10 +772,12 @@ key the caller may read are counted and listed.
 - The plan reads only the rule's own record of its files, never the provider. A file counts
   when an earlier pattern of the rule named it for exactly the version recorded for it. Files
   a user put there, and files with their current name, count as `unchanged_files`.
-- `plan` splits the counted files: `large_files` over 1 GiB, which pass through the node only
-  when neither a provider version nor a recorded ETag holds them; `taken_files` whose new name
-  the rule records for another file; `withheld_files` the caller may not write, which make
-  `POST` answer 403.
+- Files are copied inside the provider, in parts of up to 1 GiB at any size, while a provider
+  version or the recorded ETag holds the source, or as one part proven by the stored MD5.
+- `plan` splits the counted files: `streamed_files` that none of these holds, which pass
+  through the node unless the provider keeps a version; `taken_files` whose new name the rule
+  records for another file; `withheld_files` the caller may not write, which make `POST`
+  answer 403.
 - Each listed file is also checked against its version; a file whose version changed is not
   listed, and a rename leaves it in place.
 - A filter limits the plan and the pages alike.
@@ -800,8 +802,8 @@ key the caller may read are counted and listed.
                 "complete": true,
                 "plan": {
                     "bytes": 1048576,
-                    "large_files": 0,
-                    "large_bytes": 0,
+                    "streamed_files": 0,
+                    "streamed_bytes": 0,
                     "taken_files": 0,
                     "withheld_files": 0,
                     "unchanged_files": 12,
@@ -875,8 +877,8 @@ pub async fn get_renames(
         complete: plan.complete,
         plan: RenamePlanResponse {
             bytes: plan.bytes,
-            large_files: plan.large_files,
-            large_bytes: plan.large_bytes,
+            streamed_files: plan.streamed_files,
+            streamed_bytes: plan.streamed_bytes,
             taken_files: plan.taken_files,
             withheld_files: plan.withheld_files,
             unchanged_files: plan.unchanged_files,
