@@ -47,7 +47,7 @@ pub enum PublishRunError {
     NotFinished,
     #[error("node {0} is not a realm server")]
     NotRealmNode(NodeId),
-    #[error("the realm refused output {key}: {refusal:?}")]
+    #[error("the realm refused {key}: {refusal:?}")]
     Refused { key: String, refusal: SyncRefusal },
     #[error("the realm node is unreachable: {0}")]
     Unreachable(String),
@@ -119,6 +119,7 @@ pub async fn publish_run(
         _ => Vec::new(),
     };
     let keys = target_keys(&input.target, &outputs)?;
+    check_bucket(context, &auth, &input.target).await?;
     let mut copies = Vec::with_capacity(outputs.len());
     for (output, key) in outputs.iter().zip(keys) {
         copies.push(pull_output(context, &auth, &input.target, output, key).await?);
@@ -167,6 +168,39 @@ fn target_keys(
             }
         })
         .collect()
+}
+
+/// Asks the realm node whether the owner may write the target, whatever the run produced.
+async fn check_bucket(
+    context: &Arc<DriverContext>,
+    auth: &AuthContext,
+    target: &RemoteBinding,
+) -> Result<(), PublishRunError> {
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or_else(|| PublishRunError::Unavailable("metadata handle".to_string()))?;
+    let message = MetadataTransportMessage::ForwardCheckBucket {
+        auth_token: AuthToken::internal(auth.clone()),
+        bucket: target.bucket.clone(),
+        prefix: target.prefix.trim_end_matches('/').to_string(),
+    };
+    match metadata
+        .request_forwarded_write(target.node_id, message)
+        .await
+    {
+        Ok(MetadataTransportMessage::ForwardedBucketChecked { result: Ok(()) }) => Ok(()),
+        Ok(MetadataTransportMessage::ForwardedBucketChecked {
+            result: Err(refusal),
+        }) => Err(PublishRunError::Refused {
+            key: target.bucket.clone(),
+            refusal,
+        }),
+        Ok(other) => Err(PublishRunError::Unreachable(
+            crate::metadata::transport_message_kind(&other).to_string(),
+        )),
+        Err(error) => Err(PublishRunError::Unreachable(error.to_string())),
+    }
 }
 
 /// Asks the realm node to pull one output version and reports the copy it made.

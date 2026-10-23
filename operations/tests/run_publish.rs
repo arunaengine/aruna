@@ -12,7 +12,6 @@ use std::time::{Duration, SystemTime};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::RemoteBinding;
 use aruna_core::structs::execution::job::{
     ExecutionSpec, JobId, JobPayload, JobRecord, JobResultPayload, JobState, OutputObject,
     RunCrateStatus,
@@ -20,8 +19,9 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::structs::{RemoteBinding, SyncRefusal};
 use aruna_core::types::GroupId;
-use aruna_operations::device::publish_run::{PublishRunInput, publish_run};
+use aruna_operations::device::publish_run::{PublishRunError, PublishRunInput, publish_run};
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
@@ -300,6 +300,45 @@ async fn crate_stays_local() -> TestResult<()> {
     assert_eq!(
         read_crate_status(storage, job_id).await?,
         Some(RunCrateStatus::Pending)
+    );
+    Ok(())
+}
+
+/// The target bucket is checked at the realm before anything else, so a run without outputs
+/// cannot report a publish into a bucket that does not exist.
+#[tokio::test]
+async fn checks_empty_target() -> TestResult<()> {
+    let realm = Topology::spawn(2, 1, 1).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    let job_id = finished_run(&realm, group_id, Vec::new(), RunCrateStatus::Local).await?;
+
+    let refused = publish_run(
+        &device.context,
+        PublishRunInput {
+            job_id,
+            owner: realm.user_id,
+            node_id: device.node_id(),
+            target: RemoteBinding {
+                node_id: server.node_id(),
+                bucket: "missing-bucket".to_string(),
+                prefix: String::new(),
+            },
+        },
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(PublishRunError::Refused {
+            refusal: SyncRefusal::NotFound,
+            ..
+        })
+    ));
+    assert_eq!(
+        read_crate_status(&device.context.storage_handle, job_id).await?,
+        Some(RunCrateStatus::Local)
     );
     Ok(())
 }

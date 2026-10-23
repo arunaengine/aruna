@@ -228,7 +228,8 @@ for.
   `local` and nothing about it reaches the realm.
 - The realm node named by `node_id` pulls each output at the exact version the run wrote and
   stores it at `<prefix>/<source bucket>/<key>` in `bucket`, as the device owner, so outputs of
-  different device buckets never meet. The bucket must exist there and grant the owner WRITE.
+  different device buckets never meet. The bucket must exist there and grant the owner WRITE under
+  `prefix`; that is checked before anything is copied, also for a run without outputs.
 - Once every output is copied, the run crate is created in the realm and names the realm copies.
 - A repeated request is safe: an output the realm already copied answers with its existing version
   and a crate already written is not written again.

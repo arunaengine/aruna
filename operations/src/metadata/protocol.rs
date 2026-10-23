@@ -522,6 +522,16 @@ pub enum MetadataTransportMessage {
     FetchedVaultRecords {
         result: Result<aruna_core::structs::identity::user::vault::VaultRecords, MetadataReadError>,
     },
+    /// Whether the device owner may write under `prefix` of one bucket the realm node holds,
+    /// asked before a publish copies anything. Appended last to keep discriminants stable.
+    ForwardCheckBucket {
+        auth_token: AuthToken,
+        bucket: String,
+        prefix: String,
+    },
+    ForwardedBucketChecked {
+        result: Result<(), SyncRefusal>,
+    },
 }
 
 /// One document as a holder serves it to a device.
