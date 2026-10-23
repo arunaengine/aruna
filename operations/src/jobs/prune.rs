@@ -24,6 +24,7 @@ use super::JOB_PRUNE_PAGE;
 use super::store::{
     artifact_tombstone_key, batch_delete, first_schedule_entry, iter_prefix_page,
     job_entry_deletes, preserve_artifact_tombstone, prune_delete_entries, read_job_record,
+    staging_row_deletes,
 };
 use crate::driver::DriverContext;
 
@@ -94,6 +95,16 @@ pub(crate) async fn prune_job_page(
                         job_entry_deletes(storage, job_id, remaining).await?;
                     deletes.extend(entry_deletes);
                     if entries_more {
+                        has_more = true;
+                        break 'scan;
+                    }
+                    // A staging job's queue and manifest rows go before its record, so a cleanup
+                    // the job itself could not finish is still completed here.
+                    let remaining = deletion_cap.saturating_sub(deletes.len()).max(1);
+                    let (staging_deletes, staging_more) =
+                        staging_row_deletes(storage, job_id, remaining).await?;
+                    deletes.extend(staging_deletes);
+                    if staging_more {
                         has_more = true;
                         break 'scan;
                     }
@@ -212,6 +223,7 @@ mod tests {
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
+        STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE,
     };
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateResult,
@@ -335,6 +347,42 @@ mod tests {
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 0);
         assert_eq!(count(&storage, JOB_INDEX_KEYSPACE).await, 0);
         assert_eq!(count(&storage, SCHEDULE_INDEX_KEYSPACE).await, 0);
+    }
+
+    #[tokio::test]
+    async fn staging_rows_pruned() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 1);
+        insert_job(&storage, &terminal_record(job_id, finished))
+            .await
+            .unwrap();
+        let mut row = job_id.to_bytes().to_vec();
+        row.push(1);
+        let writes = [STAGING_QUEUE_KEYSPACE, STAGING_MANIFEST_KEYSPACE]
+            .into_iter()
+            .map(|key_space| {
+                (
+                    key_space.to_string(),
+                    ByteView::from(row.clone()),
+                    ByteView::from(Vec::new()),
+                )
+            })
+            .collect();
+        storage
+            .send_storage_effect(aruna_core::effects::StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+
+        let outcome = prune_job_batch(&context(storage.clone())).await.unwrap();
+
+        assert_eq!(outcome.pruned, 1);
+        assert_eq!(count(&storage, STAGING_QUEUE_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, STAGING_MANIFEST_KEYSPACE).await, 0);
+        assert_eq!(count(&storage, JOB_KEYSPACE).await, 0);
     }
 
     #[tokio::test]
