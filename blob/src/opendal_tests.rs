@@ -247,7 +247,7 @@ fn recorded(etag: &str) -> SourceMetadata {
 }
 
 #[tokio::test]
-async fn bound_read_skips_head() {
+async fn bound_read_direct() {
     let source = SourceListener::bind(Some("\"v2\""), false).await;
     let expected = recorded("\"v1\"");
 
@@ -266,7 +266,7 @@ async fn bound_read_skips_head() {
 }
 
 #[tokio::test]
-async fn bound_read_fails_changed() {
+async fn bound_read_changed() {
     let source = SourceListener::bind(Some("\"v2\""), true).await;
 
     let result = read_staging_source(
