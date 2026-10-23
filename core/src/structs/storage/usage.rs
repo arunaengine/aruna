@@ -13,7 +13,7 @@ use ulid::Ulid;
 pub const USAGE_GLOBAL_KEY: &[u8] = b"global";
 pub const GLOBAL_SHARD_COUNT: usize = 64;
 pub const USAGE_BACKEND_PREFIX: &str = "backend/";
-/// Node-local rows of one bucket's `objects`, `logical_bytes` and `referenced_bytes`.
+/// Node-local [`BucketCounters`] rows, one per bucket.
 pub const USAGE_BUCKET_PREFIX: &str = "bucket/";
 
 /// Usage keys group fixed binary node snapshots by node or group for prefix scans.
@@ -274,6 +274,95 @@ impl UsageDelta {
             stored_bytes: self.stored_bytes.saturating_add(other.stored_bytes),
             logical_bytes: self.logical_bytes.saturating_add(other.logical_bytes),
             referenced_bytes: self.referenced_bytes.saturating_add(other.referenced_bytes),
+        }
+    }
+}
+
+/// One bucket's maintained counters, stored node-local under [`usage_bucket_key`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BucketCounters {
+    /// Current heads that are not delete markers.
+    pub objects: u64,
+    /// Stored version rows that are not delete markers, noncurrent ones included.
+    pub versions: u64,
+    pub delete_markers: u64,
+    /// As [`UsageCounters::logical_bytes`], for this bucket's versions.
+    pub logical_bytes: u64,
+    pub referenced_bytes: u64,
+}
+
+impl BucketCounters {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// Applies `delta` like [`UsageCounters::apply`]: decrements saturate at zero and are
+    /// reported as shortfalls.
+    pub fn apply(
+        &mut self,
+        delta: &BucketDelta,
+    ) -> Result<Vec<CounterShortfall>, UsageCounterError> {
+        let objects = apply_delta("objects", self.objects, delta.objects)?;
+        let versions = apply_delta("versions", self.versions, delta.versions)?;
+        let markers = apply_delta("delete_markers", self.delete_markers, delta.delete_markers)?;
+        let logical_bytes = apply_delta("logical_bytes", self.logical_bytes, delta.logical_bytes)?;
+        let referenced_bytes = apply_delta(
+            "referenced_bytes",
+            self.referenced_bytes,
+            delta.referenced_bytes,
+        )?;
+        self.objects = objects.0;
+        self.versions = versions.0;
+        self.delete_markers = markers.0;
+        self.logical_bytes = logical_bytes.0;
+        self.referenced_bytes = referenced_bytes.0;
+        Ok([
+            objects.1,
+            versions.1,
+            markers.1,
+            logical_bytes.1,
+            referenced_bytes.1,
+        ]
+        .into_iter()
+        .flatten()
+        .collect())
+    }
+}
+
+/// A change of [`BucketCounters`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BucketDelta {
+    pub objects: i128,
+    pub versions: i128,
+    pub delete_markers: i128,
+    pub logical_bytes: i128,
+    pub referenced_bytes: i128,
+}
+
+impl BucketDelta {
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            objects: self.objects.saturating_add(other.objects),
+            versions: self.versions.saturating_add(other.versions),
+            delete_markers: self.delete_markers.saturating_add(other.delete_markers),
+            logical_bytes: self.logical_bytes.saturating_add(other.logical_bytes),
+            referenced_bytes: self.referenced_bytes.saturating_add(other.referenced_bytes),
+        }
+    }
+}
+
+/// The share of a group delta that belongs to the bucket it concerns.
+impl From<UsageDelta> for BucketDelta {
+    fn from(delta: UsageDelta) -> Self {
+        Self {
+            objects: delta.objects,
+            logical_bytes: delta.logical_bytes,
+            referenced_bytes: delta.referenced_bytes,
+            ..Default::default()
         }
     }
 }
