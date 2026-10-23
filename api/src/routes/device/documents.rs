@@ -17,7 +17,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::replica::{
-    ReplicaOrigin, ReplicaRecord, cache_budget, list_replicas, replica_size,
+    ReplicaOrigin, ReplicaRecord, cache_budget, cache_usage, list_replicas,
 };
 use aruna_operations::device::selection::{SelectionError, deselect_document, select_document};
 
@@ -51,9 +51,9 @@ pub struct DeviceDocument {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceDocumentList {
     pub documents: Vec<DeviceDocument>,
-    /// Bytes of replicas this device keeps before it evicts unselected ones.
+    /// Bytes past which this device keeps no further document it only read.
     pub cache_budget_bytes: u64,
-    /// Bytes the listed replicas take now; pinned ones may push it above the budget.
+    /// Bytes the replicas and their local graphs take now; selected ones may exceed the budget.
     pub cache_used_bytes: u64,
 }
 
@@ -109,8 +109,10 @@ for.
 - A document the owner only read is a cache: while the realm answers, reads go to the realm and
   refresh the copy; while it does not, the copy answers.
 - `cacheBudgetBytes` is the owner's `ARUNA_DEVICE_CACHE_BYTES` setting, 2 GB (2,000,000,000 bytes)
-  by default. Above it, unselected documents without unpublished edits are evicted, least recently
-  used first. Selected and edited documents are never evicted and never refused for space."#,
+  by default. `cacheUsedBytes` counts the listed copies and every local graph this device installed,
+  including graphs of documents no longer listed, because a graph is not removed locally yet.
+- Once the usage reaches the budget, a document the owner only reads is no longer kept. Copies
+  already here stay; selected and edited documents are never refused for space."#,
     responses(
         (status = 200, description = "Every replica this device holds, selected or not", body = DeviceDocumentList,
             example = json!({
@@ -138,12 +140,15 @@ async fn list_documents(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<Json<DeviceDocumentList>> {
     require_owner(&state, auth).await?;
-    let replicas = list_replicas(&state.get_ctx())
+    let context = state.get_ctx();
+    let replicas = list_replicas(&context)
         .await
         .ok_or(ServerError::ServiceUnavailable)?;
     Ok(Json(DeviceDocumentList {
         cache_budget_bytes: cache_budget(),
-        cache_used_bytes: replicas.iter().map(replica_size).sum(),
+        cache_used_bytes: cache_usage(&context)
+            .await
+            .ok_or(ServerError::ServiceUnavailable)?,
         documents: replicas.into_iter().map(DeviceDocument::from).collect(),
     }))
 }

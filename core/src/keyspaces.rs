@@ -281,6 +281,10 @@ pub const REALM_MARKER_KEYSPACE: &str = "device_realm_marker";
 /// only address it has for a management-only route.
 pub const MANAGEMENT_URL_KEYSPACE: &str = "device_management_urls";
 
+/// Realm-document fetches that every realm node refused for realm membership, keyed by realm
+/// id. Two without a successful fetch between them report the device as removed.
+pub const REALM_REMOVAL_KEYSPACE: &str = "device_realm_removal";
+
 /// The one row a device keeps about its exchange with the realm: when the realm
 /// last answered, when the last pass finished, and whether one is in flight.
 pub const SYNC_STATE_KEYSPACE: &str = "device_sync_state";
@@ -290,9 +294,9 @@ pub const SYNC_STATE_KEYSPACE: &str = "device_sync_state";
 /// how far this device has synced each replica.
 pub const DEVICE_REPLICA_KEYSPACE: &str = "device_replica";
 
-/// When each device replica was last read or installed, keyed like `device_replica`. Over the
-/// cache budget, the least recently used unselected replica is evicted first.
-pub const DEVICE_REPLICA_USE_KEYSPACE: &str = "device_replica_use";
+/// Bytes of the local graph each device replica installed, keyed like `device_replica`. The
+/// graph stays when its replica row goes, so its bytes stay counted against the cache budget.
+pub const DEVICE_GRAPH_KEYSPACE: &str = "device_graph_size";
 
 /// Device-local bindings of a directory to a realm bucket prefix, keyed by
 /// folder id. Never replicated: the root path must not leave the machine.
@@ -553,9 +557,10 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DEVICE_FENCE_KEYSPACE,
     REALM_MARKER_KEYSPACE,
     MANAGEMENT_URL_KEYSPACE,
+    REALM_REMOVAL_KEYSPACE,
     SYNC_STATE_KEYSPACE,
     DEVICE_REPLICA_KEYSPACE,
-    DEVICE_REPLICA_USE_KEYSPACE,
+    DEVICE_GRAPH_KEYSPACE,
     SYNCED_FOLDER_KEYSPACE,
     SYNC_BASE_KEYSPACE,
     SYNC_UPLOAD_KEYSPACE,

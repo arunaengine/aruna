@@ -14,8 +14,8 @@ use crate::driver::DriverContext;
 
 use super::refresh::{RefreshOutcome, refresh_replica, refusal_reason};
 use super::replica::{
-    ReplicaOrigin, ReplicaRecord, ReplicaState, delete_replica, enforce_budget, read_replica,
-    store_replica, touch_replica,
+    ReplicaOrigin, ReplicaRecord, ReplicaState, cache_budget, cache_usage, delete_replica,
+    read_replica, store_replica,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
@@ -99,12 +99,12 @@ pub async fn deselect_document(
 }
 
 /// Keeps a document the owner just read online as an unselected replica, so it stays readable
-/// offline. A stale copy is refreshed; the cache then evicts down to the owner's budget.
+/// offline. A stale copy is refreshed; a new one is kept only while the cache budget allows.
 pub async fn keep_read(context: &Arc<DriverContext>, record: &MetadataRegistryRecord) {
     let document_id = record.document_id;
     match read_replica(context, document_id).await {
         // A pinned or edited copy follows the refresh beat instead.
-        Some(replica) if replica.selected || replica.pending_edits > 0 => return,
+        Some(replica) if replica.selected || replica.pending_edits > 0 => {}
         Some(replica)
             if replica
                 .record
@@ -114,6 +114,13 @@ pub async fn keep_read(context: &Arc<DriverContext>, record: &MetadataRegistryRe
             refresh_replica(context, document_id).await;
         }
         None => {
+            // A graph cannot be removed locally yet, so a full cache takes no new copy.
+            if cache_usage(context)
+                .await
+                .is_none_or(|used| used >= cache_budget())
+            {
+                return;
+            }
             let mut provisional = ReplicaRecord::new(
                 document_id,
                 record.group_id,
@@ -126,12 +133,9 @@ pub async fn keep_read(context: &Arc<DriverContext>, record: &MetadataRegistryRe
             }
             if refresh_replica(context, document_id).await != RefreshOutcome::Installed {
                 delete_replica(context, document_id).await;
-                return;
             }
         }
     }
-    touch_replica(context, document_id).await;
-    enforce_budget(context).await;
 }
 
 /// Selects a document this device created, once the realm has accepted it.

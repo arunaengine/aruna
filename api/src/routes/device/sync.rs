@@ -14,6 +14,7 @@ use utoipa_axum::routes;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_operations::device::realm_documents::realm_removed;
 use aruna_operations::device::sync_status::{
     DatasetRow, DocumentRow, SyncStatus, start_sync_run, sync_status,
 };
@@ -71,6 +72,8 @@ pub struct DeviceSyncDataset {
 pub struct DeviceSyncStatus {
     /// Whether the realm answered this device within the last poll window.
     pub realm_reachable: bool,
+    /// Whether the realm nodes keep refusing this device's realm membership.
+    pub removed_from_realm: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_sync_ms: Option<u64>,
     /// Documents still queued plus the files the folders have not exchanged.
@@ -119,6 +122,7 @@ impl From<SyncStatus> for DeviceSyncStatus {
     fn from(status: SyncStatus) -> Self {
         Self {
             realm_reachable: status.realm_reachable,
+            removed_from_realm: false,
             last_sync_ms: status.last_sync_ms,
             pending_total: status.pending_total,
             documents: status.documents.into_iter().map(Into::into).collect(),
@@ -146,11 +150,15 @@ for.
 - A create the realm has not accepted yet is listed under its local draft id, because no realm
   document id exists for it.
 - A dataset's counters are the folder's own rows: uploads no realm node has pulled, files with no
-  acknowledged version, and entries waiting for the owner to resolve."#,
+  acknowledged version, and entries waiting for the owner to resolve.
+- `removedFromRealm` is true once every realm node refused this device's realm membership in two
+  fetches with no successful one between them, which is how a device learns that it was removed.
+  Nothing is wiped; the owner may wipe the device or set it up again. A successful fetch clears it."#,
     responses(
         (status = 200, description = "Every selected document and synced folder with its unfinished work", body = DeviceSyncStatus,
             example = json!({
                 "realmReachable": true,
+                "removedFromRealm": false,
                 "lastSyncMs": 1756000000000u64,
                 "pendingTotal": 2,
                 "documents": [{
@@ -185,7 +193,10 @@ async fn get_sync_status(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<Json<DeviceSyncStatus>> {
     require_owner(&state, auth).await?;
-    Ok(Json(sync_status(&state.get_ctx()).await.into()))
+    let context = state.get_ctx();
+    let mut status: DeviceSyncStatus = sync_status(&context).await.into();
+    status.removed_from_realm = realm_removed(&context, state.get_realm_id()).await;
+    Ok(Json(status))
 }
 
 #[utoipa::path(
