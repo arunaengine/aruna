@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub const HASH_BLAKE3: &str = "blake3";
 pub const HASH_MD5: &str = "md5";
@@ -60,4 +61,33 @@ impl ChecksumAlgorithm {
 pub struct ExpectedChecksum {
     pub algorithm: ChecksumAlgorithm,
     pub digest: Vec<u8>,
+}
+
+/// The first expected checksum the computed hashes do not confirm; a missing hash fails too.
+pub fn unmatched_checksum<'a>(
+    expected: &'a [ExpectedChecksum],
+    hashes: &HashMap<String, Vec<u8>>,
+) -> Option<&'a ExpectedChecksum> {
+    expected
+        .iter()
+        .find(|checksum| hashes.get(checksum.algorithm.hash_key()) != Some(&checksum.digest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unmatched_names_algorithm() {
+        let expected = vec![ExpectedChecksum {
+            algorithm: ChecksumAlgorithm::Sha256,
+            digest: vec![7; 32],
+        }];
+        let mut hashes = HashMap::from([(HASH_MD5.to_string(), vec![1; 16])]);
+        assert_eq!(unmatched_checksum(&expected, &hashes), expected.first());
+        hashes.insert(HASH_SHA256.to_string(), vec![7; 32]);
+        assert_eq!(unmatched_checksum(&expected, &hashes), None);
+        hashes.insert(HASH_SHA256.to_string(), vec![8; 32]);
+        assert_eq!(unmatched_checksum(&expected, &hashes), expected.first());
+    }
 }

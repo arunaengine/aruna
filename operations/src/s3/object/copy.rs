@@ -345,6 +345,12 @@ async fn copy_inner(
         (false, None) => Some(source.blob),
     };
 
+    // Materialized source bytes are kept only when they match every recorded full-object digest.
+    let expected_checksums = source
+        .source_metadata
+        .as_ref()
+        .map(SourceMetadata::enforced_checksums)
+        .unwrap_or_default();
     let gate = gate_context(context, input.realm_id, now_ms()).await?;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: input.user_id,
@@ -357,7 +363,7 @@ async fn copy_inner(
             content_length,
             body,
         },
-        expected_checksums: Vec::new(),
+        expected_checksums,
         checksum_type: None,
         exists: false,
         version_source,

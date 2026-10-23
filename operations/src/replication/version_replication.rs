@@ -34,6 +34,7 @@ use aruna_core::keyspaces::{
     SYNC_REFERENCE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::structs::checksum::unmatched_checksum;
 use aruna_core::structs::execution::source_access::{
     ObservationMatch, ResolvedSourceAccess, SourceMetadata,
 };
@@ -638,6 +639,8 @@ pub enum ReplicateObjectError {
     InvalidReferenceAdvance,
     #[error("Missing blob hash")]
     MissingBlobHash,
+    #[error("source bytes do not match the recorded {0} digest")]
+    DigestMismatch(&'static str),
     #[error("encrypted versions are not replicated")]
     EncryptedVersion,
     #[error("Multipart metadata incomplete: expected {expected} parts, found {actual}")]
@@ -1830,11 +1833,19 @@ impl ReplicateObjectOperation {
                     created_by,
                     source,
                     metadata,
+                    cached_metadata,
                     ..
                 } = version
                 else {
                     return self.fail(ReplicateObjectError::VersionNotFound);
                 };
+                let enforced = cached_metadata.enforced_checksums();
+                if let Some(failed) = unmatched_checksum(&enforced, &location.hashes) {
+                    self.cleanup_reference_blob = Some(location);
+                    return self.fail(ReplicateObjectError::DigestMismatch(
+                        failed.algorithm.hash_key(),
+                    ));
+                }
                 debug!(
                     bucket = %self.request.bucket,
                     key = %self.request.key,
