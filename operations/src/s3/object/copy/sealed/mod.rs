@@ -38,6 +38,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
     CopyOrigin, CopyOwner, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::hint::with_hint;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, TxnId};
@@ -208,6 +209,12 @@ impl SealedCopyOperation {
         let bucket = value
             .map(|value| BucketInfo::from_bytes(value.as_ref()))
             .transpose()?;
+        if let Some(binding) = bucket
+            .as_ref()
+            .and_then(|bucket| bucket.distribution.as_ref())
+        {
+            self.version_id = with_hint(self.version_id, binding.hint());
+        }
         let observed = GatedBucket::observe(bucket.as_ref());
         self.refs = union_refs(&observed.policies, &self.input.source_policies)?;
         let governed = !self.refs.is_empty();

@@ -1731,6 +1731,34 @@ fn empty_success_recorded() {
 }
 
 #[test]
+fn reservation_sees_destination() {
+    // The mint sees each destination, so a distributed bucket's id can carry its set hint.
+    let mut control = sample_control();
+    let destinations = vec![
+        (node_id(1), "dist".to_string(), "a".to_string()),
+        (node_id(1), "plain".to_string(), "b".to_string()),
+    ];
+    assert!(control.reserve_outputs(&destinations, |(_, bucket, _)| {
+        match bucket.as_str() {
+            "dist" => Ulid::from_parts(1, 1),
+            _ => Ulid::from_parts(2, 2),
+        }
+    }));
+    let ids: Vec<_> = control
+        .output_commits
+        .iter()
+        .map(|commit| (commit.bucket.as_str(), commit.version_id))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            ("dist", Ulid::from_parts(1, 1)),
+            ("plain", Ulid::from_parts(2, 2))
+        ]
+    );
+}
+
+#[test]
 fn reservation_is_stable() {
     // A replayed capture must reuse the reserved VersionId, never mint a second.
     let mut control = sample_control();
@@ -1739,17 +1767,17 @@ fn reservation_is_stable() {
         (output_node, "dest".to_string(), "out/a.txt".to_string()),
         (output_node, "dest".to_string(), "out/b.txt".to_string()),
     ];
-    assert!(control.reserve_outputs(&destinations, Ulid::generate));
+    assert!(control.reserve_outputs(&destinations, |_| Ulid::generate()));
     let reserved = control.output_commits.clone();
     assert_eq!(reserved.len(), 2);
-    assert!(!control.reserve_outputs(&destinations, Ulid::generate));
+    assert!(!control.reserve_outputs(&destinations, |_| Ulid::generate()));
     assert_eq!(control.output_commits, reserved);
 
     let grown = vec![(output_node, "dest".to_string(), "out/c.txt".to_string())];
-    assert!(control.reserve_outputs(&grown, Ulid::generate));
+    assert!(control.reserve_outputs(&grown, |_| Ulid::generate()));
     assert_eq!(control.output_commits[..2], reserved[..]);
     let remote = vec![(node_id(2), "dest".to_string(), "out/a.txt".to_string())];
-    assert!(control.reserve_outputs(&remote, Ulid::generate));
+    assert!(control.reserve_outputs(&remote, |_| Ulid::generate()));
 }
 
 #[test]

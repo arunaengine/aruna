@@ -56,14 +56,15 @@ impl AttemptControl {
 
     /// Reserve one VersionId per destination this execution has not committed
     /// yet, keeping every existing reservation so a replayed capture reuses it
-    /// instead of creating a second version. Reports whether anything was added.
+    /// instead of creating a second version. `mint` sees the destination, so a distributed
+    /// bucket's id carries its set hint. Reports whether anything was added.
     pub fn reserve_outputs<F>(
         &mut self,
         destinations: &[(crate::NodeId, String, String)],
         mut mint: F,
     ) -> bool
     where
-        F: FnMut() -> Ulid,
+        F: FnMut(&(crate::NodeId, String, String)) -> Ulid,
     {
         let mut reserved: BTreeSet<(crate::NodeId, String, String)> = self
             .output_commits
@@ -71,13 +72,14 @@ impl AttemptControl {
             .map(|commit| (commit.node_id, commit.bucket.clone(), commit.key.clone()))
             .collect();
         let mut changed = false;
-        for (node_id, bucket, key) in destinations {
+        for destination in destinations {
+            let (node_id, bucket, key) = destination;
             if reserved.insert((*node_id, bucket.clone(), key.clone())) {
                 self.output_commits.push(OutputCommitIntent {
                     node_id: *node_id,
                     bucket: bucket.clone(),
                     key: key.clone(),
-                    version_id: mint(),
+                    version_id: mint(destination),
                 });
                 changed = true;
             }

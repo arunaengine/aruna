@@ -28,6 +28,7 @@ use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPoli
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
@@ -152,6 +153,8 @@ pub(crate) struct PageGuards {
     pub policies: Vec<PlacementPolicyRef>,
     pub job_created_ms: u64,
     pub heads: Vec<Option<CurrentVersionPointer>>,
+    /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
+    pub set_hint: Option<SetHint>,
 }
 
 /// The rows of one page, its usage change and its outcome.
@@ -217,11 +220,12 @@ pub(crate) fn check_guards(
         .map(|value| BucketInfo::from_bytes(value.as_ref()))
         .transpose()?;
     let expected = &input.expected_bucket;
-    let policies = match bucket {
+    let (policies, set_hint) = match bucket {
         Some(bucket)
             if expected.group_id == input.group_id && bucket.identity() == expected.identity() =>
         {
-            bucket.placement_policies
+            let hint = bucket.distribution.as_ref().map(|binding| binding.hint());
+            (bucket.placement_policies, hint)
         }
         _ => return Err(PageImportError::BucketChanged),
     };
@@ -257,6 +261,7 @@ pub(crate) fn check_guards(
         policies,
         job_created_ms: record.created_at_ms,
         heads,
+        set_hint,
     })
 }
 
@@ -400,7 +405,7 @@ fn register_rows(
         Some(input.node_id),
         Some(connector.connector_id),
     );
-    let version_id = Ulid::generate();
+    let version_id = mint_version(guards.set_hint);
     let version = BlobVersion::reference(
         binding,
         entry.observation.clone(),

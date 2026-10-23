@@ -588,3 +588,38 @@ async fn replay_charges_once() {
     };
     assert_eq!(values.len(), 1);
 }
+
+#[test]
+fn guards_carry_hint() {
+    use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+
+    let mut bound = bucket();
+    bound.distribution = Some(DistributionBinding {
+        set_id: Ulid::from_bytes([5u8; 16]),
+        member_id: Ulid::from_bytes([6u8; 16]),
+        incarnation: 1,
+        revision: Default::default(),
+    });
+    let values = vec![
+        (Key::from(b"fence".to_vec()), None),
+        (
+            Key::from(b"bucket".to_vec()),
+            value(bound.to_bytes().unwrap()),
+        ),
+        (
+            Key::from(b"connector".to_vec()),
+            value(connector().to_bytes().unwrap()),
+        ),
+        (
+            Key::from(b"job".to_vec()),
+            value(record(token()).to_bytes().unwrap()),
+        ),
+        (Key::from(b"head".to_vec()), None),
+    ];
+    let input = input(vec![entry("a")]);
+    let guards = crate::staging::page_rows::check_guards(&input, values).unwrap();
+    assert_eq!(
+        guards.set_hint,
+        Some(SetHint::of_set(Ulid::from_bytes([5u8; 16])))
+    );
+}

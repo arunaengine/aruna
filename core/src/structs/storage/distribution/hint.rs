@@ -56,9 +56,14 @@ pub fn hinted_id(time_ms: u64, random: u128, hint: SetHint) -> Ulid {
 pub fn mint_version(hint: Option<SetHint>) -> Ulid {
     let fresh = Ulid::generate();
     match hint {
-        Some(hint) => hinted_id(fresh.timestamp_ms(), fresh.random(), hint),
+        Some(hint) => with_hint(fresh, hint),
         None => fresh,
     }
+}
+
+/// A freshly minted id with its hint bits set; its time and low random bits stay.
+pub fn with_hint(id: Ulid, hint: SetHint) -> Ulid {
+    hinted_id(id.timestamp_ms(), id.random(), hint)
 }
 
 /// Local index from hint to the sets that share it, built from distribution records.

@@ -181,9 +181,14 @@ async fn publishes_terminal_success() {
     .expect("attempt intent commits");
     let executor = family.target.public();
     let destinations = vec![(executor, "ws".to_string(), "out.txt".to_string())];
-    let control = reserve_output_commits(&ctx.storage_handle, physical(), &destinations)
-        .await
-        .expect("output commits reserved");
+    let control = reserve_output_commits(
+        &ctx.storage_handle,
+        physical(),
+        &destinations,
+        &Default::default(),
+    )
+    .await
+    .expect("output commits reserved");
     let outputs = vec![OutputObject {
         node_id: executor,
         bucket: "ws".to_string(),

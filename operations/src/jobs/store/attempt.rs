@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use std::collections::BTreeMap;
 
 pub async fn read_attempt_control(
     storage: &StorageHandle,
@@ -29,13 +31,18 @@ pub async fn read_attempt_control(
 /// Write-ahead one VersionId per output destination in the attempt-control
 /// transaction that already fences this physical execution. It commits before
 /// any output write, so a replayed capture reuses the reserved identities.
+/// `hints` holds the set hints of distributed destination buckets by node and bucket.
 pub async fn reserve_output_commits(
     storage: &StorageHandle,
     job_id: JobId,
     destinations: &[(NodeId, String, String)],
+    hints: &BTreeMap<(NodeId, String), SetHint>,
 ) -> Result<AttemptControl, JobMutationError> {
+    let mint = |(node_id, bucket, _): &(NodeId, String, String)| {
+        mint_version(hints.get(&(*node_id, bucket.clone())).copied())
+    };
     let (_, control) = mutate_attempt_control(storage, job_id, |_, control| {
-        match control.reserve_outputs(destinations, Ulid::generate) {
+        match control.reserve_outputs(destinations, mint) {
             true => Ok(JobMutation::Persist),
             false => Ok(JobMutation::Skip),
         }

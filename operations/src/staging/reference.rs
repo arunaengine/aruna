@@ -181,6 +181,14 @@ pub async fn write_reference_version(
             write.expected_bucket.as_ref(),
         )
         .await?;
+        if let (Some(hint), Some(planned)) = (set_hint, write.preassigned_version_id)
+            && SetHint::of_version(planned) != hint
+        {
+            return Err(StorageError::WriteError(
+                "planned reference version lacks the set hint".into(),
+            )
+            .into());
+        }
         let version_id = write
             .preassigned_version_id
             .unwrap_or_else(|| mint_version(set_hint));

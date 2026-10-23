@@ -484,3 +484,36 @@ async fn governed_copy_registered() {
 
 #[path = "abe_tests.rs"]
 mod abe;
+
+#[test]
+fn copy_carries_hint() {
+    use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+    use aruna_core::structs::storage::format::Compression;
+
+    let mut operation = SealedCopyOperation::new(input(&sealed_location(), Ulid::generate()));
+    let minted = operation.version_id;
+    operation.start();
+    let info = BucketInfo {
+        group_id: Ulid::from_bytes([2; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(DistributionBinding {
+            set_id: Ulid::from_bytes([5u8; 16]),
+            member_id: Ulid::from_bytes([6u8; 16]),
+            incarnation: 1,
+            revision: Default::default(),
+        }),
+    };
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: Vec::<u8>::new().into(),
+        value: Some(info.to_bytes().unwrap().into()),
+    }));
+    let hint = SetHint::of_set(Ulid::from_bytes([5u8; 16]));
+    assert_eq!(SetHint::of_version(operation.version_id), hint);
+    assert_eq!(operation.version_id.timestamp_ms(), minted.timestamp_ms());
+}

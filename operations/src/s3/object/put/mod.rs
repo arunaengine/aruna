@@ -659,6 +659,12 @@ impl PutObjectOperation {
             .as_ref()
             .and_then(|bucket| bucket.distribution.as_ref())
             .map(DistributionBinding::hint);
+        // A planned id is minted before the write; inside a set it must already carry the hint.
+        if let (Some(hint), Some(id)) = (self.set_hint, self.config.preassigned_version_id)
+            && SetHint::of_version(id) != hint
+        {
+            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
+        }
         let group_id = bucket
             .as_ref()
             .map_or(self.config.group_id, |bucket| bucket.group_id);
@@ -2660,6 +2666,37 @@ mod decision_tests {
             config.finalize(),
             Err(PutObjectError::PolicyGate(PolicyGateError::NoSubject))
         ));
+    }
+
+    #[test]
+    fn planned_id_needs_hint() {
+        // A planned id in a distributed bucket must already carry the set hint.
+        use aruna_core::structs::storage::distribution::hint::with_hint;
+        use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+        let set_id = Ulid::from_bytes([5u8; 16]);
+        let planned = |id: Ulid| {
+            let mut operation = operation("eu-west");
+            operation.config.preassigned_version_id = Some(id);
+            operation.start();
+            operation.step(read(None));
+            let mut info = BucketInfo::from_bytes(&bucket(Vec::new(), 0)).unwrap();
+            info.distribution = Some(DistributionBinding {
+                set_id: set_id,
+                member_id: Ulid::from_bytes([6u8; 16]),
+                incarnation: 1,
+                revision: Default::default(),
+            });
+            operation.step(read(Some(ByteView::from(info.to_bytes().unwrap()))));
+            operation
+        };
+        let hint = SetHint::of_set(set_id);
+        let plain = Ulid::from_parts(1, 0);
+        assert_ne!(SetHint::of_version(plain), hint);
+        assert!(matches!(
+            planned(plain).finalize(),
+            Err(PutObjectError::InvalidPreassignedVersion)
+        ));
+        assert!(!planned(with_hint(plain, hint)).is_complete());
     }
 
     #[test]
