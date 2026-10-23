@@ -663,18 +663,31 @@ pub async fn get_job(
     let job = read_bucket_job(&context, &rule.bucket)
         .await
         .map_err(ServerError::InternalError)?;
+    match job {
+        Some(job) => Ok(Json(Some(shown(&context, &rule.bucket, job).await?))),
+        None => Ok(Json(None)),
+    }
+}
+
+/// The job as the routes show it, with the files a rename planned to rename where its start
+/// stored them for its move.
+async fn shown(
+    context: &aruna_operations::driver::DriverContext,
+    bucket: &str,
+    job: BucketJob,
+) -> ServerResult<OrganizeJob> {
     let total = match &job {
-        Some(BucketJob::Rename(record, _)) => {
-            let total = rename_total(&context, &rule.bucket, record.started_at_ms).await;
+        BucketJob::Rename(record, _) => {
+            let total = rename_total(context, bucket, record.started_at_ms).await;
             total.map_err(ServerError::InternalError)?
         }
         _ => None,
     };
-    let mut job: Option<OrganizeJob> = job.map(Into::into);
-    if let (Some(job), Some(total)) = (job.as_mut(), total) {
-        (job.total, job.counted) = (total, true);
+    let mut shown = OrganizeJob::from(job);
+    if let Some(total) = total {
+        (shown.total, shown.counted) = (total, true);
     }
-    Ok(Json(job))
+    Ok(shown)
 }
 
 #[utoipa::path(
@@ -690,7 +703,8 @@ pub async fn get_job(
 - `pause` keeps the job's position; `resume` continues from it.
 - `abort` ends the job for good, also a paused one. Each key or file it finished stays finished,
   since each change is one transaction; the step in flight completes or leaves nothing behind,
-  like after a restart. The job then shows `aborted` with its counts, and a new job may start."#,
+  like after a restart. The job then shows `aborted` with its counts, and a new job may start.
+- The answer shows a rename's `total` as `GET` on the job does."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule"),
         ("import_id" = String, Path, description = "Rule whose bucket is organized"),
@@ -722,10 +736,9 @@ pub async fn control_job(
         _ => return Err(ServerError::BadRequestMessage("unknown action".to_string())),
     };
     let operation = BucketJobOperation::new(rule.bucket.clone(), rule.group_id, action, now_ms());
-    let job = drive(operation, &state.get_ctx())
-        .await
-        .map_err(job_error)?;
-    Ok(Json(job.into()))
+    let context = state.get_ctx();
+    let job = drive(operation, &context).await.map_err(job_error)?;
+    Ok(Json(shown(&context, &rule.bucket, job).await?))
 }
 
 #[utoipa::path(

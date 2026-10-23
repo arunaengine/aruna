@@ -319,4 +319,11 @@ async fn shows_rename_total() {
         put(RENAME_TOTAL_KEYSPACE, row.to_bytes().unwrap()).await;
         assert_eq!(shown().await, ("rename".to_string(), total, counted));
     }
+    // A pause answers the same total.
+    let path = Path((ids.0.clone(), ids.1.clone(), "pause".to_string()));
+    let auth = Extension(Some(test.auth.clone()));
+    let Json(paused) = control_job(State(test.state.clone()), auth, path)
+        .await
+        .unwrap();
+    assert_eq!((paused.total, paused.counted), (40, true));
 }
