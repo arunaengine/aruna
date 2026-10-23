@@ -1771,7 +1771,7 @@ pub async fn process_migrations(
             let mut retired = record;
             retired.retry_at_ms = None;
             retired.finished_at_ms = Some(now);
-            store_progress(context, &bucket, &retired).await?;
+            store_progress(context, &bucket, &retired, None).await?;
             continue;
         }
         if let Some(after) = migrate_page(context, &bucket, record, MIGRATION_TIME).await? {
@@ -1859,7 +1859,7 @@ async fn migrate_page(
             return Ok(Some(MIGRATION_CONTINUE));
         }
         record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
-        store_progress(context, bucket, &record).await?;
+        store_progress(context, bucket, &record, None).await?;
         return Ok(None);
     }
     // A due retry pass counts its own skips and failures.
@@ -1872,7 +1872,7 @@ async fn migrate_page(
             Some(routing) => Some(routing),
             None => {
                 record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
-                store_progress(context, bucket, &record).await?;
+                store_progress(context, bucket, &record, None).await?;
                 return Ok(None);
             }
         },
@@ -2025,14 +2025,13 @@ async fn migrate_page(
         cursor: record.cursor.clone(),
         ..ahead
     };
-    store_ahead(context, bucket, &ahead).await?;
     let more = next.is_some() || done < versions.len();
     if stopped {
         let aborted = rename_request(context, bucket, &record).await?;
         if aborted.is_some_and(|request| request.aborted_at_ms.is_some()) {
             return end_aborted(context, bucket, record).await;
         }
-        store_progress(context, bucket, &record).await?;
+        store_progress(context, bucket, &record, Some(&ahead)).await?;
         return Ok(None);
     }
     if denied > 0 {
@@ -2066,7 +2065,7 @@ async fn migrate_page(
             }
         }
     };
-    store_progress(context, bucket, &record).await?;
+    store_progress(context, bucket, &record, Some(&ahead)).await?;
     Ok(after)
 }
 
@@ -2089,10 +2088,11 @@ async fn read_ahead(
     }
 }
 
-/// Stores the rows a run finished after its cursor, before its progress, so a run whose
-/// progress was not stored never passes over them; without any the row goes.
-async fn store_ahead(
-    context: &crate::driver::DriverContext,
+/// Writes the rows a run finished after its cursor in `txn_id`, the transaction of its progress,
+/// so they count exactly when the progress does; without any the row goes.
+async fn stage_ahead(
+    storage: &aruna_storage::StorageHandle,
+    txn_id: TxnId,
     bucket: &str,
     ahead: &MigrationAhead,
 ) -> Result<(), String> {
@@ -2102,16 +2102,16 @@ async fn store_ahead(
         true => StorageEffect::Delete {
             key_space: space,
             key,
-            txn_id: None,
+            txn_id: Some(txn_id),
         },
         false => StorageEffect::Write {
             key_space: space,
             key,
             value: ahead.to_bytes().map_err(|error| error.to_string())?.into(),
-            txn_id: None,
+            txn_id: Some(txn_id),
         },
     };
-    match context.storage_handle.send_storage_effect(effect).await {
+    match storage.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
             Ok(())
         }
@@ -2131,7 +2131,7 @@ async fn end_aborted(
     }
     record.retry_at_ms = None;
     record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
-    store_progress(context, bucket, &record).await?;
+    store_progress(context, bucket, &record, None).await?;
     Ok(None)
 }
 
@@ -2546,10 +2546,12 @@ pub async fn move_routing(
     snapshot.map(Some).map_err(|error| error.to_string())
 }
 
+/// Stores the progress, with the rows a run finished `ahead` of its cursor where given.
 async fn store_progress(
     context: &crate::driver::DriverContext,
     bucket: &str,
     record: &CompressionMigration,
+    ahead: Option<&MigrationAhead>,
 ) -> Result<(), String> {
     let storage = &context.storage_handle;
     let txn_id = match storage
@@ -2559,7 +2561,7 @@ async fn store_progress(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         other => return Err(format!("could not start a progress transaction: {other:?}")),
     };
-    let staged = stage_progress(storage, txn_id, bucket, record).await;
+    let staged = stage_progress(storage, txn_id, bucket, record, ahead).await;
     if !matches!(staged, Ok(true)) {
         storage
             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -2575,12 +2577,14 @@ async fn store_progress(
     }
 }
 
-/// Writes the progress in `txn_id`. Returns `false` when a newer setting replaced the record.
+/// Writes the progress, and the rows `ahead` where given, in `txn_id`. Returns `false` when a
+/// newer setting replaced the record.
 async fn stage_progress(
     storage: &aruna_storage::StorageHandle,
     txn_id: TxnId,
     bucket: &str,
     record: &CompressionMigration,
+    ahead: Option<&MigrationAhead>,
 ) -> Result<bool, String> {
     let key: Key = bucket.as_bytes().to_vec().into();
     let current = storage
@@ -2616,6 +2620,9 @@ async fn stage_progress(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => {}
         other => return Err(format!("could not write migration progress: {other:?}")),
+    }
+    if let Some(ahead) = ahead {
+        stage_ahead(storage, txn_id, bucket, ahead).await?;
     }
     // A finished migration leaves the queue and its rename request with its last progress;
     // the request of an aborted rename stays to show the abort.
@@ -3262,7 +3269,10 @@ mod tests {
                 rows: vec![row(1).to_bytes().unwrap()],
                 ..MigrationAhead::default()
             };
-            store_ahead(&context, "b", &ahead).await.unwrap();
+            let ahead = ahead.to_bytes().unwrap();
+            storage
+                .send_storage_effect(write(MIGRATION_AHEAD_KEYSPACE, b"b".to_vec(), ahead))
+                .await;
             let after = migrate_page(&context, "b", record, Duration::MAX).await;
             assert_eq!(after.unwrap(), None);
             let stored = read_progress(&context, &key).await.unwrap().unwrap();
@@ -3270,6 +3280,59 @@ mod tests {
             assert_eq!(stored.cursor, Some(row(2).to_bytes().unwrap()));
             assert_eq!(read_ahead(&context, "b").await.unwrap(), None);
         }
+    }
+
+    #[tokio::test]
+    async fn survives_lost_progress() {
+        // Rows ahead are stored with the progress: a run whose progress is lost leaves them as
+        // they were, so the run that repeats it counts each row once.
+        let temp = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let context = crate::tests::s3::test_context(storage.clone());
+        let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
+        let row = |index: u64| VersionKey::new("b", format!("k{index}"), Ulid::from_parts(1, 1));
+        let write = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        for index in 0..3 {
+            let version = row(index).to_bytes().unwrap();
+            let effect = write(BLOB_VERSIONS_KEYSPACE, version, deleted.to_bytes().unwrap());
+            storage.send_storage_effect(effect).await;
+        }
+        // An earlier run counted k0 and k2 while k1 still ran.
+        let mut record = CompressionMigration::new(ZSTD, 1);
+        (record.cursor, record.skipped) = (Some(row(0).to_bytes().unwrap()), 2);
+        let ahead = MigrationAhead {
+            started_at_ms: 1,
+            cursor: record.cursor.clone(),
+            rows: vec![row(2).to_bytes().unwrap()],
+            ..MigrationAhead::default()
+        };
+        let ahead = ahead.to_bytes().unwrap();
+        storage
+            .send_storage_effect(write(MIGRATION_AHEAD_KEYSPACE, b"b".to_vec(), ahead))
+            .await;
+        // Without its progress row the next run stores nothing, as if it stopped before storing.
+        let key: Key = b"b".to_vec().into();
+        let lost = migrate_page(&context, "b", record.clone(), Duration::MAX).await;
+        assert_eq!(lost.unwrap(), None);
+        assert_eq!(read_progress(&context, &key).await.unwrap(), None);
+        let progress = record.to_bytes().unwrap();
+        storage
+            .send_storage_effect(write(
+                COMPRESSION_MIGRATION_KEYSPACE,
+                b"b".to_vec(),
+                progress,
+            ))
+            .await;
+        let after = migrate_page(&context, "b", record, Duration::MAX).await;
+        assert_eq!(after.unwrap(), None);
+        let stored = read_progress(&context, &key).await.unwrap().unwrap();
+        assert_eq!(stored.skipped, 3);
+        assert_eq!(read_ahead(&context, "b").await.unwrap(), None);
     }
 
     #[tokio::test]
