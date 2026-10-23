@@ -188,9 +188,9 @@ impl From<PublishedRun> for PublishRunResponse {
 fn map_publish_error(error: PublishRunError) -> ServerError {
     match error {
         PublishRunError::NotFound => ServerError::NotFound,
-        PublishRunError::NotFinished | PublishRunError::Collision(_) => {
-            ServerError::Conflict(error.to_string())
-        }
+        PublishRunError::NotFinished
+        | PublishRunError::Collision(_)
+        | PublishRunError::TargetChanged => ServerError::Conflict(error.to_string()),
         PublishRunError::NotRealmNode(_)
         | PublishRunError::Refused {
             refusal: SyncRefusal::NotFound | SyncRefusal::Invalid(_),
@@ -231,8 +231,9 @@ for.
   different device buckets never meet. The bucket must exist there and grant the owner WRITE under
   `prefix`; that is checked before anything is copied, also for a run without outputs.
 - Once every output is copied, the run crate is created in the realm and names the realm copies.
-- A repeated request is safe: an output the realm already copied answers with its existing version
-  and a crate already written is not written again.
+- The first request freezes its target before anything is copied. Repeating it is safe and answers
+  with the copies already made; a crate already written is not written again. A request naming
+  another node, bucket or prefix for the same run is refused with 409.
 - A run that has not finished, whose crate is still being prepared, or with two outputs on one
   key is refused with 409."#,
     params(("job_id" = String, Path, description = "Job id of the local run: a 26-character ULID; an unparseable id is 404")),
@@ -256,7 +257,7 @@ for.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the device owner, or the realm refused the owner's write", body = ErrorResponse),
         (status = 404, description = "No such local run, or this node is not a user node", body = ErrorResponse),
-        (status = 409, description = "The run has not finished, or two outputs share one key", body = ErrorResponse),
+        (status = 409, description = "The run has not finished, two outputs share one key, or it is published to another target", body = ErrorResponse),
         (status = 502, description = "The realm node could not be reached", body = ErrorResponse),
         (status = 503, description = "The realm node or this device could not finish the publish now", body = ErrorResponse)
     ),

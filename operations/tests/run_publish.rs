@@ -247,6 +247,14 @@ async fn publishes_local_run() -> TestResult<()> {
         read_crate_status(&device.context.storage_handle, job_id).await?,
         Some(published.run_crate)
     );
+
+    // The first target is frozen: another prefix would leave the crate naming the first copies.
+    let mut moved = input();
+    moved.target.prefix = "runs/other".to_string();
+    assert!(matches!(
+        publish_run(&device.context, moved).await,
+        Err(PublishRunError::TargetChanged)
+    ));
     Ok(())
 }
 

@@ -7,15 +7,19 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::keyspaces::RUN_PUBLISH_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::{
-    JobId, JobPayload, JobResultPayload, OutputObject, RunCrateStatus,
+    JobId, JobPayload, JobResultPayload, OutputObject, RunCrateStatus, run_crate_key,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::data_identity::parse_hash;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{RemoteBinding, SyncRefusal};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -51,6 +55,8 @@ pub enum PublishRunError {
     Refused { key: String, refusal: SyncRefusal },
     #[error("the realm node is unreachable: {0}")]
     Unreachable(String),
+    #[error("this run is already being published to another target")]
+    TargetChanged,
     #[error("two outputs of the run would land on {0}")]
     Collision(String),
     #[error("the run crate was not written: {0}")]
@@ -114,16 +120,37 @@ pub async fn publish_run(
         path_restrictions: None,
         session: None,
     };
-    let outputs = match &record.result {
-        Some(JobResultPayload::Execution { outputs, .. }) => outputs.clone(),
-        _ => Vec::new(),
-    };
-    let keys = target_keys(&input.target, &outputs)?;
-    check_bucket(context, &auth, &input.target).await?;
-    let mut copies = Vec::with_capacity(outputs.len());
-    for (output, key) in outputs.iter().zip(keys) {
-        copies.push(pull_output(context, &auth, &input.target, output, key).await?);
+    let frozen = read_frozen(context, input.job_id).await?;
+    if frozen
+        .as_ref()
+        .is_some_and(|frozen| frozen.target != input.target)
+    {
+        return Err(PublishRunError::TargetChanged);
     }
+    let copies = match frozen.and_then(|frozen| frozen.copies) {
+        // A repeated publish answers with the copies already made.
+        Some(copies) => copies,
+        None => {
+            let outputs = match &record.result {
+                Some(JobResultPayload::Execution { outputs, .. }) => outputs.clone(),
+                _ => Vec::new(),
+            };
+            let keys = target_keys(&input.target, &outputs)?;
+            check_bucket(context, &auth, &input.target).await?;
+            let mut frozen = FrozenPublish {
+                target: input.target.clone(),
+                copies: None,
+            };
+            store_frozen(context, input.job_id, &frozen).await?;
+            let mut copies = Vec::with_capacity(outputs.len());
+            for (output, key) in outputs.iter().zip(keys) {
+                copies.push(pull_output(context, &auth, &input.target, output, key).await?);
+            }
+            frozen.copies = Some(copies.clone());
+            store_frozen(context, input.job_id, &frozen).await?;
+            copies
+        }
+    };
     if let Some(written @ RunCrateStatus::Written { .. }) = status {
         return Ok(PublishedRun {
             outputs: copies,
@@ -149,6 +176,59 @@ pub async fn publish_run(
         outputs: copies,
         run_crate,
     })
+}
+
+/// The target one publish froze before its first copy, and the copies once all are made.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FrozenPublish {
+    target: RemoteBinding,
+    copies: Option<Vec<OutputObject>>,
+}
+
+async fn read_frozen(
+    context: &Arc<DriverContext>,
+    job_id: JobId,
+) -> Result<Option<FrozenPublish>, PublishRunError> {
+    let unavailable = |reason: String| PublishRunError::Unavailable(reason);
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: RUN_PUBLISH_KEYSPACE.to_string(),
+            key: run_crate_key(job_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => postcard::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|error| unavailable(error.to_string())),
+        other => Err(unavailable(format!("{other:?}"))),
+    }
+}
+
+async fn store_frozen(
+    context: &Arc<DriverContext>,
+    job_id: JobId,
+    frozen: &FrozenPublish,
+) -> Result<(), PublishRunError> {
+    let bytes = postcard::to_allocvec(frozen)
+        .map_err(|error| PublishRunError::Unavailable(error.to_string()))?;
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: RUN_PUBLISH_KEYSPACE.to_string(),
+            key: run_crate_key(job_id),
+            value: bytes.into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        other => Err(PublishRunError::Unavailable(format!("{other:?}"))),
+    }
 }
 
 /// The realm key of every output, `<prefix>/<source bucket>/<key>`, so outputs of different

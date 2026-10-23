@@ -338,6 +338,10 @@ pub const JOB_INDEX_KEYSPACE: &str = "job_owner_index";
 pub const ACTIVE_USER_KEYSPACE: &str = "job_active_user";
 pub const DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const RUN_CRATE_KEYSPACE: &str = "job_run_crate";
+
+/// The realm target a device froze for publishing one local run, and the copies it made,
+/// keyed like `job_run_crate`. Device-local and never replicated.
+pub const RUN_PUBLISH_KEYSPACE: &str = "job_run_publish";
 pub const ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
 /// Signed immutable output records, keyed by ExecutionId.
 pub const OUTPUT_RECORD_KEYSPACE: &str = "job_output_records";
@@ -570,6 +574,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ACTIVE_USER_KEYSPACE,
     DEDUP_INDEX_KEYSPACE,
     RUN_CRATE_KEYSPACE,
+    RUN_PUBLISH_KEYSPACE,
     ATTEMPT_CONTROL_KEYSPACE,
     OUTPUT_RECORD_KEYSPACE,
     JOB_ENTRY_KEYSPACE,
