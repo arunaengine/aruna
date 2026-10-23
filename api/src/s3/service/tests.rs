@@ -804,17 +804,18 @@ async fn newer_refresh_updates() {
     let test = setup_state();
     let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
     let refreshed_at = UNIX_EPOCH + Duration::from_secs(30);
-    let new_metadata = source_metadata(20, "newer");
-    write_reference_version(&test, source_metadata(10, "original"), last_refresh).await;
+    // A confirmed observation moves the refresh time; the version's fields stay as recorded.
+    let original = source_metadata(10, "original");
+    write_reference_version(&test, original.clone(), last_refresh).await;
 
     refresh_reference_metadata(
         test.context.clone(),
-        refresh(&test, new_metadata.clone(), refreshed_at),
+        refresh(&test, original.clone(), refreshed_at),
     )
     .await
     .unwrap();
 
-    assert_reference_state(&test, &new_metadata, refreshed_at).await;
+    assert_reference_state(&test, &original, refreshed_at).await;
 }
 
 fn setup_state() -> TestState {

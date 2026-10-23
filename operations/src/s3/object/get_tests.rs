@@ -22,7 +22,7 @@ use aruna_core::events::SubOperationEvent;
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    REPLICATION_OBLIGATION_KEYSPACE,
+    CONNECTOR_REFERENCE_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
@@ -1001,11 +1001,12 @@ async fn bound_connector_used() {
     let key = "test.txt".to_string();
     let version_id = Ulid::generate();
     let connector_id = Ulid::generate();
+    // The test source sends no Last-Modified, so the recorded observation has none either.
     let cached_metadata = SourceMetadata {
         content_length: 15,
         content_type: Some("text/plain".to_string()),
         etag: Some("etag-123".to_string()),
-        last_modified: Some(SystemTime::UNIX_EPOCH),
+        last_modified: None,
         source_version: None,
         digests: Default::default(),
     };
@@ -1515,10 +1516,12 @@ fn advance_writes_obligation() {
         (_, _, version_value),
         (_, _, head_value),
         (key_space, _, obligation_value),
+        (reference_space, ..),
     ] = writes.as_slice()
     else {
-        panic!("expected version, head and obligation writes, got {writes:?}")
+        panic!("expected version, head, obligation and reference writes, got {writes:?}")
     };
+    assert_eq!(reference_space, CONNECTOR_REFERENCE_KEYSPACE);
     let successor = BlobVersion::from_bytes(version_value.as_ref()).unwrap();
     assert_eq!(successor.created_by, creator);
     assert_ne!(successor.created_by, operation.input.user_identity);
@@ -1747,7 +1750,7 @@ fn historical_read_fails() {
     let mut operation = drifted_operation();
     let headed = observation(9);
     let mut read = headed.clone();
-    read.content_type = Some("changed/type".to_string());
+    read.etag = Some("changed-etag".to_string());
     operation.advance_observation = None;
     operation.reference_explicit = true;
     operation.source_metadata = Some(headed);

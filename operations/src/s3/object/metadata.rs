@@ -1089,17 +1089,17 @@ mod tests {
         let last_refresh = SystemTime::UNIX_EPOCH;
         let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let new_metadata = source_metadata(30, "newer");
-        write_reference_version(&test, source_metadata(1, "original"), last_refresh, 0).await;
+        let original = source_metadata(1, "original");
+        write_reference_version(&test, original.clone(), last_refresh, 0).await;
 
         crate::driver::drive(
-            QueueRefreshOperation::new(refresh(&test, new_metadata.clone(), newer)),
+            QueueRefreshOperation::new(refresh(&test, original.clone(), newer)),
             &test.context,
         )
         .await
         .expect("newer queue succeeds");
         crate::driver::drive(
-            QueueRefreshOperation::new(refresh(&test, source_metadata(10, "older"), older)),
+            QueueRefreshOperation::new(refresh(&test, original.clone(), older)),
             &test.context,
         )
         .await
@@ -1110,7 +1110,7 @@ mod tests {
 
         let result = process_batch(&test.context).await.expect("drain succeeds");
         assert_eq!(result.succeeded, 2);
-        assert_reference_state(&test, &new_metadata, newer).await;
+        assert_reference_state(&test, &original, newer).await;
     }
 
     #[tokio::test]
