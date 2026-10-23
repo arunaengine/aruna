@@ -3314,9 +3314,6 @@ fn materialized_trace() {
     assert_eq!(result.group_id, Some(group_id));
 }
 
-/// Constructor-to-finalize trace of a delete marker: no blob is
-/// transferred, the head is cleared and the apply acknowledgement closes
-/// the stream.
 /// The existing row of the version id is read with its marker status, which the bucket's
 /// version and marker counts follow when the incoming row replaces it.
 #[test]
@@ -3531,6 +3528,9 @@ fn stalled_head_liveness() {
     }
 }
 
+/// Constructor-to-finalize trace of a delete marker: no blob is
+/// transferred, the head is cleared and the apply acknowledgement closes
+/// the stream.
 #[test]
 fn delete_marker_trace() {
     let stream_id = trace_stream_id();
