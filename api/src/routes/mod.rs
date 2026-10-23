@@ -282,6 +282,7 @@ pub(crate) mod tests {
         ("GET", "/device/folders/{folder_id}"),
         ("GET", "/device/folders/{folder_id}/actions"),
         ("GET", "/device/folders/{folder_id}/entries"),
+        ("GET", "/device/origins/{version_id}"),
         ("GET", "/device/sync/status"),
         ("GET", "/device/transfers"),
         ("GET", "/ga4gh/drs/v1/download"),

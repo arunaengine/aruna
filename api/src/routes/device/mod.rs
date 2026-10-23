@@ -6,6 +6,7 @@ pub mod documents;
 pub mod drafts;
 pub mod dto;
 pub mod folders;
+pub mod origins;
 pub mod sync;
 pub mod transfers;
 pub mod wipe;
@@ -29,6 +30,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(documents::router())
         .merge(drafts::router())
         .merge(folders::router())
+        .merge(origins::router())
         .merge(sync::router())
         .merge(transfers::router())
         .merge(wipe::router())
@@ -55,6 +57,7 @@ mod tests {
             "/device/folders/{folder_id}/pause",
             "/device/folders/{folder_id}/resume",
             "/device/folders/{folder_id}/sync",
+            "/device/origins/{version_id}",
             "/device/transfers",
             "/device/wipe",
         ] {

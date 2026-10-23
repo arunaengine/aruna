@@ -306,6 +306,10 @@ pub const SYNC_LOG_KEYSPACE: &str = "sync_action_log";
 /// key, source device and version, and the delete flag. Written with the version it names.
 pub const SYNC_RECEIPT_KEYSPACE: &str = "sync_pull_receipts";
 
+/// Which local file each realm version this device published came from, keyed by realm
+/// version id. Never replicated: the path must not leave the machine.
+pub const SYNC_ORIGIN_KEYSPACE: &str = "sync_local_origins";
+
 pub const SOURCE_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_SECRET_KEYSPACE: &str = "source_connector_secret";
 
@@ -547,6 +551,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SYNC_UPLOAD_KEYSPACE,
     SYNC_LOG_KEYSPACE,
     SYNC_RECEIPT_KEYSPACE,
+    SYNC_ORIGIN_KEYSPACE,
     SOURCE_INDEX_KEYSPACE,
     SOURCE_SECRET_KEYSPACE,
     CONNECTOR_INDEX_KEYSPACE,

@@ -2,10 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::StructuredId;
 use aruna_core::errors::AuthorizationError;
+use aruna_core::id::NodeId;
+use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
     ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
     RunCrateStatus,
@@ -29,7 +31,7 @@ const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket"
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{put_crate_status, read_crate_status, read_job_record};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::drive;
+use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
@@ -37,6 +39,7 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
+use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
 /// records a durable status and never fails the parent; this internal job succeeds
@@ -162,7 +165,15 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         });
     }
 
-    let jsonld = build_crate_jsonld(&parent, spec, document_id);
+    let devices = match input_devices(context, &parent, spec, node_id).await {
+        Ok(devices) => devices,
+        Err(error) => {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "run crate input provenance read failed: {error}"
+            )));
+        }
+    };
+    let jsonld = build_crate_jsonld(&parent, spec, document_id, &devices);
 
     let (status, resource) = match route_metadata_create(
         CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
@@ -231,7 +242,55 @@ fn is_transient(error: &MetadataWriteError) -> bool {
 
 /// RO-Crate 1.2 JSON-LD conforming to the Process Run Crate 0.5 profile. No
 /// secrets are included (spec 16.10).
-fn build_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Ulid) -> String {
+/// The device each input version on this node was published from, by input destination key.
+/// A version that is gone names no device; any other read failure retries the crate.
+async fn input_devices(
+    context: &DriverContext,
+    record: &JobRecord,
+    spec: &ExecutionSpec,
+    node_id: NodeId,
+) -> Result<BTreeMap<String, String>, HeadObjectError> {
+    let mut devices = BTreeMap::new();
+    for input in &spec.inputs {
+        let InputSource::S3 { bucket, key, .. } = &input.source;
+        let captured = record.captured_inputs.iter().find(|captured| {
+            captured.destination_key == input.dest_key && captured.source_node_id == node_id
+        });
+        let Some(captured) = captured else {
+            continue;
+        };
+        let head = HeadObjectOperation::new(HeadObjectInput {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: Some(captured.version_id),
+        });
+        let metadata = match drive(head, context).await {
+            Ok(head) => head.metadata,
+            Err(
+                HeadObjectError::NoSuchKey
+                | HeadObjectError::NoSuchVersion
+                | HeadObjectError::DeleteMarker,
+            ) => continue,
+            Err(error) => return Err(error),
+        };
+        if let Some(device) = metadata.get(ORIGIN_DEVICE_TAG) {
+            devices.insert(input.dest_key.clone(), device.clone());
+        }
+    }
+    Ok(devices)
+}
+
+/// The contextual entity id of one device an input came from.
+fn device_entity(device: &str) -> String {
+    format!("#device-{device}")
+}
+
+fn build_crate_jsonld(
+    record: &JobRecord,
+    spec: &ExecutionSpec,
+    document_id: Ulid,
+    devices: &BTreeMap<String, String>,
+) -> String {
     let root = format!("https://w3id.org/aruna/{document_id}");
     let action_id = format!("#run-{}", record.job_id);
     let agent_id = format!("#agent-{}", record.created_by);
@@ -296,6 +355,7 @@ fn build_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Uli
         .apply(&mut file);
         (id, serde_json::Value::Object(file))
     };
+    let mut used_devices = BTreeSet::new();
     let mut object_ids = Vec::with_capacity(spec.inputs.len());
     let mut part_ids = Vec::new();
     let mut files = Vec::new();
@@ -309,6 +369,11 @@ fn build_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Uli
         let mut file = json!({ "@type": "File", "name": name });
         if let Some(captured) = captured {
             file["contentSize"] = json!(captured.bytes.to_string());
+        }
+        // Only the device a version came from is named, never the local path it had there.
+        if let Some(device) = devices.get(&input.dest_key) {
+            file["isBasedOn"] = json!({ "@id": device_entity(device) });
+            used_devices.insert(device.clone());
         }
         let location = ObjectLocation {
             bucket: bucket.clone(),
@@ -458,6 +523,14 @@ fn build_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Uli
         }),
     ];
     graph.extend(files);
+    graph.extend(used_devices.iter().map(|device| {
+        json!({
+            "@id": device_entity(device),
+            "@type": "IndividualProduct",
+            "name": "Aruna device",
+            "identifier": device
+        })
+    }));
     if let Some(property) = workspace_property {
         graph.push(property);
     }
@@ -671,7 +744,7 @@ mod pure_tests {
 
     fn parse(record: &JobRecord, spec: &ExecutionSpec) -> serde_json::Value {
         let doc = Ulid::from_bytes(record.job_id.to_bytes());
-        serde_json::from_str(&build_crate_jsonld(record, spec, doc)).unwrap()
+        serde_json::from_str(&build_crate_jsonld(record, spec, doc, &BTreeMap::new())).unwrap()
     }
 
     pub(super) fn entity_id(value: &Value) -> Option<&str> {
@@ -849,7 +922,7 @@ mod tests {
         let (record, spec) = execution_record();
         let document_id = Ulid::from_bytes(record.job_id.to_bytes());
         let root_id = format!("https://w3id.org/aruna/{document_id}");
-        let jsonld = build_crate_jsonld(&record, &spec, document_id);
+        let jsonld = build_crate_jsonld(&record, &spec, document_id, &BTreeMap::new());
         let directory = tempfile::tempdir().unwrap();
         let node = craqle::CraqleNode::open(directory.path()).unwrap();
         let graph_id = craqle::GraphId::new(&root_id);
@@ -905,6 +978,37 @@ mod tests {
         }));
     }
 
+    fn device_id() -> String {
+        iroh::SecretKey::from_bytes(&[8; 32]).public().to_string()
+    }
+
+    #[test]
+    fn names_input_device() {
+        // An input published from a device points at one entity naming only that device.
+        let (record, spec) = execution_record();
+        let devices = BTreeMap::from([("inputs/in.txt".to_string(), device_id())]);
+        let document_id = Ulid::from_bytes(record.job_id.to_bytes());
+        let jsonld: Value =
+            serde_json::from_str(&build_crate_jsonld(&record, &spec, document_id, &devices))
+                .unwrap();
+        let graph = jsonld["@graph"].as_array().unwrap();
+        let input = graph
+            .iter()
+            .find(|entity| entity["name"] == "Input sample")
+            .expect("the input file is described");
+        let device = format!("#device-{}", device_id());
+        assert_eq!(entity_id(&input["isBasedOn"]), Some(device.as_str()));
+        let entity = graph
+            .iter()
+            .find(|entity| entity["@id"] == device.as_str())
+            .expect("the device is a contextual entity");
+        assert_eq!(entity["@type"], "IndividualProduct");
+        assert_eq!(entity["identifier"], device_id().as_str());
+        // An input from no device names none.
+        let plain = build_crate_jsonld(&record, &spec, document_id, &BTreeMap::new());
+        assert!(!plain.contains("IndividualProduct"));
+    }
+
     #[test]
     fn meets_builtin_profile() {
         // The built-in shapes must accept what this generator writes.
@@ -912,7 +1016,10 @@ mod tests {
         use crate::metadata::profile::shacl::{ProfileShaclEngine, ProfileShapes};
 
         let (record, spec) = execution_record();
-        let jsonld = build_crate_jsonld(&record, &spec, Ulid::from_bytes(record.job_id.to_bytes()));
+        // An input from a device carries its provenance entity, which the shapes must accept.
+        let devices = BTreeMap::from([("inputs/in.txt".to_string(), device_id())]);
+        let document_id = Ulid::from_bytes(record.job_id.to_bytes());
+        let jsonld = build_crate_jsonld(&record, &spec, document_id, &devices);
         let directory = tempfile::tempdir().unwrap();
         let engine = ProfileShaclEngine::open(directory.path()).unwrap();
         let report = engine

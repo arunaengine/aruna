@@ -21,8 +21,8 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::{
-    ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, RemoteBinding, SyncBase,
-    SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal,
+    ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, ORIGIN_DEVICE_TAG,
+    RemoteBinding, SyncBase, SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal,
 };
 use aruna_core::types::GroupId;
 use aruna_operations::device::sync::ReconcileFolderError;
@@ -30,7 +30,7 @@ use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, a
 use aruna_operations::device::sync::folders::{
     BindFolderInput, FolderError, bind_folder, list_entries, list_transfers, read_bound,
 };
-use aruna_operations::device::sync::outbox::drain_sync_outbox;
+use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::reconcile_folder;
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
 use aruna_operations::driver::{DriverContext, drive};
@@ -40,6 +40,7 @@ use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
 use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
+use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
@@ -432,6 +433,52 @@ async fn fences_overlapping_pulls() -> TestResult<()> {
         1,
         "one device version, one realm version"
     );
+    Ok(())
+}
+
+/// A pulled version names the device it came from, and only that device keeps which local
+/// file it was.
+#[tokio::test]
+async fn records_pull_origin() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    create_bucket(&server.context, group_id, realm.user_id).await?;
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("note.txt"), b"from the device")?;
+    let folder = bind(&realm, root.path(), group_id).await?;
+    reconcile_folder(&device.context, &folder).await?;
+    await_uploads(&realm).await?;
+
+    let head = drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: REMOTE_BUCKET.to_string(),
+            key: "note.txt".to_string(),
+            version_id: None,
+        }),
+        &server.context,
+    )
+    .await?;
+    let device_id = device.node_id().to_string();
+    assert_eq!(head.metadata.get(ORIGIN_DEVICE_TAG), Some(&device_id));
+    let root_path = root.path().to_string_lossy().to_string();
+    assert!(
+        head.metadata
+            .values()
+            .all(|value| !value.contains(&root_path)),
+        "no local path reaches the realm"
+    );
+    let version_id = head
+        .resolved_version_id
+        .or(head.version_id)
+        .ok_or("the head names its version")?;
+    let origin = local_origin(&device.context, version_id)
+        .await?
+        .ok_or("the device keeps the origin of what it published")?;
+    assert_eq!(origin.folder_id, folder.folder_id);
+    assert_eq!(origin.relative, "note.txt");
+    assert!(origin.modified_at_ms.is_some());
     Ok(())
 }
 
