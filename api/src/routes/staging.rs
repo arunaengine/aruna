@@ -468,31 +468,14 @@ pub async fn stage_batch(
             }
         };
         let remaining = BATCH_LIMIT - items.len();
-        match drive(
-            ListStagingOperation::new(ListStagingInput {
-                group_id,
-                connector_id,
-                source_path: source_prefix.clone(),
-                // One spare entry: a listing that fits ends before the page is full.
-                request: ListRequest {
-                    limit: remaining + 1,
-                    recursive: true,
-                    files_only: true,
-                    ..Default::default()
-                },
-            }),
-            &state.get_ctx(),
-        )
-        .await
-        {
-            Ok(result) => {
-                if result.next_cursor.is_some() || result.entries.len() > remaining {
+        match list_prefix(&state, group_id, connector_id, &source_prefix, remaining).await {
+            Ok(entries) => {
+                if entries.len() > remaining {
                     return Err(ServerError::BadRequestReason(format!(
                         "batch expands beyond {BATCH_LIMIT} items"
                     )));
                 }
-                let expanded =
-                    map_prefix_entries(result.entries, &source_prefix, &prefix.target_prefix);
+                let expanded = map_prefix_entries(entries, &source_prefix, &prefix.target_prefix);
                 ensure_batch_capacity(items.len(), expanded.len(), BATCH_LIMIT)?;
                 items.extend(expanded);
             }
@@ -525,6 +508,42 @@ pub async fn stage_batch(
     results.extend(expansion_errors);
 
     Ok((StatusCode::OK, Json(StageBatchResponse { results })))
+}
+
+/// Lists the files below a prefix page by page, stopping once more than `remaining` are found.
+async fn list_prefix(
+    state: &ServerState,
+    group_id: aruna_core::types::GroupId,
+    connector_id: ulid::Ulid,
+    source_prefix: &str,
+    remaining: usize,
+) -> Result<Vec<SourceEntry>, ListStagingError> {
+    let mut entries = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = drive(
+            ListStagingOperation::new(ListStagingInput {
+                group_id,
+                connector_id,
+                source_path: source_prefix.to_string(),
+                // One spare entry tells a listing that fits from one that does not.
+                request: ListRequest {
+                    cursor,
+                    limit: remaining + 1 - entries.len(),
+                    recursive: true,
+                    files_only: true,
+                    ..Default::default()
+                },
+            }),
+            &state.get_ctx(),
+        )
+        .await?;
+        entries.extend(page.entries);
+        match page.next_cursor {
+            Some(next) if entries.len() <= remaining => cursor = Some(next),
+            _ => return Ok(entries),
+        }
+    }
 }
 
 #[utoipa::path(
