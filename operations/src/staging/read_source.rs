@@ -24,6 +24,8 @@ pub struct ReadSourceInput {
     pub connector_id: Ulid,
     pub source_path: String,
     pub range: Option<Range<u64>>,
+    /// The observation the read must stay bound to, if any.
+    pub expected: Option<SourceMetadata>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -110,7 +112,7 @@ impl ReadSourceOperation {
                         smallvec![Effect::StagingSource(StagingSourceEffect::Read {
                             access: resolved.access,
                             range: self.input.range.clone(),
-                            expected: None,
+                            expected: self.input.expected.clone(),
                         })]
                     }
                     Err(error) => self.emit_error(error.into()),
@@ -206,6 +208,7 @@ mod tests {
             connector_id: Ulid::from_bytes([2u8; 16]),
             source_path: "folder/file.txt".to_string(),
             range: Some(5..11),
+            expected: None,
         }
     }
 
@@ -389,6 +392,7 @@ mod tests {
                 connector_id: connector.connector_id,
                 source_path: "folder/file.txt".to_string(),
                 range: None,
+                expected: None,
             }),
             &test_context.driver_context,
         )

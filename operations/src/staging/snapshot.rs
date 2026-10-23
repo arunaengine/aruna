@@ -15,6 +15,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
@@ -41,6 +42,8 @@ pub struct MaterializeSnapshotInput {
     pub retry_key: Option<String>,
     pub expected_bucket: BucketInfo,
     pub restrictions: Option<Vec<PathRestriction>>,
+    /// Digests the read bytes must match before they are kept, such as manifest digests.
+    pub expected_checksums: Vec<ExpectedChecksum>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -80,6 +83,7 @@ pub async fn stage_snapshot_blob(
             connector_id: input.connector_id,
             source_path: input.source_path.clone(),
             range: None,
+            expected: None,
         }),
         context,
     )
@@ -132,7 +136,7 @@ pub async fn stage_snapshot_blob(
             content_length: Some(read_result.metadata.content_length),
             body: Some(read_result.stream),
         },
-        expected_checksums: Vec::new(),
+        expected_checksums: input.expected_checksums,
         checksum_type: None,
         exists: false,
         version_source: Some(version_source.clone()),
@@ -271,6 +275,7 @@ mod tests {
             retry_key: Some("job-1".to_string()),
             expected_bucket,
             restrictions: None,
+            expected_checksums: Vec::new(),
         };
 
         let first = stage_snapshot_blob(context, input.clone()).await.unwrap();

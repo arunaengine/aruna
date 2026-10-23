@@ -14,6 +14,7 @@ use byteview::ByteView;
 use tracing::warn;
 
 use super::executor::{JobContext, JobRunOutcome};
+use super::staging_manifest::read_manifest_chunk;
 use super::staging_walk::{
     PageFailure, check_access, clear_queue, finish_failed, item_phase, record_failure, start_walk,
     walk_page,
@@ -26,6 +27,7 @@ use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob};
 use crate::staging::snapshot::{MaterializeSnapshotInput, stage_snapshot_blob};
+use aruna_core::structs::checksum::ExpectedChecksum;
 
 pub async fn read_staging_checkpoint(
     context: &crate::driver::DriverContext,
@@ -82,7 +84,7 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
         {
             checkpoint.current_path = Some(item.source_path.clone());
             checkpoint.phase = item_phase(spec);
-            match stage_item(ctx, spec, &item.source_path, &item.target_key).await {
+            match stage_item(ctx, spec, &item.source_path, &item.target_key, Vec::new()).await {
                 Ok(size) => {
                     checkpoint.items_current = checkpoint.items_current.saturating_add(1);
                     checkpoint.items_succeeded = checkpoint.items_succeeded.saturating_add(1);
@@ -106,14 +108,18 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
             continue;
         }
 
-        if checkpoint.walk.is_none() {
+        if checkpoint.manifest.is_none() && checkpoint.walk.is_none() {
             match start_walk(ctx, spec, &mut checkpoint).await {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(error) => return retryable_error(error),
             }
         }
-        if let Err(outcome) = walk_page(ctx, spec, &mut checkpoint).await {
+        let page = match checkpoint.manifest.is_some() {
+            true => read_manifest_chunk(ctx, spec, &mut checkpoint).await,
+            false => walk_page(ctx, spec, &mut checkpoint).await,
+        };
+        if let Err(outcome) = page {
             return match outcome {
                 PageFailure::Retry(message) => retryable_error(message),
                 PageFailure::Permanent(message) => {
@@ -147,6 +153,7 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
         items_done: 0,
         prefixes_done: 0,
         walk: None,
+        manifest: None,
         queue_head: 0,
         queue_tail: 0,
         items_current: 0,
@@ -166,6 +173,7 @@ pub(super) async fn stage_item(
     spec: &StagingJobSpec,
     source_path: &str,
     target_key: &str,
+    expected_checksums: Vec<ExpectedChecksum>,
 ) -> Result<u64, ItemFailure> {
     let expected_bucket = ensure_item_permission(ctx, spec, source_path, target_key).await?;
     let (size, version_id) = match spec.strategy {
@@ -204,6 +212,7 @@ pub(super) async fn stage_item(
                     retry_key: Some(ctx.job_id.to_string()),
                     expected_bucket,
                     restrictions: spec.auth_context.path_restrictions.clone(),
+                    expected_checksums,
                 },
             )
             .await
@@ -368,6 +377,7 @@ mod pure_tests {
                 source_prefix: "refseq".to_string(),
                 target_prefix: String::new(),
             }],
+            checksum_manifest: None,
         };
         let mut checkpoint = initial_checkpoint(&spec);
         for _ in 0..1000 {

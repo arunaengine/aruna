@@ -403,6 +403,7 @@ async fn batch_rejects_cap() {
             strategy: ApiStagingStrategy::Snapshot,
             items: Some(items),
             prefixes: None,
+            checksum_manifest: None,
         }),
     )
     .await;
@@ -426,6 +427,7 @@ async fn batch_rejects_node() {
             strategy: ApiStagingStrategy::Snapshot,
             items: None,
             prefixes: None,
+            checksum_manifest: None,
         }),
     )
     .await;
@@ -448,6 +450,7 @@ async fn batch_sync_unimplemented() {
             strategy: ApiStagingStrategy::Sync,
             items: None,
             prefixes: None,
+            checksum_manifest: None,
         }),
     )
     .await;

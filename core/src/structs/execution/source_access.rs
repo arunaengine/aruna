@@ -164,8 +164,15 @@ impl SourceMetadata {
                 None => missing = true,
             }
         }
-        for (algorithm, stored) in &self.digests {
-            if let Some(seen) = fresh.digests.get(algorithm)
+        // ETag evidence repeats the ETag and may not be a hash at all, so only shipped or
+        // verified digests are compared.
+        let compared_digest = |digest: &&SourceDigest| digest.origin != DigestOrigin::ListingEtag;
+        for (algorithm, stored) in self
+            .digests
+            .iter()
+            .filter(|(_, digest)| compared_digest(digest))
+        {
+            if let Some(seen) = fresh.digests.get(algorithm).filter(compared_digest)
                 && seen.scope == stored.scope
             {
                 if seen.digest != stored.digest {
@@ -355,6 +362,9 @@ mod tests {
         let mut stored = metadata();
         stored.digests.insert(algorithm, evidence.clone());
         assert!(stored.enforced_checksums().is_empty());
+        let mut other_evidence = stored.clone();
+        other_evidence.digests.get_mut(&algorithm).unwrap().digest[0] ^= 1;
+        assert_eq!(stored.compare(&other_evidence), ObservationMatch::Same);
 
         let shipped = SourceDigest {
             origin: DigestOrigin::Manifest,

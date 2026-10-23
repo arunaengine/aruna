@@ -188,6 +188,9 @@ pub struct StageBatchRequest {
     pub items: Option<Vec<StageBatchItem>>,
     #[serde(default)]
     pub prefixes: Option<Vec<StageBatchPrefix>>,
+    /// Name of an `md5sum` or `sha256sum` manifest below each prefix; jobs only.
+    #[serde(default)]
+    pub checksum_manifest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -356,7 +359,8 @@ route, and sending `prefixes` additionally requires READ on the group's data pat
 **Limits**
 - Named and expanded objects together may not exceed 1000, and a prefix that would expand past that
   limit fails the entire request rather than truncating.
-- `node_id`, when given, must be this node: staging always runs where the request lands."#,
+- `node_id`, when given, must be this node: staging always runs where the request lands.
+- `checksum_manifest` is refused with 400; manifests are read by staging jobs only."#,
     request_body(
         content = StageBatchRequest,
         description = "One connector and target bucket for the whole batch, plus explicit `items`, `prefixes` to expand, or both; leaving both out runs an empty batch",
@@ -419,6 +423,11 @@ pub async fn stage_batch(
     let connector_id = parse_connector_id(&request.connector_id)?;
     if request.strategy == ApiStagingStrategy::Sync {
         return Err(ServerError::Unimplemented);
+    }
+    if request.checksum_manifest.is_some() {
+        return Err(ServerError::BadRequestReason(
+            "checksum manifests are read by staging jobs only".to_string(),
+        ));
     }
     let node_id = request
         .node_id
@@ -534,6 +543,13 @@ Nothing is authorized later while the job runs.
   means the job is durable and queued on this node, and nothing has been read or copied yet.
 - Unlike the blocking route there is no cap on the number of items, and prefixes are stored and
   walked by the job rather than expanded here.
+- S3 prefixes are walked as one flat listing with a provider cursor; other sources are walked
+  directory by directory from a durable queue. Each page and its checkpoint are written together,
+  and references are registered from listing metadata (size, ETag, last-modified) without a HEAD
+  per file.
+- `checksum_manifest` names an `md5sum` or `sha256sum` file below each prefix. It is read before
+  the prefix, and each imported file carries its digest; a later complete read of a reference and a
+  snapshot copy keep bytes only when they match it.
 - There is no idempotency key, so resubmitting the same body creates another job and stages the same
   objects a second time.
 - Progress and completion are observed by reading the job by its id.
@@ -554,7 +570,8 @@ Nothing is authorized later while the job runs.
                     "source_prefix": "refseq/2026",
                     "target_prefix": "genomes/2026"
                 }
-            ]
+            ],
+            "checksum_manifest": "MD5SUMS"
         })
     ),
     responses(
@@ -566,7 +583,7 @@ Nothing is authorized later while the job runs.
                 "job_id": "01JJOB0123456789ABCDEFGHJ"
             })
         ),
-        (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path or prefix is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
+        (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path, prefix or checksum manifest name is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on a source path or WRITE on a target key", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, or a connector or source path does not exist", body = ErrorResponse),
@@ -656,6 +673,12 @@ pub async fn submit_staging(
             "at least one staging item or prefix is required".to_string(),
         ));
     }
+    let checksum_manifest = request
+        .checksum_manifest
+        .filter(|name| !name.trim().is_empty());
+    if let Some(name) = checksum_manifest.as_deref() {
+        validate_source_path(name)?;
+    }
 
     let result = submit_staging_job(
         &state.get_ctx(),
@@ -672,6 +695,7 @@ pub async fn submit_staging(
             },
             items,
             prefixes,
+            checksum_manifest,
         },
         node_id,
         state.rocrate_limits().artifact_retention_ms,
@@ -1253,6 +1277,7 @@ async fn snapshot_blob(
             retry_key: None,
             expected_bucket: bucket_info,
             restrictions: auth.path_restrictions.clone(),
+            expected_checksums: Vec::new(),
         },
     )
     .await

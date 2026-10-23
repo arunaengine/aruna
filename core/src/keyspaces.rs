@@ -404,6 +404,8 @@ pub const UPLOAD_CLEANUP_KEYSPACE: &str = "rocrate_upload_cleanups";
 pub const STAGING_STATE_KEYSPACE: &str = "staging_job_state";
 /// Directories a staging job still has to list, keyed by job id and queue position.
 pub const STAGING_QUEUE_KEYSPACE: &str = "staging_directory_queue";
+/// Digests a staging job read from checksum manifests, keyed by job id and source path.
+pub const STAGING_MANIFEST_KEYSPACE: &str = "staging_manifest_digests";
 
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
 
@@ -623,6 +625,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     UPLOAD_CLEANUP_KEYSPACE,
     STAGING_STATE_KEYSPACE,
     STAGING_QUEUE_KEYSPACE,
+    STAGING_MANIFEST_KEYSPACE,
     BUCKET_STATS_DB,
     API_STATE_KEYSPACE,
     NODE_STATE_KEYSPACE,

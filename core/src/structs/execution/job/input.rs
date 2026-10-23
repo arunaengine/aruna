@@ -211,6 +211,9 @@ pub struct StagingJobSpec {
     pub strategy: StagingStrategy,
     pub items: Vec<StagingJobItem>,
     pub prefixes: Vec<StagingJobPrefix>,
+    /// Name of an `md5sum` or `sha256sum` manifest below each prefix whose digests the
+    /// imported files carry and a complete read must match.
+    pub checksum_manifest: Option<String>,
 }
 
 /// One server-side object copy run outside a request, for a source whose bytes
@@ -266,6 +269,15 @@ pub struct StagingWalk {
     pub queue_row: Option<u64>,
 }
 
+/// A checksum manifest being read in bounded chunks before its prefix is walked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestRead {
+    pub source_path: String,
+    pub offset: u64,
+    /// The manifest as first observed; later chunks are read bound to it.
+    pub observation: Option<crate::structs::execution::source_access::SourceMetadata>,
+}
+
 /// Progress of a staging job. It stays small: positions and counters only, while directories
 /// still to list wait in the separately paginated queue.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +290,7 @@ pub struct StagingJobCheckpoint {
     /// Spec prefixes already started.
     pub prefixes_done: u64,
     pub walk: Option<StagingWalk>,
+    pub manifest: Option<ManifestRead>,
     /// Queue rows `[queue_head, queue_tail)` are directories still to list.
     pub queue_head: u64,
     pub queue_tail: u64,

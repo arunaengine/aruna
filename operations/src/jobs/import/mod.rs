@@ -509,6 +509,7 @@ async fn acquire_source(
                     connector_id: *connector_id,
                     source_path: path.clone(),
                     range: None,
+                    expected: None,
                 }),
                 &ctx.driver,
             )

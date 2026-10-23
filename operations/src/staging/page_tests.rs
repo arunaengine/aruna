@@ -97,6 +97,7 @@ fn checkpoint() -> StagingJobCheckpoint {
         items_done: 0,
         prefixes_done: 1,
         walk: None,
+        manifest: None,
         queue_head: 0,
         queue_tail: 0,
         items_current: 0,

@@ -6,13 +6,15 @@
 use std::path::{Component, Path};
 use std::time::SystemTime;
 
-use aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE;
+use aruna_core::keyspaces::{STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE};
+use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::execution::job::{
-    StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase, StagingJobSpec,
-    StagingWalk,
+    ManifestRead, StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase,
+    StagingJobSpec, StagingWalk,
 };
 use aruna_core::structs::execution::source_access::{
-    ListRequest, SourceEntry, SourceEntryKind, SourceMetadata,
+    DigestOrigin, DigestScope, ListRequest, SourceDigest, SourceEntry, SourceEntryKind,
+    SourceMetadata,
 };
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
@@ -25,6 +27,7 @@ use super::executor::{JobContext, JobRunOutcome};
 use super::staging::{
     ItemFailure, load_live_bucket, persist_rows, queue_key, stage_item, sync_progress,
 };
+use super::staging_manifest::{ManifestDigest, manifest_digests};
 use super::store::{batch_delete, iter_prefix_page, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
@@ -84,41 +87,47 @@ pub(super) async fn start_walk(
         cursor: None,
         queue_row: None,
     });
+    // The prefix's manifest is read before its first page, so every page can look it up.
+    checkpoint.manifest = spec.checksum_manifest.as_ref().map(|name| ManifestRead {
+        source_path: format!("{}{name}", directory_list_path(&prefix.source_prefix)),
+        offset: 0,
+        observation: None,
+    });
     checkpoint.prefixes_done += 1;
     Ok(true)
 }
 
-/// Deletes the job's queue rows page by page; rows left by a failed pass are retried by the
-/// next run and do not change the outcome.
+/// Deletes the job's queue and manifest rows page by page; rows left by a failed pass stay
+/// until the next run and do not change the outcome.
 pub(super) async fn clear_queue(ctx: &JobContext) {
+    for key_space in [STAGING_QUEUE_KEYSPACE, STAGING_MANIFEST_KEYSPACE] {
+        if let Err(error) = clear_rows(ctx, key_space).await {
+            warn!(job_id = %ctx.job_id, error = %error, "Staging job row cleanup failed");
+        }
+    }
+}
+
+async fn clear_rows(ctx: &JobContext, key_space: &str) -> Result<(), String> {
     let storage = &ctx.driver.storage_handle;
     let prefix = ByteView::from(ctx.job_id.to_bytes().to_vec());
     loop {
-        let rows = iter_prefix_page(
+        let (rows, _) = iter_prefix_page(
             storage,
-            STAGING_QUEUE_KEYSPACE,
+            key_space,
             Some(prefix.clone()),
             None,
             QUEUE_CLEANUP_PAGE,
             None,
         )
-        .await;
-        let rows = match rows {
-            Ok((rows, _)) if !rows.is_empty() => rows,
-            Ok(_) => return,
-            Err(error) => {
-                warn!(job_id = %ctx.job_id, error = %error, "Staging queue cleanup failed");
-                return;
-            }
-        };
+        .await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
         let deletes = rows
             .into_iter()
-            .map(|(key, _)| (STAGING_QUEUE_KEYSPACE.to_string(), key))
+            .map(|(key, _)| (key_space.to_string(), key))
             .collect();
-        if let Err(error) = batch_delete(storage, deletes, None).await {
-            warn!(job_id = %ctx.job_id, error = %error, "Staging queue cleanup failed");
-            return;
-        }
+        batch_delete(storage, deletes, None).await?;
     }
 }
 
@@ -163,6 +172,7 @@ struct StagedFile {
     target_key: String,
     size: Option<u64>,
     observation: Option<SourceMetadata>,
+    manifest: Option<ManifestDigest>,
 }
 
 /// Lists one page of the current walk and records it, with the walk's next position and the
@@ -241,6 +251,15 @@ pub(super) async fn walk_page(
             }
         }
     }
+    if spec.checksum_manifest.is_some() {
+        let paths: Vec<&str> = files.iter().map(|file| file.source_path.as_str()).collect();
+        let digests = manifest_digests(ctx, &paths)
+            .await
+            .map_err(PageFailure::Retry)?;
+        for (file, digest) in files.iter_mut().zip(digests) {
+            file.manifest = digest;
+        }
+    }
     next.phase = item_phase(spec);
     let Some(page) = page else {
         // The listing failed for good: record that and move on.
@@ -266,7 +285,7 @@ struct PageRows {
     deletes: Vec<(KeySpace, Key)>,
 }
 
-async fn commit_rows(
+pub(super) async fn commit_rows(
     ctx: &JobContext,
     checkpoint: &mut StagingJobCheckpoint,
     next: StagingJobCheckpoint,
@@ -351,7 +370,8 @@ async fn import_page(
             Ok(()) => match file.observation {
                 Some(observation) => Ok(observation),
                 None => head_observation(ctx, spec, &file.source_path).await,
-            },
+            }
+            .map(|observation| with_manifest(observation, file.manifest)),
             Err(failure) => Err(failure),
         };
         match observation {
@@ -415,7 +435,11 @@ async fn snapshot_page(
             return Ok(());
         }
         next.current_path = Some(file.source_path.clone());
-        match stage_item(ctx, spec, &file.source_path, &file.target_key).await {
+        let expected = file
+            .manifest
+            .map(|(algorithm, digest)| vec![ExpectedChecksum { algorithm, digest }])
+            .unwrap_or_default();
+        match stage_item(ctx, spec, &file.source_path, &file.target_key, expected).await {
             Ok(size) => {
                 next.items_current = next.items_current.saturating_add(1);
                 next.items_succeeded = next.items_succeeded.saturating_add(1);
@@ -429,6 +453,24 @@ async fn snapshot_page(
         ctx.progress.set_current(next.items_current);
     }
     commit_rows(ctx, checkpoint, next, rows.writes, rows.deletes).await
+}
+
+/// Adds a shipped manifest digest to an observation; it binds every complete read.
+fn with_manifest(
+    mut observation: SourceMetadata,
+    digest: Option<ManifestDigest>,
+) -> SourceMetadata {
+    if let Some((algorithm, digest)) = digest {
+        let origin = DigestOrigin::Manifest;
+        let scope = DigestScope::FullObject;
+        let digest = SourceDigest {
+            digest,
+            scope,
+            origin,
+        };
+        observation.digests.insert(algorithm, digest);
+    }
+    observation
 }
 
 async fn head_observation(
@@ -503,6 +545,7 @@ fn map_source_entry(
     Ok(match entry.kind {
         SourceEntryKind::File => MappedEntry::File(StagedFile {
             observation: entry.observation(),
+            manifest: None,
             source_path: entry_path,
             target_key: target,
             size: entry.size,
@@ -538,7 +581,7 @@ fn relative_entry_path(base: &str, entry: &str, nested: bool) -> Result<String, 
     Ok(relative.to_string())
 }
 
-fn canonical_walker_path(path: &str) -> Result<String, String> {
+pub(super) fn canonical_walker_path(path: &str) -> Result<String, String> {
     let mut path = path.trim();
     while let Some(stripped) = path.strip_prefix("./") {
         path = stripped;
