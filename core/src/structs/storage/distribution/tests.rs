@@ -39,7 +39,7 @@ fn sharded(count: u8, boundaries: &[&str], replicas: usize) -> DistributionConfi
 
 fn change(predecessor: Option<DistributionRevision>, op: DistributionOp) -> DistributionChange {
     DistributionChange {
-        set_id: id(99),
+        set_id: owned_set_id(id(90), 1, 99),
         predecessor,
         op,
     }
@@ -434,4 +434,21 @@ fn shapes_and_unsupported() {
             Err(DistributionError::Unsupported(name))
         );
     }
+}
+
+#[test]
+fn sets_bind_owners() {
+    let set_id = owned_set_id(id(90), 7, 3);
+    assert!(owned_by(set_id, id(90)));
+    assert!(!owned_by(set_id, id(91)));
+    assert_eq!(set_id.timestamp_ms(), 7);
+    assert!(owned_by(mint_set_id(id(91)), id(91)));
+    // Another group cannot create a set under an id it does not own.
+    let mut foreign = sharded(2, &["m"], 0);
+    foreign.owner_group = id(91);
+    let create = change(None, DistributionOp::Create { config: foreign });
+    assert_eq!(
+        create.validate_shape(),
+        Err(DistributionError::ForeignSet(create.set_id))
+    );
 }

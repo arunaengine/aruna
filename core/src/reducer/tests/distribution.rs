@@ -7,11 +7,11 @@ use crate::admin_documents::AdminDocumentTarget;
 use crate::structs::storage::distribution::presets::replica_layout;
 use crate::structs::storage::distribution::{
     DistributionChange, DistributionConfig, DistributionError, DistributionOp,
-    DistributionRevision, DistributionSettings, SetPhase,
+    DistributionRevision, DistributionSettings, SetPhase, owned_set_id,
 };
 
 fn set_id() -> Ulid {
-    Ulid::from_bytes([40; 16])
+    owned_set_id(group_id(), 1, 40)
 }
 
 fn target() -> AdminDocumentTarget {
@@ -239,5 +239,35 @@ fn foreign_changes_refused() {
     assert_eq!(
         realm_config_state().apply(&on_config),
         Err(AdminDocumentError::UnsupportedTarget)
+    );
+}
+
+#[test]
+fn foreign_create_refused() {
+    // Another group's admin cannot replace a set, however early its event sorts.
+    let mut state = state();
+    state
+        .apply(&change_event(
+            10,
+            1,
+            1,
+            None,
+            DistributionOp::Create { config: config() },
+        ))
+        .unwrap();
+    let mut foreign = config();
+    foreign.owner_group = Ulid::from_bytes([77; 16]);
+    let early = change_event(1, 3, 1, None, DistributionOp::Create { config: foreign });
+    assert_eq!(
+        state.apply(&early),
+        Err(DistributionError::ForeignSet(set_id()).into())
+    );
+    assert_eq!(
+        state
+            .materialized_distribution()
+            .unwrap()
+            .config
+            .owner_group,
+        group_id()
     );
 }

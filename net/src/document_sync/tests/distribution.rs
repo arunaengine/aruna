@@ -8,7 +8,7 @@ use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
 use aruna_core::structs::storage::distribution::presets::replica_layout;
 use aruna_core::structs::storage::distribution::{
     DistributionChange, DistributionConfig, DistributionOp, DistributionRecord,
-    DistributionRevision, DistributionSettings, SetPhase,
+    DistributionRevision, DistributionSettings, SetPhase, owned_set_id,
 };
 
 struct Fixture {
@@ -121,7 +121,7 @@ async fn fixture(storage: &StorageHandle) -> Fixture {
     let fixture = Fixture {
         realm_id,
         group_id: Ulid::from_parts(832, 1),
-        set_id: Ulid::from_parts(833, 1),
+        set_id: owned_set_id(Ulid::from_parts(832, 1), 833, 1),
         admin: test_actor(31, user(1), realm_id),
         member: test_actor(32, user(2), realm_id),
         other: test_actor(33, user(3), realm_id),

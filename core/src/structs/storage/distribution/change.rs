@@ -10,7 +10,7 @@ use super::validate::{validate_config, validate_record};
 use super::{
     DistributionConfig, DistributionError, DistributionMember, DistributionRecord,
     DistributionRevision, DistributionSettings, MAX_BOUND_BYTES, MAX_MEMBERS, MemberState,
-    SetPhase,
+    SetPhase, owned_by,
 };
 use crate::NodeId;
 
@@ -175,6 +175,9 @@ impl DistributionChange {
         }
         match &self.op {
             DistributionOp::Create { config } => {
+                if !owned_by(self.set_id, config.owner_group) {
+                    return Err(DistributionError::ForeignSet(self.set_id));
+                }
                 validate_config(config)?;
                 let fresh = config.members.iter().all(|member| {
                     member.state == MemberState::Created && member.incarnation.is_none()

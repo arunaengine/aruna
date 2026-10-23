@@ -58,6 +58,10 @@ pub enum DistributionError {
     TooLarge,
     #[error("the distribution change names set {0}, not this record")]
     SetMismatch(Ulid),
+    #[error("set {0} does not belong to the group that creates it")]
+    ForeignSet(Ulid),
+    #[error("the origin already has the most changes waiting for their predecessor")]
+    TooManyPending,
     #[error("the distribution change predecessor is stale or unknown")]
     StaleRevision,
     #[error("the distributed bucket is not pending")]

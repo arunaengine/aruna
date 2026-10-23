@@ -31,6 +31,39 @@ pub const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// The first coordinator epoch of a range; epoch 0 belongs to ordinary buckets.
 pub const FIRST_EPOCH: u64 = 1;
 
+const OWNER_DOMAIN: &[u8] = b"aruna-distribution-owner-v1";
+const OWNER_BITS: u32 = 48;
+const FREE_BITS: u32 = 80 - OWNER_BITS;
+
+/// A set id whose random part commits to its owner group: 48 bits of BLAKE3 over the group
+/// and 32 free bits. No other group can create a set under this id.
+pub fn owned_set_id(owner_group: GroupId, time_ms: u64, free: u32) -> Ulid {
+    Ulid::from_parts(
+        time_ms,
+        owner_tag(owner_group) << FREE_BITS | u128::from(free),
+    )
+}
+
+/// Mints a new set id for `owner_group` now.
+pub fn mint_set_id(owner_group: GroupId) -> Ulid {
+    let fresh = Ulid::generate();
+    owned_set_id(owner_group, fresh.timestamp_ms(), fresh.random() as u32)
+}
+
+/// Whether `set_id` commits to `owner_group`; the set's ownership never changes.
+pub fn owned_by(set_id: Ulid, owner_group: GroupId) -> bool {
+    set_id.random() >> FREE_BITS == owner_tag(owner_group)
+}
+
+fn owner_tag(owner_group: GroupId) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(OWNER_DOMAIN);
+    hasher.update(&owner_group.to_bytes());
+    let mut tag = [0; 16];
+    tag[10..].copy_from_slice(&hasher.finalize().as_bytes()[..6]);
+    u128::from_be_bytes(tag)
+}
+
 /// The coordinator epoch a version was written under. Heads order by (original epoch,
 /// generation); ordinary buckets always carry 0.
 #[derive(
