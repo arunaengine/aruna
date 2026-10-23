@@ -45,13 +45,12 @@ async fn keeps_owner_reads() -> TestResult<()> {
         )
         .await
         .is_ok_and(|record| record.document_id == document_id)
+            && read_replica(&device.context, document_id)
+                .await
+                .is_some_and(|replica| replica.serves_reads())
     };
-    wait_until(
-        "the owner's read through the device",
-        device.node_id(),
-        read,
-    )
-    .await?;
+    // A holder serves the graph once its render is ready, so a read may come before the copy.
+    wait_until("the owner's read leaves a copy", device.node_id(), read).await?;
 
     let replica = read_replica(&device.context, document_id)
         .await
