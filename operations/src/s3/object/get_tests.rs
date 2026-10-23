@@ -1803,6 +1803,40 @@ fn unknown_keeps_digests() {
     assert_eq!(result.last_refresh, None);
 }
 
+// A pinned version without validators is served only as a complete read checked against its
+// recorded digests; bytes that miss them fail the stream at its end.
+#[tokio::test]
+async fn pinned_unknown_verified() {
+    use futures_util::StreamExt;
+    let mut operation = drifted_operation();
+    let mut stored = observation(9);
+    stored.etag = None;
+    stored.digests.insert(
+        ChecksumAlgorithm::Sha256,
+        SourceDigest {
+            digest: vec![7; 32],
+            scope: DigestScope::FullObject,
+            origin: DigestOrigin::Manifest,
+        },
+    );
+    operation.reference_cached = Some(stored);
+    operation.reference_explicit = true;
+    operation.state = GetObjectState::HeadReferenceSource;
+
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(9),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+    ));
+    operation.step(source_read(observation(9)));
+
+    let result = operation.finalize().unwrap();
+    let items: Vec<_> = result.blob.collect().await;
+    assert!(items.last().is_some_and(Result::is_err));
+}
+
 // A matching read is served, and the stale promise is cleared with it.
 #[test]
 fn read_match_serves() {

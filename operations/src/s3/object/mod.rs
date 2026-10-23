@@ -13,4 +13,5 @@ pub mod metadata;
 pub mod placement;
 pub mod put;
 pub mod search;
+mod verified;
 pub mod versions;

@@ -1414,7 +1414,12 @@ impl ReplicateObjectOperation {
         else {
             return None;
         };
-        Some(cached_metadata.compare(metadata) == ObservationMatch::Same)
+        // An unconfirmed observation may still be kept: the write checks the recorded digests.
+        Some(match cached_metadata.compare(metadata) {
+            ObservationMatch::Same => true,
+            ObservationMatch::Unknown => !cached_metadata.enforced_checksums().is_empty(),
+            ObservationMatch::Changed => false,
+        })
     }
 
     fn resolve_reference(&mut self, version: ReplicationVersion) -> Effects {
@@ -4424,6 +4429,41 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(op.state, ReplicateObjectState::Finish);
         assert_eq!(op.finalize(), Ok(ReplicationSuboperationResult::Skipped));
+    }
+
+    // A source without validators is still materialized when recorded digests check the write.
+    #[test]
+    fn unknown_digest_matches() {
+        use aruna_core::structs::checksum::ChecksumAlgorithm;
+        use aruna_core::structs::execution::source_access::{
+            DigestOrigin, DigestScope, SourceDigest,
+        };
+        let mut cached = reference_cached_metadata();
+        cached.etag = None;
+        cached.last_modified = None;
+        let mut op = ReplicateObjectOperation::new(version_request(Ulid::generate()));
+        let reference = |cached_metadata: SourceMetadata| ReplicationVersion::Reference {
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            source: reference_source_binding(),
+            cached_metadata,
+            last_refresh: SystemTime::UNIX_EPOCH,
+            metadata: HashMap::new(),
+            advance_count: 0,
+        };
+        op.replication_version = Some(reference(cached.clone()));
+        assert_eq!(op.reference_matches(&cached), Some(false));
+
+        cached.digests.insert(
+            ChecksumAlgorithm::Sha256,
+            SourceDigest {
+                digest: vec![1; 32],
+                scope: DigestScope::FullObject,
+                origin: DigestOrigin::Manifest,
+            },
+        );
+        op.replication_version = Some(reference(cached.clone()));
+        assert_eq!(op.reference_matches(&cached), Some(true));
     }
 
     #[test]

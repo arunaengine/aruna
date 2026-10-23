@@ -25,6 +25,7 @@ use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
     multipart_summary_read, summary_from_read,
 };
+use crate::s3::object::verified::verified;
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
@@ -37,6 +38,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::source_access::{
@@ -303,6 +305,8 @@ pub struct GetObjectOperation {
     reference_cached: Option<SourceMetadata>,
     /// `last_refresh` of the stored reference version; served when undrifted.
     reference_last_refresh: Option<SystemTime>,
+    /// Recorded digests a complete read of an unconfirmed reference must match.
+    verify_digests: Vec<ExpectedChecksum>,
     /// Whether the caller pinned an explicit version (a historical read).
     reference_explicit: bool,
     /// Fresh observation to record in the successor and then serve.
@@ -366,6 +370,7 @@ impl GetObjectOperation {
             reference_stream: None,
             reference_cached: None,
             reference_last_refresh: None,
+            verify_digests: Vec::new(),
             reference_explicit: false,
             advance_observation: None,
             released_bytes: 0,
@@ -1054,12 +1059,9 @@ impl GetObjectOperation {
                     return self.serve_reference_source(served, true);
                 }
                 if comparison == ObservationMatch::Unknown {
-                    // Nothing proves the bytes unchanged: a pinned version is refused, and the
-                    // current one is served fresh without counting as refreshed.
-                    if self.reference_explicit {
-                        return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
-                    }
-                    // The version's recorded digests still bind whoever keeps these bytes.
+                    // Nothing proves the bytes unchanged. A complete read is checked against the
+                    // recorded digests at its end; without them a pinned version is refused, and
+                    // the current one is served fresh without counting as refreshed.
                     let digests = self
                         .reference_cached
                         .as_ref()
@@ -1069,6 +1071,14 @@ impl GetObjectOperation {
                         digests,
                         ..metadata
                     };
+                    let enforced = served.enforced_checksums();
+                    let complete = self.input.range.is_none();
+                    if self.reference_explicit && (enforced.is_empty() || !complete) {
+                        return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                    }
+                    if complete {
+                        self.verify_digests = enforced;
+                    }
                     return self.serve_reference_source(served, false);
                 }
                 // A pinned historical version cannot serve drifted bytes:
@@ -1473,6 +1483,7 @@ impl GetObjectOperation {
         self.reference_access = None;
         self.reference_cached = None;
         self.reference_last_refresh = None;
+        self.verify_digests = Vec::new();
         self.reference_creator = None;
         self.reference_advance = None;
         self.advance_pointer = None;
@@ -1591,6 +1602,9 @@ impl GetObjectOperation {
         };
         if let Some(lease) = self.reference_lease.take() {
             blob = leased(blob, lease);
+        }
+        if !self.verify_digests.is_empty() {
+            blob = verified(blob, std::mem::take(&mut self.verify_digests));
         }
         let Some(source_metadata) = self.source_metadata.clone() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
