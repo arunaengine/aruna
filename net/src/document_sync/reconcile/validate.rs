@@ -1335,6 +1335,13 @@ fn family_matches_targets(
             DocumentTarget::RealmConfig { realm_id },
             AdminDocumentTarget::RealmConfig { realm_id: event_realm_id }
         ) if realm_id == event_realm_id
+    ) || matches!(
+        (family, target, event_target),
+        (
+            AdminOperationFamily::Distribution,
+            DocumentTarget::RealmConfig { realm_id },
+            AdminDocumentTarget::Distribution { realm_id: event_realm_id, .. }
+        ) if realm_id == event_realm_id
     )
 }
 
@@ -1700,9 +1707,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         AdminOperationFamily::RealmAuthorization => validate_role_assignment(event),
         AdminOperationFamily::RealmConfig => validate_config_shape(event),
         AdminOperationFamily::User => Ok(()),
-        AdminOperationFamily::Distribution => {
-            Err("distribution changes are not admitted yet".into())
-        }
+        AdminOperationFamily::Distribution => validate_distribution_shape(event),
     };
     if let Err(reason) = shape {
         return reject(&reason);
@@ -1731,6 +1736,9 @@ pub(in crate::document_sync) async fn validate_admin_event(
                 }
                 AdminOperationFamily::Group => {
                     validate_group_authority(storage, event, previous_state.as_ref()).await?
+                }
+                AdminOperationFamily::Distribution => {
+                    validate_distribution_authority(storage, event, previous_state.as_ref()).await?
                 }
                 _ => validate_user_authority(storage, event, previous_state.as_ref()).await?,
             };
