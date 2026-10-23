@@ -14,10 +14,12 @@ use crate::types::GroupId;
 pub mod change;
 pub mod hint;
 pub mod presets;
+pub mod statement;
 pub mod validate;
 
 pub use change::{DistributionChange, DistributionOp, TransferRole};
 pub use hint::{HintIndex, SetHint};
+pub use statement::{SetRoot, SignedStatement, Statement, StatementKind};
 pub use validate::DistributionError;
 
 /// At most this many key ranges per set (scale rules).
