@@ -149,8 +149,7 @@ impl BlobHandler {
 
     /// The provider copies the source version, or its current bytes, in parts of at most
     /// `COPY_PART` bytes and completes create-only where asked, and the size is checked. `None`
-    /// asks for a streamed copy: the provider refused a part, or a one-part copy's ETag is not
-    /// the source MD5.
+    /// asks for a streamed copy: the storage cannot copy, or a one-part ETag is not the MD5.
     async fn copy_inside(
         &self,
         resolved: ResolvedBackend,
@@ -198,14 +197,15 @@ impl BlobHandler {
                         return Err(error);
                     }
                 }
-                // A source without its recorded ETag changed, so it is not copied at all.
-                Err(error @ BlobError::IntegrityCheckFailed(_)) => {
+                // Only a storage that cannot copy at all gets the bytes through the node.
+                Err(BlobError::CopyUnsupported) => {
+                    tracing::warn!("The storage cannot copy inside itself; the bytes are streamed");
+                    return self.settle(target, (&path, &upload_id), plain.ulid).await;
+                }
+                // Any other refusal, like a changed source or a busy storage, is retried later.
+                Err(error) => {
                     self.settle(target, (&path, &upload_id), plain.ulid).await?;
                     return Err(error);
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "Provider copy refused; the bytes are streamed");
-                    return self.settle(target, (&path, &upload_id), plain.ulid).await;
                 }
             }
         }

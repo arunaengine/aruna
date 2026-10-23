@@ -281,6 +281,9 @@ impl NativeMultipart {
             .await
             .map_err(|error| match status(&error) {
                 Some(412) => BlobError::IntegrityCheckFailed("the source lost its ETag".into()),
+                // Only a refusal of the call itself says the storage cannot copy.
+                Some(501) => BlobError::CopyUnsupported,
+                _ if error.code() == Some("NotImplemented") => BlobError::CopyUnsupported,
                 _ => write_error("copy part", error),
             })?;
         output

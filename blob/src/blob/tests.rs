@@ -4228,3 +4228,190 @@ async fn s3_copies_plain() {
     };
     assert_eq!(read_back(&handler, copy).await, b"renamed bytes");
 }
+
+/// An S3 storage that records each request line. A part copy answers with `copied` as its
+/// ETag, or without one as a storage too busy for now.
+async fn copying_storage(copied: Option<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let (mut request, mut buffer) = (Vec::new(), [0u8; 8192]);
+            // The head, then as many body bytes as it announces.
+            let head = loop {
+                let read = stream.read(&mut buffer).await.unwrap_or(0);
+                request.extend_from_slice(&buffer[..read]);
+                let end = request.windows(4).position(|window| window == b"\r\n\r\n");
+                match (end, read) {
+                    (Some(end), _) => break Some(end + 4),
+                    (None, 0) => break None,
+                    _ => {}
+                }
+            };
+            let Some(head) = head else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&request[..head]).to_string();
+            let length = (text.to_lowercase().lines())
+                .find_map(|line| line.strip_prefix("content-length:")?.trim().parse().ok())
+                .unwrap_or(0usize);
+            while request.len() < head + length {
+                let read = stream.read(&mut buffer).await.unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let line = text.lines().next().unwrap_or_default().to_string();
+            log.lock().unwrap().push(line.clone());
+            let started = "<InitiateMultipartUploadResult><UploadId>u1</UploadId>\
+                           </InitiateMultipartUploadResult>";
+            let (status, body) = match (line.split_once(' '), &copied) {
+                (Some(("POST", target)), _) if target.contains("uploads") => {
+                    ("200 OK", started.to_string())
+                }
+                (Some(("PUT", _)), Some(etag)) => (
+                    "200 OK",
+                    format!("<CopyPartResult><ETag>\"{etag}\"</ETag></CopyPartResult>"),
+                ),
+                (Some(("PUT", _)), None) => (
+                    "503 Slow Down",
+                    "<Error><Code>SlowDown</Code></Error>".to_string(),
+                ),
+                (Some(("POST", _)), _) => (
+                    "200 OK",
+                    "<CompleteMultipartUploadResult><ETag>\"c-1\"</ETag>\
+                     </CompleteMultipartUploadResult>"
+                        .to_string(),
+                ),
+                (Some(("DELETE", _)), _) => ("204 No Content", String::new()),
+                _ => ("500 Internal Server Error", String::new()),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    (endpoint, seen)
+}
+
+/// A handler whose group storage is the S3 storage at `endpoint`, the unversioned source
+/// there with a known MD5, and the name it is copied to.
+fn copy_source(
+    context: &TestContext,
+    endpoint: &str,
+) -> (
+    BlobHandler,
+    ResolvedBackend,
+    BackendLocation,
+    aruna_core::structs::storage::backend_import::PlainPath,
+) {
+    use aruna_core::structs::checksum::HASH_MD5;
+    use aruna_core::structs::storage::backend_import::PlainPath;
+    let env = S3Env {
+        endpoint: endpoint.to_string(),
+        access_key: "key".to_string(),
+        secret_key: "secret".to_string(),
+        region: "us-east-1".to_string(),
+    };
+    let backend_id = Ulid::generate();
+    let entry = NodeBackend::new(
+        BackendConfig {
+            backend_type: Backend::Group(GroupBackendKind::S3),
+            root: String::new(),
+            service_config: s3_config(&env, Some("lab")),
+            bucket_prefix: None,
+            max_bucket_size: None,
+            multipart_bucket: Some("lab".to_string()),
+            timeouts: Default::default(),
+        },
+        None,
+    );
+    let groups = HashMap::from([(backend_id, Arc::new(entry))]);
+    let handler = BlobHandler {
+        registry: context.blob_handle.handler.registry.with_groups(groups),
+        ..context.blob_handle.handler.clone()
+    };
+    let (bytes, ulid) = (b"renamed bytes", Ulid::generate());
+    let source = BackendLocation {
+        backend: BackendRef::Group(backend_id),
+        storage_class: None,
+        root: String::new(),
+        storage_bucket: String::new(),
+        backend_path: "raw/7_a.bin".to_string(),
+        ulid,
+        format: StoredFormat {
+            layout: StoredLayout::Plain(ulid),
+            ..StoredFormat::default()
+        },
+        created_by: test_user_id(),
+        created_at: SystemTime::now(),
+        staging: false,
+        partial: false,
+        blob_size: bytes.len() as u64,
+        hashes: HashMap::from([
+            (HASH_MD5.to_string(), md5::compute(bytes).0.to_vec()),
+            (
+                HASH_BLAKE3.to_string(),
+                blake3::hash(bytes).as_bytes().to_vec(),
+            ),
+        ]),
+    };
+    let plain = PlainPath {
+        path: "raw/a.bin~7".to_string(),
+        ulid: Ulid::generate(),
+        if_not_exists: true,
+        exact: true,
+    };
+    let resolved = ResolvedBackend::new(BackendRef::Group(backend_id), None);
+    (handler, resolved, source, plain)
+}
+
+#[tokio::test]
+async fn retries_transient_copies() {
+    // A part copy the storage refuses for now is retried later; no byte passes the node.
+    let context = setup_two_backends().await;
+    let (endpoint, seen) = copying_storage(None).await;
+    let (handler, resolved, source, plain) = copy_source(&context, &endpoint);
+    let event = handler.copy_plain(resolved, plain, source, None).await;
+    assert!(
+        matches!(event, BlobEvent::Error(BlobError::WriteError(_))),
+        "{event:?}"
+    );
+    let seen = seen.lock().unwrap().clone();
+    // The upload goes, and nothing reads the source.
+    assert!(
+        seen.iter().any(|line| line.starts_with("DELETE")),
+        "{seen:?}"
+    );
+    let read = |line: &String| line.starts_with("GET") || line.starts_with("HEAD");
+    assert!(!seen.iter().any(read), "{seen:?}");
+}
+
+#[tokio::test]
+async fn copies_without_reading() {
+    // A copy whose part ETag is the source MD5 asks for the copy alone, never a read.
+    let context = setup_two_backends().await;
+    let md5 = hex::encode(md5::compute(b"renamed bytes").0);
+    let (endpoint, seen) = copying_storage(Some(md5)).await;
+    let (handler, resolved, source, plain) = copy_source(&context, &endpoint);
+    let event = handler
+        .copy_plain(resolved, plain, source.clone(), None)
+        .await;
+    let BlobEvent::PlainWritten { location, .. } = event else {
+        panic!("copy failed: {event:?}")
+    };
+    assert_eq!(location.get_blake3(), source.get_blake3());
+    let seen = seen.lock().unwrap().clone();
+    let methods: Vec<&str> = seen
+        .iter()
+        .filter_map(|line| line.split(' ').next())
+        .collect();
+    assert_eq!(methods, ["POST", "PUT", "POST"], "{seen:?}");
+}
