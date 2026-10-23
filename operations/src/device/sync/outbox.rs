@@ -8,18 +8,19 @@ use std::time::Duration;
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
+use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_ORIGIN_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
 use aruna_core::metadata::AuthToken;
+use aruna_core::structs::execution::offered_directory::modified_ms;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{
-    EntrySide, EntryState, FolderState, SyncBase, SyncPull, SyncPullAck, SyncRefusal, SyncedBytes,
-    SyncedFolder,
+    EntrySide, EntryState, FolderState, LocalOrigin, SyncBase, SyncPull, SyncPullAck, SyncRefusal,
+    SyncedBytes, SyncedFolder,
 };
 use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, TxnId};
+use aruna_core::types::{Key, TxnId, Value};
 use aruna_storage::storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
@@ -30,6 +31,7 @@ use crate::device::backlog::{
 use crate::device::drain::DrainOutcome;
 use crate::driver::DriverContext;
 
+use super::folders::FolderError;
 use super::pull::forward_pull;
 use super::repository::{
     MAX_UPLOAD_ATTEMPTS, SYNC_PAGE_SIZE, SyncUpload, UploadState, abort_txn, base_entry, base_key,
@@ -215,10 +217,12 @@ async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &
         warn!(relative = %upload.relative, "Failed to encode a synced base");
         return;
     };
+    let mut rows = vec![row];
+    rows.extend(origin_row(upload, ack));
     let Some(txn_id) = start_txn(context).await else {
         return;
     };
-    let settled = write_rows(context, vec![row], Some(txn_id)).await
+    let settled = write_rows(context, rows, Some(txn_id)).await
         && super::repository::delete_rows(
             context,
             vec![(
@@ -234,6 +238,43 @@ async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &
     }
     if commit_txn(context, txn_id).await {
         info!(relative = %upload.relative, version = %ack.version_id, "Published a synced file");
+    }
+}
+
+/// Which local file the acknowledged version came from, kept on this device only. A delete
+/// leaves no file to name.
+fn origin_row(upload: &SyncUpload, ack: &SyncPullAck) -> Option<(String, Key, Value)> {
+    let origin = LocalOrigin {
+        folder_id: upload.folder_id,
+        relative: upload.relative.clone(),
+        modified_at_ms: modified_ms(&upload.fingerprint),
+        fingerprint: upload.fingerprint.clone(),
+    };
+    let bytes = (!upload.deleted)
+        .then(|| origin.to_bytes().ok())
+        .flatten()?;
+    let key = ack.version_id.to_bytes().to_vec().into();
+    Some((SYNC_ORIGIN_KEYSPACE.to_string(), key, bytes.into()))
+}
+
+/// The local file this device published as realm version `version_id`, if it did.
+pub async fn local_origin(
+    context: &Arc<DriverContext>,
+    version_id: ulid::Ulid,
+) -> Result<Option<LocalOrigin>, FolderError> {
+    let read = StorageEffect::Read {
+        key_space: SYNC_ORIGIN_KEYSPACE.to_string(),
+        key: version_id.to_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => LocalOrigin::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|_| FolderError::Unavailable),
+        _ => Err(FolderError::Unavailable),
     }
 }
 

@@ -19,6 +19,10 @@ pub const MAX_SYNC_PAGE: usize = 256;
 /// from. It makes a replayed pull idempotent instead of a second version.
 pub const SYNC_VERSION_TAG: &str = "aruna-sync-source-version";
 
+/// Version metadata tag naming the device a pulled realm version came from. The realm keeps
+/// only the device; which local file it was stays on that device.
+pub const ORIGIN_DEVICE_TAG: &str = "aruna-engine.org/origin-device";
+
 /// Directory a folder's move-aside puts files into, relative to the root.
 pub const SYNC_TRASH_DIR: &str = ".aruna/trash";
 
@@ -589,6 +593,26 @@ impl SyncPull {
             self.source.version,
             self.deleted,
         ))?)
+    }
+}
+
+/// The local file one realm version this device published came from. Device-local only: the
+/// path never leaves the machine.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocalOrigin {
+    pub folder_id: Ulid,
+    pub relative: String,
+    pub modified_at_ms: Option<u64>,
+    pub fingerprint: String,
+}
+
+impl LocalOrigin {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 

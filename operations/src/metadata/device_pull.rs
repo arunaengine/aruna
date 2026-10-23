@@ -15,8 +15,8 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::{
-    RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull, SyncPullAck,
-    SyncPullStatus, SyncRefusal, SyncVersionPage,
+    ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
+    SyncPullAck, SyncPullStatus, SyncRefusal, SyncVersionPage,
 };
 use aruna_core::types::{GroupId, Key, Value};
 use futures_util::StreamExt;
@@ -404,10 +404,7 @@ async fn delete_target(
         })
         // The marker carries the device version it came from, and the receipt
         // committed with it makes a retried delete the same one.
-        .with_metadata(HashMap::from([(
-            SYNC_VERSION_TAG.to_string(),
-            request.source.version.to_string(),
-        )]))
+        .with_metadata(pull_tags(request))
         .with_fence(guards, receipts),
         context,
     )
@@ -487,10 +484,7 @@ async fn commit_pull(
         routing,
     })
     .with_bucket_guard(bucket.clone())
-    .with_metadata(HashMap::from([(
-        SYNC_VERSION_TAG.to_string(),
-        request.source.version.to_string(),
-    )]))
+    .with_metadata(pull_tags(request))
     .with_fence(guards, receipts);
     let result = drive(operation, context).await.map_err(|error| {
         debug!(error = %error, "A forwarded sync pull could not be written");
@@ -536,6 +530,21 @@ fn read_refusal(error: &BaoReadError) -> SyncRefusal {
         ),
         _ => SyncRefusal::Unavailable,
     }
+}
+
+/// The device version a realm version came from and the device that published it. The local
+/// path stays on the device.
+fn pull_tags(request: &SyncPull) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            SYNC_VERSION_TAG.to_string(),
+            request.source.version.to_string(),
+        ),
+        (
+            ORIGIN_DEVICE_TAG.to_string(),
+            request.source.node_id.to_string(),
+        ),
+    ])
 }
 
 /// The receipt row of this device version: absent until the version or marker commits.
