@@ -9,6 +9,7 @@ mod topology;
 
 use std::time::Duration;
 
+use aruna_core::StructuredId;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::device::replica::read_replica;
 use aruna_operations::metadata::api::GetVisibleRequest;
