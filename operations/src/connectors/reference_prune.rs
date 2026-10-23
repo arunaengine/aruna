@@ -6,22 +6,26 @@
 use std::time::Duration;
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
 };
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
+use smallvec::smallvec;
+use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::connectors::repository::references_connector;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 
 /// Reference rows one pruning transaction checks.
 const PRUNE_PAGE: usize = 128;
@@ -67,12 +71,10 @@ pub async fn prune_references(context: &DriverContext) -> Result<bool, String> {
     let more = rows.len() == PRUNE_CONNECTORS;
     let mut remaining = false;
     for (connector, cursor) in rows {
-        let Ok(connector_id) = <[u8; 16]>::try_from(connector.as_ref()).map(Ulid::from_bytes)
-        else {
-            delete_raw(context, connector).await?;
-            continue;
-        };
-        remaining |= prune_page(context, connector_id, cursor).await?;
+        let page = PrunePageOperation::new(connector, cursor);
+        remaining |= drive(page, context)
+            .await
+            .map_err(|error| error.to_string())?;
     }
     Ok(more || remaining)
 }
@@ -92,135 +94,253 @@ async fn queued(storage: &StorageHandle, limit: usize) -> Result<Vec<(Key, Value
     }
 }
 
-/// Prunes one page of stale rows after `cursor`. A live reference ends the pruning: the next
-/// check meets it at once. `true` while the connector stays queued.
-async fn prune_page(
-    context: &DriverContext,
-    connector_id: Ulid,
-    cursor: Value,
-) -> Result<bool, String> {
-    let txn_id = match send(context, StorageEffect::StartTransaction { read: false }).await? {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("unexpected transaction event: {other:?}")),
-    };
-    let result = prune_rows(context, txn_id, connector_id, cursor).await;
-    let commit = match result {
-        Ok(_) => send(context, StorageEffect::CommitTransaction { txn_id }).await,
-        Err(_) => send(context, StorageEffect::AbortTransaction { txn_id }).await,
-    };
-    let queued = result?;
-    match commit? {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(queued),
-        other => Err(format!("unexpected commit event: {other:?}")),
-    }
+#[derive(Debug, Error, PartialEq)]
+pub enum PruneError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error("unexpected event in state {state:?}: {received}")]
+    UnexpectedEvent { state: PruneState, received: String },
 }
 
-async fn prune_rows(
-    context: &DriverContext,
-    txn_id: TxnId,
-    connector_id: Ulid,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PruneState {
+    Init,
+    StartTransaction,
+    ReadRows,
+    ReadVersions,
+    WriteQueue,
+    DeleteRows,
+    Commit,
+    Abort,
+    Finish,
+    Error,
+}
+
+/// Prunes one page of one queued connector's stale rows in a transaction. A live reference
+/// ends the pruning, since the next check meets it at once. Outputs whether the connector
+/// stays queued.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PrunePageOperation {
+    queue_key: Key,
     cursor: Value,
-) -> Result<bool, String> {
-    let queue_key = ByteView::from(connector_id.to_bytes().to_vec());
-    let iter = StorageEffect::Iter {
-        key_space: CONNECTOR_REFERENCE_KEYSPACE.to_string(),
-        prefix: Some(queue_key.clone()),
-        start: (!cursor.is_empty()).then(|| IterStart::After(cursor)),
-        limit: PRUNE_PAGE,
-        txn_id: Some(txn_id),
-    };
-    let (rows, next) = match send(context, iter).await? {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => (values, next_start_after),
-        other => return Err(format!("unexpected reference rows event: {other:?}")),
-    };
-    let reads = rows
-        .iter()
-        .map(|(row, _)| {
-            let version_key = row.get(ROW_PREFIX..).unwrap_or_default();
-            (
-                BLOB_VERSIONS_KEYSPACE.to_string(),
-                ByteView::from(version_key.to_vec()),
-            )
-        })
-        .collect();
-    let versions = match send(
-        context,
-        StorageEffect::BatchRead {
-            reads,
+    state: PruneState,
+    txn_id: Option<TxnId>,
+    rows: Vec<Key>,
+    next: Option<Key>,
+    deletes: Vec<(KeySpace, Key)>,
+    queued: bool,
+    output: Option<Result<bool, PruneError>>,
+}
+
+impl PrunePageOperation {
+    pub(crate) fn new(queue_key: Key, cursor: Value) -> Self {
+        Self {
+            queue_key,
+            cursor,
+            state: PruneState::Init,
+            txn_id: None,
+            rows: Vec::new(),
+            next: None,
+            deletes: Vec::new(),
+            queued: false,
+            output: None,
+        }
+    }
+
+    fn txn(&self) -> Result<TxnId, PruneError> {
+        self.txn_id.ok_or(StorageError::TransactionNotFound.into())
+    }
+
+    fn fail(&mut self, error: PruneError) -> Effects {
+        self.output = Some(Err(error));
+        match self.txn_id.take() {
+            Some(txn_id) => {
+                self.state = PruneState::Abort;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            None => {
+                self.state = PruneState::Error;
+                smallvec![]
+            }
+        }
+    }
+
+    fn delete_rows(&mut self, txn_id: TxnId) -> Effects {
+        self.state = PruneState::DeleteRows;
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes: std::mem::take(&mut self.deletes),
             txn_id: Some(txn_id),
-        },
-    )
-    .await?
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => return Err(format!("unexpected version read event: {other:?}")),
-    };
-    let mut stale = Vec::new();
-    let mut live = false;
-    for ((row, _), (_, value)) in rows.into_iter().zip(versions) {
-        let version = value
-            .map(|value| BlobVersion::from_bytes(value.as_ref()))
-            .transpose()
-            .map_err(|error| error.to_string())?;
-        if version.is_some_and(|version| references_connector(&version, connector_id)) {
-            live = true;
-            break;
+        })]
+    }
+
+    fn step_inner(&mut self, event: Event) -> Result<Effects, PruneError> {
+        match (self.state, event) {
+            (
+                PruneState::StartTransaction,
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
+            ) => {
+                self.txn_id = Some(txn_id);
+                let Ok(connector) = <[u8; 16]>::try_from(self.queue_key.as_ref()) else {
+                    // A malformed queue row names no connector and is only removed.
+                    let queue_row = (CONNECTOR_PRUNE_KEYSPACE.to_string(), self.queue_key.clone());
+                    self.deletes.push(queue_row);
+                    return Ok(self.delete_rows(txn_id));
+                };
+                self.state = PruneState::ReadRows;
+                let cursor = std::mem::take(&mut self.cursor);
+                Ok(smallvec![Effect::Storage(StorageEffect::Iter {
+                    key_space: CONNECTOR_REFERENCE_KEYSPACE.to_string(),
+                    prefix: Some(ByteView::from(connector.to_vec())),
+                    start: (!cursor.is_empty()).then_some(IterStart::After(cursor)),
+                    limit: PRUNE_PAGE,
+                    txn_id: Some(txn_id),
+                })])
+            }
+            (
+                PruneState::ReadRows,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                self.rows = values.into_iter().map(|(row, _)| row).collect();
+                self.next = next_start_after;
+                let reads = self
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let version_key = row.get(ROW_PREFIX..).unwrap_or_default();
+                        (
+                            BLOB_VERSIONS_KEYSPACE.to_string(),
+                            ByteView::from(version_key.to_vec()),
+                        )
+                    })
+                    .collect();
+                self.state = PruneState::ReadVersions;
+                Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: Some(self.txn()?),
+                })])
+            }
+            (
+                PruneState::ReadVersions,
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+            ) => self.plan_page(values),
+            (PruneState::WriteQueue, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                Ok(self.delete_rows(self.txn()?))
+            }
+            (PruneState::DeleteRows, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
+                self.state = PruneState::Commit;
+                let txn_id = self.txn()?;
+                Ok(smallvec![Effect::Storage(
+                    StorageEffect::CommitTransaction { txn_id }
+                )])
+            }
+            (PruneState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
+                self.txn_id = None;
+                self.state = PruneState::Finish;
+                self.output = Some(Ok(self.queued));
+                Ok(smallvec![])
+            }
+            (PruneState::Commit, Event::Storage(StorageEvent::Error { error })) => {
+                // A failed commit leaves no transaction to abort.
+                self.txn_id = None;
+                Err(error.into())
+            }
+            (PruneState::Abort, Event::Storage(_)) => {
+                self.state = PruneState::Error;
+                Ok(smallvec![])
+            }
+            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (state, event) => Err(PruneError::UnexpectedEvent {
+                state,
+                received: format!("{event:?}"),
+            }),
         }
-        stale.push((CONNECTOR_REFERENCE_KEYSPACE.to_string(), row));
     }
-    let queued = !live && next.is_some();
-    match next.filter(|_| queued) {
-        Some(next) => {
-            let (key_space, key, value) = prune_queue_write(connector_id, next);
-            write(context, txn_id, key_space, key, value).await?;
+
+    /// Stale rows up to the first live reference are deleted; the queue row moves on when more
+    /// rows follow and no live reference was met, else it is deleted.
+    fn plan_page(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<Effects, PruneError> {
+        let txn_id = self.txn()?;
+        let connector_id = <[u8; 16]>::try_from(self.queue_key.as_ref())
+            .map(Ulid::from_bytes)
+            .map_err(|_| StorageError::InvalidEffect)?;
+        let mut live = false;
+        for (row, (_, value)) in std::mem::take(&mut self.rows).into_iter().zip(values) {
+            let version = value
+                .map(|value| BlobVersion::from_bytes(value.as_ref()))
+                .transpose()?;
+            if version.is_some_and(|version| references_connector(&version, connector_id)) {
+                live = true;
+                break;
+            }
+            self.deletes
+                .push((CONNECTOR_REFERENCE_KEYSPACE.to_string(), row));
         }
-        None => stale.push((CONNECTOR_PRUNE_KEYSPACE.to_string(), queue_key)),
-    }
-    let deletes = StorageEffect::BatchDelete {
-        deletes: stale,
-        txn_id: Some(txn_id),
-    };
-    match send(context, deletes).await? {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(queued),
-        other => Err(format!("unexpected prune delete event: {other:?}")),
-    }
-}
-
-async fn write(
-    context: &DriverContext,
-    txn_id: TxnId,
-    key_space: KeySpace,
-    key: Key,
-    value: Value,
-) -> Result<(), String> {
-    let write = StorageEffect::Write {
-        key_space,
-        key,
-        value,
-        txn_id: Some(txn_id),
-    };
-    match send(context, write).await? {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(format!("unexpected queue write event: {other:?}")),
+        self.queued = !live && self.next.is_some();
+        match self.next.take().filter(|_| self.queued) {
+            Some(next) => {
+                let (key_space, key, value) = prune_queue_write(connector_id, next);
+                self.state = PruneState::WriteQueue;
+                Ok(smallvec![Effect::Storage(StorageEffect::Write {
+                    key_space,
+                    key,
+                    value,
+                    txn_id: Some(txn_id),
+                })])
+            }
+            None => {
+                let queue_row = (CONNECTOR_PRUNE_KEYSPACE.to_string(), self.queue_key.clone());
+                self.deletes.push(queue_row);
+                Ok(self.delete_rows(txn_id))
+            }
+        }
     }
 }
 
-async fn delete_raw(context: &DriverContext, key: Key) -> Result<(), String> {
-    let delete = StorageEffect::Delete {
-        key_space: CONNECTOR_PRUNE_KEYSPACE.to_string(),
-        key,
-        txn_id: None,
-    };
-    send(context, delete).await.map(|_| ())
-}
+impl Operation for PrunePageOperation {
+    type Output = bool;
+    type Error = PruneError;
 
-async fn send(context: &DriverContext, effect: StorageEffect) -> Result<Event, String> {
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        event => Ok(event),
+    fn start(&mut self) -> Effects {
+        self.state = PruneState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if matches!(self.state, PruneState::Finish | PruneState::Error) {
+            return smallvec![];
+        }
+        match self.step_inner(event) {
+            Ok(effects) => effects,
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, PruneState::Finish | PruneState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(PruneError::UnexpectedEvent {
+            state: self.state,
+            received: "no output".to_string(),
+        }))
+    }
+
+    fn abort(&mut self) -> Effects {
+        match self.txn_id.take() {
+            Some(txn_id) => {
+                self.state = PruneState::Abort;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            None => smallvec![],
+        }
     }
 }
 
@@ -299,6 +419,32 @@ mod tests {
         };
         let now = SystemTime::UNIX_EPOCH;
         BlobVersion::reference(binding, metadata, now, Default::default(), now)
+    }
+
+    // A queue row that names no connector is removed in its own transaction.
+    #[test]
+    fn malformed_queue_dropped() {
+        let mut operation = PrunePageOperation::new(
+            ByteView::from(b"short".to_vec()),
+            ByteView::from(Vec::new()),
+        );
+        operation.start();
+        let txn_id = Ulid::from_bytes([1; 16]);
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })]
+                if deletes.len() == 1 && deletes[0].0 == CONNECTOR_PRUNE_KEYSPACE
+        ));
+        operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert_eq!(operation.finalize(), Ok(false));
     }
 
     // Queued stale rows are pruned page by page until the queue row is gone; a live reference
