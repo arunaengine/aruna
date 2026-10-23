@@ -1,0 +1,225 @@
+//! Tests that a finished local run reaches the realm only when its owner publishes it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+// Fresh builds overflow the default query depth in nested async layouts.
+#![recursion_limit = "256"]
+
+mod topology;
+
+use std::time::{Duration, SystemTime};
+
+use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::RemoteBinding;
+use aruna_core::structs::execution::job::{
+    ExecutionSpec, JobId, JobPayload, JobRecord, JobResultPayload, JobState, OutputObject,
+    RunCrateStatus,
+};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::types::GroupId;
+use aruna_operations::device::publish_run::{PublishRunInput, publish_run};
+use aruna_operations::device::realm_documents::fetch_realm_documents;
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::jobs::store::{insert_job, put_crate_status, read_crate_status};
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use futures_util::StreamExt;
+use topology::{TestResult, Topology};
+use ulid::Ulid;
+
+const REMOTE_BUCKET: &str = "lab-data";
+const LOCAL_BUCKET: &str = "run-out";
+const OUTPUT: &[u8] = b">contig1\nACGT\n";
+/// Only ends a hung exchange; never a performance assertion.
+const FETCH_BUDGET: Duration = Duration::from_secs(30);
+
+async fn create_bucket(
+    context: &DriverContext,
+    name: &str,
+    group_id: GroupId,
+    realm: &Topology,
+) -> TestResult<()> {
+    drive(
+        CreateBucketOperation::new(
+            name.to_string(),
+            BucketInfo {
+                group_id,
+                created_at: SystemTime::now(),
+                created_by: realm.user_id,
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+                compression: Compression::Off,
+            },
+        ),
+        context,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The output a local run wrote into a device bucket.
+async fn write_output(realm: &Topology, group_id: GroupId) -> TestResult<Ulid> {
+    let device = realm.user_node();
+    let result = drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: realm.user_id,
+            group_id,
+            realm_id: realm.realm_id,
+            node_id: device.node_id(),
+            request: PutObjectInput {
+                bucket: LOCAL_BUCKET.to_string(),
+                key: "contigs.fasta".to_string(),
+                content_length: Some(OUTPUT.len() as u64),
+                body: Some(
+                    BackendStream::new(tokio_util::io::ReaderStream::new(OUTPUT))
+                        as BackendStream<Result<bytes::Bytes, StreamError>>,
+                ),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        }),
+        device.context.as_ref(),
+    )
+    .await?;
+    Ok(result.version_id)
+}
+
+/// A succeeded local run whose crate waits for the owner, as the device records it.
+async fn finished_run(realm: &Topology, group_id: GroupId, version_id: Ulid) -> TestResult<JobId> {
+    let device = realm.user_node();
+    let job_id = JobId::from_bytes([0xC3; 16]);
+    let spec = ExecutionSpec {
+        group_id,
+        name: None,
+        description: None,
+        tags: Default::default(),
+        image: "alpine".to_string(),
+        entrypoint: None,
+        command: Vec::new(),
+        workdir: None,
+        env: Default::default(),
+        resources: Default::default(),
+        executor_constraint: None,
+        inputs: Vec::new(),
+        file_outputs: Vec::new(),
+        workspace_outputs: Vec::new(),
+        output_prefixes: Vec::new(),
+        collision_policy: Default::default(),
+    };
+    let mut record = JobRecord::new(
+        job_id,
+        JobPayload::Execution(spec),
+        realm.user_id,
+        device.node_id(),
+        1,
+        1,
+        None,
+    );
+    record.state = JobState::Succeeded;
+    record.finished_at_ms = Some(2);
+    record.result = Some(JobResultPayload::Execution {
+        exit_code: Some(0),
+        workspace_bucket: None,
+        outputs: vec![OutputObject {
+            node_id: device.node_id(),
+            bucket: LOCAL_BUCKET.to_string(),
+            key: "contigs.fasta".to_string(),
+            version_id,
+            execution_id: Ulid::from(9u128),
+            container_path: "/out/contigs.fasta".to_string(),
+            size: OUTPUT.len() as u64,
+            digest: Some(blake3::hash(OUTPUT).to_hex().to_string()),
+        }],
+        stdout: String::new(),
+        stderr: String::new(),
+        output_digest: None,
+    });
+    let storage = &device.context.storage_handle;
+    insert_job(storage, &record).await?;
+    put_crate_status(storage, job_id, &RunCrateStatus::Local).await?;
+    Ok(job_id)
+}
+
+async fn read_remote(realm: &Topology, group_id: GroupId, key: &str) -> TestResult<Vec<u8>> {
+    let server = realm.node(0);
+    let result = drive(
+        GetObjectOperation::new(GetObjectInput {
+            bucket: REMOTE_BUCKET.to_string(),
+            key: key.to_string(),
+            version_id: None,
+            range: None,
+            group_id,
+            user_identity: realm.user_id,
+            realm_id: realm.realm_id,
+            node_id: server.node_id(),
+        }),
+        server.context.as_ref(),
+    )
+    .await?;
+    let mut bytes = Vec::new();
+    let mut blob = result.blob.0;
+    while let Some(chunk) = blob.next().await {
+        bytes.extend_from_slice(&chunk?);
+    }
+    Ok(bytes)
+}
+
+/// Publishing copies the exact output version under the prefix and writes the
+/// crate once; a repeated publish replays the same copy.
+#[tokio::test]
+async fn publishes_local_run() -> TestResult<()> {
+    let realm = Topology::spawn(2, 1, 1).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    create_bucket(&server.context, REMOTE_BUCKET, group_id, &realm).await?;
+    create_bucket(&device.context, LOCAL_BUCKET, group_id, &realm).await?;
+    let version_id = write_output(&realm, group_id).await?;
+    let job_id = finished_run(&realm, group_id, version_id).await?;
+    let input = || PublishRunInput {
+        job_id,
+        owner: realm.user_id,
+        node_id: device.node_id(),
+        target: RemoteBinding {
+            node_id: server.node_id(),
+            bucket: REMOTE_BUCKET.to_string(),
+            prefix: "runs/assembly".to_string(),
+        },
+    };
+
+    let published = publish_run(&device.context, input()).await?;
+    assert_eq!(published.outputs.len(), 1);
+    assert_eq!(published.outputs[0].key, "runs/assembly/contigs.fasta");
+    assert_eq!(published.outputs[0].node_id, server.node_id());
+    assert!(matches!(
+        published.run_crate,
+        RunCrateStatus::Written { .. }
+    ));
+    assert_eq!(
+        read_remote(&realm, group_id, "runs/assembly/contigs.fasta").await?,
+        OUTPUT
+    );
+
+    let replayed = publish_run(&device.context, input()).await?;
+    assert_eq!(
+        replayed.outputs[0].version_id,
+        published.outputs[0].version_id
+    );
+    assert_eq!(replayed.run_crate, published.run_crate);
+    assert_eq!(
+        read_crate_status(&device.context.storage_handle, job_id).await?,
+        Some(published.run_crate)
+    );
+    Ok(())
+}
