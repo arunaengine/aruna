@@ -257,7 +257,7 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn existing_bound_bucket_refused() {
+    fn bound_bucket_refused() {
         let group_id = Ulid::from_bytes([1; 16]);
         let mut info = BucketInfo {
             group_id,

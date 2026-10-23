@@ -875,7 +875,7 @@ fn version_binds_publisher() {
 }
 
 #[test]
-fn epoch_only_when_bound() {
+fn epoch_needs_binding() {
     // An ordinary bucket orders by generation alone, whatever epoch a manifest claims.
     let stored_epoch = |bound: bool| {
         let mut manifest = make_reference_manifest();

@@ -93,7 +93,7 @@ fn public(public: bool) -> DistributionOp {
 }
 
 #[test]
-fn creation_reduces_to_active() {
+fn creation_activates_set() {
     let mut state = state();
     let create = change_event(10, 1, 1, None, DistributionOp::Create { config: config() });
     assert_eq!(state.apply(&create), Ok(AdminApplyStatus::Applied));
@@ -180,7 +180,7 @@ fn concurrent_successors_converge() {
 }
 
 #[test]
-fn out_of_order_changes_apply() {
+fn late_changes_apply() {
     let create = change_event(10, 1, 1, None, DistributionOp::Create { config: config() });
     let mut source = state();
     source.apply(&create).unwrap();
@@ -198,7 +198,7 @@ fn out_of_order_changes_apply() {
 }
 
 #[test]
-fn unsupported_and_foreign_refused() {
+fn foreign_changes_refused() {
     let mut state = state();
     state
         .apply(&change_event(

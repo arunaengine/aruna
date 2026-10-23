@@ -115,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn hint_uses_blake3_bits() {
+    fn hint_uses_blake3() {
         let set_id = set(1);
         let hash = blake3::hash(&set_id.to_bytes());
         let bits = u32::from_be_bytes([
@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn hint_keeps_mint_time() {
+    fn hint_keeps_time() {
         let hint = SetHint::of_set(set(2));
         let time_ms = (1 << 48) - 1;
         let id = hinted_id(time_ms, u128::MAX, hint);
@@ -140,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn minted_ids_carry_hint() {
+    fn minted_ids_hinted() {
         let before = SystemTime::now() - Duration::from_secs(1);
         let hint = SetHint::of_set(set(3));
         let id = mint_version(Some(hint));

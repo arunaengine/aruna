@@ -71,7 +71,7 @@ fn replica_preset_validates() {
 }
 
 #[test]
-fn shard_preset_spreads_ranges() {
+fn shard_preset_spreads() {
     let config = sharded(3, &["g", "p"], 1);
     assert_eq!(validate_config(&config), Ok(()));
     let roles: Vec<_> = config
@@ -97,7 +97,7 @@ fn shard_preset_spreads_ranges() {
 }
 
 #[test]
-fn edges_hold_all_records() {
+fn edges_hold_records() {
     let mut layout = shard_layout(id(99), &nodes(2), &["m".to_string()], 0).unwrap();
     add_edges(&mut layout, &[(id(7), node(7))], DataStrategy::CacheOnUse).unwrap();
     assert!(add_edges(&mut layout, &[(id(8), node(8))], DataStrategy::Copy).is_err());
@@ -110,10 +110,12 @@ fn edges_hold_all_records() {
     );
 }
 
+type Mutation = fn(&mut Vec<KeyRange>);
+
 #[test]
-fn ranges_must_be_complete() {
+fn ranges_stay_complete() {
     let base = sharded(2, &["m"], 0);
-    let mutations: Vec<(fn(&mut Vec<KeyRange>), DistributionError)> = vec![
+    let mutations: Vec<(Mutation, DistributionError)> = vec![
         (
             |ranges| ranges[0].lower = "a".into(),
             DistributionError::IncompleteRanges,
@@ -164,7 +166,7 @@ fn ranges_must_be_complete() {
 }
 
 #[test]
-fn range_count_is_bounded() {
+fn range_count_bounded() {
     let boundaries: Vec<String> = (1..MAX_RANGES).map(|index| format!("{index:05}")).collect();
     let layout = shard_layout(id(99), &nodes(4), &boundaries, 0).unwrap();
     assert_eq!(
@@ -180,7 +182,7 @@ fn range_count_is_bounded() {
 }
 
 #[test]
-fn record_size_is_bounded() {
+fn record_size_bounded() {
     let boundaries: Vec<String> = (1..MAX_RANGES)
         .map(|index| format!("{index:05}{}", "k".repeat(1000)))
         .collect();
@@ -341,7 +343,7 @@ fn creation_reaches_active() {
 }
 
 #[test]
-fn stale_changes_are_refused() {
+fn stale_changes_refused() {
     let created = apply_change(
         None,
         &change(

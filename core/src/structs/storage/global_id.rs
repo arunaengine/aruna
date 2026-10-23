@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn url_needs_its_base() {
+    fn url_needs_base() {
         let path = format!("/{}/{}", realm(), id(1));
         assert_eq!(
             GlobalId::parse_url(&format!("https://w3id.org/aruna/datax{path}")),
