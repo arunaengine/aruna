@@ -7,7 +7,9 @@ use crate::groups::backends::backend_key;
 use crate::groups::imports::ImportRuleError;
 use crate::groups::imports::create::{CreateImportInput, CreateImportOperation};
 use crate::groups::storage_routing::routing_key;
-use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
+use crate::node::usage_stats::{
+    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -358,7 +360,8 @@ impl CreateBucketOperation {
                 buckets: 1,
                 ..Default::default()
             },
-        );
+        )
+        .in_bucket(&self.bucket, RowChange::Kept);
         self.state = CreateBucketState::UpdateUsage;
         let effects = update.start(txn_id);
         self.usage_update = Some(update);

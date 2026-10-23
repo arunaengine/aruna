@@ -353,7 +353,7 @@ fn rekey_waits_transition() {
 
 mod envelopes {
     use super::*;
-    use crate::node::usage_stats::StoredDelta;
+    use crate::node::usage_stats::{RowChange, StoredDelta};
     use aruna_core::compute::SecretBytes;
     use aruna_core::keyspaces::*;
     use aruna_core::structs::identity::realm::QuotaConfig;
@@ -608,7 +608,10 @@ mod envelopes {
         };
         let stored = StoredDelta::for_location(&new, true).unwrap();
         let expected = UsageCounterUpdate::with_stored(GROUP, delta, stored);
-        assert_eq!(operation.usage, Some(expected));
+        assert_eq!(
+            operation.usage,
+            Some(expected.in_bucket("b", RowChange::Kept))
+        );
     }
 
     /// A real envelope of generation 1 for `object`, made with the write id `WRITE`.

@@ -85,10 +85,11 @@ pub(super) fn record_effect_fields(span: &Span, effect: &StorageEffect) {
         StorageEffect::AddUsage {
             key_space,
             deltas,
+            buckets,
             txn_id,
         } => {
             span.record("key_space", field::display(key_space));
-            span.record("batch_len", deltas.len() as u64);
+            span.record("batch_len", (deltas.len() + buckets.len()) as u64);
             span.record("txn_id", field::display(txn_id));
         }
         StorageEffect::BatchDelete { deletes, txn_id } => {

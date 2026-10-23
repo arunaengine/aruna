@@ -30,7 +30,7 @@ use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket, R
 use crate::structs::storage::format::Compression;
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingShare};
-use crate::structs::storage::usage::UsageDelta;
+use crate::structs::storage::usage::{BucketDelta, UsageDelta};
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
 use bytes::Bytes;
@@ -555,6 +555,8 @@ pub enum StorageEffect {
     AddUsage {
         key_space: KeySpace,
         deltas: Vec<(Key, UsageDelta)>,
+        /// Changes of `BucketCounters` rows, applied the same way.
+        buckets: Vec<(Key, BucketDelta)>,
         txn_id: TxnId,
     },
     Delete {

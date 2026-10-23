@@ -32,8 +32,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::storage::usage::{
-    NodeUsageSnapshot, UsageCounters, dirty_group_key, global_shard_keys, usage_group_key,
-    usage_snapshot_key,
+    BucketCounters, NodeUsageSnapshot, USAGE_BUCKET_PREFIX, UsageCounters, dirty_group_key,
+    global_shard_keys, usage_bucket_key, usage_group_key, usage_snapshot_key,
 };
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::records::HeadAliasContext;
@@ -289,7 +289,8 @@ async fn complete_upload(
     .unwrap()
 }
 
-async fn read_usage_stats(ctx: &DriverContext) -> Vec<(Vec<u8>, UsageCounters)> {
+/// Every usage row as stored: bucket rows hold [`BucketCounters`], the others [`UsageCounters`].
+async fn usage_rows(ctx: &DriverContext) -> Vec<(Vec<u8>, Vec<u8>)> {
     let Event::Storage(StorageEvent::IterResult { values, .. }) = ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
@@ -303,15 +304,29 @@ async fn read_usage_stats(ctx: &DriverContext) -> Vec<(Vec<u8>, UsageCounters)> 
     else {
         panic!("unexpected iter event");
     };
-    values
-        .into_iter()
-        .map(|(key, value)| {
-            (
-                key.to_vec(),
-                UsageCounters::from_bytes(value.as_ref()).unwrap(),
-            )
-        })
+    let rows = values.into_iter();
+    rows.map(|(key, value)| (key.to_vec(), value.to_vec()))
         .collect()
+}
+
+async fn read_usage_stats(ctx: &DriverContext) -> Vec<(Vec<u8>, UsageCounters)> {
+    let rows = usage_rows(ctx).await.into_iter();
+    rows.filter(|(key, _)| !key.starts_with(USAGE_BUCKET_PREFIX.as_bytes()))
+        .map(|(key, value)| (key, UsageCounters::from_bytes(&value).unwrap()))
+        .collect()
+}
+
+async fn bucket_rows(ctx: &DriverContext) -> BTreeMap<Vec<u8>, BucketCounters> {
+    let rows = usage_rows(ctx).await.into_iter();
+    rows.filter(|(key, _)| key.starts_with(USAGE_BUCKET_PREFIX.as_bytes()))
+        .map(|(key, value)| (key, BucketCounters::from_bytes(&value).unwrap()))
+        .collect()
+}
+
+async fn read_bucket(ctx: &DriverContext, bucket: &str) -> BucketCounters {
+    let mut rows = bucket_rows(ctx).await;
+    rows.remove(&usage_bucket_key(bucket))
+        .expect("the bucket row")
 }
 
 /// Effective, reader-visible counters: the summed global total across all 64 shards, plus every
@@ -353,9 +368,9 @@ async fn read_global(ctx: &DriverContext) -> UsageCounters {
 /// scan must leave the reader-visible counters byte-identical to what the
 /// incremental bookkeeping produced.
 async fn assert_matches_rebuild(ctx: &DriverContext) {
-    let before = effective_usage(ctx).await;
+    let before = (effective_usage(ctx).await, bucket_rows(ctx).await);
     drive(RebuildStatsOperation::new(), ctx).await.unwrap();
-    let after = effective_usage(ctx).await;
+    let after = (effective_usage(ctx).await, bucket_rows(ctx).await);
     assert_eq!(
         before, after,
         "incremental counters diverged from rebuilt truth: before={before:?} after={after:?}"
@@ -643,6 +658,49 @@ async fn abort_preserves_counters() {
     assert_eq!(global.stored_bytes, 0);
     assert_eq!(global.logical_bytes, 0);
 
+    assert_matches_rebuild(&h.driver).await;
+}
+
+#[tokio::test]
+async fn uploads_count_records() {
+    let h = setup().await;
+    let group_id = Ulid::generate();
+    create_bucket(&h, "bucket", group_id).await;
+    let uploads = async || read_bucket(&h.driver, "bucket").await.open_uploads;
+
+    let done = create_upload(&h, "bucket", "done.bin", group_id).await;
+    let dropped = create_upload(&h, "bucket", "dropped.bin", group_id).await;
+    assert_eq!(uploads().await, 2);
+    assert_matches_rebuild(&h.driver).await;
+
+    let part = upload_part(&h, "bucket", "done.bin", done, 1, b"kept").await;
+    complete_upload(&h, "bucket", "done.bin", done, &[part], 4).await;
+    assert_eq!(uploads().await, 1);
+    assert_matches_rebuild(&h.driver).await;
+
+    let abort = || {
+        AbortUploadOperation::new(AbortUploadInput {
+            bucket: "bucket".to_string(),
+            key: "dropped.bin".to_string(),
+            upload_id: dropped,
+            now_ms: aruna_operations::driver::now_ms(),
+        })
+    };
+    drive(abort(), &h.driver).await.unwrap();
+    assert_eq!(uploads().await, 0);
+    // A repeated abort finds no record and counts nothing.
+    let again = drive(abort(), &h.driver).await;
+    assert!(again.is_err());
+    assert_eq!(uploads().await, 0);
+
+    // The stale sweep ends an old upload through the same abort.
+    create_upload(&h, "bucket", "stale.bin", group_id).await;
+    assert_eq!(uploads().await, 1);
+    let later = aruna_operations::driver::now_ms() + 365 * 24 * 3_600_000;
+    aruna_operations::blob::cleanup::sweep_stale_uploads(&h.driver, later)
+        .await
+        .unwrap();
+    assert_eq!(uploads().await, 0);
     assert_matches_rebuild(&h.driver).await;
 }
 

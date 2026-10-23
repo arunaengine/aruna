@@ -9,7 +9,9 @@ use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_eff
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
 };
-use crate::node::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
+use crate::node::usage_stats::{
+    QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
+};
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
@@ -660,7 +662,8 @@ impl SealedCopyOperation {
             referenced_bytes: -i128::from(self.released_bytes),
             ..Default::default()
         };
-        self.usage = Some(UsageCounterUpdate::for_group(self.input.group_id, delta));
+        let usage = UsageCounterUpdate::for_group(self.input.group_id, delta);
+        self.usage = Some(usage.in_bucket(&self.input.bucket, RowChange::AddedVersion));
         match self.input.quota_ceiling.filter(|_| added > 0) {
             Some(ceiling) => {
                 let mut gate = QuotaGate::new_for_realm(

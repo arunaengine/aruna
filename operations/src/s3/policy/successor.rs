@@ -8,7 +8,9 @@ use crate::blob::managed_copy::{
     register_entry, scan_effect, validate_registration, version_scope,
 };
 use crate::blob::records::HeadAliasContext;
-use crate::node::usage_stats::{QuotaGate, QuotaGateError, UsageCounterUpdate, UsageUpdateError};
+use crate::node::usage_stats::{
+    QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
+};
 use crate::placement::policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
@@ -652,7 +654,8 @@ impl SuccessorMint {
         let released = predecessor.offered_size(&self.plan.context.bucket, &self.plan.context.key);
         delta.referenced_bytes -= i128::from(released.unwrap_or(0));
         self.quota_bytes = u64::try_from(delta.logical_bytes).unwrap_or_default();
-        self.usage = Some(UsageCounterUpdate::for_group(group_id, delta));
+        let usage = UsageCounterUpdate::for_group(group_id, delta);
+        self.usage = Some(usage.in_bucket(&self.plan.context.bucket, RowChange::AddedVersion));
         self.outcome = Some(SuccessorOutcome::Minted {
             version_id,
             refs: self.effective_refs.clone(),
@@ -1913,7 +1916,7 @@ mod pure_tests {
     #[test]
     fn offered_successor_uncharged() {
         // The successor of a head observation takes over its charge, so the
-        // group is charged once and no counter moves.
+        // group is charged once and no group counter moves.
         let mut observation = reference();
         if let aruna_core::structs::storage::blob::BlobVersionState::Reference { source, .. } =
             &mut observation.state
@@ -1932,13 +1935,31 @@ mod pure_tests {
         mint.plan.resolved = resolution(&policy);
         drive_to_copy(&mut mint, &observation).expect("writes follow");
 
-        let written = Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        });
-        let effects = mint
-            .step(written, Some(Ulid::from_parts(4, 4)))
-            .expect("the write settles");
-        assert!(effects.is_none());
+        let written = || {
+            Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            })
+        };
+        let txn_id = Some(Ulid::from_parts(4, 4));
+        let effects = mint.step(written(), txn_id).expect("the write settles");
+        // No group counter moves; only the bucket counts the successor's row.
+        let Some(
+            [
+                Effect::Storage(StorageEffect::AddUsage {
+                    deltas, buckets, ..
+                }),
+            ],
+        ) = effects.as_deref()
+        else {
+            panic!("expected the bucket row update, got {effects:?}");
+        };
+        assert!(deltas.iter().all(|(_, delta)| delta.is_zero()));
+        let versions: Vec<_> = buckets.iter().map(|(_, delta)| delta.versions).collect();
+        assert_eq!(versions, [1]);
+        // The counter rows, then the dirty markers, are written.
+        mint.step(written(), txn_id).expect("the counters settle");
+        let done = mint.step(written(), txn_id).expect("the markers settle");
+        assert!(done.is_none());
         assert_eq!(mint.state, MintState::Done);
     }
 

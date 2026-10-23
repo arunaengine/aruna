@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use aruna_api::error::ServerError;
-use aruna_api::routes::bucket_usage::{BucketUsageQuery, get_bucket_usage};
+use aruna_api::routes::bucket_usage::get_bucket_usage;
 use aruna_api::routes::storage::routing::{
     BucketRoutingRequest, get_bucket_routing, put_bucket_routing,
 };
@@ -32,11 +32,12 @@ use aruna_core::structs::storage::blob::{
     CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_operations::node::usage_stats::RebuildStatsOperation;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
@@ -45,7 +46,6 @@ use ulid::Ulid;
 struct Fixture {
     _directory: TempDir,
     state: Arc<ServerState>,
-    owner: AuthContext,
     reader: AuthContext,
 }
 
@@ -64,6 +64,28 @@ async fn write_value(state: &ServerState, key_space: &str, key: Vec<u8>, value: 
         event,
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
+}
+
+/// An open multipart upload of `data`.
+fn open_upload(group_id: Ulid, created_by: UserId) -> MultipartUpload {
+    MultipartUpload {
+        upload_id: Ulid::from_bytes([15u8; 16]),
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        bucket: "data".to_string(),
+        key: "reads/pending.fastq".to_string(),
+        group_id,
+        created_by,
+        created_at: UNIX_EPOCH,
+        status: MultipartUploadStatus::Open,
+        completing_since_ms: None,
+        checksum_hint: None,
+        metadata: HashMap::new(),
+        placement_policies: Vec::new(),
+        subject_generation: 0,
+        backend_upload: None,
+        encryption: None,
+    }
 }
 
 /// One bucket with two stored versions of a key, one delete marker and one open
@@ -244,43 +266,22 @@ async fn setup() -> Fixture {
         )
         .await;
     }
-    let upload_id = Ulid::from_bytes([15u8; 16]);
+    let upload = open_upload(group_id, owner);
+    let upload_key = upload.upload_id.to_bytes().to_vec();
     write_value(
         &state,
         UPLOAD_KEYSPACE,
-        upload_id.to_bytes().to_vec(),
-        MultipartUpload {
-            upload_id,
-            backend: BackendRef::node_default(),
-            storage_class: None,
-            bucket: "data".to_string(),
-            key: "reads/pending.fastq".to_string(),
-            group_id,
-            created_by: owner,
-            created_at: UNIX_EPOCH,
-            status: MultipartUploadStatus::Open,
-            completing_since_ms: None,
-            checksum_hint: None,
-            metadata: HashMap::new(),
-            placement_policies: Vec::new(),
-            subject_generation: 0,
-            backend_upload: None,
-            encryption: None,
-        }
-        .to_bytes()
-        .unwrap(),
+        upload_key,
+        upload.to_bytes().unwrap(),
     )
     .await;
+    // The rows above were seeded without counters, so the counters are rebuilt from them.
+    let rebuilt = drive(RebuildStatsOperation::new(), state.get_ctx().as_ref()).await;
+    rebuilt.expect("the usage counters rebuild");
 
     Fixture {
         _directory: directory,
         state,
-        owner: AuthContext {
-            user_id: owner,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        },
         reader: AuthContext {
             user_id: reader,
             realm_id,
@@ -298,35 +299,40 @@ async fn usage_counts_inventory() {
         State(fixture.state.clone()),
         Extension(Some(fixture.reader.clone())),
         Path("data".to_string()),
-        Query(BucketUsageQuery { limit: None }),
     )
     .await
     .unwrap();
 
+    // The counter row the rebuild filled answers every number but the open uploads.
     assert_eq!(usage.bucket, "data");
     assert_eq!(usage.objects, 1);
     assert_eq!(usage.versions, 2);
     assert_eq!(usage.delete_markers, 1);
     assert_eq!(usage.open_multipart_uploads, 1);
     assert_eq!(usage.logical_bytes, 84);
+    assert_eq!(usage.referenced_bytes, 0);
     assert!(usage.complete);
-}
 
-#[tokio::test]
-async fn usage_reports_truncation() {
-    let fixture = setup().await;
-
+    // An upload record written past the counter stays unseen: the route reads no upload rows.
+    let upload_id = Ulid::from_bytes([16u8; 16]);
+    let mut record = open_upload(Ulid::from_bytes([10u8; 16]), fixture.reader.user_id);
+    record.upload_id = upload_id;
+    let value = record.to_bytes().unwrap();
+    write_value(
+        &fixture.state,
+        UPLOAD_KEYSPACE,
+        upload_id.to_bytes().to_vec(),
+        value,
+    )
+    .await;
     let Json(usage) = get_bucket_usage(
         State(fixture.state.clone()),
-        Extension(Some(fixture.owner.clone())),
+        Extension(Some(fixture.reader.clone())),
         Path("data".to_string()),
-        Query(BucketUsageQuery { limit: Some(1) }),
     )
     .await
     .unwrap();
-
-    assert!(!usage.complete);
-    assert!(usage.versions + usage.delete_markers <= 1);
+    assert_eq!(usage.open_multipart_uploads, 1);
 }
 
 #[tokio::test]
