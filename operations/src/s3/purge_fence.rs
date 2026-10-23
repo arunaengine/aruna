@@ -67,7 +67,7 @@ pub async fn ensure_write_allowed(
     check_decoded_fence(fence.as_ref(), bucket, key)
 }
 
-fn check_decoded_fence(
+pub(crate) fn check_decoded_fence(
     fence: Option<&StoragePurgeFence>,
     bucket: &str,
     key: &str,

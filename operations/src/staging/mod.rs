@@ -8,6 +8,7 @@ pub mod head_source;
 pub mod list_source;
 pub mod native_source;
 pub mod offered_directory;
+pub mod page_rows;
 pub mod read_source;
 pub mod reference;
 pub mod snapshot;

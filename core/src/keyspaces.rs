@@ -329,6 +329,8 @@ pub const SYNC_ORIGIN_KEYSPACE: &str = "sync_local_origins";
 
 pub const SOURCE_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_SECRET_KEYSPACE: &str = "source_connector_secret";
+/// One row per reference version bound to a connector, keyed by connector id first.
+pub const CONNECTOR_REFERENCE_KEYSPACE: &str = "source_connector_references";
 
 // Repository interop: metadata harvest framework (#442).
 pub const CONNECTOR_INDEX_KEYSPACE: &str = "repository_connector_index";
@@ -580,6 +582,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SYNC_ORIGIN_KEYSPACE,
     SOURCE_INDEX_KEYSPACE,
     SOURCE_SECRET_KEYSPACE,
+    CONNECTOR_REFERENCE_KEYSPACE,
     CONNECTOR_INDEX_KEYSPACE,
     CONNECTOR_SECRET_KEYSPACE,
     HARVEST_SOURCE_KEYSPACE,
