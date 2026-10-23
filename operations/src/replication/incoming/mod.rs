@@ -116,6 +116,8 @@ enum IncomingVersionState {
     VerifyExistingBlob,
     WriteBlobLocation,
     ReadObjectLookup,
+    /// Reads the head of a key whose row a historical item replaces with the other kind.
+    ReadNamedHead,
     ReadCurrentVersion,
     ApplyHeadTransition,
     WriteBlobVersion,
@@ -586,6 +588,7 @@ impl Operation for IncomingVersionOperation {
             IncomingVersionState::VerifyExistingBlob => self.accept_verified_blob(event),
             IncomingVersionState::WriteBlobLocation => self.accept_blob_location(event),
             IncomingVersionState::ReadObjectLookup => self.accept_object_lookup(event),
+            IncomingVersionState::ReadNamedHead => self.accept_named_head(event),
             IncomingVersionState::ReadCurrentVersion => self.accept_current_version(event),
             IncomingVersionState::ApplyHeadTransition => self.accept_head_progress(event),
             IncomingVersionState::WriteBlobVersion => self.accept_blob_version(event),
@@ -705,6 +708,7 @@ impl IncomingVersionOperation {
             IncomingVersionState::VerifyExistingBlob => "VerifyExistingBlob",
             IncomingVersionState::WriteBlobLocation => "WriteBlobLocation",
             IncomingVersionState::ReadObjectLookup => "ReadObjectLookup",
+            IncomingVersionState::ReadNamedHead => "ReadNamedHead",
             IncomingVersionState::ReadCurrentVersion => "ReadCurrentVersion",
             IncomingVersionState::ApplyHeadTransition => "ApplyHeadTransition",
             IncomingVersionState::WriteBlobVersion => "WriteBlobVersion",
@@ -1725,13 +1729,24 @@ impl IncomingVersionOperation {
 
     fn write_object_lookup(&mut self) -> Effects {
         if !self.manifest.current_version {
+            // The head may still name the replaced row, whose liveness then changes.
+            let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
+            if self
+                .existing_marker
+                .is_some_and(|existing| existing != marker)
+            {
+                return self.read_head(IncomingVersionState::ReadNamedHead);
+            }
             return self.write_version();
         }
         if self.manifest.current_version_generation.is_none() {
             return self.fail(IncomingVersionError::MissingVersionGeneration);
         }
+        self.read_head(IncomingVersionState::ReadObjectLookup)
+    }
 
-        self.state = IncomingVersionState::ReadObjectLookup;
+    fn read_head(&mut self, state: IncomingVersionState) -> Effects {
+        self.state = state;
         let key = match BlobHeadKey::new(&self.manifest.bucket, &self.manifest.key).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
@@ -1757,6 +1772,37 @@ impl IncomingVersionOperation {
             key: key.into(),
             txn_id: self.txn_id,
         })]
+    }
+
+    /// The liveness change of a replaced row the head names while the head stays: a version
+    /// replaced by a marker deletes the object, the reverse revives it.
+    fn named_head_delta(&self, head: Option<&CurrentVersionPointer>) -> i128 {
+        let names = head.is_some_and(|head| head.version_id == self.manifest.version_id);
+        match self.existing_marker.filter(|_| names) {
+            Some(was_marker) => {
+                let live = self.manifest.kind == ReplicationItemKind::Materialized;
+                i128::from(u8::from(live)) - i128::from(u8::from(!was_marker))
+            }
+            None => 0,
+        }
+    }
+
+    fn accept_named_head(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.fail(IncomingVersionError::InvalidStateEvent {
+                state: self.state_name(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let head = value.as_deref().map(CurrentVersionPointer::from_bytes);
+        match head.transpose() {
+            Ok(head) => {
+                self.object_delta = self.named_head_delta(head.as_ref());
+                self.write_version()
+            }
+            Err(error) => self.fail(error.into()),
+        }
     }
 
     fn apply_liveness(&mut self, previous_live: bool) -> Effects {
@@ -1826,6 +1872,7 @@ impl IncomingVersionOperation {
             });
         } else {
             self.pending_head = None;
+            self.object_delta = self.named_head_delta(existing_pointer.as_ref());
         }
         self.resume_head_transition()
     }
