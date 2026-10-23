@@ -1057,14 +1057,19 @@ impl GetObjectOperation {
                     stored.compare(&metadata)
                 });
                 if let (ObservationMatch::Same, Some(stored)) = (comparison, stored) {
-                    // Undrifted: serve the recorded observation, bound to its ETag.
+                    // Undrifted: serve the recorded observation, bound to its ETag. Without a
+                    // strong ETag to bind to, recorded digests are checked on the whole bytes.
                     self.last_refresh = self.reference_last_refresh;
                     let content_type = stored.content_type.clone().or(metadata.content_type);
                     let served = SourceMetadata {
                         content_type,
                         ..stored
                     };
-                    return self.serve_reference_source(served, true);
+                    let bound = strong_validator(served.etag.as_deref());
+                    if !bound {
+                        self.verify_digests = served.enforced_checksums();
+                    }
+                    return self.serve_reference_source(served, bound);
                 }
                 if comparison == ObservationMatch::Unknown {
                     // Nothing proves the bytes unchanged. The whole bytes are checked against the
@@ -2387,3 +2392,9 @@ async fn local_multipart_summary(
 #[cfg(test)]
 #[path = "get_tests.rs"]
 mod test;
+
+/// Whether an ETag can bind a read through `If-Match`: present and not weak.
+fn strong_validator(etag: Option<&str>) -> bool {
+    etag.map(str::trim)
+        .is_some_and(|etag| !etag.is_empty() && !etag.starts_with("W/"))
+}

@@ -1871,6 +1871,33 @@ fn pinned_unknown_verified() {
     );
 }
 
+// Equal length and a second-rounded date call changed bytes the same, so a pin without a strong
+// ETag is checked against its digests even when the observation compares as the same.
+#[test]
+fn same_without_etag_verified() {
+    let mut operation = drifted_operation();
+    let mut stored = digested(9, 7);
+    stored.etag = None;
+    stored.last_modified = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(5));
+    operation.reference_cached = Some(stored.clone());
+    operation.state = GetObjectState::HeadReferenceSource;
+
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: stored.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read {
+            expected: None,
+            ..
+        })]
+    ));
+    assert!(matches!(
+        operation.step(source_read(stored)).as_slice(),
+        [Effect::Blob(BlobEffect::SpoolHidden { .. })]
+    ));
+}
+
 // A bound read whose condition fails queues a request to observe the source, which the refresh
 // worker retries until it records the change; the read itself fails as changed.
 #[test]
