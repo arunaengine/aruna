@@ -218,7 +218,8 @@ impl BlobHandler {
     }
 
     /// The location names the exact key with an empty storage bucket, which marks it as
-    /// external; its hashes describe the bytes as they were read.
+    /// external; its hashes describe the bytes as they were read. A write's empty reservation
+    /// is no file and unreadable.
     async fn external_hash(
         &self,
         resolved: ResolvedBackend,
@@ -229,6 +230,7 @@ impl BlobHandler {
         let operator = self.operator_from_location(&location)?;
         let storage_path = self.object_path(&location)?;
         let read_error = |error: &str| BlobError::ReadError(error.to_string());
+        let reserved = || BlobError::Unreadable("the path holds a write's reservation".into());
         let open_error = |error: opendal::Error| match error.kind() {
             opendal::ErrorKind::NotFound => BlobError::Unreadable(error.to_string()),
             _ => read_error(&error.to_string()),
@@ -243,6 +245,9 @@ impl BlobHandler {
             .await
             .map_err(|_| read_error("timed out reading the object"))?
             .map_err(open_error)?;
+        if reservation(&metadata) {
+            return Err(reserved());
+        }
         let version = backend_version(&operator, &metadata);
         let etag = metadata.etag().map(str::to_string);
         // Without a version the read names the stated ETag where the storage can, so the hash
@@ -263,9 +268,9 @@ impl BlobHandler {
             .map_err(|_| read_error("timed out starting the object read"))?
             .map_err(|error| read_error(&error.to_string()))?;
         // The ETag is the one of the response hashed; a storage that reports none has none.
-        let etag = match timeout(self.io_timeout(), stream.metadata()).await {
-            Ok(Ok(read)) => read.etag().map(str::to_string),
-            Ok(Err(error)) if error.kind() == opendal::ErrorKind::Unsupported => None,
+        let (etag, marked) = match timeout(self.io_timeout(), stream.metadata()).await {
+            Ok(Ok(read)) => (read.etag().map(str::to_string), reservation(&read)),
+            Ok(Err(error)) if error.kind() == opendal::ErrorKind::Unsupported => (None, false),
             Ok(Err(error)) => return Err(read_error(&error.to_string())),
             Err(_) => return Err(read_error("timed out opening the object read")),
         };
@@ -279,6 +284,10 @@ impl BlobHandler {
             let chunk = chunk.map_err(|error| read_error(&error.to_string()))?;
             size = size.saturating_add(chunk.len() as u64);
             hasher.update(&chunk);
+        }
+        // An empty file shares a reservation's ETag, so the read may find one the stat did not.
+        if marked && size == 0 {
+            return Err(reserved());
         }
         Ok(BlobEvent::ExternalHashed {
             location: BackendLocation {

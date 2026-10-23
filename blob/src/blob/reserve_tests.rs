@@ -30,6 +30,8 @@ struct Fake {
     before_delete: Option<(String, Stored)>,
     /// A foreign write that lands at its key right after a reservation of that key.
     after_reserve: Option<(String, Stored)>,
+    /// A foreign write that lands at its key right after the next look at that key.
+    after_head: Option<(String, Stored)>,
 }
 
 type Shared = Arc<Mutex<Fake>>;
@@ -141,6 +143,9 @@ async fn serve(
                 }
                 None => (StatusCode::OK, found.body.clone()),
             };
+            if head && let Some((_, foreign)) = fake.after_head.take_if(|(at, _)| *at == key) {
+                fake.objects.insert(key.clone(), foreign);
+            }
             listed.push(("content-length".to_string(), body.len().to_string()));
             match head {
                 true => answer(status, &listed, Body::empty()),
@@ -530,6 +535,31 @@ async fn hides_marked_reservations() {
             panic!("the stat failed")
         };
         assert_eq!(location.is_some(), file, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn hash_skips_reservations() {
+    // A reservation is no file to hash, whether the stat shows it or only the read finds it in
+    // place of an empty file; a genuine empty file still hashes.
+    let (_context, handler, resolved, fake) = tenant().await;
+    let marked = stored(b"", &[("aruna-reservation", "01K8")]);
+    place(&fake, "tenant/raw/a.bin", marked.clone());
+    place(&fake, "tenant/raw/b.bin", stored(b"", &[]));
+    place(&fake, "tenant/raw/c.bin", stored(b"", &[]));
+    fake.lock().unwrap().after_head = Some(("tenant/raw/b.bin".to_string(), marked));
+    for (path, file) in [
+        ("raw/a.bin", false),
+        ("raw/b.bin", false),
+        ("raw/c.bin", true),
+    ] {
+        let hashed = handler.hash_external(resolved.clone(), path.to_string(), test_user_id());
+        let answer = match hashed.await {
+            BlobEvent::ExternalHashed { .. } => Some(true),
+            BlobEvent::Error(BlobError::Unreadable(_)) => Some(false),
+            _ => None,
+        };
+        assert_eq!(answer, Some(file), "{path}");
     }
 }
 
