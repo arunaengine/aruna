@@ -650,16 +650,16 @@ fn maps_wildcard_output() {
 }
 
 #[test]
-fn rejects_input_match() {
-    // An input the pattern would select must not be captured as an output.
+fn accepts_input_match() {
+    // Nextflow's SEQTK_TRIM globs `*.fastq.gz` beside its staged reads; capture skips the input.
     let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
     task.inputs[0].path = "/in/data.csv".to_string();
     task.outputs[0].path = "/in/*.csv".to_string();
     task.outputs[0].path_prefix = Some("/in".to_string());
 
-    let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
 
-    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(spec.file_outputs[0].container_path, "/in/*.csv");
 }
 
 #[test]

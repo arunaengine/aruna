@@ -1374,11 +1374,7 @@ fn map_task_outputs(
     for output in &file_outputs {
         // A pattern is captured under its literal prefix, which is the directory
         // the container must be able to write.
-        let pattern = has_wildcard(&output.container_path)
-            .then(|| output_glob(&output.container_path))
-            .transpose()
-            .map_err(|_| TesError::bad_request("invalid output path"))?;
-        let parent = if pattern.is_some() {
+        let parent = if has_wildcard(&output.container_path) {
             literal_prefix(&output.container_path)
                 .map_err(|_| TesError::bad_request("invalid output parent path"))?
         } else {
@@ -1393,10 +1389,10 @@ fn map_task_outputs(
         if parent == "/" {
             return Err(TesError::bad_request("root output parent is forbidden"));
         }
+        // A glob may match a staged input; capture skips it, as Nextflow globs its work dir.
         for input in inputs {
             if let Some(path) = input.container_path.as_deref()
                 && (path == output.container_path
-                    || pattern.as_ref().is_some_and(|glob| glob.is_match(path))
                     || paths_overlap(path, parent)
                         .map_err(|_| TesError::bad_request("invalid input or output path"))?)
             {
