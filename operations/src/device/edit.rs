@@ -336,15 +336,15 @@ pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
     replayed
 }
 
-/// Whether this replica may take the edit locally: the owner selected it and
-/// a refresh has left it something to edit.
-pub fn accepts_edits(replica: &ReplicaRecord) -> bool {
-    replica.selected && replica.record.is_some()
+/// Whether this replica may take the edit locally: the owner selected it, or it is a usable copy
+/// the owner read and the owner edits it, and a refresh has left it something to edit.
+pub fn accepts_edits(replica: &ReplicaRecord, by_owner: bool) -> bool {
+    replica.record.is_some() && (replica.selected || by_owner && replica.serves_reads())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceEditError, apply_local_edit, read_actor, replays_edit};
+    use super::{DeviceEditError, accepts_edits, apply_local_edit, read_actor, replays_edit};
     use crate::device::publish_queue::{
         MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, PublishState, publish_entry,
     };
@@ -480,6 +480,23 @@ mod tests {
         );
         replica.record = Some(Box::new(record.clone()));
         replica
+    }
+
+    // A copy the owner read is edited offline by the owner alone; a selected one as before.
+    #[tokio::test]
+    async fn admits_read_copy() {
+        let (_dir, _context, record) = device().await;
+        let mut read = replica(&record);
+        read.selected = false;
+        read.displayed_jsonld = r#"{"@graph":[]}"#.to_string();
+        assert!(accepts_edits(&read, true));
+        assert!(!accepts_edits(&read, false));
+        read.displayed_jsonld.clear();
+        assert!(
+            !accepts_edits(&read, true),
+            "an empty copy has nothing to edit"
+        );
+        assert!(accepts_edits(&replica(&record), false));
     }
 
     #[tokio::test]
