@@ -22,7 +22,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::driver::drive;
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
-use aruna_core::errors::StagingSourceError;
+use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::structs::identity::auth::Permission;
 
 /// Manifest bytes one chunk reads; a manifest line must fit into one chunk.
@@ -168,7 +168,7 @@ pub(super) async fn read_manifest_chunk(
 /// Errors that stay on a retry: the manifest is then skipped instead of retried.
 fn lasting_head(error: &HeadSourceError) -> bool {
     match error {
-        HeadSourceError::Resolve(_) => true,
+        HeadSourceError::Resolve(error) => lasting_resolution(error),
         HeadSourceError::Staging(error) => lasting_source(error),
         HeadSourceError::UnexpectedEvent { .. } | HeadSourceError::HeadSourceFailed => false,
     }
@@ -176,9 +176,20 @@ fn lasting_head(error: &HeadSourceError) -> bool {
 
 fn lasting_read(error: &ReadSourceError) -> bool {
     match error {
-        ReadSourceError::Resolve(_) => true,
+        ReadSourceError::Resolve(error) => lasting_resolution(error),
         ReadSourceError::Staging(error) => lasting_source(error),
         ReadSourceError::UnexpectedEvent { .. } | ReadSourceError::ReadSourceFailed => false,
+    }
+}
+
+/// A missing or unusable connector stays; storage failures such as a timeout pass.
+fn lasting_resolution(error: &SourceResolutionError) -> bool {
+    match error {
+        SourceResolutionError::StorageError(_) | SourceResolutionError::ResolveFailed => false,
+        SourceResolutionError::ConversionError(_)
+        | SourceResolutionError::NotFound
+        | SourceResolutionError::UnsupportedConnectorKind(_)
+        | SourceResolutionError::InvalidSourcePath => true,
     }
 }
 
@@ -242,6 +253,7 @@ fn manifest_key(job_id: JobId, source_path: &str) -> Key {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::errors::StorageError;
     use crate::driver::DriverContext;
     use crate::jobs::executor::ProgressReporter;
     use aruna_core::structs::execution::job::{
@@ -330,6 +342,13 @@ mod tests {
         )));
         assert!(lasting_head(&HeadSourceError::Staging(
             StagingSourceError::AccessDenied
+        )));
+        for storage in [StorageError::Timeout, StorageError::QueueFull] {
+            let resolution = SourceResolutionError::StorageError(storage);
+            assert!(!lasting_read(&ReadSourceError::Resolve(resolution)));
+        }
+        assert!(lasting_head(&HeadSourceError::Resolve(
+            SourceResolutionError::NotFound
         )));
     }
 
