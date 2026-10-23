@@ -961,7 +961,8 @@ path.
 **Limits**
 - `truncated` says more entries may follow; `next_cursor` is then set and passed back as `cursor`
   with the same `path` to read the next page. A page can be short or even empty while more follow.
-- S3 sources continue after the last listed key. Sources without a provider cursor (`http`,
+- S3 sources read a level as the keys below it and continue after the last key read, so a page
+  passing through a large subdirectory can hold few entries. Sources without a provider cursor (`http`,
   `webdav`) re-list from the start and skip, and refuse to continue past 100000 entries with 400."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),

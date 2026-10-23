@@ -358,7 +358,8 @@ async fn list_operator(
     path: &str,
     request: &ListRequest,
 ) -> Result<(Vec<SourceEntry>, Option<ListCursor>), StagingSourceError> {
-    if !operator.info().capability().list_with_start_after {
+    let capability = operator.info().capability();
+    if !(capability.list_with_start_after && capability.list_with_recursive) {
         let offset = fallback_offset(request, FALLBACK_SKIP_LIMIT)?;
         let (entries, truncated) = list_skipping(operator, path, request, offset).await?;
         return Ok(offset_page(entries, truncated, offset));
@@ -389,30 +390,26 @@ async fn list_operator(
             return Ok((entries, Some(ListCursor::After(lower.to_string()))));
         }
     }
+    // One level is listed as flat keys rolled up into directories, so the cursor is always a key
+    // of one sorted listing and never depends on how a provider orders a page.
     let mut lister = operator
         .lister_with(path)
-        .recursive(request.recursive)
+        .recursive(true)
         .limit(limit - entries.len());
     if let Some(floor) = floor.as_deref() {
         lister = lister.start_after(floor);
     }
     let mut lister = lister.await.map_err(list_error)?;
     let mut highest = floor.clone();
+    // A directory the previous page already listed, from the key the cursor names.
+    let mut last_directory = floor.as_deref().and_then(|key| child_directory(path, key));
     let budget = limit - entries.len();
     let mut consumed = 0usize;
-    let mut seen_file = false;
     // A provider page holds `budget` entries, so stopping there never fetches a lookahead page.
     while consumed < budget {
         let Some(entry) = lister.try_next().await.map_err(list_error)? else {
             return Ok((entries, None));
         };
-        // Pages list directories before files, so a directory after a file opens the next
-        // page; the cursor then stays at the end of the page that was read completely.
-        let directory = entry.metadata().is_dir();
-        if !request.recursive && directory && seen_file {
-            break;
-        }
-        seen_file |= !directory;
         consumed += 1;
         let entry_path = entry.path();
         if request
@@ -422,7 +419,7 @@ async fn list_operator(
         {
             return Ok((entries, None));
         }
-        // A provider may repeat the prefix a cursor named; anything at or below it was served.
+        // A provider may repeat the key a cursor named; anything at or below it was served.
         if floor.as_deref().is_some_and(|floor| entry_path <= floor) {
             continue;
         }
@@ -432,11 +429,46 @@ async fn list_operator(
         {
             highest = Some(entry_path.to_string());
         }
-        if let Some(entry) = source_entry(entry_path, entry.metadata(), path, request.files_only) {
-            entries.push(entry);
+        let directory = (!request.recursive)
+            .then(|| child_directory(path, entry_path))
+            .flatten();
+        match directory {
+            Some(directory) => {
+                if last_directory.as_deref() != Some(directory.as_str()) && !request.files_only {
+                    entries.push(directory_entry(&directory));
+                }
+                last_directory = Some(directory);
+            }
+            None => {
+                if let Some(entry) =
+                    source_entry(entry_path, entry.metadata(), path, request.files_only)
+                {
+                    entries.push(entry);
+                }
+            }
         }
     }
     Ok((entries, highest.map(ListCursor::After)))
+}
+
+/// The direct child directory of `path` that `key` lies in, with a trailing slash.
+fn child_directory(path: &str, key: &str) -> Option<String> {
+    let relative = key.strip_prefix(path)?;
+    let end = relative.find('/')?;
+    Some(format!("{path}{}", &relative[..=end]))
+}
+
+fn directory_entry(directory: &str) -> SourceEntry {
+    let trimmed = directory.trim_end_matches('/');
+    SourceEntry {
+        name: trimmed.rsplit('/').next().unwrap_or(trimmed).to_string(),
+        path: trimmed.to_string(),
+        kind: SourceEntryKind::Directory,
+        size: None,
+        modified: None,
+        etag: None,
+        stat: None,
+    }
 }
 
 /// Reads the inclusive lower key itself, since `start_after` skips it.
