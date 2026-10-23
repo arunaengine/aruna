@@ -81,9 +81,24 @@ pub enum RowChange {
     AddedMarker,
     RemovedVersion,
     RemovedMarker,
+    /// A marker row replaced in place by a version row of the same id.
+    MarkerToVersion,
+    VersionToMarker,
 }
 
 impl RowChange {
+    /// Writing a row, a delete marker or not, where the version id may already have one;
+    /// `existing` says whether that row is a delete marker.
+    pub fn written(existing: Option<bool>, marker: bool) -> Self {
+        match (existing, marker) {
+            (None, false) => Self::AddedVersion,
+            (None, true) => Self::AddedMarker,
+            (Some(true), false) => Self::MarkerToVersion,
+            (Some(false), true) => Self::VersionToMarker,
+            (Some(_), _) => Self::Kept,
+        }
+    }
+
     fn delta(self) -> BucketDelta {
         let (versions, delete_markers) = match self {
             Self::Kept => (0, 0),
@@ -91,6 +106,8 @@ impl RowChange {
             Self::AddedMarker => (0, 1),
             Self::RemovedVersion => (-1, 0),
             Self::RemovedMarker => (0, -1),
+            Self::MarkerToVersion => (1, -1),
+            Self::VersionToMarker => (-1, 1),
         };
         BucketDelta {
             versions,
@@ -2260,6 +2277,36 @@ mod tests {
             panic!("expected the counter deltas, got {effects:?}");
         };
         assert!(buckets.is_empty());
+    }
+
+    #[test]
+    fn rows_follow_replacement() {
+        // A replay replaces a row of its own kind; another kind moves one count to the other.
+        let cases = [
+            (None, false, RowChange::AddedVersion, (1, 0)),
+            (None, true, RowChange::AddedMarker, (0, 1)),
+            (Some(true), false, RowChange::MarkerToVersion, (1, -1)),
+            (Some(false), true, RowChange::VersionToMarker, (-1, 1)),
+            (Some(true), true, RowChange::Kept, (0, 0)),
+            (Some(false), false, RowChange::Kept, (0, 0)),
+        ];
+        let group_id = Ulid::generate();
+        for (existing, marker, row, (versions, delete_markers)) in cases {
+            assert_eq!(RowChange::written(existing, marker), row);
+            let update = UsageCounterUpdate::for_group(group_id, UsageDelta::default());
+            let mut update = update.in_bucket("data", row);
+            let effects = update.start(Ulid::generate());
+            let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice()
+            else {
+                panic!("expected the counter deltas, got {effects:?}");
+            };
+            let delta = BucketDelta {
+                versions,
+                delete_markers,
+                ..Default::default()
+            };
+            assert_eq!(buckets, &vec![(usage_bucket_key("data").into(), delta)]);
+        }
     }
 
     #[tokio::test]

@@ -3317,6 +3317,68 @@ fn materialized_trace() {
 /// Constructor-to-finalize trace of a delete marker: no blob is
 /// transferred, the head is cleared and the apply acknowledgement closes
 /// the stream.
+/// The existing row of the version id is read with its marker status, which the bucket's
+/// version and marker counts follow when the incoming row replaces it.
+#[test]
+fn replaced_row_kind() {
+    use crate::node::usage_stats::RowChange;
+
+    let group_id = test_group_id();
+    type Row = fn(&VersionReplicationManifest) -> BlobVersion;
+    let marker: Row = |manifest| BlobVersion::deleted(manifest.created_at, manifest.created_by);
+    let version: Row = |manifest| {
+        BlobVersion::materialized(
+            [3; 32],
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            manifest.created_at,
+            manifest.created_by,
+            None,
+        )
+    };
+    let cases = [
+        (
+            ReplicationItemKind::DeleteMarker,
+            version,
+            RowChange::VersionToMarker,
+        ),
+        (
+            ReplicationItemKind::Materialized,
+            marker,
+            RowChange::MarkerToVersion,
+        ),
+        (ReplicationItemKind::DeleteMarker, marker, RowChange::Kept),
+        (ReplicationItemKind::Materialized, version, RowChange::Kept),
+    ];
+    for (kind, existing, expected) in cases {
+        let manifest = make_manifest(kind.clone());
+        let existing = existing(&manifest);
+        let mut op = IncomingVersionOperation::new(
+            trace_stream_id(),
+            iroh::SecretKey::from_bytes(&[0x30; 32]).public(),
+            test_realm_id(),
+            manifest,
+        );
+        op.manifest_policy = Some(op.target_authorization_path(group_id));
+        op.writer_policy = Some(op.target_authorization_path(group_id));
+        op.start();
+        op.step(bucket_read(Some(
+            make_bucket_info(group_id).to_bytes().unwrap().into(),
+        )));
+        op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+            result: Ok(GroupRoutingInputs::default()),
+        }));
+        assert_eq!(op.state, IncomingVersionState::ReadExistingVersion);
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing.to_bytes().unwrap().into()),
+        }));
+        let incoming = kind == ReplicationItemKind::DeleteMarker;
+        assert_eq!(op.existing_marker, Some(existing.is_deleted()));
+        assert_eq!(RowChange::written(op.existing_marker, incoming), expected);
+    }
+}
+
 #[test]
 fn delete_marker_trace() {
     let stream_id = trace_stream_id();

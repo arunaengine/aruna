@@ -348,8 +348,9 @@ pub struct IncomingVersionOperation {
     usage_update: Option<UsageCounterUpdate>,
     existing_blob_location: Option<BackendLocation>,
     replaced_version: Option<BlobVersion>,
-    /// The destination already held a row of this version id, which the write replaces.
-    version_existed: bool,
+    /// Whether the row this version id already had at the destination is a delete marker;
+    /// `None` without such a row. The write replaces it.
+    existing_marker: Option<bool>,
     advance_version_exists: bool,
     received_blob: Option<ReceivedBlob>,
     existing_current_pointer: Option<CurrentVersionPointer>,
@@ -422,7 +423,7 @@ impl IncomingVersionOperation {
             usage_update: None,
             existing_blob_location: None,
             replaced_version: None,
-            version_existed: false,
+            existing_marker: None,
             advance_version_exists: false,
             received_blob: None,
             existing_current_pointer: None,
@@ -2159,11 +2160,7 @@ impl IncomingVersionOperation {
             Err(error) => return self.fail(error),
         };
         let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
-        let row = match (self.version_existed, marker) {
-            (true, _) => RowChange::Kept,
-            (false, true) => RowChange::AddedMarker,
-            (false, false) => RowChange::AddedVersion,
-        };
+        let row = RowChange::written(self.existing_marker, marker);
         if marker {
             let update = UsageCounterUpdate::for_group(group_id, group_delta)
                 .in_bucket(&self.manifest.bucket, row);
@@ -2577,13 +2574,13 @@ impl IncomingVersionOperation {
             kind = ?self.manifest.kind,
             "Loaded existing destination version metadata"
         );
-        self.version_existed = value.is_some();
 
         if let Some(value) = value {
             let existing = match BlobVersion::from_bytes(value.as_ref()) {
                 Ok(existing) => existing,
                 Err(error) => return self.fail(error.into()),
             };
+            self.existing_marker = Some(existing.is_deleted());
             if self.manifest.reference_advance.is_some() {
                 let incoming = match self.reference_version() {
                     Ok(incoming) => incoming,
