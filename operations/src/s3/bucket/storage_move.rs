@@ -192,6 +192,11 @@ impl StartMoveOperation {
         if seen.len() != self.guards.len() || !seen.iter().map(|(_, value)| value).eq(expected) {
             return self.fail(StartMoveError::RuleChanged);
         }
+        let total = values.pop().and_then(|(_, value)| value);
+        let total = match total.as_deref().map(RenameTotal::from_bytes).transpose() {
+            Ok(total) => total,
+            Err(error) => return self.fail(error.into()),
+        };
         // A re-mapping or duplicate cleanup of the bucket holds it until it ends.
         let linked = values.pop().and_then(|(_, value)| value);
         match linked.as_deref().map(LinkedJob::from_bytes).transpose() {
@@ -199,7 +204,7 @@ impl StartMoveOperation {
             Ok(_) => {}
             Err(error) => return self.fail(error.into()),
         }
-        match self.rows(values) {
+        match self.rows(values, total) {
             Ok(writes) => {
                 self.state = StartMoveState::Write;
                 smallvec![Effect::Storage(StorageEffect::BatchWrite {
@@ -211,9 +216,11 @@ impl StartMoveOperation {
         }
     }
 
+    /// The rows of the move; `planned` is the total an earlier start of a rename stored.
     fn rows(
         &mut self,
         values: Vec<(Key, Option<Value>)>,
+        planned: Option<RenameTotal>,
     ) -> Result<Vec<(String, Key, Value)>, StartMoveError> {
         let Ok([info, settings, transition, stored]) =
             <[_; 4]>::try_from(values).map(|values| values.map(|(_, value)| value))
@@ -245,10 +252,12 @@ impl StartMoveOperation {
             let key: Key = self.bucket.as_bytes().to_vec().into();
             let value = request.to_bytes()?.into();
             writes.push((RENAME_MOVE_KEYSPACE.to_string(), key.clone(), value));
-            let total = RenameTotal {
+            // A start repeated for the same move keeps the total its first start planned.
+            let kept = planned.filter(|planned| planned.started_at_ms == started_at_ms);
+            let total = kept.unwrap_or(RenameTotal {
                 started_at_ms,
                 total,
-            };
+            });
             writes.push((
                 RENAME_TOTAL_KEYSPACE.to_string(),
                 key,
@@ -287,8 +296,9 @@ impl Operation for StartMoveOperation {
                     .iter()
                     .map(|(space, key, _)| (space.clone(), key.clone()));
                 let mut reads = move_reads(&self.bucket);
-                let key = self.bucket.as_bytes().to_vec().into();
-                reads.push((LINKED_JOB_KEYSPACE.to_string(), key));
+                let key: Key = self.bucket.as_bytes().to_vec().into();
+                reads.push((LINKED_JOB_KEYSPACE.to_string(), key.clone()));
+                reads.push((RENAME_TOTAL_KEYSPACE.to_string(), key));
                 reads.extend(guards);
                 smallvec![Effect::Storage(StorageEffect::BatchRead {
                     reads,
@@ -420,7 +430,7 @@ mod tests {
             let info = Some(info.to_bytes().unwrap().into());
             let values = vec![(Key::from(vec![]), info), (vec![].into(), None)];
             let values = [values, vec![(vec![].into(), None), (vec![].into(), None)]].concat();
-            let writes = operation.rows(values).unwrap();
+            let writes = operation.rows(values, None).unwrap();
             let asked = writes
                 .iter()
                 .find(|(space, ..)| space == RENAME_MOVE_KEYSPACE);
@@ -446,6 +456,27 @@ mod tests {
             };
             assert_eq!(total, renaming.then_some(planned));
         }
+        // A start repeated for the running move keeps its first total; an older one's goes.
+        let mut running = CompressionMigration::new(Compression::Off, 5);
+        (running.moving, running.prefix) = (true, "in/".to_string());
+        for (started_at_ms, kept) in [(5, 10), (4, 3)] {
+            let operation = StartMoveOperation::new("b".into(), group_id, "in/".into(), 7);
+            let mut operation = operation.renaming((asker(), node()), grant(), 3);
+            let info = Some(info.to_bytes().unwrap().into());
+            let stored = Some(running.to_bytes().unwrap().into());
+            let values = vec![(vec![].into(), info), (vec![].into(), None)];
+            let values = [values, vec![(vec![].into(), None), (vec![].into(), stored)]].concat();
+            let total = RenameTotal {
+                started_at_ms,
+                total: 10,
+            };
+            let writes = operation.rows(values, Some(total)).unwrap();
+            let total = writes
+                .iter()
+                .find(|(space, ..)| space == RENAME_TOTAL_KEYSPACE)
+                .map(|(_, _, value)| RenameTotal::from_bytes(value).unwrap().total);
+            assert_eq!(total, Some(kept));
+        }
     }
 
     #[test]
@@ -468,7 +499,7 @@ mod tests {
             panic!("expected the reads, got {effects:?}")
         };
         assert_eq!(reads.last().map(|(space, _)| space.as_str()), Some("rules"));
-        let mut values: Vec<(Key, Option<Value>)> = vec![(vec![].into(), None); 5];
+        let mut values: Vec<(Key, Option<Value>)> = vec![(vec![].into(), None); 6];
         values.push((vec![1].into(), Some(vec![3].into())));
         operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
         assert!(matches!(
