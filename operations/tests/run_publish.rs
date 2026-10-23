@@ -223,14 +223,17 @@ async fn publishes_local_run() -> TestResult<()> {
 
     let published = publish_run(&device.context, input()).await?;
     assert_eq!(published.outputs.len(), 1);
-    assert_eq!(published.outputs[0].key, "runs/assembly/contigs.fasta");
+    assert_eq!(
+        published.outputs[0].key,
+        "runs/assembly/run-out/contigs.fasta"
+    );
     assert_eq!(published.outputs[0].node_id, server.node_id());
     assert!(matches!(
         published.run_crate,
         RunCrateStatus::Written { .. }
     ));
     assert_eq!(
-        read_remote(&realm, group_id, "runs/assembly/contigs.fasta").await?,
+        read_remote(&realm, group_id, "runs/assembly/run-out/contigs.fasta").await?,
         OUTPUT
     );
 

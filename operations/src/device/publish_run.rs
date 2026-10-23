@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use aruna_core::UserId;
@@ -50,6 +51,8 @@ pub enum PublishRunError {
     Refused { key: String, refusal: SyncRefusal },
     #[error("the realm node is unreachable: {0}")]
     Unreachable(String),
+    #[error("two outputs of the run would land on {0}")]
+    Collision(String),
     #[error("the run crate was not written: {0}")]
     Crate(String),
     #[error("device state unavailable: {0}")]
@@ -115,9 +118,10 @@ pub async fn publish_run(
         Some(JobResultPayload::Execution { outputs, .. }) => outputs.clone(),
         _ => Vec::new(),
     };
+    let keys = target_keys(&input.target, &outputs)?;
     let mut copies = Vec::with_capacity(outputs.len());
-    for output in &outputs {
-        copies.push(pull_output(context, &auth, &input.target, output).await?);
+    for (output, key) in outputs.iter().zip(keys) {
+        copies.push(pull_output(context, &auth, &input.target, output, key).await?);
     }
     if let Some(written @ RunCrateStatus::Written { .. }) = status {
         return Ok(PublishedRun {
@@ -146,12 +150,32 @@ pub async fn publish_run(
     })
 }
 
+/// The realm key of every output, `<prefix>/<source bucket>/<key>`, so outputs of different
+/// buckets never meet. Two outputs on one key are refused before anything is copied.
+fn target_keys(
+    target: &RemoteBinding,
+    outputs: &[OutputObject],
+) -> Result<Vec<String>, PublishRunError> {
+    let mut seen = HashSet::new();
+    outputs
+        .iter()
+        .map(|output| {
+            let key = target.remote_key(&format!("{}/{}", output.bucket, output.key));
+            match seen.insert(key.clone()) {
+                true => Ok(key),
+                false => Err(PublishRunError::Collision(key)),
+            }
+        })
+        .collect()
+}
+
 /// Asks the realm node to pull one output version and reports the copy it made.
 async fn pull_output(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
     target: &RemoteBinding,
     output: &OutputObject,
+    key: String,
 ) -> Result<OutputObject, PublishRunError> {
     let metadata = context
         .metadata_handle
@@ -165,7 +189,6 @@ async fn pull_output(
         output.version_id,
     )
     .map_err(|error| PublishRunError::Unavailable(error.to_string()))?;
-    let key = target.remote_key(&output.key);
     let message = MetadataTransportMessage::ForwardSyncPull {
         auth_token: AuthToken::internal(auth.clone()),
         source: Box::new(source),
@@ -196,5 +219,47 @@ async fn pull_output(
             crate::metadata::transport_message_kind(&other).to_string(),
         )),
         Err(error) => Err(PublishRunError::Unreachable(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ulid::Ulid;
+
+    fn output(bucket: &str, key: &str) -> OutputObject {
+        OutputObject {
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: Ulid::from(2u128),
+            execution_id: Ulid::from(3u128),
+            container_path: String::new(),
+            size: 1,
+            digest: None,
+        }
+    }
+
+    // One file name in two buckets lands on two keys; the same key twice is refused.
+    #[test]
+    fn keeps_buckets_apart() {
+        let target = RemoteBinding {
+            node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+            bucket: "lab-data".to_string(),
+            prefix: "runs/one".to_string(),
+        };
+        let keys = target_keys(
+            &target,
+            &[output("a", "report.txt"), output("b", "report.txt")],
+        )
+        .expect("distinct buckets map apart");
+        assert_eq!(keys, ["runs/one/a/report.txt", "runs/one/b/report.txt"]);
+        assert!(matches!(
+            target_keys(
+                &target,
+                &[output("a", "report.txt"), output("a", "report.txt")]
+            ),
+            Err(PublishRunError::Collision(key)) if key == "runs/one/a/report.txt"
+        ));
     }
 }

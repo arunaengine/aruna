@@ -188,7 +188,9 @@ impl From<PublishedRun> for PublishRunResponse {
 fn map_publish_error(error: PublishRunError) -> ServerError {
     match error {
         PublishRunError::NotFound => ServerError::NotFound,
-        PublishRunError::NotFinished => ServerError::Conflict(error.to_string()),
+        PublishRunError::NotFinished | PublishRunError::Collision(_) => {
+            ServerError::Conflict(error.to_string())
+        }
         PublishRunError::NotRealmNode(_)
         | PublishRunError::Refused {
             refusal: SyncRefusal::NotFound | SyncRefusal::Invalid(_),
@@ -225,12 +227,13 @@ for.
 - A local run stays on this device until it is published: until then its `run_crate` reads
   `local` and nothing about it reaches the realm.
 - The realm node named by `node_id` pulls each output at the exact version the run wrote and
-  stores it under `prefix` in `bucket`, as the device owner. The bucket must exist there and grant
-  the owner WRITE.
+  stores it at `<prefix>/<source bucket>/<key>` in `bucket`, as the device owner, so outputs of
+  different device buckets never meet. The bucket must exist there and grant the owner WRITE.
 - Once every output is copied, the run crate is created in the realm and names the realm copies.
 - A repeated request is safe: an output the realm already copied answers with its existing version
   and a crate already written is not written again.
-- A run that has not finished, or whose crate is still being prepared, is refused with 409."#,
+- A run that has not finished, whose crate is still being prepared, or with two outputs on one
+  key is refused with 409."#,
     params(("job_id" = String, Path, description = "Job id of the local run: a 26-character ULID; an unparseable id is 404")),
     request_body(content = PublishRunRequest, example = json!({
         "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
@@ -242,7 +245,7 @@ for.
             example = json!({
                 "outputs": [{
                     "bucket": "lab-data",
-                    "key": "runs/assembly/contigs.fasta",
+                    "key": "runs/assembly/run-out/contigs.fasta",
                     "version_id": "01JZ7Q3V4K8M2N6P0R5S9T1W3X",
                     "size": 1048576
                 }],
@@ -252,7 +255,7 @@ for.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the device owner, or the realm refused the owner's write", body = ErrorResponse),
         (status = 404, description = "No such local run, or this node is not a user node", body = ErrorResponse),
-        (status = 409, description = "The run has not finished", body = ErrorResponse),
+        (status = 409, description = "The run has not finished, or two outputs share one key", body = ErrorResponse),
         (status = 502, description = "The realm node could not be reached", body = ErrorResponse),
         (status = 503, description = "The realm node or this device could not finish the publish now", body = ErrorResponse)
     ),
