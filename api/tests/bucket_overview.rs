@@ -32,8 +32,9 @@ use aruna_core::structs::storage::blob::{
     CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_operations::node::usage_stats::RebuildStatsOperation;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::extract::{Path, Query, State};
@@ -271,6 +272,9 @@ async fn setup() -> Fixture {
         .unwrap(),
     )
     .await;
+    // The rows above were seeded without counters, so the counters are rebuilt from them.
+    let rebuilt = drive(RebuildStatsOperation::new(), state.get_ctx().as_ref()).await;
+    rebuilt.expect("the usage counters rebuild");
 
     Fixture {
         _directory: directory,
@@ -303,12 +307,24 @@ async fn usage_counts_inventory() {
     .await
     .unwrap();
 
+    // Without a limit only the maintained counter answers.
     assert_eq!(usage.bucket, "data");
-    assert_eq!(usage.objects, 1);
-    assert_eq!(usage.versions, 2);
-    assert_eq!(usage.delete_markers, 1);
-    assert_eq!(usage.open_multipart_uploads, 1);
-    assert_eq!(usage.logical_bytes, 84);
+    assert_eq!((usage.objects, usage.logical_bytes), (1, 84));
+    assert_eq!(usage.versions, None);
+    assert!(usage.complete);
+
+    let Json(usage) = get_bucket_usage(
+        State(fixture.state.clone()),
+        Extension(Some(fixture.reader.clone())),
+        Path("data".to_string()),
+        Query(BucketUsageQuery { limit: Some(100) }),
+    )
+    .await
+    .unwrap();
+    assert_eq!((usage.objects, usage.logical_bytes), (1, 84));
+    assert_eq!(usage.versions, Some(2));
+    assert_eq!(usage.delete_markers, Some(1));
+    assert_eq!(usage.open_multipart_uploads, Some(1));
     assert!(usage.complete);
 }
 
@@ -326,7 +342,10 @@ async fn usage_reports_truncation() {
     .unwrap();
 
     assert!(!usage.complete);
-    assert!(usage.versions + usage.delete_markers <= 1);
+    let scanned = usage.versions.unwrap_or(0) + usage.delete_markers.unwrap_or(0);
+    assert!(scanned <= 1);
+    // The counter stays exact while the scan stops early.
+    assert_eq!((usage.objects, usage.logical_bytes), (1, 84));
 }
 
 #[tokio::test]
