@@ -123,6 +123,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::WritePlain { .. } => (EffectClass::Transfer, "write_plain"),
         BlobEffect::CopyPlain { .. } => (EffectClass::Transfer, "copy_plain"),
         BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
+        BlobEffect::StatExternal { .. } => (EffectClass::Control, "stat_external"),
         BlobEffect::DeletePlain { .. } => (EffectClass::Local, "delete_plain"),
         BlobEffect::StatCopy { .. } => (EffectClass::Control, "stat_copy"),
         BlobEffect::SettleCopy { .. } => (EffectClass::Control, "settle_copy"),
@@ -945,7 +946,8 @@ impl BlobHandler {
                 resolved,
                 plain,
                 source,
-            } => Box::pin(self.copy_plain(resolved, plain, *source)).await,
+                etag,
+            } => Box::pin(self.copy_plain(resolved, plain, *source, etag)).await,
             BlobEffect::StatCopy { location } => Box::pin(self.stat_copy(location)).await,
             BlobEffect::SettleCopy { attempt, upload } => {
                 let upload = upload.map(|(location, id)| (*location, id));
@@ -954,6 +956,11 @@ impl BlobHandler {
             BlobEffect::StatPlain { backend, path } => {
                 Box::pin(self.stat_plain(backend, path)).await
             }
+            BlobEffect::StatExternal {
+                resolved,
+                path,
+                created_by,
+            } => Box::pin(self.stat_external(resolved, path, created_by)).await,
             BlobEffect::DeletePlain {
                 location,
                 version,

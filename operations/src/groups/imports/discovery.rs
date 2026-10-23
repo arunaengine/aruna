@@ -5,7 +5,7 @@
 use super::shared::{Claim, claim_file, read_shared, taken_paths};
 use super::{ImportRuleError, read_earlier, validate_folder};
 use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
-use crate::blob::migration::misplaced::{Misplaced, count_misplaced};
+use crate::blob::migration::misplaced::{RenamePlan, rename_page};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::parse_read;
 use crate::groups::backends::query::GetBackendOperation;
@@ -298,19 +298,19 @@ pub async fn rename_guards(
     }
 }
 
-/// The renames of a rule's files after `bucket_access`, only for keys the caller holds
-/// `permission` on; the others count as withheld.
+/// The plan of a rename of a rule's files after `bucket_access`, over all its keys; files
+/// whose key the caller lacks `permission` on count as withheld.
 pub async fn authorized_renames(
     context: &DriverContext,
     (auth, node_id): (&AuthContext, NodeId),
     rule: &BackendImport,
     permission: Permission,
-) -> Result<Misplaced, ImportRuleError> {
+) -> Result<RenamePlan, ImportRuleError> {
     let access = bucket_access(context, auth, node_id, rule).await?;
     let allow = |key: &str| access.allows(Some(key), &permission);
-    count_misplaced(context, &rule.bucket, &rule.key_prefix, Some(&allow))
-        .await
-        .map_err(ImportRuleError::Read)
+    let all = |_: &str| true;
+    let planned = rename_page(context, rule, (&all, &allow), (None, None, 0)).await;
+    Ok(planned.map_err(ImportRuleError::Read)?.plan)
 }
 
 /// A preview after `bucket_access`; it shows only files whose key the caller may read.

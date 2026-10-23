@@ -260,6 +260,13 @@ pub enum BlobEvent {
         exists: bool,
         version: Option<String>,
     },
+    /// The metadata of an external file; its location has no hashes, and is `None` without a
+    /// file at the path.
+    ExternalStat {
+        location: Option<BackendLocation>,
+        version: Option<String>,
+        etag: Option<String>,
+    },
     CopyStat {
         exists: bool,
     },

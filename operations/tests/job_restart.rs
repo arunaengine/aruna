@@ -2,9 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Fresh builds overflow the default query depth in nested async layouts.
-#![recursion_limit = "256"]
-
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,7 +24,7 @@ const CHILD_MODE_ENV: &str = "ARUNA_JOB_RESTART_CHILD";
 const CHILD_STORAGE_ENV: &str = "ARUNA_JOB_RESTART_STORAGE";
 const MARKER_A_ENV: &str = "ARUNA_JOB_RESTART_MARKER_A";
 const MARKER_B_ENV: &str = "ARUNA_JOB_RESTART_MARKER_B";
-const CHILD_TEST_NAME: &str = "restart_recovery_child";
+const CHILD_TEST_NAME: &str = "job_restart::restart_recovery_child";
 
 fn node_id(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

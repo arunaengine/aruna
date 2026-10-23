@@ -8,7 +8,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::structs::storage::usage::{UsageCounters, UsageDelta};
+use aruna_core::structs::storage::usage::{BucketCounters, BucketDelta, UsageCounters, UsageDelta};
 use byteview::ByteView;
 use std::future::{Future, poll_fn};
 use std::sync::atomic::Ordering;
@@ -2398,6 +2398,7 @@ async fn add_usage(handle: &StorageHandle, txn_id: Ulid, delta: UsageDelta) {
         .send_storage_effect(StorageEffect::AddUsage {
             key_space: USAGE_STATS_KEYSPACE.to_string(),
             deltas: vec![(ByteView::from(b"group".to_vec()), delta)],
+            buckets: Vec::new(),
             txn_id,
         })
         .await
@@ -2443,6 +2444,61 @@ async fn parallel_usage_commits() {
 
     let counters = read_usage(&handle, None).await.unwrap();
     assert_eq!((counters.objects, counters.logical_bytes), (3, 30));
+}
+
+#[tokio::test]
+async fn bucket_usage_commits() {
+    let dir = tempdir().unwrap();
+    let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let key = ByteView::from(b"bucket/data".to_vec());
+    let change = async |delta: BucketDelta| {
+        let txn_id = start_write_transaction(&handle).await;
+        let effect = StorageEffect::AddUsage {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            deltas: Vec::new(),
+            buckets: vec![(key.clone(), delta), (key.clone(), delta)],
+            txn_id,
+        };
+        let event = handle.send_storage_effect(effect).await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+        commit_transaction(&handle, txn_id).await;
+    };
+    // Two changes of one row in one transaction both apply; a decrement clamps at zero.
+    change(BucketDelta {
+        versions: 2,
+        logical_bytes: 10,
+        ..Default::default()
+    })
+    .await;
+    change(BucketDelta {
+        versions: -1,
+        delete_markers: -1,
+        ..Default::default()
+    })
+    .await;
+    let event = handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(bytes), ..
+    }) = event
+    else {
+        panic!("the bucket row is stored, got {event:?}");
+    };
+    let counters = BucketCounters::from_bytes(&bytes).unwrap();
+    let expected = BucketCounters {
+        versions: 2,
+        logical_bytes: 20,
+        ..Default::default()
+    };
+    assert_eq!(counters, expected);
 }
 
 #[tokio::test]

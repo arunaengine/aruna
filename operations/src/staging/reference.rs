@@ -8,7 +8,9 @@ use crate::connectors::repository::{
 };
 use crate::connectors::resolver::secret_fingerprint;
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
+use crate::node::usage_stats::{
+    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
@@ -302,7 +304,8 @@ pub async fn write_reference_version(
                 referenced_bytes: i128::from(referenced_bytes) - i128::from(released.unwrap_or(0)),
                 ..Default::default()
             },
-        );
+        )
+        .in_bucket(&write.bucket, RowChange::AddedVersion);
         if !usage_update.is_noop() {
             run_usage_update(context, txn_id, &mut usage_update).await?;
         }

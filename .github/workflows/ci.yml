@@ -136,7 +136,8 @@ jobs:
           --with-requirements scripts/arc-native/requirements.txt
           sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
           exec cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --run-ignored only --no-tests fail -E "binary(git_native)"'
+          --profile ci --run-ignored only --no-tests fail
+          -E "package(aruna) & binary(integration) & test(/^git_native::/)"'
 
   restart-stress:
     name: Restart scale stress
@@ -163,7 +164,7 @@ jobs:
         run: >-
           cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --run-ignored only --no-tests fail
-          -E 'binary(restart_traffic) & test(/offline_scale_/)'
+          -E 'package(aruna-operations) & binary(integration) & test(/^restart_traffic::offline_scale_/)'
 
   s3-backend:
     needs: test-build
@@ -224,9 +225,9 @@ jobs:
           | test(=blob::tests::framed::s3_framed_fallback) | test(=blob::tests::framed::s3_omitted_part)
           | test(=blob::tests::framed::s3_completion_budget)
           | test(=blob::tests::framed::s3_bucketless_framed))
-          | (package(aruna-operations) & binary(multipart)
-          & (test(=s3_provider_flow) | test(=s3_framed_completion)))
-          | (package(aruna-operations) & binary(linked_import))'
+          | (package(aruna-operations) & binary(integration)
+          & (test(=multipart::s3_provider_flow) | test(=multipart::s3_framed_completion)))
+          | (package(aruna-operations) & binary(integration) & test(/^linked_import::/))'
 
   docker-backend:
     runs-on: ubuntu-latest
@@ -256,8 +257,8 @@ jobs:
       - name: Run the Docker backend cases
         run: >-
           cargo nextest run -p aruna-compute --no-default-features --features docker
-          --test docker_backend --locked --run-ignored all --no-tests fail
-          -E 'test(=idempotent_submit) | test(=resubmit_after_removal) | test(=exit_code_capture) | test(=file_transfer) | test(=wildcard_outputs) | test(=chunked_transfer) | test(=cancelled_submit) | test(=cancel_stops) | test(=created_cancel_removes) | test(=reconcile_adopts) | test(=log_bounds) | test(=resource_limits) | test(=foreign_not_adopted) | test(=wait_is_observational)'
+          --test integration --locked --run-ignored all --no-tests fail
+          -E 'test(/^docker_backend::(idempotent_submit|resubmit_after_removal|exit_code_capture|file_transfer|wildcard_outputs|chunked_transfer|cancelled_submit|cancel_stops|created_cancel_removes|reconcile_adopts|log_bounds|resource_limits|foreign_not_adopted|wait_is_observational)$/)'
 
   # The compute and node manifests define the supported backend selections; an
   # all-feature build alone can hide a conditional-import mistake. The all-feature

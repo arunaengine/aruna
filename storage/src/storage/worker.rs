@@ -13,7 +13,6 @@ use aruna_core::effects::{IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::{NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, prefix_upper_bound};
-use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::telemetry::duration_ms;
 use byteview::ByteView;
 use crossfire::select::Select;
@@ -30,6 +29,7 @@ use super::handle::{
 use super::metrics::{StorageMetrics, record_storage_call};
 use super::persistence::FjallPersistPolicy;
 use super::telemetry::{storage_effect_kind, storage_event_kind};
+use super::transactions::CounterChange;
 use crate::compaction::Compactor;
 
 pub(super) enum Txn {
@@ -160,7 +160,7 @@ pub struct FjallStorage {
     /// Committed deletes per keyspace since its last compaction.
     pub(super) deletes: HashMap<String, u64>,
     pub(super) txn_deletes: HashMap<Ulid, HashMap<String, u64>>,
-    pub(super) txn_usage: HashMap<Ulid, Vec<(String, ByteView, UsageDelta)>>,
+    pub(super) txn_usage: HashMap<Ulid, Vec<(String, ByteView, CounterChange)>>,
     /// Open write transactions that wrote or deleted realm config rows.
     pub(super) config_txns: HashSet<Ulid>,
 }
@@ -233,8 +233,9 @@ impl FjallStorage {
             StorageEffect::AddUsage {
                 key_space,
                 deltas,
+                buckets,
                 txn_id,
-            } => self.add_usage(key_space, deltas, txn_id),
+            } => self.add_usage(key_space, deltas, buckets, txn_id),
             StorageEffect::CommitTransaction { txn_id } => self.commit_transaction(txn_id),
             StorageEffect::Delete {
                 key_space,

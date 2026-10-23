@@ -4,8 +4,7 @@
 
 #![allow(dead_code)]
 
-#[path = "../convergence/mod.rs"]
-mod convergence;
+use crate::convergence;
 
 use aruna_core::keys::generate_signing_key;
 use std::collections::{BTreeMap, HashSet};

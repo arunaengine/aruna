@@ -2,9 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-#![recursion_limit = "256"]
-
-mod shared;
+use crate::shared;
 
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};

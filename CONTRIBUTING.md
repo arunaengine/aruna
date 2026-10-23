@@ -28,6 +28,10 @@ revision. The same commands are available locally: `just check` compiles every
 supported feature selection, and `just test` runs the nextest and doctest
 commands (it requires `cargo-nextest`).
 
+Each crate builds its `tests/` files as modules of one `integration` test binary.
+Run them with nextest, which starts every test in its own process; select one file
+with `-E 'test(/^<file>::/)'`.
+
 All required PR checks must pass before merge. A failed, partial, or earlier
 run is not a pass; rerun affected checks after corrections. Use the pinned
 Rust toolchain, independent CI workspaces and bounded aggregate concurrency.

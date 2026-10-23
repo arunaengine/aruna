@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::abe::copies::copy_row;
-use crate::node::usage_stats::StoredDelta;
+use crate::node::usage_stats::{RowChange, StoredDelta};
 use crate::s3::bucket::key::rows::Row;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use aruna_core::keyspaces::{
@@ -341,11 +341,15 @@ impl RewriteVersionOperation {
             logical_bytes: added,
             ..Default::default()
         };
+        let bucket = &self.version_key.bucket;
         match (self.charge.map(|(group, _)| group), stored) {
-            (Some(group), Some(stored)) => {
-                Some(UsageCounterUpdate::with_stored(group, delta, stored))
+            (Some(group), Some(stored)) => Some(
+                UsageCounterUpdate::with_stored(group, delta, stored)
+                    .in_bucket(bucket, RowChange::Kept),
+            ),
+            (Some(group), None) => {
+                Some(UsageCounterUpdate::for_group(group, delta).in_bucket(bucket, RowChange::Kept))
             }
-            (Some(group), None) => Some(UsageCounterUpdate::for_group(group, delta)),
             (None, stored) => stored.map(UsageCounterUpdate::for_stored),
         }
     }

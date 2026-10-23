@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::node::usage_stats::count_upload;
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };
@@ -55,6 +56,8 @@ pub enum CreateMultipartState {
     FenceBackend,
     CheckSettings,
     WriteUpload,
+    /// Books the new record on the bucket's open upload count.
+    CountUpload,
     WritePending,
     CommitTransaction,
     AbortBackendUpload,
@@ -661,6 +664,30 @@ impl CreateMultipartOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(CreateMultipartError::TransactionMissing);
         };
+        // The bucket counts the upload in the transaction that creates its record.
+        if self.state == CreateMultipartState::WriteUpload {
+            self.state = CreateMultipartState::CountUpload;
+            return smallvec![count_upload(&self.input.bucket, 1, txn_id)];
+        }
+        self.write_rest(txn_id)
+    }
+
+    fn upload_counted(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+            return self.emit_error(CreateMultipartError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
+                received: event,
+            });
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(CreateMultipartError::TransactionMissing);
+        };
+        self.write_rest(txn_id)
+    }
+
+    /// Writes the pending envelope, if any, then commits.
+    fn write_rest(&mut self, txn_id: TxnId) -> Effects {
         if let Some(envelope) = self.envelope.take() {
             let value = match envelope.to_bytes() {
                 Ok(value) => value,
@@ -761,6 +788,7 @@ impl Operation for CreateMultipartOperation {
             CreateMultipartState::WriteUpload | CreateMultipartState::WritePending => {
                 self.handle_record_written(event)
             }
+            CreateMultipartState::CountUpload => self.upload_counted(event),
             CreateMultipartState::CommitTransaction => self.handle_transaction_committed(event),
             CreateMultipartState::AbortBackendUpload => self.backend_aborted(event),
             CreateMultipartState::Finish => smallvec![],
@@ -1103,9 +1131,10 @@ mod pure_tests {
             Some(plan)
         );
         assert_eq!(upload.backend_upload, None);
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+        operation.step(Event::Storage(StorageEvent::WriteResult {
             key: b"upload".to_vec().into(),
         }));
+        let effects = counted(&mut operation);
         let [
             Effect::Storage(StorageEffect::Write {
                 key_space,
@@ -1158,10 +1187,27 @@ mod pure_tests {
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
             key: b"upload".to_vec().into(),
         }));
+        assert_eq!(operation.state, super::CreateMultipartState::CountUpload);
+        let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice() else {
+            panic!("expected the upload count, got {effects:?}")
+        };
+        let uploads: Vec<_> = buckets
+            .iter()
+            .map(|(_, delta)| delta.open_uploads)
+            .collect();
+        assert_eq!(uploads, [1]);
         assert_eq!(
-            effects.as_slice(),
+            counted(&mut operation).as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
         );
+    }
+
+    /// Settles the open upload count the record write books.
+    fn counted(operation: &mut CreateMultipartOperation) -> aruna_core::types::Effects {
+        assert_eq!(operation.state, super::CreateMultipartState::CountUpload);
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }))
     }
 
     #[test]

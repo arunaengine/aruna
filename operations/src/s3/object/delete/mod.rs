@@ -8,7 +8,9 @@ use crate::blob::records::{
     delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,
     write_version_effect,
 };
-use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish};
+use crate::node::usage_stats::{
+    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+};
 use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::row_fence::{FenceError, RowFence};
@@ -885,7 +887,15 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::NoTransactionFound);
         };
         let delta = self.usage_delta();
-        let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta);
+        // A version delete removes its row; a delete without a version writes a marker.
+        let row = match (self.input.version_id, self.target_version.as_ref()) {
+            (None, _) => RowChange::AddedMarker,
+            (Some(_), Some(target)) if target.is_deleted() => RowChange::RemovedMarker,
+            (Some(_), Some(_)) => RowChange::RemovedVersion,
+            (Some(_), None) => RowChange::Kept,
+        };
+        let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta)
+            .in_bucket(&self.input.bucket, row);
         if update.is_noop() {
             return self.write_delete_audit();
         }

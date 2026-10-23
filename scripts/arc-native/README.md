@@ -205,7 +205,7 @@ CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEB
   uv run --no-project --with-requirements scripts/arc-native/requirements.txt \
   sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)"; \
     exec nice -n 19 ionice -c3 cargo test --locked -p aruna --no-default-features \
-    --test git_native -- --ignored --nocapture'
+    --test integration -- --ignored --nocapture git_native::'
 ```
 
 The Python code in this test generates a fixture and drives clients; it does not serve
