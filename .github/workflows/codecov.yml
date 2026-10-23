@@ -162,7 +162,7 @@ jobs:
           sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
           exec cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
-          -E "binary(git_native)"'
+          -E "package(aruna) & binary(integration) & test(/^git_native::/)"'
 
       # The S3 backend cases of the tests workflow, split across the shards like the Git tests.
       - name: Run instrumented S3 backend tests

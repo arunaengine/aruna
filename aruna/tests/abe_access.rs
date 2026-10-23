@@ -2,8 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-#![recursion_limit = "256"]
-mod shared;
+use crate::shared;
 
 use aruna_core::UserId;
 use aruna_core::compute::{SecretBytes, SharedSecret};
@@ -325,7 +324,12 @@ async fn abe_restart() -> TestResult<()> {
     // and reads with the scoped object key.
     let root = tempfile::tempdir()?;
     let output = std::process::Command::new(std::env::current_exe()?)
-        .args(["--ignored", "--exact", "abe_restart_child", "--nocapture"])
+        .args([
+            "--ignored",
+            "--exact",
+            "abe_access::abe_restart_child",
+            "--nocapture",
+        ])
         .env(RESTART_ROOT, root.path())
         .output()?;
     assert!(

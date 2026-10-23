@@ -136,7 +136,8 @@ jobs:
           --with-requirements scripts/arc-native/requirements.txt
           sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
           exec cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --run-ignored only --no-tests fail -E "binary(git_native)"'
+          --profile ci --run-ignored only --no-tests fail
+          -E "package(aruna) & binary(integration) & test(/^git_native::/)"'
 
   restart-stress:
     name: Restart scale stress
