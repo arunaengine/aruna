@@ -1004,6 +1004,7 @@ mod pure_tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Zstd { level: 3 },
+            distribution: None,
         };
         operation.step(bucket_read(Some(bucket.to_bytes().unwrap()), None));
 

@@ -67,6 +67,7 @@ fn bucket_info(group_id: Ulid, user_id: UserId, rules: Vec<StorageRoutingRule>) 
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     }
 }
 

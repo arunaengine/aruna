@@ -421,6 +421,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         for renaming in [false, true] {
             let mut operation = StartMoveOperation::new("b".into(), group_id, "in/".into(), 7);

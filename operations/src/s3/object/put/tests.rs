@@ -146,6 +146,7 @@ fn guard_allows_edit() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let edited = BucketInfo {
         cors_configuration: Some(
@@ -199,6 +200,7 @@ fn stale_encoding_rejected() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Zstd { level: 3 },
+        distribution: None,
     };
     let mut op = PutObjectOperation::new(config);
     op.state = PutObjectState::StartTransaction;
@@ -242,6 +244,7 @@ fn recreate_rejected() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let recreated = BucketInfo {
         created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),

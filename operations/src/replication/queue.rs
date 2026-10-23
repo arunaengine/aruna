@@ -2942,6 +2942,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         match storage
             .send_storage_effect(StorageEffect::Write {

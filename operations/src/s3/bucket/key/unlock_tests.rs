@@ -65,6 +65,7 @@ fn checked(caller: UserId, admins: &[UserId]) -> (UnlockBucketOperation, Effects
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let settings = BucketEncryption {
         mode: EncryptionMode::VaultLocked,
@@ -218,6 +219,7 @@ async fn reversed_unlock_shorten() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let settings = BucketEncryption {
         mode: EncryptionMode::VaultLocked,

@@ -751,6 +751,7 @@ pub(crate) mod test {
             placement_policies: policies,
             placement_policy_generation: 1,
             compression: Compression::Off,
+            distribution: None,
         };
         let _ = context
             .storage_handle
@@ -1321,6 +1322,7 @@ pub(crate) mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 1,
             compression: Compression::Zstd { level: 3 },
+            distribution: None,
         };
         let _ = context
             .storage_handle

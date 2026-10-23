@@ -230,6 +230,7 @@ fn stale_encoding_aborts() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Zstd { level: 3 },
+        distribution: None,
     };
 
     let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {

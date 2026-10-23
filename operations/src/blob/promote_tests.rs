@@ -273,6 +273,7 @@ fn promotes_pending_alias() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Default::default(),
+        distribution: None,
     };
     let buckets = vec![(
         Key::from(b"bucket".to_vec()),
@@ -361,6 +362,7 @@ fn bucket_rows() -> Vec<(Key, Option<Value>)> {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Default::default(),
+        distribution: None,
     };
     vec![(
         Key::from(b"bucket".to_vec()),

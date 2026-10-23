@@ -208,6 +208,7 @@ async fn setup_fixture() -> Fixture {
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
+                distribution: None,
             }
             .to_bytes()
             .unwrap(),
@@ -654,6 +655,7 @@ async fn refuses_offered_write() {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         }
         .to_bytes()
         .unwrap(),

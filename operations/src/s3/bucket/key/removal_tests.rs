@@ -124,6 +124,7 @@ fn run_by(case: Case, admin: bool) -> (RemoveHolderOperation, Effects) {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let settings = BucketEncryption {
         mode: case.mode,

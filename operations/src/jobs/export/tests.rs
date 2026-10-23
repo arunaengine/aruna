@@ -197,6 +197,7 @@ async fn seed_bao(
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let hash: [u8; 32] = location.get_blake3().unwrap().try_into().unwrap();
     let version = BlobVersion::materialized(
@@ -2852,6 +2853,7 @@ async fn two_copies() -> (BaoNode, UserId, UserId, [ExportCandidate; 2]) {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let version = BlobVersion::materialized(
         hash,

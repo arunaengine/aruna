@@ -609,6 +609,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Default::default(),
+            distribution: None,
         };
         let realm_key = realm.as_bytes().to_vec();
         put(

@@ -267,6 +267,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: None,
         }
         .to_bytes()
         .unwrap()

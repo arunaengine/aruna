@@ -574,6 +574,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Default::default(),
+            distribution: None,
         };
         let realm_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());

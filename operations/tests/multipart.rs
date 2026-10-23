@@ -2090,6 +2090,7 @@ async fn set_compression(
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression,
+        distribution: None,
     };
     let event = context
         .driver

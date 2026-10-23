@@ -699,6 +699,7 @@ async fn setup_state() -> TestState {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     write_doc(
         &driver_ctx,

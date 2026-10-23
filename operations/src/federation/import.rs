@@ -651,6 +651,7 @@ pub(crate) mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Default::default(),
+            distribution: None,
         };
         let effect = StorageEffect::Write {
             key_space: S3_BUCKET_KEYSPACE.to_string(),

@@ -700,6 +700,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression,
+            distribution: None,
         };
         Some(bucket.to_bytes().unwrap().into())
     }

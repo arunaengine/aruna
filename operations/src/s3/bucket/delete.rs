@@ -825,6 +825,7 @@ mod link_tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         info.to_bytes().unwrap().into()
     }
@@ -1059,6 +1060,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 },
             ),
             &driver_ctx,
@@ -1136,6 +1138,7 @@ mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         drive(
             CreateBucketOperation::new(bucket.clone(), info),
@@ -1254,6 +1257,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 },
             ),
             &driver_ctx,
@@ -1304,6 +1308,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 },
             ),
             &driver_ctx,
@@ -1425,6 +1430,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 }
                 .to_bytes()
                 .unwrap()
@@ -1492,6 +1498,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 }
                 .to_bytes()
                 .unwrap()

@@ -2535,6 +2535,7 @@ mod decision_tests {
             placement_policies: refs,
             placement_policy_generation: generation,
             compression: Compression::Off,
+            distribution: None,
         };
         ByteView::from(info.to_bytes().expect("bucket encodes"))
     }

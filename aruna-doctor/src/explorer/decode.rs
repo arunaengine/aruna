@@ -1030,6 +1030,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 7,
             compression: Compression::Off,
+            distribution: None,
         };
 
         let decoded = decode_entry(

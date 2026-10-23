@@ -1118,6 +1118,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let _ = context
             .storage_handle
@@ -1402,6 +1403,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         Value::from(bucket.to_bytes().expect("bucket encodes"))
     }

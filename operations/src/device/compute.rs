@@ -730,6 +730,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         for (key_space, row_key, value) in [
             (

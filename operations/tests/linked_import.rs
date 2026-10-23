@@ -134,6 +134,7 @@ async fn seed_group(driver: &DriverContext, actor: &Actor, group_id: GroupId) {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let create = CreateBucketOperation::new(BUCKET.to_string(), info);
     drive(create, driver).await.unwrap();

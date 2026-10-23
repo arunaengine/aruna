@@ -89,6 +89,7 @@ async fn sealed(storage: &StorageHandle) -> (Sealed, Ulid, ObjectEnvelope) {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Default::default(),
+        distribution: None,
     };
     put(
         storage,

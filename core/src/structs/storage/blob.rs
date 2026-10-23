@@ -17,6 +17,7 @@ use crate::structs::execution::staging::VersionSourceBinding;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
+use crate::structs::storage::distribution::DistributionBinding;
 use crate::structs::storage::encryption::SealPlan;
 use crate::structs::storage::format::{Compression, EncodingClass, StoredFormat, StoredLayout};
 use crate::structs::storage::group_backend::GroupBackendKind;
@@ -745,6 +746,8 @@ pub struct BucketInfo {
     pub placement_policy_generation: u64,
     /// Compression of new writes; each node also re-encodes its own copies to match.
     pub compression: Compression,
+    /// Membership in a distributed set; `None` keeps the bucket ordinary.
+    pub distribution: Option<DistributionBinding>,
 }
 
 /// The incarnation of a bucket from its creation row, which tells one bucket of a name from
@@ -2144,6 +2147,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 7,
             compression: Compression::Off,
+            distribution: None,
         }
     }
 

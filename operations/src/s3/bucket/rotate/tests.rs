@@ -22,6 +22,7 @@ fn info() -> BucketInfo {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Zstd { level: 3 },
+        distribution: None,
     }
 }
 

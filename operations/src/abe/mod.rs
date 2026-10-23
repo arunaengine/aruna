@@ -664,6 +664,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Default::default(),
+            distribution: None,
         };
         let parameters = AbeParameters {
             realm_id,
@@ -808,6 +809,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Default::default(),
+            distribution: None,
         });
         operation.txn = Some(TxnId::generate());
         operation.snapshot = Some(Snapshot {
@@ -994,6 +996,7 @@ mod tests {
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Default::default(),
+                distribution: None,
             });
             operation.snapshot_read(values(account, config))
         };

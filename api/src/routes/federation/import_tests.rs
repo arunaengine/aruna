@@ -212,6 +212,7 @@ async fn fixture(with_blob: bool) -> Fixture {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Default::default(),
+        distribution: None,
     };
     write(
         &state,

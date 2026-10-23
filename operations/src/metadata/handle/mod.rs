@@ -141,6 +141,7 @@ async fn create_sync_bucket(
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
+                distribution: None,
             },
         ),
         context,

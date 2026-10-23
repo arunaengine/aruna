@@ -183,6 +183,7 @@ pub(crate) async fn setup() -> (tempfile::TempDir, DriverContext) {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let name = BUCKET.as_bytes().to_vec();
     put(

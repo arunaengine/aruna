@@ -511,6 +511,7 @@ mod mapped_tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         }
     }
 
@@ -808,6 +809,7 @@ mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
 
         let result = drive(
@@ -843,6 +845,7 @@ mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
 
         drive(
@@ -887,6 +890,7 @@ mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let storage = &driver_ctx.storage_handle;
         let mut seen = Vec::new();

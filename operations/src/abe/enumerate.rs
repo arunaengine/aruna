@@ -185,6 +185,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Default::default(),
+            distribution: None,
         });
         operation.snapshot = Some(Snapshot {
             parameters: create_parameters(&secret, realm_id, node, key).unwrap(),
