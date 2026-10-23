@@ -67,14 +67,40 @@ impl Batch {
         key == other_key || (name.is_some() && name == other_name)
     }
 
+    /// Marks `row` as finished by an earlier run, so it neither runs nor counts again.
+    pub(super) fn passed(&mut self, row: usize) {
+        self.finished[row] = true;
+        self.pass_finished();
+    }
+
     fn start(&mut self, row: usize) {
         self.waiting.remove(&row);
         if row == self.next {
-            let key = &self.rows[row].0;
-            let end = (row + 1..self.rows.len()).find(|later| self.rows[*later].0 != *key);
-            self.next = end.unwrap_or(self.rows.len());
+            self.next = self.key_end(row);
+            self.pass_finished();
         }
         self.running.push(row);
+    }
+
+    /// The row after the last row of `row`'s key.
+    fn key_end(&self, row: usize) -> usize {
+        let key = &self.rows[row].0;
+        let end = (row + 1..self.rows.len()).find(|later| self.rows[*later].0 != *key);
+        end.unwrap_or(self.rows.len())
+    }
+
+    /// Opens the keys at `next` whose first rows an earlier run finished; their next row waits.
+    fn pass_finished(&mut self) {
+        while self.finished.get(self.next) == Some(&true) {
+            let (start, end) = (self.next, self.key_end(self.next));
+            self.next = end;
+            if let Some(row) = (start..end).find(|row| !self.finished[*row]) {
+                self.waiting.insert(row);
+            }
+        }
+        while self.finished.get(self.done) == Some(&true) {
+            self.done += 1;
+        }
     }
 
     fn finish(&mut self, row: usize) {
@@ -91,6 +117,11 @@ impl Batch {
     /// Rows finished in storage order from the first one on; the cursor moves over these only.
     pub(super) fn done(&self) -> usize {
         self.done
+    }
+
+    /// The finished rows after the first unfinished one.
+    pub(super) fn finished_after(&self) -> impl Iterator<Item = usize> + '_ {
+        (self.done..self.rows.len()).filter(|row| self.finished[*row])
     }
 }
 
@@ -190,6 +221,28 @@ mod tests {
         assert_eq!(rows.ready(), Some(1));
         rows.start(1);
         assert_eq!(rows.ready(), Some(2));
+    }
+
+    #[test]
+    fn passes_finished_rows() {
+        // Rows an earlier run finished never run again, and the cursor moves over them.
+        let mut rows = batch(&["a", "b", "b", "c"]);
+        rows.passed(1);
+        assert_eq!(rows.ready(), Some(0));
+        rows.start(0);
+        assert_eq!(rows.ready(), Some(2));
+        rows.start(2);
+        assert_eq!(rows.ready(), Some(3));
+        rows.start(3);
+        rows.finish(3);
+        assert_eq!(rows.finished_after().collect::<Vec<_>>(), [1, 3]);
+        rows.finish(0);
+        assert_eq!(
+            (rows.done(), rows.finished_after().collect::<Vec<_>>()),
+            (2, vec![3])
+        );
+        rows.finish(2);
+        assert_eq!(rows.done(), 4);
     }
 
     #[tokio::test]
