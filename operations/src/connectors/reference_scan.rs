@@ -137,3 +137,133 @@ impl ReferenceScan {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectors::repository::connector_reference_key;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::storage::blob::VersionKey;
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    fn txn() -> TxnId {
+        Ulid::from_bytes([9; 16])
+    }
+
+    fn row(connector_id: Ulid, key: &str) -> Key {
+        connector_reference_key(connector_id, &VersionKey::new("bucket", key, Ulid::nil())).unwrap()
+    }
+
+    fn reference(connector_id: Ulid) -> Option<ByteView> {
+        let binding = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::S3,
+                public_config: HashMap::new(),
+                source_path: "a".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(connector_id),
+        };
+        let metadata = SourceMetadata {
+            content_length: 1,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let now = SystemTime::UNIX_EPOCH;
+        let version = BlobVersion::reference(binding, metadata, now, Default::default(), now);
+        Some(ByteView::from(version.to_bytes().unwrap()))
+    }
+
+    fn rows(keys: Vec<Key>, next: Option<Key>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: keys
+                .into_iter()
+                .map(|key| (key, ByteView::from(Vec::new())))
+                .collect(),
+            next_start_after: next,
+        })
+    }
+
+    #[test]
+    fn live_row_refers() {
+        let connector_id = Ulid::from_bytes([2; 16]);
+        let mut scan = ReferenceScan::new(connector_id);
+        assert!(matches!(
+            scan.start(None, txn()).as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
+                if key_space == CONNECTOR_REFERENCE_KEYSPACE
+        ));
+        let Ok(ScanStep::Next(reads)) = scan.step(rows(vec![row(connector_id, "a")], None), txn())
+        else {
+            panic!("expected the version reads");
+        };
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = reads.as_slice() else {
+            panic!("expected one batch read");
+        };
+        let expected = VersionKey::new("bucket", "a", Ulid::nil())
+            .to_bytes()
+            .unwrap();
+        assert_eq!(reads[0].1.as_ref(), expected.as_slice());
+
+        let versions = Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(reads[0].1.clone(), reference(connector_id))],
+        });
+        assert!(matches!(
+            scan.step(versions, txn()),
+            Ok(ScanStep::Referenced)
+        ));
+    }
+
+    #[test]
+    fn stale_rows_pruned() {
+        let connector_id = Ulid::from_bytes([2; 16]);
+        let mut scan = ReferenceScan::new(connector_id);
+        scan.start(None, txn());
+        let page = vec![row(connector_id, "gone"), row(connector_id, "rebound")];
+        let next = page[1].clone();
+        scan.step(rows(page, Some(next.clone())), txn()).ok();
+        let versions = Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Key::from(b"gone".to_vec()), None),
+                (
+                    Key::from(b"rebound".to_vec()),
+                    reference(Ulid::from_bytes([3; 16])),
+                ),
+            ],
+        });
+
+        let Ok(ScanStep::Next(prune)) = scan.step(versions, txn()) else {
+            panic!("expected the stale rows to be pruned");
+        };
+        assert!(matches!(
+            prune.as_slice(),
+            [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] if deletes.len() == 2
+        ));
+        let deleted = Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        });
+        let Ok(ScanStep::Next(page)) = scan.step(deleted, txn()) else {
+            panic!("expected the next page");
+        };
+        assert!(matches!(
+            page.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { start: Some(IterStart::After(key)), .. })]
+                if *key == next
+        ));
+        assert!(matches!(
+            scan.step(rows(Vec::new(), None), txn()),
+            Ok(ScanStep::Complete)
+        ));
+    }
+}

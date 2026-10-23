@@ -345,13 +345,17 @@ mod tests {
     use super::*;
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     use crate::connectors::replace_connector::{ReplaceSourceInput, ReplaceSourceOperation};
-    use crate::connectors::repository::{parse_secret_read, read_secret_effect};
+    use crate::connectors::repository::{
+        connector_reference_key, connector_reference_write, parse_secret_read, read_secret_effect,
+    };
     use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
     use crate::driver::{DriverContext, drive};
     use crate::staging::descriptor::build_source_binding;
     use aruna_core::effects::IterStart;
     use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+    use aruna_core::keyspaces::{
+        BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, SOURCE_INDEX_KEYSPACE,
+    };
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
     use aruna_core::structs::execution::source_connector::{
         SourceConnector, SourceConnectorKind, SourceConnectorSecret,
@@ -437,32 +441,31 @@ mod tests {
     }
 
     async fn write_reference_version(context: &DriverContext, source: VersionSourceBinding) {
-        let version_id = ulid::Ulid::generate();
-        let key = VersionKey::new("bucket", "key", version_id)
-            .to_bytes()
-            .unwrap();
-        let value = BlobVersion::reference(
+        let version_key = VersionKey::new("bucket", "key", ulid::Ulid::generate());
+        let version = BlobVersion::reference(
             source,
             source_metadata(),
             SystemTime::UNIX_EPOCH,
             Default::default(),
             SystemTime::UNIX_EPOCH,
-        )
-        .to_bytes()
-        .unwrap();
+        );
+        let mut writes = vec![(
+            BLOB_VERSIONS_KEYSPACE.to_string(),
+            version_key.to_bytes().unwrap().into(),
+            version.to_bytes().unwrap().into(),
+        )];
+        writes.extend(connector_reference_write(&version, &version_key).unwrap());
 
         let event = context
             .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: key.into(),
-                value: value.into(),
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
                 txn_id: None,
             })
             .await;
         assert!(matches!(
             event,
-            Event::Storage(StorageEvent::WriteResult { .. })
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
         ));
     }
 
@@ -562,27 +565,56 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn reference_aborts_delete() {
-        let connector_id = Ulid::from_bytes([2u8; 16]);
-        let txn_id = Ulid::from_bytes([3u8; 16]);
+    /// An operation inside its transaction with the reference scan started.
+    fn scanning(connector_id: Ulid, txn_id: Ulid) -> DeleteSourceOperation {
         let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id,
         });
-        operation.state = DeleteSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
+        operation.state = DeleteSourceState::StartTransaction;
+        operation.has_secret = true;
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation
+    }
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+    fn reference_rows(connector_id: Ulid, next: Option<Key>) -> Event {
+        let version_key = VersionKey::new("bucket", "key", Ulid::nil());
+        Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                connector_reference_key(connector_id, &version_key).unwrap(),
+                Vec::new().into(),
+            )],
+            next_start_after: next,
+        })
+    }
+
+    fn version_read(version: Option<BlobVersion>) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
             values: vec![(
                 vec![1].into(),
-                reference_blob_version(connector_id)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
+                version.map(|version| version.to_bytes().unwrap().into()),
             )],
-            next_start_after: None,
-        }));
+        })
+    }
+
+    fn pruned() -> Event {
+        Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn reference_aborts_delete() {
+        let connector_id = Ulid::from_bytes([2u8; 16]);
+        let txn_id = Ulid::from_bytes([3u8; 16]);
+        let mut operation = scanning(connector_id, txn_id);
+
+        assert!(matches!(
+            operation.step(reference_rows(connector_id, None)).as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { txn_id: Some(read_txn), .. })]
+                if *read_txn == txn_id
+        ));
+        let effects = operation.step(version_read(Some(reference_blob_version(connector_id))));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
@@ -601,19 +633,17 @@ mod tests {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
         let next_key: Key = vec![9u8].into();
-        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id,
-        });
-        operation.state = DeleteSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
+        let mut operation = scanning(connector_id, txn_id);
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![],
-            next_start_after: Some(next_key.clone()),
-        }));
+        operation.step(reference_rows(connector_id, Some(next_key.clone())));
+        // A row whose version is gone is pruned in the scan's own transaction.
         assert!(matches!(
-            effects.as_slice(),
+            operation.step(version_read(None)).as_slice(),
+            [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id: Some(prune_txn) })]
+                if *prune_txn == txn_id && deletes[0].0 == CONNECTOR_REFERENCE_KEYSPACE
+        ));
+        assert!(matches!(
+            operation.step(pruned()).as_slice(),
             [Effect::Storage(StorageEffect::Iter {
                 start: Some(IterStart::After(key)),
                 txn_id: Some(scan_txn),
@@ -627,8 +657,8 @@ mod tests {
         }));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchDelete { txn_id: Some(delete_txn), .. })]
-                if *delete_txn == txn_id
+            [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id: Some(delete_txn) })]
+                if *delete_txn == txn_id && deletes[0].0 == SOURCE_INDEX_KEYSPACE
         ));
     }
 
@@ -636,36 +666,13 @@ mod tests {
     fn later_page_aborts() {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let next_key: Key = vec![9u8].into();
-        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id,
-        });
-        operation.state = DeleteSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
+        let mut operation = scanning(connector_id, txn_id);
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![],
-            next_start_after: Some(next_key.clone()),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(key)),
-                ..
-            })] if key.as_ref() == next_key.as_ref()
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                vec![1].into(),
-                reference_blob_version(connector_id)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            )],
-            next_start_after: None,
-        }));
+        operation.step(reference_rows(connector_id, Some(vec![9u8].into())));
+        operation.step(version_read(None));
+        operation.step(pruned());
+        operation.step(reference_rows(connector_id, None));
+        let effects = operation.step(version_read(Some(reference_blob_version(connector_id))));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
@@ -682,12 +689,7 @@ mod tests {
     #[test]
     fn scan_failure_aborts() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id: Ulid::from_bytes([2u8; 16]),
-        });
-        operation.state = DeleteSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
+        let mut operation = scanning(Ulid::from_bytes([2u8; 16]), txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
             key: vec![].into(),
@@ -699,12 +701,10 @@ mod tests {
         ));
 
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-        assert_eq!(
+        assert!(matches!(
             operation.finalize(),
-            Err(DeleteSourceError::StorageError(StorageError::ReadError(
-                "unexpected event".to_string()
-            )))
-        );
+            Err(DeleteSourceError::StorageError(StorageError::ReadError(_)))
+        ));
     }
 
     #[test]
