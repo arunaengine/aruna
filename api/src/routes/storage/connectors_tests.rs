@@ -255,6 +255,7 @@ async fn entries_reject_traversal() {
         Query(ConnectorEntriesQuery {
             path: "../secret".to_string(),
             limit: None,
+            cursor: None,
         }),
     )
     .await;
@@ -273,6 +274,7 @@ async fn entries_require_permission() {
         Query(ConnectorEntriesQuery {
             path: String::new(),
             limit: None,
+            cursor: None,
         }),
     )
     .await;
@@ -285,6 +287,28 @@ fn entries_normalize_prefix() {
     assert_eq!(normalize_browse_path("prefix").unwrap(), "prefix/");
     assert_eq!(normalize_browse_path("prefix/").unwrap(), "prefix/");
     assert_eq!(normalize_browse_path("").unwrap(), "");
+}
+
+#[test]
+fn cursor_round_trips() {
+    for cursor in [
+        ListCursor::After("datasets/run 1/ä.txt".to_string()),
+        ListCursor::Offset(500),
+    ] {
+        assert_eq!(decode_cursor(&encode_cursor(&cursor)).unwrap(), cursor);
+    }
+    for invalid in ["%%%", "", "eA", "aw"] {
+        assert!(matches!(
+            decode_cursor(invalid),
+            Err(ServerError::BadRequestReason(_))
+        ));
+    }
+    assert!(matches!(
+        map_list_error(ListStagingError::Staging(
+            aruna_core::errors::StagingSourceError::InvalidListing("past".to_string()),
+        )),
+        ServerError::BadRequestReason(reason) if reason == "past"
+    ));
 }
 
 #[test]
