@@ -720,13 +720,33 @@ pub struct RenamePageQuery {
     pub after: Option<String>,
 }
 
+/// What a rename would do, from the rule's own record of its files.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct RenamePlanResponse {
+    /// Bytes of the `count` files.
+    pub bytes: u64,
+    /// Of them, files over 1 GiB and their bytes; without a provider version they are copied
+    /// through the node, the others inside the provider.
+    pub large_files: u64,
+    pub large_bytes: u64,
+    /// Of them, files whose new name another file of the rule already holds; they fail.
+    pub taken_files: u64,
+    /// Of them, files the caller may read but not write; they keep their name.
+    pub withheld_files: u64,
+    /// The rule's other files, which keep their name, and their bytes.
+    pub unchanged_files: u64,
+    pub unchanged_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ImportRenamesResponse {
     /// Files of the rule that an earlier pattern named and that a rename would give their
     /// current name, as far as the caller may read their keys.
     pub count: u64,
-    /// `false` when the count stopped at its limit; `count` is then a lower bound.
+    /// Always `true`: the plan covers every file of the rule.
     pub complete: bool,
+    /// The rest of the plan.
+    pub plan: RenamePlanResponse,
     /// One page of them.
     pub files: Vec<RenameFileResponse>,
     /// Cursor of the next page; omitted on the last page.
@@ -749,16 +769,21 @@ bucket, including request policies. Tokens with path restrictions are refused. O
 key the caller may read are counted and listed.
 
 **Behavior**
-- A file counts when its version reads it from the rule's folder and an earlier pattern of the
-  rule named it for exactly that version. Files a user put there, and files with their current
-  name, never count.
+- The plan reads only the rule's own record of its files, never the provider. A file counts
+  when an earlier pattern of the rule named it for exactly the version recorded for it. Files
+  a user put there, and files with their current name, count as `unchanged_files`.
+- `plan` splits the counted files: `large_files` over 1 GiB, which are copied through the node
+  when the provider keeps no versions; `taken_files` whose new name another file of the rule
+  holds; `withheld_files` the caller may not write, which make `POST` answer 403.
+- Each listed file is also checked against its version; a file whose version changed is not
+  listed, and a rename leaves it in place.
+- A filter limits the plan and the pages alike.
 - Changing the pattern renames nothing; only `POST` on this path does.
 
 **Limits**
-- Pages hold 1 to 1000 files, in storage order; `next` resumes after the last version passed
-  over and names only keys the caller may read. Totals and a page each pass over at most 10,000
-  version rows and check at most 5,000, also with a filter; `complete` is then false and
-  `count` is a lower bound."#,
+- Pages hold 1 to 1000 files, in path order; `next` resumes after the last listed file. The
+  plan covers every file of the rule, read in batches, so `complete` is always true; a large
+  rule takes longer to plan."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the rule, as a 26-character ULID"),
         ("import_id" = String, Path, description = "Rule to check, as a 26-character ULID"),
@@ -772,6 +797,15 @@ key the caller may read are counted and listed.
             example = json!({
                 "count": 1,
                 "complete": true,
+                "plan": {
+                    "bytes": 1048576,
+                    "large_files": 0,
+                    "large_bytes": 0,
+                    "taken_files": 0,
+                    "withheld_files": 0,
+                    "unchanged_files": 12,
+                    "unchanged_bytes": 52428800
+                },
                 "files": [{
                     "from": "instrument/raw/01JA7Q3K2M4N5P6Q7R8S9T0V1W_b.fastq",
                     "to": "instrument/raw/b.fastq~01JA7Q3K2M4N5P6Q7R8S9T0V1W",
@@ -821,7 +855,7 @@ pub async fn get_renames(
     let writable = |key: &str| access.allows(Some(key), &Permission::WRITE);
     let found = rename_page(
         &context,
-        (&rule.bucket, &rule.key_prefix),
+        &rule,
         (&readable, &writable),
         (page.filter.as_deref(), after, limit),
     )
@@ -834,10 +868,19 @@ pub async fn get_renames(
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let last = status.filter(|record| record.moving && record.prefix == rule.key_prefix);
-    let files = found.entries.into_iter();
+    let (files, plan) = (found.entries.into_iter(), found.plan);
     Ok(Json(ImportRenamesResponse {
-        count: found.total,
-        complete: found.complete,
+        count: plan.files,
+        complete: plan.complete,
+        plan: RenamePlanResponse {
+            bytes: plan.bytes,
+            large_files: plan.large_files,
+            large_bytes: plan.large_bytes,
+            taken_files: plan.taken_files,
+            withheld_files: plan.withheld_files,
+            unchanged_files: plan.unchanged_files,
+            unchanged_bytes: plan.unchanged_bytes,
+        },
         files: files
             .map(|(from, to, writable)| RenameFileResponse { from, to, writable })
             .collect(),
@@ -871,9 +914,9 @@ restrictions are refused.
 **Limits**
 - Only files on the rule's own folder storage are renamed. Encrypted buckets answer 409
   `bucket_encrypted`, and a move with another prefix answers 409 `move_running`.
-- The keys `GET` on this path reaches are checked before the start; files beyond its limits
-  are checked when the rename reaches them. A pattern change between that check and the start
-  answers 409 `rule_changed`; once the rename runs, pattern changes are refused.
+- The keys of all files `GET` on this path plans are checked before the start. A pattern
+  change between that check and the start answers 409 `rule_changed`; once the rename runs,
+  pattern changes are refused.
 - A storage that cannot create a file only while its name is free renames nothing: each such
   file keeps its name and counts as failed. A copy an earlier rename left at the new name is
   still used when its bytes match.
@@ -929,10 +972,10 @@ pub async fn start_renames(
     let checked = authorized_renames(&state.get_ctx(), caller, &rule, Permission::WRITE)
         .await
         .map_err(map_error)?;
-    if checked.withheld > 0 {
+    if checked.withheld_files > 0 {
         return Err(ServerError::Forbidden);
     }
-    // Files past the check's limits are authorized one by one when the rename reaches them.
+    // Files written after the check are authorized one by one when the rename reaches them.
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
     let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms())
         .renaming((auth.clone(), state.get_node_id()), grant)
