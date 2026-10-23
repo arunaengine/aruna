@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::distribution::change::ChangeAuthority;
 use aruna_core::structs::storage::distribution::{DistributionChange, DistributionOp};
@@ -131,4 +132,93 @@ async fn group_admin_authority(
             ),
         },
     )
+}
+
+/// Reduces the change into the set's state and stores the record every realm node reads.
+pub(in crate::document_sync) async fn apply_distribution_operation(
+    storage: &StorageHandle,
+    document_target: DocumentTarget,
+    event: AdminDocumentEvent,
+) -> Result<()> {
+    let (
+        DocumentTarget::RealmConfig { realm_id },
+        AdminDocumentTarget::Distribution {
+            realm_id: event_realm_id,
+            set_id,
+        },
+    ) = (&document_target, &event.target)
+    else {
+        return Err(NetError::Bootstrap(
+            "distribution changes ride the realm config document".to_string(),
+        ));
+    };
+    if realm_id != event_realm_id {
+        return Err(NetError::Bootstrap(
+            "distribution change realm does not match its document".to_string(),
+        ));
+    }
+    let set_id = *set_id;
+    for _ in 0..APPLY_CONFLICT_ATTEMPTS {
+        tokio::task::yield_now().await;
+        let txn_id = start_storage_transaction(storage).await?;
+        let writes = match distribution_writes(storage, txn_id, &event, set_id).await {
+            Ok(Some(writes)) => writes,
+            Ok(None) => return abort_txn(storage, txn_id).await,
+            Err(error) => return Err(abort_error(storage, txn_id, error).await),
+        };
+        match replace_batch_in(storage, txn_id, Vec::new(), writes).await {
+            Ok(()) => return Ok(()),
+            Err(NetError::Storage(StorageError::TransactionConflict)) => {
+                let _ = abort_txn(storage, txn_id).await;
+            }
+            Err(error) => {
+                let _ = abort_txn(storage, txn_id).await;
+                return Err(error);
+            }
+        }
+    }
+    Err(NetError::Dht(
+        "distribution change apply conflict retries exhausted".to_string(),
+    ))
+}
+
+/// The reducer state and record writes of one attempt; `None` for a duplicate event.
+async fn distribution_writes(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    event: &AdminDocumentEvent,
+    set_id: Ulid,
+) -> Result<Option<Vec<(String, ByteView, Value)>>> {
+    let bootstrap = |error: String| NetError::Bootstrap(error);
+    let mut state = transaction_read(
+        storage,
+        DOCUMENT_STATE_KEYSPACE.to_string(),
+        reducer_state_key(&event.target),
+        Some(txn_id),
+    )
+    .await?
+    .map(|bytes| decode_reducer_state(&bytes))
+    .transpose()
+    .map_err(|error| bootstrap(error.to_string()))?
+    .unwrap_or_else(|| AdminDocumentState::new(event.target.clone()));
+    if state
+        .apply(event)
+        .map_err(|error| bootstrap(error.to_string()))?
+        == AdminApplyStatus::Duplicate
+    {
+        return Ok(None);
+    }
+    let mut writes =
+        vec![reducer_state_entry(&state).map_err(|error| bootstrap(error.to_string()))?];
+    if let Some(record) = state.materialized_distribution() {
+        let bytes = record
+            .to_bytes()
+            .map_err(|error| bootstrap(error.to_string()))?;
+        writes.push((
+            DISTRIBUTION_KEYSPACE.to_string(),
+            set_id.to_bytes().to_vec().into(),
+            bytes.into(),
+        ));
+    }
+    Ok(Some(writes))
 }

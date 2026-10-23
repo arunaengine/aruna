@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::errors::ConversionError;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::types::GroupId;
 
@@ -192,6 +193,14 @@ pub struct DistributionRecord {
 }
 
 impl DistributionRecord {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
     pub fn member(&self, member_id: Ulid) -> Option<&DistributionMember> {
         self.config
             .members

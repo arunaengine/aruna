@@ -50,6 +50,8 @@ pub const DOCUMENT_JOB_KEYSPACE: &str = "metadata_materialization_document_jobs"
 pub const DEAD_LETTER_KEYSPACE: &str = "metadata_materialization_dead_letters";
 pub const MATERIALIZATION_PRUNE_KEYSPACE: &str = "metadata_materialization_prunes";
 pub const DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
+/// Reduced distribution records by set id, materialized from their admin reducer state.
+pub const DISTRIBUTION_KEYSPACE: &str = "distribution_records";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
@@ -461,6 +463,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DEAD_LETTER_KEYSPACE,
     MATERIALIZATION_PRUNE_KEYSPACE,
     DOCUMENT_STATE_KEYSPACE,
+    DISTRIBUTION_KEYSPACE,
     DOCUMENT_CONFLICT_KEYSPACE,
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,

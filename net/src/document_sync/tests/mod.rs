@@ -44,6 +44,7 @@ use std::env;
 use tempfile::TempDir;
 
 mod admin_validation;
+mod distribution;
 mod fanout;
 mod federated;
 mod git;

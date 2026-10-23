@@ -30,6 +30,9 @@ pub(crate) async fn apply_admin_operation(
         (DocumentTarget::RealmConfig { .. }, AdminDocumentTarget::RealmConfig { .. }) => {
             apply_realm_config(storage, document_target, event).await
         }
+        (DocumentTarget::RealmConfig { .. }, AdminDocumentTarget::Distribution { .. }) => {
+            apply_distribution_operation(storage, document_target, event).await
+        }
         _ => Err(NetError::Bootstrap(
             "admin document operation target does not match document sync target".to_string(),
         )),
