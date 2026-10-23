@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use aruna_api::error::ServerError;
-use aruna_api::routes::bucket_usage::{BucketUsageQuery, get_bucket_usage};
+use aruna_api::routes::bucket_usage::get_bucket_usage;
 use aruna_api::routes::storage::routing::{
     BucketRoutingRequest, get_bucket_routing, put_bucket_routing,
 };
@@ -37,7 +37,7 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::node::usage_stats::RebuildStatsOperation;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
@@ -46,7 +46,6 @@ use ulid::Ulid;
 struct Fixture {
     _directory: TempDir,
     state: Arc<ServerState>,
-    owner: AuthContext,
     reader: AuthContext,
 }
 
@@ -279,12 +278,6 @@ async fn setup() -> Fixture {
     Fixture {
         _directory: directory,
         state,
-        owner: AuthContext {
-            user_id: owner,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        },
         reader: AuthContext {
             user_id: reader,
             realm_id,
@@ -302,50 +295,19 @@ async fn usage_counts_inventory() {
         State(fixture.state.clone()),
         Extension(Some(fixture.reader.clone())),
         Path("data".to_string()),
-        Query(BucketUsageQuery { limit: None }),
     )
     .await
     .unwrap();
 
-    // Without a limit only the maintained counter answers.
+    // The counter row the rebuild filled answers every number but the open uploads.
     assert_eq!(usage.bucket, "data");
-    assert_eq!((usage.objects, usage.logical_bytes), (1, 84));
-    assert_eq!(usage.versions, None);
+    assert_eq!(usage.objects, 1);
+    assert_eq!(usage.versions, 2);
+    assert_eq!(usage.delete_markers, 1);
+    assert_eq!(usage.open_multipart_uploads, 1);
+    assert_eq!(usage.logical_bytes, 84);
+    assert_eq!(usage.referenced_bytes, 0);
     assert!(usage.complete);
-
-    let Json(usage) = get_bucket_usage(
-        State(fixture.state.clone()),
-        Extension(Some(fixture.reader.clone())),
-        Path("data".to_string()),
-        Query(BucketUsageQuery { limit: Some(100) }),
-    )
-    .await
-    .unwrap();
-    assert_eq!((usage.objects, usage.logical_bytes), (1, 84));
-    assert_eq!(usage.versions, Some(2));
-    assert_eq!(usage.delete_markers, Some(1));
-    assert_eq!(usage.open_multipart_uploads, Some(1));
-    assert!(usage.complete);
-}
-
-#[tokio::test]
-async fn usage_reports_truncation() {
-    let fixture = setup().await;
-
-    let Json(usage) = get_bucket_usage(
-        State(fixture.state.clone()),
-        Extension(Some(fixture.owner.clone())),
-        Path("data".to_string()),
-        Query(BucketUsageQuery { limit: Some(1) }),
-    )
-    .await
-    .unwrap();
-
-    assert!(!usage.complete);
-    let scanned = usage.versions.unwrap_or(0) + usage.delete_markers.unwrap_or(0);
-    assert!(scanned <= 1);
-    // The counter stays exact while the scan stops early.
-    assert_eq!((usage.objects, usage.logical_bytes), (1, 84));
 }
 
 #[tokio::test]
