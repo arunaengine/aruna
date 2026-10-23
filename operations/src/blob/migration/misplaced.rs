@@ -9,7 +9,8 @@ use crate::driver::DriverContext;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_VERSIONS_KEYSPACE, BROKEN_VERSION_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BROKEN_VERSION_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{
     BackendImport, COPY_PART, ImportedObject, object_key, object_prefix,
@@ -268,7 +269,7 @@ pub async fn rename_page(
             None,
         )
         .await?;
-        let mut renames = Vec::new();
+        let mut candidates = Vec::new();
         for (row_key, value) in &rows {
             let (key, path, row) = row_parts(rule, (row_key, value))?;
             let Some(key) = key.filter(|key| shown(key)) else {
@@ -276,12 +277,24 @@ pub async fn rename_page(
             };
             // A mapped key names its file by the storage side of the mapping.
             let named = routing.storage_key(rule, &key);
-            let Some(to) = rule.rename_target(patterns, &path, &named, row.version_id) else {
-                page.plan.unchanged_files += 1;
-                page.plan.unchanged_bytes += row.size;
-                continue;
-            };
+            match rule.rename_target(patterns, &path, &named, row.version_id) {
+                Some(to) => candidates.push((row_key.clone(), key, path, row, to)),
+                None => {
+                    page.plan.unchanged_files += 1;
+                    page.plan.unchanged_bytes += row.size;
+                }
+            }
+        }
+        // Only a file its version still reads is work; any other record keeps its name.
+        let found = confirmed(context, (&routing, &earlier), &rule.bucket, &candidates).await?;
+        let mut renames = Vec::new();
+        for ((row_key, key, path, row, to), found) in candidates.into_iter().zip(found) {
             let plan = &mut page.plan;
+            if !found {
+                plan.unchanged_files += 1;
+                plan.unchanged_bytes += row.size;
+                continue;
+            }
             plan.files += 1;
             plan.bytes += row.size;
             if row.size > COPY_PART {
@@ -293,12 +306,8 @@ pub async fn rename_page(
                 .as_deref()
                 .is_none_or(|after| row_key.as_ref() > after);
             if listed && page.entries.len() < limit {
-                let version_key = VersionKey::new(&rule.bucket, &key, row.version_id);
-                let found = listed_rename(context, (&routing, &earlier), &version_key, &path);
-                if let Some((from, to)) = found.await? {
-                    page.entries.push((from, to, writable(&key)));
-                    page.next = Some(row_key.to_vec());
-                }
+                page.entries.push((path, to.clone(), writable(&key)));
+                page.next = Some(row_key.to_vec());
             }
             renames.push((key, row, to));
         }
@@ -330,20 +339,78 @@ fn row_parts(
     Ok((key, path, row))
 }
 
-/// The old and new path of the file at `path`, if its version still reads it and a rename
-/// gives it the current name.
-async fn listed_rename(
+/// Whether each candidate's version still reads its file there and a rename gives that file
+/// the candidate's new name; the versions and their locations are read in one batch each.
+async fn confirmed(
     context: &DriverContext,
-    inputs: (&RoutingSnapshot, &super::Earlier),
-    version_key: &VersionKey,
-    path: &str,
-) -> Result<Option<(String, String)>, String> {
-    let key = version_key.to_bytes().map_err(|error| error.to_string())?;
-    let Some(version) = read(context, BLOB_VERSIONS_KEYSPACE, key.into()).await? else {
-        return Ok(None);
+    (routing, earlier): (&RoutingSnapshot, &super::Earlier),
+    bucket: &str,
+    candidates: &[(Key, String, String, ImportedObject, String)],
+) -> Result<Vec<bool>, String> {
+    let keys: Vec<VersionKey> = (candidates.iter())
+        .map(|(_, key, _, row, _)| VersionKey::new(bucket, key, row.version_id))
+        .collect();
+    let reads = keys.iter().map(|key| {
+        let key = key.to_bytes().map_err(|error| error.to_string())?;
+        Ok((BLOB_VERSIONS_KEYSPACE.to_string(), key.into()))
+    });
+    let versions = batch(context, reads.collect::<Result<_, String>>()?).await?;
+    // The copy each version reads, where a move would take it.
+    let mut places = Vec::new();
+    for (index, (key, value)) in keys.iter().zip(versions).enumerate() {
+        let Some(value) = value else {
+            continue;
+        };
+        let version = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
+        let Ok((resolved, Some(plain))) = place(routing, key) else {
+            continue;
+        };
+        let target = (resolved.backend.clone(), resolved.compression.into());
+        if let Some(source) = source_key(&version, |_: &_| target.clone(), true) {
+            places.push((index, plain, source));
+        }
+    }
+    let reads = (places.iter())
+        .map(|(_, _, source)| {
+            (
+                BLOB_LOCATIONS_KEYSPACE.to_string(),
+                source.to_bytes().into(),
+            )
+        })
+        .collect();
+    let locations = batch(context, reads).await?;
+    let mut found = vec![false; candidates.len()];
+    for ((index, plain, _), value) in places.into_iter().zip(locations) {
+        let Some(value) = value else {
+            continue;
+        };
+        let location = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
+        let (_, _, path, _, to) = &candidates[index];
+        found[index] = location.backend_path == *path
+            && plain.path == *to
+            && renames(routing, earlier, &plain, &location, &keys[index]);
+    }
+    Ok(found)
+}
+
+/// The values of `reads` in one storage call, in their order.
+async fn batch(
+    context: &DriverContext,
+    reads: Vec<(String, Key)>,
+) -> Result<Vec<Option<aruna_core::types::Value>>, String> {
+    if reads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let read = StorageEffect::BatchRead {
+        reads,
+        txn_id: None,
     };
-    let found = renamed(context, inputs, version_key, &version).await?;
-    Ok(found.filter(|(from, _)| from == path))
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            Ok(values.into_iter().map(|(_, value)| value).collect())
+        }
+        other => Err(format!("could not read the plan's records: {other:?}")),
+    }
 }
 
 /// Renames whose new path a record of the rule keeps for another key or version, read in
@@ -353,25 +420,14 @@ async fn taken(
     rule: &BackendImport,
     renames: &[(String, ImportedObject, String)],
 ) -> Result<u64, String> {
-    if renames.is_empty() {
-        return Ok(0);
-    }
     let reads = (renames.iter())
         .map(|(_, _, to)| {
             let row = object_key(rule.import_id, to);
             (IMPORTED_OBJECT_KEYSPACE.to_string(), row)
         })
         .collect();
-    let batch = StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    };
-    let values = match context.storage_handle.send_storage_effect(batch).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => return Err(format!("could not read the new paths: {other:?}")),
-    };
     let mut taken = 0;
-    for ((key, row, to), (_, held)) in renames.iter().zip(values) {
+    for ((key, row, to), held) in renames.iter().zip(batch(context, reads).await?) {
         let Some(held) = held else {
             continue;
         };
@@ -383,38 +439,12 @@ async fn taken(
     Ok(taken)
 }
 
-/// The old and new path of the version's linked file, if a rename renames it.
-async fn renamed(
-    context: &DriverContext,
-    (routing, earlier): (
-        &aruna_core::structs::storage::routing::RoutingSnapshot,
-        &super::Earlier,
-    ),
-    version_key: &VersionKey,
-    value: &[u8],
-) -> Result<Option<(String, String)>, String> {
-    let Ok((resolved, Some(plain))) = place(routing, version_key) else {
-        return Ok(None);
-    };
-    let version = BlobVersion::from_bytes(value).map_err(|error| error.to_string())?;
-    let target = (resolved.backend.clone(), resolved.compression.into());
-    let Some(source) = source_key(&version, |_: &_| target.clone(), true) else {
-        return Ok(None);
-    };
-    let Some(location) = read_location(context, &source).await? else {
-        return Ok(None);
-    };
-    let found = renames(routing, earlier, &plain, &location, version_key);
-    Ok(found.then_some((location.backend_path, plain.path)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::s3::bucket::rename::tests::{BUCKET, group, put, rule, setup};
     use aruna_core::keyspaces::{
-        BACKEND_INDEX_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
-        S3_BUCKET_KEYSPACE,
+        BACKEND_INDEX_KEYSPACE, IMPORT_PATTERN_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::storage::backend_import::write_patterns;
@@ -533,8 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn plans_indexed_renames() {
-        // The plan comes from the rule's index alone; listed files are checked against their
-        // version.
+        // The plan reads the rule's index and counts only files their version still reads.
         let (_directory, context) = setup().await;
         linked_bucket(&context).await;
         let id = |at: u64| Ulid::from_parts(at, 1);
@@ -569,15 +598,12 @@ mod tests {
             1,
         )
         .await;
-        // A large file is planned from its record, though no version reads it any more.
         let large = COPY_PART + 1;
-        recorded(
-            &context,
-            ("h.bin", id(19)),
-            &format!("raw/{}_h.bin", id(19)),
-            large,
-        )
-        .await;
+        let path = format!("raw/{}_h.bin", id(19));
+        linked_file(&context, ("h.bin", id(19)), &path, large).await;
+        // A record whose version is gone is no work; its file keeps its name.
+        let stale = format!("raw/{}_i.txt", id(20));
+        recorded(&context, ("i.txt", id(20)), &stale, 17).await;
         let readable = |key: &str| !key.starts_with("secret/");
         let writable = |key: &str| key != "b.txt";
         let checks = (&readable as &KeyCheck<'_>, &writable as &KeyCheck<'_>);
@@ -596,8 +622,8 @@ mod tests {
             large_bytes: large,
             taken_files: 1,
             withheld_files: 1,
-            unchanged_files: 4,
-            unchanged_bytes: 34,
+            unchanged_files: 5,
+            unchanged_bytes: 51,
             complete: true,
         };
         assert_eq!(page.plan, plan);
@@ -607,8 +633,14 @@ mod tests {
         let rest = rest.unwrap();
         let (from, to) = renamed("b.txt", 12);
         assert_eq!(rest.entries, vec![(from, to, false)]);
-        // The hidden key and the file without a version are not listed; no cursor follows.
-        let last = rename_page(&context, &rule(), checks, (None, rest.next, 1)).await;
+        let large = rename_page(&context, &rule(), checks, (None, rest.next, 1)).await;
+        let large = large.unwrap();
+        assert_eq!(
+            large.entries,
+            vec![(path, format!("raw/h.bin~{}", id(19)), true)]
+        );
+        // The stale record and the hidden key are not listed; no cursor follows.
+        let last = rename_page(&context, &rule(), checks, (None, large.next, 1)).await;
         let last = last.unwrap();
         assert_eq!((last.entries.len(), last.next), (0, None));
         // A filter limits the plan and the pages alike.
