@@ -11,8 +11,8 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    S3_BUCKET_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
@@ -29,6 +29,8 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     HashIndex, ManagedCopyKey, VersionKey, object_permission_path,
 };
+use aruna_core::structs::storage::distribution::DistributionView;
+use aruna_core::structs::storage::distribution::inventory::{IndexEntry, Position, index_key};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
@@ -455,6 +457,8 @@ enum IncomingBaoState {
     Init,
     StartTransaction,
     ReadRealm,
+    /// A logical version target is looked up in this node's member bucket of the set.
+    LocateVersion,
     ReadExactVersion,
     ReadExactBucket,
     ResolveSource,
@@ -536,6 +540,8 @@ pub struct IncomingBaoOperation {
     lease: Option<ReadLease>,
     /// Active key of the encrypting bucket of a plain copy being served.
     plain_key: Option<BucketKeyRef>,
+    /// Where a logical version target lies in this node's member bucket.
+    located: Option<VersionedObjectArn>,
 }
 
 impl IncomingBaoOperation {
@@ -584,6 +590,7 @@ impl IncomingBaoOperation {
             now_ms: 0,
             lease: None,
             plain_key: None,
+            located: None,
         }
     }
 
@@ -614,6 +621,7 @@ impl IncomingBaoOperation {
     fn exact_target(&self) -> Option<&VersionedObjectArn> {
         match &self.request.target {
             BaoReadTarget::ExactVersion(target) => Some(target),
+            BaoReadTarget::Version { .. } => self.located.as_ref(),
             BaoReadTarget::Blake3(_) => None,
         }
     }
@@ -621,7 +629,7 @@ impl IncomingBaoOperation {
     fn hash_target(&self) -> Option<[u8; 32]> {
         match &self.request.target {
             BaoReadTarget::Blake3(hash) => Some(*hash),
-            BaoReadTarget::ExactVersion(_) => None,
+            BaoReadTarget::ExactVersion(_) | BaoReadTarget::Version { .. } => None,
         }
     }
 
@@ -998,6 +1006,7 @@ impl IncomingBaoOperation {
             IncomingBaoState::Init => "init",
             IncomingBaoState::StartTransaction => "start_transaction",
             IncomingBaoState::ReadRealm => "read_realm",
+            IncomingBaoState::LocateVersion => "locate_version",
             IncomingBaoState::ReadExactVersion => "read_exact_version",
             IncomingBaoState::ReadExactBucket => "read_exact_bucket",
             IncomingBaoState::ResolveSource => "resolve_source",
@@ -1066,6 +1075,23 @@ impl IncomingBaoOperation {
                     self.read_exact_bucket()
                 }
             }
+            BaoReadTarget::Version { set_id, version_id } => {
+                let (set_id, version_id) = (*set_id, *version_id);
+                if self.request.expected_blake3.is_none() {
+                    return self.send_refusal(BaoReadRefusal::InvalidTarget);
+                }
+                self.state = IncomingBaoState::LocateVersion;
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads: vec![
+                        (DISTRIBUTION_KEYSPACE.to_string(), set_id.to_bytes().into()),
+                        (
+                            VERSION_INDEX_KEYSPACE.to_string(),
+                            index_key(set_id, version_id).into(),
+                        ),
+                    ],
+                    txn_id: self.txn_id,
+                })]
+            }
             BaoReadTarget::Blake3(hash) => {
                 if self
                     .request
@@ -1080,6 +1106,40 @@ impl IncomingBaoOperation {
                 }
             }
         }
+    }
+
+    /// Finds a logical version in this node's member bucket: the record names the bucket, the
+    /// version id index the key. The bucket read that follows checks the binding.
+    fn handle_located(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected(event);
+        };
+        let BaoReadTarget::Version { set_id, version_id } = self.request.target else {
+            return self.send_refusal(BaoReadRefusal::InvalidTarget);
+        };
+        let (Some((_, Some(record))), Some((_, Some(index)))) = (values.first(), values.get(1))
+        else {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let bucket = match DistributionView::from_bytes(record) {
+            Ok(view) => view.snapshot().config.bucket.clone(),
+            Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
+        };
+        let position = IndexEntry::from_bytes(index)
+            .and_then(|entry| Position::decode(&entry.position))
+            .ok()
+            .filter(|position| position.set_id == set_id);
+        let Some(position) = position else {
+            return self.send_refusal(BaoReadRefusal::BackendFailure);
+        };
+        self.located = Some(VersionedObjectArn {
+            realm_id: self.request.realm_id,
+            node_id: self.local_node,
+            bucket,
+            key: position.key,
+            version: version_id,
+        });
+        self.read_exact_bucket()
     }
 
     fn handle_exact_version(&mut self, event: Event) -> Effects {
@@ -1220,6 +1280,12 @@ impl IncomingBaoOperation {
             Ok(bucket) => bucket,
             Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
         };
+        // Only the member bucket bound to the set answers for it, never a bucket of the name.
+        if let BaoReadTarget::Version { set_id, .. } = self.request.target
+            && bucket.distribution.as_ref().map(|binding| binding.set_id) != Some(set_id)
+        {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        }
         let target = self
             .exact_target()
             .expect("exact target required after exact bucket read");
@@ -1466,6 +1532,7 @@ impl Operation for IncomingBaoOperation {
         match self.state {
             IncomingBaoState::StartTransaction => self.handle_start(event),
             IncomingBaoState::ReadRealm => self.handle_realm(event),
+            IncomingBaoState::LocateVersion => self.handle_located(event),
             IncomingBaoState::ReadExactVersion => self.handle_exact_version(event),
             IncomingBaoState::ReadExactBucket => self.handle_exact_bucket(event),
             IncomingBaoState::ResolveSource => match event {
@@ -2357,6 +2424,108 @@ mod pure_tests {
             value: Some(bucket_value()),
         }));
         assert_eq!(refusal_from(&effects), BaoReadRefusal::ReadDenied);
+    }
+
+    /// A request for one version of `set_id` by its logical identity.
+    fn version_request(set_id: Ulid, hash: [u8; 32]) -> BaoReadRequest {
+        let mut request = read_request(node_from_seed(1), hash);
+        request.target = BaoReadTarget::Version {
+            set_id,
+            version_id: Ulid::from(4u128),
+        };
+        request
+    }
+
+    fn bound_bucket(
+        binding: Option<aruna_core::structs::storage::distribution::DistributionBinding>,
+    ) -> byteview::ByteView {
+        let mut bucket = BucketInfo::from_bytes(&bucket_value()).unwrap();
+        bucket.distribution = binding;
+        bucket.to_bytes().unwrap().into()
+    }
+
+    // A logical version is found through the set's record and version id index in this node's
+    // member bucket, then served like an exact version of that bucket.
+    #[test]
+    fn serves_logical_version() {
+        use aruna_core::structs::storage::distribution::OriginalEpoch;
+        use aruna_core::structs::storage::distribution::inventory::{
+            IndexEntry, VersionEntry, version_position,
+        };
+        let (snapshot, record) = crate::distribution::test_record::record(true);
+        let set_id = snapshot.set_id();
+        let (local_node, peer) = (node_from_seed(1), node_from_seed(2));
+        let hash = [4u8; 32];
+        let path = aruna_core::structs::storage::blob::object_permission_path(
+            test_realm(),
+            Ulid::from(5u128),
+            local_node,
+            "spire",
+            "path/file.txt",
+        );
+        let index = IndexEntry {
+            position: version_position(
+                set_id,
+                "path/file.txt",
+                OriginalEpoch(1),
+                1,
+                Ulid::from(4u128),
+            ),
+            version: VersionEntry::default(),
+        };
+        let start = || {
+            let mut operation = IncomingBaoOperation::new(
+                peer,
+                local_node,
+                test_realm(),
+                Ulid::from(9u128),
+                version_request(set_id, hash),
+            )
+            .with_policy_paths(HashSet::from([path.clone()]));
+            operation.start();
+            let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: Vec::<u8>::new().into(),
+                value: Some(realm_value(peer)),
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 2
+            ));
+            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![
+                    (Vec::new().into(), Some(record.clone().into())),
+                    (Vec::new().into(), Some(index.to_bytes().unwrap().into())),
+                ],
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Read { key, .. })] if key.as_ref() == b"spire"
+            ));
+            operation
+        };
+
+        // A bucket of the name that is not the set's member never answers for it.
+        let mut stranger = start();
+        let effects = stranger.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(bound_bucket(None)),
+        }));
+        assert_eq!(refusal_from(&effects), BaoReadRefusal::NotFound);
+
+        let mut operation = start();
+        let binding = crate::distribution::test_record::binding(&snapshot, 1, 5);
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(bound_bucket(Some(binding))),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(version_value(hash)),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
     }
 
     #[test]

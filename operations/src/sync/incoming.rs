@@ -731,6 +731,11 @@ async fn bao_policy(
             }
             Ok((paths, allowed, had_denial))
         }
+        // The serve finds the version in its member bucket and checks the caller in its
+        // snapshot transaction, as for every target.
+        crate::replication::protocol::BaoReadTarget::Version { .. } => {
+            Ok((paths, Vec::new(), false))
+        }
     }
 }
 
