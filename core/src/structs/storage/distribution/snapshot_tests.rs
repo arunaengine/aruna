@@ -205,3 +205,22 @@ fn equivocation_marks_conflict() {
     other.root.nonce = [8; 16];
     assert!(install(Some(&view), signed(other)).is_err());
 }
+
+#[test]
+fn ranges_resolve_keys() {
+    let nodes = [
+        (member_id(1), secret(1).public()),
+        (member_id(2), secret(2).public()),
+    ];
+    let bounds = ["g".to_string(), "p".to_string()];
+    let layout = shard_layout(root().set_id(), &nodes, &bounds, 0).unwrap();
+    let mut snapshot = created();
+    snapshot.config.members = layout.members;
+    snapshot.config.ranges = layout.ranges;
+    let coordinator = |key: &str| snapshot.range_for(key).map(|range| range.coordinator);
+    assert_eq!(coordinator(""), Some(member_id(1)));
+    assert_eq!(coordinator("f/zz"), Some(member_id(1)));
+    assert_eq!(coordinator("g"), Some(member_id(2)));
+    assert_eq!(coordinator("zzz"), Some(member_id(1)));
+    assert!(!snapshot.serving());
+}
