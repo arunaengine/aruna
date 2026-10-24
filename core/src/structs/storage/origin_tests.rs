@@ -82,3 +82,32 @@ fn oversized_device_is_unbounded() {
     };
     assert!(!upload.bounded());
 }
+
+#[test]
+fn source_url_joins_public_parts() {
+    use crate::structs::execution::source_connector::SourceConnectorKind;
+    use std::collections::HashMap;
+    let descriptor = PortableSourceDescriptor {
+        kind: SourceConnectorKind::S3,
+        public_config: HashMap::from([
+            (
+                "endpoint".to_string(),
+                "https://s3.gi.denbi.de/".to_string(),
+            ),
+            ("bucket".to_string(), "bakrep-v2-data-007".to_string()),
+        ]),
+        source_path: "/genomes/a.gbff".to_string(),
+        version_selector: None,
+        capabilities: Vec::new(),
+        origin_node_id: None,
+    };
+    assert_eq!(
+        public_source_url(&descriptor).as_deref(),
+        Some("https://s3.gi.denbi.de/bakrep-v2-data-007/genomes/a.gbff")
+    );
+    let device = PortableSourceDescriptor {
+        kind: SourceConnectorKind::LocalDirectory,
+        ..descriptor
+    };
+    assert_eq!(public_source_url(&device), None);
+}

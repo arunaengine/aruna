@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::id::NodeId;
+use crate::structs::execution::staging::PortableSourceDescriptor;
 use crate::structs::storage::global_id::GlobalId;
 use crate::structs::storage::replication::VersionedObjectArn;
 
@@ -119,6 +120,37 @@ pub fn project(
         }
     }
     projection
+}
+
+/// The public URL of an external source object, from the descriptor's public settings:
+/// endpoint, bucket and root, then the path. Device folders and Aruna sources have none.
+pub fn public_source_url(descriptor: &PortableSourceDescriptor) -> Option<String> {
+    use crate::structs::execution::source_connector::SourceConnectorKind;
+    if !matches!(
+        descriptor.kind,
+        SourceConnectorKind::Http
+            | SourceConnectorKind::S3
+            | SourceConnectorKind::Webdav
+            | SourceConnectorKind::Ftp
+    ) {
+        return None;
+    }
+    let config = &descriptor.public_config;
+    let endpoint = config.get("endpoint")?.trim_end_matches('/');
+    let mut url = endpoint.to_string();
+    for part in ["bucket", "root"]
+        .iter()
+        .filter_map(|name| config.get(*name))
+        .map(|part| part.trim_matches('/'))
+        .chain(std::iter::once(
+            descriptor.source_path.trim_start_matches('/'),
+        ))
+        .filter(|part| !part.is_empty())
+    {
+        url.push('/');
+        url.push_str(part);
+    }
+    Some(url)
 }
 
 #[cfg(test)]
