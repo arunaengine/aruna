@@ -274,7 +274,7 @@ async fn requeue_publish(context: &Arc<DriverContext>, now_ms: u64) {
 }
 
 /// Moves the timer to now. An idle arm would keep the beat a device always has pending.
-async fn arm(context: &Arc<DriverContext>, key: TaskKey) {
+pub(crate) async fn arm(context: &Arc<DriverContext>, key: TaskKey) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return;
     };

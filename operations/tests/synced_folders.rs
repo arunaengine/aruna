@@ -34,15 +34,17 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::device_pull::{accept_pull, pull_status};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
-use aruna_operations::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+use aruna_operations::staging::offered_directory::{
+    OfferDirectoryInput, OfferedDirectoryError, offer_directory,
+};
 use futures_util::StreamExt;
-use topology::{TestResult, Topology, hang_cap, wait_for_convergence};
+use topology::{TestResult, Topology, hang_cap, wait_for_convergence, wait_until};
 use ulid::Ulid;
 
 const MANAGEMENT_NODES: usize = 2;
@@ -224,7 +226,35 @@ async fn entry_of(
         .ok_or_else(|| format!("the folder has no entry for {path}").into())
 }
 
-/// A folder bound to the realm node's bucket, with its first sweep taken.
+/// The device without its task runtime. A bind through it wakes no background pass, so only
+/// the test's own passes decide.
+fn manual_context(context: &DriverContext) -> std::sync::Arc<DriverContext> {
+    std::sync::Arc::new(DriverContext {
+        task_handle: None,
+        ..context.clone()
+    })
+}
+
+/// A create-enabled binding of `root` to the realm node's bucket.
+fn create_input(realm: &Topology, root: &std::path::Path, group_id: GroupId) -> BindFolderInput {
+    BindFolderInput {
+        folder_id: Ulid::generate(),
+        root: root.to_string_lossy().to_string(),
+        group_id,
+        remote: RemoteBinding {
+            node_id: realm.node(0).node_id(),
+            bucket: REMOTE_BUCKET.to_string(),
+            prefix: String::new(),
+        },
+        create_bucket: true,
+        mode: FolderMode::TwoWay,
+        propagate_deletes: true,
+        realm_id: realm.realm_id,
+        user_id: realm.user_id,
+    }
+}
+
+/// A folder bound to the realm node's bucket. No pass has observed it yet.
 async fn bind(
     realm: &Topology,
     root: &std::path::Path,
@@ -233,7 +263,7 @@ async fn bind(
     let device = realm.user_node();
     let server = realm.node(0);
     let folder = bind_folder(
-        &device.context,
+        &manual_context(&device.context),
         BindFolderInput {
             folder_id: Ulid::generate(),
             root: root.to_string_lossy().to_string(),
@@ -247,7 +277,6 @@ async fn bind(
             mode: FolderMode::TwoWay,
             propagate_deletes: true,
             realm_id: realm.realm_id,
-            node_id: device.node_id(),
             user_id: realm.user_id,
         },
     )
@@ -490,7 +519,7 @@ async fn creates_remote_bucket() -> TestResult<()> {
     std::fs::write(root.path().join("note.txt"), b"from the device")?;
 
     let folder = bind_folder(
-        &device.context,
+        &manual_context(&device.context),
         BindFolderInput {
             folder_id: Ulid::generate(),
             root: root.path().to_string_lossy().to_string(),
@@ -504,7 +533,6 @@ async fn creates_remote_bucket() -> TestResult<()> {
             mode: FolderMode::TwoWay,
             propagate_deletes: true,
             realm_id: realm.realm_id,
-            node_id: device.node_id(),
             user_id: realm.user_id,
         },
     )
@@ -540,6 +568,75 @@ async fn creates_remote_bucket() -> TestResult<()> {
     Ok(())
 }
 
+/// The bind answers before the directory is walked; the pass it wakes observes the folder and
+/// publishes it in the background.
+#[tokio::test]
+async fn binds_before_scanning() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("note.txt"), b"from the device")?;
+
+    let folder = bind_folder(&device.context, create_input(&realm, root.path(), group_id)).await?;
+    assert_eq!(
+        folder.observed_files, 0,
+        "the bind must not walk the folder"
+    );
+
+    wait_until(
+        "the background pass publishes the file",
+        server.node_id(),
+        || async {
+            read_object(&realm, &server.context, group_id, "note.txt")
+                .await
+                .is_ok_and(|bytes| bytes == b"from the device")
+        },
+    )
+    .await?;
+    assert_eq!(
+        read_bound(&device.context, folder.folder_id)
+            .await?
+            .observed_files,
+        1
+    );
+    Ok(())
+}
+
+/// A root that is not a usable directory is refused before the realm node creates the bucket.
+#[tokio::test]
+async fn refuses_missing_root() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    let root = tempfile::tempdir()?;
+
+    let error = bind_folder(
+        &device.context,
+        create_input(&realm, &root.path().join("missing"), group_id),
+    )
+    .await
+    .expect_err("a missing root is refused");
+    assert!(matches!(
+        error,
+        FolderError::Offer(OfferedDirectoryError::Source(_))
+    ));
+    assert!(
+        matches!(
+            drive(
+                GetBucketOperation::new(REMOTE_BUCKET.to_string()),
+                &server.context
+            )
+            .await,
+            Err(GetBucketError::NotFound)
+        ),
+        "a refused bind must not leave the bucket behind"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn refuses_foreign_bucket() -> TestResult<()> {
     // A create-enabled bind must not adopt a same-named bucket from another group.
@@ -566,7 +663,6 @@ async fn refuses_foreign_bucket() -> TestResult<()> {
             mode: FolderMode::TwoWay,
             propagate_deletes: true,
             realm_id: realm.realm_id,
-            node_id: device.node_id(),
             user_id: realm.user_id,
         },
     )
@@ -678,7 +774,6 @@ async fn refuses_invalid_remotes() -> TestResult<()> {
         mode: FolderMode::TwoWay,
         propagate_deletes: true,
         realm_id: realm.realm_id,
-        node_id: device.node_id(),
         user_id: realm.user_id,
     };
 

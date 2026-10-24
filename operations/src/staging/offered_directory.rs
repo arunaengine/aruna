@@ -335,7 +335,10 @@ fn local_access(root: &str, path: &str) -> ResolvedSourceAccess {
     }
 }
 
-async fn check_root(context: &DriverContext, root: &str) -> Result<(), OfferedDirectoryError> {
+pub(crate) async fn check_root(
+    context: &DriverContext,
+    root: &str,
+) -> Result<(), OfferedDirectoryError> {
     let event = send_source_effect(
         context,
         StagingSourceEffect::Check {

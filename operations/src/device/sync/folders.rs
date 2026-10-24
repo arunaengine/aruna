@@ -15,6 +15,7 @@ use aruna_core::structs::{
     EntryState, FolderMode, FolderState, RemoteBinding, SyncActionRecord, SyncBase, SyncPageLimit,
     SyncRefusal, SyncedFolder,
 };
+use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
@@ -24,7 +25,7 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::get_config::GetConfigOperation;
 use crate::staging::offered_directory::{
-    OfferDirectoryInput, OfferedDirectoryError, WithdrawOfferInput, offer_directory, withdraw_offer,
+    OfferedDirectoryError, WithdrawOfferInput, check_root, withdraw_offer,
 };
 
 use super::repository::{
@@ -44,7 +45,6 @@ pub struct BindFolderInput {
     pub mode: FolderMode,
     pub propagate_deletes: bool,
     pub realm_id: RealmId,
-    pub node_id: NodeId,
     pub user_id: UserId,
 }
 
@@ -88,9 +88,8 @@ pub struct FolderCounters {
     pub errors: usize,
 }
 
-/// Binds one directory to a realm bucket prefix and takes the first
-/// observation of it. The bucket becomes this device's read-only view of the
-/// directory, exactly as an offered directory is.
+/// Binds one directory to a realm bucket prefix and answers before the directory is walked:
+/// the first reconcile pass, woken here, observes and publishes it in the background.
 pub async fn bind_folder(
     context: &Arc<DriverContext>,
     input: BindFolderInput,
@@ -112,6 +111,7 @@ pub async fn bind_folder(
     {
         return Err(FolderError::BucketBound(local_bucket));
     }
+    check_root(context, &input.root).await?;
     let config = drive(GetConfigOperation::new(input.realm_id), context)
         .await
         .map_err(|_| FolderError::Unavailable)?;
@@ -121,6 +121,20 @@ pub async fn bind_folder(
     if !eligible.contains(&input.remote.node_id) {
         return Err(FolderError::NotRealmNode(input.remote.node_id));
     }
+    // Detached, so a dropped request cannot stop between creating the bucket and recording it.
+    let context = context.clone();
+    tokio::spawn(async move { record_binding(&context, input, local_bucket).await })
+        .await
+        .map_err(|_| FolderError::Unavailable)?
+}
+
+/// Creates or probes the remote bucket, then records the binding. No remote step follows a
+/// creation, so a bucket this bind created always belongs to a recorded folder.
+async fn record_binding(
+    context: &Arc<DriverContext>,
+    input: BindFolderInput,
+    local_bucket: String,
+) -> Result<SyncedFolder, FolderError> {
     let auth = AuthContext {
         user_id: input.user_id,
         realm_id: input.realm_id,
@@ -154,30 +168,19 @@ pub async fn bind_folder(
             Err(error) => Err(error),
         };
         creation.map_err(|error| map_remote_error(error, &input.remote))?;
+    } else {
+        request_versions(
+            context,
+            input.remote.node_id,
+            auth,
+            input.remote.bucket.clone(),
+            input.remote.prefix.clone(),
+            None,
+            SyncPageLimit::new(1),
+        )
+        .await
+        .map_err(|error| map_remote_error(error, &input.remote))?;
     }
-    request_versions(
-        context,
-        input.remote.node_id,
-        auth,
-        input.remote.bucket.clone(),
-        input.remote.prefix.clone(),
-        None,
-        SyncPageLimit::new(1),
-    )
-    .await
-    .map_err(|error| map_remote_error(error, &input.remote))?;
-    let sweep = offer_directory(
-        context,
-        OfferDirectoryInput {
-            bucket: local_bucket.clone(),
-            root: input.root.clone(),
-            group_id: input.group_id,
-            realm_id: input.realm_id,
-            node_id: input.node_id,
-            user_id: input.user_id,
-        },
-    )
-    .await?;
 
     let folder = SyncedFolder {
         folder_id: input.folder_id,
@@ -193,10 +196,11 @@ pub async fn bind_folder(
         last_reconcile_ms: None,
         last_error: None,
         last_error_ms: None,
-        observed_files: sweep.files as u64,
+        observed_files: 0,
         list_cursor: None,
     };
     store_folder(context, &folder).await?;
+    crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
     Ok(folder)
 }
 

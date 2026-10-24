@@ -380,7 +380,6 @@ async fn bind_synced_folder(
             propagate_deletes: mode != FolderMode::DownloadOnly
                 && request.propagate_deletes.unwrap_or(true),
             realm_id: state.get_realm_id(),
-            node_id: state.get_node_id(),
             user_id: auth.user_id,
         },
     )
