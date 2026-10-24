@@ -497,17 +497,14 @@ pub async fn unbind_folder(
     context: &Arc<DriverContext>,
     folder_id: Ulid,
 ) -> Result<(), FolderError> {
-    let folder = read_bound(context, folder_id).await?;
-    if folder.state != FolderState::Deleting {
-        store_folder(
-            context,
-            &SyncedFolder {
-                state: FolderState::Deleting,
-                ..folder
-            },
-        )
-        .await?;
-    }
+    // One transaction, so a pause or resume that read the folder earlier cannot write over it.
+    update_folder(context, folder_id, |current| {
+        Ok(SyncedFolder {
+            state: FolderState::Deleting,
+            ..current
+        })
+    })
+    .await?;
     crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
     Ok(())
 }
@@ -589,18 +586,14 @@ pub async fn set_folder_state(
     folder_id: Ulid,
     state: FolderState,
 ) -> Result<SyncedFolder, FolderError> {
-    let current = read_bound(context, folder_id).await?;
-    // A folder whose cleanup is running is on its way out, not resumable.
-    if current.state == FolderState::Deleting {
-        return Err(FolderError::NotFound);
-    }
-    // Pausing or resuming must not skip the realm bucket a binding still has to confirm.
-    if matches!(current.state, FolderState::Binding { .. }) {
-        return Err(FolderError::StillBinding);
-    }
-    let folder = SyncedFolder { state, ..current };
-    store_folder(context, &folder).await?;
-    Ok(folder)
+    update_folder(context, folder_id, |current| match current.state {
+        // A folder whose cleanup is running is on its way out, not resumable.
+        FolderState::Deleting => Err(FolderError::NotFound),
+        // Pausing or resuming must not skip the realm bucket a binding still has to confirm.
+        FolderState::Binding { .. } => Err(FolderError::StillBinding),
+        _ => Ok(SyncedFolder { state, ..current }),
+    })
+    .await
 }
 
 /// Turns the propagation of local deletions on or off for one folder.
@@ -674,6 +667,7 @@ async fn update_folder(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn store_folder(
     context: &Arc<DriverContext>,
     folder: &SyncedFolder,
@@ -1066,6 +1060,107 @@ mod tests {
             finish_binding(&context, listed).await,
             Err(FolderError::NotFound)
         );
+    }
+
+    /// Hands every storage effect to `storage`. The first write of a folder row in `held` waits
+    /// for `release` on its own thread, so the effects behind it still run.
+    fn hold_write(
+        storage: aruna_storage::StorageHandle,
+        receivers: aruna_storage::storage::StorageReceivers,
+        held: FolderState,
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        fn forward(
+            storage: &aruna_storage::StorageHandle,
+            effect: aruna_core::effects::StorageEffect,
+            response: aruna_storage::storage::ResponseSender,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("a proxy runtime");
+            if let aruna_core::events::Event::Storage(event) =
+                runtime.block_on(storage.send_storage_effect(effect))
+            {
+                response.send(event);
+            }
+        }
+        let writes_held = move |effect: &aruna_core::effects::StorageEffect| match effect {
+            aruna_core::effects::StorageEffect::BatchWrite { writes, .. } => {
+                writes.iter().any(|(key_space, _, value)| {
+                    key_space == SYNCED_FOLDER_KEYSPACE
+                        && SyncedFolder::from_bytes(value).is_ok_and(|row| row.state == held)
+                })
+            }
+            _ => false,
+        };
+        std::thread::spawn(move || {
+            let _bulk = receivers.bulk;
+            let mut gate = Some((reached, release));
+            while let Ok((effect, response, ..)) = receivers.foreground.recv() {
+                if writes_held(&effect)
+                    && let Some((reached, release)) = gate.take()
+                {
+                    let storage = storage.clone();
+                    std::thread::spawn(move || {
+                        let _ = reached.send(());
+                        let _ = release.recv();
+                        forward(&storage, effect, response);
+                    });
+                    continue;
+                }
+                forward(&storage, effect, response);
+            }
+        });
+    }
+
+    // A pause or resume that read the folder before an acknowledged unbind must not write over
+    // `Deleting`. The test plays the storage worker and holds the setter's write until then.
+    #[tokio::test]
+    async fn unbind_outlasts_pause() {
+        for (start, target) in [
+            (FolderState::Active, FolderState::Paused),
+            (FolderState::Paused, FolderState::Active),
+        ] {
+            let (_dir, context) = context().await;
+            let context = Arc::new(context);
+            let folder = bound_folder(start);
+            let folder_id = folder.folder_id;
+            store_folder(&context, &folder).await.expect("row stored");
+            let (storage, receivers) = aruna_storage::StorageHandle::new();
+            let (reached, held) = tokio::sync::oneshot::channel();
+            let (release, gate) = std::sync::mpsc::channel();
+            hold_write(
+                context.storage_handle.clone(),
+                receivers,
+                target.clone(),
+                reached,
+                gate,
+            );
+            let proxied = Arc::new(DriverContext {
+                storage_handle: storage,
+                ..(*context).clone()
+            });
+
+            let setter = tokio::spawn({
+                let proxied = proxied.clone();
+                let target = target.clone();
+                async move { set_folder_state(&proxied, folder_id, target).await }
+            });
+            held.await.expect("the setter reaches its write");
+            unbind_folder(&proxied, folder_id)
+                .await
+                .expect("the unbind is acknowledged");
+            release.send(()).expect("the held write waits");
+
+            let set = setter.await.expect("the setter task ends");
+            assert!(set.is_err(), "{target:?}: {set:?}");
+            assert_eq!(
+                read_bound(&context, folder_id).await.map(|row| row.state),
+                Ok(FolderState::Deleting)
+            );
+        }
     }
 
     // Two reservations of one root race in storage; the transaction lets exactly one through,
