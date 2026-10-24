@@ -18,7 +18,7 @@ use aruna_core::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
 use aruna_operations::auth::bearer_token::token_grant;
-use aruna_operations::blob::permission_paths::ResolvePathsOperation;
+use aruna_operations::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_operations::distribution::resolve::{GlobalResolution, resolve_version};
 use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, issue_ticket, redeem_ticket,
@@ -464,7 +464,7 @@ objects.
         (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
         (status = 403, description = "The caller presented a token but may not read the object, or the token belongs to another realm", body = DrsErrorPayload),
         (status = 404, description = "No such object on this node, or an anonymous caller may not read it, which is deliberately indistinguishable", body = DrsErrorPayload),
-        (status = 409, description = "More than one distributed bucket holds the version id, or a node ARN names a distributed bucket's version this node's member does not hold; use the global id", body = DrsErrorPayload),
+        (status = 409, description = "More than one distributed bucket holds the version id, a node ARN names a distributed bucket's version this node's member does not hold, or a content hash names more objects than one lookup reads; use the global id", body = DrsErrorPayload),
         (status = 503, description = "The node owning the identifier could not answer within the request's probe budget, or has published no API URL to download from; the caller may retry", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
@@ -1445,9 +1445,15 @@ async fn resolve_content_hash(
         return Ok(ResolveOutcome::NotFound);
     }
 
-    let mappings = drive(ResolvePathsOperation::new(*hash), &state.get_ctx())
-        .await
-        .map_err(|error| DrsError::internal(error.to_string()))?;
+    let mappings = match drive(ResolvePathsOperation::new(*hash), &state.get_ctx()).await {
+        Ok(mappings) => mappings,
+        Err(ResolvePathsError::TooManyAliases) => {
+            return Err(DrsError::conflict(
+                "the content hash names more objects than one lookup reads; it is ambiguous, use the global id or a versioned ARN",
+            ));
+        }
+        Err(error) => return Err(DrsError::internal(error.to_string())),
+    };
     debug!(?mappings);
 
     let mut any_local_mapping = false;
