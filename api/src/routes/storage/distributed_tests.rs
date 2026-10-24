@@ -114,3 +114,21 @@ fn degraded_ranges_name_coordinator() {
     assert_eq!(response.ranges[0].unreachable_since_ms, Some(77));
     assert_eq!(response.ranges[0].coordinator_node, Some(node_text(2)));
 }
+
+#[test]
+fn guard_refusals_map() {
+    let set_id = Ulid::from_bytes([1; 16]);
+    let wrong = GuardError::NotCoordinator {
+        set_id,
+        range_id: Ulid::from_bytes([2; 16]),
+        node_id: node_text(2).parse().unwrap(),
+    };
+    assert!(matches!(
+        map_guard_error(wrong),
+        ServerError::ServiceUnavailableReason(_)
+    ));
+    assert!(matches!(
+        map_guard_error(GuardError::Unbound(set_id)),
+        ServerError::Conflict(_)
+    ));
+}

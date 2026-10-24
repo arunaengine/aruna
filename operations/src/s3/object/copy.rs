@@ -125,6 +125,8 @@ fn sealed_error(error: SealedCopyError) -> CopyObjectError {
             put(PutObjectError::QuotaExceeded { limit, usage })
         }
         SealedCopyError::PolicyGate(error) => put(PutObjectError::PolicyGate(error)),
+        SealedCopyError::Distribution(error) => put(PutObjectError::Distribution(error)),
+        SealedCopyError::Usage(error) => put(PutObjectError::UsageUpdateError(error)),
         SealedCopyError::NoSuchVersion => CopyObjectError::Get(GetObjectError::NoSuchVersion),
         SealedCopyError::Blob(error) => put(PutObjectError::BlobWriteFailed(error)),
         error => put(PutObjectError::WriteFailed(error.to_string())),

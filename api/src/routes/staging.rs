@@ -1552,6 +1552,9 @@ fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
         // never learn: the refusal is reported without them.
         MaterializeReferenceError::Policy(_) => ServerError::Forbidden,
         MaterializeReferenceError::Purge(_) => ServerError::ServiceUnavailable,
+        MaterializeReferenceError::Distribution(error) => {
+            crate::routes::storage::distributed::map_guard_error(error)
+        }
     }
 }
 

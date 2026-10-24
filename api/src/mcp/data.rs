@@ -1276,6 +1276,9 @@ fn map_put_error(error: PutObjectError) -> CallToolResult {
         PutObjectError::PolicyError(error) => internal_error(error),
         PutObjectError::PolicyGate(error) => internal_error(error),
         PutObjectError::PurgeFence(error) => internal_error(error),
+        PutObjectError::Distribution(error) => {
+            server_error(crate::routes::storage::distributed::map_guard_error(error))
+        }
         PutObjectError::PutObjectFailed => internal_error("object write failed"),
         error @ (PutObjectError::HeadChanged
         | PutObjectError::ImportRemoved
