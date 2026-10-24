@@ -494,10 +494,15 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
         }
     };
     let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
-    let blob_handle =
-        BlobHandler::with_registry(registry, storage_handle.clone(), net_handle, policy)
-            .await
-            .unwrap();
+    let blob_handle = BlobHandler::with_registry(
+        registry,
+        storage_handle.clone(),
+        net_handle,
+        policy,
+        Some(temp_dir.path().join("spool")),
+    )
+    .await
+    .unwrap();
 
     TestContext {
         _temp_dir: temp_dir,
@@ -1750,6 +1755,7 @@ async fn sweeps_demoted_backend() {
         storage_handle.clone(),
         net_handle.clone(),
         EgressPolicy::loopback(),
+        None,
     )
     .await
     .unwrap();
@@ -1774,6 +1780,7 @@ async fn sweeps_demoted_backend() {
         storage_handle,
         net_handle,
         EgressPolicy::loopback(),
+        None,
     )
     .await
     .unwrap();

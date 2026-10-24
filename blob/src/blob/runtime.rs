@@ -84,6 +84,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::CompleteUpload { .. } => (EffectClass::Transfer, "complete_upload"),
         BlobEffect::AbortUpload { .. } => (EffectClass::Control, "abort_upload"),
         BlobEffect::SpoolHidden { .. } => (EffectClass::Spool, "spool_hidden"),
+        BlobEffect::SpoolLocal { .. } => (EffectClass::Spool, "spool_local"),
         BlobEffect::Replicate { .. } => (EffectClass::Transfer, "replicate"),
         BlobEffect::HandleReplication { .. } => (EffectClass::Transfer, "handle_replication"),
         BlobEffect::ServeRead { .. } => (EffectClass::Transfer, "serve_read"),
@@ -297,7 +298,9 @@ impl BlobHandle {
             None
         };
         let deadline = match &effect {
-            BlobEffect::SpoolHidden { deadline, .. } => *deadline,
+            BlobEffect::SpoolHidden { deadline, .. } | BlobEffect::SpoolLocal { deadline, .. } => {
+                *deadline
+            }
             _ => None,
         };
         // A composition runs on the transfer slot its reservation already holds.
@@ -580,16 +583,22 @@ impl BlobHandler {
         net: NetHandle,
         policy: EgressPolicy,
     ) -> Result<BlobHandle, BlobLibError> {
-        Self::with_registry(BackendRegistry::single(config), storage, net, policy).await
+        Self::with_registry(BackendRegistry::single(config), storage, net, policy, None).await
     }
 
+    /// Builds the handler; `spool_dir` must be a writable disk directory, created when missing.
+    /// Without one, every local spool fails.
     #[allow(clippy::new_ret_no_self)]
     pub async fn with_registry(
         registry: BackendRegistry,
         storage: StorageHandle,
         net: NetHandle,
         policy: EgressPolicy,
+        spool_dir: Option<std::path::PathBuf>,
     ) -> Result<BlobHandle, BlobLibError> {
+        if let Some(dir) = spool_dir.as_deref() {
+            super::local_spool::prepare_dir(dir)?;
+        }
         let blob_handler = BlobHandler {
             registry,
             egress: EgressGuard::new(policy)?,
@@ -616,6 +625,8 @@ impl BlobHandler {
                 super::unlock::UNLOCKED_BUCKETS,
             ))),
             pithos_budget: Arc::new(Semaphore::new(super::pithos::budget_permits())),
+            spool_dir: spool_dir.map(Arc::new),
+            spool_files: Arc::new(Semaphore::new(super::local_spool::SPOOL_FILES)),
             spool_budget: Arc::new(Semaphore::new(SPOOL_BUDGET_MIB)),
             transient_spools: Arc::default(),
             live_spools: Arc::default(),
@@ -838,6 +849,12 @@ impl BlobHandler {
                     Box::pin(spool).await
                 }
             }
+            BlobEffect::SpoolLocal {
+                size,
+                deadline,
+                range,
+                blob,
+            } => Box::pin(self.spool_local(size, deadline, range, blob)).await,
             BlobEffect::ReadHiddenRange { location, range } => {
                 Box::pin(self.read_hidden_range(location, range)).await
             }

@@ -157,6 +157,12 @@ pub enum BlobEvent {
         blob: BackendStream<Result<Bytes, BackendStreamError>>,
         stream_size: u64,
     },
+    /// The hashes of all spooled bytes and a stream of the requested range of them.
+    LocalSpooled {
+        hashes: std::collections::HashMap<String, Vec<u8>>,
+        size: u64,
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
     HiddenDeleted,
     HiddenListed {
         entries: Vec<HiddenBlobEntry>,

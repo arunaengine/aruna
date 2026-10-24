@@ -18,9 +18,10 @@ use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupIn
 use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
-use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_compute::ExecutorRegistry;
 use aruna_core::UserId;
+use aruna_core::egress::EgressPolicy;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::node_vault::NodeVaultKey;
@@ -1009,10 +1010,12 @@ async fn initialize_context(
     };
     let blob_handle = if let Some(config) = full_storage_config {
         Some(
-            BlobHandler::new(
-                config.blob_backend_config(),
+            BlobHandler::with_registry(
+                BackendRegistry::single(config.blob_backend_config()),
                 storage_handle.clone(),
                 net.clone(),
+                EgressPolicy::strict(),
+                Some(Path::new(&config.blob_root).with_file_name("spool")),
             )
             .await?,
         )

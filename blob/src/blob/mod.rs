@@ -24,6 +24,7 @@ mod frames;
 mod group;
 mod in_place;
 mod io;
+mod local_spool;
 pub mod pithos;
 mod plain;
 mod registry;
@@ -97,6 +98,10 @@ pub struct BlobHandler {
     unlocks: Arc<StdMutex<unlock::UnlockRegistry>>,
     /// Pithos working set in MiB permits, shared by archive opens, encoders and compositions.
     pithos_budget: Arc<Semaphore>,
+    /// Writable disk directory of unnamed spool files; without one, spools fail.
+    spool_dir: Option<Arc<std::path::PathBuf>>,
+    /// Open spool files, each held until its read stream ends.
+    spool_files: Arc<Semaphore>,
     /// Transient spool budget in MiB permits, and the permits held by spool charge.
     spool_budget: Arc<Semaphore>,
     transient_spools: Arc<StdMutex<HashMap<String, OwnedSemaphorePermit>>>,

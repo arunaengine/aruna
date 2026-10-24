@@ -1462,6 +1462,7 @@ async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) 
         storage_handle.clone(),
         net_handle.clone(),
         EgressPolicy::loopback(),
+        None,
     )
     .await
     .unwrap();

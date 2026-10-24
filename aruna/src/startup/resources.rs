@@ -423,6 +423,7 @@ async fn fill(
         acquired.storage_handle.clone(),
         net_handle.clone(),
         EgressPolicy::strict().with_deny(config.blob_backends.extra_deny.clone()),
+        Some(config.spool_path.clone()),
     )
     .await?;
     acquired.blob_handle = Some(blob_handle.clone());

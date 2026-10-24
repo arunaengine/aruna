@@ -176,6 +176,7 @@ async fn setup_pattern(pattern: &str) -> TestContext {
         storage_handle.clone(),
         net_handle.clone(),
         EgressPolicy::loopback(),
+        None,
     )
     .await
     .unwrap();

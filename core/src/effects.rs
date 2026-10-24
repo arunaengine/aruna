@@ -138,6 +138,15 @@ pub enum BlobEffect {
         /// its read stream deletes it when that stream ends or is dropped.
         transient: bool,
     },
+    /// Spools `blob` to an unnamed local temporary file and answers its hashes with a stream
+    /// of `range` (all of it by default); the file is gone once that stream ends or drops.
+    SpoolLocal {
+        /// The exact length: a longer or shorter stream fails the spool.
+        size: u64,
+        deadline: Option<Instant>,
+        range: Option<Range<u64>>,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
     ReadHiddenRange {
         location: BackendLocation,
         range: Range<u64>,

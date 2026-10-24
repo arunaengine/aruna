@@ -89,10 +89,15 @@ async fn setup_context() -> TestContext {
     backends.insert("cold".to_string(), Arc::new(cold));
     let registry = BackendRegistry::new(backends, BackendRef::DEFAULT_NODE_NAME.into()).unwrap();
     let policy = EgressPolicy::loopback();
-    let blob_handle =
-        BlobHandler::with_registry(registry, storage_handle.clone(), net_handle.clone(), policy)
-            .await
-            .unwrap();
+    let blob_handle = BlobHandler::with_registry(
+        registry,
+        storage_handle.clone(),
+        net_handle.clone(),
+        policy,
+        None,
+    )
+    .await
+    .unwrap();
     let driver = DriverContext {
         storage_handle,
         net_handle: Some(net_handle),

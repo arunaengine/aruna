@@ -108,11 +108,11 @@ pub enum BlobError {
     /// The backend key would be longer than group storages accept.
     #[error("The path is too long for this storage: keys are at most 1024 bytes")]
     KeyTooLong,
-    /// Transient spools together would hold more than their disk budget; a retry may fit.
-    #[error("Transient spools would exceed their {limit} byte budget")]
+    /// Local spools together would exceed their disk budget or file count; a retry may fit.
+    #[error("Local spools would exceed their {limit} byte budget or their file count")]
     SpoolBudgetExhausted { limit: u64 },
-    /// One transient spool would need more than the whole spool budget; no retry can fit it.
-    #[error("A transient spool cannot hold more than {limit} bytes")]
+    /// One local spool would need more than the whole spool budget; no retry can fit it.
+    #[error("A local spool cannot hold more than {limit} bytes")]
     SpoolTooLarge { limit: u64 },
 }
 

@@ -63,6 +63,8 @@ pub struct Settings {
     pub metadata_search_storage: MetadataSearchStorage,
     pub fjall_persist_policy: FjallPersistPolicy,
     pub sync_storage_path: PathBuf,
+    /// Writable disk directory of unnamed temporary spool files.
+    pub spool_path: PathBuf,
     pub blob_root: String,
     pub blob_backends: NodeBackendsConfig,
     pub blob_bucket_prefix: Option<String>,
@@ -141,6 +143,10 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{storage_path}/document-sync")));
     let document_sync_runtime = load_sync_config(env)?;
+    let spool_path = env
+        .var("SPOOL_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{storage_path}/spool")));
     let blob_root = env
         .var("BLOB_ROOT")
         .unwrap_or_else(|| format!("{storage_path}/blobstore"));
@@ -304,6 +310,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         metadata_search_storage,
         fjall_persist_policy,
         sync_storage_path,
+        spool_path,
         blob_root,
         blob_backends,
         blob_bucket_prefix,
