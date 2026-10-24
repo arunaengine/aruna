@@ -10,7 +10,7 @@ use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use crate::blob::records::blob_location_read;
-use crate::connectors::resolver::NATIVE_RELATIONSHIP_ID;
+use crate::connectors::resolver::{NATIVE_RELATIONSHIP_ID, NATIVE_SET_ID};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{RecordReadError, parse_read};
@@ -48,7 +48,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
 };
-use aruna_core::structs::storage::distribution::OriginalEpoch;
+use aruna_core::structs::storage::distribution::{OriginalEpoch, Publication};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::{
@@ -252,6 +252,8 @@ struct SyncTransferContext {
     origin: Option<SyncOrigin>,
     upstream_sources: Vec<ArunaArn>,
     writer_auth_context: Option<AuthContext>,
+    /// A coordinator's publication to one member of a distributed bucket.
+    distribution: Option<Publication>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -757,6 +759,7 @@ impl ReplicateScopeOperation {
             })),
             upstream_sources,
             writer_auth_context,
+            distribution: None,
         });
         self
     }
@@ -785,6 +788,28 @@ impl ReplicateScopeOperation {
             origin: None,
             upstream_sources: Vec::new(),
             writer_auth_context: Some(writer_auth_context),
+            distribution: None,
+        });
+        self
+    }
+
+    /// Publishes the source version to one member of a distributed bucket under the same
+    /// bucket name and key: bytes only for a `copy` replica, its record otherwise, delete
+    /// markers always, and references with their own source.
+    pub(crate) fn with_distribution(mut self, publication: Publication, local: NodeId) -> Self {
+        self.input.replicate_delete_markers = true;
+        self.sync = Some(SyncTransferContext {
+            target_bucket: self.input.bucket.clone(),
+            source_prefix: None,
+            target_prefix: None,
+            source_node_id: local,
+            relationship_id: Ulid::nil(),
+            reference_intent: !publication.bytes,
+            reference_handling: ReferenceHandling::Preserve,
+            origin: None,
+            upstream_sources: Vec::new(),
+            writer_auth_context: None,
+            distribution: Some(publication),
         });
         self
     }
@@ -1965,6 +1990,7 @@ impl ReplicateObjectOperation {
             ReplicationVersion::Reference {
                 created_at,
                 created_by,
+                source,
                 cached_metadata,
                 metadata,
                 ..
@@ -1976,12 +2002,20 @@ impl ReplicateObjectOperation {
                     .sync
                     .as_ref()
                     .ok_or(ReplicateObjectError::UnresolvedReferenceVersion)?;
+                // Members of a set read the source themselves; connector ids are node-local.
+                let source = match sync.distribution {
+                    Some(_) => VersionSourceBinding {
+                        connector_id: None,
+                        ..source
+                    },
+                    None => self.reference_binding(sync),
+                };
                 Ok(ManifestVersionParts {
                     kind: ReplicationItemKind::Materialized,
                     created_at,
                     created_by,
                     blob: None,
-                    source: Some(self.reference_binding(sync)),
+                    source: Some(source),
                     reference: Some(cached_metadata),
                     metadata,
                 })
@@ -2090,6 +2124,10 @@ impl ReplicateObjectOperation {
             original_epoch: self.version_epoch,
             version_generation: self.version_generation,
             logical_identity: self.version_identity,
+            distribution: self
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.distribution.clone()),
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -2109,14 +2147,20 @@ impl ReplicateObjectOperation {
         Ok(())
     }
 
+    /// Names the copy a record-only target reads later: the sync relationship, or in a
+    /// distributed bucket the set whose holders keep the bytes.
     fn reference_binding(&self, sync: &SyncTransferContext) -> VersionSourceBinding {
+        let config = match &sync.distribution {
+            Some(publication) => (NATIVE_SET_ID, publication.set_id),
+            None => (NATIVE_RELATIONSHIP_ID, sync.relationship_id),
+        };
         VersionSourceBinding {
             strategy: StagingStrategy::Reference,
             descriptor: PortableSourceDescriptor {
                 kind: SourceConnectorKind::ArunaNative,
                 public_config: std::collections::HashMap::from([(
-                    NATIVE_RELATIONSHIP_ID.to_string(),
-                    sync.relationship_id.to_string(),
+                    config.0.to_string(),
+                    config.1.to_string(),
                 )]),
                 source_path: format!("{}/{}", self.request.bucket, self.request.key),
                 version_selector: Some(format!("version:{}", self.request.version_id)),
@@ -3402,6 +3446,7 @@ mod tests {
             origin: None,
             upstream_sources: Vec::new(),
             writer_auth_context: None,
+            distribution: None,
         }
     }
 
@@ -4359,6 +4404,69 @@ mod tests {
         assert_eq!(
             manifest.source.expect("reference binding").descriptor.kind,
             SourceConnectorKind::ArunaNative
+        );
+    }
+
+    #[test]
+    fn publication_keeps_source() {
+        // Members of a set read the external source themselves, never through the coordinator.
+        let version_id = Ulid::generate();
+        let publication = Publication {
+            set_id: Ulid::from_bytes([4; 16]),
+            range_id: Ulid::from_bytes([5; 16]),
+            revision: 3,
+            epoch: aruna_core::structs::storage::distribution::PublicationEpoch(2),
+            member_id: Ulid::from_bytes([6; 16]),
+            incarnation: 7,
+            bytes: false,
+        };
+        let mut sync = reference_sync();
+        sync.distribution = Some(publication.clone());
+        let mut op =
+            ReplicateObjectOperation::new(request_with_mode(version_id, ReplicationMode::Live))
+                .with_sync(sync);
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
+        }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![2u8].into(),
+            value: None,
+        }));
+        let manifest = op.manifest.expect("manifest built");
+        assert_eq!(manifest.distribution, Some(publication));
+        let source = manifest.source.expect("reference binding");
+        let mut expected = reference_source_binding();
+        expected.connector_id = None;
+        assert_eq!(source, expected);
+    }
+
+    #[test]
+    fn records_name_set() {
+        // A record-only member learns which set's holders keep the bytes it may fetch later.
+        let set_id = Ulid::from_bytes([4; 16]);
+        let mut sync = reference_sync();
+        sync.distribution = Some(Publication {
+            set_id,
+            range_id: Ulid::from_bytes([5; 16]),
+            revision: 3,
+            epoch: aruna_core::structs::storage::distribution::PublicationEpoch(2),
+            member_id: Ulid::from_bytes([6; 16]),
+            incarnation: 7,
+            bytes: false,
+        });
+        let op = ReplicateObjectOperation::new(version_request(Ulid::generate())).with_sync(sync);
+        let binding = op.reference_binding(op.sync.as_ref().unwrap());
+        assert_eq!(
+            binding.descriptor.public_config.get(NATIVE_SET_ID),
+            Some(&set_id.to_string())
+        );
+        assert!(
+            !binding
+                .descriptor
+                .public_config
+                .contains_key(NATIVE_RELATIONSHIP_ID)
         );
     }
 

@@ -399,6 +399,7 @@ pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationMani
         original_epoch: Default::default(),
         version_generation: 0,
         logical_identity: None,
+        distribution: None,
     }
 }
 

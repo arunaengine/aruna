@@ -39,6 +39,7 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
+use super::members::{MemberTarget, bound_record, member_publication};
 use super::parking::{PARKED_DUE, park_job};
 use super::plaintext::{consent_delete, consent_write, job_consent, plaintext_allowed};
 use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
@@ -76,6 +77,8 @@ pub struct BlobJobRecord {
     pub upstream_sources: Vec<ArunaArn>,
     pub writer_auth_context: Option<AuthContext>,
     pub reference_advance: Option<ReferenceAdvance>,
+    /// A coordinator's publication to one member of a distributed bucket.
+    pub distribution: Option<MemberTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +118,7 @@ struct BlobJobIdentity<'a> {
     relationship_id: Option<Ulid>,
     origin: Option<&'a SyncOrigin>,
     upstream_sources: &'a [ArunaArn],
+    member: Option<&'a MemberTarget>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +207,7 @@ impl BlobJobRecord {
             upstream_sources: Vec::new(),
             writer_auth_context,
             reference_advance: None,
+            distribution: None,
         }
     }
 
@@ -235,6 +240,11 @@ impl BlobJobRecord {
 
     pub fn with_reference_advance(mut self, advance: ReferenceAdvance) -> Self {
         self.reference_advance = Some(advance);
+        self
+    }
+
+    pub fn with_member(mut self, target: MemberTarget) -> Self {
+        self.distribution = Some(target);
         self
     }
 
@@ -318,6 +328,7 @@ pub fn blob_job_key(record: &BlobJobRecord) -> Result<Key, ConversionError> {
         relationship_id: record.relationship_id,
         origin: record.origin.as_ref(),
         upstream_sources: &record.upstream_sources,
+        member: record.distribution.as_ref(),
     };
     let mut key = b"v1".to_vec();
     key.extend(postcard::to_allocvec(&identity)?);
@@ -1480,6 +1491,9 @@ async fn process_blob_job(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
+    if let Some(target) = job.distribution.as_ref() {
+        return publish_member(context, job, target, operation, relationships).await;
+    }
     let mut watch_group_id = None;
     let relationship = if let Some(relationship_id) = job.relationship_id {
         let Some(relationship) = stored_relationship else {
@@ -1606,6 +1620,37 @@ async fn process_blob_job(
         relationships,
     )
     .await
+}
+
+/// Sends a distributed bucket's version to one member under the publication this node's
+/// record gives now. A job whose publication ended is done: the current coordinator owes it.
+async fn publish_member(
+    context: &DriverContext,
+    job: &BlobJobRecord,
+    target: &MemberTarget,
+    operation: ReplicateScopeOperation,
+    relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
+) -> Result<BlobJobOutcome, String> {
+    let ReplicateScopeTarget::Version { key, .. } = &job.input.target else {
+        return Ok(BlobJobOutcome::TerminalFailure);
+    };
+    let Some(local) = context.net_handle.as_ref().map(|net| net.node_id()) else {
+        return Err("source node identity unavailable".to_string());
+    };
+    let publication = bound_record(context, &job.input.bucket)
+        .await?
+        .and_then(|(binding, snapshot)| member_publication(&binding, &snapshot, key, target))
+        .filter(|(_, node_id)| *node_id == job.input.target_node_id);
+    let Some((publication, _)) = publication else {
+        info!(
+            bucket = %job.input.bucket,
+            member_id = %target.member_id,
+            "Dropping a publication this node no longer owes"
+        );
+        return Ok(BlobJobOutcome::Succeeded);
+    };
+    let operation = operation.with_distribution(publication, local);
+    finish_blob_job(context, job, operation, None, None, relationships).await
 }
 
 async fn finish_blob_job(
@@ -2704,6 +2749,7 @@ async fn reschedule_blob_job(
         upstream_sources: job.upstream_sources.clone(),
         writer_auth_context: job.writer_auth_context.clone(),
         reference_advance: job.reference_advance,
+        distribution: job.distribution.clone(),
     };
     match storage
         .send_storage_effect(StorageEffect::Write {
@@ -3608,6 +3654,7 @@ mod tests {
             upstream_sources: Vec::new(),
             writer_auth_context: Some(auth_context()),
             reference_advance: None,
+            distribution: None,
         };
         let (key_space, key, value) = blob_job_entry(&future_job).unwrap();
         match storage

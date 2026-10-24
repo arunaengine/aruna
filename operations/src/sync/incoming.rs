@@ -1463,6 +1463,7 @@ mod tests {
             original_epoch: Default::default(),
             version_generation: 0,
             logical_identity: None,
+            distribution: None,
         };
 
         assert_eq!(
@@ -1962,6 +1963,7 @@ mod tests {
             original_epoch: Default::default(),
             version_generation: 0,
             logical_identity: None,
+            distribution: None,
         });
         let summary = VersionReplicationMessage::LocationSummaryRequest(LocationSummaryRequest {
             realm_id: RealmId::from_bytes([8u8; 32]),

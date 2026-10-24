@@ -7,6 +7,7 @@ pub(crate) mod dht_registration;
 mod error;
 pub mod incoming;
 pub mod locations;
+pub mod members;
 pub mod parking;
 pub mod plaintext;
 pub mod protocol;

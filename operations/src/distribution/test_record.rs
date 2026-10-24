@@ -25,6 +25,11 @@ pub(crate) fn member(seed: u8) -> Ulid {
 /// Two shards split at "m"; member 1 coordinates the lower one. Both admitted with
 /// incarnation 5; `active` decides whether the set was activated.
 pub(crate) fn record(active: bool) -> (DistributionSnapshot, Vec<u8>) {
+    replicated(active, 0)
+}
+
+/// The two shards of [`record`], each with `replicas` copies on the other member.
+pub(crate) fn replicated(active: bool, replicas: usize) -> (DistributionSnapshot, Vec<u8>) {
     let root = SetRoot {
         publisher: secret(1).public(),
         owner_group: Ulid::from_bytes([90; 16]),
@@ -34,7 +39,7 @@ pub(crate) fn record(active: bool) -> (DistributionSnapshot, Vec<u8>) {
         (member(1), secret(1).public()),
         (member(2), secret(2).public()),
     ];
-    let layout = shard_layout(root.set_id(), &nodes, &["m".to_string()], 0).unwrap();
+    let layout = shard_layout(root.set_id(), &nodes, &["m".to_string()], replicas).unwrap();
     let create = DistributionRequest::Create {
         root: root.clone(),
         config: DistributionConfig {

@@ -13,7 +13,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{MAX_REF_INPUT, PlacementPolicyRef, PlacementSubject};
 use aruna_core::structs::storage::blob::{BackendLocation, CopyOrigin};
-use aruna_core::structs::storage::distribution::OriginalEpoch;
+use aruna_core::structs::storage::distribution::{OriginalEpoch, Publication};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
 };
@@ -77,6 +77,9 @@ pub struct VersionReplicationManifest {
     pub version_generation: u64,
     /// The logical identity the set fixed for the version, whatever form its bytes take.
     pub logical_identity: Option<[u8; 32]>,
+    /// A coordinator's publication to a member of a distributed bucket; the member admits it
+    /// against its own record instead of a relationship or a writer's permissions.
+    pub distribution: Option<Publication>,
 }
 
 impl VersionReplicationManifest {
@@ -191,6 +194,18 @@ impl VersionReplicationManifest {
         {
             return Err(ConversionError::FromStrError(
                 "replication manifest reference advance is invalid".to_string(),
+            ));
+        }
+
+        // A publication carries the coordinator's own version: no hop, advance or upstream.
+        if let Some(publication) = &self.distribution
+            && (self.origin.is_some()
+                || self.reference_advance.is_some()
+                || !self.upstream_sources.is_empty()
+                || (!publication.bytes && self.blob.is_some()))
+        {
+            return Err(ConversionError::FromStrError(
+                "replication manifest publication is invalid".to_string(),
             ));
         }
 
@@ -713,6 +728,7 @@ mod pure_tests {
             original_epoch: Default::default(),
             version_generation: 0,
             logical_identity: None,
+            distribution: None,
         }
     }
 
