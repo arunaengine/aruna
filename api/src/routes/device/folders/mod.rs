@@ -281,9 +281,14 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
 **Behavior**
 - The device-local bucket is derived from the folder id, so the owner never names it and it cannot
   collide with a bucket they already use.
-- `create_bucket` creates a missing remote bucket through the node plane before the listing probe.
-- The directory is walked once and every file becomes one read-only object of that bucket; no byte
-  is copied into this node's blob store.
+- `create_bucket` creates a missing remote bucket through the node plane. Without it, a listing
+  probe checks that the remote bucket exists and the owner may read it.
+- Once the remote bucket is created, the bind completes even if the caller stops waiting, so the
+  bucket never stays behind without a folder.
+- The answer comes before the directory is walked. The first sync pass starts at once in the
+  background: every file becomes one read-only object of that bucket, and no byte is copied into
+  this node's blob store. `GET /device/folders/{folder_id}` and `GET /device/transfers` show its
+  progress.
 - `two_way` syncs both directions; `upload_only` never writes to disk; `download_only` never
   publishes: local edits and deletions stay local, and `propagate_deletes` is always false.
 - Local data always wins locally: a file is replaced automatically only while its fingerprint and
@@ -294,7 +299,9 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
   `propagate_deletes` is set.
 
 **Limits**
-- A device binds at most 64 folders, and a folder holds at most 100000 files.
+- A device binds at most 64 folders.
+- A folder holds at most 100000 files. A larger folder is bound, but its sync passes stop with this
+  limit in `last_error`.
 - Roots must not nest."#,
     request_body(
         content = BindFolderRequest,
@@ -311,7 +318,7 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
         })
     ),
     responses(
-        (status = 201, description = "The folder is bound and its first observation is registered", body = SyncedFolderView,
+        (status = 201, description = "The folder is bound and its first sync pass runs in the background", body = SyncedFolderView,
             example = json!({
                 "folder_id": "01JFOLDER0123456789ABCDEFG",
                 "root": "/home/ada/data",
@@ -326,15 +333,14 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
                 "propagate_deletes": true,
                 "state": "active",
                 "counters": {
-                    "observed": 131,
-                    "in_sync": 128,
-                    "uploading": 2,
-                    "conflicts": 1,
+                    "observed": 0,
+                    "in_sync": 0,
+                    "uploading": 0,
+                    "conflicts": 0,
                     "pending_replacements": 0,
                     "remote_deleted": 0,
                     "errors": 0
                 },
-                "last_reconcile_ms": 1775748191000_i64,
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "Malformed ids, an unusable directory, a non-realm target, or a missing remote bucket", body = ErrorResponse),
