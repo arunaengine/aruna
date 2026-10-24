@@ -169,6 +169,9 @@ impl DocumentSyncService {
             )
             .await?;
         }
+        // Every pass, with or without new events, gives parked snapshots another chance:
+        // a local membership change never passes through the replicated apply path.
+        super::retry_parked(&self.storage, self.realm_id).await?;
         Ok(DocumentReconcileResult {
             targets: applied_targets,
             metadata_create_events,

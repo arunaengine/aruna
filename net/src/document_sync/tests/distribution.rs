@@ -535,3 +535,66 @@ async fn parked_forks_conflict() {
     assert_eq!(view.head.snapshot, admitted);
     assert!(view.conflicted());
 }
+
+#[tokio::test]
+async fn local_membership_retries() {
+    // A local membership change is no replicated apply, yet the next pass installs the
+    // parked snapshot even without new events.
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    const LOCAL: u8 = 45;
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(LOCAL).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm(),
+    )
+    .expect("document sync service opens");
+    let target = DocumentTarget::RealmConfig { realm_id: realm() };
+    let topic_id = target.sync_topic_id(realm(), &PlacementRef::NIL);
+    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    config.ensure_node(node(LOCAL), RealmNodeKind::Management);
+    let write_config = |config: &RealmConfigDocument| {
+        target_write_entry(
+            target.clone(),
+            config.to_bytes(&actor(LOCAL)).unwrap().into(),
+        )
+    };
+    batch_write_to(&storage, vec![write_config(&config)])
+        .await
+        .unwrap();
+    let snapshot = published(PUBLISHER, created(), PUBLISHER);
+    let signature = secret(PUBLISHER).sign(&snapshot.signing_bytes(&PlacementRef::NIL).unwrap());
+    let published = service
+        .publish_documents(
+            vec![DocumentSyncPublish::AdminOperation {
+                target: target.clone(),
+                event: Box::new(snapshot),
+                placement: PlacementRef::NIL,
+                allow_genesis: true,
+                origin_signature: Some(signature),
+            }],
+            Vec::new(),
+        )
+        .await;
+    assert!(matches!(
+        published,
+        DocumentNetEvent::DocumentsPublished { .. }
+    ));
+    reset_test_cursor(&service, topic_id).await;
+    service.reconcile_document_topics([topic_id]).await.unwrap();
+    assert_eq!(parked(&storage).await, Some(1));
+
+    config.ensure_node(node(PUBLISHER), RealmNodeKind::Server);
+    batch_write_to(&storage, vec![write_config(&config)])
+        .await
+        .unwrap();
+    service.reconcile_document_topics([topic_id]).await.unwrap();
+    assert_eq!(parked(&storage).await, None);
+    assert_eq!(stored(&storage).await.unwrap().head.snapshot, created());
+    service.shutdown().await;
+}
