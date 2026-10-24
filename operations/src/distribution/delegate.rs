@@ -11,7 +11,7 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::storage::distribution::delegation::{
-    Delegation, DelegationError, MAX_VALID_SECS, SignedDelegation,
+    BodyTrailer, Delegation, DelegationError, MAX_VALID_SECS, Payload, SignedDelegation,
 };
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::types::GroupId;
@@ -61,6 +61,7 @@ pub struct DelegationInput {
     pub key: String,
     pub copy_source: Option<String>,
     pub request_digest: [u8; 32],
+    pub payload: Payload,
 }
 
 /// Signs a delegation for one request with this node's key; `now` is Unix seconds.
@@ -89,6 +90,7 @@ pub fn issue_delegation(
         key: input.key,
         copy_source: input.copy_source,
         request_digest: input.request_digest,
+        payload: input.payload,
         nonce: rand::random(),
         issued_at: now,
         valid_secs: DELEGATION_SECS,
@@ -100,6 +102,16 @@ pub fn issue_delegation(
         signature: net.sign(&bytes),
         delegation,
     })
+}
+
+/// Signs the trailer of a framed body this node forwards under the delegation with `nonce`.
+pub fn sign_body(
+    context: &DriverContext,
+    nonce: &[u8; 16],
+    trailer: &BodyTrailer,
+) -> Option<iroh::Signature> {
+    let net = context.net_handle.as_ref()?;
+    Some(net.sign(&trailer.signing_bytes(nonce)))
 }
 
 /// Accepts a delegation for this node once: the issuer must be a configured realm

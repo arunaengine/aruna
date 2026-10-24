@@ -26,6 +26,32 @@ const SKEW_SECS: u64 = 30;
 const MAX_ENCODED: usize = 16 * 1024;
 const DOMAIN: &str = "aruna-distribution-delegation-v1";
 const DIGEST_DOMAIN: &[u8] = b"aruna-distribution-request-v1";
+const BODY_DOMAIN: &[u8] = b"aruna-distribution-body-v1";
+const TRAILER_DOMAIN: &str = "aruna-distribution-trailer-v1";
+/// Room for the client's checksum in a body trailer; base64 SHA-256 needs 44 bytes.
+const CHECKSUM_BYTES: usize = 64;
+/// Bytes the issuer appends to a framed body: length, digest, checksum and signature.
+pub const TRAILER_BYTES: usize = 8 + 32 + 1 + CHECKSUM_BYTES + 64;
+
+/// How a delegation binds the request body.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Payload {
+    /// The request has no body.
+    Empty,
+    /// The body streams and ends with a trailer the issuer signs over its length and digest.
+    Framed,
+    /// A small body known in advance, bound by its digest.
+    Digest([u8; 32]),
+}
+
+/// What the issuer signs at the end of a framed body; the target checks it before it commits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BodyTrailer {
+    pub length: u64,
+    pub digest: [u8; 32],
+    /// The client's verified trailing checksum value, if the client sent one.
+    pub checksum: Option<String>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Delegation {
@@ -49,6 +75,7 @@ pub struct Delegation {
     pub key: String,
     pub copy_source: Option<String>,
     pub request_digest: [u8; 32],
+    pub payload: Payload,
     pub nonce: [u8; 16],
     /// Unix seconds at which the issuer signed.
     pub issued_at: u64,
@@ -135,6 +162,69 @@ impl SignedDelegation {
     }
 }
 
+/// The digest a body is bound by, framed or known in advance.
+pub fn body_hasher() -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BODY_DOMAIN);
+    hasher
+}
+
+pub fn body_digest(body: &[u8]) -> [u8; 32] {
+    *body_hasher().update(body).finalize().as_bytes()
+}
+
+impl BodyTrailer {
+    /// The bytes the issuer signs, bound to one delegation by its nonce.
+    pub fn signing_bytes(&self, nonce: &[u8; 16]) -> Vec<u8> {
+        postcard::to_allocvec(&(
+            TRAILER_DOMAIN,
+            nonce,
+            self.length,
+            self.digest,
+            &self.checksum,
+        ))
+        .unwrap_or_default()
+    }
+
+    pub fn encode(
+        &self,
+        signature: &iroh::Signature,
+    ) -> Result<[u8; TRAILER_BYTES], DelegationError> {
+        let checksum = self.checksum.as_deref().unwrap_or_default().as_bytes();
+        if checksum.len() > CHECKSUM_BYTES {
+            return Err(DelegationError::Encoding);
+        }
+        let mut bytes = [0; TRAILER_BYTES];
+        bytes[..8].copy_from_slice(&self.length.to_be_bytes());
+        bytes[8..40].copy_from_slice(&self.digest);
+        bytes[40] = checksum.len() as u8;
+        bytes[41..41 + checksum.len()].copy_from_slice(checksum);
+        bytes[41 + CHECKSUM_BYTES..].copy_from_slice(&signature.to_bytes());
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<(Self, iroh::Signature)> {
+        let bytes: &[u8; TRAILER_BYTES] = bytes.try_into().ok()?;
+        let length = u64::from_be_bytes(bytes[..8].try_into().ok()?);
+        let digest = bytes[8..40].try_into().ok()?;
+        let size = usize::from(bytes[40]);
+        let checksum = bytes
+            .get(41..41 + size)
+            .filter(|_| size <= CHECKSUM_BYTES)?;
+        let checksum = match size {
+            0 => None,
+            _ => Some(String::from_utf8(checksum.to_vec()).ok()?),
+        };
+        let signature: [u8; 64] = bytes[41 + CHECKSUM_BYTES..].try_into().ok()?;
+        let trailer = Self {
+            length,
+            digest,
+            checksum,
+        };
+        Some((trailer, iroh::Signature::from_bytes(&signature)))
+    }
+}
+
 /// Binds a delegation to one request: method, bucket, key, query and the headers that
 /// describe its body, given as lowercase name and value pairs in any order.
 pub fn request_digest(
@@ -179,6 +269,7 @@ mod tests {
             key: "a/b".to_string(),
             copy_source: None,
             request_digest: request_digest("PUT", "spire", "a/b", None, &[]),
+            payload: Payload::Framed,
             nonce: [7; 16],
             issued_at: 100,
             valid_secs: 10,
@@ -248,5 +339,24 @@ mod tests {
             base,
             request_digest("DELETE", "b", "k", None, &[("content-length", "3")])
         );
+    }
+
+    #[test]
+    fn trailers_round_trip() {
+        let trailer = BodyTrailer {
+            length: 3,
+            digest: body_digest(b"abc"),
+            checksum: Some("NSRBwg==".to_string()),
+        };
+        let signature = secret(1).sign(&trailer.signing_bytes(&[7; 16]));
+        let bytes = trailer.encode(&signature).unwrap();
+        let (decoded, read) = BodyTrailer::decode(&bytes).unwrap();
+        assert_eq!(decoded, trailer);
+        let bytes = decoded.signing_bytes(&[7; 16]);
+        assert!(secret(1).public().verify(&bytes, &read).is_ok());
+        // Another delegation's nonce does not verify the same trailer.
+        let other = decoded.signing_bytes(&[8; 16]);
+        assert!(secret(1).public().verify(&other, &read).is_err());
+        assert!(BodyTrailer::decode(&bytes[..3]).is_none());
     }
 }

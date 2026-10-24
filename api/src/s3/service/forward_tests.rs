@@ -92,3 +92,30 @@ fn unreachable_names_range() {
     assert!(message.contains("degraded"));
     assert!(message.contains(&forward().range_id.to_string()));
 }
+
+#[test]
+fn semantic_headers_bound() {
+    let sent = headers(&[("content-length", "7"), ("x-amz-meta-origin", "lab")]);
+    let issued = forwarded_digest(&Method::PUT, "spire", "a/b", None, &sent);
+    for (name, value) in [
+        ("x-amz-meta-origin", "other"),
+        ("if-match", "\"abc\""),
+        ("cache-control", "no-store"),
+        ("x-amz-checksum-crc32", "AAAAAA=="),
+    ] {
+        let mut changed = sent.clone();
+        changed.insert(
+            http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            http::HeaderValue::from_str(value).unwrap(),
+        );
+        let digest = forwarded_digest(&Method::PUT, "spire", "a/b", None, &changed);
+        assert_ne!(digest, issued, "{name} must be bound");
+    }
+    // Headers without request semantics may differ in transit.
+    let mut transit = sent.clone();
+    transit.insert("user-agent", http::HeaderValue::from_static("proxy"));
+    assert_eq!(
+        forwarded_digest(&Method::PUT, "spire", "a/b", None, &transit),
+        issued
+    );
+}

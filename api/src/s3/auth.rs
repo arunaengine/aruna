@@ -17,7 +17,9 @@ use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX
 use aruna_core::structs::storage::blob::{
     BucketInfo, UserAccess, bucket_permission_path, group_permission_path, object_permission_path,
 };
-use aruna_core::structs::storage::distribution::delegation::{DELEGATION_HEADER, SignedDelegation};
+use aruna_core::structs::storage::distribution::delegation::{
+    DELEGATION_HEADER, Payload, SignedDelegation,
+};
 use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::auth::bearer_token::realm_user_cutoff;
@@ -82,9 +84,23 @@ impl Display for Action {
     }
 }
 
-/// Marks a request that arrived with a delegation; it is never forwarded again.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct DelegatedRequest;
+/// Marks a request that arrived with a delegation; it is never forwarded again, and its body
+/// is checked against the binding the issuer signed.
+#[derive(Clone, Debug)]
+pub(crate) struct DelegatedRequest {
+    pub issuer: NodeId,
+    pub nonce: [u8; 16],
+    pub payload: Payload,
+}
+
+/// The body binding each forwarded operation must carry.
+fn payload_fits(operation: &str, payload: &Payload) -> bool {
+    match operation {
+        "PutObject" | "UploadPart" => matches!(payload, Payload::Framed),
+        "CompleteMultipartUpload" => matches!(payload, Payload::Digest(_)),
+        _ => matches!(payload, Payload::Empty),
+    }
+}
 
 /// The S3 operations a member forwards to a range's coordinator.
 const DELEGATED_OPERATIONS: &[&str] = &[
@@ -684,6 +700,7 @@ impl AuthProvider {
             || delegation.bucket != bucket
             || delegation.key != key
             || delegation.request_digest != digest
+            || !payload_fits(operation, &delegation.payload)
         {
             return Err(denied("the delegation names another request"));
         }
@@ -728,7 +745,11 @@ impl AuthProvider {
         .map_err(map_authorize_error)?;
         cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(bucket_info);
-        cx.extensions_mut().insert(DelegatedRequest);
+        cx.extensions_mut().insert(DelegatedRequest {
+            issuer: delegation.issuer,
+            nonce: delegation.nonce,
+            payload: delegation.payload.clone(),
+        });
         cx.extensions_mut().insert(UserAccess {
             access_key: delegation.credential_id,
             user_identity: delegation.user_id,
@@ -1033,6 +1054,19 @@ impl AuthProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payloads_fit_operations() {
+        assert!(payload_fits("PutObject", &Payload::Framed));
+        assert!(!payload_fits("PutObject", &Payload::Empty));
+        assert!(payload_fits(
+            "CompleteMultipartUpload",
+            &Payload::Digest([1; 32])
+        ));
+        assert!(!payload_fits("CompleteMultipartUpload", &Payload::Framed));
+        assert!(payload_fits("DeleteObject", &Payload::Empty));
+        assert!(!payload_fits("DeleteObject", &Payload::Framed));
+    }
     use aruna_storage::FjallStorage;
 
     fn provider(path: &str) -> AuthProvider {

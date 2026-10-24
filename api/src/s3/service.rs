@@ -11,8 +11,12 @@ mod encryption;
 mod forward;
 mod forward_parts;
 mod listing;
+mod payload;
 
 pub(crate) use forward::forwarded_digest;
+
+use crate::s3::auth::DelegatedRequest;
+use aruna_core::structs::storage::distribution::delegation::{Payload, body_digest};
 mod multipart;
 mod object;
 mod response;
@@ -915,10 +919,26 @@ impl S3 for ArunaS3Service {
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: forward::passed_headers(&req.headers, req.input.content_length),
-                body: req.input.body.take(),
+                body: match req.input.body.take() {
+                    Some(body) => forward::ForwardBody::Stream(body),
+                    None => forward::ForwardBody::Empty,
+                },
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return Ok(Self::forwarded_put(&response));
+        }
+        // A forwarded body must end with the issuer's signed trailer.
+        if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
+            let check = payload::BodyCheck {
+                issuer: delegated.issuer,
+                nonce: delegated.nonce,
+            };
+            req.input.body = req
+                .input
+                .body
+                .take()
+                .map(|body| payload::unframe_body(body, check));
+            req.input.content_length = payload::unframed_length(req.input.content_length)?;
         }
         let metadata = object_metadata(
             req.input.metadata.clone().unwrap_or_default(),
@@ -1155,7 +1175,7 @@ impl S3 for ArunaS3Service {
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: forward::passed_headers(&req.headers, None),
-                body: None,
+                body: forward::ForwardBody::Empty,
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return Self::forwarded_create(response, req.input.bucket, req.input.key).await;
@@ -1260,10 +1280,25 @@ impl S3 for ArunaS3Service {
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: forward::passed_headers(&req.headers, req.input.content_length),
-                body,
+                body: match body {
+                    Some(body) => forward::ForwardBody::Stream(body),
+                    None => forward::ForwardBody::Empty,
+                },
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return Ok(Self::forwarded_part(&response));
+        }
+        if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
+            let check = payload::BodyCheck {
+                issuer: delegated.issuer,
+                nonce: delegated.nonce,
+            };
+            req.input.body = req
+                .input
+                .body
+                .take()
+                .map(|body| payload::unframe_body(body, check));
+            req.input.content_length = payload::unframed_length(req.input.content_length)?;
         }
         let body = req
             .input
@@ -1445,10 +1480,19 @@ impl S3 for ArunaS3Service {
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers,
-                body: Some(StreamingBlob::from(bytes::Bytes::from(body))),
+                body: forward::ForwardBody::Known(bytes::Bytes::from(body)),
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return Self::forwarded_complete(response).await;
+        }
+        // A forwarded completion lists exactly the parts the issuer bound.
+        if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
+            let body = forward_parts::completion_body(req.input.multipart_upload.as_ref());
+            let bound = matches!(delegated.payload, Payload::Digest(digest)
+                if digest == body_digest(body.as_bytes()));
+            if !bound {
+                return Err(s3_error!(AccessDenied, "Delegation refused: other parts"));
+            }
         }
         let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
         let checksum_request = parse_completion_checksum(&req.headers)?;
@@ -1592,7 +1636,7 @@ impl S3 for ArunaS3Service {
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: Vec::new(),
-                body: None,
+                body: forward::ForwardBody::Empty,
             };
             self.forward_write(&user_access, &forward, request).await?;
             return Ok(S3Response::new(AbortMultipartUploadOutput::default()));
@@ -2152,7 +2196,7 @@ impl S3 for ArunaS3Service {
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: Vec::new(),
-                body: None,
+                body: forward::ForwardBody::Empty,
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return Ok(Self::forwarded_delete(&response));

@@ -10,9 +10,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::WriteRoute;
-use aruna_core::structs::storage::distribution::delegation::{DELEGATION_HEADER, request_digest};
+use aruna_core::structs::storage::distribution::delegation::{
+    DELEGATION_HEADER, Payload, TRAILER_BYTES, body_digest, request_digest,
+};
 use aruna_operations::distribution::delegate::{DelegationInput, issue_delegation, node_urls};
 use aruna_operations::distribution::guard::route_write;
+use bytes::Bytes;
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{DeleteObjectOutput, ETag, PutObjectOutput, StreamingBlob};
@@ -21,12 +24,13 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::ArunaS3Service;
+use super::payload::frame_body;
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Headers that describe the body; the delegation binds their values.
+/// Headers that describe the body.
 const DIGEST_HEADERS: &[&str] = &[
     "content-length",
     "content-md5",
@@ -83,7 +87,24 @@ pub(super) struct ForwardRequest {
     pub key: String,
     pub query: Option<String>,
     pub headers: Vec<(String, String)>,
-    pub body: Option<StreamingBlob>,
+    pub body: ForwardBody,
+}
+
+/// The body of a forwarded request and how its delegation binds it.
+pub(super) enum ForwardBody {
+    Empty,
+    /// Streams with a trailer the issuer signs over its length and digest.
+    Stream(StreamingBlob),
+    /// A small body known in advance, bound by its digest.
+    Known(Bytes),
+}
+
+/// Whether a header carries request semantics the delegation must bind.
+fn semantic(name: &str) -> bool {
+    DIGEST_HEADERS.contains(&name)
+        || PASSED_HEADERS.contains(&name)
+        || name.starts_with("x-amz-meta-")
+        || name.starts_with("x-amz-checksum-")
 }
 
 /// The digest of a forwarded request as its target sees it.
@@ -94,9 +115,14 @@ pub(crate) fn forwarded_digest(
     query: Option<&str>,
     headers: &HeaderMap,
 ) -> [u8; 32] {
-    let pairs: Vec<(&str, &str)> = DIGEST_HEADERS
+    // Every semantic header the target sees counts, so none can be added or changed.
+    let pairs: Vec<(&str, &str)> = headers
         .iter()
-        .filter_map(|name| Some((*name, headers.get(*name)?.to_str().ok()?)))
+        .filter(|(name, _)| semantic(name.as_str()))
+        .map(|(name, value)| {
+            let value = value.to_str().unwrap_or("\u{fffd}");
+            (name.as_str(), value)
+        })
         .collect();
     request_digest(method.as_str(), bucket, key, query, &pairs)
 }
@@ -235,8 +261,19 @@ impl ArunaS3Service {
         let Some(base) = urls.and_then(|urls| urls.s3) else {
             return Err(unreachable_error(forward));
         };
+        let (payload, extra) = match &request.body {
+            ForwardBody::Empty => (Payload::Empty, 0),
+            ForwardBody::Stream(_) => (Payload::Framed, TRAILER_BYTES as i64),
+            ForwardBody::Known(bytes) => (Payload::Digest(body_digest(bytes)), 0),
+        };
         let mut headers = HeaderMap::new();
         for (name, value) in &request.headers {
+            // A framed body is longer by its trailer.
+            let value = match (name.as_str(), value.parse::<i64>()) {
+                ("content-length", Ok(length)) => (length + extra).to_string(),
+                _ => value.clone(),
+            };
+            let value = &value;
             if let (Ok(name), Ok(value)) = (
                 http::HeaderName::from_bytes(name.as_bytes()),
                 http::HeaderValue::from_str(value),
@@ -266,10 +303,15 @@ impl ArunaS3Service {
             key: request.key.clone(),
             copy_source: None,
             request_digest: digest,
+            payload,
         };
-        let delegation = issue_delegation(self.state.as_ref(), input, unix_secs(SystemTime::now()))
-            .and_then(|signed| Ok(signed.encode()?))
-            .map_err(|error| s3_error!(InternalError, "Could not delegate the write: {error}"))?;
+        let refused = |error: &dyn std::fmt::Display| {
+            s3_error!(InternalError, "Could not delegate the write: {error}")
+        };
+        let signed = issue_delegation(self.state.as_ref(), input, unix_secs(SystemTime::now()))
+            .map_err(|error| refused(&error))?;
+        let delegation = signed.encode().map_err(|error| refused(&error))?;
+        let nonce = signed.delegation.nonce;
         let path = utf8_percent_encode(&request.key, KEY_SET);
         let mut url = format!("{}/{}/{path}", base.trim_end_matches('/'), request.bucket);
         if let Some(query) = query {
@@ -279,8 +321,13 @@ impl ArunaS3Service {
             .request(request.method.clone(), &url)
             .headers(headers)
             .header(DELEGATION_HEADER, delegation);
-        if let Some(body) = request.body {
-            outgoing = outgoing.body(reqwest::Body::wrap_stream(body));
+        match request.body {
+            ForwardBody::Empty => {}
+            ForwardBody::Stream(body) => {
+                let framed = frame_body(body, self.state.clone(), nonce);
+                outgoing = outgoing.body(reqwest::Body::wrap_stream(framed));
+            }
+            ForwardBody::Known(bytes) => outgoing = outgoing.body(bytes),
         }
         let response = match outgoing.send().await {
             Ok(response) => response,
