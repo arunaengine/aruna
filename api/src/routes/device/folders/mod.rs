@@ -271,9 +271,10 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
   collide with a bucket they already use.
 - `create_bucket` creates a missing remote bucket through the node plane. Without it, a listing
   probe checks that the remote bucket exists and the owner may read it.
-- The folder is recorded in state `binding` before the realm node is asked, so a retried or
-  concurrent call for the same root answers 409. It turns `active` once the realm node confirms the
-  bucket; a refusal removes it again.
+- The folder is recorded in state `binding` before the realm node is asked, so a retried call for
+  the same root answers 409. Of two concurrent calls only one is recorded; the other answers 409 or
+  a retryable 503. The folder turns `active` once the realm node confirms the bucket; a refusal
+  removes it again.
 - If the realm node does not answer, the call fails with 502 or 503 but the folder stays `binding`
   and the next folder pass finishes it, also after a restart, so a bucket the node created never
   stays behind without a folder. Unbinding the folder stops that.
@@ -341,7 +342,7 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 409, description = "The root overlaps a bound folder, also one still binding, or the bucket belongs to another group", body = ErrorResponse),
         (status = 502, description = "The remote realm node is unreachable", body = ErrorResponse),
-        (status = 503, description = "The device sync service or realm configuration is unavailable", body = ErrorResponse)
+        (status = 503, description = "The device sync service or realm configuration is unavailable, or the folder list changed while this bind was recorded; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
