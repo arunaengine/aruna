@@ -15,6 +15,7 @@ use aruna_core::structs::placement::policy::{
 };
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
+use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_operations::driver::{drive, gate_context, now_ms};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
@@ -1257,27 +1258,32 @@ pub async fn mint_object_placement(
         Ulid::from_string(&request.mutation_id).map_err(|_| ServerError::BadRequest)?;
     let expected_version_id =
         Ulid::from_string(&request.expected_version_id).map_err(|_| ServerError::BadRequest)?;
+    // A distributed bucket's successor id carries its set hint.
+    let hint = info.distribution.as_ref().map(|binding| binding.hint());
     let outcome = drive(
-        PolicyMutationOperation::new(PolicyMutationConfig {
-            context: aruna_operations::blob::records::HeadAliasContext::new(
-                auth.realm_id,
-                info.group_id,
-                state.get_node_id(),
-                bucket,
-                request.key,
-            ),
-            auth_context: auth,
-            mutation_id,
-            expected_head: CurrentVersionPointer::new_with_generation(
-                expected_version_id,
-                request.expected_generation,
-            ),
-            bucket_identity: info.identity(),
-            target_refs: refs_from(request.policies)?,
-            subject,
-            created_at: SystemTime::now(),
-            now_ms: now_ms(),
-        }),
+        PolicyMutationOperation::new_with_version(
+            PolicyMutationConfig {
+                context: aruna_operations::blob::records::HeadAliasContext::new(
+                    auth.realm_id,
+                    info.group_id,
+                    state.get_node_id(),
+                    bucket,
+                    request.key,
+                ),
+                auth_context: auth,
+                mutation_id,
+                expected_head: CurrentVersionPointer::new_with_generation(
+                    expected_version_id,
+                    request.expected_generation,
+                ),
+                bucket_identity: info.identity(),
+                target_refs: refs_from(request.policies)?,
+                subject,
+                created_at: SystemTime::now(),
+                now_ms: now_ms(),
+            },
+            mint_version(hint),
+        ),
         &state.get_ctx(),
     )
     .await

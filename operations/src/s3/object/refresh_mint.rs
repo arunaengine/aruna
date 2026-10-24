@@ -22,7 +22,6 @@ use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::connectors::repository::connector_reference_write;
 use crate::distribution::inventory::{AddedVersion, entry_of, stamp_generation, version_written};
@@ -32,6 +31,8 @@ use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::object::get::MAX_AUTO_ADVANCES;
 use crate::s3::object::metadata::ReferenceRefresh;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::hint::mint_version;
 
 /// One storage row a successor writes.
 type Row = (KeySpace, Key, Value);
@@ -166,7 +167,8 @@ impl MintSuccessorOperation {
         }
         let refresh = &self.refresh;
         let now = SystemTime::now();
-        let version_id = Ulid::generate();
+        let hint = bucket.distribution.as_ref().map(DistributionBinding::hint);
+        let version_id = mint_version(hint);
         let successor = BlobVersion::reference(
             source.clone(),
             self.observation.clone(),
@@ -325,6 +327,7 @@ mod tests {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use std::collections::HashMap;
+    use ulid::Ulid;
 
     fn observation(content_length: u64) -> SourceMetadata {
         SourceMetadata {

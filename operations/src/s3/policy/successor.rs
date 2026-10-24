@@ -39,6 +39,7 @@ use aruna_core::structs::storage::blob::{
     ManagedCopyKey, ManagedCopyRecord, VersionKey,
 };
 use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -388,6 +389,12 @@ impl SuccessorMint {
             return Err(SuccessorError::BucketChanged);
         };
         if bucket.identity() != self.plan.bucket_identity {
+            return Err(SuccessorError::BucketChanged);
+        }
+        // A successor in a distributed bucket must carry the set hint it was planned with.
+        if let Some(binding) = bucket.distribution.as_ref()
+            && SetHint::of_version(self.plan.successor_version_id) != binding.hint()
+        {
             return Err(SuccessorError::BucketChanged);
         }
         self.group_id = Some(bucket.group_id);
@@ -1441,6 +1448,27 @@ mod pure_tests {
                 drift(Some(recreated.to_bytes().unwrap()), advertised()),
                 None
             ),
+            Err(SuccessorError::BucketChanged)
+        );
+    }
+
+    #[test]
+    fn needs_set_hint() {
+        // A successor id planned without the set hint is refused in a distributed bucket.
+        let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Replace));
+        mint.start(None).expect("start builds");
+        mint.step(read(None), None).expect("mutation absent");
+        mint.step(read(Some(head().to_bytes().unwrap())), None)
+            .expect("head matches");
+        let mut bound = bucket();
+        bound.distribution = Some(super::DistributionBinding {
+            set_id: Ulid::from_bytes([5; 16]),
+            member_id: Ulid::from_bytes([6; 16]),
+            incarnation: 1,
+            revision: Default::default(),
+        });
+        assert_eq!(
+            mint.step(drift(Some(bound.to_bytes().unwrap()), advertised()), None),
             Err(SuccessorError::BucketChanged)
         );
     }
