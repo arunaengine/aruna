@@ -84,8 +84,22 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
         {
             checkpoint.current_path = Some(item.source_path.clone());
             checkpoint.phase = item_phase(spec);
-            match stage_item(ctx, spec, &item.source_path, &item.target_key, Vec::new()).await {
-                Ok(size) => {
+            // Another coordinator of a distributed bucket imports this key with its own job.
+            let elsewhere = match imported_elsewhere(ctx, spec, &item.target_key).await {
+                Ok(elsewhere) => elsewhere,
+                Err(ItemFailure::System(message)) => return retryable_error(message),
+                // A bucket that is gone or replaced fails the item below, as for any bucket.
+                Err(_) => false,
+            };
+            let staged = match elsewhere {
+                true => Ok(None),
+                false => stage_item(ctx, spec, &item.source_path, &item.target_key, Vec::new())
+                    .await
+                    .map(Some),
+            };
+            match staged {
+                Ok(None) => {}
+                Ok(Some(size)) => {
                     checkpoint.items_current = checkpoint.items_current.saturating_add(1);
                     checkpoint.items_succeeded = checkpoint.items_succeeded.saturating_add(1);
                     if spec.strategy == StagingStrategy::Snapshot {
@@ -265,6 +279,19 @@ async fn ensure_item_permission(
     let bucket_info = pinned_bucket(ctx, spec).await?;
     check_access(ctx, spec, source_path, target_key).await?;
     Ok(bucket_info)
+}
+
+/// Whether another coordinator of the distributed destination imports `key`.
+async fn imported_elsewhere(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    key: &str,
+) -> Result<bool, ItemFailure> {
+    let bucket = pinned_bucket(ctx, spec).await?;
+    let own = super::staging_walk::coordinated(ctx, &bucket, &[key])
+        .await
+        .map_err(ItemFailure::System)?;
+    Ok(own.first() == Some(&false))
 }
 
 /// The live destination bucket, only while it is still the one the job was submitted for.

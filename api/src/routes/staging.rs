@@ -10,8 +10,9 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::execution::jobs::{
     decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
 };
+use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::connectors::ApiConnectorKind;
-use crate::routes::storage::relay::{relay_json, rest_target};
+use crate::routes::storage::relay::{RestForward, relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
@@ -24,6 +25,7 @@ use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_operations::auth::permission_rules::permission_rules;
+use aruna_operations::distribution::guard::bound_view;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
@@ -218,7 +220,22 @@ pub struct StageBatchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[schema(as = SubmitStagingJobResponse)]
 pub struct SubmitStagingResponse {
+    /// This node's job, or the first coordinator's when this node coordinates no range of a
+    /// distributed bucket.
     pub job_id: String,
+    /// The jobs the other coordinators of a distributed bucket run for their own keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coordinator_jobs: Vec<CoordinatorJobResponse>,
+}
+
+/// A coordinator's job of a distributed bucket import, or why it was not started.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct CoordinatorJobResponse {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -614,6 +631,9 @@ Nothing is authorized later while the job runs.
 - There is no idempotency key, so resubmitting the same body creates another job and stages the same
   objects a second time.
 - Progress and completion are observed by reading the job by its id.
+- In a distributed bucket every coordinator imports only the keys of the ranges it coordinates:
+  this node relays the job to the other coordinators with the caller's bearer token and lists their
+  jobs in `coordinator_jobs`; it starts no job of its own when it coordinates no range.
 
 **Limits**
 - At least one item or prefix is required.
@@ -656,9 +676,15 @@ Nothing is authorized later while the job runs.
 pub async fn submit_staging(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<StageBatchRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitStagingResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
+    let relayed = StageBatchRequest {
+        node_id: None,
+        ..request.clone()
+    };
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
     if request.strategy == ApiStagingStrategy::Sync {
@@ -741,6 +767,27 @@ pub async fn submit_staging(
         validate_source_path(name)?;
     }
 
+    // A distributed bucket imports by range: every coordinator runs a job for its own keys.
+    let fan_out =
+        (bucket_info.distribution.as_ref()).filter(|_| !headers.contains_key(RELAY_HOP_HEADER));
+    let (local, coordinator_jobs) = match fan_out {
+        Some(binding) => coordinator_jobs(&state, binding, bearer.as_ref(), &relayed).await?,
+        None => (true, Vec::new()),
+    };
+    if !local {
+        let job_id = (coordinator_jobs.iter())
+            .find_map(|job| job.job_id.clone())
+            .ok_or_else(|| {
+                ServerError::ServiceUnavailableReason(
+                    "no coordinator of the distributed bucket accepted the job".to_string(),
+                )
+            })?;
+        let response = SubmitStagingResponse {
+            job_id,
+            coordinator_jobs,
+        };
+        return Ok((StatusCode::ACCEPTED, Json(response)));
+    }
     let result = submit_staging_job(
         &state.get_ctx(),
         StagingJobSpec {
@@ -769,6 +816,7 @@ pub async fn submit_staging(
         StatusCode::ACCEPTED,
         Json(SubmitStagingResponse {
             job_id: result.job_id.to_string(),
+            coordinator_jobs,
         }),
     ))
 }
@@ -1437,6 +1485,54 @@ async fn reference_blob(
 /// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes` from
 /// the realm quota config, mirroring the S3 surface's `resolve_quota_ceiling`.
 /// `None` means the group is unlimited.
+/// Starts the job on every other coordinator of a distributed bucket with the caller's bearer;
+/// reports whether this node coordinates a range itself.
+async fn coordinator_jobs(
+    state: &ServerState,
+    binding: &aruna_core::structs::storage::distribution::DistributionBinding,
+    bearer: Option<&ValidatedBearer>,
+    request: &StageBatchRequest,
+) -> ServerResult<(bool, Vec<CoordinatorJobResponse>)> {
+    let view = bound_view(state.get_ctx().as_ref(), binding)
+        .await
+        .map_err(crate::routes::storage::distributed::map_guard_error)?;
+    let snapshot = view.snapshot();
+    let local = state.get_node_id();
+    let (mut coordinates, mut nodes) = (false, Vec::<RestForward>::new());
+    for range in &snapshot.config.ranges {
+        let Some(member) = snapshot.member(range.coordinator) else {
+            continue;
+        };
+        if member.node_id == local {
+            coordinates = true;
+        } else if !nodes
+            .iter()
+            .any(|forward| forward.node_id == member.node_id)
+        {
+            nodes.push(RestForward {
+                set_id: binding.set_id,
+                range_id: range.range_id,
+                node_id: member.node_id,
+            });
+        }
+    }
+    let mut jobs = Vec::with_capacity(nodes.len());
+    for forward in nodes {
+        let path = "/data/staging/jobs";
+        let answer = relay_json::<SubmitStagingResponse>(state, &forward, path, bearer, request);
+        let (job_id, error) = match answer.await {
+            Ok((_, answer)) => (Some(answer.job_id), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        jobs.push(CoordinatorJobResponse {
+            node_id: forward.node_id.to_string(),
+            job_id,
+            error,
+        });
+    }
+    Ok((coordinates, jobs))
+}
+
 async fn resolve_quota_ceiling(
     state: &ServerState,
     group_id: ulid::Ulid,

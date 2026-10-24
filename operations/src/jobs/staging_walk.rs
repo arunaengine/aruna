@@ -19,7 +19,8 @@ use aruna_core::structs::execution::source_access::{
 };
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::storage::distribution::WriteRoute;
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use tracing::warn;
@@ -31,6 +32,7 @@ use super::staging::{
 use super::staging_manifest::{ManifestDigest, manifest_digests};
 use super::store::{batch_delete, iter_prefix_page, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::distribution::guard::bound_view;
 use crate::driver::drive;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::list_source::{
@@ -362,6 +364,44 @@ fn list_failure(error: ListStagingError) -> ItemFailure {
     }
 }
 
+/// Which of `keys` this node imports: in a distributed bucket only the keys of ranges it
+/// coordinates, since every coordinator runs its own job for its keys.
+pub(super) async fn coordinated(
+    ctx: &JobContext,
+    bucket: &BucketInfo,
+    keys: &[&str],
+) -> Result<Vec<bool>, String> {
+    let Some(binding) = bucket.distribution.as_ref() else {
+        return Ok(vec![true; keys.len()]);
+    };
+    let view = bound_view(&ctx.driver, binding)
+        .await
+        .map_err(|error| error.to_string())?;
+    let snapshot = view.snapshot();
+    (keys.iter())
+        .map(|key| match snapshot.write_route(binding.member_id, key) {
+            Ok(WriteRoute::Local { .. }) => Ok(true),
+            Ok(WriteRoute::Forward { .. }) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        })
+        .collect()
+}
+
+/// The files of a page this node imports.
+async fn own_files(
+    ctx: &JobContext,
+    bucket: &BucketInfo,
+    files: Vec<StagedFile>,
+) -> Result<Vec<StagedFile>, PageFailure> {
+    let keys: Vec<&str> = files.iter().map(|file| file.target_key.as_str()).collect();
+    let own = coordinated(ctx, bucket, &keys)
+        .await
+        .map_err(PageFailure::Retry)?;
+    Ok((files.into_iter().zip(own))
+        .filter_map(|(file, own)| own.then_some(file))
+        .collect())
+}
+
 /// Registers a page's files as references with listing metadata, in one transaction with the
 /// checkpoint. Files a listing gives no size for are read with one HEAD each.
 async fn import_page(
@@ -383,8 +423,9 @@ async fn import_page(
             return Err(PageFailure::Permanent(message));
         }
     };
-    let mut entries = Vec::with_capacity(rows.files.len());
-    for file in rows.files {
+    let files = own_files(ctx, &bucket, rows.files).await?;
+    let mut entries = Vec::with_capacity(files.len());
+    for file in files {
         let observation = match check_access(ctx, spec, &file.source_path, &file.target_key).await {
             Ok(()) => match file.observation {
                 Some(observation) => Ok(observation),
@@ -451,7 +492,16 @@ async fn snapshot_page(
     mut next: StagingJobCheckpoint,
     rows: PageRows,
 ) -> Result<(), PageFailure> {
-    for file in rows.files {
+    let bucket = match pinned_bucket(ctx, spec).await {
+        Ok(bucket) => bucket,
+        Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
+        Err(
+            ItemFailure::Denied(message)
+            | ItemFailure::Stage(message)
+            | ItemFailure::Lasting(message),
+        ) => return Err(PageFailure::Permanent(message)),
+    };
+    for file in own_files(ctx, &bucket, rows.files).await? {
         if ctx.cancel.is_cancelled() || ctx.shutdown.is_cancelled() {
             return Ok(());
         }
