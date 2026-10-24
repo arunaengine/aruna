@@ -461,3 +461,7 @@ pub fn open_ranges(
     }
     Ok(writes)
 }
+
+#[cfg(test)]
+#[path = "inventory_tests.rs"]
+mod tests;

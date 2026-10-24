@@ -11,6 +11,8 @@ use crate::driver::DriverContext;
 
 pub mod inventory;
 pub mod publish;
+#[cfg(test)]
+pub(crate) mod test_store;
 
 /// Signs a snapshot with this node's key, only when this node is the set's bound publisher.
 pub(crate) fn sign_snapshot(context: &DriverContext, claim: SnapshotClaim) -> SnapshotSignEvent {
