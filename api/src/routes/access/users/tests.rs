@@ -241,13 +241,14 @@ async fn read_realm_config(driver_ctx: &DriverContext, realm_id: &RealmId) -> Re
 }
 
 async fn spawn_test_node(provider: OidcProviderConfig, claim_initial_admin: bool) -> TestNode {
-    spawn_node(provider, claim_initial_admin, false).await
+    spawn_node(provider, claim_initial_admin, false, true).await
 }
 
 async fn spawn_node(
     provider: OidcProviderConfig,
     claim_initial_admin: bool,
     claims_on_register: bool,
+    management: bool,
 ) -> TestNode {
     let temp_dir = tempfile::tempdir().unwrap();
     let storage_handle = FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
@@ -359,7 +360,10 @@ async fn spawn_node(
             driver_ctx.clone(),
             realm_id,
             node_id,
-            NodeCapabilities::management_node(realm_signing_key).unwrap(),
+            match management {
+                true => NodeCapabilities::management_node(realm_signing_key).unwrap(),
+                false => NodeCapabilities::user_node(realm_id).unwrap(),
+            },
             claims_on_register,
             Some(Arc::new(OidcValidator::new().unwrap())),
             aruna_operations::jobs::runtime::JobsRuntime::new(),
@@ -1016,6 +1020,40 @@ async fn registration_consumes_secret() {
     oidc_task.abort();
 }
 
+/// A relay hop header from any caller must not let a node that is not a management node mint a
+/// user of its own.
+#[tokio::test]
+async fn refuses_local_registration() {
+    let issuer = "https://issuer.example";
+    let kid = "main-key";
+    let signing_key = generate_signing_key();
+    let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+    let node = spawn_node(provider, false, false, false).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/v1/access/users/register", node.base_url))
+        .header(crate::routes::management_relay::RELAY_HOP_HEADER, "1")
+        .bearer_auth(sign_oidc_token(
+            issuer,
+            kid,
+            &signing_key,
+            "device-subject",
+            Some("Device Alice"),
+            None,
+        ))
+        .json(&RegisterUserRequest {
+            onboarding_secret: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    node.server_task.abort();
+    node.net.shutdown().await;
+    oidc_task.abort();
+}
+
 async fn register_status(node: &TestNode, oidc_token: &str, onboarding_secret: &str) -> StatusCode {
     reqwest::Client::new()
         .post(format!("{}/api/v1/access/users/register", node.base_url))
@@ -1050,7 +1088,7 @@ async fn burned_secret_recovers() {
     let kid = "main-key";
     let signing_key = generate_signing_key();
     let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
-    let node = spawn_node(provider, false, true).await;
+    let node = spawn_node(provider, false, true, true).await;
 
     let burned = create_local_secret(&node).await;
     let decoded = OnboardingSecret::decode(&burned).unwrap();
@@ -1136,7 +1174,7 @@ async fn restart_keeps_administrator() {
     let kid = "main-key";
     let signing_key = generate_signing_key();
     let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
-    let node = spawn_node(provider, true, true).await;
+    let node = spawn_node(provider, true, true, true).await;
     assert_eq!(
         load_persisted_state::<bool>(node.context.as_ref(), ADMIN_CLAIMED_KEY).await,
         None

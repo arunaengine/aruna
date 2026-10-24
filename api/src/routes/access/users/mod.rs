@@ -649,7 +649,7 @@ initial realm administrator role.
         ),
         (status = 400, description = "Malformed request body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid OIDC bearer token, or an onboarding secret that is unknown, expired, already claimed or issued for another realm", body = ErrorResponse),
-        (status = 403, description = "The onboarding secret was issued for another purpose than the initial realm administrator", body = ErrorResponse),
+        (status = 403, description = "The onboarding secret was issued for another purpose than the initial realm administrator, or the call carries a relay hop to a node that is not a management node", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
     ),
@@ -660,6 +660,10 @@ async fn register_user(
     headers: HeaderMap,
     Json(request): Json<RegisterUserRequest>,
 ) -> ServerResult<(StatusCode, Json<RegisterUserResponse>)> {
+    // Only a management node resolves subjects; a forged relay hop must not reach this point.
+    if !state.is_management_node() {
+        return Err(ServerError::Forbidden);
+    }
     let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
     let oidc_identity = validate_oidc_token(&state, token).await?;
 
