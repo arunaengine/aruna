@@ -512,6 +512,16 @@ fn delete_until_lookup(
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, .. })]
+            if key_space == S3_BUCKET_KEYSPACE
+    ));
+    // An ordinary bucket goes on to the version.
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: None,
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })]
             if key_space == BLOB_VERSIONS_KEYSPACE
     ));
 
@@ -1787,7 +1797,7 @@ fn marker_carries_hint() {
     use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
     use aruna_core::structs::storage::format::Compression;
 
-    let marker = |binding: Option<DistributionBinding>| {
+    let marker = |binding: Option<DistributionBinding>, record: Option<Vec<u8>>| {
         let mut operation = audit_op(None);
         operation.state = DeleteObjectState::CheckPurgeFence;
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -1814,20 +1824,76 @@ fn marker_carries_hint() {
             key: b"bucket".to_vec().into(),
             value: Some(info.to_bytes().unwrap().into()),
         }));
+        if let Some(record) = record {
+            assert_eq!(operation.state, DeleteObjectState::ReadRecord);
+            operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: vec![2u8].into(),
+                value: Some(record.into()),
+            }));
+        }
         assert_ne!(operation.state, DeleteObjectState::Error);
         (
             operation.version_id.expect("marker id minted"),
             operation.set_hint,
         )
     };
-    let set_id = Ulid::from_bytes([7u8; 16]);
-    let (hinted, hint) = marker(Some(DistributionBinding {
-        set_id,
-        member_id: Ulid::from_bytes([8u8; 16]),
-        incarnation: 1,
-        revision: Default::default(),
-    }));
+    let (snapshot, bytes) = crate::distribution::test_record::record(true);
+    let set_id = snapshot.set_id();
+    let binding = crate::distribution::test_record::binding(&snapshot, 1, 5);
+    let (hinted, hint) = marker(Some(binding), Some(bytes));
     assert_eq!(hint, Some(SetHint::of_set(set_id)));
     assert_eq!(SetHint::of_version(hinted), SetHint::of_set(set_id));
-    assert_eq!(marker(None).1, None);
+    assert_eq!(marker(None, None).1, None);
+}
+
+#[test]
+fn member_marker_refused() {
+    let (snapshot, bytes) = crate::distribution::test_record::record(true);
+    let mut operation = audit_op(None);
+    operation.binding = Some(crate::distribution::test_record::binding(&snapshot, 2, 5));
+    operation.state = DeleteObjectState::ReadRecord;
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![2u8].into(),
+        value: Some(bytes.into()),
+    }));
+    assert!(matches!(
+        operation.finalize(),
+        Err(DeleteObjectError::Distribution(
+            crate::distribution::guard::GuardError::NotCoordinator { .. }
+        ))
+    ));
+}
+
+#[test]
+fn distributed_version_refused() {
+    use aruna_core::structs::storage::format::Compression;
+    let (snapshot, _) = crate::distribution::test_record::record(true);
+    let mut operation = audit_op(Some(Ulid::from_bytes([3u8; 16])));
+    operation.state = DeleteObjectState::StartTransaction;
+    let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: Ulid::from_bytes([4u8; 16]),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == S3_BUCKET_KEYSPACE
+    ));
+    let info = BucketInfo {
+        group_id: Ulid::from_bytes([2u8; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: test_user_id(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(crate::distribution::test_record::binding(&snapshot, 1, 5)),
+    };
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: Some(info.to_bytes().unwrap().into()),
+    }));
+    assert_eq!(
+        operation.finalize(),
+        Err(DeleteObjectError::DistributedVersion)
+    );
 }

@@ -8,8 +8,9 @@ use crate::blob::records::{
     delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,
     write_version_effect,
 };
+use crate::distribution::guard::{GuardError, record_epoch, record_read};
 use crate::distribution::inventory::{
-    AddedVersion, InventoryChange, stamp_generation, version_written,
+    AddedVersion, InventoryChange, stamp_head, stamp_version, version_written,
 };
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
@@ -60,6 +61,10 @@ pub enum DeleteObjectState {
     CheckPurgeFence,
     /// Reads the bucket record for the set hint a new delete marker carries.
     ReadBucketBinding,
+    /// Reads a distributed bucket's record: only the key's coordinator adds a delete marker.
+    ReadRecord,
+    /// Reads the bucket record before a single version is deleted.
+    ReadVersionBucket,
     ReadTargetVersion,
     ReadTargetLocation,
     ReadAllVersions,
@@ -153,6 +158,12 @@ pub enum DeleteObjectError {
     ManagedCopyError(#[from] ManagedCopyError),
     #[error(transparent)]
     PurgeFence(#[from] PurgeFenceError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
+    #[error(
+        "single versions of a distributed bucket cannot be deleted; delete the key for a delete marker"
+    )]
+    DistributedVersion,
     #[error("DeleteObject failed")]
     DeleteObjectFailed,
     #[error("The version changed since it was read.")]
@@ -371,8 +382,13 @@ impl DeleteObjectOperation {
         };
 
         self.txn_id = Some(txn_id);
-        if let Some(version_id) = self.input.version_id {
-            self.read_target_version(version_id)
+        if self.input.version_id.is_some() {
+            self.state = DeleteObjectState::ReadVersionBucket;
+            smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: self.input.bucket.as_bytes().into(),
+                txn_id: self.txn_id,
+            })]
         } else {
             self.state = DeleteObjectState::CheckPurgeFence;
             smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
@@ -406,7 +422,46 @@ impl DeleteObjectOperation {
         };
         self.binding = bucket.and_then(|bucket| bucket.distribution);
         self.set_hint = self.binding.as_ref().map(DistributionBinding::hint);
-        self.write_tombstone()
+        match self.binding.as_ref() {
+            Some(binding) => {
+                self.state = DeleteObjectState::ReadRecord;
+                smallvec![record_read(binding)]
+            }
+            None => self.write_tombstone(),
+        }
+    }
+
+    fn record_checked(&mut self, event: Event) -> Effects {
+        let Some(binding) = self.binding.as_ref() else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        match record_epoch(binding, &self.input.key, event) {
+            Ok(epoch) => {
+                self.marker_epoch = epoch;
+                self.write_tombstone()
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    /// A single version may hold the current head on one member only, so a distributed
+    /// bucket refuses to delete it.
+    fn version_bucket_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let bound = match value
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(bucket) => bucket.is_some_and(|bucket| bucket.distribution.is_some()),
+            Err(error) => return self.emit_error(error.into()),
+        };
+        match (bound, self.input.version_id) {
+            (true, _) => self.emit_error(DeleteObjectError::DistributedVersion),
+            (false, Some(version_id)) => self.read_target_version(version_id),
+            (false, None) => self.emit_error(DeleteObjectError::InvalidOperationState),
+        }
     }
 
     fn read_target_version(&mut self, version_id: Ulid) -> Effects {
@@ -1122,6 +1177,7 @@ impl DeleteObjectOperation {
     ) -> Effects {
         match CurrentVersionPointer::next_for(existing, version_id) {
             Ok(pointer) => {
+                let pointer = stamp_head(pointer, self.binding.as_ref(), self.marker_epoch);
                 self.marker_head = Some(pointer.clone());
                 self.pending_new_pointer = Some(pointer);
             }
@@ -1141,7 +1197,12 @@ impl DeleteObjectOperation {
         let mut version = BlobVersion::deleted(created_at, self.input.deleted_by);
         version.metadata = self.metadata.clone();
         let generation = self.marker_head.as_ref().map_or(0, |head| head.generation);
-        let version = stamp_generation(version, self.binding.as_ref(), generation);
+        let version = stamp_version(
+            version,
+            self.binding.as_ref(),
+            generation,
+            self.marker_epoch,
+        );
         self.marker_epoch = version.original_epoch;
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
@@ -1245,6 +1306,8 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::StartTransaction => self.handle_transaction_started(event),
             DeleteObjectState::CheckPurgeFence => self.fence_checked(event),
             DeleteObjectState::ReadBucketBinding => self.binding_read(event),
+            DeleteObjectState::ReadRecord => self.record_checked(event),
+            DeleteObjectState::ReadVersionBucket => self.version_bucket_read(event),
             DeleteObjectState::ReadTargetVersion => self.target_version_read(event),
             DeleteObjectState::ReadTargetLocation => self.target_location_read(event),
             DeleteObjectState::ReadAllVersions => self.versions_read(event),

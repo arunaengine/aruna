@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
     RANGE_INDEX_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
-use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState};
+use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, RangeAccount, RangeCounters, RangeSlot, SAMPLE_SIZE, SampleEntry,
     account_key, generation_key, pending_key, sample_count_key, sample_prefix, slot_key, slot_seek,
@@ -539,6 +539,32 @@ pub fn stamp_generation(
     match binding {
         Some(_) => version.with_generation(generation),
         None => version,
+    }
+}
+
+/// Stamps the head generation and the coordinator's epoch a version is written as, inside a
+/// distributed bucket only.
+pub fn stamp_version(
+    version: BlobVersion,
+    binding: Option<&DistributionBinding>,
+    generation: u64,
+    epoch: OriginalEpoch,
+) -> BlobVersion {
+    match binding {
+        Some(_) => version.with_generation(generation).with_epoch(epoch),
+        None => version,
+    }
+}
+
+/// The head a coordinator installs in a distributed bucket carries the range's epoch.
+pub fn stamp_head(
+    pointer: CurrentVersionPointer,
+    binding: Option<&DistributionBinding>,
+    epoch: OriginalEpoch,
+) -> CurrentVersionPointer {
+    match binding {
+        Some(_) => pointer.with_epoch(epoch),
+        None => pointer,
     }
 }
 

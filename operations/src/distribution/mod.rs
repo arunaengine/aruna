@@ -12,6 +12,7 @@ use crate::driver::DriverContext;
 pub mod admit;
 pub mod create;
 pub mod forward;
+pub mod guard;
 pub mod handoff;
 pub mod inventory;
 pub mod publish;
@@ -19,6 +20,8 @@ pub mod rebuild;
 pub mod refill;
 pub mod split;
 pub mod status;
+#[cfg(test)]
+pub(crate) mod test_record;
 #[cfg(test)]
 pub(crate) mod test_store;
 

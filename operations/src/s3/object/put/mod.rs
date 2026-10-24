@@ -11,7 +11,8 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
-use crate::distribution::inventory::{AddedVersion, stamp_generation, version_written};
+use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, version_written};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
@@ -83,6 +84,8 @@ pub enum PutObjectState {
     ReadPreassignedCopy,
     ReadGateBucket,
     PolicyGate,
+    /// Reads a distributed bucket's record: only the key's coordinator writes, at its epoch.
+    ReadRecord,
     CheckPurgeWrite,
     /// Reads the bucket's encryption settings, then its active key, to capture the seal plan.
     ReadSealSettings,
@@ -204,6 +207,8 @@ pub enum PutObjectError {
     PolicyError(#[from] PlacementPolicyError),
     #[error(transparent)]
     PolicyGate(#[from] PolicyGateError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
     #[error(transparent)]
     PurgeFence(#[from] PurgeFenceError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
@@ -720,6 +725,27 @@ impl PutObjectOperation {
     }
 
     fn check_write_fence(&mut self) -> Effects {
+        if let Some(binding) = self.binding.as_ref() {
+            self.state = PutObjectState::ReadRecord;
+            return smallvec![record_read(binding)];
+        }
+        self.read_write_fence()
+    }
+
+    fn record_checked(&mut self, event: Event) -> Effects {
+        let Some(binding) = self.binding.as_ref() else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        match record_epoch(binding, &self.config.request.key, event) {
+            Ok(epoch) => {
+                self.version_epoch = epoch;
+                self.read_write_fence()
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn read_write_fence(&mut self) -> Effects {
         self.state = PutObjectState::CheckPurgeWrite;
         smallvec![write_fence_read(&self.config.request.bucket, None)]
     }
@@ -1255,7 +1281,7 @@ impl PutObjectOperation {
         version_id: Ulid,
     ) -> Effects {
         let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
-            Ok(pointer) => pointer,
+            Ok(pointer) => stamp_head(pointer, self.binding.as_ref(), self.version_epoch),
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
         self.head_pointer = Some(pointer.clone());
@@ -1413,7 +1439,12 @@ impl PutObjectOperation {
                 version_id,
             );
             let generation = self.head_pointer.as_ref().map_or(0, |head| head.generation);
-            let version = stamp_generation(version, self.binding.as_ref(), generation);
+            let version = stamp_version(
+                version,
+                self.binding.as_ref(),
+                generation,
+                self.version_epoch,
+            );
             self.stored_policies = version.placement_policies.clone();
             self.version_epoch = version.original_epoch;
             let effect = match write_version_effect(&version_key, &version, self.txn_id) {
@@ -2074,6 +2105,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadPreassignedCopy => self.handle_preassigned_copy(event),
             PutObjectState::ReadGateBucket => self.handle_gate_bucket(event),
             PutObjectState::PolicyGate => self.handle_policy_gate(event),
+            PutObjectState::ReadRecord => self.record_checked(event),
             PutObjectState::CheckPurgeWrite => self.write_fence_checked(event),
             PutObjectState::ReadSealSettings => self.seal_settings_read(event),
             PutObjectState::ReadSealKey => self.seal_key_read(event),

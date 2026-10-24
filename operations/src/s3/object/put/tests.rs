@@ -2722,3 +2722,65 @@ async fn plain_owns_copy() {
         assert_eq!(&BackendLocation::from_bytes(&value).unwrap(), written);
     }
 }
+
+/// Starts a put into a bucket bound as member `seed` of the two-shard test set and answers
+/// the bucket and record reads; the key "some-file.txt" lies in member 1's range.
+fn bound_put(seed: u8) -> (PutObjectOperation, aruna_core::types::Effects) {
+    use crate::distribution::test_record::{binding, record};
+    use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+    let (snapshot, bytes) = record(true);
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let config = put_config(realm_id, group_id, iroh::SecretKey::generate().public());
+    let bucket = BucketInfo {
+        group_id,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: config.user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(binding(&snapshot, seed, 5)),
+    };
+    let mut op = PutObjectOperation::new(config);
+    op.start();
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"mybucket".to_vec().into(),
+        value: Some(bucket.to_bytes().unwrap().into()),
+    }));
+    let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+        panic!("a bound bucket reads its record first, got {effects:?}");
+    };
+    assert_eq!(key_space, DISTRIBUTION_KEYSPACE);
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: snapshot.set_id().to_bytes().to_vec().into(),
+        value: Some(bytes.into()),
+    }));
+    (op, effects)
+}
+
+#[test]
+fn coordinator_put_stamps_epoch() {
+    let (op, effects) = bound_put(1);
+    assert_eq!(
+        op.version_epoch,
+        aruna_core::structs::storage::distribution::OriginalEpoch(1)
+    );
+    let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+        panic!("the coordinator continues with the purge fence, got {effects:?}");
+    };
+    assert_eq!(key_space, PURGE_FENCE_KEYSPACE);
+}
+
+#[test]
+fn member_put_names_coordinator() {
+    let (op, effects) = bound_put(2);
+    assert!(effects.is_empty());
+    assert!(matches!(
+        op.finalize(),
+        Err(PutObjectError::Distribution(
+            crate::distribution::guard::GuardError::NotCoordinator { .. }
+        ))
+    ));
+}
