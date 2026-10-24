@@ -402,6 +402,12 @@ objects.
   object's metadata.
 - Only the owning node serves the bytes, so a routed answer's access method is a download URL on
   the owner's published API URL; an owner that published none is unavailable (503).
+- A distributed bucket's version is named by its global id (URL or short path
+  `/{realm-id}/{version-id}`), resolved on any realm node through the set records: this node's
+  member answers when it keeps the bytes, otherwise a chosen holder answers for the caller. The
+  access URL is the pinned download URL (`here=true`) of the holder chosen by free download slots.
+  A node ARN of a distributed bucket's object is answered only from this node's member and its
+  canonical id is the global id.
 - A content-hash identifier resolves against every object on this node carrying that content and
   returns the first one the caller may read, so the same digest can resolve differently for
   different callers.
@@ -420,7 +426,8 @@ objects.
   `https://w3id.org/aruna/data/{blake3-hex}`, `https://w3id.org/aruna/data/{versioned-s3-arn}`,
   `arn:aruna:{realm_id}:{node_id}:ch/{blake3-hex}` with 64 lowercase hex characters, or
   `arn:aruna:{realm_id}:{node_id}:s3/{bucket}/{key}@{version-ulid}` whose key is percent-encoded
-  except for the separating slashes."#,
+  except for the separating slashes, or a global id `https://w3id.org/aruna/data/{realm-id}/{version-id}`
+  or `/{realm-id}/{version-id}`. Bucket and prefix global ids name no object (400)."#,
     params(("object_id" = String, Path, description = "Aruna data W3ID, content-hash `ch` ARN, or versioned `s3` ARN locator; the whole remainder of the path is taken as the identifier")),
     responses(
         (status = 200, description = "The resolved DRS object, as visible to this caller", body = DrsObjectResponse, example = json!({
@@ -457,6 +464,7 @@ objects.
         (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
         (status = 403, description = "The caller presented a token but may not read the object, or the token belongs to another realm", body = DrsErrorPayload),
         (status = 404, description = "No such object on this node, or an anonymous caller may not read it, which is deliberately indistinguishable", body = DrsErrorPayload),
+        (status = 409, description = "More than one distributed bucket holds the version id, or a node ARN names a distributed bucket's version this node's member does not hold; use the global id", body = DrsErrorPayload),
         (status = 503, description = "The node owning the identifier could not answer within the request's probe budget, or has published no API URL to download from; the caller may retry", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
@@ -1318,14 +1326,34 @@ async fn resolve_versioned(
     if arn.node_id != state.get_node_id() {
         return resolve_routed(state, auth, requested_id, arn, deadline).await;
     }
-    let canonical = arn.to_w3id();
+    // A member bucket of a distributed bucket is named by the global id, never by a node ARN.
+    let member = drive(
+        GetBucketOperation::new(arn.bucket.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .is_ok_and(|info| info.distribution.is_some());
+    let canonical = match member {
+        true => GlobalId::Version {
+            realm_id: arn.realm_id,
+            version_id: arn.version,
+        }
+        .to_url(),
+        false => arn.to_w3id(),
+    };
     let object = ObjectRef {
         bucket: &arn.bucket,
         key: &arn.key,
         version_id: arn.version,
         canonical_w3id: &canonical,
     };
-    resolve_local(state, auth, requested_id, &object).await
+    match resolve_local(state, auth, requested_id, &object).await? {
+        // Only this node's current binding was asked, which proves no absence.
+        ResolveOutcome::NotFound if member => Err(DrsError::conflict(
+            "not resolvable as a node ARN of a distributed bucket; use the global id",
+        )),
+        outcome => Ok(outcome),
+    }
 }
 
 /// Resolves one version of a bucket on this node, checked on this node's own path.
