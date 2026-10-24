@@ -55,6 +55,14 @@ impl AdminDocumentState {
             AdminDocumentOperation::ConfigPortalSet { features } => {
                 self.apply_config_setting(event, CONFIG_PORTAL_PATH, portal_value(features));
             }
+            AdminDocumentOperation::DatabaseSet { entry, .. } => {
+                let value = serde_json::to_string(entry)
+                    .map_err(|_| AdminDocumentError::InvalidDatabase)?;
+                self.apply_register(event, &database_path(entry.entry_id), Some(value));
+            }
+            AdminDocumentOperation::DatabaseRemoved { entry_id } => {
+                self.apply_register(event, &database_path(*entry_id), None);
+            }
             AdminDocumentOperation::ConfigPoliciesSet { policies } => {
                 self.apply_config_setting(event, CONFIG_POLICIES_PATH, policies_value(policies));
             }

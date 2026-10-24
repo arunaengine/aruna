@@ -22,6 +22,7 @@ pub const CONFIG_POLICIES_PATH: &str = "realm_config.request_policies";
 pub const CONFIG_STRATEGY_PATH: &str = "realm_config.placement.default_strategy";
 pub const JOB_FAMILY_PATH: &str = "realm_config.placement.job_family_strategy";
 pub const REVOKED_TOKENS_PATH: &str = "realm_config.revoked_tokens";
+pub const DATABASES_PREFIX: &str = "realm_config.databases.";
 
 pub(super) fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> bool {
     event.observed.observes(dot)
@@ -219,7 +220,13 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         // Stored per event by the distribution reducer, never as an attribute path.
         AdminDocumentOperation::DistributionPublished { .. } => Vec::new(),
+        AdminDocumentOperation::DatabaseSet { entry, .. } => vec![database_path(entry.entry_id)],
+        AdminDocumentOperation::DatabaseRemoved { entry_id } => vec![database_path(*entry_id)],
     }
+}
+
+pub fn database_path(entry_id: Ulid) -> String {
+    format!("{DATABASES_PREFIX}{entry_id}")
 }
 
 pub(super) fn role_definition_value(role: &AdminRoleDefinition) -> String {

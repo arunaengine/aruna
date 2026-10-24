@@ -217,6 +217,8 @@ pub struct RealmConfigDocument {
     pub federation: Option<crate::federation::FederationSettings>,
     /// Realm default on/off state of optional portal features; a missing name means on.
     pub portal_features: BTreeMap<String, bool>,
+    /// Buckets marked as databases, each with the dataset that describes it.
+    pub databases: Vec<crate::structs::identity::database::DatabaseEntry>,
 }
 
 pub const MAX_PORTAL_FEATURES: usize = 64;
@@ -502,9 +504,10 @@ impl RealmConfigDocument {
         // Exclude request policies because they do not route requests; each receiver enforces its local set,
         // and nodes without a realm-config bucket may never observe them.
         canonical.request_policies.clear();
-        // Exclude federation settings and portal features: they never route requests.
+        // Exclude federation settings, portal features and databases: they never route requests.
         canonical.federation = None;
         canonical.portal_features.clear();
+        canonical.databases.clear();
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -543,6 +546,7 @@ impl RealmConfigDocument {
             compute: crate::structs::placement::compute_config::RealmComputeConfig::default(),
             federation: None,
             portal_features: BTreeMap::new(),
+            databases: Vec::new(),
         }
     }
 
@@ -1240,6 +1244,7 @@ mod test {
             placement_transitions: Vec::new(),
             federation: None,
             portal_features: BTreeMap::new(),
+            databases: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -1800,6 +1805,7 @@ mod test {
             placement_transitions: Vec::new(),
             federation: None,
             portal_features: BTreeMap::new(),
+            databases: Vec::new(),
         };
 
         assert_eq!(document.replication_factor_for(other_group_id, None), 3);

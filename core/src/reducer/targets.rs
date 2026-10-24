@@ -301,6 +301,27 @@ impl AdminDocumentState {
             .and_then(|value| serde_json::from_str(value).ok())
     }
 
+    /// The database entries the events agree on; an entry in conflict is left out.
+    pub fn materialized_databases(&self) -> Vec<crate::structs::identity::database::DatabaseEntry> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return Vec::new();
+        }
+        self.user_subject_ids
+            .range(DATABASES_PREFIX.to_string()..)
+            .take_while(|(path, _)| path.starts_with(DATABASES_PREFIX))
+            .filter(|(path, _)| !self.conflicts.contains_key(*path))
+            .filter_map(|(_, version)| version.value.as_deref())
+            .filter_map(|value| serde_json::from_str(value).ok())
+            .collect()
+    }
+
+    /// The register version of a database entry, which a consent names as its predecessor.
+    pub fn database_version(&self, entry_id: Ulid) -> Option<AdminDocumentDot> {
+        self.user_subject_ids
+            .get(&database_path(entry_id))
+            .map(|version| version.dot)
+    }
+
     pub fn materialized_realm_quota(&self) -> Option<QuotaConfig> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return None;
@@ -542,6 +563,24 @@ impl AdminDocumentState {
             CONFIG_DISCOVERY_PATH,
             realm_discovery_value(discovery),
         );
+    }
+
+    /// Sets or clears one register path of the realm config.
+    pub(super) fn apply_register(
+        &mut self,
+        event: &AdminDocumentEvent,
+        path: &str,
+        value: Option<String>,
+    ) {
+        let current = self.user_subject_ids.get(path).cloned();
+        match self.reduce_value(event, path, current, value) {
+            Some(version) => {
+                self.user_subject_ids.insert(path.to_string(), version);
+            }
+            None => {
+                self.user_subject_ids.remove(path);
+            }
+        }
     }
 
     pub(super) fn apply_config_setting(

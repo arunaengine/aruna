@@ -74,6 +74,8 @@ pub enum AdminDocumentError {
     InvalidGroupDeletion,
     #[error("group dataset location is invalid")]
     InvalidLocation,
+    #[error("database entry is invalid")]
+    InvalidDatabase,
     #[error(transparent)]
     InvalidUserAttribute(#[from] UserAttributeError),
     #[error("placement labels must not set the derived label `{0}`")]
