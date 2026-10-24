@@ -2322,6 +2322,7 @@ impl S3 for ArunaS3Service {
         }
 
         let quiet = req.input.delete.quiet.unwrap_or(false);
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
             realm_id: self.realm_id,
@@ -2394,6 +2395,16 @@ impl S3 for ArunaS3Service {
                 version_id,
             });
         }
+        // Delete markers for keys another member coordinates are forwarded there one by one.
+        let (entries, forwarded, forward_errors) = self
+            .forward_deletes(
+                &req.extensions,
+                (&bucket, bucket_info.as_ref()),
+                &user_access,
+                entries,
+            )
+            .await;
+        errors.extend(forward_errors);
 
         let outcomes = delete_objects(
             &self.state,
@@ -2410,7 +2421,13 @@ impl S3 for ArunaS3Service {
         .await;
 
         Ok(self
-            .delete_objects_response(quiet, bucket, replication_auth, errors, outcomes)
+            .delete_objects_response(
+                quiet,
+                bucket,
+                replication_auth,
+                (forwarded, errors),
+                outcomes,
+            )
             .await)
     }
 

@@ -218,10 +218,10 @@ impl ArunaS3Service {
         quiet: bool,
         bucket: String,
         replication_auth: AuthContext,
-        prior_errors: Vec<S3DeleteError>,
+        (forwarded, prior_errors): (Vec<DeletedObject>, Vec<S3DeleteError>),
         outcomes: Vec<BulkDeleteOutcome>,
     ) -> S3Response<DeleteObjectsOutput> {
-        let mut deleted = Vec::new();
+        let mut deleted = forwarded;
         let mut errors = prior_errors;
         for outcome in outcomes {
             match outcome.result {
@@ -492,7 +492,7 @@ mod tests {
                 true,
                 "bucket".to_string(),
                 AuthContext::anonymous(RealmId([7u8; 32])),
-                vec![],
+                (vec![], vec![]),
                 outcomes,
             )
             .await;
@@ -512,7 +512,7 @@ mod tests {
                 false,
                 "bucket".to_string(),
                 AuthContext::anonymous(RealmId([7u8; 32])),
-                vec![],
+                (vec![], vec![]),
                 outcomes,
             )
             .await;
@@ -543,7 +543,7 @@ mod tests {
                 false,
                 "bucket".to_string(),
                 AuthContext::anonymous(RealmId([7u8; 32])),
-                prior,
+                (vec![], prior),
                 vec![missing("after")],
             )
             .await;
@@ -553,5 +553,33 @@ mod tests {
             .filter_map(|error| error.key.as_deref())
             .collect();
         assert_eq!(keys, vec!["denied", "after"]);
+    }
+
+    #[tokio::test]
+    async fn forwarded_deletes_listed() {
+        let (_dir, service) = test_service().await;
+        let forwarded = vec![DeletedObject {
+            key: Some("remote".to_string()),
+            delete_marker: Some(true),
+            delete_marker_version_id: Some("v1".to_string()),
+            ..Default::default()
+        }];
+        let response = service
+            .delete_objects_response(
+                false,
+                "bucket".to_string(),
+                AuthContext::anonymous(RealmId([7u8; 32])),
+                (forwarded, vec![]),
+                vec![success("local")],
+            )
+            .await;
+        let keys: Vec<String> = response
+            .output
+            .deleted
+            .expect("deleted list")
+            .into_iter()
+            .filter_map(|object| object.key)
+            .collect();
+        assert_eq!(keys, vec!["remote".to_string(), "local".to_string()]);
     }
 }

@@ -15,10 +15,13 @@ use aruna_core::structs::storage::distribution::delegation::{
 };
 use aruna_operations::distribution::delegate::{DelegationInput, issue_delegation, node_urls};
 use aruna_operations::distribution::guard::route_write;
+use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use bytes::Bytes;
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use s3s::dto::{DeleteObjectOutput, ETag, PutObjectOutput, StreamingBlob};
+use s3s::dto::{
+    DeleteObjectOutput, DeletedObject, ETag, Error as S3DeleteError, PutObjectOutput, StreamingBlob,
+};
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
 use tracing::warn;
 use ulid::Ulid;
@@ -423,6 +426,59 @@ impl ArunaS3Service {
             checksum_sha256: header(response, "x-amz-checksum-sha256"),
             ..Default::default()
         })
+    }
+
+    /// Forwards each delete marker whose key another member coordinates, one delegated
+    /// request per key, and keeps the other entries for this node.
+    pub(super) async fn forward_deletes(
+        &self,
+        extensions: &http::Extensions,
+        bucket: (&str, Option<&BucketInfo>),
+        user: &UserAccess,
+        entries: Vec<BulkDeleteEntry>,
+    ) -> (Vec<BulkDeleteEntry>, Vec<DeletedObject>, Vec<S3DeleteError>) {
+        let (name, info) = bucket;
+        let (mut local, mut deleted, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+        for entry in entries {
+            if entry.version_id.is_some() {
+                local.push(entry);
+                continue;
+            }
+            let forwarded = match self.forward_target(extensions, info, &entry.key).await {
+                Ok(None) => {
+                    local.push(entry);
+                    continue;
+                }
+                Ok(Some(forward)) => {
+                    let request = ForwardRequest {
+                        method: Method::DELETE,
+                        operation: "DeleteObject",
+                        bucket: name.to_string(),
+                        key: entry.key.clone(),
+                        query: None,
+                        headers: Vec::new(),
+                        body: ForwardBody::Empty,
+                    };
+                    self.forward_write(user, &forward, request).await
+                }
+                Err(error) => Err(error),
+            };
+            match forwarded {
+                Ok(response) => deleted.push(DeletedObject {
+                    key: Some(entry.key),
+                    delete_marker: header(&response, "x-amz-delete-marker").map(|v| v == "true"),
+                    delete_marker_version_id: header(&response, "x-amz-version-id"),
+                    ..Default::default()
+                }),
+                Err(error) => errors.push(S3DeleteError {
+                    code: Some(error.code().as_str().to_string()),
+                    key: Some(entry.key),
+                    version_id: None,
+                    message: error.message().map(str::to_string),
+                }),
+            }
+        }
+        (local, deleted, errors)
     }
 
     pub(super) fn forwarded_delete(response: &reqwest::Response) -> S3Response<DeleteObjectOutput> {
