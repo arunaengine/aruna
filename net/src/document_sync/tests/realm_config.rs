@@ -2343,7 +2343,10 @@ async fn drops_evicted_node() {
             target,
             &actor,
             3,
-            AdminDocumentOperation::ConfigNodeRemoved { node_id: device },
+            AdminDocumentOperation::ConfigNodeRemoved {
+                node_id: device,
+                cutoffs: Vec::new(),
+            },
         ),
     )
     .await

@@ -32,6 +32,7 @@ use crate::structs::placement::transition::{
     BucketBarrier, BucketCompletion, BucketForceFinalize, CandidatePlacementMap, CompletionProof,
     PlacementActivation, PlacementTransition, StallReport, TransitionPlan, TransitionStatus,
 };
+use crate::structs::storage::distribution::{MAX_CUTOFFS, PublisherCutoff};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::reserved_label;
 use crate::structured_id::PlacementHandle;
@@ -108,6 +109,8 @@ pub enum AdminDocumentError {
     JobFamilyRemoved,
     #[error(transparent)]
     Distribution(#[from] crate::structs::storage::distribution::DistributionError),
+    #[error("publisher cutoffs repeat a set or exceed their bound")]
+    InvalidCutoffs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

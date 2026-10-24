@@ -88,6 +88,7 @@ fn removes_config_node() {
         AdminDocumentClock::default().with_observed(origin, 1),
         AdminDocumentOperation::ConfigNodeRemoved {
             node_id: config_node,
+            cutoffs: Vec::new(),
         },
     );
 
@@ -97,6 +98,44 @@ fn removes_config_node() {
     assert!(state.materialized_config_nodes().is_empty());
     assert_eq!(state.removed_config_nodes(), BTreeSet::from([config_node]));
     assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn removal_keeps_cutoffs() {
+    use crate::structs::storage::distribution::{DistributionRevision, PublisherCutoff};
+    let cutoff = |seed: u8| PublisherCutoff {
+        set_id: Ulid::from_bytes([seed; 16]),
+        revision: DistributionRevision {
+            number: u64::from(seed),
+            digest: [seed; 32],
+        },
+    };
+    let origin = node(1);
+    let removal = |cutoffs: Vec<PublisherCutoff>| {
+        realm_config_event(
+            2,
+            origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::ConfigNodeRemoved {
+                node_id: node(12),
+                cutoffs,
+            },
+        )
+    };
+    let mut state = realm_config_state();
+    state.apply(&removal(vec![cutoff(5), cutoff(3)])).unwrap();
+    assert_eq!(
+        state.publisher_cutoffs(&node(12)),
+        Some(vec![cutoff(3), cutoff(5)])
+    );
+    assert_eq!(state.publisher_cutoffs(&node(13)), None);
+    let mut repeated = cutoff(3);
+    repeated.revision.number = 9;
+    assert_eq!(
+        realm_config_state().apply(&removal(vec![cutoff(3), repeated])),
+        Err(AdminDocumentError::InvalidCutoffs)
+    );
 }
 
 #[test]

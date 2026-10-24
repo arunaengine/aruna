@@ -1359,7 +1359,10 @@ mod pure_tests {
         state
             .apply_operation(
                 &actor,
-                AdminDocumentOperation::ConfigNodeRemoved { node_id: device },
+                AdminDocumentOperation::ConfigNodeRemoved {
+                    node_id: device,
+                    cutoffs: Vec::new(),
+                },
             )
             .unwrap();
         overlay_reducer_state(&mut config, &state, 0);

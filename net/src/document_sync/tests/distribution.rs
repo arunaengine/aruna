@@ -238,6 +238,7 @@ async fn membership_gaps_defer() {
     };
     let removed = AdminDocumentOperation::ConfigNodeRemoved {
         node_id: node(PUBLISHER),
+        cutoffs: Vec::new(),
     };
     state.apply_operation(&actor(OTHER), ensure).unwrap();
     state.apply_operation(&actor(OTHER), removed).unwrap();

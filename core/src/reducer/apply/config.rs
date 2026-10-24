@@ -14,8 +14,17 @@ impl AdminDocumentState {
             AdminDocumentOperation::ConfigNodeEnsured { node_id, kind } => {
                 self.apply_config_node(event, node_id, Some(node_kind_value(kind)));
             }
-            AdminDocumentOperation::ConfigNodeRemoved { node_id } => {
+            AdminDocumentOperation::ConfigNodeRemoved { node_id, cutoffs } => {
+                let mut sorted = cutoffs.clone();
+                sorted.sort();
+                sorted.dedup_by_key(|cutoff| cutoff.set_id);
+                if sorted.len() != cutoffs.len() || sorted.len() > MAX_CUTOFFS {
+                    return Err(AdminDocumentError::InvalidCutoffs);
+                }
                 self.apply_config_node(event, node_id, None);
+                let value = serde_json::to_string(&sorted)
+                    .map_err(|_| AdminDocumentError::InvalidCutoffs)?;
+                self.apply_config_setting(event, &publisher_cutoffs_path(node_id), value);
             }
             AdminDocumentOperation::OidcProviderUpserted { provider } => {
                 self.apply_oidc_provider(event, &provider.id, Some(oidc_provider_value(provider)));

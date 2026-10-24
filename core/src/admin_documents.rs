@@ -349,6 +349,9 @@ pub enum AdminDocumentOperation {
     #[serde(rename = "RealmConfigNodeRemoved")]
     ConfigNodeRemoved {
         node_id: NodeId,
+        /// The last revision of each set the node published, as the remover held them;
+        /// relays of the node's snapshots stop there.
+        cutoffs: Vec<crate::structs::storage::distribution::PublisherCutoff>,
     },
     /// Renames a group after creation. Only the label changes; the group id and
     /// every permission path stay as they are (postcard append-only: new
@@ -556,7 +559,10 @@ mod tests {
                 node_id: node(1),
                 kind: RealmNodeKind::Management,
             },
-            AdminDocumentOperation::ConfigNodeRemoved { node_id: node(1) },
+            AdminDocumentOperation::ConfigNodeRemoved {
+                node_id: node(1),
+                cutoffs: Vec::new(),
+            },
             AdminDocumentOperation::OidcProviderUpserted {
                 provider: oidc_provider("default"),
             },

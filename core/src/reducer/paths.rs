@@ -70,9 +70,11 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         | AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id } => {
             vec![realm_user_path(role_id, user_id)]
         }
-        AdminDocumentOperation::ConfigNodeEnsured { node_id, .. }
-        | AdminDocumentOperation::ConfigNodeRemoved { node_id } => {
+        AdminDocumentOperation::ConfigNodeEnsured { node_id, .. } => {
             vec![config_node_path(node_id)]
+        }
+        AdminDocumentOperation::ConfigNodeRemoved { node_id, .. } => {
+            vec![config_node_path(node_id), publisher_cutoffs_path(node_id)]
         }
         AdminDocumentOperation::OidcProviderUpserted { provider } => {
             vec![config_oidc_path(&provider.id)]
@@ -256,6 +258,10 @@ pub fn realm_user_path(role_id: &RoleId, user_id: &UserId) -> String {
 
 pub fn config_node_path(node_id: &NodeId) -> String {
     format!("realm_config.nodes.{node_id}")
+}
+
+pub fn publisher_cutoffs_path(node_id: &NodeId) -> String {
+    format!("realm_config.publisher_cutoffs.{node_id}")
 }
 
 pub fn config_oidc_path(provider_id: &str) -> String {

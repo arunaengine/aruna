@@ -209,6 +209,7 @@ impl RemoveNodeOperation {
             &self.config.actor,
             AdminDocumentOperation::ConfigNodeRemoved {
                 node_id: self.config.node_id,
+                cutoffs: Vec::new(),
             },
         )?;
         // The stored document is derived from the reducer, exactly as the

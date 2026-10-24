@@ -55,6 +55,17 @@ impl AdminDocumentState {
 }
 
 impl AdminDocumentState {
+    /// The cutoffs a node's removal recorded, if the realm config removed it.
+    pub fn publisher_cutoffs(&self, node_id: &NodeId) -> Option<Vec<PublisherCutoff>> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+        self.user_subject_ids
+            .get(&publisher_cutoffs_path(node_id))
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| serde_json::from_str(value).ok())
+    }
+
     pub fn materialized_group_name(&self) -> Option<String> {
         if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
             return None;

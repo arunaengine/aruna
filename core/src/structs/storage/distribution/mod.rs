@@ -180,6 +180,17 @@ pub enum SetPhase {
     Active,
 }
 
+/// At most this many sets one removed publisher's cutoffs name.
+pub const MAX_CUTOFFS: usize = 1024;
+
+/// The last revision of one set a removed publisher may still have relayed: its authority
+/// to publish ended with the realm config change that carries this cutoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct PublisherCutoff {
+    pub set_id: Ulid,
+    pub revision: DistributionRevision,
+}
+
 /// One revision of a set: its number and the digest of its canonical snapshot.
 #[derive(
     Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
