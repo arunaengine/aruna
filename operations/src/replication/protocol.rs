@@ -729,6 +729,7 @@ mod pure_tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::from_parts(3, 3)),
         });

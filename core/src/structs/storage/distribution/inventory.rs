@@ -219,7 +219,8 @@ pub fn content_identity(version: &BlobVersion) -> Option<[u8; 32]> {
             let descriptor = &source.descriptor;
             let config: BTreeMap<_, _> = descriptor.public_config.iter().collect();
             let observed = (
-                (&descriptor.kind, config, &descriptor.source_path),
+                (&descriptor.kind, config, &descriptor.namespace),
+                &descriptor.source_path,
                 &descriptor.version_selector,
                 &cached_metadata.etag,
                 cached_metadata.last_modified,
@@ -338,7 +339,7 @@ mod tests {
         };
         use std::time::SystemTime;
 
-        let reference = |bucket: &str, etag: &str| {
+        let named = |bucket: &str, etag: &str, namespace: Option<&str>| {
             let descriptor = PortableSourceDescriptor {
                 kind: SourceConnectorKind::S3,
                 public_config: [("bucket", bucket), ("endpoint", "https://s3.example")]
@@ -349,6 +350,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: namespace.map(str::to_string),
             };
             let source = VersionSourceBinding {
                 strategy: StagingStrategy::Reference,
@@ -367,7 +369,13 @@ mod tests {
             let version = BlobVersion::reference(source, observed, now, Default::default(), now);
             content_identity(&version).unwrap()
         };
+        let reference = |bucket: &str, etag: &str| named(bucket, etag, None);
         assert_eq!(reference("one", "e1"), reference("one", "e1"));
+        assert_ne!(
+            named("one", "e1", Some("alice")),
+            named("one", "e1", Some("bob")),
+            "another login namespace"
+        );
         assert_ne!(
             reference("one", "e1"),
             reference("two", "e1"),

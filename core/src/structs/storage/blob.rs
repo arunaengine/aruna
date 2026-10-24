@@ -1686,6 +1686,7 @@ mod tests {
                     version_selector: None,
                     capabilities: Vec::new(),
                     origin_node_id: None,
+                    namespace: None,
                 },
                 connector_id,
             };
@@ -1985,6 +1986,7 @@ mod tests {
                 version_selector: Some("v1".to_string()),
                 capabilities: vec!["versioned".to_string()],
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };

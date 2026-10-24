@@ -24,6 +24,9 @@ pub struct PortableSourceDescriptor {
     pub version_selector: Option<String>,
     pub capabilities: Vec<String>,
     pub origin_node_id: Option<NodeId>,
+    /// Digest of the credential principal when it selects what the address names, as a login
+    /// directory; the same on every node, never a connector id or a secret.
+    pub namespace: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -50,6 +53,7 @@ mod tests {
             version_selector: Some("v1".to_string()),
             capabilities: vec!["versioned".to_string()],
             origin_node_id: None,
+            namespace: None,
         };
 
         let restored: PortableSourceDescriptor =
@@ -72,6 +76,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::from_bytes([4u8; 16])),
         };

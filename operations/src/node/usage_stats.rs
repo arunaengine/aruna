@@ -2648,6 +2648,7 @@ mod tests {
                         version_selector: None,
                         capabilities: Vec::new(),
                         origin_node_id: None,
+                        namespace: None,
                     },
                     connector_id: Some(Ulid::generate()),
                 },
@@ -2863,6 +2864,7 @@ mod tests {
                     version_selector: Some(format!("version:{version_id}")),
                     capabilities: Vec::new(),
                     origin_node_id: Some(iroh::SecretKey::from_bytes(&[4u8; 32]).public()),
+                    namespace: None,
                 },
                 connector_id: None,
             },
@@ -2919,6 +2921,7 @@ mod tests {
                     version_selector: None,
                     capabilities: Vec::new(),
                     origin_node_id: None,
+                    namespace: None,
                 },
                 connector_id: None,
             };

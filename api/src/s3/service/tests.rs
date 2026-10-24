@@ -1030,6 +1030,7 @@ fn source_binding() -> VersionSourceBinding {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: None,
     }

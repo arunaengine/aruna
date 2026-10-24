@@ -753,6 +753,7 @@ mod tests {
                 version_selector: Some("version:v42".to_string()),
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };
@@ -793,6 +794,7 @@ mod tests {
                 version_selector: Some("etag:abc".to_string()),
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };
@@ -817,6 +819,7 @@ mod tests {
                 version_selector: Some("v42".to_string()),
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };
@@ -840,6 +843,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: None,
         };
@@ -992,6 +996,7 @@ mod tests {
                 version_selector: Some(format!("version:{version_id}")),
                 capabilities: Vec::new(),
                 origin_node_id: Some(origin),
+                namespace: None,
             },
             connector_id: None,
         };
@@ -1028,6 +1033,7 @@ mod tests {
                 version_selector: Some(format!("version:{}", Ulid::generate())),
                 capabilities: Vec::new(),
                 origin_node_id: Some(origin),
+                namespace: None,
             },
             connector_id: None,
         };
@@ -1051,6 +1057,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id,
         }
@@ -1123,6 +1130,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(connector.connector_id),
         };

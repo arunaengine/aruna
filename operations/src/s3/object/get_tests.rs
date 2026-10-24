@@ -1021,6 +1021,7 @@ async fn bound_connector_used() {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: Some(connector_id),
     };
@@ -1188,6 +1189,7 @@ async fn drift_creates_successor() {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: Some(Ulid::generate()),
     };
@@ -1374,6 +1376,7 @@ fn reference_source() -> VersionSourceBinding {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: Some(Ulid::generate()),
     }
@@ -2213,6 +2216,7 @@ async fn historical_drift_fails() {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: Some(Ulid::generate()),
     };

@@ -2122,6 +2122,7 @@ impl ReplicateObjectOperation {
                 version_selector: Some(format!("version:{}", self.request.version_id)),
                 capabilities: Vec::new(),
                 origin_node_id: Some(sync.source_node_id),
+                namespace: None,
             },
             connector_id: None,
         }
@@ -3326,6 +3327,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         }

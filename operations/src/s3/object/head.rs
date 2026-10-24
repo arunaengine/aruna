@@ -1048,6 +1048,7 @@ mod tests {
                 version_selector: Some(format!("version:{version_id}")),
                 capabilities: Vec::new(),
                 origin_node_id: Some(origin),
+                namespace: None,
             },
             connector_id: None,
         };
@@ -1166,6 +1167,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::generate()),
         };

@@ -163,16 +163,19 @@ impl ReplaceSourceOperation {
 
     fn prepare_replacement(&mut self, existing: SourceConnector) {
         let now = SystemTime::now();
-        self.replacement = Some(SourceConnector::new(
-            existing.connector_id,
-            existing.group_id,
-            self.input.name.clone(),
-            self.input.kind,
-            self.input.public_config.clone(),
-            existing.created_at,
-            now,
-            existing.created_by,
-        ));
+        self.replacement = Some(
+            SourceConnector::new(
+                existing.connector_id,
+                existing.group_id,
+                self.input.name.clone(),
+                self.input.kind,
+                self.input.public_config.clone(),
+                existing.created_at,
+                now,
+                existing.created_by,
+            )
+            .with_namespace(&self.input.secret_config),
+        );
         self.replacement_secret = SourceConnectorSecret::new(
             existing.connector_id,
             self.input.secret_config.clone(),

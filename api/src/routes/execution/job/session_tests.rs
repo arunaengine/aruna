@@ -711,6 +711,7 @@ async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::generate()),
         },
