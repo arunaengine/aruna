@@ -902,6 +902,23 @@ impl S3 for ArunaS3Service {
                 move || headers.read(Clone::clone),
             ));
         }
+        // A member that does not coordinate the key's range forwards the write.
+        if let Some(forward) = self
+            .forward_target(&req.extensions, bucket_info.as_ref(), &req.input.key)
+            .await?
+        {
+            let request = forward::ForwardRequest {
+                method: http::Method::PUT,
+                operation: "PutObject",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: forward::passed_headers(&req.headers, req.input.content_length),
+                body: req.input.body.take(),
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Ok(Self::forwarded_put(&response));
+        }
         let metadata = object_metadata(
             req.input.metadata.clone().unwrap_or_default(),
             req.input.content_type.as_deref(),
@@ -2038,6 +2055,25 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let version_id = parse_version_id(req.input.version_id)?;
+        // A delete marker for a key another member coordinates is forwarded there.
+        let bucket_info = req.extensions.get::<BucketInfo>();
+        if version_id.is_none()
+            && let Some(forward) = self
+                .forward_target(&req.extensions, bucket_info, &req.input.key)
+                .await?
+        {
+            let request = forward::ForwardRequest {
+                method: http::Method::DELETE,
+                operation: "DeleteObject",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: Vec::new(),
+                body: None,
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Ok(Self::forwarded_delete(&response));
+        }
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
             realm_id: self.realm_id,
