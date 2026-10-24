@@ -10,6 +10,7 @@ use crate::NodeId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::types::GroupId;
 
+pub mod accounting;
 pub mod hint;
 pub mod inventory;
 pub mod presets;
