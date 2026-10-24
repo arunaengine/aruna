@@ -10,6 +10,7 @@ use aruna_core::keyspaces::{
     INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
     RANGE_INDEX_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
+use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, RangeAccount, RangeCounters, RangeSlot, SampleSlot, account_key, generation_key,
     pending_key, sample_key, slot_key, slot_seek,
@@ -18,7 +19,7 @@ use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, IndexEntry, Position, VersionEntry, head_position, index_key,
     upload_position, version_position,
 };
-use aruna_core::structs::storage::distribution::{KeyRange, OriginalEpoch};
+use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange, OriginalEpoch};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -436,6 +437,36 @@ fn route(
         .filter(|(_, delta)| !delta.is_zero())
         .map(|(key, delta)| (ByteView::from(key), delta))
         .collect())
+}
+
+/// What a version row of `size` bytes contributes.
+pub fn entry_of(version: &BlobVersion, size: u64) -> VersionEntry {
+    VersionEntry {
+        marker: version.is_deleted(),
+        size,
+        referenced: matches!(version.state, BlobVersionState::Reference { .. }),
+    }
+}
+
+/// The change of one version written to `key` of a distributed bucket; with `head` the
+/// version also becomes the key's head. `None` for an ordinary bucket.
+pub fn version_written(
+    binding: Option<&DistributionBinding>,
+    key: &str,
+    added: AddedVersion,
+    head: bool,
+) -> Option<InventoryChange> {
+    let mut change = InventoryChange::new(binding?.set_id, key);
+    if head {
+        change.head = HeadChange::Set(HeadEntry {
+            version_id: added.version_id,
+            epoch: added.epoch,
+            generation: added.generation,
+            version: added.entry,
+        });
+    }
+    change.added.push(added);
+    Some(change)
 }
 
 /// The range index rows and fresh account rows of ranges this node has not opened yet.

@@ -44,6 +44,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::abe::copies::copy_version;
+use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::driver::{DriverContext, drive};
 use crate::storage_read::scan_all;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
@@ -52,6 +53,8 @@ use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocume
 pub enum UsageUpdateError {
     #[error("usage counter update received unexpected event: {0:?}")]
     UnexpectedEvent(Event),
+    #[error(transparent)]
+    Inventory(#[from] InventoryError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +62,7 @@ enum UsageUpdatePhase {
     Pending,
     Adding,
     Writing,
+    Inventory,
     Done,
 }
 
@@ -71,6 +75,8 @@ pub struct UsageCounterUpdate {
     /// The row of the bucket the change concerns, if it concerns one.
     bucket: Option<(Vec<u8>, BucketDelta)>,
     dirty_group: Option<GroupId>,
+    /// The distributed bucket rows of the key, maintained in the same transaction.
+    inventory: Option<InventoryUpdate>,
     phase: UsageUpdatePhase,
 }
 
@@ -223,6 +229,7 @@ impl UsageCounterUpdate {
             ],
             bucket: None,
             dirty_group: Some(group_id),
+            inventory: None,
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -242,6 +249,7 @@ impl UsageCounterUpdate {
             entries,
             bucket: None,
             dirty_group: Some(group_id),
+            inventory: None,
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -260,12 +268,19 @@ impl UsageCounterUpdate {
         self
     }
 
+    /// Also maintains the inventory of a distributed bucket's key; `None` for ordinary buckets.
+    pub fn with_inventory(mut self, change: Option<InventoryChange>) -> Self {
+        self.inventory = change.map(InventoryUpdate::new);
+        self
+    }
+
     /// The reclaim sweep's debit: physical bytes leave, no group counter moves.
     pub fn for_stored(stored: StoredDelta) -> Self {
         Self {
             entries: stored.entries(),
             bucket: None,
             dirty_group: None,
+            inventory: None,
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -294,6 +309,7 @@ impl UsageCounterUpdate {
         let bucket = self.bucket.as_ref().map(|(_, delta)| *delta);
         self.entries.iter().all(|(_, delta)| delta.is_zero())
             && bucket.is_none_or(|delta| delta == BucketDelta::default())
+            && self.inventory.is_none()
     }
 
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
@@ -330,8 +346,26 @@ impl UsageCounterUpdate {
                 )]))
             }
             (UsageUpdatePhase::Writing, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.phase = UsageUpdatePhase::Done;
-                Ok(None)
+                match self.inventory.as_mut() {
+                    Some(inventory) => {
+                        self.phase = UsageUpdatePhase::Inventory;
+                        Ok(Some(inventory.start(txn_id)))
+                    }
+                    None => {
+                        self.phase = UsageUpdatePhase::Done;
+                        Ok(None)
+                    }
+                }
+            }
+            (UsageUpdatePhase::Inventory, event) => {
+                let Some(inventory) = self.inventory.as_mut() else {
+                    return Err(UsageUpdateError::UnexpectedEvent(event));
+                };
+                let effects = inventory.step(event, txn_id)?;
+                if effects.is_none() {
+                    self.phase = UsageUpdatePhase::Done;
+                }
+                Ok(effects)
             }
             (_, received) => Err(UsageUpdateError::UnexpectedEvent(received)),
         }
