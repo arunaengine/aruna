@@ -168,6 +168,7 @@ pub async fn upload(
         size: object.size,
         sha256: object.oid.clone(),
         blake3: [0; 32],
+        global: None,
     };
     permit(context, auth, &target, Permission::WRITE).await?;
     let content = (target.key, object.size, object.oid.as_str());

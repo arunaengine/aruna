@@ -249,6 +249,7 @@ fn stored() -> (Value, LinkedObject) {
         size: 12,
         sha256: OID.into(),
         blake3: [5; 32],
+        global: None,
     };
     let linked = LinkedObject {
         entity: id,

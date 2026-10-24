@@ -35,6 +35,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::data_identity::{DataIdentity, text_values};
+use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::telemetry::time_stage;
@@ -121,7 +122,7 @@ async fn resolve(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or(GitError::Unavailable)?;
-    let (size, hashes, group_id) = if exact.node_id == node {
+    let (size, hashes, group_id, global) = if exact.node_id == node {
         let bucket = drive(GetBucketOperation::new(exact.bucket.clone()), context)
             .await
             .map_err(|_| GitError::NotFound)?;
@@ -156,7 +157,11 @@ async fn resolve(
         let info = get_object_info(context, input, None)
             .await
             .map_err(|_| GitError::NotFound)?;
-        (info.size, info.hashes, Some(bucket.group_id))
+        let global = bucket.distribution.as_ref().map(|_| GlobalId::Version {
+            realm_id: exact.realm_id,
+            version_id: exact.version,
+        });
+        (info.size, info.hashes, Some(bucket.group_id), global)
     } else {
         let request = BaoReadRequest {
             auth_context: auth.clone(),
@@ -169,7 +174,7 @@ async fn resolve(
             range: None,
         };
         match managed_read(context, exact.node_id, request).await {
-            Ok(BaoReadOutput::Metadata { size, hashes, .. }) => (size, hashes, None),
+            Ok(BaoReadOutput::Metadata { size, hashes, .. }) => (size, hashes, None, None),
             _ => return Err(GitError::NotFound),
         }
     };
@@ -188,6 +193,7 @@ async fn resolve(
             .get(HASH_BLAKE3)
             .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
             .ok_or(GitError::Unavailable)?,
+        global,
     })
 }
 
@@ -253,6 +259,18 @@ async fn located(
     }
     let mut found = Vec::new();
     let node = context.net_handle.as_ref().map(|net| net.node_id());
+    // A global id resolves on a member of its set; other holders are the resolver's to choose.
+    if let (Some(GlobalId::Version { version_id, .. }), Some(node)) = (
+        identity
+            .global
+            .as_ref()
+            .filter(|global| global.realm_id() == realm_id),
+        node,
+    ) && let Ok(Some((bucket, key))) =
+        crate::metadata::global_entries::local_version(context, *version_id).await
+    {
+        found.extend(VersionedObjectArn::new(realm_id, node, bucket, key, *version_id).ok());
+    }
     if let (Some(location), Some(node)) = (&identity.location, node)
         && let Ok(bucket) = drive(GetBucketOperation::new(location.bucket.clone()), context).await
         && let Ok(Some(object)) = objects::described(

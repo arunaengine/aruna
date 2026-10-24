@@ -210,6 +210,7 @@ pub async fn described(
         size: location.blob_size,
         sha256: hex::encode(sha256),
         blake3,
+        global: None,
     }))
 }
 

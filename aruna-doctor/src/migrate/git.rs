@@ -141,6 +141,7 @@ mod tests {
             size: 42,
             sha256: "ab".repeat(32),
             blake3: [3; 32],
+            global: None,
         };
         let old = LegacyRecord {
             event_id: Ulid::from(5),
