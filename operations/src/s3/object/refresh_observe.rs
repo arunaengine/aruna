@@ -36,6 +36,21 @@ pub enum ObserveError {
     },
 }
 
+impl ObserveError {
+    /// The observed version is gone or can no longer be resolved; source and storage failures
+    /// pass and are retried.
+    pub(crate) fn is_obsolete(&self) -> bool {
+        match self {
+            Self::NotReference | Self::Conversion(_) => true,
+            Self::Resolve(error) => !matches!(
+                error,
+                SourceResolutionError::StorageError(_) | SourceResolutionError::ResolveFailed
+            ),
+            Self::Storage(_) | Self::Source(_) | Self::UnexpectedEvent { .. } => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObserveState {
     Init,
@@ -173,9 +188,16 @@ mod tests {
             error: StagingSourceError::ReadError("reset".to_string()),
         }));
 
+        let error = operation.finalize().unwrap_err();
         assert!(matches!(
-            operation.finalize(),
-            Err(ObserveError::Source(StagingSourceError::ReadError(_)))
+            error,
+            ObserveError::Source(StagingSourceError::ReadError(_))
         ));
+        assert!(!error.is_obsolete());
+        assert!(ObserveError::NotReference.is_obsolete());
+        assert!(
+            !ObserveError::Resolve(SourceResolutionError::StorageError(StorageError::Timeout))
+                .is_obsolete()
+        );
     }
 }

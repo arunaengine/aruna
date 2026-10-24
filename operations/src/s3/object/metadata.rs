@@ -471,9 +471,12 @@ async fn observe_and_refresh(
 ) -> Result<(), String> {
     if refresh.metadata.is_none() {
         let version_key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id);
-        let observed = drive(ObserveSourceOperation::new(version_key), context)
-            .await
-            .map_err(|error| error.to_string())?;
+        let observed = match drive(ObserveSourceOperation::new(version_key), context).await {
+            Ok(observed) => observed,
+            // Work for a version that is gone or no longer resolvable is finished, not retried.
+            Err(error) if error.is_obsolete() => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
         refresh.metadata = Some(observed);
         refresh.refreshed_at = SystemTime::now().max(refresh.refreshed_at);
     }
@@ -1188,9 +1191,9 @@ mod tests {
         assert_eq!(head.generation, 2);
     }
 
-    // A request without an observation keeps its job until the worker can observe the source.
+    // A request for a version that no longer exists is finished instead of retried forever.
     #[tokio::test]
-    async fn observation_request_retried() {
+    async fn obsolete_request_finished() {
         let test = setup_state();
         let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let mut request = refresh(&test, source_metadata(1, "unused"), refreshed_at);
@@ -1201,8 +1204,8 @@ mod tests {
 
         let result = process_batch(&test.context).await.expect("drain runs");
 
-        assert_eq!((result.succeeded, result.failed), (0, 1));
-        assert_eq!(read_jobs(&test.context.storage_handle).await.len(), 1);
+        assert_eq!((result.succeeded, result.failed), (1, 0));
+        assert!(read_jobs(&test.context.storage_handle).await.is_empty());
     }
 
     #[tokio::test]
