@@ -11,6 +11,7 @@ yanked = "deny"
 # updates; new advisories beyond this set still fail the gate.
 ignore = [
     "RUSTSEC-2023-0071", # rsa Marvin timing sidechannel, no fixed release
+    "RUSTSEC-2026-0387", # crypto-bigint 0.5 via elliptic-curve 0.13 (jsonwebtoken, bls12_381_plus), no 0.5 fix
     "RUSTSEC-2023-0089", # atomic-polyfill unmaintained (transitive)
     "RUSTSEC-2024-0370", # proc-macro-error unmaintained (transitive)
     "RUSTSEC-2024-0436", # paste unmaintained (transitive)
