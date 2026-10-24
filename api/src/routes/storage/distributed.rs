@@ -91,6 +91,12 @@ pub struct SettingsRequest {
     pub search_index: bool,
     #[serde(default)]
     pub public: bool,
+    /// A range splits once its coordinator counts more current objects; omitted never splits.
+    #[serde(default)]
+    pub split_objects: Option<u64>,
+    /// A range splits once its current bytes exceed this; omitted never splits.
+    #[serde(default)]
+    pub split_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -154,6 +160,9 @@ pub struct RangeResponse {
     /// Exclusive upper key bound; omitted for the end of the key space.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upper: Option<String>,
+    /// The range this one was split from; omitted for a range from the creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<String>,
     pub coordinator: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_node: Option<String>,
@@ -252,6 +261,8 @@ fn create_input(group_id: Ulid, request: CreateDistributedRequest) -> ServerResu
         }),
         search_index: request.settings.search_index,
         public: request.settings.public,
+        split_objects: request.settings.split_objects,
+        split_bytes: request.settings.split_bytes,
     };
     Ok(CreateInput {
         bucket: request.bucket,
@@ -314,6 +325,7 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
             range_id: range.range_id.to_string(),
             lower: range.lower,
             upper: range.upper,
+            lineage: range.lineage.map(|lineage| lineage.to_string()),
             coordinator: range.coordinator.to_string(),
             coordinator_node: range.coordinator_node.map(|node| node.to_string()),
             epoch: range.epoch,
@@ -352,9 +364,9 @@ pub(crate) fn map_guard_error(error: GuardError) -> ServerError {
         GuardError::NotCoordinator { .. }
         | GuardError::RecordMissing(_)
         | GuardError::Unreadable(_)
-        | GuardError::Route(RouteError::Pending(_) | RouteError::Moving(_)) => {
-            ServerError::ServiceUnavailableReason(error.to_string())
-        }
+        | GuardError::Route(
+            RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
+        ) => ServerError::ServiceUnavailableReason(error.to_string()),
         GuardError::Route(_) | GuardError::Unbound(_) => ServerError::Conflict(error.to_string()),
         GuardError::Conversion(error) => ServerError::InternalError(error.to_string()),
     }

@@ -22,7 +22,9 @@ pub mod presets;
 pub mod request;
 pub mod route;
 pub mod snapshot;
+pub mod split;
 pub mod statement;
+pub mod upload;
 pub mod validate;
 
 pub use delivery::{AdmissionError, Delivery, Publication};
@@ -169,6 +171,10 @@ pub struct DistributionSettings {
     pub range_behaviour: Option<RangeBehaviour>,
     pub search_index: bool,
     pub public: bool,
+    /// A range whose coordinator counts more current objects than this splits; `None` never.
+    pub split_objects: Option<u64>,
+    /// A range whose current bytes exceed this splits; `None` never.
+    pub split_bytes: Option<u64>,
 }
 
 /// The configuration a `create` carries in full.

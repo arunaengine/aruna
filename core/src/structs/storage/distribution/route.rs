@@ -41,6 +41,10 @@ pub enum RouteError {
     NotMember(Ulid),
     #[error("no range of distributed bucket {0} holds the key")]
     NoRange(Ulid),
+    #[error(
+        "range {0} no longer leads to the key's range or epoch; retry after the record updates"
+    )]
+    StaleRange(Ulid),
 }
 
 /// Where a read is answered.

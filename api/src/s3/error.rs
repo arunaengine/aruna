@@ -132,9 +132,9 @@ pub(crate) fn guard_error(error: &GuardError) -> S3Error {
         GuardError::NotCoordinator { .. } => distributed_error("WrongCoordinator", message, true),
         GuardError::RecordMissing(_)
         | GuardError::Unreadable(_)
-        | GuardError::Route(RouteError::Pending(_) | RouteError::Moving(_)) => {
-            distributed_error("DistributedBucketUnavailable", message, true)
-        }
+        | GuardError::Route(
+            RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
+        ) => distributed_error("DistributedBucketUnavailable", message, true),
         GuardError::Route(
             RouteError::Deleting(_) | RouteError::NotMember(_) | RouteError::NoRange(_),
         )

@@ -176,8 +176,7 @@ impl DistributionSnapshot {
         if coordinator.node_id != sender {
             return Err(AdmissionError::NotCoordinator(sender));
         }
-        let named =
-            publication.range_id == range.range_id || range.lineage == Some(publication.range_id);
+        let named = self.descends(range, publication.range_id);
         if !named || publication.epoch != range.publication_epoch() {
             return Err(AdmissionError::Stale {
                 range_id: range.range_id,
@@ -242,6 +241,7 @@ mod tests {
             statements: Vec::new(),
             tombstones: Vec::new(),
             admin_number: 1,
+            retired: Vec::new(),
         }
     }
 

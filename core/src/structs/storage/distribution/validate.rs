@@ -84,6 +84,8 @@ pub enum DistributionError {
     UnknownSet,
     #[error("only the set's publisher publishes its revisions")]
     NotPublisher,
+    #[error("a split threshold must be at least one")]
+    InvalidSplit,
 }
 
 /// Checks the shape of a configuration; record-level checks add the encoded size.
@@ -96,6 +98,9 @@ pub fn validate_config(config: &DistributionConfig) -> Result<(), DistributionEr
     }
     if config.settings.refresh_secs == Some(0) {
         return Err(DistributionError::InvalidRefresh);
+    }
+    if config.settings.split_objects == Some(0) || config.settings.split_bytes == Some(0) {
+        return Err(DistributionError::InvalidSplit);
     }
     let members = validate_members(config)?;
     validate_ranges(&config.ranges)?;

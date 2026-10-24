@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::snapshot::{DistributionSnapshot, Lifecycle};
+use super::split::apply_split;
 use super::validate::validate_config;
 use super::{
     DistributionConfig, DistributionError, DistributionMember, DistributionSettings,
@@ -103,6 +104,9 @@ pub fn next_snapshot(
         (None, _) => return Err(DistributionError::UnknownSet),
         (Some(head), request) => {
             let mut next = head.clone();
+            // A split statement is evidence for the revision that applies it only.
+            next.statements
+                .retain(|signed| !matches!(signed.statement.kind, StatementKind::Split { .. }));
             accept(realm_id, &mut next, request)?;
             next.number = head.number + 1;
             next.previous = Some(head.digest());
@@ -153,6 +157,7 @@ fn created(
         statements: Vec::new(),
         tombstones: Vec::new(),
         admin_number: 1,
+        retired: Vec::new(),
     })
 }
 
@@ -181,6 +186,9 @@ fn accept(
         DistributionRequest::ChangeSettings { settings } => {
             if settings.refresh_secs == Some(0) {
                 return Err(DistributionError::InvalidRefresh);
+            }
+            if settings.split_objects == Some(0) || settings.split_bytes == Some(0) {
+                return Err(DistributionError::InvalidSplit);
             }
             next.config.settings = settings.clone();
             Ok(())
@@ -253,6 +261,11 @@ fn embed(
         } => {
             next.statements.push(signed.clone());
             caught_up(next, statement.member_id, *member_id, *intent)
+        }
+        StatementKind::Split { .. } => {
+            apply_split(next, statement)?;
+            next.statements.push(signed.clone());
+            Ok(())
         }
         kind => Err(DistributionError::Unsupported(kind.name())),
     }

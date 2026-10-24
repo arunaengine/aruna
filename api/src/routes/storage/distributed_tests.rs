@@ -109,6 +109,7 @@ fn degraded_names_coordinator() {
             range_id: Ulid::from_bytes([3; 16]),
             lower: String::new(),
             upper: None,
+            lineage: None,
             coordinator: Ulid::from_bytes([2; 16]),
             coordinator_node: Some(node),
             epoch: 1,

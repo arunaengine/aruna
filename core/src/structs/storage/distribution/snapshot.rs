@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::split::{RetiredRange, check_retired};
 use super::validate::validate_config;
 use super::{
     DistributionConfig, DistributionError, DistributionMember, DistributionRevision, KeyRange,
@@ -69,6 +70,8 @@ pub struct DistributionSnapshot {
     pub tombstones: Vec<Tombstone>,
     /// The last revision an admin request produced; older automatic requests are stale.
     pub admin_number: u64,
+    /// Ranges splits replaced, so ancestor ids in requests and uploads still resolve.
+    pub retired: Vec<RetiredRange>,
 }
 
 impl DistributionSnapshot {
@@ -131,6 +134,7 @@ impl DistributionSnapshot {
             ));
         }
         validate_config(&self.config)?;
+        check_retired(self)?;
         if self.config.owner_group != self.root.owner_group {
             return Err(DistributionError::ForeignSet(self.set_id()));
         }

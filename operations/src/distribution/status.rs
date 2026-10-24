@@ -57,6 +57,8 @@ pub struct RangeStatus {
     pub range_id: Ulid,
     pub lower: String,
     pub upper: Option<String>,
+    /// The range this one was split from.
+    pub lineage: Option<Ulid>,
     pub coordinator: Ulid,
     pub coordinator_node: Option<NodeId>,
     pub epoch: u64,
@@ -110,6 +112,7 @@ pub fn summarize(
                 range_id: range.range_id,
                 lower: range.lower.clone(),
                 upper: range.upper.clone(),
+                lineage: range.lineage,
                 coordinator: range.coordinator,
                 coordinator_node,
                 epoch: range.epoch,
