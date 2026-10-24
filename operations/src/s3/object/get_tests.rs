@@ -1474,6 +1474,48 @@ fn source_read(metadata: SourceMetadata) -> Event {
     })
 }
 
+// A distributed bucket records source changes only through the coordinated refresh, so a
+// drifted read there fails and releases its transaction instead of advancing the binding.
+#[test]
+fn bound_bucket_never_advances() {
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::format::Compression;
+
+    let mut operation = drifted_operation();
+    let txn_id = Ulid::generate();
+    operation.txn_id = Some(txn_id);
+    operation.state = GetObjectState::ReadBucketAdvance;
+    let bucket = BucketInfo {
+        group_id: Ulid::from_bytes([2; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(DistributionBinding {
+            set_id: Ulid::from_bytes([5; 16]),
+            member_id: Ulid::from_bytes([6; 16]),
+            incarnation: 1,
+            revision: Default::default(),
+        }),
+    };
+    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: Some(bucket.to_bytes().unwrap().into()),
+    }));
+    assert_eq!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    );
+    assert!(matches!(
+        operation.finalize(),
+        Err(GetObjectError::ReferenceSourceChanged)
+    ));
+}
+
 // CAS: only the reader whose head still matches may write the successor;
 // a concurrent winner makes this read abort and restart.
 #[test]

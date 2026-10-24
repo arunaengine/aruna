@@ -34,7 +34,7 @@ use aruna_core::errors::{
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     ABE_GRANT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
@@ -53,7 +53,7 @@ use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::abe_access::{KeyGrant, MAX_REQUESTS};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, CurrentVersionPointer, HiddenBlobKey, ManagedCopyKey, VersionKey,
+    BlobVersionState, BucketInfo, CurrentVersionPointer, HiddenBlobKey, ManagedCopyKey, VersionKey,
 };
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease, TokenCredential,
@@ -98,6 +98,8 @@ pub enum GetObjectState {
     CommitTransaction,
     HeadReferenceSource,
     StartAdvanceTransaction,
+    /// Reads the bucket in the advance transaction; a distributed bucket never advances here.
+    ReadBucketAdvance,
     ReadHeadAdvance,
     ReadAdvance,
     WriteSuccessor,
@@ -1177,9 +1179,37 @@ impl GetObjectOperation {
             });
         };
         self.txn_id = Some(txn_id);
+        self.state = GetObjectState::ReadBucketAdvance;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// Source changes of a distributed bucket become successors only through the coordinated
+    /// refresh, so a read there fails instead of advancing the binding.
+    fn handle_advance_bucket(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.abort_with_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let bucket = match value
+            .map(|value| BucketInfo::from_bytes(&value))
+            .transpose()
+        {
+            Ok(bucket) => bucket,
+            Err(err) => return self.abort_with_error(GetObjectError::ConversionError(err)),
+        };
+        if bucket.is_some_and(|bucket| bucket.distribution.is_some()) {
+            return self.abort_with_error(GetObjectError::ReferenceSourceChanged);
+        }
         let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
             Ok(key) => key.into(),
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+            Err(err) => return self.abort_with_error(GetObjectError::ConversionError(err)),
         };
         self.state = GetObjectState::ReadHeadAdvance;
         smallvec![Effect::Storage(StorageEffect::Read {
@@ -1789,6 +1819,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectState::HeadReferenceSource => self.reference_head_received(event),
             GetObjectState::StartAdvanceTransaction => self.handle_advance_started(event),
+            GetObjectState::ReadBucketAdvance => self.handle_advance_bucket(event),
             GetObjectState::ReadHeadAdvance => self.handle_advance_head(event),
             GetObjectState::ReadAdvance => self.handle_advance_version(event),
             GetObjectState::WriteSuccessor => self.handle_successor_written(event),
