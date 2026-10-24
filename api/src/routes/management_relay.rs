@@ -55,6 +55,7 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/access/onboarding/bootstrap"),
     ("POST", "/access/onboarding/secrets"),
     ("POST", "/access/sessions"),
+    ("POST", "/access/users/register"),
     ("PUT", "/access/policies/realm"),
     ("PUT", "/access/users/{id}/status"),
     ("PUT", "/compute/config"),

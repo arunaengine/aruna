@@ -79,6 +79,17 @@ fn hop_stops_relay() {
 }
 
 #[test]
+fn relays_user_registration() {
+    // A device has no subject index for realm users; a local register mints a stray user.
+    let route = Some("/api/v1/access/users/register");
+    assert_eq!(
+        relay_route(&Method::POST, route, false, false),
+        Some("/access/users/register")
+    );
+    assert_eq!(relay_route(&Method::POST, route, true, false), None);
+}
+
+#[test]
 fn management_answers_itself() {
     assert_eq!(
         relay_route(
