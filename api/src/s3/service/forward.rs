@@ -199,11 +199,19 @@ pub(super) fn passed_headers(
     passed
 }
 
+/// Query parameters of a presigned SigV2 request; SigV4 ones all start with `X-Amz-`.
+const PRESIGN_V2: &[&str] = &["AWSAccessKeyId", "Signature", "Expires"];
+
 /// The query of a forwarded request without presigning parameters.
 pub(super) fn passed_query(query: Option<&str>) -> Option<String> {
     let kept: Vec<&str> = query?
         .split('&')
-        .filter(|pair| !pair.is_empty() && !pair.to_ascii_lowercase().starts_with("x-amz-"))
+        .filter(|pair| {
+            let name = pair.split('=').next().unwrap_or_default();
+            !name.is_empty()
+                && !name.to_ascii_lowercase().starts_with("x-amz-")
+                && !PRESIGN_V2.contains(&name)
+        })
         .collect();
     (!kept.is_empty()).then(|| kept.join("&"))
 }

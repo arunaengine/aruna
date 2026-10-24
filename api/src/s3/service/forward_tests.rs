@@ -48,6 +48,10 @@ fn signatures_stay_behind() {
         Some("tagging".to_string())
     );
     assert_eq!(passed_query(Some("X-Amz-Date=1")), None);
+    assert_eq!(
+        passed_query(Some("AWSAccessKeyId=a&Signature=s&Expires=9&partNumber=2")),
+        Some("partNumber=2".to_string())
+    );
 }
 
 #[test]
