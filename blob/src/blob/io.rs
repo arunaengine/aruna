@@ -10,6 +10,7 @@ use super::backend::{
 use super::group::GROUP_WRITE_CHUNK;
 use super::pithos::{ArchiveEncoder, Share, working_set};
 use super::plain::Held;
+use super::spool::{ChargeSettle, charge_key};
 use crate::codec::{FrameEncoder, Guard};
 use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
@@ -1953,6 +1954,7 @@ impl BlobHandler {
     /// Reserves `max_bytes` of the spool budget for `spool`; deleting the spool releases it.
     pub(super) async fn spool_transient(
         &self,
+        (namespace, name): (Ulid, &str),
         max_bytes: Option<u64>,
         spool: impl Future<Output = BlobEvent>,
     ) -> BlobEvent {
@@ -1969,12 +1971,18 @@ impl BlobHandler {
         let Ok(permit) = self.spool_budget.clone().try_acquire_many_owned(units) else {
             return BlobEvent::Error(BlobError::SpoolBudgetExhausted { limit });
         };
+        let charge = match self.hold_charge((namespace, name), units, permit).await {
+            Ok(charge) => charge,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let mut settle = ChargeSettle {
+            handler: self.clone(),
+            namespace,
+            charge,
+            armed: true,
+        };
         let event = spool.await;
-        if let BlobEvent::HiddenSpooled { location, .. } = &event
-            && let Ok(mut held) = self.transient_spools.lock()
-        {
-            held.insert(location.backend_path.clone(), permit);
-        }
+        settle.armed = !matches!(event, BlobEvent::HiddenSpooled { .. });
         event
     }
 
@@ -1987,10 +1995,7 @@ impl BlobHandler {
             Ok(key) => key,
             Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
         };
-        let transient = self
-            .transient_spools
-            .lock()
-            .is_ok_and(|held| held.contains_key(&key.backend_path));
+        let transient = charge_key(&key.backend_path).is_some_and(|charge| self.charged(charge));
         let cleanup = transient.then(|| SpoolCleanup {
             handler: self.clone(),
             key,
@@ -2028,8 +2033,10 @@ impl BlobHandler {
         if let Err(error) = self.delete_path(&operator, &storage_path).await {
             return BlobEvent::Error(BlobError::DeleteError(error.to_string()));
         }
-        if let Ok(mut held) = self.transient_spools.lock() {
-            held.remove(&key.backend_path);
+        if let Some(charge) = charge_key(&key.backend_path).filter(|charge| self.charged(charge))
+            && let Err(error) = self.release_charge(charge).await
+        {
+            return BlobEvent::Error(error);
         }
         if let Err(error) = self.release_hidden(&key).await {
             return BlobEvent::Error(error);

@@ -621,6 +621,9 @@ impl BlobHandler {
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;
+        if let Err(error) = blob_handler.restore_charges().await {
+            tracing::warn!(%error, "transient spool charges were not restored");
+        }
         let status_handler = blob_handler.clone();
         let monitor_cancel = blob_handler.monitor_cancel.clone();
         let monitor_task = tokio::spawn(async move {
@@ -821,10 +824,15 @@ impl BlobHandler {
                 blob,
                 transient,
             } => {
+                // A transient spool gets a name of its own, so its charge names only it.
+                let name = match transient {
+                    true => format!("{name}-{}", Ulid::generate()),
+                    false => name,
+                };
                 let spool =
                     self.spool_hidden_blob(namespace, &name, created_by, max_bytes, deadline, blob);
                 if transient {
-                    Box::pin(self.spool_transient(max_bytes, spool)).await
+                    Box::pin(self.spool_transient((namespace, &name), max_bytes, spool)).await
                 } else {
                     Box::pin(spool).await
                 }

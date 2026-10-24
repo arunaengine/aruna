@@ -30,6 +30,7 @@ mod registry;
 mod replication;
 mod runtime;
 mod source;
+mod spool;
 mod unlock;
 
 pub use group::{BackendClaim, GroupHold};
@@ -96,7 +97,7 @@ pub struct BlobHandler {
     unlocks: Arc<StdMutex<unlock::UnlockRegistry>>,
     /// Pithos working set in MiB permits, shared by archive opens, encoders and compositions.
     pithos_budget: Arc<Semaphore>,
-    /// Transient spool budget in MiB permits, and the permits held by spool path.
+    /// Transient spool budget in MiB permits, and the permits held by spool charge.
     spool_budget: Arc<Semaphore>,
     transient_spools: Arc<StdMutex<HashMap<String, OwnedSemaphorePermit>>>,
 }

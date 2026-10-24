@@ -20,7 +20,7 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE, PATHS_INDEX_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE,
+    SPOOL_CHARGE_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::Status;
@@ -1581,6 +1581,76 @@ async fn transient_spool_cleanup() {
         context.blob_handle.send_blob_effect(oversized).await,
         Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit }))
     );
+}
+
+// Spool charges outlive the process: a restart charges leftover spools again and drops
+// charges whose spools are gone, and a failed spool settles its own charge.
+#[tokio::test]
+async fn spool_charges_restored() {
+    let context = setup_blob_handle(5).await;
+    let handler = &context.blob_handle.handler;
+    let namespace = Ulid::from_bytes([13u8; 16]);
+    let full = handler.spool_budget.available_permits();
+    let spool = |name: &str, bytes: &[u8]| BlobEffect::SpoolHidden {
+        namespace,
+        name: name.to_string(),
+        created_by: test_user_id(),
+        max_bytes: Some(4),
+        deadline: None,
+        blob: stream_from_bytes(bytes),
+        transient: true,
+    };
+    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = context
+        .blob_handle
+        .send_blob_effect(spool("kept", b"four"))
+        .await
+    else {
+        panic!("transient spool failed")
+    };
+    let stale = StorageEffect::Write {
+        key_space: SPOOL_CHARGE_KEYSPACE.to_string(),
+        key: format!("_jobs/{namespace}/gone-{}", Ulid::nil())
+            .into_bytes()
+            .into(),
+        value: postcard::to_allocvec(&1u32).unwrap().into(),
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(stale).await;
+
+    // A restart starts without held permits.
+    handler.transient_spools.lock().unwrap().clear();
+    handler.restore_charges().await.unwrap();
+    assert_eq!(handler.spool_budget.available_permits(), full - 1);
+    assert_eq!(
+        keyspace_count(&context.storage_handle, SPOOL_CHARGE_KEYSPACE).await,
+        1
+    );
+
+    let key = HiddenBlobKey::try_from(&location).unwrap();
+    assert_eq!(
+        context
+            .blob_handle
+            .send_blob_effect(BlobEffect::DeleteHidden { key })
+            .await,
+        Event::Blob(BlobEvent::HiddenDeleted)
+    );
+    assert_eq!(handler.spool_budget.available_permits(), full);
+
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(spool("failed", b"too long"))
+            .await,
+        Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 4 }))
+    ));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while keyspace_count(&context.storage_handle, SPOOL_CHARGE_KEYSPACE).await > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a failed spool must settle its charge");
+    assert_eq!(handler.spool_budget.available_permits(), full);
 }
 
 #[tokio::test]
