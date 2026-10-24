@@ -49,6 +49,13 @@ pub(crate) async fn list_http_autoindex(
 
     while let Some(dir) = queue.pop_front() {
         if fetches == MAX_INDEX_FETCHES {
+            // Without an entry the next page could not move on, so the walk fails instead.
+            if entries.is_empty() {
+                return Err(StagingSourceError::InvalidListing(format!(
+                    "the source holds more than {MAX_INDEX_FETCHES} directory indexes without \
+                     entries; list a narrower path"
+                )));
+            }
             return Ok((entries, true));
         }
         fetches += 1;
