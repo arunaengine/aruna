@@ -574,6 +574,10 @@ async fn manifest_policy(
         Err(GetBucketError::NotFound) => manifest.group_id,
         Err(error) => return Err(error.to_string()),
     };
+    // The member admits a publication against its record of the set, not a user's grants.
+    if manifest.distribution.is_some() {
+        return Ok((None, None));
+    }
     let path = if manifest.key.is_empty() {
         bucket_permission_path(local_realm, group_id, local_node, &manifest.bucket)
     } else {

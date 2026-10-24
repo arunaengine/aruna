@@ -57,7 +57,9 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::distribution::inventory::{VersionEntry, logical_identity};
-use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
+use aruna_core::structs::storage::distribution::{
+    AdmissionError, DistributionBinding, OriginalEpoch,
+};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
@@ -109,6 +111,10 @@ enum IncomingVersionState {
     StartTransaction,
     CheckPurgeFence,
     CheckDrift,
+    /// Reads the record of the destination's set to admit a publication.
+    ReadPublicationRecord,
+    /// Reads that record again inside the apply transaction.
+    RecheckPublication,
     VerifyReplaced,
     ReadReplacedEnvelope,
     ReadReplacedRows,
@@ -236,6 +242,13 @@ pub enum IncomingVersionError {
     StalePlan,
     #[error(transparent)]
     Blob(#[from] BlobError),
+    #[error(transparent)]
+    Admission(#[from] AdmissionError),
+    /// A member bucket takes only its coordinators' publications, and only it takes them.
+    #[error("only a distributed bucket's coordinators publish to its member buckets")]
+    ForeignPublication,
+    #[error("the record of the destination's distributed bucket has not reached this node yet")]
+    RecordMissing,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -548,7 +561,10 @@ impl Operation for IncomingVersionOperation {
         {
             return self.reject_negotiation(IncomingVersionError::RealmMismatch);
         }
-        if self.manifest.writer_auth_context.is_none() && self.manifest.reference_advance.is_none()
+        // A publication is admitted against the record instead of a writer's permissions.
+        if self.manifest.writer_auth_context.is_none()
+            && self.manifest.reference_advance.is_none()
+            && self.manifest.distribution.is_none()
         {
             return self.reject_negotiation(IncomingVersionError::WriterPermissionDenied);
         }
@@ -593,6 +609,8 @@ impl Operation for IncomingVersionOperation {
             IncomingVersionState::StartTransaction => self.accept_transaction_start(event),
             IncomingVersionState::CheckPurgeFence => self.accept_purge_fence(event),
             IncomingVersionState::CheckDrift => self.accept_drift_check(event),
+            IncomingVersionState::ReadPublicationRecord => self.accept_publication_record(event),
+            IncomingVersionState::RecheckPublication => self.accept_publication_recheck(event),
             // Apply/commit: expose the version and settle ownership.
             IncomingVersionState::VerifyReplaced => self.accept_replaced_version(event),
             IncomingVersionState::ReadReplacedEnvelope => self.accept_replaced_envelope(event),
@@ -714,6 +732,8 @@ impl IncomingVersionOperation {
             IncomingVersionState::StartTransaction => "StartTransaction",
             IncomingVersionState::CheckPurgeFence => "CheckPurgeFence",
             IncomingVersionState::CheckDrift => "CheckDrift",
+            IncomingVersionState::ReadPublicationRecord => "ReadPublicationRecord",
+            IncomingVersionState::RecheckPublication => "RecheckPublication",
             IncomingVersionState::VerifyReplaced => "VerifyReplaced",
             IncomingVersionState::ReadReplacedEnvelope => "ReadReplacedEnvelope",
             IncomingVersionState::ReadReplacedRows => "ReadReplacedRows",
@@ -1081,6 +1101,9 @@ impl IncomingVersionOperation {
     }
 
     fn check_permissions(&mut self, group_id: Ulid) -> Effects {
+        if self.manifest.distribution.is_some() {
+            return self.read_publication_record(false);
+        }
         let path = self.target_authorization_path(group_id);
         if self.manifest_policy.as_deref() != Some(path.as_str()) {
             return self.reject_negotiation(IncomingVersionError::ManifestPermissionDenied);
@@ -2588,7 +2611,7 @@ impl IncomingVersionOperation {
         }
 
         let Some(value) = value else {
-            if self.create_attempted {
+            if self.create_attempted || self.manifest.distribution.is_some() {
                 return self.reject_negotiation(IncomingVersionError::DestinationNotFound);
             }
             if self.manifest.reference_advance.is_some() {
@@ -2622,6 +2645,9 @@ impl IncomingVersionOperation {
         self.destination_compression = bucket_info.compression;
         self.destination_bound = bucket_info.distribution.is_some();
         self.destination_binding = bucket_info.distribution.clone();
+        if self.destination_bound != self.manifest.distribution.is_some() {
+            return self.reject_negotiation(IncomingVersionError::ForeignPublication);
+        }
         let Some(key) = settings
             .active_key()
             .filter(|_| self.manifest.kind == ReplicationItemKind::Materialized)
@@ -3170,6 +3196,13 @@ impl IncomingVersionOperation {
             Ok(split) => split,
             Err(error) => return self.fail(error.into()),
         };
+        // A bucket bound or replaced since the negotiation takes nothing from this stream.
+        let binding = bucket
+            .as_ref()
+            .and_then(|bucket| bucket.distribution.clone());
+        if binding != self.destination_binding {
+            return self.fail(IncomingVersionError::ForeignPublication);
+        }
         let observed = GatedBucket::observe(bucket.as_ref());
         if let Some(gated) = self.gated_bucket.as_ref() {
             if !gated.matches(&observed) {
@@ -3194,7 +3227,10 @@ impl IncomingVersionOperation {
         {
             return self.fail(StorageError::TransactionConflict.into());
         }
-        self.verify_replaced()
+        match self.manifest.distribution {
+            Some(_) => self.read_publication_record(true),
+            None => self.verify_replaced(),
+        }
     }
 }
 
@@ -3756,6 +3792,8 @@ fn same_reference(existing: &BlobVersion, incoming: &BlobVersion) -> bool {
     existing == *incoming
 }
 
+mod admission;
+
 #[cfg(test)]
 mod pure_tests;
 
@@ -3763,3 +3801,7 @@ mod pure_tests;
 /// without a compliant local destination, and a reference registers nothing.
 #[cfg(test)]
 mod decision_tests;
+
+#[cfg(test)]
+#[path = "admission_tests.rs"]
+mod admission_tests;

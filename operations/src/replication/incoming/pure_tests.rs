@@ -262,7 +262,7 @@ async fn refused_copy_absent() {
     }
 }
 
-fn test_realm_id() -> RealmId {
+pub(super) fn test_realm_id() -> RealmId {
     RealmId::from_bytes([7u8; 32])
 }
 
@@ -336,7 +336,7 @@ fn make_location() -> BackendLocation {
     }
 }
 
-fn make_bucket_info(group_id: Ulid) -> BucketInfo {
+pub(super) fn make_bucket_info(group_id: Ulid) -> BucketInfo {
     BucketInfo {
         group_id,
         created_at: SystemTime::UNIX_EPOCH,
@@ -529,7 +529,7 @@ fn expect_rejected_negotiation(effect: &Effect, expected_reason: &str) {
 }
 
 /// Answers the routing load that follows every destination bucket read.
-fn load_routing(
+pub(super) fn load_routing(
     op: &mut IncomingVersionOperation,
     inputs: GroupRoutingInputs,
 ) -> aruna_core::types::Effects {
@@ -600,7 +600,7 @@ fn no_drift() -> Event {
 }
 
 /// The destination bucket read with no encryption settings row.
-fn bucket_read(bucket: Option<aruna_core::types::Value>) -> Event {
+pub(super) fn bucket_read(bucket: Option<aruna_core::types::Value>) -> Event {
     Event::Storage(StorageEvent::BatchReadResult {
         values: vec![
             (b"bucket".to_vec().into(), bucket),
