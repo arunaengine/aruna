@@ -5,6 +5,7 @@
 
 use super::*;
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE};
+use aruna_core::structs::storage::distribution::parking::{Authority, publisher_authority};
 use aruna_core::structs::storage::distribution::{PublisherCutoff, SignedSnapshot, publisher_key};
 
 /// Content rules that need no stored state: the target's set, the publisher as origin, the
@@ -46,7 +47,10 @@ pub(in crate::document_sync) async fn validate_distribution_authority(
         ));
     };
     Ok(
-        match publisher_authority(storage, *realm_id, snapshot).await? {
+        match Membership::read(storage, *realm_id)
+            .await?
+            .authority(snapshot)
+        {
             Authority::Current => AdminEventValidation::Accepted,
             Authority::Ended(reason) => AdminEventValidation::Rejected(reason.to_string()),
             // Parked by the apply step, so the topic cursor moves on past a membership gap.
@@ -55,61 +59,47 @@ pub(in crate::document_sync) async fn validate_distribution_authority(
     )
 }
 
-/// Whether the realm config lets a snapshot's publisher publish it.
-pub(in crate::document_sync) enum Authority {
-    Current,
-    Unknown,
-    Ended(&'static str),
+/// The realm config and its removal cutoffs, read once for any number of authority decisions.
+pub(in crate::document_sync) struct Membership {
+    realm_id: RealmId,
+    config: Option<RealmConfigDocument>,
+    state: Option<AdminDocumentState>,
 }
 
-pub(in crate::document_sync) async fn publisher_authority(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-    signed: &SignedSnapshot,
-) -> Result<Authority> {
-    let publisher = signed.snapshot.root.publisher;
-    let Some(config) = read_realm_config(storage, realm_id).await? else {
-        return Ok(Authority::Unknown);
-    };
-    if config.realm_id != realm_id {
-        return Ok(Authority::Ended("stored realm config names another realm"));
+impl Membership {
+    pub(in crate::document_sync) async fn read(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+    ) -> Result<Self> {
+        Ok(Self {
+            realm_id,
+            config: read_realm_config(storage, realm_id).await?,
+            state: read_reducer_state(storage, &AdminDocumentTarget::RealmConfig { realm_id })
+                .await?,
+        })
     }
-    match configured_node_kind(&config, &publisher) {
-        Some(kind) if kind.is_sync_eligible() => return Ok(Authority::Current),
-        Some(_) => return Ok(Authority::Ended("distribution publisher cannot publish")),
-        None => {}
-    }
-    let Some(cutoffs) = removed_cutoffs(storage, realm_id, &publisher).await? else {
-        return Ok(Authority::Unknown);
-    };
-    let revision = signed.snapshot.revision();
-    let within = cutoffs
-        .iter()
-        .find(|cutoff| cutoff.set_id == signed.snapshot.set_id())
-        .is_some_and(|cutoff| revision == cutoff.revision);
-    Ok(match within {
-        true => Authority::Current,
-        false => Authority::Ended("snapshot is not the removed publisher's cutoff"),
-    })
-}
 
-/// The cutoffs of a node the realm config once listed and then removed.
-async fn removed_cutoffs(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-    node_id: &NodeId,
-) -> Result<Option<Vec<PublisherCutoff>>> {
-    let state = read_reducer_state(storage, &AdminDocumentTarget::RealmConfig { realm_id }).await?;
-    let Some(state) = state else {
-        return Ok(None);
-    };
-    let path = config_node_path(node_id);
-    let removed = state
-        .user_subject_ids
-        .get(&path)
-        .is_some_and(|version| version.value.is_none())
-        || state.conflicts.contains_key(&path);
-    Ok(removed.then(|| state.publisher_cutoffs(node_id).unwrap_or_default()))
+    /// The cutoffs of a node the realm config once listed and then removed.
+    fn removed(&self, node_id: &NodeId) -> Option<Vec<PublisherCutoff>> {
+        let state = self.state.as_ref()?;
+        let path = config_node_path(node_id);
+        let removed = state
+            .user_subject_ids
+            .get(&path)
+            .is_some_and(|version| version.value.is_none())
+            || state.conflicts.contains_key(&path);
+        removed.then(|| state.publisher_cutoffs(node_id).unwrap_or_default())
+    }
+
+    pub(in crate::document_sync) fn authority(&self, signed: &SignedSnapshot) -> Authority {
+        let removed = self.removed(&signed.snapshot.root.publisher);
+        publisher_authority(
+            self.realm_id,
+            self.config.as_ref(),
+            removed.as_deref(),
+            signed,
+        )
+    }
 }
 
 /// Reduces the snapshot into the set's state and stores the signed view every node reads.
@@ -141,9 +131,12 @@ pub(in crate::document_sync) async fn apply_distribution_operation(
             "distribution records change only through published snapshots".to_string(),
         ));
     };
-    match publisher_authority(storage, realm_id, snapshot).await? {
+    match Membership::read(storage, realm_id)
+        .await?
+        .authority(snapshot)
+    {
         Authority::Current => install_snapshot(storage, &event, set_id).await,
-        Authority::Unknown => park_snapshot(storage, &event, snapshot).await,
+        Authority::Unknown => park_snapshot(storage, &event, snapshot).await.map(|_| ()),
         Authority::Ended(reason) => {
             warn!(%set_id, %reason, "Dropping a distribution snapshot without authority");
             Ok(())

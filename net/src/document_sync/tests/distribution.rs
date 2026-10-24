@@ -489,3 +489,49 @@ async fn cutoff_is_exact() {
     assert_eq!(exact, AdminEventValidation::Accepted);
     assert_eq!(stored(&storage).await.unwrap().head.snapshot, cutoff);
 }
+
+#[tokio::test]
+async fn parked_forks_conflict() {
+    // Two snapshots of one number wait together and install as a conflict, not a winner.
+    let (_dir, storage) = test_storage();
+    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    config.ensure_node(node(OTHER), RealmNodeKind::Management);
+    batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            DocumentTarget::RealmConfig { realm_id: realm() },
+            config.to_bytes(&actor(OTHER)).unwrap().into(),
+        )],
+    )
+    .await
+    .unwrap();
+    let admitted = admitted(&created(), MEMBER);
+    let mut fork = admitted.clone();
+    fork.config.settings.public = true;
+    for snapshot in [admitted.clone(), fork] {
+        let outcome = receive(&storage, published(PUBLISHER, snapshot, PUBLISHER)).await;
+        assert_eq!(outcome, AdminEventValidation::Accepted);
+    }
+    assert_eq!(stored(&storage).await, None);
+    let ensure = test_admin_event(
+        Ulid::from_parts(848, 1),
+        AdminDocumentTarget::RealmConfig { realm_id: realm() },
+        &actor(OTHER),
+        1,
+        AdminDocumentOperation::ConfigNodeEnsured {
+            node_id: node(PUBLISHER),
+            kind: RealmNodeKind::Server,
+        },
+    );
+    apply_admin_operation(
+        &storage,
+        DocumentTarget::RealmConfig { realm_id: realm() },
+        ensure,
+    )
+    .await
+    .unwrap();
+    assert_eq!(parked(&storage).await, None);
+    let view = stored(&storage).await.expect("installed");
+    assert_eq!(view.head.snapshot, admitted);
+    assert!(view.conflicted());
+}
