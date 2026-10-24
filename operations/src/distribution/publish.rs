@@ -244,13 +244,16 @@ impl PublishOperation {
         let Some(auth_context) = self.config.auth_context.clone() else {
             return Err(PublishError::Unauthorized);
         };
+        let txn_id = self.txn_id.ok_or(PublishError::NotFinished)?;
         self.state = PublishState::Authorize;
+        // Roles are read in the acceptance transaction, so a revoked role conflicts the commit.
+        let check = CheckPermissionsConfig {
+            auth_context,
+            path: group_admin_path(self.config.realm_id, owner),
+            required_permission: Permission::WRITE,
+        };
         Ok(smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context,
-                path: group_admin_path(self.config.realm_id, owner),
-                required_permission: Permission::WRITE,
-            }),
+            CheckPermissionsOperation::new_with_txn(check, txn_id),
             |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
         ))])
     }
