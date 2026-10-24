@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -246,8 +248,64 @@ fn embed(
             next.statements.push(signed.clone());
             Ok(())
         }
+        StatementKind::CaughtUp {
+            member_id, intent, ..
+        } => {
+            next.statements.push(signed.clone());
+            caught_up(next, statement.member_id, *member_id, *intent)
+        }
         kind => Err(DistributionError::Unsupported(kind.name())),
     }
+}
+
+/// Takes a coordinator's catch-up statement for `target` and makes the member ready once every
+/// coordinator of a range it holds stated it; the statements then leave the record.
+fn caught_up(
+    next: &mut DistributionSnapshot,
+    signer: Ulid,
+    target: Ulid,
+    intent: [u8; 32],
+) -> Result<(), DistributionError> {
+    let member = next
+        .member(target)
+        .ok_or(DistributionError::NoMember(target))?;
+    if member.state != MemberState::CatchingUp || member.intent != intent {
+        return Err(DistributionError::InvalidStatement(
+            "the member is not catching up for this intent",
+        ));
+    }
+    let coordinators: BTreeSet<Ulid> = next
+        .held_ranges(target)
+        .iter()
+        .map(|range| range.coordinator)
+        .filter(|coordinator| *coordinator != target)
+        .collect();
+    if !coordinators.contains(&signer) {
+        return Err(DistributionError::InvalidStatement(
+            "the signer coordinates no range the member holds",
+        ));
+    }
+    let stated = |signed: &SignedStatement| match signed.statement.kind {
+        StatementKind::CaughtUp {
+            member_id,
+            intent: stated,
+            ..
+        } => member_id == target && stated == intent,
+        _ => false,
+    };
+    let signers: BTreeSet<Ulid> = (next.statements.iter())
+        .filter(|signed| stated(signed))
+        .map(|signed| signed.statement.member_id)
+        .collect();
+    if coordinators.is_subset(&signers) {
+        next.statements.retain(|signed| !stated(signed));
+        if let Some(member) =
+            (next.config.members.iter_mut()).find(|member| member.member_id == target)
+        {
+            member.state = MemberState::Ready;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

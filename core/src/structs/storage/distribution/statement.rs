@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::DistributionMember;
 use super::request::TransferRole;
 use crate::NodeId;
 use crate::structs::identity::realm::RealmId;
@@ -14,6 +15,7 @@ use crate::types::GroupId;
 const SET_DOMAIN: &[u8] = b"aruna-distribution-set-v1";
 const STATEMENT_DOMAIN: &str = "aruna-distribution-statement-v1";
 const ADMIT_DOMAIN: &[u8] = b"aruna-distribution-admit-v1";
+const CAUGHT_DOMAIN: &[u8] = b"aruna-distribution-caught-up-v1";
 
 /// The preimage of a set id: whoever creates the set carries it, every receiver recomputes it.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -75,6 +77,14 @@ pub enum StatementKind {
         lower_id: Ulid,
         upper_id: Ulid,
     },
+    /// A coordinator delivered every range it coordinates that a catching-up member holds,
+    /// everything up to the watermark (milliseconds) its bootstrap started at included.
+    CaughtUp {
+        member_id: Ulid,
+        /// The intent of the catching-up member, so a later join catches up again.
+        intent: [u8; 32],
+        watermark: u64,
+    },
     /// An automatic balancing transfer proposed by the range's coordinator.
     TransferPrepare {
         /// The revision number the coordinator decided on.
@@ -96,6 +106,7 @@ impl StatementKind {
             Self::DeleteFenced { .. } => "delete fenced",
             Self::Split { .. } => "split",
             Self::TransferPrepare { .. } => "transfer prepare",
+            Self::CaughtUp { .. } => "caught up",
         }
     }
 
@@ -149,6 +160,38 @@ impl Statement {
             incarnation,
             intent,
             kind: StatementKind::Admit,
+        }
+    }
+
+    /// A coordinator's statement that `target` caught up with its ranges. Its id is derived
+    /// from both members and the target's intent, so a retry is embedded once.
+    pub fn caught_up(
+        realm_id: RealmId,
+        set_id: Ulid,
+        signer: &DistributionMember,
+        target: &DistributionMember,
+        watermark: u64,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(CAUGHT_DOMAIN);
+        hasher.update(&set_id.to_bytes());
+        hasher.update(&signer.member_id.to_bytes());
+        hasher.update(&target.member_id.to_bytes());
+        hasher.update(&target.intent);
+        let mut id = [0; 16];
+        id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        Self {
+            realm_id,
+            set_id,
+            statement_id: Ulid::from_bytes(id),
+            member_id: signer.member_id,
+            incarnation: signer.incarnation.unwrap_or_default(),
+            intent: signer.intent,
+            kind: StatementKind::CaughtUp {
+                member_id: target.member_id,
+                intent: target.intent,
+                watermark,
+            },
         }
     }
 

@@ -206,10 +206,10 @@ fn admission_binds_create() {
     assert!(next_snapshot(realm(), Some(&created()), &admit(2, 2)).is_ok());
 }
 
-#[test]
-fn late_edge_admission() {
+/// Member 1 coordinates the only range; stream edge member 2 is admitted after activation.
+fn late_edge() -> DistributionSnapshot {
+    use crate::structs::storage::distribution::DataStrategy;
     use crate::structs::storage::distribution::presets::add_edges;
-    use crate::structs::storage::distribution::{DataStrategy, MemberState};
     let nodes = [(member_id(1), secret(1).public())];
     let mut layout = replica_layout(root().set_id(), &nodes).unwrap();
     let edge = [(member_id(2), secret(2).public())];
@@ -229,11 +229,48 @@ fn late_edge_admission() {
     };
     let head = step(&head, &admit(1));
     let head = step(&head, &DistributionRequest::Activate);
-    let head = step(&head, &admit(2));
+    step(&head, &admit(2))
+}
+
+#[test]
+fn late_edge_admission() {
+    use crate::structs::storage::distribution::MemberState;
+    let head = late_edge();
     assert_eq!(head.member(member_id(1)).unwrap().state, MemberState::Ready);
     assert_eq!(
         head.member(member_id(2)).unwrap().state,
         MemberState::CatchingUp
     );
     assert!(head.serving());
+}
+
+#[test]
+fn caught_up_readies() {
+    use crate::structs::storage::distribution::MemberState;
+    let head = late_edge();
+    let (coordinator, edge) = (
+        head.member(member_id(1)).unwrap(),
+        head.member(member_id(2)).unwrap(),
+    );
+    let statement = Statement::caught_up(realm(), head.set_id(), coordinator, edge, 7);
+    let request = DistributionRequest::Statement(Box::new(statement.clone().sign(&secret(1))));
+    let forged = Statement::caught_up(realm(), head.set_id(), edge, edge, 7);
+    let forged = DistributionRequest::Statement(Box::new(forged.sign(&secret(2))));
+    assert!(
+        next_snapshot(realm(), Some(&head), &forged).is_err(),
+        "only a coordinator of a held range states it"
+    );
+    let ready = step(&head, &request);
+    assert_eq!(
+        ready.member(member_id(2)).unwrap().state,
+        MemberState::Ready
+    );
+    assert!(
+        ready
+            .statements
+            .iter()
+            .all(|signed| signed.statement.statement_id != statement.statement_id),
+        "the statement leaves the record with the catch-up"
+    );
+    assert!(next_snapshot(realm(), Some(&ready), &request).is_err());
 }
