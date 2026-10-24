@@ -1689,6 +1689,7 @@ async fn bucket_rows_sum() {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         drive(
             CreateBucketOperation::new(bucket.to_string(), info),

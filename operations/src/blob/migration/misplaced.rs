@@ -488,6 +488,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let name = BUCKET.as_bytes().to_vec();
         put(context, S3_BUCKET_KEYSPACE, name, info.to_bytes().unwrap()).await;

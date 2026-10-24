@@ -299,6 +299,7 @@ async fn lists_bucket_jobs() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let quiet = quiet.to_bytes().unwrap().into();
     crate::tests::routes::write_doc(&context, S3_BUCKET_KEYSPACE, key("quiet"), quiet).await;
@@ -386,6 +387,7 @@ async fn lists_unrouted_import() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let row = info.to_bytes().unwrap().into();
     let bucket = b"linked".to_vec().into();
