@@ -36,6 +36,7 @@ pub(crate) mod test_record;
 #[cfg(test)]
 pub(crate) mod test_store;
 pub mod ticket;
+pub mod usage;
 pub mod version_key;
 pub mod versions;
 

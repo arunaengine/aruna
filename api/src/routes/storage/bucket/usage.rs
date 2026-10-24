@@ -7,6 +7,7 @@ use std::sync::Arc;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
+use aruna_operations::distribution::usage::{RangeUsage, range_usage};
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -40,8 +41,14 @@ pub struct BucketUsageResponse {
     pub logical_bytes: u64,
     /// Bytes reachable only through external references.
     pub referenced_bytes: u64,
-    /// Always true: every number is counted in full.
+    /// False for a distributed bucket while a range is not held here or is being rebuilt.
     pub complete: bool,
+    /// Ranges of a distributed bucket; absent for an ordinary bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranges: Option<usize>,
+    /// Ranges of a distributed bucket whose counters this node holds and summed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranges_counted: Option<usize>,
 }
 
 impl BucketUsageResponse {
@@ -55,6 +62,25 @@ impl BucketUsageResponse {
             logical_bytes: counters.logical_bytes,
             referenced_bytes: counters.referenced_bytes,
             complete: true,
+            ranges: None,
+            ranges_counted: None,
+        }
+    }
+
+    fn of_ranges(bucket: String, usage: RangeUsage) -> Self {
+        let count = |value: i128| u64::try_from(value.max(0)).unwrap_or(u64::MAX);
+        let counters = usage.counters;
+        Self {
+            bucket,
+            objects: count(counters.objects),
+            versions: count(counters.versions),
+            delete_markers: count(counters.delete_markers),
+            open_multipart_uploads: count(counters.open_uploads),
+            logical_bytes: count(counters.logical_bytes),
+            referenced_bytes: count(counters.referenced_bytes),
+            complete: usage.complete,
+            ranges: Some(usage.ranges),
+            ranges_counted: Some(usage.counted),
         }
     }
 }
@@ -78,7 +104,11 @@ objects.
   does. `referenced_bytes` sums the sizes of versions that only point to external data.
 - `open_multipart_uploads` counts uploads not yet completed or aborted, including one a
   completion or abort is finishing.
-- `complete` is always true."#,
+- A distributed bucket answers from the maintained counters of the key ranges this node holds,
+  one read per range. `ranges` and `ranges_counted` say how many ranges the set has and how many
+  were summed; `complete` is false while a range is held elsewhere or its counters are being
+  rebuilt.
+- `complete` is always true for an ordinary bucket."#,
     params(
         ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")
     ),
@@ -123,8 +153,14 @@ pub async fn get_bucket_usage(
         Permission::READ,
     )
     .await?;
-    let counters = bucket_counters(&state, &bucket).await?;
-    Ok(Json(BucketUsageResponse::new(bucket, counters)))
+    let ranges = range_usage(&state.get_ctx(), &bucket).await;
+    match ranges.map_err(|error| ServerError::InternalError(error.to_string()))? {
+        Some(usage) => Ok(Json(BucketUsageResponse::of_ranges(bucket, usage))),
+        None => {
+            let counters = bucket_counters(&state, &bucket).await?;
+            Ok(Json(BucketUsageResponse::new(bucket, counters)))
+        }
+    }
 }
 
 /// The bucket's counter row; a bucket without one holds nothing yet.
