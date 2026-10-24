@@ -957,7 +957,7 @@ impl IncomingVersionOperation {
             .manifest
             .reference_advance_count
             .ok_or(IncomingVersionError::ReferenceCountMissing)?;
-        Ok(BlobVersion::reference(
+        let version = BlobVersion::reference(
             source,
             metadata,
             self.manifest.created_at,
@@ -967,7 +967,24 @@ impl IncomingVersionOperation {
         .with_metadata(self.manifest.metadata.clone())
         .with_advance_count(advance_count)
         .with_publisher(self.publisher_node_id)
-        .with_policies(self.manifest.placement_policies.clone())?)
+        .with_policies(self.manifest.placement_policies.clone())?;
+        Ok(self.stamped(version))
+    }
+
+    /// The version as this destination stores it: epoch, generation and, in a distributed
+    /// bucket, the identity the set fixed, so a retry compares equal to what it applied.
+    fn stamped(&self, version: BlobVersion) -> BlobVersion {
+        let version = version
+            .with_epoch(self.original_epoch())
+            .with_generation(self.version_generation());
+        match self.destination_bound {
+            true => {
+                let identity = self.manifest.logical_identity;
+                let identity = identity.or_else(|| logical_identity(&version));
+                version.with_identity(identity)
+            }
+            false => version,
+        }
     }
 
     fn incoming_logical_bytes(&self) -> Result<u64, IncomingVersionError> {
@@ -2020,18 +2037,7 @@ impl IncomingVersionOperation {
             ),
         };
 
-        let version = version
-            .with_epoch(self.original_epoch())
-            .with_generation(self.version_generation());
-        // A preserved reference materialized here keeps the identity the set fixed for it.
-        let version = match self.destination_bound {
-            true => {
-                let identity = self.manifest.logical_identity;
-                let identity = identity.or_else(|| logical_identity(&version));
-                version.with_identity(identity)
-            }
-            false => version,
-        };
+        let version = self.stamped(version);
         self.written_identity = logical_identity(&version);
         self.written_pending = matches!(version.state, BlobVersionState::PendingContent { .. });
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {

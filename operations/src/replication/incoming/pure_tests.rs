@@ -1022,6 +1022,28 @@ fn valid_advance() {
 }
 
 #[test]
+fn advance_retry_matches() {
+    // A retried advance rebuilds the reference exactly as the first apply stored it, epoch,
+    // generation and identity included, so the stored version is not refused.
+    let (mut manifest, _, publisher) = advance_fixture();
+    manifest.original_epoch = OriginalEpoch(3);
+    let mut op = advance_operation(manifest, publisher);
+    op.destination_bound = true;
+    op.txn_id = Some(Ulid::from_parts(13, 13));
+    let rebuilt = op.reference_version().unwrap();
+    let effects = op.write_blob_version();
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected reference version write")
+    };
+    let stored = BlobVersion::from_bytes(value.as_ref()).unwrap();
+    assert_eq!(
+        (stored.generation, stored.original_epoch),
+        (8, OriginalEpoch(3))
+    );
+    assert_eq!(rebuilt, stored);
+}
+
+#[test]
 fn advance_replay_orders() {
     // A head written at a later epoch already supersedes a replayed advance, whatever its
     // generation; comparing generations alone would refuse the replay as invalid lineage.
