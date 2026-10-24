@@ -119,7 +119,7 @@ async fn opened(handle: &StorageHandle, upper: Option<&str>) -> bool {
 }
 
 #[tokio::test]
-async fn admission_opens_ranges_once() {
+async fn opens_ranges_once() {
     let (_dir, handle) = open();
     bucket(&handle, member_id(), 42, 42).await;
     let first = run(&handle, true).await.unwrap();
@@ -156,7 +156,7 @@ async fn replaced_bucket_refused() {
 }
 
 #[tokio::test]
-async fn unsigned_admission_opens_nothing() {
+async fn unsigned_opens_nothing() {
     let (_dir, handle) = open();
     bucket(&handle, member_id(), 42, 42).await;
     assert!(matches!(

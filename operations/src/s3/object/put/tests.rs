@@ -2761,7 +2761,7 @@ fn bound_put(seed: u8) -> (PutObjectOperation, aruna_core::types::Effects) {
 }
 
 #[test]
-fn coordinator_put_stamps_epoch() {
+fn coordinator_stamps_put() {
     let (op, effects) = bound_put(1);
     assert_eq!(
         op.version_epoch,
@@ -2774,7 +2774,7 @@ fn coordinator_put_stamps_epoch() {
 }
 
 #[test]
-fn member_put_names_coordinator() {
+fn member_put_refused() {
     let (op, effects) = bound_put(2);
     assert!(effects.is_empty());
     assert!(matches!(

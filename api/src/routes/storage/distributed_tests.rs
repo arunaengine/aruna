@@ -51,7 +51,7 @@ fn create_request_converts() {
 }
 
 #[test]
-fn publisher_outage_is_unavailable() {
+fn publisher_outage_unavailable() {
     let unavailable = PublishRefusal::Unavailable("publisher node x is unreachable".to_string());
     let ServerError::ServiceUnavailableReason(message) =
         map_create_error(CreateError::Publish(unavailable))
@@ -70,7 +70,7 @@ fn publisher_outage_is_unavailable() {
 }
 
 #[test]
-fn degraded_ranges_name_coordinator() {
+fn degraded_names_coordinator() {
     let node: NodeId = node_text(2).parse().unwrap();
     let status = DistributionStatus {
         set_id: Ulid::from_bytes([1; 16]),

@@ -20,7 +20,7 @@ fn coordinator_stamps_epoch() {
 }
 
 #[test]
-fn unready_sets_refuse_writes() {
+fn unready_sets_refuse() {
     let (snapshot, bytes) = record(false);
     let own = binding(&snapshot, 1, 5);
     assert_eq!(

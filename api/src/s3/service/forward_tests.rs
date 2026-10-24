@@ -51,7 +51,7 @@ fn signatures_stay_behind() {
 }
 
 #[test]
-fn digest_matches_target_view() {
+fn digest_matches_target() {
     // The target recomputes the digest from the headers it receives.
     let sent = headers(&[("content-length", "7"), ("content-type", "text/csv")]);
     let issuer = forwarded_digest(&Method::PUT, "spire", "a/b", None, &sent);
@@ -65,7 +65,7 @@ fn digest_matches_target_view() {
 }
 
 #[test]
-fn coordinator_denial_hints_globs() {
+fn denial_hints_globs() {
     let body = "<Error><Code>AccessDenied</Code><Message>Permission denied</Message></Error>";
     let error = coordinator_error(&forward(), http::StatusCode::FORBIDDEN, body);
     assert_eq!(*error.code(), S3ErrorCode::AccessDenied);

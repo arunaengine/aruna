@@ -21,7 +21,7 @@ fn input(layout: LayoutKind, edges: Vec<(NodeId, DataStrategy)>) -> CreateInput 
 }
 
 #[test]
-fn replica_plan_with_edge() {
+fn replica_plan_edge() {
     let set_id = Ulid::from_bytes([3; 16]);
     let edges = vec![(node(3), DataStrategy::Stream)];
     let layout = plan_layout(set_id, &input(LayoutKind::Replica, edges)).unwrap();
@@ -79,6 +79,6 @@ fn copy_edges_refused() {
 }
 
 #[test]
-fn forbidden_member_hints_globs() {
+fn forbidden_hints_globs() {
     assert!(refusal_text(&SyncRefusal::Forbidden).contains("node glob"));
 }

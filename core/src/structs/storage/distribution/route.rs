@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn assigned_members_hold_own_ranges() {
+    fn assigned_holds_own() {
         let head = active();
         let held: Vec<Ulid> = head
             .held_ranges(member(2))

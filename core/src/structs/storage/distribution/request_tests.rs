@@ -207,7 +207,7 @@ fn admission_binds_create() {
 }
 
 #[test]
-fn late_edges_catch_up() {
+fn late_edge_admission() {
     use crate::structs::storage::distribution::presets::add_edges;
     use crate::structs::storage::distribution::{DataStrategy, MemberState};
     let nodes = [(member_id(1), secret(1).public())];

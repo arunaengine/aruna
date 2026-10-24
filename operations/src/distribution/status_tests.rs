@@ -55,7 +55,7 @@ fn only(reachable: u8) -> impl Fn(NodeId) -> Reach {
 }
 
 #[test]
-fn unreachable_coordinator_degrades_range() {
+fn coordinator_degrades_range() {
     let status = summarize(realm(), &view(), only(1));
     assert!(status.degraded);
     assert!(!status.configuration_unavailable);
@@ -77,7 +77,7 @@ fn unreachable_coordinator_degrades_range() {
 }
 
 #[test]
-fn unreachable_publisher_stops_configuration() {
+fn publisher_stops_configuration() {
     let status = summarize(realm(), &view(), only(2));
     assert!(status.configuration_unavailable);
     assert_eq!(status.ranges[1].degraded, None);

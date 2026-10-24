@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn urls_keep_one_nest() {
+    fn urls_keep_nest() {
         assert_eq!(
             relay_url("https://a.example/", "/data/staging"),
             "https://a.example/api/v1/data/staging"

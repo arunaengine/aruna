@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn delegation_verifies_once_bound() {
+    fn delegation_verifies_bound() {
         let signed = delegation().sign(&secret(1));
         let (realm, target) = (signed.delegation.realm_id, secret(2).public());
         let decoded = SignedDelegation::decode(&signed.encode().unwrap()).unwrap();
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_expiry_bounds_validity() {
+    fn credential_bounds_validity() {
         let mut long = delegation();
         long.credential_expiry = 103;
         let signed = long.sign(&secret(1));

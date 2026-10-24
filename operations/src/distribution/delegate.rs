@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn spent_nonces_stay_bounded() {
+    fn spent_nonces_bounded() {
         let mut spent: BTreeMap<[u8; 16], u64> = (0..MAX_SPENT as u32)
             .map(|index| {
                 let mut nonce = [0; 16];
