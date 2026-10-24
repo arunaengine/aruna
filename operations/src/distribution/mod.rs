@@ -9,6 +9,7 @@ use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 
 use crate::driver::DriverContext;
 
+pub mod handoff;
 pub mod inventory;
 pub mod publish;
 #[cfg(test)]
