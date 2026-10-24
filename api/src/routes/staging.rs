@@ -359,8 +359,8 @@ route, and sending `prefixes` additionally requires READ on the group's data pat
 **Limits**
 - Named and expanded objects together may not exceed 1000, and a prefix that would expand past that
   limit fails the entire request rather than truncating.
-- A prefix is listed in at most 8 pages; a prefix that needs more fails the request with 400 and
-  belongs in a staging job.
+- All prefixes of one request are listed in at most 8 pages together; a request that needs more
+  fails with 400 and belongs in a staging job.
 - `node_id`, when given, must be this node: staging always runs where the request lands.
 - `checksum_manifest` is refused with 400; manifests are read by staging jobs only."#,
     request_body(
@@ -456,6 +456,8 @@ pub async fn stage_batch(
         .await?;
     }
     let mut expansion_errors = Vec::new();
+    // One page budget for the whole request, however many prefixes it names.
+    let mut pages_left = BATCH_LIST_PAGES;
     for prefix in prefixes {
         let source_prefix = match normalize_prefix(&prefix.source_prefix) {
             Ok(prefix) => prefix,
@@ -470,11 +472,20 @@ pub async fn stage_batch(
             }
         };
         let remaining = BATCH_LIMIT - items.len();
-        match list_prefix(&state, group_id, connector_id, &source_prefix, remaining).await {
+        let listed = list_prefix(
+            &state,
+            (group_id, connector_id),
+            &source_prefix,
+            remaining,
+            &mut pages_left,
+        )
+        .await;
+        match listed {
             Ok(None) => {
-                return Err(ServerError::BadRequestReason(format!(
-                    "prefix {source_prefix} lists more than a batch examines; submit it as a staging job"
-                )));
+                return Err(ServerError::BadRequestReason(
+                    "the prefixes list more than a batch examines; submit them as a staging job"
+                        .to_string(),
+                ));
             }
             Ok(Some(entries)) => {
                 if entries.len() > remaining {
@@ -517,21 +528,22 @@ pub async fn stage_batch(
     Ok((StatusCode::OK, Json(StageBatchResponse { results })))
 }
 
-/// Listing pages one batch prefix may examine; a larger prefix belongs in a staging job.
+/// Listing pages one batch request may examine across its prefixes; more belongs in a job.
 const BATCH_LIST_PAGES: usize = 8;
 
 /// Lists the files below a prefix page by page, stopping once more than `remaining` are found.
-/// `None` when the prefix needs more than [`BATCH_LIST_PAGES`] pages.
+/// Each page spends one of `pages_left`; `None` once the request's pages are spent.
 async fn list_prefix(
     state: &ServerState,
-    group_id: aruna_core::types::GroupId,
-    connector_id: ulid::Ulid,
+    (group_id, connector_id): (aruna_core::types::GroupId, ulid::Ulid),
     source_prefix: &str,
     remaining: usize,
+    pages_left: &mut usize,
 ) -> Result<Option<Vec<SourceEntry>>, ListStagingError> {
     let mut entries = Vec::new();
     let mut cursor = None;
-    for _ in 0..BATCH_LIST_PAGES {
+    while *pages_left > 0 {
+        *pages_left -= 1;
         let page = drive(
             ListStagingOperation::new(ListStagingInput {
                 group_id,
