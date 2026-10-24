@@ -60,6 +60,20 @@ pub const DISTRIBUTION_PUBLISHER_KEYSPACE: &str = "distribution_publishers";
 pub const DISTRIBUTION_PARKED_KEYSPACE: &str = "distribution_parked";
 /// The revision number of each parked snapshot, so the bound is counted without the bodies.
 pub const PARKED_INDEX_KEYSPACE: &str = "distribution_parked_index";
+/// Ordered inventory of each distributed bucket: head and version rows by set id and position.
+pub const INVENTORY_KEYSPACE: &str = "distribution_inventory";
+/// Open multipart uploads of each distributed bucket by set id, key and upload id.
+pub const UPLOAD_INVENTORY_KEYSPACE: &str = "distribution_uploads";
+/// Version id to inventory position, by set id and version id.
+pub const VERSION_INDEX_KEYSPACE: &str = "distribution_version_index";
+/// The installed key ranges of each set by set id and exclusive upper bound.
+pub const RANGE_INDEX_KEYSPACE: &str = "distribution_ranges";
+/// The accounting row of each range: active generation, rebuild cursors and split state.
+pub const RANGE_ACCOUNT_KEYSPACE: &str = "distribution_range_accounts";
+/// Delta-merged counter rows of each range by generation, and pending split rows.
+pub const RANGE_COUNTER_KEYSPACE: &str = "distribution_range_counters";
+/// The bounded key sample of each range and its refill cursor.
+pub const KEY_SAMPLE_KEYSPACE: &str = "distribution_key_samples";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
@@ -482,6 +496,13 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DISTRIBUTION_PUBLISHER_KEYSPACE,
     DISTRIBUTION_PARKED_KEYSPACE,
     PARKED_INDEX_KEYSPACE,
+    INVENTORY_KEYSPACE,
+    UPLOAD_INVENTORY_KEYSPACE,
+    VERSION_INDEX_KEYSPACE,
+    RANGE_INDEX_KEYSPACE,
+    RANGE_ACCOUNT_KEYSPACE,
+    RANGE_COUNTER_KEYSPACE,
+    KEY_SAMPLE_KEYSPACE,
     DOCUMENT_CONFLICT_KEYSPACE,
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,
