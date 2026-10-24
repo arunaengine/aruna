@@ -318,6 +318,9 @@ pub(crate) async fn list_staging_source(
 /// Entries a source without a provider cursor may skip per page: each page re-lists from the
 /// start, so deeper pages are refused rather than growing without bound.
 const FALLBACK_SKIP_LIMIT: usize = 100_000;
+/// Entries, directories included, a fallback page may read before it fails: a re-listed tree
+/// is walked from its start for every page.
+const MAX_FALLBACK_EXAMINED: usize = 250_000;
 /// Largest page a provider answers in one request, so a page never needs a second request.
 const PROVIDER_PAGE_LIMIT: usize = 1000;
 
@@ -361,7 +364,8 @@ async fn list_operator(
     let capability = operator.info().capability();
     if !(capability.list_with_start_after && capability.list_with_recursive) {
         let offset = fallback_offset(request, FALLBACK_SKIP_LIMIT)?;
-        let (entries, truncated) = list_skipping(operator, path, request, offset).await?;
+        let bounds = (offset, MAX_FALLBACK_EXAMINED);
+        let (entries, truncated) = list_skipping(operator, path, request, bounds).await?;
         return Ok(offset_page(entries, truncated, offset));
     }
     if !request.recursive && (request.lower.is_some() || request.stop.is_some()) {
@@ -522,12 +526,13 @@ async fn probe_lower(
     Ok(source_entry(lower, &metadata, path, request.files_only))
 }
 
-/// The fallback for a provider without `start_after`: it re-lists and skips `offset` entries.
+/// The fallback for a provider without `start_after`: it re-lists and skips `offset` entries,
+/// reading at most `max_examined` listed entries before it fails.
 async fn list_skipping(
     operator: &Operator,
     path: &str,
     request: &ListRequest,
-    offset: usize,
+    (offset, max_examined): (usize, usize),
 ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
     let mut lister = operator
         .lister_with(path)
@@ -536,7 +541,15 @@ async fn list_skipping(
         .map_err(list_error)?;
     let mut entries = Vec::with_capacity(request.limit);
     let mut skipped = 0usize;
+    let mut examined = 0usize;
     while let Some(entry) = lister.try_next().await.map_err(list_error)? {
+        examined += 1;
+        if examined > max_examined {
+            return Err(StagingSourceError::InvalidListing(format!(
+                "this source lists more than {max_examined} entries for one page; list a \
+                 narrower path"
+            )));
+        }
         let Some(entry) = source_entry(entry.path(), entry.metadata(), path, request.files_only)
         else {
             continue;

@@ -791,6 +791,38 @@ async fn recursive_list_truncates() {
     assert_eq!(cursor, Some(ListCursor::Offset(1)));
 }
 
+// A source without a provider cursor is walked from its start, so a page that reads too many
+// entries, directories included, fails instead of walking on.
+#[tokio::test]
+async fn fallback_walk_bounded() {
+    let dir = tempdir().unwrap();
+    for nested in ["prefix/a/b/c", "prefix/d/e"] {
+        tokio::fs::create_dir_all(dir.path().join(nested))
+            .await
+            .unwrap();
+    }
+    tokio::fs::write(dir.path().join("prefix/z.txt"), b"z")
+        .await
+        .unwrap();
+    let operator = build_service::<services::Fs>(
+        HashMap::from([("root".to_string(), dir.path().to_str().unwrap().to_string())]),
+        None,
+    )
+    .unwrap();
+    let request = list_request(1, true, true);
+
+    let refused = list_skipping(&operator, "prefix/", &request, (0, 3)).await;
+    assert!(matches!(
+        refused,
+        Err(StagingSourceError::InvalidListing(_))
+    ));
+    let (entries, _) = list_skipping(&operator, "prefix/", &request, (0, 100))
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "prefix/z.txt");
+}
+
 fn list_request(limit: usize, recursive: bool, files_only: bool) -> ListRequest {
     ListRequest {
         limit,
