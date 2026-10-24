@@ -17,5 +17,6 @@ pub mod group_backends;
 pub mod imports;
 pub mod moves;
 pub mod organize;
+pub mod relay;
 pub mod rename;
 pub mod routing;

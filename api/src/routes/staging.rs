@@ -11,6 +11,7 @@ use crate::routes::execution::jobs::{
     decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
 };
 use crate::routes::storage::connectors::ApiConnectorKind;
+use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
@@ -280,6 +281,9 @@ connector's source path, both checked against the concrete path rather than a pr
 - `sync` is accepted by the schema but not implemented and always fails.
 - A 201 means the new version is committed here and immediately readable through S3; propagating it
   to any sync target is queued afterwards and neither awaited nor reported here.
+- In a distributed bucket only the coordinator of the key's range writes. Another member relays
+  the request there with the caller's bearer token, and the coordinator checks it again. An
+  unreachable coordinator answers 503 and the write is not queued.
 
 **Limits**
 - A snapshot is charged against the realm's quota ceiling for the group."#,
@@ -316,16 +320,30 @@ connector's source path, both checked against the concrete path rather than a pr
         (status = 403, description = "Token from another realm, no WRITE on the target key or READ on the source path, or the snapshot would exceed the group's quota ceiling", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, the connector does not exist, or the source object is absent", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
-        (status = 502, description = "The source connector could not be read; nothing was staged and the caller may retry", body = ErrorResponse)
+        (status = 502, description = "The source connector could not be read; nothing was staged and the caller may retry", body = ErrorResponse),
+        (status = 503, description = "The coordinator of the key's distributed range is unreachable or the bucket is not active yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn stage_blob(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<StageRequest>,
 ) -> ServerResult<(StatusCode, Json<StageResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
+    // A member that does not coordinate the key's range relays the write with the bearer.
+    if let StageRequest::Snapshot(target) | StageRequest::Reference(target) = &request {
+        let bucket_info = load_bucket_info(&state, &target.bucket).await?;
+        let forward = rest_target(&state, &bucket_info, &target.key, &headers).await?;
+        if let Some(forward) = forward {
+            let path = "/data/staging";
+            let (status, answer) =
+                relay_json(&state, &forward, path, bearer.as_ref(), &request).await?;
+            return Ok((status, Json(answer)));
+        }
+    }
 
     match request {
         StageRequest::Snapshot(request) => snapshot_blob(state, auth, request).await,
