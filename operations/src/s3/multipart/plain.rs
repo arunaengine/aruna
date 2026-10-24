@@ -860,6 +860,40 @@ mod tests {
     }
 
     #[test]
+    fn registered_closes_upload() {
+        // Adopting a registered version still closes the upload in a distributed bucket.
+        let commit = |bound: bool| {
+            let (mut operation, _) = recorded(true, None);
+            operation.registered = true;
+            operation.txn_id = Some(Ulid::from_bytes([7u8; 16]));
+            operation.binding =
+                bound.then(
+                    || aruna_core::structs::storage::distribution::DistributionBinding {
+                        set_id: Ulid::from_bytes([5u8; 16]),
+                        member_id: Ulid::from_bytes([6u8; 16]),
+                        incarnation: 1,
+                        revision: Default::default(),
+                    },
+                );
+            let effects = operation.write_obligation();
+            (operation.state, effects)
+        };
+        let (state, effects) = commit(false);
+        assert_eq!(state, CompleteUploadState::CommitFinalizeTransaction);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
+        let (state, effects) = commit(true);
+        assert_eq!(state, CompleteUploadState::CloseInventory);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
+                if key_space == aruna_core::keyspaces::RANGE_INDEX_KEYSPACE
+        ));
+    }
+
+    #[test]
     fn adopts_registered_version() {
         let found = |stored: Option<[u8; 32]>, staged: bool| {
             let (mut operation, _) = recorded(true, None);

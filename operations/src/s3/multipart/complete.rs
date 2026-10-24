@@ -9,7 +9,7 @@ use crate::blob::records::{
     write_location_effect, write_version_effect,
 };
 use crate::distribution::inventory::{
-    AddedVersion, InventoryChange, stamp_generation, version_written,
+    AddedVersion, InventoryChange, InventoryUpdate, stamp_generation, version_written,
 };
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
@@ -144,6 +144,8 @@ pub enum CompleteUploadState {
     WriteReplicationObligation,
     EnforceQuota,
     UpdateUsage,
+    /// Closes the upload in the inventory of a distributed bucket before a registered commit.
+    CloseInventory,
     CommitFinalizeTransaction,
     AbortFinalizeTransaction,
     ResetUploadTransaction,
@@ -331,6 +333,8 @@ pub struct CompleteUploadOperation {
     /// The head the finalize installs and the epoch of its version, for the inventory.
     head_pointer: Option<CurrentVersionPointer>,
     version_epoch: OriginalEpoch,
+    /// The close-only inventory update of a completion that adopts a registered version.
+    close: Option<InventoryUpdate>,
     /// The reset that returns the record to `Open` has already been taken, so
     /// no later cleanup step may take it a second time.
     reset_done: bool,
@@ -411,6 +415,7 @@ impl CompleteUploadOperation {
             binding: None,
             head_pointer: None,
             version_epoch: OriginalEpoch::default(),
+            close: None,
             reset_done: false,
             compose_share: None,
             selected_parts: HashMap::new(),
@@ -2014,11 +2019,33 @@ impl CompleteUploadOperation {
         self.write_obligation()
     }
 
+    fn commit_registered(&mut self, txn_id: TxnId) -> Effects {
+        self.state = CompleteUploadState::CommitFinalizeTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn handle_inventory_closed(&mut self, event: Event) -> Effects {
+        let (Some(txn_id), Some(close)) = (self.txn_id, self.close.as_mut()) else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        match close.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => self.commit_registered(txn_id),
+            Err(error) => self.schedule_error(UsageUpdateError::from(error).into()),
+        }
+    }
+
     fn write_obligation(&mut self) -> Effects {
         // A registered version keeps its obligation and charges; only the upload is cleared.
         if let (true, Some(txn_id)) = (self.registered, self.txn_id) {
-            self.state = CompleteUploadState::CommitFinalizeTransaction;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+            if let Some(binding) = self.binding.as_ref() {
+                let mut change = InventoryChange::new(binding.set_id, self.input.key.clone());
+                change.upload = Some((self.input.upload_id, false));
+                let close = self.close.insert(InventoryUpdate::new(change));
+                self.state = CompleteUploadState::CloseInventory;
+                return close.start(txn_id);
+            }
+            return self.commit_registered(txn_id);
         }
         let Some(version_id) = self.version_id else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
@@ -2513,6 +2540,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteReplicationObligation => self.obligation_written(event),
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),
             CompleteUploadState::UpdateUsage => self.handle_usage_update(event),
+            CompleteUploadState::CloseInventory => self.handle_inventory_closed(event),
             CompleteUploadState::CommitFinalizeTransaction => self.handle_finalize_committed(event),
             CompleteUploadState::AbortFinalizeTransaction => self.abort_finalize(event),
             CompleteUploadState::ResetUploadTransaction => self.reset_started(event),
