@@ -1839,7 +1839,8 @@ fn marker_carries_hint() {
     };
     let (snapshot, bytes) = crate::distribution::test_record::record(true);
     let set_id = snapshot.set_id();
-    let binding = crate::distribution::test_record::binding(&snapshot, 1, 5);
+    // "reports/a.csv" lies above "m", in the range member 2 coordinates.
+    let binding = crate::distribution::test_record::binding(&snapshot, 2, 5);
     let (hinted, hint) = marker(Some(binding), Some(bytes));
     assert_eq!(hint, Some(SetHint::of_set(set_id)));
     assert_eq!(SetHint::of_version(hinted), SetHint::of_set(set_id));
@@ -1850,7 +1851,7 @@ fn marker_carries_hint() {
 fn member_marker_refused() {
     let (snapshot, bytes) = crate::distribution::test_record::record(true);
     let mut operation = audit_op(None);
-    operation.binding = Some(crate::distribution::test_record::binding(&snapshot, 2, 5));
+    operation.binding = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     operation.state = DeleteObjectState::ReadRecord;
     operation.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![2u8].into(),

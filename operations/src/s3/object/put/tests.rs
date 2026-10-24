@@ -2724,7 +2724,7 @@ async fn plain_owns_copy() {
 }
 
 /// Starts a put into a bucket bound as member `seed` of the two-shard test set and answers
-/// the bucket and record reads; the key "some-file.txt" lies in member 1's range.
+/// the bucket and record reads; the key "some-file.txt" lies in member 2's range.
 fn bound_put(seed: u8) -> (PutObjectOperation, aruna_core::types::Effects) {
     use crate::distribution::test_record::{binding, record};
     use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
@@ -2762,7 +2762,7 @@ fn bound_put(seed: u8) -> (PutObjectOperation, aruna_core::types::Effects) {
 
 #[test]
 fn coordinator_stamps_put() {
-    let (op, effects) = bound_put(1);
+    let (op, effects) = bound_put(2);
     assert_eq!(
         op.version_epoch,
         aruna_core::structs::storage::distribution::OriginalEpoch(1)
@@ -2775,7 +2775,7 @@ fn coordinator_stamps_put() {
 
 #[test]
 fn member_put_refused() {
-    let (op, effects) = bound_put(2);
+    let (op, effects) = bound_put(1);
     assert!(effects.is_empty());
     assert!(matches!(
         op.finalize(),
