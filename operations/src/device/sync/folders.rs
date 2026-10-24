@@ -196,6 +196,9 @@ pub(crate) async fn finish_binding(
     context: &Arc<DriverContext>,
     folder: SyncedFolder,
 ) -> Result<SyncedFolder, FolderError> {
+    let _pass = super::folder_lock(folder.folder_id).await;
+    // The caller's copy may be stale: a binding unbound or finished since is left alone.
+    let folder = read_bound(context, folder.folder_id).await?;
     let FolderState::Binding { create_bucket } = folder.state else {
         return Ok(folder);
     };
@@ -1034,6 +1037,33 @@ mod tests {
         assert!(entries.is_empty());
         assert_eq!(
             read_bound(&context, folder.folder_id).await,
+            Err(FolderError::NotFound)
+        );
+    }
+
+    // A pass that listed a binding before its unbind must not ask the realm node for a bucket once
+    // the folder is deleting or gone. This context reaches no realm node, so a request would fail.
+    #[tokio::test]
+    async fn skips_unbound_binding() {
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let listed = bound_folder(FolderState::Binding {
+            create_bucket: true,
+        });
+        let deleting = SyncedFolder {
+            state: FolderState::Deleting,
+            ..listed.clone()
+        };
+        store_folder(&context, &deleting).await.expect("row stored");
+        assert_eq!(finish_binding(&context, listed.clone()).await, Ok(deleting));
+
+        let row = vec![(
+            SYNCED_FOLDER_KEYSPACE.to_string(),
+            folder_key(listed.folder_id),
+        )];
+        assert!(delete_rows(&context, row, None).await);
+        assert_eq!(
+            finish_binding(&context, listed).await,
             Err(FolderError::NotFound)
         );
     }
