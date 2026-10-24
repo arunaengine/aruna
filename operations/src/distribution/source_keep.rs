@@ -1,7 +1,6 @@
-//! Keeps the source bytes of an external reference on a copy-on-use or cache-on-use member of
-//! a distributed bucket. After a read served the reference from its source, the whole object
-//! is read once more, bound to its recorded ETag or checked against its recorded digests, and
-//! published like any kept copy; a source that allows neither is never kept.
+//! Keeps the source bytes of an external reference on a copy-on-use or cache-on-use member:
+//! after a read served it from its source, the whole object is read again, bound to its ETag
+//! or checked against its digests, and published like any kept copy; else nothing is kept.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

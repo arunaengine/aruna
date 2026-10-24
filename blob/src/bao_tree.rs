@@ -549,7 +549,7 @@ mod tests {
 
     // A gap in the decoded chunks or a short read never passes as the whole range.
     #[tokio::test]
-    async fn range_writer_refuses_gaps() {
+    async fn range_writer_gaps() {
         let (writer, _reader) = tokio::io::duplex(64);
         let mut range = RangeWriter::new(writer, 3..9);
         assert!(range.write_at(4, b"efgh").await.is_err());
