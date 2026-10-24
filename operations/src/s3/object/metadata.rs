@@ -39,6 +39,8 @@ use aruna_core::structs::identity::auth::AuthContext;
 
 const REFRESH_SCAN_PAGE: usize = 512;
 const REFRESH_BATCH_SIZE: usize = 64;
+// Queue writes that lose to a racing drain or request reread the job, up to this often.
+const QUEUE_CONFLICT_RETRIES: u32 = 8;
 
 pub const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(1);
 
@@ -180,6 +182,7 @@ enum QueueRefreshState {
 pub struct QueueRefreshOperation {
     refresh: ReferenceRefresh,
     txn_id: Option<Ulid>,
+    conflicts: u32,
     state: QueueRefreshState,
     output: Option<Result<QueueRefreshResult, ReferenceRefreshError>>,
 }
@@ -189,6 +192,7 @@ impl QueueRefreshOperation {
         Self {
             refresh,
             txn_id: None,
+            conflicts: 0,
             state: QueueRefreshState::Init,
             output: None,
         }
@@ -290,6 +294,16 @@ impl Operation for QueueRefreshOperation {
                         self.finish(true, false)
                     }
                 };
+            }
+            (
+                QueueRefreshState::Commit,
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }),
+            ) if self.conflicts < QUEUE_CONFLICT_RETRIES => {
+                self.txn_id = None;
+                self.conflicts += 1;
+                return self.start_transaction();
             }
             (_, Event::Storage(StorageEvent::Error { error })) => return self.fail(error.into()),
             (_, Event::Storage(event)) => event,
@@ -1253,6 +1267,50 @@ mod tests {
         let result = process_batch(&test.context).await.expect("drain succeeds");
         assert_eq!(result.succeeded, 1);
         assert_reference_state(&test, &original, newer).await;
+    }
+
+    // A queue write that loses to a racing commit rereads the job instead of dropping the request.
+    #[tokio::test]
+    async fn queue_conflict_retried() {
+        let test = setup_state();
+        let mut operation = QueueRefreshOperation::new(refresh(
+            &test,
+            source_metadata(1, "original"),
+            SystemTime::UNIX_EPOCH,
+        ));
+        let conflict = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            })
+        };
+        operation.start();
+        for _ in 0..=QUEUE_CONFLICT_RETRIES {
+            let txn_id = Ulid::generate();
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: ByteView::from(Vec::new()),
+                value: None,
+            }));
+            operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            }));
+            assert_eq!(operation.state, QueueRefreshState::Commit);
+            let effects = operation.step(conflict());
+            let retried = matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::StartTransaction {
+                    read: false
+                })]
+            );
+            assert_eq!(retried, !operation.is_complete());
+        }
+
+        assert_eq!(
+            operation.finalize(),
+            Err(ReferenceRefreshError::Storage(
+                StorageError::TransactionConflict
+            ))
+        );
     }
 
     // A drain that finishes a request a newer one replaced keeps the newer job queued.
