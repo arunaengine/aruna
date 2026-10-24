@@ -13,6 +13,7 @@ pub mod handoff;
 pub mod inventory;
 pub mod publish;
 pub mod rebuild;
+pub mod refill;
 pub mod split;
 #[cfg(test)]
 pub(crate) mod test_store;
