@@ -42,6 +42,7 @@ fn cached(seed: u8, size: u64, capacity: u64) -> KeptCopy {
         kind: KeptKind::Cache,
         set_id: id(1),
         version_id: id(seed),
+        identity: [seed; 32],
         blake3: [seed; 32],
         size,
         location: location(seed, size),

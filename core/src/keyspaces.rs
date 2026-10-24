@@ -82,7 +82,7 @@ pub const CATCH_UP_KEYSPACE: &str = "distribution_catch_up";
 pub const BOOTSTRAP_KEYSPACE: &str = "distribution_bootstrap";
 /// Copy-on-use attachments by set id and version id: a verified local copy a GET reads.
 pub const ATTACHMENT_KEYSPACE: &str = "distribution_attachments";
-/// Cache-on-use entries by BLAKE3, and the cache totals row.
+/// Cache-on-use entries by the logical identity of their version, and the cache totals row.
 pub const CACHE_ENTRY_KEYSPACE: &str = "distribution_cache_entries";
 /// Cache entries in admission order, by entry ULID, so eviction starts at the oldest.
 pub const CACHE_ORDER_KEYSPACE: &str = "distribution_cache_order";

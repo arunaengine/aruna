@@ -81,6 +81,7 @@ fn kept_copy_matches() {
         location: location(9),
     };
     let entry = CacheEntry {
+        key: [3; 32],
         blake3: [3; 32],
         location: location(9),
         size: 9,
@@ -107,6 +108,30 @@ fn kept_copy_matches() {
     };
     assert_eq!(
         kept_location(&held, &[row(None), row(Some(foreign.to_bytes().unwrap()))]),
+        None
+    );
+}
+
+// A kept copy of an external reference serves only when complete and hashed as recorded.
+#[test]
+fn kept_reference_matches() {
+    let mut whole = location(9);
+    whole.hashes = HashMap::from([(HASH_BLAKE3.to_string(), vec![5; 32])]);
+    let attached = Attachment {
+        blake3: [5; 32],
+        location: whole.clone(),
+    };
+    let row = |value: Vec<u8>| (Key::from(Vec::new()), Some(Value::from(value)));
+    let none = (Key::from(Vec::new()), None);
+    let values = [row(attached.to_bytes().unwrap()), none.clone()];
+    assert_eq!(kept_source_location(&values, 9), Some(whole.clone()));
+    assert_eq!(kept_source_location(&values, 10), None);
+    let forged = Attachment {
+        blake3: [6; 32],
+        location: whole,
+    };
+    assert_eq!(
+        kept_source_location(&[row(forged.to_bytes().unwrap()), none], 9),
         None
     );
 }

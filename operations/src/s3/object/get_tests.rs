@@ -2664,3 +2664,130 @@ async fn slices_routed_range() {
     let suffix = ObjectRangeRequest::Suffix { length: 3 }.resolve(8).unwrap();
     assert_eq!(read(suffix.range).await, b"fgh");
 }
+
+fn distributed_operation() -> GetObjectOperation {
+    let mut operation = GetObjectOperation::new(GetObjectInput {
+        bucket: "spire".to_string(),
+        key: "a.txt".to_string(),
+        version_id: None,
+        range: None,
+        group_id: Ulid::from_parts(5, 5),
+        user_identity: UserId::local(Ulid::from_parts(2, 2), RealmId([0u8; 32])),
+        realm_id: RealmId([0u8; 32]),
+        node_id: test_node_id(),
+    });
+    operation.txn_id = Some(Ulid::from_parts(9, 9));
+    operation
+}
+
+// A version this member holds only the record of looks for a kept copy, then hands the read to
+// the holders of its range with the facts the record gives.
+#[test]
+fn held_version_pulls() {
+    use aruna_core::structs::storage::distribution::on_use::attachment_key;
+    let mut operation = distributed_operation();
+    let set_id = Ulid::from_parts(7, 7);
+    let mut source = reference_source();
+    source.descriptor.kind = SourceConnectorKind::ArunaNative;
+    source.descriptor.public_config = HashMap::from([("set_id".to_string(), set_id.to_string())]);
+    let version = BlobVersion::reference(
+        source,
+        observation(4),
+        SystemTime::UNIX_EPOCH,
+        UserId::local(Ulid::from_parts(1, 1), RealmId([0u8; 32])),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_identity(Some([3; 32]));
+    let version_id = Ulid::from_parts(4, 4);
+
+    let effects = operation.read_version(version_id, version, false);
+
+    let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+        panic!("expected the kept copy reads")
+    };
+    assert_eq!(reads[0].1.to_vec(), attachment_key(set_id, version_id));
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(Vec::new().into(), None), (Vec::new().into(), None)],
+    }));
+    let Err(GetObjectError::HeldElsewhere(held)) = operation.finalize() else {
+        panic!("expected a read through holders")
+    };
+    assert_eq!((held.set_id, held.blake3, held.size), (set_id, [3; 32], 4));
+}
+
+// A member serves its kept copy of an external reference without asking the source.
+#[test]
+fn kept_reference_served() {
+    use aruna_core::structs::storage::distribution::on_use::Attachment;
+    use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
+    let mut operation = distributed_operation();
+    let version = BlobVersion::reference(
+        reference_source(),
+        observation(4),
+        SystemTime::UNIX_EPOCH,
+        UserId::local(Ulid::from_parts(1, 1), RealmId([0u8; 32])),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_identity(Some([6; 32]));
+    let effects = operation.read_version(Ulid::from_parts(4, 4), version, false);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })]
+            if key_space == aruna_core::keyspaces::S3_BUCKET_KEYSPACE
+    ));
+    let bucket = aruna_core::structs::storage::blob::BucketInfo {
+        group_id: Ulid::from_parts(5, 5),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: aruna_core::structs::storage::format::Compression::Off,
+        distribution: Some(DistributionBinding {
+            set_id: Ulid::from_parts(7, 7),
+            member_id: Ulid::from_parts(8, 8),
+            incarnation: 5,
+            revision: DistributionRevision::default(),
+        }),
+    };
+    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: Vec::<u8>::new().into(),
+        value: Some(bucket.to_bytes().unwrap().into()),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 2
+    ));
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/tmp".to_string(),
+        storage_bucket: "aruna_test".to_string(),
+        backend_path: "_jobs/kept".to_string(),
+        ulid: Ulid::nil(),
+        format: StoredFormat::default(),
+        created_by: Default::default(),
+        created_at: SystemTime::UNIX_EPOCH,
+        staging: false,
+        partial: false,
+        blob_size: 4,
+        hashes: HashMap::from([("blake3".to_string(), vec![2; 32])]),
+    };
+    let attached = Attachment {
+        blake3: [2; 32],
+        location,
+    };
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (Vec::new().into(), Some(attached.to_bytes().unwrap().into())),
+            (Vec::new().into(), None),
+        ],
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })]
+            if key_space == aruna_core::keyspaces::OBJECT_METADATA_KEYSPACE
+    ));
+    assert_eq!(operation.state, GetObjectState::ReadMultipartSummary);
+}

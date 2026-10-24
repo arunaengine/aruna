@@ -28,9 +28,13 @@ pub struct Attachment {
     pub location: BackendLocation,
 }
 
-/// One cache entry, stored by its BLAKE3 and again by its admission order.
+/// One cache entry, stored by its key and again by its admission order.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CacheEntry {
+    /// The logical identity of its version: the BLAKE3 of stored bytes, or the observation
+    /// digest of an external reference.
+    pub key: [u8; 32],
+    /// The BLAKE3 of the kept bytes.
     pub blake3: [u8; 32],
     pub location: BackendLocation,
     pub size: u64,
@@ -91,11 +95,11 @@ pub fn attachment_key(set_id: Ulid, version_id: Ulid) -> Vec<u8> {
     key
 }
 
-/// The claim key of one fill: its kind, then the attachment key or the BLAKE3.
-pub fn claim_key(kind: KeptKind, set_id: Ulid, version_id: Ulid, blake3: [u8; 32]) -> Vec<u8> {
+/// The claim key of one fill: its kind, then the attachment key or the cache entry key.
+pub fn claim_key(kind: KeptKind, set_id: Ulid, version_id: Ulid, identity: [u8; 32]) -> Vec<u8> {
     match kind {
         KeptKind::Attachment => [&[0u8][..], &attachment_key(set_id, version_id)].concat(),
-        KeptKind::Cache => [&[1u8][..], &blake3[..]].concat(),
+        KeptKind::Cache => [&[1u8][..], &identity[..]].concat(),
     }
 }
 

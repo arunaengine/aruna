@@ -12,7 +12,8 @@ use crate::blob::records::blob_location_read;
 use crate::connectors::repository::connector_reference_write;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::pull::{
-    HeldElsewhere, PullRequest, kept_location, kept_reads, pull_through,
+    HeldElsewhere, PullRequest, kept_location, kept_reads, kept_source_location, kept_source_reads,
+    pull_through,
 };
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
@@ -96,6 +97,9 @@ pub enum GetObjectState {
     GetCurrentVersion,
     /// A distributed version kept elsewhere first looks for this member's kept copy.
     ReadKept,
+    /// A reference of a distributed bucket reads its bucket, then this member's kept copy.
+    ReadSourceBucket,
+    ReadSourceKept,
     ResolveReferenceAccess,
     ReadMultipartSummary,
     CommitTransaction,
@@ -368,6 +372,8 @@ pub struct GetObjectOperation {
     source_policies: Vec<PlacementPolicyRef>,
     /// A distributed version this member keeps no bytes of, unless a kept copy turns up.
     held: Option<HeldElsewhere>,
+    /// The logical identity of a reference in a distributed bucket, its kept copy's key.
+    source_identity: Option<[u8; 32]>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
     /// Active key of an encrypting bucket whose reference or unsealed copy is read.
     reference_key: Option<BucketKeyRef>,
@@ -419,6 +425,7 @@ impl GetObjectOperation {
             pending_copy: None,
             source_policies: Vec::new(),
             held: None,
+            source_identity: None,
             output: None,
             reference_key: None,
             reference_lease: None,
@@ -677,12 +684,17 @@ impl GetObjectOperation {
                 self.source_metadata = None;
                 self.last_refresh = None;
                 self.version_created_at = None;
-                self.state = GetObjectState::ResolveReferenceAccess;
-                let group_id = Some(self.input.group_id);
-                smallvec![resolve_binding_effect(ResolveBindingInput {
-                    source,
-                    group_id
-                })]
+                // Only a distributed bucket fixes an identity; its member may keep the bytes.
+                self.source_identity = version.identity;
+                if version.identity.is_some() {
+                    self.state = GetObjectState::ReadSourceBucket;
+                    return smallvec![Effect::Storage(StorageEffect::Read {
+                        key_space: S3_BUCKET_KEYSPACE.to_string(),
+                        key: self.input.bucket.as_bytes().into(),
+                        txn_id: self.txn_id,
+                    })];
+                }
+                self.resolve_reference()
             }
             BlobVersionState::PendingContent { archive, .. }
                 if self.token || self.object.is_some() =>
@@ -692,6 +704,62 @@ impl GetObjectOperation {
             BlobVersionState::PendingContent { .. } => {
                 self.emit_error(ConversionError::BucketKey(BucketKeyError::Unsupported).into())
             }
+        }
+    }
+
+    fn resolve_reference(&mut self) -> Effects {
+        let Some(source) = self.source_binding.clone() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        self.state = GetObjectState::ResolveReferenceAccess;
+        let group_id = Some(self.input.group_id);
+        smallvec![resolve_binding_effect(ResolveBindingInput {
+            source,
+            group_id
+        })]
+    }
+
+    /// A member of a distributed bucket looks for its kept copy of the reference first.
+    fn source_bucket_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+        let binding = value
+            .as_deref()
+            .and_then(|value| BucketInfo::from_bytes(value).ok())
+            .and_then(|bucket| bucket.distribution);
+        let (Some(binding), Some(identity), Some(version_id)) =
+            (binding, self.source_identity, self.resolved_version_id)
+        else {
+            return self.resolve_reference();
+        };
+        self.state = GetObjectState::ReadSourceKept;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: kept_source_reads(binding.set_id, version_id, identity),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// Serves the kept copy of a reference without asking its source, or reads the source.
+    fn source_kept_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let size = self
+            .reference_cached
+            .as_ref()
+            .map(|cached| cached.content_length);
+        match size.and_then(|size| kept_source_location(&values, size)) {
+            Some(location) => self.read_multipart_summary(location, self.resolved_version_id),
+            None => self.resolve_reference(),
         }
     }
 
@@ -1858,6 +1926,8 @@ impl Operation for GetObjectOperation {
             GetObjectState::GetBlobLocation => self.location_read(event),
             GetObjectState::GetCurrentVersion => self.current_version_received(event),
             GetObjectState::ReadKept => self.kept_read(event),
+            GetObjectState::ReadSourceBucket => self.source_bucket_read(event),
+            GetObjectState::ReadSourceKept => self.source_kept_read(event),
             GetObjectState::ResolveReferenceAccess => self.reference_access_resolved(event),
             GetObjectState::ReadMultipartSummary => self.summary_read(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
@@ -2512,7 +2582,7 @@ async fn local_multipart_summary(
 mod test;
 
 /// Whether an ETag can bind a read through `If-Match`: present and not weak.
-fn strong_validator(etag: Option<&str>) -> bool {
+pub(crate) fn strong_validator(etag: Option<&str>) -> bool {
     etag.map(str::trim)
         .is_some_and(|etag| !etag.is_empty() && !etag.starts_with("W/"))
 }

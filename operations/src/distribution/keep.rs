@@ -202,6 +202,8 @@ pub struct KeptCopy {
     pub kind: KeptKind,
     pub set_id: Ulid,
     pub version_id: Ulid,
+    /// The cache entry key: the version's logical identity.
+    pub identity: [u8; 32],
     pub blake3: [u8; 32],
     pub size: u64,
     pub location: BackendLocation,
@@ -399,10 +401,7 @@ impl PublishKeptOperation {
         let copy = &self.copy;
         let mut totals = self.totals;
         for entry in &self.evicted {
-            deletes.push((
-                CACHE_ENTRY_KEYSPACE.to_string(),
-                entry.blake3.to_vec().into(),
-            ));
+            deletes.push((CACHE_ENTRY_KEYSPACE.to_string(), entry.key.to_vec().into()));
             deletes.push((
                 CACHE_ORDER_KEYSPACE.to_string(),
                 entry.order.to_bytes().to_vec().into(),
@@ -411,6 +410,7 @@ impl PublishKeptOperation {
             totals.entries = totals.entries.saturating_sub(1);
         }
         let entry = CacheEntry {
+            key: copy.identity,
             blake3: copy.blake3,
             location: copy.location.clone(),
             size: copy.size,
@@ -422,7 +422,7 @@ impl PublishKeptOperation {
         let order = copy.order.to_bytes().to_vec();
         writes.push((
             CACHE_ENTRY_KEYSPACE.to_string(),
-            copy.blake3.to_vec().into(),
+            copy.identity.to_vec().into(),
             entry.clone().into(),
         ));
         writes.push((CACHE_ORDER_KEYSPACE.to_string(), order.into(), entry.into()));
@@ -473,7 +473,7 @@ impl Operation for PublishKeptOperation {
                     reads: vec![
                         (
                             CACHE_ENTRY_KEYSPACE.to_string(),
-                            self.copy.blake3.to_vec().into()
+                            self.copy.identity.to_vec().into()
                         ),
                         (
                             CACHE_ENTRY_KEYSPACE.to_string(),

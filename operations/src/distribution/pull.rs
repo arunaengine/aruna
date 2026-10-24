@@ -88,16 +88,41 @@ impl HeldElsewhere {
 
 /// The reads of the copies this member may keep of `held`: its attachment, its cache entry.
 pub fn kept_reads(held: &HeldElsewhere) -> Vec<(KeySpace, Key)> {
+    kept_source_reads(held.set_id, held.version_id, held.blake3)
+}
+
+/// The reads of a version's kept copies, by set and version id, and by logical identity.
+pub fn kept_source_reads(
+    set_id: Ulid,
+    version_id: Ulid,
+    identity: [u8; 32],
+) -> Vec<(KeySpace, Key)> {
     vec![
         (
             ATTACHMENT_KEYSPACE.to_string(),
-            attachment_key(held.set_id, held.version_id).into(),
+            attachment_key(set_id, version_id).into(),
         ),
-        (
-            CACHE_ENTRY_KEYSPACE.to_string(),
-            held.blake3.to_vec().into(),
-        ),
+        (CACHE_ENTRY_KEYSPACE.to_string(), identity.to_vec().into()),
     ]
+}
+
+/// The kept copy of an external reference: complete, and holding the bytes it was hashed as.
+pub fn kept_source_location(values: &[(Key, Option<Value>)], size: u64) -> Option<BackendLocation> {
+    let fits = |location: &BackendLocation, blake3: [u8; 32]| {
+        location.blob_size == size && location.get_blake3() == Some(blake3.as_slice())
+    };
+    let attached = values
+        .first()
+        .and_then(|(_, value)| Attachment::from_bytes(value.as_deref()?).ok())
+        .filter(|attached| fits(&attached.location, attached.blake3))
+        .map(|attached| attached.location);
+    attached.or_else(|| {
+        values
+            .get(1)
+            .and_then(|(_, value)| CacheEntry::from_bytes(value.as_deref()?).ok())
+            .filter(|entry| fits(&entry.location, entry.blake3))
+            .map(|entry| entry.location)
+    })
 }
 
 /// The kept copy a read uses: one whose BLAKE3 and size are the version's.
@@ -195,7 +220,7 @@ pub async fn pull_through(
     })
 }
 
-async fn read_row(
+pub(super) async fn read_row(
     context: &DriverContext,
     key_space: &str,
     key: Vec<u8>,
@@ -398,6 +423,7 @@ async fn fill(
         kind,
         set_id: held.set_id,
         version_id: held.version_id,
+        identity: held.blake3,
         blake3: held.blake3,
         size: held.size,
         location: location.clone(),
@@ -464,7 +490,7 @@ async fn write_copy(
     }
 }
 
-async fn drop_copy(context: &DriverContext, location: &BackendLocation) {
+pub(super) async fn drop_copy(context: &DriverContext, location: &BackendLocation) {
     let (Some(blob_handle), Ok(key)) = (
         context.blob_handle.as_ref(),
         HiddenBlobKey::try_from(location),
@@ -480,7 +506,7 @@ async fn drop_copy(context: &DriverContext, location: &BackendLocation) {
 }
 
 /// Releases a fill claim, so the next read may fill again.
-async fn release(context: &DriverContext, claim: Vec<u8>) {
+pub(super) async fn release(context: &DriverContext, claim: Vec<u8>) {
     let delete = StorageEffect::Delete {
         key_space: FILL_CLAIM_KEYSPACE.to_string(),
         key: claim.into(),
