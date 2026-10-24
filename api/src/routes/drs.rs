@@ -17,7 +17,9 @@ use aruna_core::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
+use aruna_operations::distribution::resolve::{GlobalResolution, resolve_version};
 use aruna_operations::driver::{drive, drive_until};
+use aruna_operations::node::holder_choice::choose_holder;
 use aruna_operations::node::node_info::read_info_documents;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
@@ -220,6 +222,11 @@ enum RequestedObjectId {
         hash: [u8; 32],
     },
     VersionedObject(VersionedObjectArn),
+    /// A distributed bucket's version by its global id.
+    GlobalVersion {
+        realm_id: aruna_core::structs::identity::realm::RealmId,
+        version_id: Ulid,
+    },
 }
 
 struct ResolvedObject {
@@ -237,6 +244,10 @@ struct ResolvedObject {
     location: Option<BackendLocation>,
     /// The owning node's published base URL when the bytes live there.
     origin: Option<String>,
+    /// The members that keep the bytes of a distributed object; empty for ordinary objects.
+    holders: Vec<aruna_core::NodeId>,
+    /// The base URL of the holder chosen to serve; its access URL is pinned there.
+    pinned: Option<String>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -453,7 +464,8 @@ pub async fn get_object(
     };
 
     match resolve_object(state.as_ref(), &auth, &object_id, routed_deadline()).await {
-        Ok(ResolveOutcome::Found(resolved)) => {
+        Ok(ResolveOutcome::Found(mut resolved)) => {
+            pin_holder(state.as_ref(), &mut resolved).await;
             let mut object = build_object_response(&base_url, &resolved);
             if resolved.location.is_some() {
                 let caller = (!anonymous).then_some(auth);
@@ -580,10 +592,12 @@ pub async fn post_objects(
     let objects: Vec<DrsBulkItem> = futures_util::stream::iter(body.object_ids)
         .map(|object_id| async move {
             let result = match resolve_object(node, auth, &object_id, deadline).await {
-                Ok(ResolveOutcome::Found(resolved)) => serde_json::to_value(build_object_response(
-                    base_url, &resolved,
-                ))
-                .unwrap_or_else(|_| json!({ "status_code": 500, "msg": "serialization failed" })),
+                Ok(ResolveOutcome::Found(mut resolved)) => {
+                    pin_holder(node, &mut resolved).await;
+                    serde_json::to_value(build_object_response(base_url, &resolved)).unwrap_or_else(
+                        |_| json!({ "status_code": 500, "msg": "serialization failed" }),
+                    )
+                }
                 Ok(ResolveOutcome::Denied) => {
                     let error = drs_denied_error(anonymous);
                     json!({ "status_code": error.status.as_u16(), "msg": error.message })
@@ -746,6 +760,37 @@ pub async fn download_object(
     response
 }
 
+/// The node that serves a distributed object instead of this one, of two fresh holders the one
+/// with more free download slots; this node counts when it keeps the bytes. `None` serves here.
+async fn chosen_holder(
+    state: &ServerState,
+    resolved: &ResolvedObject,
+) -> Option<aruna_core::NodeId> {
+    if resolved.holders.is_empty() {
+        return None;
+    }
+    let local = state.get_node_id();
+    let candidates: Vec<_> = resolved
+        .holders
+        .iter()
+        .copied()
+        .filter(|node_id| *node_id != local || resolved.location.is_some())
+        .collect();
+    choose_holder(&state.get_ctx(), &candidates, now_millis())
+        .await
+        .map(|chosen| chosen.node_id)
+        .filter(|node_id| *node_id != local)
+}
+
+/// Points the access URL of a distributed object at the holder chosen to serve it.
+async fn pin_holder(state: &ServerState, resolved: &mut ResolvedObject) {
+    if let Some(node_id) = chosen_holder(state, resolved).await
+        && let Ok(Some(origin)) = owner_origin(state, node_id).await
+    {
+        resolved.pinned = Some(origin);
+    }
+}
+
 /// The datasets whose linked parts contain a local object; `None` when no metadata node
 /// could answer, so the object itself is still served.
 async fn drs_part_of(
@@ -799,20 +844,21 @@ fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObject
     } else {
         vec![resolved.canonical_w3id.clone()]
     };
-    // Only the owning node serves the bytes, so a routed answer points at its origin.
-    let origin = match resolved.location {
-        Some(_) => Some(base_url),
-        None => resolved.origin.as_deref(),
+    // A chosen holder serves at its pinned URL; otherwise the node with the bytes serves.
+    let origin = match (&resolved.pinned, &resolved.location) {
+        (Some(pinned), _) => Some((pinned.as_str(), "&here=true")),
+        (None, Some(_)) => Some((base_url, "")),
+        (None, None) => resolved.origin.as_deref().map(|origin| (origin, "")),
     };
     let access_methods = origin
         .into_iter()
-        .map(|origin| DrsAccessMethod {
+        .map(|(origin, pin)| DrsAccessMethod {
             access_id: ACCESS_ID_HTTPS.to_string(),
             kind: "https".to_string(),
             region: None,
             access_url: Some(DrsAccessUrl {
                 url: format!(
-                    "{origin}/api/v1/ga4gh/drs/v1/download?object_id={}",
+                    "{origin}/api/v1/ga4gh/drs/v1/download?object_id={}{pin}",
                     encode_component(&resolved.requested_id)
                 ),
                 headers: HashMap::new(),
@@ -887,7 +933,88 @@ async fn resolve_object(
         RequestedObjectId::VersionedObject(arn) => {
             resolve_versioned(state, auth, object_id, &arn, deadline).await
         }
+        RequestedObjectId::GlobalVersion {
+            realm_id,
+            version_id,
+        } => resolve_global(state, auth, object_id, realm_id, version_id, deadline).await,
     }
+}
+
+/// Resolves a distributed bucket's version on any realm node: this node's member answers when
+/// it keeps the bytes, otherwise a chosen holder answers for the caller.
+async fn resolve_global(
+    state: &ServerState,
+    auth: &AuthContext,
+    requested_id: &str,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
+    version_id: Ulid,
+    deadline: Instant,
+) -> Result<ResolveOutcome, DrsError> {
+    if realm_id != state.get_realm_id() {
+        return Ok(ResolveOutcome::NotFound);
+    }
+    let context = state.get_ctx();
+    let found = match resolve_version(&context, version_id, deadline).await {
+        GlobalResolution::Found(found) => found,
+        GlobalResolution::NotFound => return Ok(ResolveOutcome::NotFound),
+        GlobalResolution::Unavailable => return Ok(ResolveOutcome::Unavailable),
+        GlobalResolution::Ambiguous => {
+            return Err(DrsError::conflict(
+                "more than one distributed bucket holds this version id",
+            ));
+        }
+    };
+    let canonical = GlobalId::Version {
+        realm_id,
+        version_id,
+    }
+    .to_url();
+    let object = ObjectRef {
+        bucket: &found.bucket,
+        key: &found.key,
+        version_id,
+        canonical_w3id: &canonical,
+    };
+    let with_holders = |outcome: ResolveOutcome| match outcome {
+        ResolveOutcome::Found(mut resolved) => {
+            resolved.holders = found.holders.clone();
+            ResolveOutcome::Found(resolved)
+        }
+        outcome => outcome,
+    };
+    if found.local {
+        // A member without the bytes of the version asks a holder instead.
+        match resolve_local(state, auth, requested_id, &object).await? {
+            ResolveOutcome::NotFound => {}
+            outcome => return Ok(with_holders(outcome)),
+        }
+    }
+    let local = state.get_node_id();
+    let remote: Vec<_> = found
+        .holders
+        .iter()
+        .copied()
+        .filter(|node_id| *node_id != local)
+        .collect();
+    let Some(holder) = choose_holder(&context, &remote, now_millis()).await else {
+        return Ok(ResolveOutcome::Unavailable);
+    };
+    let outcome = resolve_at(state, auth, requested_id, holder.node_id, &object, deadline).await?;
+    Ok(with_holders(outcome))
+}
+
+/// One exact object version a resolution names.
+struct ObjectRef<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    version_id: Ulid,
+    canonical_w3id: &'a str,
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 /// Resolve a versioned ARN owned by another node in this realm. Only the owner
@@ -908,18 +1035,37 @@ async fn resolve_routed(
     if !config.has_node(arn.node_id) {
         return Ok(ResolveOutcome::Unavailable);
     }
+    let canonical = arn.to_w3id();
+    let object = ObjectRef {
+        bucket: &arn.bucket,
+        key: &arn.key,
+        version_id: arn.version,
+        canonical_w3id: &canonical,
+    };
+    resolve_at(state, auth, requested_id, arn.node_id, &object, deadline).await
+}
+
+/// Asks `node_id` about one version for the caller; only its answer establishes absence.
+async fn resolve_at(
+    state: &ServerState,
+    auth: &AuthContext,
+    requested_id: &str,
+    node_id: aruna_core::NodeId,
+    object: &ObjectRef<'_>,
+    deadline: Instant,
+) -> Result<ResolveOutcome, DrsError> {
     let summary = drive_until(
         RemoteLocationOperation::new(
-            arn.node_id,
+            node_id,
             LocationSummaryRequest {
-                realm_id: arn.realm_id,
-                bucket: arn.bucket.clone(),
-                key: arn.key.clone(),
-                version_id: Some(arn.version),
+                realm_id: state.get_realm_id(),
+                bucket: object.bucket.to_string(),
+                key: object.key.to_string(),
+                version_id: Some(object.version_id),
                 auth_context: auth.clone(),
             },
         ),
-        &context,
+        &state.get_ctx(),
         deadline,
     )
     .await;
@@ -929,27 +1075,29 @@ async fn resolve_routed(
         Err(LocationSummaryError::BucketNotFound) => return Ok(ResolveOutcome::NotFound),
         Err(_) => return Ok(ResolveOutcome::Unavailable),
     };
-    if summary.version_id != Some(arn.version) || !summary.materialized {
+    if summary.version_id != Some(object.version_id) || !summary.materialized {
         return Ok(ResolveOutcome::NotFound);
     }
     let (Some(group_id), Some(size)) = (summary.group_id, summary.blob_size) else {
         return Ok(ResolveOutcome::Unavailable);
     };
-    let Some(origin) = owner_origin(state, arn.node_id).await? else {
+    let Some(origin) = owner_origin(state, node_id).await? else {
         return Ok(ResolveOutcome::Unavailable);
     };
     Ok(ResolveOutcome::Found(ResolvedObject {
-        bucket: arn.bucket.clone(),
-        key: arn.key.clone(),
+        bucket: object.bucket.to_string(),
+        key: object.key.to_string(),
         group_id,
-        version_id: arn.version,
-        canonical_w3id: arn.to_w3id(),
+        version_id: object.version_id,
+        canonical_w3id: object.canonical_w3id.to_string(),
         requested_id: requested_id.to_string(),
         size,
         hashes: summary.hashes.into_iter().collect(),
         source_metadata: None,
         location: None,
         origin: Some(origin),
+        holders: Vec::new(),
+        pinned: None,
     }))
 }
 
@@ -985,9 +1133,25 @@ async fn resolve_versioned(
     if arn.node_id != state.get_node_id() {
         return resolve_routed(state, auth, requested_id, arn, deadline).await;
     }
+    let canonical = arn.to_w3id();
+    let object = ObjectRef {
+        bucket: &arn.bucket,
+        key: &arn.key,
+        version_id: arn.version,
+        canonical_w3id: &canonical,
+    };
+    resolve_local(state, auth, requested_id, &object).await
+}
 
+/// Resolves one version of a bucket on this node, checked on this node's own path.
+async fn resolve_local(
+    state: &ServerState,
+    auth: &AuthContext,
+    requested_id: &str,
+    object: &ObjectRef<'_>,
+) -> Result<ResolveOutcome, DrsError> {
     let bucket_info = match drive(
-        GetBucketOperation::new(arn.bucket.clone()),
+        GetBucketOperation::new(object.bucket.to_string()),
         &state.get_ctx(),
     )
     .await
@@ -1001,9 +1165,9 @@ async fn resolve_versioned(
 
     let head = match drive(
         HeadObjectOperation::new(HeadObjectInput {
-            bucket: arn.bucket.clone(),
-            key: arn.key.clone(),
-            version_id: Some(arn.version),
+            bucket: object.bucket.to_string(),
+            key: object.key.to_string(),
+            version_id: Some(object.version_id),
         }),
         &state.get_ctx(),
     )
@@ -1024,28 +1188,30 @@ async fn resolve_versioned(
     };
 
     let path = object_permission_path(
-        arn.realm_id,
+        state.get_realm_id(),
         bucket_info.group_id,
-        arn.node_id,
-        &arn.bucket,
-        &arn.key,
+        state.get_node_id(),
+        object.bucket,
+        object.key,
     );
     if !can_read_path(state, auth, &path).await? {
         return Ok(ResolveOutcome::Denied);
     }
 
     Ok(ResolveOutcome::Found(ResolvedObject {
-        bucket: arn.bucket.clone(),
-        key: arn.key.clone(),
+        bucket: object.bucket.to_string(),
+        key: object.key.to_string(),
         group_id: bucket_info.group_id,
-        version_id: arn.version,
-        canonical_w3id: arn.to_w3id(),
+        version_id: object.version_id,
+        canonical_w3id: object.canonical_w3id.to_string(),
         requested_id: requested_id.to_string(),
         size: location.blob_size,
         hashes: location.hashes.clone().into_iter().collect(),
         source_metadata: head.source_metadata,
         location: Some(location),
         origin: None,
+        holders: Vec::new(),
+        pinned: None,
     }))
 }
 
@@ -1133,6 +1299,8 @@ async fn resolve_content_hash(
             source_metadata: head.source_metadata,
             location: Some(location),
             origin: None,
+            holders: Vec::new(),
+            pinned: None,
         }));
     }
 
@@ -1165,8 +1333,29 @@ fn parse_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
             W3idIdentifier::Global(GlobalId::Set { .. }) => Err(DrsError::bad_request(
                 "bucket and prefix ids name no object; use a version id or a content hash",
             )),
-            W3idIdentifier::Global(GlobalId::Version { .. }) => Err(DrsError::bad_request(
-                "distributed bucket version ids are not resolvable on this node yet",
+            W3idIdentifier::Global(GlobalId::Version {
+                realm_id,
+                version_id,
+            }) => Ok(RequestedObjectId::GlobalVersion {
+                realm_id,
+                version_id,
+            }),
+        };
+    }
+    // The short path form of a global id.
+    if object_id.starts_with('/') {
+        return match GlobalId::parse(object_id)
+            .map_err(|error| DrsError::bad_request(error.to_string()))?
+        {
+            GlobalId::Version {
+                realm_id,
+                version_id,
+            } => Ok(RequestedObjectId::GlobalVersion {
+                realm_id,
+                version_id,
+            }),
+            GlobalId::Set { .. } => Err(DrsError::bad_request(
+                "bucket and prefix ids name no object; use a version id or a content hash",
             )),
         };
     }
@@ -1238,6 +1427,13 @@ impl DrsError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }

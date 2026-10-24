@@ -236,6 +236,7 @@ fn parses_w3id() {
         RequestedObjectId::CanonicalW3id(hash) => assert_eq!(hash, expected_hash),
         RequestedObjectId::ContentHashArn { .. } => panic!("expected canonical w3id id"),
         RequestedObjectId::VersionedObject(_) => panic!("expected canonical w3id id"),
+        RequestedObjectId::GlobalVersion { .. } => panic!("expected canonical w3id id"),
     }
 }
 
@@ -268,6 +269,7 @@ fn parses_content_arn() {
         }
         RequestedObjectId::CanonicalW3id(_) => panic!("expected content-hash arn"),
         RequestedObjectId::VersionedObject(_) => panic!("expected content-hash arn"),
+        RequestedObjectId::GlobalVersion { .. } => panic!("expected content-hash arn"),
     }
 }
 
@@ -444,6 +446,8 @@ fn canonical_response_complete() {
         hashes: materialized_location(blake3).hashes.into_iter().collect(),
         location: Some(materialized_location(blake3)),
         origin: None,
+        holders: Vec::new(),
+        pinned: None,
         source_metadata: Some(SourceMetadata {
             content_length: 42,
             content_type: Some("application/octet-stream".to_string()),
@@ -500,6 +504,8 @@ fn content_response_aliases() {
         hashes: materialized_location(blake3).hashes.into_iter().collect(),
         location: Some(materialized_location(blake3)),
         origin: None,
+        holders: Vec::new(),
+        pinned: None,
         source_metadata: Some(SourceMetadata {
             content_length: 42,
             content_type: Some("application/octet-stream".to_string()),
@@ -591,6 +597,8 @@ async fn routed_uses_origin() {
         source_metadata: None,
         location: None,
         origin,
+        holders: Vec::new(),
+        pinned: None,
     };
     let response = build_object_response("https://local.example", &resolved);
     assert_eq!(response.access_methods.len(), 1);
@@ -628,6 +636,58 @@ fn maps_reference_errors() {
     ] {
         assert_eq!(download_error(error).status(), status);
     }
+}
+
+#[test]
+fn parses_global_versions() {
+    // The URL form and the short path form name the same version.
+    let id = aruna_core::structs::storage::global_id::GlobalId::Version {
+        realm_id: test_realm_id(),
+        version_id: Ulid::from_bytes([5u8; 16]),
+    };
+    for form in [id.to_url(), id.to_string()] {
+        match parse_object_id(&form).unwrap() {
+            RequestedObjectId::GlobalVersion {
+                realm_id,
+                version_id,
+            } => assert_eq!(
+                (realm_id, version_id),
+                (test_realm_id(), Ulid::from_bytes([5; 16]))
+            ),
+            _ => panic!("expected a global version id"),
+        }
+    }
+    let bucket = format!("/{}/{}/", test_realm_id(), Ulid::from_bytes([6u8; 16]));
+    let error = parse_object_id(&bucket).err().unwrap();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn pinned_holder_url() {
+    // A chosen holder's access URL serves there and never chooses again.
+    let resolved = ResolvedObject {
+        bucket: "spire".to_string(),
+        key: "a.fa".to_string(),
+        group_id: Ulid::from_bytes([4u8; 16]),
+        version_id: Ulid::from_bytes([5u8; 16]),
+        canonical_w3id: "https://w3id.org/aruna/data/x".to_string(),
+        requested_id: "/realm/version".to_string(),
+        size: 42,
+        hashes: Default::default(),
+        source_metadata: None,
+        location: None,
+        origin: Some("https://answered.example".to_string()),
+        holders: vec![test_node_id()],
+        pinned: Some("https://holder.example".to_string()),
+    };
+    let response = build_object_response("https://local.example", &resolved);
+    assert_eq!(
+        response.access_methods[0].access_url.as_ref().unwrap().url,
+        format!(
+            "https://holder.example/api/v1/ga4gh/drs/v1/download?object_id={}&here=true",
+            encode_component("/realm/version")
+        )
+    );
 }
 
 // Operators reading the spec must see the reference statuses the route can
