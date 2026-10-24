@@ -576,6 +576,14 @@ pub enum MetadataTransportMessage {
     DataLinkResults {
         result: Result<Box<crate::metadata::api::LinkNodePage>, MetadataReadError>,
     },
+    /// The group that owns a local bucket, asked by a management node for a database mark.
+    BucketOwner {
+        auth_token: Option<AuthToken>,
+        bucket: String,
+    },
+    BucketOwnerResult {
+        result: Result<aruna_core::types::GroupId, MetadataReadError>,
+    },
 }
 
 /// One document as a holder serves it to a device.

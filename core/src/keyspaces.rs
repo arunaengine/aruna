@@ -54,6 +54,8 @@ pub const DOCUMENT_JOB_KEYSPACE: &str = "metadata_materialization_document_jobs"
 pub const DEAD_LETTER_KEYSPACE: &str = "metadata_materialization_dead_letters";
 pub const MATERIALIZATION_PRUNE_KEYSPACE: &str = "metadata_materialization_prunes";
 pub const DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
+/// Database marks waiting for owner consent on this management node, by request id.
+pub const DATABASE_REQUEST_KEYSPACE: &str = "database_requests";
 /// Reduced distribution records by set id, materialized from their admin reducer state.
 pub const DISTRIBUTION_KEYSPACE: &str = "distribution_records";
 /// Requests a set's publisher accepted, by set id and request id, with the revision they made.
@@ -517,6 +519,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DEAD_LETTER_KEYSPACE,
     MATERIALIZATION_PRUNE_KEYSPACE,
     DOCUMENT_STATE_KEYSPACE,
+    DATABASE_REQUEST_KEYSPACE,
     DISTRIBUTION_KEYSPACE,
     DISTRIBUTION_ACCEPT_KEYSPACE,
     DISTRIBUTION_PUBLISHER_KEYSPACE,

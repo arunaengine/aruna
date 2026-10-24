@@ -511,6 +511,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::GroupCreateConflict { .. } => "forwarded_group_create_conflict",
         MetadataTransportMessage::DataLinks { .. } => "data_links",
         MetadataTransportMessage::DataLinkResults { .. } => "data_link_results",
+        MetadataTransportMessage::BucketOwner { .. } => "bucket_owner",
+        MetadataTransportMessage::BucketOwnerResult { .. } => "bucket_owner_result",
     }
 }
 
@@ -653,6 +655,26 @@ impl MetadataHandle {
         .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::DataLinkResults { result } => result.map(|page| *page),
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    pub async fn request_bucket_owner(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<AuthToken>,
+        bucket: String,
+    ) -> Result<aruna_core::types::GroupId, MetadataReadError> {
+        match send_remote_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::BucketOwner { auth_token, bucket },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::BucketOwnerResult { result } => result,
             _ => Err(MetadataReadError::Unavailable),
         }
     }

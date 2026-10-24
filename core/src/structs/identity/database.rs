@@ -167,6 +167,28 @@ impl DatabaseConsent {
     }
 }
 
+/// A curator's mark waiting for an admin of the owning group. It stays on the management node
+/// that took it and is never broadcast.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseRequest {
+    pub request_id: Ulid,
+    pub entry: DatabaseEntry,
+    /// The register version the mark replaces, which the consent will name.
+    pub predecessor: Option<AdminDocumentDot>,
+    pub curator: UserId,
+    pub created_at_ms: u64,
+}
+
+impl DatabaseRequest {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, crate::errors::ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::errors::ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 #[cfg(test)]
 #[path = "database_tests.rs"]
 mod tests;

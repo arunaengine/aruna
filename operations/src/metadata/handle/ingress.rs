@@ -1059,6 +1059,25 @@ impl MetadataHandle {
                 };
                 (MetadataTransportMessage::DataLinkResults { result }, None)
             }
+            MetadataTransportMessage::BucketOwner { auth_token, bucket } => {
+                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                    Ok(Some(_)) => crate::driver::drive(
+                        crate::s3::bucket::get::GetBucketOperation::new(bucket),
+                        context.as_ref(),
+                    )
+                    .await
+                    .map(|info| info.group_id)
+                    .map_err(|error| match error {
+                        crate::s3::bucket::get::GetBucketError::NotFound => {
+                            MetadataReadError::NotFound
+                        }
+                        _ => MetadataReadError::Unavailable,
+                    }),
+                    Ok(None) => Err(MetadataReadError::Unauthorized),
+                    Err(error) => Err(error),
+                };
+                (MetadataTransportMessage::BucketOwnerResult { result }, None)
+            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)
