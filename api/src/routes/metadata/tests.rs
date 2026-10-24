@@ -191,6 +191,7 @@ async fn public_routes_work() {
             limit: None,
             offset: None,
             after: None,
+            here: false,
         }),
     )
     .await;
@@ -263,6 +264,7 @@ async fn public_routes_work() {
             limit: None,
             offset: None,
             after: None,
+            here: false,
         }),
     )
     .await
@@ -315,6 +317,7 @@ async fn public_routes_work() {
             limit: None,
             offset: None,
             after: None,
+            here: false,
         }),
     )
     .await
@@ -341,6 +344,7 @@ async fn public_routes_work() {
             limit: None,
             offset: None,
             after: None,
+            here: false,
         }),
     )
     .await
@@ -378,6 +382,7 @@ async fn public_routes_work() {
             limit: None,
             offset: None,
             after: None,
+            here: false,
         }),
     )
     .await
@@ -398,6 +403,7 @@ async fn public_routes_work() {
             limit: Some(2),
             offset: Some(0),
             after: None,
+            here: false,
         }),
     )
     .await

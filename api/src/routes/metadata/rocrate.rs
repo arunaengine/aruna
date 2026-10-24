@@ -70,7 +70,8 @@ truncated."#,
         ("view" = Option<MetadataRoCrateView>, Query, description = "Export view, default full: full for the whole projected crate, summary for the root entity, page for a window over root-linked data entities, raw for the last accepted revision"),
         ("limit" = Option<usize>, Query, description = "Maximum number of root-linked data entities for page view. Default 100, clamped to 1..1000. Ignored by the other views"),
         ("offset" = Option<usize>, Query, description = "Offset cursor for page view: number of root-linked data entities to skip. Mutually exclusive with after, and sending both is rejected with 400"),
-        ("after" = Option<String>, Query, description = "Entity id cursor for page view: continue after this data entity id, taken from a previous response's next_cursor. Mutually exclusive with offset")
+        ("after" = Option<String>, Query, description = "Entity id cursor for page view: continue after this data entity id, taken from a previous response's next_cursor. Mutually exclusive with offset"),
+        ("here" = Option<bool>, Query, description = "Serve this node's own copy and never ask another holder; set by w3id redirects to a chosen holder. A node that holds no current copy answers an error")
     ),
     responses(
         (
@@ -195,21 +196,36 @@ pub async fn export_metadata_rocrate(
     let document_id = parse_document_id(&document_id)?;
     let view = params.view.clone().unwrap_or(MetadataRoCrateView::Full);
     let ctx = state.get_ctx();
-    let export = run_export_rocrate(
-        &ctx,
-        state.get_realm_id(),
-        ExportMetadataRequest {
-            document_id,
-            auth,
-            view: map_export_view(&view),
-            limit: params.limit,
-            offset: params.offset,
-            after: params.after.clone(),
-        },
-        forwarded_auth_token(bearer_token)?,
-        state.rocrate_limits().metadata_bytes,
-    )
-    .await
+    let request = ExportMetadataRequest {
+        document_id,
+        auth,
+        view: map_export_view(&view),
+        limit: params.limit,
+        offset: params.offset,
+        after: params.after.clone(),
+    };
+    let metadata_bytes = state.rocrate_limits().metadata_bytes;
+    let export = match params.here {
+        true => {
+            aruna_operations::metadata::forward::export_rocrate_here(
+                ctx.as_ref(),
+                state.get_realm_id(),
+                request,
+                metadata_bytes,
+            )
+            .await
+        }
+        false => {
+            run_export_rocrate(
+                &ctx,
+                state.get_realm_id(),
+                request,
+                forwarded_auth_token(bearer_token)?,
+                metadata_bytes,
+            )
+            .await
+        }
+    }
     .map_err(map_api_error)?;
     let response = map_export_response(export, &params, view)?;
     Ok((StatusCode::OK, Json(response)))

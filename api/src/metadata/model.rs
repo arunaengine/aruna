@@ -390,6 +390,9 @@ pub struct RoCrateExportParams {
     pub offset: Option<usize>,
     #[serde(default)]
     pub after: Option<String>,
+    /// Serve this node's own copy without asking other holders; w3id redirects set it.
+    #[serde(default)]
+    pub here: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::metadata::document_holder::choose_holder;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -71,10 +72,12 @@ fn rocrate_location(document_id: Ulid) -> String {
 **Authentication**: none; public route, no bearer token is read.
 
 **Behavior**: a Profile resolves under `/profile/{document_id}`, so this path answers 404 for a
-Profile and never acts as a duplicate PID."#,
+Profile and never acts as a duplicate PID. A public document redirects to the RO-Crate route of
+one of its holders: two random holders with a fresh heartbeat, the less loaded one wins, and the
+chosen holder serves its own copy. Without a fresh holder the redirect stays on this node."#,
     params(("document_id" = String, Path, description = "Document ULID carried by the w3id PID, for example 01JMETADATA0123456789ABCDE")),
     responses(
-        (status = 302, description = "Active public identifier; the Location header points at the document's RO-Crate read route, which applies its own authorization"),
+        (status = 302, description = "Active public identifier; the Location header points at the document's RO-Crate read route, which applies its own authorization: on one holder chosen by fresh heartbeat and load (absolute URL with `here=true`), or on this node"),
         (status = 404, description = "Unknown, malformed, private or Profile identifier, or a mapping still in `requested`, `processing` or `failed`"),
         (
             status = 410,
@@ -105,7 +108,20 @@ async fn resolve_pid(
         MetadataRegistryRecord::graph_iri_for(document_id),
     )
     .await;
+    if matches!(resolved, Ok(PersistentIdResolution::Redirect))
+        && let Some(holder) =
+            choose_holder(ctx.as_ref(), state.get_node_id(), document_id, now_ms()).await
+    {
+        let api = holder.api_url.trim_end_matches('/');
+        return redirect(&format!("{api}/metadata/{document_id}/rocrate?here=true"));
+    }
     landing_response(document_id, resolved)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 #[utoipa::path(

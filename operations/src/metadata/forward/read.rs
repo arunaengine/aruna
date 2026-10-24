@@ -684,6 +684,18 @@ async fn export_routed(
     }
 }
 
+/// Serves this node's own copy for a w3id redirect that chose it; it never asks another holder.
+pub async fn export_rocrate_here(
+    context: &DriverContext,
+    realm_id: RealmId,
+    request: ExportMetadataRequest,
+    metadata_bytes: u64,
+) -> Result<ExportMetadataResult, MetadataApiError> {
+    let export = export_metadata_rocrate(context, realm_id, request).await?;
+    ensure_export_limit(&export, metadata_bytes)?;
+    Ok(export)
+}
+
 pub(super) fn ensure_export_limit(
     export: &ExportMetadataResult,
     metadata_bytes: u64,
