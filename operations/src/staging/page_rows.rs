@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
+use crate::distribution::inventory::{AddedVersion, InventoryChange, entry_of, version_written};
 use crate::jobs::store::decode_job_record;
 use crate::node::usage_stats::UsageUpdateError;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
@@ -28,6 +29,7 @@ use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPoli
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
@@ -155,6 +157,7 @@ pub(crate) struct PageGuards {
     pub heads: Vec<Option<CurrentVersionPointer>>,
     /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
     pub set_hint: Option<SetHint>,
+    pub binding: Option<DistributionBinding>,
 }
 
 /// The rows of one page, its usage change and its outcome.
@@ -162,6 +165,8 @@ pub(crate) struct PageRows {
     pub writes: Vec<(KeySpace, Key, Value)>,
     pub delta: UsageDelta,
     pub result: PageImportResult,
+    /// The inventory changes of a distributed bucket, one per registered key.
+    pub inventory: Vec<InventoryChange>,
 }
 
 /// What the page does with one entry, decided against the head inside the transaction.
@@ -220,12 +225,11 @@ pub(crate) fn check_guards(
         .map(|value| BucketInfo::from_bytes(value.as_ref()))
         .transpose()?;
     let expected = &input.expected_bucket;
-    let (policies, set_hint) = match bucket {
+    let (policies, binding) = match bucket {
         Some(bucket)
             if expected.group_id == input.group_id && bucket.identity() == expected.identity() =>
         {
-            let hint = bucket.distribution.as_ref().map(|binding| binding.hint());
-            (bucket.placement_policies, hint)
+            (bucket.placement_policies, bucket.distribution)
         }
         _ => return Err(PageImportError::BucketChanged),
     };
@@ -261,7 +265,8 @@ pub(crate) fn check_guards(
         policies,
         job_created_ms: record.created_at_ms,
         heads,
-        set_hint,
+        set_hint: binding.as_ref().map(DistributionBinding::hint),
+        binding,
     })
 }
 
@@ -318,6 +323,7 @@ pub(crate) fn page_rows(
 ) -> Result<PageRows, PageImportError> {
     let mut versions = versions.into_iter();
     let mut writes = Vec::new();
+    let mut inventory = Vec::new();
     let mut delta = UsageDelta::default();
     let mut result = PageImportResult {
         registered: 0,
@@ -347,7 +353,9 @@ pub(crate) fn page_rows(
                 }
             }
             EntryPlan::Register => {
-                writes.extend(register_rows(input, guards, entry, head.as_ref())?);
+                let (rows, change) = register_rows(input, guards, entry, head.as_ref())?;
+                writes.extend(rows);
+                inventory.extend(change);
                 // An offered directory observation is charged only while it is the head.
                 let released = existing
                     .as_ref()
@@ -387,6 +395,7 @@ pub(crate) fn page_rows(
         writes,
         delta,
         result,
+        inventory,
     })
 }
 
@@ -395,7 +404,7 @@ fn register_rows(
     guards: &PageGuards,
     entry: &PageEntry,
     head: Option<&CurrentVersionPointer>,
-) -> Result<Vec<(KeySpace, Key, Value)>, PageImportError> {
+) -> Result<(Vec<(KeySpace, Key, Value)>, Option<InventoryChange>), PageImportError> {
     let connector = &input.connector;
     let binding = build_source_binding(
         StagingStrategy::Reference,
@@ -416,6 +425,13 @@ fn register_rows(
     .with_policies(guards.policies.clone())?;
     let version_key = VersionKey::new(&input.bucket, &entry.target_key, version_id);
     let pointer = CurrentVersionPointer::next_for(head, version_id)?;
+    let added = AddedVersion {
+        version_id,
+        epoch: version.original_epoch,
+        generation: pointer.generation,
+        entry: entry_of(&version, entry.observation.content_length),
+    };
+    let change = version_written(guards.binding.as_ref(), &entry.target_key, added, true);
     let head_key = BlobHeadKey::new(&input.bucket, &entry.target_key);
     let mut rows = Vec::with_capacity(4);
     rows.extend(connector_reference_write(&version, &version_key)?);
@@ -440,5 +456,5 @@ fn register_rows(
         false,
     );
     rows.push(live_obligation_entry(&obligation)?);
-    Ok(rows)
+    Ok((rows, change))
 }

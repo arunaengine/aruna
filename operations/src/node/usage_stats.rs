@@ -38,7 +38,7 @@ use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
@@ -75,8 +75,8 @@ pub struct UsageCounterUpdate {
     /// The row of the bucket the change concerns, if it concerns one.
     bucket: Option<(Vec<u8>, BucketDelta)>,
     dirty_group: Option<GroupId>,
-    /// The distributed bucket rows of the key, maintained in the same transaction.
-    inventory: Option<InventoryUpdate>,
+    /// The distributed bucket rows of each changed key, maintained in the same transaction.
+    inventory: VecDeque<InventoryUpdate>,
     phase: UsageUpdatePhase,
 }
 
@@ -229,7 +229,7 @@ impl UsageCounterUpdate {
             ],
             bucket: None,
             dirty_group: Some(group_id),
-            inventory: None,
+            inventory: VecDeque::new(),
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -249,7 +249,7 @@ impl UsageCounterUpdate {
             entries,
             bucket: None,
             dirty_group: Some(group_id),
-            inventory: None,
+            inventory: VecDeque::new(),
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -269,8 +269,14 @@ impl UsageCounterUpdate {
     }
 
     /// Also maintains the inventory of a distributed bucket's key; `None` for ordinary buckets.
-    pub fn with_inventory(mut self, change: Option<InventoryChange>) -> Self {
-        self.inventory = change.map(InventoryUpdate::new);
+    pub fn with_inventory(self, change: Option<InventoryChange>) -> Self {
+        self.with_inventories(change)
+    }
+
+    /// Maintains the inventory of several keys of a distributed bucket, one after another.
+    pub fn with_inventories(mut self, changes: impl IntoIterator<Item = InventoryChange>) -> Self {
+        self.inventory
+            .extend(changes.into_iter().map(InventoryUpdate::new));
         self
     }
 
@@ -280,7 +286,7 @@ impl UsageCounterUpdate {
             entries: stored.entries(),
             bucket: None,
             dirty_group: None,
-            inventory: None,
+            inventory: VecDeque::new(),
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -309,7 +315,7 @@ impl UsageCounterUpdate {
         let bucket = self.bucket.as_ref().map(|(_, delta)| *delta);
         self.entries.iter().all(|(_, delta)| delta.is_zero())
             && bucket.is_none_or(|delta| delta == BucketDelta::default())
-            && self.inventory.is_none()
+            && self.inventory.is_empty()
     }
 
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
@@ -346,26 +352,20 @@ impl UsageCounterUpdate {
                 )]))
             }
             (UsageUpdatePhase::Writing, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                match self.inventory.as_mut() {
-                    Some(inventory) => {
-                        self.phase = UsageUpdatePhase::Inventory;
-                        Ok(Some(inventory.start(txn_id)))
-                    }
-                    None => {
-                        self.phase = UsageUpdatePhase::Done;
-                        Ok(None)
-                    }
-                }
+                self.phase = UsageUpdatePhase::Inventory;
+                Ok(self.next_inventory(txn_id))
             }
             (UsageUpdatePhase::Inventory, event) => {
-                let Some(inventory) = self.inventory.as_mut() else {
+                let Some(inventory) = self.inventory.front_mut() else {
                     return Err(UsageUpdateError::UnexpectedEvent(event));
                 };
-                let effects = inventory.step(event, txn_id)?;
-                if effects.is_none() {
-                    self.phase = UsageUpdatePhase::Done;
+                match inventory.step(event, txn_id)? {
+                    Some(effects) => Ok(Some(effects)),
+                    None => {
+                        self.inventory.pop_front();
+                        Ok(self.next_inventory(txn_id))
+                    }
                 }
-                Ok(effects)
             }
             (_, received) => Err(UsageUpdateError::UnexpectedEvent(received)),
         }
@@ -373,6 +373,17 @@ impl UsageCounterUpdate {
 
     pub fn is_done(&self) -> bool {
         self.phase == UsageUpdatePhase::Done
+    }
+
+    /// Starts the next key's inventory update, or ends the update when none is left.
+    fn next_inventory(&mut self, txn_id: TxnId) -> Option<Effects> {
+        match self.inventory.front_mut() {
+            Some(inventory) => Some(inventory.start(txn_id)),
+            None => {
+                self.phase = UsageUpdatePhase::Done;
+                None
+            }
+        }
     }
 }
 

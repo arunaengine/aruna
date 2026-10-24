@@ -84,10 +84,8 @@ impl PageImportOperation {
         let guards = self.guards.as_ref().ok_or(PageImportError::NotFinished)?;
         let rows = page_rows(&self.input, guards, versions)?;
         if rows.result.registered > 0 {
-            self.usage = Some(UsageCounterUpdate::for_group(
-                self.input.group_id,
-                rows.delta,
-            ));
+            let usage = UsageCounterUpdate::for_group(self.input.group_id, rows.delta);
+            self.usage = Some(usage.with_inventories(rows.inventory));
         }
         self.result = Some(rows.result);
         self.state = PageImportState::WriteRows;

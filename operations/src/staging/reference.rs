@@ -8,6 +8,7 @@ use crate::connectors::repository::{
     source_connector_key,
 };
 use crate::connectors::resolver::secret_fingerprint;
+use crate::distribution::inventory::{AddedVersion, entry_of, version_written};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
@@ -173,7 +174,7 @@ pub async fn write_reference_version(
 
     let result: Result<(Ulid, bool), MaterializeReferenceError> = async {
         guard_purge_fence(context, txn_id, &write.bucket, &write.key).await?;
-        let (mut policies, set_hint) = guard_expected_bucket(
+        let (mut policies, binding) = guard_expected_bucket(
             context,
             txn_id,
             &write.bucket,
@@ -181,6 +182,7 @@ pub async fn write_reference_version(
             write.expected_bucket.as_ref(),
         )
         .await?;
+        let set_hint = binding.as_ref().map(DistributionBinding::hint);
         if let (Some(hint), Some(planned)) = (set_hint, write.preassigned_version_id)
             && SetHint::of_version(planned) != hint
         {
@@ -275,6 +277,7 @@ pub async fn write_reference_version(
             .and_then(|version| version.offered_size(&write.bucket, &write.key));
         let was_live = existing_version.is_some_and(|version| !version.is_deleted());
         let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id)?;
+        let generation = next_pointer.generation;
 
         for effect in build_transition_effects(
             &HeadAliasContext::new(
@@ -316,6 +319,13 @@ pub async fn write_reference_version(
         }
 
         let referenced_bytes = write.metadata.content_length;
+        let added = AddedVersion {
+            version_id,
+            epoch: version.original_epoch,
+            generation,
+            entry: entry_of(&version, referenced_bytes),
+        };
+        let inventory = version_written(binding.as_ref(), &write.key, added, true);
         let mut usage_update = UsageCounterUpdate::for_group(
             write.group_id,
             UsageDelta {
@@ -324,7 +334,8 @@ pub async fn write_reference_version(
                 ..Default::default()
             },
         )
-        .in_bucket(&write.bucket, RowChange::AddedVersion);
+        .in_bucket(&write.bucket, RowChange::AddedVersion)
+        .with_inventory(inventory);
         if !usage_update.is_noop() {
             run_usage_update(context, txn_id, &mut usage_update).await?;
         }
@@ -560,7 +571,7 @@ async fn guard_expected_bucket(
     bucket: &str,
     group_id: GroupId,
     expected: Option<&BucketInfo>,
-) -> Result<(Vec<PlacementPolicyRef>, Option<SetHint>), MaterializeReferenceError> {
+) -> Result<(Vec<PlacementPolicyRef>, Option<DistributionBinding>), MaterializeReferenceError> {
     let current = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -589,15 +600,14 @@ async fn guard_expected_bucket(
     if !unchanged {
         return Err(StorageError::TransactionConflict.into());
     }
-    let set_hint = current
+    let binding = current
         .as_ref()
-        .and_then(|bucket| bucket.distribution.as_ref())
-        .map(DistributionBinding::hint);
+        .and_then(|bucket| bucket.distribution.clone());
     Ok((
         current
             .map(|bucket| bucket.placement_policies)
             .unwrap_or_default(),
-        set_hint,
+        binding,
     ))
 }
 
