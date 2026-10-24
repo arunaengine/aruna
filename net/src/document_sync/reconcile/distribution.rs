@@ -29,7 +29,8 @@ pub(in crate::document_sync) fn validate_distribution_shape(
 }
 
 /// Committed revisions carry the publisher's acceptance, so no actor's current role is
-/// rechecked here; the publisher must still be a node that may publish in this realm.
+/// rechecked here. A publisher the config does not know yet defers; a removed one stays
+/// valid for relaying what it signed while it was a member.
 pub(in crate::document_sync) async fn validate_distribution_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
@@ -39,20 +40,48 @@ pub(in crate::document_sync) async fn validate_distribution_authority(
             "admin event target is not a distribution record".to_string(),
         ));
     };
-    let Some(config) = read_realm_config(storage, *realm_id).await? else {
-        return Ok(AdminEventValidation::Deferred {
-            dependency: Some(DocumentSyncDependency::RealmConfig(*realm_id)),
-            reason: "current realm config is unavailable".to_string(),
-        });
+    let realm_id = *realm_id;
+    let deferred = |reason: &str| {
+        Ok(AdminEventValidation::Deferred {
+            dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
+            reason: reason.to_string(),
+        })
     };
-    Ok(
-        match config.realm_id == *realm_id && origin_may_publish(&config, &event.origin_node_id) {
-            true => AdminEventValidation::Accepted,
-            false => AdminEventValidation::Rejected(
-                "distribution publisher is not a publisher-capable realm node".to_string(),
-            ),
-        },
-    )
+    let Some(config) = read_realm_config(storage, realm_id).await? else {
+        return deferred("current realm config is unavailable");
+    };
+    if config.realm_id != realm_id {
+        return Ok(AdminEventValidation::Rejected(
+            "stored realm config names another realm".to_string(),
+        ));
+    }
+    match configured_node_kind(&config, &event.origin_node_id) {
+        Some(kind) if kind.is_sync_eligible() => Ok(AdminEventValidation::Accepted),
+        Some(_) => Ok(AdminEventValidation::Rejected(
+            "distribution publisher is not a publisher-capable realm node".to_string(),
+        )),
+        None if formerly_configured(storage, realm_id, &event.origin_node_id).await? => {
+            Ok(AdminEventValidation::Accepted)
+        }
+        None => deferred("distribution publisher is not yet a known realm node"),
+    }
+}
+
+/// Whether the realm config once listed the node and then removed it.
+async fn formerly_configured(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    node_id: &NodeId,
+) -> Result<bool> {
+    let state = read_reducer_state(storage, &AdminDocumentTarget::RealmConfig { realm_id }).await?;
+    let path = config_node_path(node_id);
+    Ok(state.is_some_and(|state| {
+        state
+            .user_subject_ids
+            .get(&path)
+            .is_some_and(|version| version.value.is_none())
+            || state.conflicts.contains_key(&path)
+    }))
 }
 
 /// Reduces the snapshot into the set's state and stores the signed view every node reads.

@@ -85,7 +85,7 @@ fn published(origin: u8, snapshot: DistributionSnapshot, signer: u8) -> AdminDoc
     let signed = SignedSnapshot::sign(snapshot, realm(), &secret(signer)).unwrap();
     let target = AdminDocumentTarget::Distribution {
         realm_id: realm(),
-        set_id: root().set_id(),
+        set_id: signed.snapshot.set_id(),
     };
     let op = AdminDocumentOperation::DistributionPublished {
         snapshot: Box::new(signed),
@@ -209,4 +209,64 @@ async fn gap_recovers_by_snapshot() {
     let view = stored(&storage).await.expect("latest snapshot stored");
     assert_eq!(view.head.snapshot, third);
     assert_eq!(view.head.snapshot.number, 3);
+}
+
+#[tokio::test]
+async fn membership_gaps_defer() {
+    // A snapshot that arrives before its publisher's membership waits instead of failing.
+    let (_dir, storage) = test_storage();
+    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    config.ensure_node(node(OTHER), RealmNodeKind::Server);
+    batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            DocumentTarget::RealmConfig { realm_id: realm() },
+            config.to_bytes(&actor(OTHER)).unwrap().into(),
+        )],
+    )
+    .await
+    .unwrap();
+    let early = receive(&storage, published(PUBLISHER, created(), PUBLISHER)).await;
+    assert!(matches!(early, AdminEventValidation::Deferred { .. }));
+
+    // After the publisher's removal, what it signed as a member stays relayable.
+    let target = AdminDocumentTarget::RealmConfig { realm_id: realm() };
+    let mut state = AdminDocumentState::new(target.clone());
+    let ensure = AdminDocumentOperation::ConfigNodeEnsured {
+        node_id: node(PUBLISHER),
+        kind: RealmNodeKind::Server,
+    };
+    let removed = AdminDocumentOperation::ConfigNodeRemoved {
+        node_id: node(PUBLISHER),
+    };
+    state.apply_operation(&actor(OTHER), ensure).unwrap();
+    state.apply_operation(&actor(OTHER), removed).unwrap();
+    batch_write_to(&storage, vec![reducer_state_entry(&state).unwrap()])
+        .await
+        .unwrap();
+    let relayed = receive(&storage, published(PUBLISHER, created(), PUBLISHER)).await;
+    assert_eq!(relayed, AdminEventValidation::Accepted);
+
+    // A device can never publish a set's revisions.
+    config.ensure_node(
+        node(MEMBER),
+        RealmNodeKind::User {
+            owner: actor(MEMBER).user_id,
+        },
+    );
+    batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            DocumentTarget::RealmConfig { realm_id: realm() },
+            config.to_bytes(&actor(OTHER)).unwrap().into(),
+        )],
+    )
+    .await
+    .unwrap();
+    let mut device_root = root();
+    device_root.publisher = node(MEMBER);
+    let mut snapshot = created();
+    snapshot.root = device_root;
+    let device = receive(&storage, published(MEMBER, snapshot, MEMBER)).await;
+    assert!(rejected(device));
 }
