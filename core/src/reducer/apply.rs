@@ -19,6 +19,9 @@ impl AdminDocumentState {
         if event.target != self.target {
             return Err(AdminDocumentError::TargetMismatch);
         }
+        if let AdminDocumentTarget::Distribution { realm_id, set_id } = &event.target {
+            return self.apply_set(event, realm_id, set_id);
+        }
         // Duplicate event IDs cannot overwrite the first event, so equivocation gains nothing.
         // Admission, rather than reduction, retains the evidence.
         if self.applied_event_ids.contains(&event.event_id) {
@@ -67,8 +70,8 @@ impl AdminDocumentState {
             AdminDocumentTarget::Realm { .. } => self.apply_realm(event),
             AdminDocumentTarget::User { .. } => self.apply_user(event),
             AdminDocumentTarget::RealmConfig { realm_id } => self.apply_config(event, realm_id),
-            AdminDocumentTarget::Distribution { set_id, .. } => {
-                self.apply_distribution(event, set_id)
+            AdminDocumentTarget::Distribution { realm_id, set_id } => {
+                self.apply_set(event, realm_id, set_id)
             }
         }
     }

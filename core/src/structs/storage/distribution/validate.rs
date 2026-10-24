@@ -86,6 +86,8 @@ pub enum DistributionError {
     InvalidStatement(&'static str),
     #[error("the distributed bucket does not exist yet")]
     UnknownSet,
+    #[error("only the set's publisher publishes its revisions")]
+    NotPublisher,
 }
 
 /// Checks the shape of a configuration; record-level checks add the encoded size.

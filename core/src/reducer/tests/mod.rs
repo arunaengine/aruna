@@ -45,5 +45,6 @@ mod placement;
 mod realm_config;
 mod revocation;
 mod roles;
+mod snapshot;
 mod transitions;
 mod user;

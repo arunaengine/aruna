@@ -1692,7 +1692,10 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::ConfigFederationSet { .. }
         | AdminDocumentOperation::ConfigPortalSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
-        AdminDocumentOperation::DistributionChanged { .. } => AdminOperationFamily::Distribution,
+        AdminDocumentOperation::DistributionChanged { .. }
+        | AdminDocumentOperation::DistributionPublished { .. } => {
+            AdminOperationFamily::Distribution
+        }
     };
 
     if !family_matches_targets(family, target, &event.target) {

@@ -392,6 +392,10 @@ pub enum AdminDocumentOperation {
     DistributionChanged {
         change: Box<crate::structs::storage::distribution::DistributionChange>,
     },
+    /// The publisher's signed full snapshot of one distributed bucket's revision.
+    DistributionPublished {
+        snapshot: Box<crate::structs::storage::distribution::SignedSnapshot>,
+    },
 }
 
 impl AdminDocumentOperation {

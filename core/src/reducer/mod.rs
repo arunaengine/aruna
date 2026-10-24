@@ -45,6 +45,7 @@ mod distribution;
 mod paths;
 mod placement;
 mod revocation;
+mod snapshot;
 mod targets;
 
 pub use distribution::{FINALITY_WINDOW, MAX_PENDING};
