@@ -18,7 +18,6 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group_delete::MembershipFence;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::storage::distribution::{MAX_CUTOFFS, PublisherCutoff, cutoff_from_row};
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -53,7 +52,6 @@ pub struct RemoveNodeConfig {
 #[derive(Debug, PartialEq)]
 pub struct RemoveNodeOperation {
     config: RemoveNodeConfig,
-    cutoffs: Vec<PublisherCutoff>,
     txn_id: Option<TxnId>,
     state: RemoveNodeState,
     output: Option<Result<RealmConfigDocument, RemoveNodeError>>,
@@ -64,7 +62,7 @@ enum RemoveNodeState {
     Init,
     StartTransaction,
     ReadCurrent,
-    /// Reads the removed node's published sets as this node holds them, for its cutoffs.
+    /// Checks that the node publishes no distributed bucket.
     ReadCutoffs {
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
@@ -98,8 +96,10 @@ pub enum RemoveNodeError {
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
     ConfigMissing,
-    #[error("the node published more distributed buckets than one removal can cut off")]
-    TooManySets,
+    #[error(
+        "the node publishes distributed buckets; moving that role needs the later failover procedure"
+    )]
+    PublisherRemoval,
     #[error("no device {node_id} belongs to this caller")]
     DeviceNotFound { node_id: NodeId },
     #[error("this node is not a realm management node")]
@@ -120,7 +120,6 @@ impl RemoveNodeOperation {
     pub fn new(config: RemoveNodeConfig) -> Self {
         Self {
             config,
-            cutoffs: Vec::new(),
             txn_id: None,
             state: RemoveNodeState::Init,
             output: None,
@@ -219,7 +218,8 @@ impl RemoveNodeOperation {
             &self.config.actor,
             AdminDocumentOperation::ConfigNodeRemoved {
                 node_id: self.config.node_id,
-                cutoffs: std::mem::take(&mut self.cutoffs),
+                // A publisher is never removed here, so no set needs a cutoff yet.
+                cutoffs: Vec::new(),
             },
         )?;
         // The stored document is derived from the reducer, exactly as the
@@ -335,7 +335,7 @@ impl Operation for RemoveNodeOperation {
                         key_space: DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
                         prefix: Some(self.config.node_id.as_bytes().to_vec().into()),
                         start: None,
-                        limit: MAX_CUTOFFS + 1,
+                        limit: 1,
                         txn_id: self.txn_id,
                     })]
                 }
@@ -347,13 +347,10 @@ impl Operation for RemoveNodeOperation {
                 reducer_state_value,
             } => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    if values.len() > MAX_CUTOFFS {
-                        return self.fail(RemoveNodeError::TooManySets);
+                    // A cached head is no final cutoff, so a publisher stays until failover.
+                    if !values.is_empty() {
+                        return self.fail(RemoveNodeError::PublisherRemoval);
                     }
-                    self.cutoffs = values
-                        .iter()
-                        .filter_map(|(key, value)| cutoff_from_row(key, value))
-                        .collect();
                     match self.emit_removal_writes(document_value, reducer_state_value) {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
@@ -648,8 +645,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removal_carries_cutoffs() {
-        // The removal names each set the node published as this node holds it.
+    async fn removal_refuses_publisher() {
+        // A set's publisher is never removed with a possibly stale cutoff.
         use aruna_core::structs::storage::distribution::{DistributionRevision, publisher_key};
         let dir = tempdir().unwrap();
         let ctx = context(dir.path().to_str().unwrap());
@@ -661,7 +658,6 @@ mod tests {
             &realm_with_device(realm_id, &actor, actor.user_id),
         )
         .await;
-        let set_id = Ulid::from_bytes([7u8; 16]);
         let revision = DistributionRevision {
             number: 4,
             digest: [5u8; 32],
@@ -669,36 +665,26 @@ mod tests {
         ctx.storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
-                key: publisher_key(&node(2), set_id).into(),
+                key: publisher_key(&node(2), Ulid::from_bytes([7u8; 16])).into(),
                 value: postcard::to_allocvec(&revision).unwrap().into(),
                 txn_id: None,
             })
             .await;
-
-        drive(
+        let error = drive(
             RemoveNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
             &ctx,
         )
         .await
-        .expect("device removal applies");
-        let key = reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id });
-        let Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) = ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: DOCUMENT_STATE_KEYSPACE.to_string(),
-                key,
-                txn_id: None,
-            })
+        .unwrap_err();
+        assert_eq!(error, RemoveNodeError::PublisherRemoval);
+        let reread = drive(GetConfigOperation::new(realm_id), &ctx)
             .await
-        else {
-            panic!("reducer state stored");
-        };
-        let state = aruna_core::reducer::decode_reducer_state(value.as_ref()).unwrap();
-        assert_eq!(
-            state.publisher_cutoffs(&node(2)),
-            Some(vec![PublisherCutoff { set_id, revision }])
+            .unwrap();
+        assert!(
+            reread
+                .nodes
+                .iter()
+                .any(|entry| entry.node_id == node(2).to_string())
         );
     }
 }
