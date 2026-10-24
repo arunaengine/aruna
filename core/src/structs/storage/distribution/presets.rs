@@ -127,6 +127,8 @@ fn members(
             coverage,
             strategy,
             range_behaviour: None,
+            // Presets plan a create, so every member answers the create revision.
+            added_in: 1,
         })
         .collect()
 }

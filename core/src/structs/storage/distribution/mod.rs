@@ -14,11 +14,13 @@ use crate::types::GroupId;
 pub mod change;
 pub mod hint;
 pub mod presets;
+pub mod snapshot;
 pub mod statement;
 pub mod validate;
 
 pub use change::{DistributionChange, DistributionOp, TransferRole};
 pub use hint::{HintIndex, SetHint};
+pub use snapshot::{DistributionSnapshot, DistributionView, SignedSnapshot};
 pub use statement::{SetRoot, SignedStatement, Statement, StatementKind};
 pub use validate::DistributionError;
 
@@ -146,6 +148,9 @@ pub struct DistributionMember {
     pub strategy: DataStrategy,
     /// Overrides the bucket's range behaviour for this member.
     pub range_behaviour: Option<RangeBehaviour>,
+    /// The revision number of the create or join that added the member; its admission
+    /// answers this intent.
+    pub added_in: u64,
 }
 
 /// One key range `[lower, upper)`; `upper` `None` is the end of the key space.

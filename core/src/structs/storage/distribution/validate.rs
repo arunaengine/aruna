@@ -80,6 +80,10 @@ pub enum DistributionError {
     Malformed(&'static str),
     #[error("distribution change `{0}` is not supported yet")]
     Unsupported(&'static str),
+    #[error("statement {0} was already applied")]
+    Replayed(Ulid),
+    #[error("the statement is invalid: {0}")]
+    InvalidStatement(&'static str),
 }
 
 /// Checks the shape of a configuration; record-level checks add the encoded size.
