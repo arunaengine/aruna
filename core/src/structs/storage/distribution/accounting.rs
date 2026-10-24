@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use ulid::Ulid;
 
 use super::OriginalEpoch;
@@ -19,56 +20,69 @@ const REFILL_TAG: u8 = b'r';
 /// Above every valid UTF-8 byte, so it is the range index key of the open end.
 const OPEN_END: u8 = 0xFF;
 
+/// A range counter that left the `i128` range; the change is refused, never clamped.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("range counter {0} overflowed")]
+pub struct CounterOverflow(pub &'static str);
+
 /// Maintained counters of one range. Rows only ever receive these as commit-time deltas, so
 /// every field is signed and a pending split row may go below zero.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RangeCounters {
     /// Current heads that are not delete markers.
-    pub objects: i64,
+    pub objects: i128,
     /// Sizes of those heads.
-    pub current_bytes: i64,
+    pub current_bytes: i128,
     /// Version rows that are not delete markers, noncurrent ones included.
-    pub versions: i64,
-    pub delete_markers: i64,
+    pub versions: i128,
+    pub delete_markers: i128,
     /// Sizes of stored version rows.
-    pub logical_bytes: i64,
+    pub logical_bytes: i128,
     /// Sizes of version rows reached through an external reference.
-    pub referenced_bytes: i64,
-    pub open_uploads: i64,
+    pub referenced_bytes: i128,
+    pub open_uploads: i128,
     /// The highest original epoch of any version counted; it never decreases.
     pub max_epoch: OriginalEpoch,
 }
 
-fn signed(size: u64) -> i64 {
-    i64::try_from(size).unwrap_or(i64::MAX)
+fn add(field: &'static str, left: i128, right: i128) -> Result<i128, CounterOverflow> {
+    left.checked_add(right).ok_or(CounterOverflow(field))
+}
+
+fn neg(field: &'static str, value: i128) -> Result<i128, CounterOverflow> {
+    value.checked_neg().ok_or(CounterOverflow(field))
 }
 
 impl RangeCounters {
-    pub fn merge(self, other: Self) -> Self {
-        Self {
-            objects: self.objects.saturating_add(other.objects),
-            current_bytes: self.current_bytes.saturating_add(other.current_bytes),
-            versions: self.versions.saturating_add(other.versions),
-            delete_markers: self.delete_markers.saturating_add(other.delete_markers),
-            logical_bytes: self.logical_bytes.saturating_add(other.logical_bytes),
-            referenced_bytes: self.referenced_bytes.saturating_add(other.referenced_bytes),
-            open_uploads: self.open_uploads.saturating_add(other.open_uploads),
+    pub fn merge(self, other: Self) -> Result<Self, CounterOverflow> {
+        Ok(Self {
+            objects: add("objects", self.objects, other.objects)?,
+            current_bytes: add("current_bytes", self.current_bytes, other.current_bytes)?,
+            versions: add("versions", self.versions, other.versions)?,
+            delete_markers: add("delete_markers", self.delete_markers, other.delete_markers)?,
+            logical_bytes: add("logical_bytes", self.logical_bytes, other.logical_bytes)?,
+            referenced_bytes: add(
+                "referenced_bytes",
+                self.referenced_bytes,
+                other.referenced_bytes,
+            )?,
+            open_uploads: add("open_uploads", self.open_uploads, other.open_uploads)?,
             max_epoch: self.max_epoch.max(other.max_epoch),
-        }
+        })
     }
 
     /// The same change with every count reversed; the epoch maximum stays.
-    pub fn negate(self) -> Self {
-        Self {
-            objects: -self.objects,
-            current_bytes: -self.current_bytes,
-            versions: -self.versions,
-            delete_markers: -self.delete_markers,
-            logical_bytes: -self.logical_bytes,
-            referenced_bytes: -self.referenced_bytes,
-            open_uploads: -self.open_uploads,
+    pub fn negate(self) -> Result<Self, CounterOverflow> {
+        Ok(Self {
+            objects: neg("objects", self.objects)?,
+            current_bytes: neg("current_bytes", self.current_bytes)?,
+            versions: neg("versions", self.versions)?,
+            delete_markers: neg("delete_markers", self.delete_markers)?,
+            logical_bytes: neg("logical_bytes", self.logical_bytes)?,
+            referenced_bytes: neg("referenced_bytes", self.referenced_bytes)?,
+            open_uploads: neg("open_uploads", self.open_uploads)?,
             max_epoch: OriginalEpoch::default(),
-        }
+        })
     }
 
     pub fn is_zero(&self) -> bool {
@@ -77,7 +91,7 @@ impl RangeCounters {
 
     /// What a version row at `epoch` contributes.
     pub fn of_version(epoch: OriginalEpoch, entry: &VersionEntry) -> Self {
-        let size = signed(entry.size);
+        let size = i128::from(entry.size);
         let mut counters = Self {
             max_epoch: epoch,
             ..Self::default()
@@ -96,13 +110,13 @@ impl RangeCounters {
             true => Self::default(),
             false => Self {
                 objects: 1,
-                current_bytes: signed(head.version.size),
+                current_bytes: i128::from(head.version.size),
                 ..Self::default()
             },
         }
     }
 
-    pub fn of_upload(uploads: i64) -> Self {
+    pub fn of_upload(uploads: i128) -> Self {
         Self {
             open_uploads: uploads,
             ..Self::default()
@@ -332,7 +346,7 @@ pub fn refill_key(set_id: Ulid, range_id: Ulid) -> Vec<u8> {
 }
 
 /// A sample below half of what the range can fill needs a refill before a split uses it.
-pub fn needs_refill(occupied: usize, objects: i64) -> bool {
+pub fn needs_refill(occupied: usize, objects: i128) -> bool {
     let reachable = usize::try_from(objects.max(0))
         .unwrap_or(usize::MAX)
         .min(usize::from(SAMPLE_SIZE));
@@ -356,7 +370,7 @@ mod tests {
         let stored = RangeCounters::of_version(OriginalEpoch(2), &entry(false, 10, false));
         let linked = RangeCounters::of_version(OriginalEpoch(1), &entry(false, 4, true));
         let marker = RangeCounters::of_version(OriginalEpoch(3), &entry(true, 0, false));
-        let total = stored.merge(linked).merge(marker);
+        let total = stored.merge(linked).unwrap().merge(marker).unwrap();
         assert_eq!(
             (
                 total.versions,
@@ -367,7 +381,7 @@ mod tests {
             (2, 1, 10, 4)
         );
         assert_eq!(total.max_epoch, OriginalEpoch(3));
-        let removed = total.merge(stored.negate());
+        let removed = total.merge(stored.negate().unwrap()).unwrap();
         assert_eq!((removed.versions, removed.logical_bytes), (1, 0));
         assert_eq!(
             removed.max_epoch,

@@ -16,7 +16,7 @@ use ulid::Ulid;
 const SPACE: &str = "range_counters";
 const ROW: &[u8] = b"row";
 
-fn delta(objects: i64, epoch: u64) -> RangeCounters {
+fn delta(objects: i128, epoch: u64) -> RangeCounters {
     RangeCounters {
         objects,
         max_epoch: OriginalEpoch(epoch),

@@ -51,7 +51,7 @@ async fn charged(handle: &StorageHandle, range_id: Ulid) -> RangeCounters {
         .expect("account exists");
     let mut total = RangeCounters::default();
     for row in charged_rows(set(), range_id, &account) {
-        total = total.merge(counters(handle, row).await);
+        total = total.merge(counters(handle, row).await).unwrap();
     }
     total
 }

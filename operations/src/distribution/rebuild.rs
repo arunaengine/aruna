@@ -11,7 +11,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::accounting::{
-    Charge, Cursor, RangeAccount, RangeCounters, Rebuild, account_key, generation_key,
+    Charge, CounterOverflow, Cursor, RangeAccount, RangeCounters, Rebuild, account_key,
+    generation_key,
 };
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, Position, VersionEntry, range_interval,
@@ -39,6 +40,8 @@ pub enum RebuildError {
     },
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Overflow(#[from] CounterOverflow),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("rebuild received unexpected event: {0:?}")]
@@ -266,7 +269,7 @@ impl RebuildOperation {
         };
         let mut total = RangeCounters::default();
         for (key, value) in &values {
-            total = total.merge(contribution(self.walk, key, value)?);
+            total = total.merge(contribution(self.walk, key, value)?)?;
         }
         let cursor = match (truncated, self.terminal, self.probe_end.clone()) {
             (Some(last), _, _) => Cursor::At(last.to_vec()),

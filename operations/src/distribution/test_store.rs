@@ -197,7 +197,7 @@ pub(crate) fn purge(set_id: Ulid, key: &str, seeds: &[u8]) -> InventoryUpdate {
 }
 
 /// Counters of `objects` current versions holding `bytes`, one version each, at epoch 1.
-pub(crate) fn exact(objects: i64, bytes: i64) -> RangeCounters {
+pub(crate) fn exact(objects: i128, bytes: i128) -> RangeCounters {
     RangeCounters {
         objects,
         current_bytes: bytes,

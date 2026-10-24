@@ -5,7 +5,7 @@
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
-use aruna_core::structs::storage::distribution::accounting::RangeCounters;
+use aruna_core::structs::storage::distribution::accounting::{CounterOverflow, RangeCounters};
 use aruna_core::structs::storage::usage::{
     BucketCounters, BucketDelta, CounterShortfall, UsageCounters, UsageDelta,
 };
@@ -28,13 +28,16 @@ pub(super) enum CounterChange {
 
 impl CounterChange {
     /// Folds two changes of one row; rows of one key always hold the same kind.
-    fn merge(self, other: Self) -> Self {
-        match (self, other) {
+    fn merge(self, other: Self) -> Result<Self, StorageError> {
+        let overflow = |error: CounterOverflow| StorageError::WriteError(error.to_string());
+        Ok(match (self, other) {
             (Self::Usage(left), Self::Usage(right)) => Self::Usage(left.merge(right)),
             (Self::Bucket(left), Self::Bucket(right)) => Self::Bucket(left.merge(right)),
-            (Self::Range(left), Self::Range(right)) => Self::Range(left.merge(right)),
+            (Self::Range(left), Self::Range(right)) => {
+                Self::Range(left.merge(right).map_err(overflow)?)
+            }
             (_, other) => other,
-        }
+        })
     }
 }
 
@@ -103,7 +106,10 @@ impl FjallStorage {
                 .iter_mut()
                 .find(|(space, existing, _)| *space == key_space && *existing == key)
             {
-                Some((_, _, existing)) => *existing = existing.merge(change),
+                Some((_, _, existing)) => match existing.merge(change) {
+                    Ok(merged) => *existing = merged,
+                    Err(error) => return StorageEvent::Error { error },
+                },
                 None => pending.push((key_space.clone(), key, change)),
             }
         }
@@ -144,7 +150,8 @@ impl FjallStorage {
                 CounterChange::Range(delta) => {
                     let counters = stored.map(RangeCounters::from_bytes).transpose();
                     let counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
-                    let value = counters.merge(delta).to_bytes();
+                    let merged = counters.merge(delta).map_err(|e| failed(&e))?;
+                    let value = merged.to_bytes();
                     (value.map_err(|e| failed(&e))?, Vec::new())
                 }
             };

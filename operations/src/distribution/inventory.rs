@@ -12,8 +12,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState};
 use aruna_core::structs::storage::distribution::accounting::{
-    Charge, RangeAccount, RangeCounters, RangeSlot, SampleSlot, account_key, generation_key,
-    pending_key, sample_key, slot_key, slot_seek,
+    Charge, CounterOverflow, RangeAccount, RangeCounters, RangeSlot, SampleSlot, account_key,
+    generation_key, pending_key, sample_key, slot_key, slot_seek,
 };
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, IndexEntry, Position, VersionEntry, head_position, index_key,
@@ -36,6 +36,8 @@ pub enum InventoryError {
     Collision(Ulid),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Overflow(#[from] CounterOverflow),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("inventory update received unexpected event: {0:?}")]
@@ -286,7 +288,7 @@ impl InventoryUpdate {
                     continue;
                 }
                 let old = RangeCounters::of_version(added.epoch, &existing.version);
-                counters = counters.merge(old.negate());
+                counters = counters.merge(old.negate()?)?;
                 position = existing.position;
             }
             let entry = IndexEntry {
@@ -316,7 +318,7 @@ impl InventoryUpdate {
                 .push((INVENTORY_KEYSPACE.into(), entry.position.clone().into()));
             self.deletes
                 .push((VERSION_INDEX_KEYSPACE.into(), index.into()));
-            let counters = RangeCounters::of_version(epoch, &entry.version).negate();
+            let counters = RangeCounters::of_version(epoch, &entry.version).negate()?;
             contributions.push((Walk::Versions, entry.position, counters));
         }
         Ok(())
@@ -350,7 +352,7 @@ impl InventoryUpdate {
         }
         let removed = old.map_or_else(RangeCounters::default, |old| RangeCounters::of_head(&old));
         let added = new.map_or_else(RangeCounters::default, |new| RangeCounters::of_head(&new));
-        contributions.push((Walk::Versions, position, added.merge(removed.negate())));
+        contributions.push((Walk::Versions, position, added.merge(removed.negate()?)?));
         Ok(())
     }
 
@@ -421,20 +423,22 @@ fn route(
         Charge::Retired { .. } => return Err(InventoryError::RangeRetired(range_id)),
     };
     let mut rows: Vec<(Vec<u8>, RangeCounters)> = Vec::new();
-    let mut add =
-        |key: Vec<u8>, delta: RangeCounters| match rows.iter_mut().find(|row| row.0 == key) {
-            Some((_, total)) => *total = total.merge(delta),
+    let mut add = |key: Vec<u8>, delta: RangeCounters| -> Result<(), CounterOverflow> {
+        match rows.iter_mut().find(|row| row.0 == key) {
+            Some((_, total)) => *total = total.merge(delta)?,
             None => rows.push((key, delta)),
-        };
+        }
+        Ok(())
+    };
     for (walk, position, delta) in contributions {
-        add(charged.clone(), delta);
+        add(charged.clone(), delta)?;
         if let Some(rebuild) = &account.rebuild {
             let cursor = match walk {
                 Walk::Versions => &rebuild.versions,
                 Walk::Uploads => &rebuild.uploads,
             };
             if cursor.covers(&position) {
-                add(generation_key(set_id, range_id, rebuild.generation), delta);
+                add(generation_key(set_id, range_id, rebuild.generation), delta)?;
             }
         }
     }
