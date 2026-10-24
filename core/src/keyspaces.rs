@@ -456,6 +456,8 @@ pub const STAGING_QUEUE_KEYSPACE: &str = "staging_directory_queue";
 pub const STAGING_MANIFEST_KEYSPACE: &str = "staging_manifest_digests";
 
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
+/// Provider buckets below their object limit, keyed by backend, load and bucket name.
+pub const BUCKET_FREE_INDEX: &str = "bucket_free_index";
 
 pub const API_STATE_KEYSPACE: &str = "api_state";
 pub const NODE_STATE_KEYSPACE: &str = "node_state";
@@ -735,6 +737,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DISTRIBUTION_LIFECYCLE_KEYSPACE,
     DISTRIBUTION_PURGE_KEYSPACE,
     SOURCE_ROOT_KEYSPACE,
+    BUCKET_FREE_INDEX,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

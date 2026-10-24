@@ -19,8 +19,8 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE, PATHS_INDEX_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BUCKET_FREE_INDEX, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::Status;
@@ -1196,6 +1196,40 @@ async fn hidden_bucket_registered() {
     assert_eq!(
         keyspace_count(&context.storage_handle, BUCKET_STATS_DB).await,
         1
+    );
+}
+
+#[tokio::test]
+async fn full_bucket_leaves_index() {
+    let context = setup_blob_handle(2).await;
+    let write = |key: &str| BlobEffect::Write {
+        resolved: ResolvedBackend::node_default(),
+        bucket: "bucket-a".to_string(),
+        key: key.to_string(),
+        created_by: test_user_id(),
+        blob: stream_from_bytes(b"one"),
+        size: None,
+    };
+    let Event::Blob(BlobEvent::WriteFinished { location: first }) =
+        context.blob_handle.send_blob_effect(write("one.bin")).await
+    else {
+        panic!("first write failed")
+    };
+    assert_eq!(
+        keyspace_count(&context.storage_handle, BUCKET_FREE_INDEX).await,
+        1,
+        "a bucket below its limit stays selectable"
+    );
+    let Event::Blob(BlobEvent::WriteFinished { location: second }) =
+        context.blob_handle.send_blob_effect(write("two.bin")).await
+    else {
+        panic!("second write failed")
+    };
+    assert_eq!(first.storage_bucket, second.storage_bucket);
+    assert_eq!(
+        keyspace_count(&context.storage_handle, BUCKET_FREE_INDEX).await,
+        0,
+        "a full bucket leaves the free index in the reserving transaction"
     );
 }
 

@@ -9,10 +9,12 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_CLEANUP_KEYSPACE, BUCKET_FREE_INDEX, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE,
+};
 use aruna_core::structs::storage::blob::{
-    Backend, BackendBucket, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork,
-    HIDDEN_BLOB_PREFIX, HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_path,
+    Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, HIDDEN_BLOB_PREFIX,
+    HiddenBlobKey, MULTIPART_PART_PREFIX, ensure_confined_path,
 };
 use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, MAX_KEY_LEN, PARTS_PREFIX};
 use aruna_core::types::TxnId;
@@ -146,19 +148,22 @@ impl BlobHandler {
             return Ok(bucket);
         }
 
-        let buckets = self
-            .fetch_bucket_stats(backend)
-            .await?
-            .into_iter()
-            .filter(|bucket| !skip.contains(&bucket.name));
-        if let Some(bucket_max_size) = config.max_bucket_size {
-            for bucket in buckets {
-                if bucket.load < bucket_max_size {
-                    return Ok(bucket.name);
-                }
+        // With a limit the free index names the emptiest bucket below it; one seek either way.
+        let qualifier = stats_prefix(backend, None);
+        let found = match config.max_bucket_size {
+            Some(_) => {
+                let name_at = qualifier.len() + 8;
+                self.first_bucket(BUCKET_FREE_INDEX, qualifier, name_at, skip)
+                    .await?
             }
-        } else if let Some(bucket) = buckets.into_iter().next() {
-            return Ok(bucket.name);
+            None => {
+                let prefix = stats_prefix(backend, config.bucket_prefix.as_deref());
+                self.first_bucket(BUCKET_STATS_DB, prefix, qualifier.len(), skip)
+                    .await?
+            }
+        };
+        if let Some(bucket) = found {
+            return Ok(bucket);
         }
 
         let bucket_name = generate_bucket_name(config.bucket_prefix.as_deref());
@@ -425,6 +430,15 @@ impl BlobHandler {
                 "failed to reserve hidden bucket capacity".to_string(),
             ));
         }
+        if !self
+            .move_free_row(backend, bucket, (load, adjusted), txn_id)
+            .await
+        {
+            self.abort_stats_txn(&mut owner).await;
+            return Err(BlobError::ReadError(
+                "failed to update the bucket free index".to_string(),
+            ));
+        }
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Write {
@@ -544,6 +558,20 @@ impl BlobHandler {
                 "failed to release hidden bucket capacity".to_string(),
             ));
         }
+        if !self
+            .move_free_row(
+                &key.backend,
+                &key.storage_bucket,
+                (load, load.saturating_sub(1)),
+                txn_id,
+            )
+            .await
+        {
+            self.abort_stats_txn(&mut owner).await;
+            return Err(BlobError::ReadError(
+                "failed to update the bucket free index".to_string(),
+            ));
+        }
         let event = self
             .storage
             .send_effect(Effect::Storage(StorageEffect::Delete {
@@ -599,55 +627,90 @@ impl BlobHandler {
         }
     }
 
-    pub(super) async fn fetch_bucket_stats(
+    /// The first bucket name under `prefix` that `skip` does not hold, read with one seek.
+    async fn first_bucket(
         &self,
-        backend: &BackendRef,
-    ) -> Result<Vec<BackendBucket>, BlobError> {
-        let config = self.registry.config_for(backend)?;
-        let prefix = stats_prefix(backend, config.bucket_prefix.as_deref());
-        let qualifier = stats_prefix(backend, None).len();
-        let mut buckets = Vec::new();
-        let mut start_after = None;
-
-        loop {
-            let event = self
-                .storage
-                .send_effect(Effect::Storage(StorageEffect::Iter {
-                    key_space: BUCKET_STATS_DB.to_string(),
-                    prefix: Some(prefix.clone().into()),
-                    start: start_after.clone().map(IterStart::After),
-                    limit: 1024,
-                    txn_id: None,
-                }))
-                .await;
-
-            let Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) = event
-            else {
-                return Err(BlobError::ReadError(
-                    "unexpected storage event while reading bucket stats".to_string(),
-                ));
-            };
-
-            for (key, value) in values {
-                let name =
-                    String::from_utf8(key.as_ref().get(qualifier..).unwrap_or_default().to_vec())
-                        .map_err(ConversionError::from)?;
-                let load =
-                    u64::from_le_bytes(value.as_ref().try_into().map_err(ConversionError::from)?);
-                buckets.push(BackendBucket::from((name, load)));
-            }
-
-            if let Some(next_start_after) = next_start_after {
-                start_after = Some(next_start_after);
-            } else {
-                break;
+        key_space: &str,
+        prefix: Vec<u8>,
+        name_at: usize,
+        skip: &[String],
+    ) -> Result<Option<String>, BlobError> {
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix: Some(prefix.into()),
+                start: None,
+                limit: skip.len().saturating_add(1),
+                txn_id: None,
+            }))
+            .await;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            return Err(BlobError::ReadError(
+                "unexpected storage event while reading bucket stats".to_string(),
+            ));
+        };
+        for (key, _) in values {
+            let name = key.as_ref().get(name_at..).unwrap_or_default().to_vec();
+            let name = String::from_utf8(name).map_err(ConversionError::from)?;
+            if !skip.contains(&name) {
+                return Ok(Some(name));
             }
         }
+        Ok(None)
+    }
 
-        Ok(buckets)
+    /// The object limit of a bucket the free index tracks; `None` for pinned, group and
+    /// multipart buckets and buckets outside the configured prefix.
+    fn indexed_limit(&self, backend: &BackendRef, bucket: &str) -> Option<u64> {
+        if !self.stats_managed(backend, bucket) {
+            return None;
+        }
+        let config = self.registry.config_for(backend).ok()?;
+        if fixed_bucket(&config).ok()?.is_some()
+            || !bucket.starts_with(config.bucket_prefix.as_deref().unwrap_or_default())
+        {
+            return None;
+        }
+        config.max_bucket_size
+    }
+
+    /// Moves a bucket's free index row from load `old` to `new` in the stats transaction; a
+    /// bucket at its limit leaves the index.
+    async fn move_free_row(
+        &self,
+        backend: &BackendRef,
+        bucket: &str,
+        (old, new): (u64, u64),
+        txn_id: TxnId,
+    ) -> bool {
+        let Some(limit) = self.indexed_limit(backend, bucket) else {
+            return true;
+        };
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Delete {
+                key_space: BUCKET_FREE_INDEX.to_string(),
+                key: free_key(backend, old, bucket).into(),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
+            return false;
+        }
+        if new >= limit {
+            return true;
+        }
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: BUCKET_FREE_INDEX.to_string(),
+                key: free_key(backend, new, bucket).into(),
+                value: ByteView::from(Vec::new()),
+                txn_id: Some(txn_id),
+            }))
+            .await;
+        matches!(event, Event::Storage(StorageEvent::WriteResult { .. }))
     }
 
     pub(super) async fn write_bucket_load(
@@ -656,18 +719,32 @@ impl BlobHandler {
         bucket: &str,
         load: u64,
     ) -> Result<(), BlobError> {
+        let mut writes = vec![(
+            BUCKET_STATS_DB.to_string(),
+            stats_key(backend, bucket).into(),
+            load.to_le_bytes().to_vec().into(),
+        )];
+        if self
+            .indexed_limit(backend, bucket)
+            .is_some_and(|limit| load < limit)
+        {
+            let key = free_key(backend, load, bucket).into();
+            writes.push((
+                BUCKET_FREE_INDEX.to_string(),
+                key,
+                ByteView::from(Vec::new()),
+            ));
+        }
         let event = self
             .storage
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: BUCKET_STATS_DB.to_string(),
-                key: stats_key(backend, bucket).into(),
-                value: load.to_le_bytes().to_vec().into(),
+            .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                writes,
                 txn_id: None,
             }))
             .await;
 
         match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
             Event::Storage(StorageEvent::Error { error }) => Err(BlobError::ReadError(format!(
                 "failed to write bucket stats: {error}"
             ))),
@@ -849,6 +926,20 @@ impl BlobHandler {
             self.abort_stats_txn(&mut owner).await;
             return Err(BlobError::ReadError(
                 "failed to release bucket capacity".to_string(),
+            ));
+        }
+        if !self
+            .move_free_row(
+                &location.backend,
+                &location.storage_bucket,
+                (load, load.saturating_sub(1)),
+                txn_id,
+            )
+            .await
+        {
+            self.abort_stats_txn(&mut owner).await;
+            return Err(BlobError::ReadError(
+                "failed to update the bucket free index".to_string(),
             ));
         }
         let event = self
@@ -1056,6 +1147,15 @@ impl BlobHandler {
                 "failed to write bucket stats".to_string(),
             ));
         }
+        if !self
+            .move_free_row(backend, bucket, (load, adjusted), txn_id)
+            .await
+        {
+            self.abort_stats_txn(&mut owner).await;
+            return Err(BlobError::ReadError(
+                "failed to update the bucket free index".to_string(),
+            ));
+        }
 
         if let Some(location) = location {
             let value = match intent_value(location) {
@@ -1238,6 +1338,14 @@ impl BlobHandler {
             .transpose()
             .map_err(BlobError::ConversionError)
     }
+}
+
+/// The free index row of a bucket at `load`; big-endian loads sort the emptiest bucket first.
+fn free_key(backend: &BackendRef, load: u64, bucket: &str) -> Vec<u8> {
+    let mut key = stats_prefix(backend, None);
+    key.extend_from_slice(&load.to_be_bytes());
+    key.extend_from_slice(bucket.as_bytes());
+    key
 }
 
 /// Bucket stats are per backend: the key is the backend discriminator, a NUL
