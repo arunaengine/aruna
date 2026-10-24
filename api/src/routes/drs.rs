@@ -19,7 +19,7 @@ use aruna_core::structs::storage::replication::{
 };
 use aruna_operations::auth::bearer_token::token_grant;
 use aruna_operations::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
-use aruna_operations::distribution::resolve::{GlobalResolution, resolve_version};
+use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version};
 use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, issue_ticket, redeem_ticket,
 };
@@ -411,6 +411,11 @@ objects.
 - A content-hash identifier resolves against every object on this node carrying that content and
   returns the first one the caller may read, so the same digest can resolve differently for
   different callers.
+- A content-hash W3ID that no object on this node carries is looked up in the content indexes of
+  distributed buckets (at most 16 versions, bounded probes) and answers under the global id of
+  the first readable version. A search that could not ask every range answers 503 instead of 404.
+- A content hash carried by more objects on this node than one lookup reads answers 409; use
+  the global id or a versioned ARN.
 - The response carries the requested identifier in `id`, the canonical W3ID in `aliases` when the
   request used a different form, and the stored checksums in a stable order.
 - For an object held here it carries a single `https` access method whose `access_url.url` is a
@@ -1115,7 +1120,12 @@ async fn resolve_object(
 ) -> Result<ResolveOutcome, DrsError> {
     match parse_object_id(object_id)? {
         RequestedObjectId::CanonicalW3id(hash) => {
-            resolve_content_hash(state, auth, object_id, None, &hash).await
+            match resolve_content_hash(state, auth, object_id, None, &hash).await? {
+                ResolveOutcome::NotFound => {
+                    resolve_distributed_hash(state, auth, object_id, hash, deadline).await
+                }
+                outcome => Ok(outcome),
+            }
         }
         RequestedObjectId::ContentHashArn {
             realm_id,
@@ -1130,6 +1140,34 @@ async fn resolve_object(
             version_id,
         } => resolve_global(state, auth, object_id, realm_id, version_id, deadline).await,
     }
+}
+
+/// Resolves a bare content hash that no local bucket holds through the content indexes of
+/// distributed buckets; the first readable version answers under its global id. An incomplete
+/// search without a hit is unavailable, never absent.
+async fn resolve_distributed_hash(
+    state: &ServerState,
+    auth: &AuthContext,
+    requested_id: &str,
+    hash: [u8; 32],
+    deadline: Instant,
+) -> Result<ResolveOutcome, DrsError> {
+    let resolution = resolve_content(&state.get_ctx(), hash, deadline).await;
+    let realm_id = state.get_realm_id();
+    let mut denied = false;
+    for found in resolution.versions {
+        let version_id = found.version_id;
+        match resolve_global(state, auth, requested_id, realm_id, version_id, deadline).await? {
+            ResolveOutcome::Found(object) => return Ok(ResolveOutcome::Found(object)),
+            ResolveOutcome::Denied => denied = true,
+            ResolveOutcome::NotFound | ResolveOutcome::Unavailable => {}
+        }
+    }
+    Ok(match (denied, resolution.incomplete) {
+        (true, _) => ResolveOutcome::Denied,
+        (false, true) => ResolveOutcome::Unavailable,
+        (false, false) => ResolveOutcome::NotFound,
+    })
 }
 
 /// Resolves a distributed bucket's version on any realm node: this node's member answers when
