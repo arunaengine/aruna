@@ -84,6 +84,8 @@ pub enum DistributionError {
     Replayed(Ulid),
     #[error("the statement is invalid: {0}")]
     InvalidStatement(&'static str),
+    #[error("the distributed bucket does not exist yet")]
+    UnknownSet,
 }
 
 /// Checks the shape of a configuration; record-level checks add the encoded size.

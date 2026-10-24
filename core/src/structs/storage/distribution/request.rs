@@ -1,0 +1,219 @@
+//! Defines the requests a set's publisher accepts and derives the next snapshot from its head.
+//! Admin requests come with the requester's authority; statements carry their signer's.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
+
+use super::snapshot::{DistributionSnapshot, Lifecycle};
+use super::validate::validate_config;
+use super::{
+    DistributionConfig, DistributionError, DistributionMember, DistributionSettings,
+    MAX_RECORD_BYTES, MemberState, SetPhase, SetRoot, SignedStatement, StatementKind, TransferRole,
+};
+use crate::structs::identity::realm::RealmId;
+
+/// Room the signature and envelope take next to an encoded snapshot.
+const SIGNED_OVERHEAD: usize = 128;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DistributionRequest {
+    /// A pending set with its full configuration and the preimage of its id.
+    Create {
+        root: SetRoot,
+        config: DistributionConfig,
+    },
+    /// Needs the admissions of every coordinator and replica.
+    Activate,
+    ChangeSettings {
+        settings: DistributionSettings,
+    },
+    Join {
+        member: DistributionMember,
+    },
+    Leave {
+        member_id: Ulid,
+    },
+    TransferPrepare {
+        transfer_id: Ulid,
+        range_id: Ulid,
+        to: Ulid,
+        epoch: u64,
+        role: TransferRole,
+    },
+    TransferActivate {
+        transfer_id: Ulid,
+        range_id: Ulid,
+    },
+    /// The deletion identity: every member id with its local bucket incarnation.
+    DeletePrepare {
+        members: Vec<(Ulid, u128)>,
+    },
+    DeleteCommit,
+    /// A member's or coordinator's signed statement for the publisher to embed.
+    Statement(Box<SignedStatement>),
+}
+
+impl DistributionRequest {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::Activate => "activate",
+            Self::ChangeSettings { .. } => "change settings",
+            Self::Join { .. } => "join",
+            Self::Leave { .. } => "leave",
+            Self::TransferPrepare { .. } => "transfer prepare",
+            Self::TransferActivate { .. } => "transfer activate",
+            Self::DeletePrepare { .. } => "delete prepare",
+            Self::DeleteCommit => "delete commit",
+            Self::Statement(signed) => signed.statement.kind.name(),
+        }
+    }
+
+    /// Admin requests need group admin WRITE on the owner group when the publisher accepts them.
+    pub fn admin(&self) -> bool {
+        !matches!(self, Self::Statement(_))
+    }
+}
+
+/// Derives the revision after `head` that accepts `request`. Pure: the publisher commits the
+/// result with its signature; nothing else ever produces a revision.
+pub fn next_snapshot(
+    realm_id: RealmId,
+    head: Option<&DistributionSnapshot>,
+    request: &DistributionRequest,
+) -> Result<DistributionSnapshot, DistributionError> {
+    let next = match (head, request) {
+        (None, DistributionRequest::Create { root, config }) => created(root, config)?,
+        (Some(head), DistributionRequest::Create { .. }) => {
+            return Err(DistributionError::SetMismatch(head.set_id()));
+        }
+        (None, _) => return Err(DistributionError::UnknownSet),
+        (Some(head), request) => {
+            let mut next = head.clone();
+            accept(realm_id, &mut next, request)?;
+            next.number = head.number + 1;
+            next.previous = Some(head.digest());
+            if request.admin() {
+                next.admin_number = next.number;
+            }
+            next
+        }
+    };
+    next.validate(realm_id)?;
+    let size = postcard::to_allocvec(&next)
+        .map_err(|_| DistributionError::TooLarge)?
+        .len();
+    if size + SIGNED_OVERHEAD > MAX_RECORD_BYTES {
+        return Err(DistributionError::TooLarge);
+    }
+    Ok(next)
+}
+
+fn created(
+    root: &SetRoot,
+    config: &DistributionConfig,
+) -> Result<DistributionSnapshot, DistributionError> {
+    if root.owner_group != config.owner_group {
+        return Err(DistributionError::ForeignSet(root.set_id()));
+    }
+    validate_config(config)?;
+    let fresh = config.members.iter().all(|member| {
+        member.state == MemberState::Created && member.incarnation.is_none() && member.added_in == 1
+    });
+    if !fresh {
+        return Err(DistributionError::InvalidCreate);
+    }
+    Ok(DistributionSnapshot {
+        root: root.clone(),
+        number: 1,
+        previous: None,
+        phase: SetPhase::Pending,
+        config: config.clone(),
+        lifecycle: Lifecycle::default(),
+        statements: Vec::new(),
+        tombstones: Vec::new(),
+        admin_number: 1,
+    })
+}
+
+fn accept(
+    realm_id: RealmId,
+    next: &mut DistributionSnapshot,
+    request: &DistributionRequest,
+) -> Result<(), DistributionError> {
+    match request {
+        DistributionRequest::Statement(signed) => embed(realm_id, next, signed),
+        DistributionRequest::Activate => {
+            if next.phase != SetPhase::Pending {
+                return Err(DistributionError::NotPending);
+            }
+            next.phase = SetPhase::Active;
+            // Snapshot validation names the first coordinator or replica not yet admitted.
+            Ok(())
+        }
+        DistributionRequest::ChangeSettings { settings } => {
+            if settings.refresh_secs == Some(0) {
+                return Err(DistributionError::InvalidRefresh);
+            }
+            next.config.settings = settings.clone();
+            Ok(())
+        }
+        DistributionRequest::Create { .. } => Err(DistributionError::SetMismatch(next.set_id())),
+        DistributionRequest::Join { .. }
+        | DistributionRequest::Leave { .. }
+        | DistributionRequest::TransferPrepare { .. }
+        | DistributionRequest::TransferActivate { .. }
+        | DistributionRequest::DeletePrepare { .. }
+        | DistributionRequest::DeleteCommit => Err(DistributionError::Unsupported(request.name())),
+    }
+}
+
+/// Embeds a statement once: its own signature, member and intent are checked, and an
+/// automatic request older than the last admin revision is dropped.
+fn embed(
+    realm_id: RealmId,
+    next: &mut DistributionSnapshot,
+    signed: &SignedStatement,
+) -> Result<(), DistributionError> {
+    let statement = &signed.statement;
+    if next
+        .statements
+        .iter()
+        .any(|known| known.statement.statement_id == statement.statement_id)
+    {
+        return Err(DistributionError::Replayed(statement.statement_id));
+    }
+    if statement.kind.automatic() && statement.intent < next.admin_number {
+        return Err(DistributionError::StaleRevision);
+    }
+    next.check_statement(realm_id, signed)?;
+    match &statement.kind {
+        StatementKind::Admit => {
+            if next.phase != SetPhase::Pending {
+                return Err(DistributionError::NotPending);
+            }
+            let member = next
+                .config
+                .members
+                .iter_mut()
+                .find(|member| member.member_id == statement.member_id)
+                .ok_or(DistributionError::NoMember(statement.member_id))?;
+            // A new set holds nothing yet, so an admitted member has nothing to catch up.
+            member.incarnation = Some(statement.incarnation);
+            member.state = MemberState::Ready;
+            next.statements.retain(|known| {
+                known.statement.member_id != statement.member_id
+                    || !matches!(known.statement.kind, StatementKind::Admit)
+            });
+            next.statements.push(signed.clone());
+            Ok(())
+        }
+        kind => Err(DistributionError::Unsupported(kind.name())),
+    }
+}
+
+#[cfg(test)]
+#[path = "request_tests.rs"]
+mod tests;

@@ -14,12 +14,14 @@ use crate::types::GroupId;
 pub mod change;
 pub mod hint;
 pub mod presets;
+pub mod request;
 pub mod snapshot;
 pub mod statement;
 pub mod validate;
 
 pub use change::{DistributionChange, DistributionOp, TransferRole};
 pub use hint::{HintIndex, SetHint};
+pub use request::{DistributionRequest, next_snapshot};
 pub use snapshot::{DistributionSnapshot, DistributionView, SignedSnapshot};
 pub use statement::{SetRoot, SignedStatement, Statement, StatementKind};
 pub use validate::DistributionError;
