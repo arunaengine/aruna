@@ -270,3 +270,19 @@ async fn membership_gaps_defer() {
     let device = receive(&storage, published(MEMBER, snapshot, MEMBER)).await;
     assert!(rejected(device));
 }
+
+#[tokio::test]
+async fn federated_admin_published() {
+    // A federated admin's accepted request still reaches every node as the publisher's revision.
+    let (_dir, storage) = test_storage();
+    realm_nodes(&storage).await;
+    let mut event = published(PUBLISHER, created(), PUBLISHER);
+    event.actor.user_id = UserId::new(Ulid::from_parts(845, 1), RealmId::from_bytes([85; 32]));
+    assert_eq!(
+        receive(&storage, event).await,
+        AdminEventValidation::Accepted
+    );
+    let mut forged = published(OTHER, created(), PUBLISHER);
+    forged.actor.user_id = UserId::new(Ulid::from_parts(845, 1), RealmId::from_bytes([85; 32]));
+    assert!(rejected(receive(&storage, forged).await));
+}

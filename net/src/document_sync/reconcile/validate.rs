@@ -1288,13 +1288,19 @@ async fn validate_admin_envelope(
 }
 
 /// A federated user acts through the reconciled realm only on group events, which the group
-/// authority check still decides, and to revoke its own token.
+/// authority check still decides, to revoke its own token, and through a set's publisher.
 fn foreign_actor_allowed(event: &AdminDocumentEvent, realm_id: RealmId) -> bool {
     event.actor.realm_id == realm_id
         && !event.actor.user_id.is_nil()
         && match &event.op {
             AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. } => {
                 *token_owner == event.actor.user_id
+            }
+            // The publisher accepted a federated admin's request; signature, realm and set
+            // are still checked by the distribution shape rules.
+            AdminDocumentOperation::DistributionPublished { snapshot } => {
+                matches!(event.target, AdminDocumentTarget::Distribution { .. })
+                    && snapshot.snapshot.root.publisher == event.origin_node_id
             }
             _ => matches!(event.target, AdminDocumentTarget::Group { .. }),
         }
