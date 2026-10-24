@@ -12,6 +12,7 @@ use crate::driver::DriverContext;
 pub mod handoff;
 pub mod inventory;
 pub mod publish;
+pub mod rebuild;
 #[cfg(test)]
 pub(crate) mod test_store;
 
