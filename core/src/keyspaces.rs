@@ -10,6 +10,10 @@ pub const REALM_CONFIG_KEYSPACE: &str = "realm_config";
 pub const METADATA_INDEX_KEYSPACE: &str = "metadata_index";
 pub const DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const IRI_INDEX_KEYSPACE: &str = "metadata_iri_reference_index";
+/// Data link postings by identifier, then document: what a materialized document links to.
+pub const DATA_LINK_KEYSPACE: &str = "metadata_data_links";
+/// The same postings by document first, so a materialization replaces exactly its own rows.
+pub const DOCUMENT_LINK_KEYSPACE: &str = "metadata_document_links";
 pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
 /// Time-ordered index of registry records by `updated_at_ms`, for OAI-PMH
 /// datestamp enumeration (#320). Written atomically with each registry record.
@@ -485,6 +489,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     METADATA_INDEX_KEYSPACE,
     DOCUMENT_INDEX_KEYSPACE,
     IRI_INDEX_KEYSPACE,
+    DATA_LINK_KEYSPACE,
+    DOCUMENT_LINK_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE,
     UPDATED_INDEX_KEYSPACE,
     VISIBILITY_INDEX_KEYSPACE,

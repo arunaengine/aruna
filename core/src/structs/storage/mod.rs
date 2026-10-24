@@ -10,6 +10,7 @@ pub mod blob;
 pub mod broken;
 pub mod cleanup;
 pub mod data_identity;
+pub mod data_link;
 pub mod dataset_location;
 pub mod delete_audit;
 pub mod discovery;
