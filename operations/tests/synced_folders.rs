@@ -677,6 +677,34 @@ async fn creates_realm_bucket() -> TestResult<()> {
         Err(FolderError::NotRealmNode(device.node_id()))
     );
 
+    // A folder bind still adopts the bucket of its own group.
+    let root = tempfile::tempdir()?;
+    let folder = bind_folder(
+        &manual_context(&device.context),
+        create_input(&realm, root.path(), group_id),
+    )
+    .await?;
+    assert_eq!(folder.state, FolderState::Active);
+
+    // The node decides existence in its create transaction: one of two racing creates wins.
+    let fresh = RealmBucketInput {
+        bucket: "fresh-data".to_string(),
+        ..input(group_id, server.node_id())
+    };
+    let (left, right) = tokio::join!(
+        create_realm_bucket(&device.context, fresh.clone()),
+        create_realm_bucket(&device.context, fresh)
+    );
+    let mut outcomes = [left, right];
+    outcomes.sort_by_key(Result::is_err);
+    assert_eq!(outcomes[0], Ok(()));
+    assert_eq!(
+        outcomes[1],
+        Err(FolderError::BucketExists {
+            node: server.node_id(),
+            bucket: "fresh-data".to_string(),
+        })
+    );
     Ok(())
 }
 

@@ -60,7 +60,8 @@ bind with `create_bucket`.
 - The device forwards the creation through the node plane; the realm node creates and holds the
   bucket.
 - A bucket of that name the node already holds is refused with 409 and code `bucket_exists`, also
-  when it belongs to another group or the owner cannot read it.
+  when it belongs to another group. The node decides this inside its create transaction, so of two
+  concurrent calls for one name exactly one creates the bucket.
 - This computer and nodes that are not realm servers cannot hold the bucket."#,
     request_body(
         content = CreateBucketRequest,

@@ -30,16 +30,31 @@ pub(crate) async fn apply_bucket_create(
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> MetadataTransportMessage {
-    let MetadataTransportMessage::ForwardCreateBucket {
-        auth_token,
-        bucket,
-        group_id,
-    } = message
-    else {
-        return reject("unexpected bucket create message");
-    };
-    let result = create_remote_bucket(context, peer, auth_token, &bucket, group_id).await;
-    if let Err(refusal) = &result {
+    match message {
+        MetadataTransportMessage::ForwardCreateBucket {
+            auth_token,
+            bucket,
+            group_id,
+        } => {
+            let result = create_remote_bucket(context, peer, auth_token, &bucket, group_id).await;
+            note_refusal(peer, &bucket, &result);
+            MetadataTransportMessage::ForwardedBucketCreated { result }
+        }
+        MetadataTransportMessage::ForwardCreateNewBucket {
+            auth_token,
+            bucket,
+            group_id,
+        } => {
+            let result = create_once(context, peer, auth_token, &bucket, group_id).await;
+            note_refusal(peer, &bucket, &result);
+            MetadataTransportMessage::ForwardedNewBucket { result }
+        }
+        _ => reject("unexpected bucket create message"),
+    }
+}
+
+fn note_refusal<T>(peer: NodeId, bucket: &str, result: &Result<T, SyncRefusal>) {
+    if let Err(refusal) = result {
         warn!(
             %peer,
             %bucket,
@@ -47,9 +62,9 @@ pub(crate) async fn apply_bucket_create(
             "Refused a forwarded bucket creation"
         );
     }
-    MetadataTransportMessage::ForwardedBucketCreated { result }
 }
 
+/// Creates the bucket, or accepts one of the same group the node already holds.
 pub(super) async fn create_remote_bucket(
     context: &Arc<DriverContext>,
     peer: NodeId,
@@ -57,6 +72,32 @@ pub(super) async fn create_remote_bucket(
     bucket: &str,
     group_id: GroupId,
 ) -> Result<(), SyncRefusal> {
+    if create_once(context, peer, auth_token, bucket, group_id).await? {
+        return Ok(());
+    }
+    match drive(
+        GetBucketOperation::new(bucket.to_string()),
+        context.as_ref(),
+    )
+    .await
+    {
+        Ok(info) if info.group_id == group_id => Ok(()),
+        Ok(_) => Err(SyncRefusal::Invalid(format!(
+            "bucket \"{bucket}\" belongs to another group"
+        ))),
+        Err(_) => Err(SyncRefusal::Unavailable),
+    }
+}
+
+/// Creates the bucket inside the node's create transaction. `Ok(false)`: the node already held
+/// a bucket of that name, in any group, and created nothing.
+async fn create_once(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: AuthToken,
+    bucket: &str,
+    group_id: GroupId,
+) -> Result<bool, SyncRefusal> {
     let net_handle = context
         .net_handle
         .as_ref()
@@ -105,25 +146,21 @@ pub(super) async fn create_remote_bucket(
     )
     .await;
     match created {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(true),
         Err(error @ CreateBucketError::ProviderBucket(_)) => {
             Err(SyncRefusal::Invalid(error.to_string()))
         }
-        Err(CreateBucketError::BucketAlreadyExists) => {
-            match drive(
-                GetBucketOperation::new(bucket.to_string()),
-                context.as_ref(),
-            )
-            .await
-            {
-                Ok(info) if info.group_id == group_id => Ok(()),
-                Ok(_) => Err(SyncRefusal::Invalid(format!(
-                    "bucket \"{bucket}\" belongs to another group"
-                ))),
-                Err(_) => Err(SyncRefusal::Unavailable),
-            }
-        }
-        Err(_) => Err(SyncRefusal::Unavailable),
+        Err(CreateBucketError::BucketAlreadyExists) => Ok(false),
+        // A create that lost the commit race to one of the same name still reports existence.
+        Err(_) => match drive(
+            GetBucketOperation::new(bucket.to_string()),
+            context.as_ref(),
+        )
+        .await
+        {
+            Ok(_) => Ok(false),
+            Err(_) => Err(SyncRefusal::Unavailable),
+        },
     }
 }
 

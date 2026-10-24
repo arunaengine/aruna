@@ -340,7 +340,7 @@ async fn forward_create(
 }
 
 /// Creates a bucket on a realm node for the owner without binding a folder to it. A bucket of
-/// that name the node already holds is refused, never adopted.
+/// that name the node already holds, in any group, is refused, never adopted.
 pub async fn create_realm_bucket(
     context: &Arc<DriverContext>,
     input: RealmBucketInput,
@@ -357,28 +357,40 @@ pub async fn create_realm_bucket(
         bucket: input.bucket,
         prefix: String::new(),
     };
-    let probe = request_versions(
-        context,
-        remote.node_id,
-        auth.clone(),
-        remote.bucket.clone(),
-        String::new(),
-        None,
-        SyncPageLimit::new(1),
-    )
-    .await;
-    // The node answers NotFound only for a bucket it does not hold; Forbidden means it holds one.
-    match probe {
-        Err(ReconcileFolderError::Refused(SyncRefusal::NotFound)) => {}
-        Ok(_) | Err(ReconcileFolderError::Refused(SyncRefusal::Forbidden)) => {
-            return Err(FolderError::BucketExists {
-                node: remote.node_id,
-                bucket: remote.bucket,
-            });
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(FolderError::Unavailable)?;
+    // The node decides existence inside its create transaction, so concurrent creates cannot
+    // both succeed.
+    let reply = metadata
+        .request_forwarded_write(
+            remote.node_id,
+            MetadataTransportMessage::ForwardCreateNewBucket {
+                auth_token: aruna_core::metadata::AuthToken::internal(auth),
+                bucket: remote.bucket.clone(),
+                group_id: input.group_id,
+            },
+        )
+        .await
+        .map_err(|error| ReconcileFolderError::Unreachable(error.to_string()));
+    let created = match reply {
+        Ok(MetadataTransportMessage::ForwardedNewBucket { result }) => {
+            result.map_err(ReconcileFolderError::Refused)
         }
-        Err(error) => return Err(map_remote_error(error, &remote)),
+        Ok(other) => Err(ReconcileFolderError::Unreachable(format!(
+            "unexpected metadata response: {}",
+            crate::metadata::transport_message_kind(&other)
+        ))),
+        Err(error) => Err(error),
+    };
+    match created.map_err(|error| map_remote_error(error, &remote))? {
+        true => Ok(()),
+        false => Err(FolderError::BucketExists {
+            node: remote.node_id,
+            bucket: remote.bucket,
+        }),
     }
-    forward_create(context, auth, &remote, input.group_id).await
 }
 
 /// Wakes the background pass for a folder whose root is still a usable directory.
