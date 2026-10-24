@@ -9,6 +9,7 @@ pub mod claim_admin;
 pub mod create_realm;
 pub mod database_list;
 pub mod database_publish;
+pub mod databases;
 pub mod ensure_config;
 pub mod forward;
 pub mod get_config;
