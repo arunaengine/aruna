@@ -77,4 +77,6 @@ async fn restores_lost_sample() {
         written,
         "a refill places keys as writes did"
     );
+    let count = counters(&handle, sample_count_key(set(), range_id())).await;
+    assert_eq!(count.sampled, 60, "the refill corrects the count row");
 }
