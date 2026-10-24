@@ -864,6 +864,15 @@ mod pure_tests {
                 value,
             }));
             if found {
+                let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
+                else {
+                    panic!("expected the binding read, got {effects:?}")
+                };
+                assert_eq!(key_space, S3_BUCKET_KEYSPACE);
+                effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+                    key: Vec::new().into(),
+                    value: None,
+                }));
                 let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice()
                 else {
                     panic!("expected the upload count, got {effects:?}")
