@@ -72,6 +72,24 @@ pub fn range_holders(snapshot: &DistributionSnapshot, key: &str) -> Vec<NodeId> 
         .collect()
 }
 
+/// The ready members that keep the bytes of `key`'s range in `set_id`, from this node's
+/// record; none without a readable record.
+pub async fn key_holders(context: &DriverContext, set_id: Ulid, key: &str) -> Vec<NodeId> {
+    let read = StorageEffect::Read {
+        key_space: DISTRIBUTION_KEYSPACE.to_string(),
+        key: set_id.to_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => DistributionView::from_bytes(&value)
+            .map(|view| range_holders(view.snapshot(), key))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// Whom to ask for the key of a version in `snapshot`: one ready member with `all` coverage,
 /// otherwise the coordinator of every range. `local` is never asked.
 pub fn probe_targets(snapshot: &DistributionSnapshot, local: NodeId) -> Vec<NodeId> {

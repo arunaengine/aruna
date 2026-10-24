@@ -12,6 +12,7 @@ mod forward;
 mod forward_copy;
 mod forward_list;
 mod forward_parts;
+mod forward_reads;
 mod forward_versions;
 mod listing;
 mod payload;
@@ -1871,6 +1872,21 @@ impl S3 for ArunaS3Service {
         let key = req.input.key;
         let response_bucket = bucket.clone();
         let response_key = key.clone();
+        if let Some(holder) = self
+            .read_holder(&req.extensions, bucket_info.as_ref(), &key)
+            .await?
+        {
+            let request = forward_reads::read_request(
+                http::Method::GET,
+                "GetObject",
+                &bucket,
+                &key,
+                req.uri.query(),
+                &req.headers,
+            );
+            let response = self.forward_read(&user_access, &holder, request).await?;
+            return Ok(forward_reads::forwarded_get(response));
+        }
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
 
         let range_request = requested_range.map(object_range_request);
@@ -2110,6 +2126,21 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(|info| info.group_id)
             .unwrap_or(user_access.group_id);
+        if let Some(holder) = self
+            .read_holder(&req.extensions, bucket_info.as_ref(), &key)
+            .await?
+        {
+            let request = forward_reads::read_request(
+                http::Method::HEAD,
+                "HeadObject",
+                &bucket,
+                &key,
+                req.uri.query(),
+                &req.headers,
+            );
+            let response = self.forward_read(&user_access, &holder, request).await?;
+            return Ok(forward_reads::forwarded_head(&response));
+        }
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
         let operation = HeadObjectOperation::new(HOI {
             bucket: bucket.clone(),

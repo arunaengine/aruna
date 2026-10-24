@@ -62,6 +62,7 @@ const PASSED_HEADERS: &[&str] = &[
     "expires",
     "if-match",
     "if-none-match",
+    "range",
     "x-amz-checksum-algorithm",
     "x-amz-checksum-type",
     "x-amz-mp-object-size",
@@ -305,7 +306,7 @@ fn coordinator_error(forward: &Forward, status: http::StatusCode, body: &str) ->
     let message = xml_field(body, "Message").unwrap_or_default();
     let message = match status {
         http::StatusCode::FORBIDDEN => format!(
-            "The coordinator node {} denied the write: {message} Every member checks the \
+            "The node {} denied the request: {message} Every member checks the \
              caller on its own path; grant the bucket with a node glob such as \
              /{{realm}}/g/{{group}}/data/*/{{bucket}}/**.",
             forward.node_id
@@ -379,8 +380,8 @@ impl ArunaS3Service {
     }
 
     /// Whether this member answers a read of `key`, or with `listing` of every key under it,
-    /// from its own view; `true` while it still catches up. A range it keeps no records of is
-    /// refused with its coordinator named, since reads through holders come later.
+    /// from its own view; `true` while it still catches up. A listing that reaches a range it
+    /// keeps no records of is refused with its coordinator named; GET and HEAD go to a holder.
     pub(super) async fn read_scope(
         &self,
         bucket: Option<&BucketInfo>,

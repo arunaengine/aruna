@@ -103,7 +103,7 @@ fn payload_fits(operation: &str, payload: &Payload) -> bool {
     }
 }
 
-/// The S3 operations a member forwards to a range's coordinator.
+/// The S3 operations a member forwards to a range's coordinator, or reads to a holder.
 const DELEGATED_OPERATIONS: &[&str] = &[
     "PutObject",
     "DeleteObject",
@@ -116,6 +116,8 @@ const DELEGATED_OPERATIONS: &[&str] = &[
     "UploadPartCopy",
     "ListObjectsV2",
     "ListObjectVersions",
+    "GetObject",
+    "HeadObject",
 ];
 
 /// Forwarded listings address a bucket and name their key range in the query.
