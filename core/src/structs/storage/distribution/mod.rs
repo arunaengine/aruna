@@ -11,6 +11,7 @@ use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::types::GroupId;
 
 pub mod accounting;
+pub mod delegation;
 pub mod hint;
 pub mod inventory;
 pub mod parking;
