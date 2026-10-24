@@ -325,6 +325,109 @@ mod tests {
         );
     }
 
+    async fn seed(context: &crate::driver::DriverContext, bucket: &str, bound: bool) -> Ulid {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::{
+            BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+        };
+        use aruna_core::structs::storage::blob::{
+            BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
+        };
+        use aruna_core::structs::storage::distribution::DistributionBinding;
+        use aruna_core::structs::storage::format::EncodingClass;
+        let realm = RealmId::from_bytes([1; 32]);
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([3; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::local(Ulid::from_bytes([5; 16]), realm),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: bound.then(|| DistributionBinding {
+                set_id: Ulid::from_bytes([6; 16]),
+                member_id: Ulid::from_bytes([7; 16]),
+                incarnation: 0,
+                revision: Default::default(),
+            }),
+        };
+        let version_id = Ulid::from_bytes([8; 16]);
+        let version = BlobVersion::materialized(
+            [9; 32],
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            std::time::SystemTime::UNIX_EPOCH,
+            info.created_by,
+            None,
+        );
+        let writes = vec![
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                bucket.as_bytes().to_vec().into(),
+                info.to_bytes().unwrap().into(),
+            ),
+            (
+                BLOB_HEAD_KEYSPACE.to_string(),
+                BlobHeadKey::new(bucket, "a.txt").to_bytes().unwrap().into(),
+                CurrentVersionPointer::new(version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                VersionKey::new(bucket, "a.txt", version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                version.to_bytes().unwrap().into(),
+            ),
+        ];
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+        version_id
+    }
+
+    #[tokio::test]
+    async fn bound_bucket_entries_get_global_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = crate::driver::DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm = RealmId::from_bytes([1; 32]);
+        let version_id = seed(&context, "shared", true).await;
+        seed(&context, "plain", false).await;
+        let mut crate_value = json!({"@graph": [
+            {"@id": "s3://shared/a.txt", "contentUrl": "s3://shared/a.txt"},
+            {"@id": "s3://plain/a.txt", "contentUrl": "s3://plain/a.txt"}
+        ]});
+        let rewritten = super::normalize_entries(&context, realm, node(3), &mut crate_value)
+            .await
+            .unwrap();
+        assert_eq!(rewritten, 1);
+        let global = aruna_core::structs::storage::global_id::GlobalId::Version {
+            realm_id: realm,
+            version_id,
+        }
+        .to_url();
+        assert_eq!(crate_value["@graph"][0]["@id"], global.as_str());
+        assert_eq!(crate_value["@graph"][0]["contentUrl"], global.as_str());
+        // An ordinary bucket keeps its location; only member buckets have a global id.
+        assert_eq!(crate_value["@graph"][1]["@id"], "s3://plain/a.txt");
+    }
+
     #[test]
     fn rewrites_identifier_positions() {
         let old = "s3://lab/a.txt";
