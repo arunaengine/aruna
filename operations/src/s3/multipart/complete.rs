@@ -8,6 +8,7 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
+use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
@@ -47,8 +48,9 @@ use aruna_core::structs::storage::blob::{
     BlobVersion, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
     VersionKey, WriteOwner,
 };
-use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::inventory::VersionEntry;
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::{
@@ -322,6 +324,11 @@ pub struct CompleteUploadOperation {
     compression: Compression,
     /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
     set_hint: Option<SetHint>,
+    /// The bucket's distribution binding, whose inventory the finalize transaction maintains.
+    binding: Option<DistributionBinding>,
+    /// The head the finalize installs and the epoch of its version, for the inventory.
+    head_pointer: Option<CurrentVersionPointer>,
+    version_epoch: OriginalEpoch,
     /// The reset that returns the record to `Open` has already been taken, so
     /// no later cleanup step may take it a second time.
     reset_done: bool,
@@ -399,6 +406,9 @@ impl CompleteUploadOperation {
             gated_bucket: None,
             compression: Compression::Off,
             set_hint: None,
+            binding: None,
+            head_pointer: None,
+            version_epoch: OriginalEpoch::default(),
             reset_done: false,
             compose_share: None,
             selected_parts: HashMap::new(),
@@ -1019,10 +1029,10 @@ impl CompleteUploadOperation {
             .as_ref()
             .map(|bucket| bucket.compression)
             .unwrap_or_default();
-        self.set_hint = bucket
+        self.binding = bucket
             .as_ref()
-            .and_then(|bucket| bucket.distribution.as_ref())
-            .map(DistributionBinding::hint);
+            .and_then(|bucket| bucket.distribution.clone());
+        self.set_hint = self.binding.as_ref().map(DistributionBinding::hint);
         let inherited = self
             .upload_record
             .as_ref()
@@ -1589,6 +1599,7 @@ impl CompleteUploadOperation {
             Ok(context) => context,
             Err(err) => return self.schedule_error(err),
         };
+        self.head_pointer = Some(pointer.clone());
         let effect = match write_head_effect(&alias_context, pointer, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
@@ -1693,6 +1704,7 @@ impl CompleteUploadOperation {
         };
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
         self.stored_policies = version.placement_policies.clone();
+        self.version_epoch = version.original_epoch;
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
@@ -2028,6 +2040,24 @@ impl CompleteUploadOperation {
         smallvec![effect]
     }
 
+    /// The composed version, the head it becomes and the upload it closes.
+    fn inventory_change(&self, size: i128) -> Option<InventoryChange> {
+        let added = AddedVersion {
+            version_id: self.version_id?,
+            epoch: self.version_epoch,
+            generation: self.head_pointer.as_ref().map_or(0, |head| head.generation),
+            entry: VersionEntry {
+                marker: false,
+                size: u64::try_from(size).unwrap_or_default(),
+                referenced: false,
+            },
+        };
+        let head = self.head_pointer.is_some();
+        let mut change = version_written(self.binding.as_ref(), &self.input.key, added, head)?;
+        change.upload = Some((self.input.upload_id, false));
+        Some(change)
+    }
+
     fn obligation_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
@@ -2059,9 +2089,11 @@ impl CompleteUploadOperation {
         let Some(stored) = stored else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
+        let inventory = self.inventory_change(size);
         self.usage_update = Some(
             UsageCounterUpdate::with_stored(group_id, group_delta, stored)
-                .in_bucket(&self.input.bucket, RowChange::AddedVersion),
+                .in_bucket(&self.input.bucket, RowChange::AddedVersion)
+                .with_inventory(inventory),
         );
 
         // Enforce the hard group quota before the counters commit. Only a positive

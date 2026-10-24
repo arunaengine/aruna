@@ -8,6 +8,7 @@ use crate::blob::records::{
     delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,
     write_version_effect,
 };
+use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
@@ -35,6 +36,8 @@ use aruna_core::structs::storage::delete_audit::{
     BlobAuditKind, BlobAuditRecord, delete_audit_key, trail_key,
 };
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::inventory::VersionEntry;
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::usage::UsageDelta;
@@ -214,6 +217,11 @@ pub struct DeleteObjectOperation {
     row_fence: Option<RowFence>,
     /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
     set_hint: Option<SetHint>,
+    /// The bucket's distribution binding, read with the marker write for its inventory.
+    binding: Option<DistributionBinding>,
+    /// The marker's head and version epoch, for the inventory.
+    marker_head: Option<CurrentVersionPointer>,
+    marker_epoch: OriginalEpoch,
 }
 
 impl DeleteObjectOperation {
@@ -250,6 +258,9 @@ impl DeleteObjectOperation {
             incarnation: None,
             row_fence: None,
             set_hint: None,
+            binding: None,
+            marker_head: None,
+            marker_epoch: OriginalEpoch::default(),
         }
     }
 
@@ -391,9 +402,8 @@ impl DeleteObjectOperation {
             Ok(bucket) => bucket,
             Err(error) => return self.emit_error(error.into()),
         };
-        self.set_hint = bucket
-            .and_then(|bucket| bucket.distribution)
-            .map(|binding| binding.hint());
+        self.binding = bucket.and_then(|bucket| bucket.distribution);
+        self.set_hint = self.binding.as_ref().map(DistributionBinding::hint);
         self.write_tombstone()
     }
 
@@ -925,7 +935,8 @@ impl DeleteObjectOperation {
             (Some(_), None) => RowChange::Kept,
         };
         let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta)
-            .in_bucket(&self.input.bucket, row);
+            .in_bucket(&self.input.bucket, row)
+            .with_inventory(self.marker_inventory());
         if update.is_noop() {
             return self.write_delete_audit();
         }
@@ -933,6 +944,28 @@ impl DeleteObjectOperation {
         let effects = update.start(txn_id);
         self.usage_update = Some(update);
         effects
+    }
+
+    /// A delete marker of a distributed bucket becomes a version row and the key's head.
+    fn marker_inventory(&self) -> Option<InventoryChange> {
+        let (None, Some(version_id), Some(head)) = (
+            self.input.version_id,
+            self.version_id,
+            self.marker_head.as_ref(),
+        ) else {
+            return None;
+        };
+        let added = AddedVersion {
+            version_id,
+            epoch: self.marker_epoch,
+            generation: head.generation,
+            entry: VersionEntry {
+                marker: true,
+                size: 0,
+                referenced: false,
+            },
+        };
+        version_written(self.binding.as_ref(), &self.input.key, added, true)
     }
 
     fn handle_usage_update(&mut self, event: Event) -> Effects {
@@ -1085,7 +1118,10 @@ impl DeleteObjectOperation {
         existing: Option<&CurrentVersionPointer>,
     ) -> Effects {
         match CurrentVersionPointer::next_for(existing, version_id) {
-            Ok(pointer) => self.pending_new_pointer = Some(pointer),
+            Ok(pointer) => {
+                self.marker_head = Some(pointer.clone());
+                self.pending_new_pointer = Some(pointer);
+            }
             Err(err) => return self.emit_error(err.into()),
         }
         self.prepare_head_transition(HeadTransitionContinuation::WriteDeletedVersion)
@@ -1101,6 +1137,7 @@ impl DeleteObjectOperation {
             .to_owned();
         let mut version = BlobVersion::deleted(created_at, self.input.deleted_by);
         version.metadata = self.metadata.clone();
+        self.marker_epoch = version.original_epoch;
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,

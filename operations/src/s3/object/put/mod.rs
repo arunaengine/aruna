@@ -11,6 +11,7 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
+use crate::distribution::inventory::{AddedVersion, version_written};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
@@ -47,8 +48,9 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ManagedCopyKey, VersionKey,
     WriteOwner,
 };
-use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::inventory::VersionEntry;
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
@@ -340,6 +342,11 @@ pub struct PutObjectOperation {
     row_fence: Option<RowFence>,
     /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
     pub(super) set_hint: Option<SetHint>,
+    /// The bucket's distribution binding, whose inventory the version transaction maintains.
+    binding: Option<DistributionBinding>,
+    /// The head this write installs and the epoch of its version, for the inventory.
+    head_pointer: Option<CurrentVersionPointer>,
+    version_epoch: OriginalEpoch,
 }
 
 impl PutObjectOperation {
@@ -400,6 +407,9 @@ impl PutObjectOperation {
             replayed: false,
             row_fence: None,
             set_hint: None,
+            binding: None,
+            head_pointer: None,
+            version_epoch: OriginalEpoch::default(),
         }
     }
 
@@ -655,10 +665,10 @@ impl PutObjectOperation {
             GatedBucket::observe(bucket.as_ref())
                 .stored_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
-        self.set_hint = bucket
+        self.binding = bucket
             .as_ref()
-            .and_then(|bucket| bucket.distribution.as_ref())
-            .map(DistributionBinding::hint);
+            .and_then(|bucket| bucket.distribution.clone());
+        self.set_hint = self.binding.as_ref().map(DistributionBinding::hint);
         // A planned id is minted before the write; inside a set it must already carry the hint.
         if let (Some(hint), Some(id)) = (self.set_hint, self.config.preassigned_version_id)
             && SetHint::of_version(id) != hint
@@ -1248,6 +1258,7 @@ impl PutObjectOperation {
             Ok(pointer) => pointer,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
+        self.head_pointer = Some(pointer.clone());
         let effect = match write_head_effect(&self.alias_context(), pointer, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -1402,6 +1413,7 @@ impl PutObjectOperation {
                 version_id,
             );
             self.stored_policies = version.placement_policies.clone();
+            self.version_epoch = version.original_epoch;
             let effect = match write_version_effect(&version_key, &version, self.txn_id) {
                 Ok(effect) => effect,
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -1550,9 +1562,24 @@ impl PutObjectOperation {
         let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
             return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
         };
+        let added = self.version_id.map(|version_id| AddedVersion {
+            version_id,
+            epoch: self.version_epoch,
+            generation: self.head_pointer.as_ref().map_or(0, |head| head.generation),
+            entry: VersionEntry {
+                marker: false,
+                size: location.blob_size,
+                referenced: false,
+            },
+        });
+        let head = self.head_pointer.is_some();
+        let key = &self.config.request.key;
+        let inventory =
+            added.and_then(|added| version_written(self.binding.as_ref(), key, added, head));
         self.usage_update = Some(
             UsageCounterUpdate::with_stored(self.config.group_id, group_delta, stored)
-                .in_bucket(&self.config.request.bucket, RowChange::AddedVersion),
+                .in_bucket(&self.config.request.bucket, RowChange::AddedVersion)
+                .with_inventory(inventory),
         );
 
         // Enforce the hard quota before counters commit; only a
