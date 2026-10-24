@@ -370,12 +370,9 @@ async fn uploads_count_once() {
     assert_eq!(counters(&handle, active(1)).await.open_uploads, 0);
 }
 
-/// A full sample takes a new key only in place of its largest entry, so its size stays.
-#[tokio::test]
-async fn full_sample_evicts() {
-    let (_dir, handle) = open();
-    single_range(&handle).await;
-    let txn_id = begin(&handle).await;
+/// Marks the sample of range 1 full and stores its largest entry with `priority`.
+async fn fill_sample(handle: &StorageHandle, priority: u64) -> Vec<u8> {
+    let txn_id = begin(handle).await;
     let full = RangeCounters {
         sampled: i128::from(SAMPLE_SIZE),
         ..RangeCounters::default()
@@ -384,7 +381,7 @@ async fn full_sample_evicts() {
     let event = handle
         .send_storage_effect(StorageEffect::AddCounters {
             key_space: RANGE_COUNTER_KEYSPACE.to_string(),
-            deltas: vec![(count.clone().into(), full)],
+            deltas: vec![(count.into(), full)],
             txn_id,
         })
         .await;
@@ -392,24 +389,64 @@ async fn full_sample_evicts() {
         event,
         Event::Storage(StorageEvent::BatchWriteResult { .. })
     ));
-    assert!(commit(&handle, txn_id).await);
+    assert!(commit(handle, txn_id).await);
     let largest = SampleEntry {
-        priority: u64::MAX,
+        priority,
         key: "largest".to_string(),
     };
     let row = largest.row_key(set(), id(1));
+    write_sample(handle, row.clone(), None).await;
+    row
+}
+
+async fn write_sample(handle: &StorageHandle, row: Vec<u8>, txn_id: Option<TxnId>) {
     let event = handle
         .send_storage_effect(StorageEffect::Write {
             key_space: KEY_SAMPLE_KEYSPACE.to_string(),
-            key: row.clone().into(),
+            key: row.into(),
             value: Vec::new().into(),
-            txn_id: None,
+            txn_id,
         })
         .await;
     assert!(matches!(
         event,
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
+}
+
+/// A key that cannot enter a full sample never reads its largest entry in the transaction,
+/// so a concurrent sample change does not conflict with the write.
+#[tokio::test]
+async fn full_sample_no_conflict() {
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    fill_sample(&handle, 0).await;
+    let writer = begin(&handle).await;
+    stage(&handle, writer, &mut put("a", 1, 1, 1))
+        .await
+        .unwrap();
+    let other = begin(&handle).await;
+    let smaller = SampleEntry {
+        priority: 0,
+        key: "another".to_string(),
+    };
+    write_sample(&handle, smaller.row_key(set(), id(1)), Some(other)).await;
+    assert!(commit(&handle, other).await);
+    assert!(
+        commit(&handle, writer).await,
+        "the writer read no sample row"
+    );
+    let taken = SampleEntry::of_key("a").row_key(set(), id(1));
+    assert!(get(&handle, KEY_SAMPLE_KEYSPACE, taken).await.is_none());
+}
+
+/// A full sample takes a new key only in place of its largest entry, so its size stays.
+#[tokio::test]
+async fn full_sample_evicts() {
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    let count = sample_count_key(set(), id(1));
+    let row = fill_sample(&handle, u64::MAX).await;
 
     assert!(apply(&handle, put("a", 1, 1, 1)).await.unwrap());
     let taken = SampleEntry::of_key("a").row_key(set(), id(1));

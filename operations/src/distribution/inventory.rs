@@ -93,6 +93,7 @@ enum Phase {
     Locate,
     Read { range_id: Ulid },
     SampleCount { range_id: Ulid },
+    SampleProbe { range_id: Ulid },
     SampleLast { range_id: Ulid },
     Write,
     Delete,
@@ -201,12 +202,25 @@ impl InventoryUpdate {
                     self.admit(range_id, None)?;
                     return Ok(self.next_effect(txn_id));
                 }
+                // A full sample is probed outside the transaction first, so keys that cannot
+                // enter never conflict on its largest entry.
+                self.phase = Phase::SampleProbe { range_id };
+                Ok(Some(smallvec![self.read_largest(range_id, None)]))
+            }
+            (
+                Phase::SampleProbe { range_id },
+                Event::Storage(StorageEvent::IterResult { values, .. }),
+            ) => {
+                let range_id = *range_id;
+                let last = values.first().and_then(|(key, _)| SampleEntry::decode(key));
+                let enters = (self.candidate.as_ref())
+                    .is_some_and(|entry| last.as_ref().is_none_or(|last| ranks_below(entry, last)));
+                if !enters {
+                    self.candidate = None;
+                    return Ok(self.next_effect(txn_id));
+                }
                 self.phase = Phase::SampleLast { range_id };
-                Ok(Some(smallvec![Effect::Storage(StorageEffect::Last {
-                    key_space: KEY_SAMPLE_KEYSPACE.to_string(),
-                    prefix: Some(sample_prefix(self.change.set_id, range_id).into()),
-                    txn_id: Some(txn_id),
-                })]))
+                Ok(Some(smallvec![self.read_largest(range_id, Some(txn_id))]))
             }
             (
                 Phase::SampleLast { range_id },
@@ -316,7 +330,7 @@ impl InventoryUpdate {
         contributions: &mut Vec<(Walk, Vec<u8>, RangeCounters)>,
     ) -> Result<(), InventoryError> {
         let set_id = self.change.set_id;
-        for mut added in self.change.added.clone() {
+        for added in self.change.added.clone() {
             let mut position = version_position(
                 set_id,
                 &self.change.key,
@@ -429,15 +443,23 @@ impl InventoryUpdate {
         }
     }
 
+    /// The sample's largest entry, read in the transaction only to validate an admission.
+    fn read_largest(&self, range_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+        Effect::Storage(StorageEffect::Last {
+            key_space: KEY_SAMPLE_KEYSPACE.to_string(),
+            prefix: Some(sample_prefix(self.change.set_id, range_id).into()),
+            txn_id,
+        })
+    }
+
     /// Takes the candidate into a sample below its size, or in place of a larger `last`.
     fn admit(&mut self, range_id: Ulid, last: Option<SampleEntry>) -> Result<(), InventoryError> {
         let Some(entry) = self.candidate.take() else {
             return Ok(());
         };
         let set_id = self.change.set_id;
-        let rank = |entry: &SampleEntry| (entry.priority, entry.key.clone());
         match last {
-            Some(last) if rank(&entry) >= rank(&last) => return Ok(()),
+            Some(last) if !ranks_below(&entry, &last) => return Ok(()),
             Some(last) => {
                 let evicted = last.row_key(set_id, range_id);
                 self.deletes
@@ -491,6 +513,11 @@ impl InventoryUpdate {
         self.phase = Phase::Done;
         None
     }
+}
+
+/// Whether `entry` sorts before `other` in the sample order (priority, then key).
+fn ranks_below(entry: &SampleEntry, other: &SampleEntry) -> bool {
+    (entry.priority, entry.key.as_str()) < (other.priority, other.key.as_str())
 }
 
 /// Routes each contribution to the rows the account names: the active or pending row, and
