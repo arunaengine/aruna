@@ -402,7 +402,14 @@ async fn unbinds_folder() {
     .await
     .unwrap();
     assert_eq!(unbound.folder_id, id.to_string());
-    assert_eq!(unbound.removed, 0);
+    let Json(deleting) = get_synced_folder(
+        State(fixture.state.clone()),
+        Extension(Some(owner_auth(&fixture))),
+        Path(id.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(deleting.state, FolderStateName::Deleting);
 }
 
 #[tokio::test]

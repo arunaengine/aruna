@@ -26,7 +26,7 @@ use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
 use aruna_operations::device::sync::folders::{
     BindFolderInput, FolderError, RealmBucketInput, bind_folder, create_realm_bucket, list_entries,
-    list_folders, list_transfers, read_bound, unbind_folder,
+    list_folders, list_transfers, read_bound, set_folder_state, unbind_folder,
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
@@ -721,14 +721,8 @@ async fn skips_unbound_folder() -> TestResult<()> {
     std::fs::write(root.path().join("note.txt"), b"from the device")?;
     let listed = bind(&realm, root.path(), group_id).await?;
 
-    unbind_folder(
-        &device.context,
-        listed.folder_id,
-        realm.realm_id,
-        device.node_id(),
-        realm.user_id,
-    )
-    .await?;
+    unbind_folder(&manual_context(&device.context), listed.folder_id).await?;
+    reconcile_folders(&manual_context(&device.context)).await;
     let plan = reconcile_folder(&device.context, &listed).await?;
     assert_eq!(plan.uploads, 0);
     let offers = list_offers(&device.context).await?;
@@ -738,6 +732,43 @@ async fn skips_unbound_folder() -> TestResult<()> {
             .all(|offer| offer.bucket != listed.local_bucket)
     );
     let (entries, _) = list_entries(&device.context, listed.folder_id, None, None).await?;
+    assert!(entries.is_empty());
+    Ok(())
+}
+
+/// An unbind cut short after it marked the folder, by a cancelled call or a restart, is finished
+/// by the folder pass instead of staying `deleting`.
+#[tokio::test]
+async fn finishes_cancelled_unbind() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    create_bucket(&server.context, group_id, realm.user_id).await?;
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("note.txt"), b"from the device")?;
+    let folder = bind(&realm, root.path(), group_id).await?;
+    reconcile_folder(&device.context, &folder).await?;
+    assert!(
+        list_offers(&device.context)
+            .await?
+            .iter()
+            .any(|offer| offer.bucket == folder.local_bucket)
+    );
+
+    set_folder_state(&device.context, folder.folder_id, FolderState::Deleting).await?;
+    reconcile_folders(&manual_context(&device.context)).await;
+    assert_eq!(
+        read_bound(&device.context, folder.folder_id).await,
+        Err(FolderError::NotFound)
+    );
+    let offers = list_offers(&device.context).await?;
+    assert!(
+        offers
+            .iter()
+            .all(|offer| offer.bucket != folder.local_bucket)
+    );
+    let (entries, _) = list_entries(&device.context, folder.folder_id, None, None).await?;
     assert!(entries.is_empty());
     Ok(())
 }

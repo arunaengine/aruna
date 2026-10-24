@@ -84,8 +84,6 @@ pub struct BindFolderRequest {
 #[derive(Debug, serde::Serialize, Deserialize, ToSchema)]
 pub struct UnboundFolder {
     pub folder_id: String,
-    /// Objects the device tombstoned in its own observation bucket.
-    pub removed: usize,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -593,6 +591,9 @@ async fn update_synced_folder(
 for. Nothing outside this device is decided here, so the owner binding is the whole authority.
 
 **Behavior**
+- The answer comes at once: the folder turns `deleting` and the folder pass, started right away,
+  removes it after any pass still running on it. A removal cut short, also by a restart, resumes in
+  the next pass.
 - The binding, its merge bases, its queued uploads and its audit log are removed from this device.
 - The device's own observation bucket is emptied with delete markers; the realm objects the folder
   published stay.
@@ -600,8 +601,8 @@ for. Nothing outside this device is decided here, so the owner binding is the wh
   exactly as they are."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
-        (status = 200, description = "The folder is unbound", body = UnboundFolder,
-            example = json!({"folder_id": "01JFOLDER0123456789ABCDEFG", "removed": 128})),
+        (status = 200, description = "The folder is marked `deleting` and is removed in the background", body = UnboundFolder,
+            example = json!({"folder_id": "01JFOLDER0123456789ABCDEFG"})),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
@@ -615,25 +616,13 @@ async fn unbind_synced_folder(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<UnboundFolder>> {
-    let auth = require_owner(&state, auth).await?;
+    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
-    let context = state.get_ctx();
-    // An unknown folder answers 404 before anything is torn down.
-    read_bound(&context, folder_id)
+    unbind_folder(&state.get_ctx(), folder_id)
         .await
         .map_err(map_folder_error)?;
-    let removed = unbind_folder(
-        &context,
-        folder_id,
-        state.get_realm_id(),
-        state.get_node_id(),
-        auth.user_id,
-    )
-    .await
-    .map_err(map_folder_error)?;
     Ok(Json(UnboundFolder {
         folder_id: folder_id.to_string(),
-        removed,
     }))
 }
 

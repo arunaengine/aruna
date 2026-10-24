@@ -488,29 +488,39 @@ pub async fn read_bound(
         .ok_or(FolderError::NotFound)
 }
 
-/// Stops syncing one folder; the owner's filesystem is untouched.
-///
-/// Marked `Deleting` first and removed last, so a crash mid-way leaves work the next call resumes.
+/// Stops syncing one folder; the owner's filesystem is untouched. The folder is marked
+/// `Deleting` and the folder pass, woken here, removes it, also after a cancelled call or a restart.
 pub async fn unbind_folder(
     context: &Arc<DriverContext>,
     folder_id: Ulid,
-    realm_id: RealmId,
-    node_id: NodeId,
-    user_id: UserId,
-) -> Result<usize, FolderError> {
+) -> Result<(), FolderError> {
     let folder = read_bound(context, folder_id).await?;
     if folder.state != FolderState::Deleting {
         store_folder(
             context,
             &SyncedFolder {
                 state: FolderState::Deleting,
-                ..folder.clone()
+                ..folder
             },
         )
         .await?;
     }
-    // A pass already in flight finishes first; a pass that starts later skips the folder.
+    crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
+    Ok(())
+}
+
+/// Removes a `Deleting` folder under its lock, after any pass in flight. The row goes last, so an
+/// interrupted cleanup resumes in the next pass. Answers the observations it tombstoned.
+pub(crate) async fn finish_unbind(
+    context: &Arc<DriverContext>,
+    folder_id: Ulid,
+    node_id: NodeId,
+) -> Result<usize, FolderError> {
     let _pass = super::folder_lock(folder_id).await;
+    let folder = read_bound(context, folder_id).await?;
+    if folder.state != FolderState::Deleting {
+        return Ok(0);
+    }
     for key_space in [SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNC_LOG_KEYSPACE] {
         clear_rows(context, key_space, folder_id).await?;
     }
@@ -518,9 +528,9 @@ pub async fn unbind_folder(
         context,
         WithdrawOfferInput {
             bucket: folder.local_bucket,
-            realm_id,
+            realm_id: folder.created_by.realm_id,
             node_id,
-            user_id,
+            user_id: folder.created_by,
         },
     )
     .await
@@ -894,15 +904,9 @@ mod tests {
             .expect("base encodes");
         assert!(super::super::repository::write_rows(&context, vec![row], None).await);
 
-        let removed = unbind_folder(
-            &context,
-            folder.folder_id,
-            realm(),
-            node(),
-            folder.created_by,
-        )
-        .await
-        .expect("a resumed unbind finishes");
+        let removed = finish_unbind(&context, folder.folder_id, node())
+            .await
+            .expect("a resumed unbind finishes");
 
         assert_eq!(removed, 0);
         assert_eq!(
@@ -1000,8 +1004,8 @@ mod tests {
         );
     }
 
-    // An unbind waits for the pass in flight on its folder, so rows that pass still writes are
-    // cleared too instead of outliving the folder.
+    // The removal of an unbound folder waits for the pass in flight on it, so rows that pass still
+    // writes are cleared too instead of outliving the folder.
     #[tokio::test]
     async fn unbind_awaits_pass() {
         let (_dir, context) = context().await;
@@ -1009,22 +1013,15 @@ mod tests {
         let folder = bound_folder(FolderState::Active);
         store_folder(&context, &folder).await.expect("row stored");
 
+        unbind_folder(&context, folder.folder_id)
+            .await
+            .expect("the folder is marked");
         let pass = super::super::folder_lock(folder.folder_id).await;
         let unbind = tokio::spawn({
             let context = context.clone();
-            let (folder_id, user_id) = (folder.folder_id, folder.created_by);
-            async move { unbind_folder(&context, folder_id, realm(), node(), user_id).await }
+            let folder_id = folder.folder_id;
+            async move { finish_unbind(&context, folder_id, node()).await }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(300), async {
-            while !read_bound(&context, folder.folder_id)
-                .await
-                .is_ok_and(|current| current.state == FolderState::Deleting)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the unbind marks the folder before it waits");
         let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())
             .expect("base encodes");
         assert!(super::super::repository::write_rows(&context, vec![row], None).await);

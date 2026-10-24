@@ -90,14 +90,21 @@ impl ReconcileFolderError {
 
 /// Reconciles every active folder once.
 pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
-    if context.net_handle.is_none() {
+    let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
         return DrainOutcome::Deferred;
-    }
+    };
     let Ok(folders) = list_folders(context).await else {
         return DrainOutcome::Deferred;
     };
     let mut work = false;
     for folder in folders {
+        // An unbind finishes here, also after a cancelled call or a restart.
+        if folder.state == FolderState::Deleting {
+            if let Err(error) = folders::finish_unbind(context, folder.folder_id, node_id).await {
+                warn!(folder = %folder.folder_id, reason = %error, "Could not finish the unbind");
+            }
+            continue;
+        }
         // A bind cut short by a lost reply, a failed write or a restart finishes here.
         if matches!(folder.state, FolderState::Binding { .. }) {
             let folder_id = folder.folder_id;
