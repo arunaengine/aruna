@@ -1,8 +1,6 @@
-//! Resolves a distributed bucket's global version id on any realm node, member or not. The
-//! hint in the id names candidate sets among the records this node holds; the key comes from
-//! a local member's version id index or from one probe per set (a member with `all` coverage)
-//! or per range. Budgets are bounded, and an exhausted budget or a silent range is "not
-//! resolvable now", never absence.
+//! Resolves a distributed bucket's global version id on any realm node: candidate sets by hint,
+//! the key from a local version id index or one probe per set or range. Budgets are bounded;
+//! an exhausted budget or a silent range is "not resolvable now", never absence.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

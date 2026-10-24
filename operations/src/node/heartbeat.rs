@@ -48,8 +48,9 @@ pub fn fresh_heartbeats(net_handle: Option<&NetHandle>) -> BTreeMap<NodeId, Held
     held
 }
 
-/// Takes the load, download slots and executor availability of each document from the node's fresh heartbeat
-/// when that names the document's advertisement, and clears them otherwise: unknown ranks worst.
+/// Takes the load, download slots and executor availability of each document from the node's
+/// fresh heartbeat when that names the document's advertisement, and clears them otherwise:
+/// unknown ranks worst.
 pub fn live_telemetry(
     fresh: &BTreeMap<NodeId, HeldHeartbeat>,
     documents: &mut BTreeMap<NodeId, NodeInfoDocument>,
