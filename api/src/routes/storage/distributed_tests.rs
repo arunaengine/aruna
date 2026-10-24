@@ -132,3 +132,20 @@ fn guard_refusals_map() {
         ServerError::Conflict(_)
     ));
 }
+
+#[test]
+fn partial_creation_names_set() {
+    let report = CreationReport {
+        set_id: Ulid::from_bytes([1; 16]),
+        active: false,
+        members: Vec::new(),
+        error: Some("configuration changes unavailable: publisher node x is unreachable".into()),
+    };
+    let response = admission_response(report);
+    assert_eq!(response.set_id, Ulid::from_bytes([1; 16]).to_string());
+    assert!(
+        response
+            .error
+            .is_some_and(|error| error.contains("unavailable"))
+    );
+}

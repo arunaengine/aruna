@@ -129,6 +129,9 @@ pub struct AdmissionResponse {
     /// Every coordinator and replica is admitted and the bucket serves.
     pub active: bool,
     pub members: Vec<MemberOutcomeResponse>,
+    /// Why admission or activation stopped; the set exists and the admission can be retried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -270,6 +273,7 @@ fn admission_response(report: CreationReport) -> AdmissionResponse {
                 error: member.error,
             })
             .collect(),
+        error: report.error,
     }
 }
 
@@ -438,6 +442,8 @@ fn admission_example() -> serde_json::Value {
 - When every coordinator and replica is admitted, the set becomes active and serves. Writes go
   to the coordinator of the key's range; other members forward them.
 - A member that fails keeps the set pending. Its error is listed; retry the admission later.
+- Once the set is recorded, the answer is 201 with its `set_id` even when admission or
+  activation stopped; `error` then says why.
   Admitted members and their buckets are kept, nothing is deleted.
 - An existing bucket of the name on a member node fails that member, unless it is this
   member's own bucket from an earlier attempt.

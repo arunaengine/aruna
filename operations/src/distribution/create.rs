@@ -84,6 +84,8 @@ pub struct CreationReport {
     pub set_id: Ulid,
     pub active: bool,
     pub members: Vec<MemberOutcome>,
+    /// Why admission or activation stopped after the set was committed; it can be retried.
+    pub error: Option<String>,
 }
 
 /// Plans the members and ranges of a new set; every member gets a fresh id.
@@ -158,7 +160,16 @@ pub async fn create_set(
         Some(auth.clone()),
     )
     .await?;
-    admit_pending(context, auth, bearer, set_id).await
+    // The set exists from here on, so every later failure still names it.
+    match admit_pending(context, auth, bearer, set_id).await {
+        Ok(report) => Ok(report),
+        Err(error) => Ok(CreationReport {
+            set_id,
+            active: false,
+            members: Vec::new(),
+            error: Some(error.to_string()),
+        }),
+    }
 }
 
 /// Admits every member the record has not admitted yet and activates the set once every
@@ -221,14 +232,18 @@ pub async fn admit_pending(
         .iter()
         .flat_map(|range| std::iter::once(&range.coordinator).chain(&range.replicas));
     let mut active = snapshot.phase == SetPhase::Active;
+    let mut error = None;
     if !active && required.into_iter().all(|member| admitted.contains(member)) {
-        activate(context, (publisher, local), set_id, auth, bearer).await?;
-        active = true;
+        match activate(context, (publisher, local), set_id, auth, bearer).await {
+            Ok(()) => active = true,
+            Err(refusal) => error = Some(refusal.to_string()),
+        }
     }
     Ok(CreationReport {
         set_id,
         active,
         members,
+        error,
     })
 }
 
