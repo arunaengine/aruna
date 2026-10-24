@@ -10,7 +10,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionView, OriginalEpoch, RouteError, WriteRoute,
+    DistributionBinding, DistributionView, OriginalEpoch, ReadRoute, RouteError, WriteRoute,
 };
 use thiserror::Error;
 use ulid::Ulid;
@@ -72,6 +72,56 @@ pub fn write_target(
         return Err(GuardError::Unbound(set_id));
     }
     Ok(snapshot.write_route(binding.member_id, key)?)
+}
+
+/// Where a read of `key`, or with `listing` of every key under it, is answered.
+pub fn read_target(
+    binding: &DistributionBinding,
+    key: &str,
+    listing: bool,
+    record: Option<&[u8]>,
+) -> Result<ReadRoute, GuardError> {
+    let set_id = binding.set_id;
+    let view = record
+        .map(DistributionView::from_bytes)
+        .transpose()?
+        .ok_or(GuardError::RecordMissing(set_id))?;
+    let snapshot = view.snapshot();
+    let member = snapshot
+        .member(binding.member_id)
+        .ok_or(RouteError::NotMember(set_id))?;
+    if member
+        .incarnation
+        .is_some_and(|admitted| admitted != binding.incarnation)
+    {
+        return Err(GuardError::Unbound(set_id));
+    }
+    Ok(snapshot.read_route(binding.member_id, key, listing)?)
+}
+
+/// Where a read of a bound bucket is answered, from this node's record.
+pub async fn route_read(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+    listing: bool,
+) -> Result<ReadRoute, GuardError> {
+    let read = StorageEffect::Read {
+        key_space: DISTRIBUTION_KEYSPACE.to_string(),
+        key: binding.set_id.to_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            read_target(binding, key, listing, value.as_deref())
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(GuardError::Unreadable(error.to_string()))
+        }
+        other => Err(GuardError::Unreadable(format!(
+            "unexpected answer {other:?}"
+        ))),
+    }
 }
 
 /// The epoch this member's write to `key` carries, or why it may not write here.

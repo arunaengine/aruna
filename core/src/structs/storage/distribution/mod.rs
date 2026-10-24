@@ -27,7 +27,7 @@ pub mod validate;
 pub use delivery::{AdmissionError, Delivery, Publication};
 pub use hint::{HintIndex, SetHint};
 pub use request::{DistributionRequest, TransferRole, next_snapshot};
-pub use route::{RouteError, WriteRoute};
+pub use route::{ReadRoute, RouteError, WriteRoute};
 pub use snapshot::{DistributionSnapshot, DistributionView, SignedSnapshot};
 pub use statement::{SetRoot, SignedStatement, Statement, StatementClaim, StatementKind};
 pub use validate::DistributionError;

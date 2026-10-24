@@ -9,12 +9,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
-use aruna_core::structs::storage::distribution::WriteRoute;
 use aruna_core::structs::storage::distribution::delegation::{
     DELEGATION_HEADER, Payload, TRAILER_BYTES, body_digest, request_digest,
 };
+use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
 use aruna_operations::distribution::delegate::{DelegationInput, issue_delegation, node_urls};
-use aruna_operations::distribution::guard::route_write;
+use aruna_operations::distribution::guard::{route_read, route_write};
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use bytes::Bytes;
 use http::{HeaderMap, Method};
@@ -224,6 +224,35 @@ fn unix_secs(time: SystemTime) -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// A catching-up member's view is incomplete: a listing or a miss proves nothing yet.
+fn catching_up_error(set_id: Ulid) -> S3Error {
+    let mut error = S3Error::with_message(
+        S3ErrorCode::Custom("DistributedBucketCatchingUp".into()),
+        format!(
+            "This member of distributed bucket {set_id} is still catching up; its view is \
+             incomplete until then. Retry later or read from a ready member."
+        ),
+    );
+    error.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
+    error
+}
+
+/// A miss of a catching-up member becomes the catch-up hint instead of a missing key.
+pub(super) fn catch_up_miss(
+    error: S3Error,
+    catching_up: bool,
+    bucket: Option<&BucketInfo>,
+) -> S3Error {
+    let missing = matches!(
+        error.code(),
+        S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion
+    );
+    match bucket.and_then(|bucket| bucket.distribution.as_ref()) {
+        Some(binding) if catching_up && missing => catching_up_error(binding.set_id),
+        _ => error,
+    }
+}
+
 fn unreachable_error(forward: &Forward) -> S3Error {
     let mut error = S3Error::with_message(
         S3ErrorCode::Custom("CoordinatorUnreachable".into()),
@@ -306,6 +335,39 @@ impl ArunaS3Service {
                 range_id,
                 node_id,
             })),
+            Err(error) => Err(guard_error(&error)),
+        }
+    }
+
+    /// Whether this member answers a read of `key`, or with `listing` of every key under it,
+    /// from its own view; `true` while it still catches up. A range it keeps no records of is
+    /// refused with its coordinator named, since reads through holders come later.
+    pub(super) async fn read_scope(
+        &self,
+        bucket: Option<&BucketInfo>,
+        key: &str,
+        listing: bool,
+    ) -> S3Result<bool> {
+        let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
+            return Ok(false);
+        };
+        match route_read(self.state.as_ref(), binding, key, listing).await {
+            Ok(ReadRoute::Local { catching_up }) if listing && catching_up => {
+                Err(catching_up_error(binding.set_id))
+            }
+            Ok(ReadRoute::Local { catching_up }) => Ok(catching_up),
+            Ok(ReadRoute::Holder { range_id, node_id }) => {
+                let mut error = S3Error::with_message(
+                    S3ErrorCode::Custom("RangeNotHeld".into()),
+                    format!(
+                        "This member of distributed bucket {} keeps no records of range {range_id}; \
+                         node {node_id} coordinates it and serves the read.",
+                        binding.set_id
+                    ),
+                );
+                error.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
+                Err(error)
+            }
             Err(error) => Err(guard_error(&error)),
         }
     }

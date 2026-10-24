@@ -48,3 +48,25 @@ fn replaced_bucket_refused() {
         Err(GuardError::Route(RouteError::NotMember(snapshot.set_id())))
     );
 }
+
+#[test]
+fn reads_stay_in_held_ranges() {
+    let (snapshot, bytes) = record(true);
+    let own = binding(&snapshot, 1, 5);
+    assert_eq!(
+        read_target(&own, "a", false, Some(&bytes)),
+        Ok(ReadRoute::Local { catching_up: false })
+    );
+    assert_eq!(
+        read_target(&own, "x", false, Some(&bytes)),
+        Ok(ReadRoute::Holder {
+            range_id: snapshot.config.ranges[1].range_id,
+            node_id: secret(2).public(),
+        })
+    );
+    let replaced = binding(&snapshot, 1, 6);
+    assert_eq!(
+        read_target(&replaced, "a", false, Some(&bytes)),
+        Err(GuardError::Unbound(snapshot.set_id()))
+    );
+}

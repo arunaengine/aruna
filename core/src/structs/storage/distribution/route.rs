@@ -6,7 +6,10 @@
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{DistributionSnapshot, KeyRange, MetadataCoverage, OriginalEpoch};
+use super::{
+    DistributionMember, DistributionSnapshot, KeyRange, MemberState, MetadataCoverage,
+    OriginalEpoch,
+};
 use crate::NodeId;
 
 /// Where one write goes.
@@ -40,7 +43,72 @@ pub enum RouteError {
     NoRange(Ulid),
 }
 
+/// Where a read is answered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReadRoute {
+    /// This member keeps the records; while it catches up, a miss proves nothing.
+    Local { catching_up: bool },
+    /// This member keeps no records of the range; its coordinator does.
+    Holder { range_id: Ulid, node_id: NodeId },
+}
+
+/// Whether `member` keeps the records of `range`.
+fn keeps_records(range: &KeyRange, member: &DistributionMember) -> bool {
+    member.coverage == MetadataCoverage::All
+        || range.coordinator == member.member_id
+        || range.replicas.contains(&member.member_id)
+}
+
+/// Whether some key starting with `prefix` lies in `range`.
+fn reaches(range: &KeyRange, prefix: &str) -> bool {
+    let below_upper = range.upper.as_deref().is_none_or(|upper| prefix < upper);
+    below_upper && (range.lower.as_str() <= prefix || range.lower.starts_with(prefix))
+}
+
 impl DistributionSnapshot {
+    /// Routes a read of `key`, or with `listing` of every key starting with it, arriving at
+    /// `member_id`: local when this member keeps the records of every range the read reaches.
+    pub fn read_route(
+        &self,
+        member_id: Ulid,
+        key: &str,
+        listing: bool,
+    ) -> Result<ReadRoute, RouteError> {
+        let set_id = self.set_id();
+        let member = self
+            .member(member_id)
+            .ok_or(RouteError::NotMember(set_id))?;
+        let reached: Vec<&KeyRange> = match listing {
+            true => self
+                .config
+                .ranges
+                .iter()
+                .filter(|range| reaches(range, key))
+                .collect(),
+            false => self.range_for(key).into_iter().collect(),
+        };
+        if reached.is_empty() {
+            return Err(RouteError::NoRange(set_id));
+        }
+        match reached
+            .into_iter()
+            .find(|range| !keeps_records(range, member))
+        {
+            None => Ok(ReadRoute::Local {
+                catching_up: member.state == MemberState::CatchingUp,
+            }),
+            Some(range) => {
+                let coordinator = self
+                    .member(range.coordinator)
+                    .ok_or(RouteError::NoRange(set_id))?;
+                Ok(ReadRoute::Holder {
+                    range_id: range.range_id,
+                    node_id: coordinator.node_id,
+                })
+            }
+        }
+    }
+
     /// Routes a write to `key` arriving at `member_id`. Only the coordinator writes, and only
     /// while the set serves and no fence covers the range.
     pub fn write_route(&self, member_id: Ulid, key: &str) -> Result<WriteRoute, RouteError> {
@@ -206,6 +274,42 @@ mod tests {
         assert_eq!(
             head.write_route(member(2), "x"),
             Err(RouteError::Deleting(head.set_id()))
+        );
+    }
+
+    #[test]
+    fn reads_held_ranges() {
+        use super::ReadRoute;
+        let head = active();
+        let upper = &head.config.ranges[1];
+        assert_eq!(
+            head.read_route(member(1), "a/b", false),
+            Ok(ReadRoute::Local { catching_up: false })
+        );
+        assert_eq!(
+            head.read_route(member(1), "x", false),
+            Ok(ReadRoute::Holder {
+                range_id: upper.range_id,
+                node_id: secret(2).public(),
+            })
+        );
+        assert_eq!(
+            head.read_route(member(1), "a", true),
+            Ok(ReadRoute::Local { catching_up: false }),
+            "every key under a/ is below m"
+        );
+        assert!(matches!(
+            head.read_route(member(1), "", true),
+            Ok(ReadRoute::Holder { .. })
+        ));
+        assert!(matches!(
+            head.read_route(member(2), "m", true),
+            Ok(ReadRoute::Local { .. })
+        ));
+        let lower = head.read_route(member(2), "l", true);
+        assert!(
+            matches!(lower, Ok(ReadRoute::Holder { .. })),
+            "keys under l stay below m"
         );
     }
 

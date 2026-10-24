@@ -647,6 +647,8 @@ impl S3 for ArunaS3Service {
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
         let start_after = req.input.start_after.clone();
+        let listed = prefix.as_deref().unwrap_or_default();
+        self.read_scope(bucket_info.as_ref(), listed, true).await?;
 
         let group_id = bucket_info
             .as_ref()
@@ -754,6 +756,8 @@ impl S3 for ArunaS3Service {
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
         let marker = req.input.marker.clone();
+        let listed = prefix.as_deref().unwrap_or_default();
+        self.read_scope(bucket_info.as_ref(), listed, true).await?;
 
         let group_id = bucket_info
             .as_ref()
@@ -1716,6 +1720,7 @@ impl S3 for ArunaS3Service {
         let key = req.input.key;
         let response_bucket = bucket.clone();
         let response_key = key.clone();
+        let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
 
         let range_request = requested_range.map(object_range_request);
 
@@ -1744,7 +1749,8 @@ impl S3 for ArunaS3Service {
             }
             _ => get_object_token(&self.state, input, restrictions, token).await,
         }
-        .map_err(IntoS3Error::into_s3_error)?;
+        .map_err(IntoS3Error::into_s3_error)
+        .map_err(|error| forward::catch_up_miss(error, catching_up, bucket_info.as_ref()))?;
         self.record_touch(
             &user_access.access_key,
             &response_bucket,
@@ -1948,11 +1954,12 @@ impl S3 for ArunaS3Service {
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        let group_id = req
-            .extensions
-            .get::<BucketInfo>()
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let group_id = bucket_info
+            .as_ref()
             .map(|info| info.group_id)
             .unwrap_or(user_access.group_id);
+        let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
         let operation = HeadObjectOperation::new(HOI {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -1961,7 +1968,8 @@ impl S3 for ArunaS3Service {
 
         let result = drive(operation, &self.state)
             .await
-            .map_err(IntoS3Error::into_s3_error)?;
+            .map_err(IntoS3Error::into_s3_error)
+            .map_err(|error| forward::catch_up_miss(error, catching_up, bucket_info.as_ref()))?;
 
         // A reference answers from its source observation without opening a source read.
         let remote_info = if result.location.is_none() && result.source_metadata.is_none() {
@@ -2170,6 +2178,8 @@ impl S3 for ArunaS3Service {
         let delimiter = req.input.delimiter.clone();
         let key_marker = req.input.key_marker.clone();
         let requested_version_marker = req.input.version_id_marker.clone();
+        let listed = prefix.as_deref().unwrap_or_default();
+        self.read_scope(bucket_info.as_ref(), listed, true).await?;
         let version_id_marker = match requested_version_marker.as_deref() {
             None => None,
             Some(marker) => Some(
