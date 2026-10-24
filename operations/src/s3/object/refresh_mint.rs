@@ -25,6 +25,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::connector_reference_write;
+use crate::distribution::inventory::{AddedVersion, entry_of, version_written};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::replication::protocol::ReferenceAdvance;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
@@ -213,7 +214,16 @@ impl MintSuccessorOperation {
             referenced_bytes: i128::from(self.observation.content_length) - i128::from(released),
             ..Default::default()
         };
-        self.usage = Some(UsageCounterUpdate::for_group(bucket.group_id, delta));
+        let added = AddedVersion {
+            version_id,
+            epoch: successor.original_epoch,
+            generation: next.generation,
+            entry: entry_of(&successor, self.observation.content_length),
+        };
+        let key = &refresh.key;
+        let inventory = version_written(bucket.distribution.as_ref(), key, added, true);
+        let usage = UsageCounterUpdate::for_group(bucket.group_id, delta);
+        self.usage = Some(usage.with_inventory(inventory));
         Ok(Some(writes))
     }
 

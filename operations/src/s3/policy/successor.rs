@@ -9,6 +9,7 @@ use crate::blob::managed_copy::{
 };
 use crate::blob::records::HeadAliasContext;
 use crate::connectors::repository::connector_reference_write;
+use crate::distribution::inventory::{AddedVersion, entry_of, version_written};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
@@ -37,6 +38,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobVersion, BlobVersionState, BucketIdentity, CurrentVersionPointer,
     ManagedCopyKey, ManagedCopyRecord, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -209,6 +211,8 @@ pub struct SuccessorMint {
     outcome: Option<SuccessorOutcome>,
     /// Owner read from the bucket record inside this transaction.
     group_id: Option<GroupId>,
+    /// The bucket's distribution binding, whose inventory the mint maintains.
+    binding: Option<DistributionBinding>,
     /// The successor's counter change, committed with its records.
     usage: Option<UsageCounterUpdate>,
     /// New logical bytes the successor books; only these need the quota gate.
@@ -227,6 +231,7 @@ impl SuccessorMint {
             effective_refs: Vec::new(),
             outcome: None,
             group_id: None,
+            binding: None,
             usage: None,
             quota_bytes: 0,
             quota_gate: None,
@@ -386,6 +391,7 @@ impl SuccessorMint {
             return Err(SuccessorError::BucketChanged);
         }
         self.group_id = Some(bucket.group_id);
+        self.binding = bucket.distribution.clone();
         let admitted = subject.is_some_and(|record| {
             record.subject.generation == self.plan.subject.generation
                 && !record.serving_blocked
@@ -578,12 +584,11 @@ impl SuccessorMint {
             successor.to_bytes()?.into(),
         ));
         // The expected pointer makes this transaction advance exactly one generation.
+        let next = CurrentVersionPointer::next_for(Some(&self.plan.expected_head), version_id)?;
         writes.push((
             BLOB_HEAD_KEYSPACE.to_string(),
             self.plan.context.head_key().to_bytes()?.into(),
-            CurrentVersionPointer::next_for(Some(&self.plan.expected_head), version_id)?
-                .to_bytes()?
-                .into(),
+            next.to_bytes()?.into(),
         ));
         writes.push((
             POLICY_MUTATION_KEYSPACE.to_string(),
@@ -653,12 +658,22 @@ impl SuccessorMint {
             return Err(SuccessorError::BucketChanged);
         };
         let mut delta = successor_usage(&successor, location.as_ref());
+        let size = u64::try_from(delta.logical_bytes + delta.referenced_bytes).unwrap_or_default();
         // An offered directory observation is charged only while it is the head.
         let released = predecessor.offered_size(&self.plan.context.bucket, &self.plan.context.key);
         delta.referenced_bytes -= i128::from(released.unwrap_or(0));
         self.quota_bytes = u64::try_from(delta.logical_bytes).unwrap_or_default();
+        let added = AddedVersion {
+            version_id,
+            epoch: successor.original_epoch,
+            generation: next.generation,
+            entry: entry_of(&successor, size),
+        };
+        let key = &self.plan.context.key;
+        let inventory = version_written(self.binding.as_ref(), key, added, true);
         let usage = UsageCounterUpdate::for_group(group_id, delta);
-        self.usage = Some(usage.in_bucket(&self.plan.context.bucket, RowChange::AddedVersion));
+        let usage = usage.in_bucket(&self.plan.context.bucket, RowChange::AddedVersion);
+        self.usage = Some(usage.with_inventory(inventory));
         self.outcome = Some(SuccessorOutcome::Minted {
             version_id,
             refs: self.effective_refs.clone(),
