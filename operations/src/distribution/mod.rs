@@ -9,6 +9,8 @@ use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 
 use crate::driver::DriverContext;
 
+pub mod publish;
+
 /// Signs a snapshot with this node's key, only when this node is the set's bound publisher.
 pub(crate) fn sign_snapshot(context: &DriverContext, claim: SnapshotClaim) -> SnapshotSignEvent {
     let Some(net_handle) = context.net_handle.as_ref() else {
