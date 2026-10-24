@@ -13,6 +13,7 @@ use crate::types::GroupId;
 pub mod accounting;
 pub mod hint;
 pub mod inventory;
+pub mod parking;
 pub mod presets;
 pub mod request;
 pub mod snapshot;
