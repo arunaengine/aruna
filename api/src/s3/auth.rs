@@ -683,8 +683,11 @@ impl AuthProvider {
             .map_or(0, |elapsed| elapsed.as_secs());
         let delegation = match accept_delegation(&self.driver_ctx, &signed, now).await {
             Ok(delegation) => delegation,
-            Err(DelegateError::Busy) => {
-                return Err(s3_error!(SlowDown, "Reduce your request rate"));
+            Err(DelegateError::Unavailable) => {
+                return Err(s3_error!(
+                    ServiceUnavailable,
+                    "The delegation could not be checked"
+                ));
             }
             Err(error) => return Err(denied(&error.to_string())),
         };

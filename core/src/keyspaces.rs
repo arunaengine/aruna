@@ -74,6 +74,8 @@ pub const RANGE_ACCOUNT_KEYSPACE: &str = "distribution_range_accounts";
 pub const RANGE_COUNTER_KEYSPACE: &str = "distribution_range_counters";
 /// The bounded key sample of each range and its refill cursor.
 pub const KEY_SAMPLE_KEYSPACE: &str = "distribution_key_samples";
+/// Spent delegation nonces by expiry second then nonce, kept until they cannot verify anymore.
+pub const DELEGATION_NONCE_KEYSPACE: &str = "distribution_delegation_nonces";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
@@ -503,6 +505,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     RANGE_ACCOUNT_KEYSPACE,
     RANGE_COUNTER_KEYSPACE,
     KEY_SAMPLE_KEYSPACE,
+    DELEGATION_NONCE_KEYSPACE,
     DOCUMENT_CONFLICT_KEYSPACE,
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,
