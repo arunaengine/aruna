@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -186,7 +188,7 @@ impl VersionEntry {
     }
 }
 
-const IDENTITY_DOMAIN: &[u8] = b"aruna-reference-identity-v1";
+const IDENTITY_DOMAIN: &[u8] = b"aruna-reference-identity-v2";
 
 /// What one version holds, independent of where its bytes are: the BLAKE3 of stored bytes,
 /// or a digest of the observed source object of a reference. Markers and archives whose
@@ -199,13 +201,16 @@ pub fn content_identity(version: &BlobVersion) -> Option<[u8; 32]> {
             cached_metadata,
             ..
         } => {
+            // The source address with its configuration sorted, then the recorded validators.
             let descriptor = &source.descriptor;
+            let config: BTreeMap<_, _> = descriptor.public_config.iter().collect();
             let observed = (
-                &descriptor.kind,
-                &descriptor.source_path,
+                (&descriptor.kind, config, &descriptor.source_path),
                 &descriptor.version_selector,
                 &cached_metadata.etag,
+                cached_metadata.last_modified,
                 cached_metadata.content_length,
+                &cached_metadata.digests,
             );
             let bytes = postcard::to_allocvec(&observed).ok()?;
             let mut hasher = blake3::Hasher::new();
@@ -308,6 +313,57 @@ mod tests {
         let (_, open) = range_interval(set(), "", None);
         let last = version_position(set(), "\u{10FFFF}\0", OriginalEpoch(0), 0, id(255));
         assert!(last < open && open < head_position(Ulid::from_bytes([8; 16]), ""));
+    }
+
+    #[test]
+    fn reference_identity_names_source() {
+        use crate::structs::execution::source_access::SourceMetadata;
+        use crate::structs::execution::source_connector::SourceConnectorKind;
+        use crate::structs::execution::staging::{
+            PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+        };
+        use std::time::SystemTime;
+
+        let reference = |bucket: &str, etag: &str| {
+            let descriptor = PortableSourceDescriptor {
+                kind: SourceConnectorKind::S3,
+                public_config: [("bucket", bucket), ("endpoint", "https://s3.example")]
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+                source_path: "data/a".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            };
+            let source = VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor,
+                connector_id: None,
+            };
+            let observed = SourceMetadata {
+                content_length: 3,
+                content_type: None,
+                etag: Some(etag.to_string()),
+                last_modified: None,
+                source_version: None,
+                digests: Default::default(),
+            };
+            let now = SystemTime::UNIX_EPOCH;
+            let version = BlobVersion::reference(source, observed, now, Default::default(), now);
+            content_identity(&version).unwrap()
+        };
+        assert_eq!(reference("one", "e1"), reference("one", "e1"));
+        assert_ne!(
+            reference("one", "e1"),
+            reference("two", "e1"),
+            "another source bucket"
+        );
+        assert_ne!(
+            reference("one", "e1"),
+            reference("one", "e2"),
+            "another validator"
+        );
     }
 
     #[test]
