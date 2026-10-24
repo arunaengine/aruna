@@ -17,8 +17,9 @@ use aruna_core::structs::{
 };
 use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{GroupId, Key};
+use aruna_core::types::{GroupId, Key, TxnId};
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -82,6 +83,8 @@ pub enum FolderError {
     RemoteUnreachable { node: NodeId, reason: String },
     #[error("the bucket \"{bucket}\" already exists on node {node}")]
     BucketExists { node: NodeId, bucket: String },
+    #[error("the folder is still being bound")]
+    StillBinding,
     #[error(transparent)]
     Offer(#[from] OfferedDirectoryError),
     #[error("a download-only folder never propagates deletions")]
@@ -106,70 +109,19 @@ pub async fn bind_folder(
     context: &Arc<DriverContext>,
     input: BindFolderInput,
 ) -> Result<SyncedFolder, FolderError> {
-    let bound = list_folders(context).await?;
-    if bound.len() >= MAX_SYNCED_FOLDERS {
-        return Err(FolderError::TooManyFolders(MAX_SYNCED_FOLDERS));
-    }
-    if let Some(existing) = bound
-        .iter()
-        .find(|folder| overlaps(&folder.root, &input.root))
-    {
-        return Err(FolderError::RootOverlaps(existing.root.clone()));
-    }
-    let local_bucket = folder_bucket(input.folder_id);
-    if bound
-        .iter()
-        .any(|folder| folder.local_bucket == local_bucket)
-    {
-        return Err(FolderError::BucketBound(local_bucket));
-    }
     check_root(context, &input.root).await?;
     ensure_realm_node(context, input.realm_id, input.remote.node_id).await?;
-    // Detached, so a dropped request cannot stop between creating the bucket and recording it.
-    let context = context.clone();
-    tokio::spawn(async move { record_binding(&context, input, local_bucket).await })
-        .await
-        .map_err(|_| FolderError::Unavailable)?
-}
-
-/// Creates or probes the remote bucket, then records the binding. No remote step follows a
-/// creation, so a bucket this bind created always belongs to a recorded folder.
-async fn record_binding(
-    context: &Arc<DriverContext>,
-    input: BindFolderInput,
-    local_bucket: String,
-) -> Result<SyncedFolder, FolderError> {
-    let auth = AuthContext {
-        user_id: input.user_id,
-        realm_id: input.realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    if input.create_bucket {
-        forward_create(context, auth, &input.remote, input.group_id).await?;
-    } else {
-        request_versions(
-            context,
-            input.remote.node_id,
-            auth,
-            input.remote.bucket.clone(),
-            input.remote.prefix.clone(),
-            None,
-            SyncPageLimit::new(1),
-        )
-        .await
-        .map_err(|error| map_remote_error(error, &input.remote))?;
-    }
-
     let folder = SyncedFolder {
         folder_id: input.folder_id,
         root: input.root,
-        local_bucket,
+        local_bucket: folder_bucket(input.folder_id),
         group_id: input.group_id,
         remote: input.remote,
         mode: input.mode,
         propagate_deletes: input.propagate_deletes,
-        state: FolderState::Active,
+        state: FolderState::Binding {
+            create_bucket: input.create_bucket,
+        },
         created_by: input.user_id,
         created_at_ms: unix_timestamp_millis(),
         last_reconcile_ms: None,
@@ -178,9 +130,159 @@ async fn record_binding(
         observed_files: 0,
         list_cursor: None,
     };
-    store_folder(context, &folder).await?;
-    crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
-    Ok(folder)
+    reserve_binding(context, &folder).await?;
+    // Detached, so a dropped request still records the outcome; a crash leaves it to the next pass.
+    let context = context.clone();
+    tokio::spawn(async move { finish_binding(&context, folder).await })
+        .await
+        .map_err(|_| FolderError::Unavailable)?
+}
+
+/// Admits `folder` and records it in one transaction. Its scan conflicts with any concurrent
+/// reservation, so a retried request cannot bind the same root twice.
+async fn reserve_binding(
+    context: &Arc<DriverContext>,
+    folder: &SyncedFolder,
+) -> Result<(), FolderError> {
+    let txn_id = start_txn(context).await.ok_or(FolderError::Unavailable)?;
+    let admitted = match scan_bound(context, Some(txn_id)).await {
+        Ok(bound) => admit(&bound, folder),
+        Err(error) => Err(error),
+    };
+    let written = match admitted {
+        Ok(()) => match folder_entry(folder) {
+            Ok(row) => match write_rows(context, vec![row], Some(txn_id)).await {
+                true => Ok(()),
+                false => Err(FolderError::Unavailable),
+            },
+            Err(_) => Err(FolderError::Unavailable),
+        },
+        Err(error) => Err(error),
+    };
+    if let Err(error) = written {
+        abort_txn(context, txn_id).await;
+        return Err(error);
+    }
+    match commit_txn(context, txn_id).await {
+        true => Ok(()),
+        false => Err(FolderError::Unavailable),
+    }
+}
+
+/// The count, overlap and bucket checks a new folder must pass against the bound ones.
+fn admit(bound: &[SyncedFolder], folder: &SyncedFolder) -> Result<(), FolderError> {
+    if bound.len() >= MAX_SYNCED_FOLDERS {
+        return Err(FolderError::TooManyFolders(MAX_SYNCED_FOLDERS));
+    }
+    if let Some(existing) = bound
+        .iter()
+        .find(|bound| overlaps(&bound.root, &folder.root))
+    {
+        return Err(FolderError::RootOverlaps(existing.root.clone()));
+    }
+    if bound
+        .iter()
+        .any(|bound| bound.local_bucket == folder.local_bucket)
+    {
+        return Err(FolderError::BucketBound(folder.local_bucket.clone()));
+    }
+    Ok(())
+}
+
+/// Confirms the realm bucket of a binding in progress and records the outcome: an accepted
+/// remote activates the folder, a refusal drops the binding, and a failure without an answer
+/// keeps it for the next folder pass. Creating again is safe: the node accepts its own bucket.
+pub(crate) async fn finish_binding(
+    context: &Arc<DriverContext>,
+    folder: SyncedFolder,
+) -> Result<SyncedFolder, FolderError> {
+    let FolderState::Binding { create_bucket } = folder.state else {
+        return Ok(folder);
+    };
+    let auth = AuthContext {
+        user_id: folder.created_by,
+        realm_id: folder.created_by.realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let remote = match create_bucket {
+        true => forward_create(context, auth, &folder.remote, folder.group_id).await,
+        false => request_versions(
+            context,
+            folder.remote.node_id,
+            auth,
+            folder.remote.bucket.clone(),
+            folder.remote.prefix.clone(),
+            None,
+            SyncPageLimit::new(1),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| map_remote_error(error, &folder.remote)),
+    };
+    let binding = |current: &SyncedFolder| matches!(current.state, FolderState::Binding { .. });
+    match remote {
+        Ok(()) => {
+            let active = update_folder(context, folder.folder_id, |current| {
+                match binding(&current) {
+                    true => Ok(SyncedFolder {
+                        state: FolderState::Active,
+                        last_error: None,
+                        last_error_ms: None,
+                        ..current
+                    }),
+                    false => Ok(current),
+                }
+            })
+            .await?;
+            crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
+            Ok(active)
+        }
+        Err(
+            error @ (FolderError::RemoteBucketMissing { .. }
+            | FolderError::RemoteForbidden { .. }
+            | FolderError::RemoteBucketConflict { .. }),
+        ) => {
+            drop_binding(context, folder.folder_id).await;
+            Err(error)
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            let noted = update_folder(context, folder.folder_id, |current| {
+                match binding(&current) {
+                    true => Ok(SyncedFolder {
+                        last_error: Some(reason),
+                        last_error_ms: Some(unix_timestamp_millis()),
+                        ..current
+                    }),
+                    false => Ok(current),
+                }
+            })
+            .await;
+            if let Err(note_error) = noted {
+                warn!(folder = %folder.folder_id, reason = %note_error, "Could not note the binding error");
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Removes a binding the realm refused, unless it changed meanwhile.
+async fn drop_binding(context: &Arc<DriverContext>, folder_id: Ulid) {
+    let Some(txn_id) = start_txn(context).await else {
+        return;
+    };
+    let key = folder_key(folder_id);
+    let binding = read_value(context, SYNCED_FOLDER_KEYSPACE, key.clone(), Some(txn_id))
+        .await
+        .and_then(|bytes| SyncedFolder::from_bytes(&bytes).ok())
+        .is_some_and(|folder| matches!(folder.state, FolderState::Binding { .. }));
+    let row = vec![(SYNCED_FOLDER_KEYSPACE.to_string(), key)];
+    match binding && delete_rows(context, row, Some(txn_id)).await {
+        true if commit_txn(context, txn_id).await => {}
+        true => warn!(folder = %folder_id, "Could not drop the refused binding"),
+        false => abort_txn(context, txn_id).await,
+    }
 }
 
 /// Refuses a node that cannot hold realm buckets, such as this computer.
@@ -337,10 +439,17 @@ fn overlaps(left: &str, right: &str) -> bool {
 }
 
 pub async fn list_folders(context: &Arc<DriverContext>) -> Result<Vec<SyncedFolder>, FolderError> {
+    scan_bound(context, None).await
+}
+
+async fn scan_bound(
+    context: &Arc<DriverContext>,
+    txn_id: Option<TxnId>,
+) -> Result<Vec<SyncedFolder>, FolderError> {
     let mut folders = Vec::new();
     let mut cursor: Option<Key> = None;
     loop {
-        let (values, next) = scan_page(context, scan_folders(cursor, None))
+        let (values, next) = scan_page(context, scan_folders(cursor, txn_id))
             .await
             .ok_or(FolderError::Unavailable)?;
         folders.extend(
@@ -455,6 +564,10 @@ pub async fn set_folder_state(
     // A folder whose cleanup is running is on its way out, not resumable.
     if current.state == FolderState::Deleting {
         return Err(FolderError::NotFound);
+    }
+    // Pausing or resuming must not skip the realm bucket a binding still has to confirm.
+    if matches!(current.state, FolderState::Binding { .. }) {
+        return Err(FolderError::StillBinding);
     }
     let folder = SyncedFolder { state, ..current };
     store_folder(context, &folder).await?;
@@ -868,6 +981,39 @@ mod tests {
         assert_eq!(
             set_folder_state(&context, folder.folder_id, FolderState::Active).await,
             Err(FolderError::NotFound)
+        );
+    }
+
+    // Two reservations of one root race in storage; the transaction lets exactly one through,
+    // and a binding cannot be paused past its realm bucket.
+    #[tokio::test]
+    async fn reserves_one_root() {
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let binding = FolderState::Binding {
+            create_bucket: true,
+        };
+        let first = bound_folder(binding.clone());
+        let second = SyncedFolder {
+            folder_id: Ulid::from_bytes([6u8; 16]),
+            local_bucket: "folder-y".to_string(),
+            ..bound_folder(binding)
+        };
+
+        let (left, right) = tokio::join!(
+            reserve_binding(&context, &first),
+            reserve_binding(&context, &second)
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        let bound = list_folders(&context).await.expect("the folders list");
+        assert_eq!(bound.len(), 1);
+        assert_eq!(
+            reserve_binding(&context, &first).await,
+            Err(FolderError::RootOverlaps(first.root.clone()))
+        );
+        assert_eq!(
+            set_folder_state(&context, bound[0].folder_id, FolderState::Paused).await,
+            Err(FolderError::StillBinding)
         );
     }
 }

@@ -48,6 +48,11 @@ pub enum FolderState {
     Error {
         reason: String,
     },
+    /// Admitted and recorded before the realm bucket is confirmed. The row reserves the root and
+    /// survives a crash; the next folder pass finishes the binding or drops a refused one.
+    Binding {
+        create_bucket: bool,
+    },
 }
 
 /// The realm side of a binding: one bucket prefix on one named realm node.

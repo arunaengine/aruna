@@ -18,7 +18,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::{
-    ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, ORIGIN_DEVICE_TAG,
+    ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, FolderState, ORIGIN_DEVICE_TAG,
     RemoteBinding, SyncBase, SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal,
 };
 use aruna_core::types::GroupId;
@@ -26,11 +26,11 @@ use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
 use aruna_operations::device::sync::folders::{
     BindFolderInput, FolderError, RealmBucketInput, bind_folder, create_realm_bucket, list_entries,
-    list_transfers, read_bound,
+    list_folders, list_transfers, read_bound,
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
-use aruna_operations::device::sync::reconcile_folder;
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
+use aruna_operations::device::sync::{reconcile_folder, reconcile_folders};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::device_pull::{accept_pull, pull_status};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
@@ -676,6 +676,64 @@ async fn creates_realm_bucket() -> TestResult<()> {
         create_realm_bucket(&device.context, input(group_id, device.node_id())).await,
         Err(FolderError::NotRealmNode(device.node_id()))
     );
+
+    Ok(())
+}
+
+/// A bind that got no answer stays recorded as `binding`: it reserves the root against a retry,
+/// and the folder pass, which also runs after a restart, creates the bucket and activates it.
+#[tokio::test]
+async fn recovers_interrupted_bind() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    let root = tempfile::tempdir()?;
+    let unanswered = std::sync::Arc::new(DriverContext {
+        metadata_handle: None,
+        task_handle: None,
+        ..(*device.context).clone()
+    });
+
+    let input = create_input(&realm, root.path(), group_id);
+    let folder_id = input.folder_id;
+    assert_eq!(
+        bind_folder(&unanswered, input).await,
+        Err(FolderError::Unavailable)
+    );
+    // The device's own timer may already have finished it; either way the bind is recorded.
+    let recorded = read_bound(&device.context, folder_id).await?.state;
+    assert!(
+        matches!(
+            recorded,
+            FolderState::Binding {
+                create_bucket: true
+            } | FolderState::Active
+        ),
+        "{recorded:?}"
+    );
+    assert_eq!(
+        bind_folder(
+            &manual_context(&device.context),
+            create_input(&realm, root.path(), group_id)
+        )
+        .await,
+        Err(FolderError::RootOverlaps(
+            root.path().to_string_lossy().to_string()
+        ))
+    );
+
+    reconcile_folders(&manual_context(&device.context)).await;
+    assert_eq!(
+        read_bound(&device.context, folder_id).await?.state,
+        FolderState::Active
+    );
+    let bucket = drive(
+        GetBucketOperation::new(REMOTE_BUCKET.to_string()),
+        &server.context,
+    )
+    .await?;
+    assert_eq!(bucket.group_id, group_id);
     Ok(())
 }
 
@@ -717,6 +775,7 @@ async fn refuses_foreign_bucket() -> TestResult<()> {
             reason: format!("bucket \"{REMOTE_BUCKET}\" belongs to another group"),
         }
     );
+    assert!(list_folders(&device.context).await?.is_empty());
     Ok(())
 }
 
@@ -843,6 +902,7 @@ async fn refuses_invalid_remotes() -> TestResult<()> {
             .expect_err("a user node is not a realm server"),
         FolderError::NotRealmNode(device.node_id())
     );
+    assert!(list_folders(&device.context).await?.is_empty());
     Ok(())
 }
 

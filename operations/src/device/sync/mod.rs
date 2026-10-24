@@ -98,6 +98,17 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
     };
     let mut work = false;
     for folder in folders {
+        // A bind cut short by a lost reply, a failed write or a restart finishes here.
+        if matches!(folder.state, FolderState::Binding { .. }) {
+            let folder_id = folder.folder_id;
+            match folders::finish_binding(context, folder).await {
+                Ok(_) => work = true,
+                Err(error) => {
+                    warn!(folder = %folder_id, reason = %error, "Could not finish the folder binding")
+                }
+            }
+            continue;
+        }
         if folder.state != FolderState::Active {
             continue;
         }

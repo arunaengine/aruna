@@ -203,6 +203,7 @@ fn folder_state(state: &FolderState) -> String {
         FolderState::Paused => "paused".to_string(),
         FolderState::Deleting => "deleting".to_string(),
         FolderState::Error { .. } => "error".to_string(),
+        FolderState::Binding { .. } => "binding".to_string(),
     }
 }
 

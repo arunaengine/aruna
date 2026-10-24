@@ -503,6 +503,50 @@ async fn pause_resume() {
     assert_eq!(refused.status_code(), StatusCode::NOT_FOUND);
 }
 
+/// A folder still binding shows as `binding` and cannot be paused or resumed past its bucket.
+#[tokio::test]
+async fn refuses_binding_pause() {
+    let fixture = setup().await;
+    let id = Ulid::from_bytes([32u8; 16]);
+    let binding = FolderState::Binding {
+        create_bucket: true,
+    };
+    seed_row(
+        &fixture.state,
+        folder_entry(&sample_folder(id, &fixture, "/data", binding)).unwrap(),
+    )
+    .await;
+    let Json(view) = get_synced_folder(
+        State(fixture.state.clone()),
+        Extension(Some(owner_auth(&fixture))),
+        Path(id.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(view.state, FolderStateName::Binding);
+    for paused in [true, false] {
+        let call = match paused {
+            true => {
+                pause_folder(
+                    State(fixture.state.clone()),
+                    Extension(Some(owner_auth(&fixture))),
+                    Path(id.to_string()),
+                )
+                .await
+            }
+            false => {
+                resume_folder(
+                    State(fixture.state.clone()),
+                    Extension(Some(owner_auth(&fixture))),
+                    Path(id.to_string()),
+                )
+                .await
+            }
+        };
+        assert_eq!(call.unwrap_err().status_code(), StatusCode::CONFLICT);
+    }
+}
+
 #[tokio::test]
 async fn sync_needs_active() {
     let fixture = setup().await;

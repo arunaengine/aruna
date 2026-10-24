@@ -198,7 +198,9 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
             ServerError::BadRequestReason(error.to_string())
         }
         FolderError::RemoteForbidden { .. } => ServerError::Forbidden,
-        FolderError::DownloadOnly => ServerError::Conflict(error.to_string()),
+        FolderError::DownloadOnly | FolderError::StillBinding => {
+            ServerError::Conflict(error.to_string())
+        }
         FolderError::RemoteUnreachable { .. } => ServerError::BadGatewayReason(error.to_string()),
         FolderError::BucketExists { .. } => {
             ServerError::Refused(StatusCode::CONFLICT, "bucket_exists", error.to_string())
@@ -269,8 +271,12 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
   collide with a bucket they already use.
 - `create_bucket` creates a missing remote bucket through the node plane. Without it, a listing
   probe checks that the remote bucket exists and the owner may read it.
-- Once the remote bucket is created, the bind completes even if the caller stops waiting, so the
-  bucket never stays behind without a folder.
+- The folder is recorded in state `binding` before the realm node is asked, so a retried or
+  concurrent call for the same root answers 409. It turns `active` once the realm node confirms the
+  bucket; a refusal removes it again.
+- If the realm node does not answer, the call fails with 502 or 503 but the folder stays `binding`
+  and the next folder pass finishes it, also after a restart, so a bucket the node created never
+  stays behind without a folder. Unbinding the folder stops that.
 - The answer comes before the directory is walked. The first sync pass starts at once in the
   background: every file becomes one read-only object of that bucket, and no byte is copied into
   this node's blob store. `GET /device/folders/{folder_id}` and `GET /device/transfers` show its
@@ -333,7 +339,7 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not this device's owner, or the remote bucket refuses the owner", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 409, description = "The root overlaps a bound folder, or the bucket belongs to another group", body = ErrorResponse),
+        (status = 409, description = "The root overlaps a bound folder, also one still binding, or the bucket belongs to another group", body = ErrorResponse),
         (status = 502, description = "The remote realm node is unreachable", body = ErrorResponse),
         (status = 503, description = "The device sync service or realm configuration is unavailable", body = ErrorResponse)
     ),
@@ -674,6 +680,7 @@ for.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
+        (status = 409, description = "The folder is still being bound", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -732,6 +739,7 @@ for."#,
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
+        (status = 409, description = "The folder is still being bound", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
