@@ -16,6 +16,7 @@ pub mod publish;
 pub mod rebuild;
 pub mod refill;
 pub mod split;
+pub mod status;
 #[cfg(test)]
 pub(crate) mod test_store;
 
