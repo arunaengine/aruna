@@ -338,7 +338,10 @@ impl InventoryUpdate {
                 {
                     return Err(InventoryError::Collision(added.version_id));
                 }
-                added.entry.identity = added.entry.identity.or(existing.version.identity);
+                // A replay of pending content after its hash became known changes nothing.
+                if added.entry.pending && existing.version.identity.is_some() {
+                    continue;
+                }
                 if existing.version == added.entry {
                     continue;
                 }
@@ -569,6 +572,7 @@ pub fn entry_of(version: &BlobVersion, size: u64) -> VersionEntry {
         size,
         referenced: matches!(version.state, BlobVersionState::Reference { .. }),
         identity: logical_identity(version),
+        pending: matches!(version.state, BlobVersionState::PendingContent { .. }),
     }
 }
 

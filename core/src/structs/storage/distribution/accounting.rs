@@ -373,6 +373,7 @@ mod tests {
             size,
             referenced,
             identity: None,
+            pending: false,
         }
     }
 

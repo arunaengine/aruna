@@ -25,6 +25,7 @@ fn stored(size: u64) -> VersionEntry {
         size,
         referenced: false,
         identity: Some([size.to_le_bytes()[0]; 32]),
+        pending: false,
     }
 }
 
@@ -132,10 +133,11 @@ async fn refuses_other_content() {
     assert_eq!(result, Err(InventoryError::Collision(id(1))));
     let mut pending = put("a", 2, 2, 0);
     if let HeadChange::Set(head) = &mut pending.change.head {
-        head.version.identity = None;
+        (head.version.identity, head.version.pending) = (None, true);
     }
-    pending.change.added[0].entry.identity = None;
-    assert!(apply(&handle, pending).await.unwrap());
+    let entry = &mut pending.change.added[0].entry;
+    (entry.identity, entry.pending) = (None, true);
+    assert!(apply(&handle, pending.clone()).await.unwrap());
     assert!(
         apply(&handle, put("a", 2, 2, 0)).await.unwrap(),
         "the hash becomes known"
@@ -143,6 +145,29 @@ async fn refuses_other_content() {
     let index = get(&handle, VERSION_INDEX_KEYSPACE, index_key(set(), id(2))).await;
     let index = IndexEntry::from_bytes(&index.unwrap()).unwrap();
     assert_eq!(index.version.identity, Some([0; 32]));
+    assert!(
+        apply(&handle, pending).await.unwrap(),
+        "a late pending replay changes nothing"
+    );
+    let again = get(&handle, VERSION_INDEX_KEYSPACE, index_key(set(), id(2))).await;
+    assert_eq!(IndexEntry::from_bytes(&again.unwrap()).unwrap(), index);
+
+    // A marker and a version never share an id, and stored content never loses its identity.
+    let mut marker = put("a", 2, 2, 0);
+    let entry = &mut marker.change.added[0].entry;
+    (entry.marker, entry.identity) = (true, None);
+    marker.change.head = HeadChange::Keep;
+    assert_eq!(
+        apply(&handle, marker).await,
+        Err(InventoryError::Collision(id(2)))
+    );
+    let mut unknown = put("a", 2, 2, 0);
+    unknown.change.added[0].entry.identity = None;
+    unknown.change.head = HeadChange::Keep;
+    assert_eq!(
+        apply(&handle, unknown).await,
+        Err(InventoryError::Collision(id(2)))
+    );
 }
 
 #[tokio::test]
@@ -156,6 +181,7 @@ async fn purge_returns_to_zero() {
         size: 0,
         referenced: false,
         identity: None,
+        pending: false,
     };
     marker.added.push(AddedVersion {
         version_id: id(2),

@@ -169,6 +169,7 @@ pub(crate) fn write(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryUp
         size,
         referenced: false,
         identity: Some([seed; 32]),
+        pending: false,
     };
     let mut change = InventoryChange::new(set_id, key);
     change.added.push(AddedVersion {

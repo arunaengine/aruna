@@ -2106,6 +2106,12 @@ impl CompleteUploadOperation {
 
     /// The composed version, the head it becomes and the upload it closes.
     fn inventory_change(&self, size: i128) -> Option<InventoryChange> {
+        // Without a hash the composed version is pending content.
+        let identity = self
+            .final_location
+            .as_ref()
+            .and_then(|location| location.get_blake3())
+            .and_then(|hash| <[u8; 32]>::try_from(hash).ok());
         let added = AddedVersion {
             version_id: self.version_id?,
             epoch: self.version_epoch,
@@ -2114,11 +2120,8 @@ impl CompleteUploadOperation {
                 marker: false,
                 size: u64::try_from(size).unwrap_or_default(),
                 referenced: false,
-                identity: self
-                    .final_location
-                    .as_ref()
-                    .and_then(|location| location.get_blake3())
-                    .and_then(|hash| <[u8; 32]>::try_from(hash).ok()),
+                identity,
+                pending: identity.is_none(),
             },
         };
         let head = self.head_pointer.is_some();

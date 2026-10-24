@@ -352,6 +352,7 @@ pub struct IncomingVersionOperation {
     /// The head this apply installs and the content of the written version, for the inventory.
     installed_head: Option<CurrentVersionPointer>,
     written_identity: Option<[u8; 32]>,
+    written_pending: bool,
     destination_inputs: GroupRoutingInputs,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
@@ -449,6 +450,7 @@ impl IncomingVersionOperation {
             destination_binding: None,
             installed_head: None,
             written_identity: None,
+            written_pending: false,
             head_transition_effects: VecDeque::new(),
             pending_version_effects: VecDeque::new(),
             release_id: None,
@@ -2031,6 +2033,7 @@ impl IncomingVersionOperation {
             false => version,
         };
         self.written_identity = logical_identity(&version);
+        self.written_pending = matches!(version.state, BlobVersionState::PendingContent { .. });
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),
@@ -2264,6 +2267,7 @@ impl IncomingVersionOperation {
                 size,
                 referenced: self.is_reference_item(),
                 identity: self.written_identity,
+                pending: self.written_pending,
             },
         };
         let head = self.installed_head.is_some();

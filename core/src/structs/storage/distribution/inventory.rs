@@ -174,16 +174,25 @@ pub struct VersionEntry {
     pub size: u64,
     /// The bytes are reached through an external reference, not stored here.
     pub referenced: bool,
-    /// The logical content identity from [`content_identity`]; `None` while it is unknown.
+    /// The logical content identity from [`logical_identity`]; `None` for a marker and while
+    /// the hash of pending content is unknown.
     pub identity: Option<[u8; 32]>,
+    /// Content whose hash a later verified read records.
+    pub pending: bool,
 }
 
 impl VersionEntry {
-    /// Two entries of one version id may differ only while one identity is unknown.
+    /// Whether `other` may stand for the same version as this stored entry: markers stay
+    /// markers, known identities match, and only pending content may learn its identity.
     pub fn same_content(&self, other: &Self) -> bool {
+        if self.marker != other.marker {
+            return false;
+        }
         match (self.identity, other.identity) {
-            (Some(left), Some(right)) => left == right,
-            _ => true,
+            (Some(stored), Some(written)) => stored == written,
+            (None, Some(_)) => self.pending,
+            (Some(_), None) => other.pending,
+            (None, None) => self.marker || (self.pending && other.pending),
         }
     }
 }
