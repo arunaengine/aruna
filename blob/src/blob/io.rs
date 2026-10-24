@@ -1962,6 +1962,9 @@ impl BlobHandler {
                 "a transient spool needs a byte limit".to_string(),
             ));
         };
+        if max_bytes > limit {
+            return BlobEvent::Error(BlobError::SpoolTooLarge { limit });
+        }
         let units = u32::try_from(max_bytes.div_ceil(1024 * 1024)).unwrap_or(u32::MAX);
         let Ok(permit) = self.spool_budget.clone().try_acquire_many_owned(units) else {
             return BlobEvent::Error(BlobError::SpoolBudgetExhausted { limit });

@@ -111,6 +111,9 @@ pub enum BlobError {
     /// Transient spools together would hold more than their disk budget; a retry may fit.
     #[error("Transient spools would exceed their {limit} byte budget")]
     SpoolBudgetExhausted { limit: u64 },
+    /// One transient spool would need more than the whole spool budget; no retry can fit it.
+    #[error("A transient spool cannot hold more than {limit} bytes")]
+    SpoolTooLarge { limit: u64 },
 }
 
 impl BlobError {

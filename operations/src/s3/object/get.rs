@@ -199,6 +199,9 @@ pub enum GetObjectError {
     /// Unverified reference reads already hold the node's spool budget; a retry may fit.
     #[error("Too many unverified reference reads are in progress.")]
     SpoolBudgetExhausted,
+    /// The bytes cannot be verified: a spool that large never fits the node's spool budget.
+    #[error("Reference reads above {limit} bytes need a source that enforces ETag conditions.")]
+    ReferenceTooLarge { limit: u64 },
     #[error("GetObject failed (miserably)")]
     GetObjectFailed,
     #[error("operation did not finish")]
@@ -1680,6 +1683,9 @@ impl GetObjectOperation {
             Event::Blob(BlobEvent::HiddenSpooled { location, size, .. }) => (location, size),
             Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. })) => {
                 return self.emit_error(GetObjectError::SpoolBudgetExhausted);
+            }
+            Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit })) => {
+                return self.emit_error(GetObjectError::ReferenceTooLarge { limit });
             }
             _ => return self.emit_error(GetObjectError::GetObjectFailed),
         };

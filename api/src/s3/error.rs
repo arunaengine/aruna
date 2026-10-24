@@ -547,6 +547,9 @@ impl IntoS3Error for GetObjectError {
                 )
             }
             GetObjectError::ReferenceAdvanceExhausted => reference_exhausted_error(),
+            error @ GetObjectError::ReferenceTooLarge { .. } => {
+                s3_error!(NotImplemented, "{}", error)
+            }
             GetObjectError::SpoolBudgetExhausted => {
                 s3_error!(
                     SlowDown,

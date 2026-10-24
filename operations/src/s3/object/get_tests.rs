@@ -1927,6 +1927,29 @@ fn spool_budget_refused() {
     );
 }
 
+// A spool larger than the whole budget fails the read for good, naming the limit.
+#[test]
+fn oversized_spool_refused() {
+    let mut operation = drifted_operation();
+    let mut stored = digested(9, 7);
+    stored.etag = None;
+    operation.reference_cached = Some(stored.clone());
+    operation.state = GetObjectState::HeadReferenceSource;
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: stored.clone(),
+    }));
+    operation.step(source_read(stored));
+
+    operation.step(Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge {
+        limit: 4,
+    })));
+
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::ReferenceTooLarge { limit: 4 })
+    );
+}
+
 // An HTTP server may ignore `If-Match`, so a pinned version it serves needs recorded digests:
 // without them it is refused even when the observation compares as the same.
 #[test]

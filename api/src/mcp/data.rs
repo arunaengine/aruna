@@ -1171,6 +1171,7 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
             "the bucket holds no readable object under that key; call list_objects for the keys \
              it does hold",
         ),
+        error @ GetObjectError::ReferenceTooLarge { .. } => bad_request(error),
         error @ GetObjectError::InvalidRange => bad_request(format!(
             "{error} offset must be below the object size; call list_objects for the size and \
              read from offset 0 for a fresh read"

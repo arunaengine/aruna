@@ -1565,6 +1565,22 @@ async fn transient_spool_cleanup() {
         Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. }))
     ));
     drop(held);
+
+    // A spool larger than the whole budget is refused for good, not as contention.
+    let limit = super::runtime::SPOOL_BUDGET_MIB as u64 * 1024 * 1024;
+    let oversized = BlobEffect::SpoolHidden {
+        namespace,
+        name: "oversized".to_string(),
+        created_by: test_user_id(),
+        max_bytes: Some(limit + 1),
+        deadline: None,
+        blob: stream_from_bytes(b"four"),
+        transient: true,
+    };
+    assert_eq!(
+        context.blob_handle.send_blob_effect(oversized).await,
+        Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit }))
+    );
 }
 
 #[tokio::test]
