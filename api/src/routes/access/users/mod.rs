@@ -611,8 +611,9 @@ initial realm administrator role.
   and is consumed single-use.
 - The registered user is always the subject of the presented token, never a user id chosen by the
   caller, and the display name comes from the token.
-- The user document is written here and reaches the other realm nodes through document sync, so it
-  may not be visible elsewhere immediately.
+- A management node resolves the subject and every other node relays the call to one, so a device
+  never creates a user of its own. The user document reaches the other realm nodes through
+  document sync, so it may not be visible elsewhere immediately.
 - No access token is returned: exchange the same OIDC token at `GET /access/token`."#,
     request_body(
         content = RegisterUserRequest,
@@ -648,7 +649,9 @@ initial realm administrator role.
         ),
         (status = 400, description = "Malformed request body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid OIDC bearer token, or an onboarding secret that is unknown, expired, already claimed or issued for another realm", body = ErrorResponse),
-        (status = 403, description = "The onboarding secret was issued for another purpose than the initial realm administrator", body = ErrorResponse)
+        (status = 403, description = "The onboarding secret was issued for another purpose than the initial realm administrator", body = ErrorResponse),
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
+        (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
