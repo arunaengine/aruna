@@ -110,6 +110,7 @@ const DELEGATED_OPERATIONS: &[&str] = &[
     "UploadPart",
     "CompleteMultipartUpload",
     "AbortMultipartUpload",
+    "ListParts",
 ];
 
 #[derive(Clone)]
@@ -666,7 +667,7 @@ impl AuthProvider {
     async fn check_delegated(&self, cx: &mut S3AccessContext<'_>, action: Action) -> S3Result<()> {
         let denied = |reason: &str| s3_error!(AccessDenied, "Delegation refused: {reason}");
         let operation = cx.s3_op().name();
-        if !matches!(action, Action::Write) || !DELEGATED_OPERATIONS.contains(&operation) {
+        if !DELEGATED_OPERATIONS.contains(&operation) {
             return Err(denied("operation is not forwarded"));
         }
         let mut values = cx.headers().get_all(DELEGATION_HEADER).iter();
@@ -736,12 +737,17 @@ impl AuthProvider {
             &key,
         );
         let extras = request_extras(cx, operation);
+        // A forwarded listing needs READ, every forwarded write WRITE, on this node's path.
+        let required = match action {
+            Action::Read => Permission::READ,
+            Action::Write => Permission::WRITE,
+        };
         authorize(
             self.driver_ctx.as_ref(),
             self.realm_id,
             &auth_context,
             &path,
-            &Permission::WRITE,
+            &required,
             extras.clone(),
         )
         .await

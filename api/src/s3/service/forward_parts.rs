@@ -5,7 +5,7 @@
 
 use s3s::dto::{
     CompleteMultipartUploadOutput, CompletedMultipartUpload, CreateMultipartUploadOutput, ETag,
-    UploadPartOutput,
+    ListPartsOutput, Part, Timestamp, TimestampFormat, UploadPartOutput,
 };
 use s3s::{S3Response, S3Result, s3_error};
 
@@ -49,6 +49,27 @@ pub(super) fn completion_body(upload: Option<&CompletedMultipartUpload>) -> Stri
     body
 }
 
+/// The parts of a ListParts answer, in their order.
+pub(super) fn listed_parts(body: &str) -> Vec<Part> {
+    body.split("<Part>")
+        .skip(1)
+        .filter_map(|part| part.split("</Part>").next())
+        .map(|part| Part {
+            part_number: xml_field(part, "PartNumber").and_then(|value| value.parse().ok()),
+            e_tag: e_tag(xml_field(part, "ETag")),
+            size: xml_field(part, "Size").and_then(|value| value.parse().ok()),
+            last_modified: xml_field(part, "LastModified")
+                .and_then(|value| Timestamp::parse(TimestampFormat::DateTime, &value).ok()),
+            checksum_crc32: xml_field(part, "ChecksumCRC32"),
+            checksum_crc32c: xml_field(part, "ChecksumCRC32C"),
+            checksum_crc64nvme: xml_field(part, "ChecksumCRC64NVME"),
+            checksum_sha1: xml_field(part, "ChecksumSHA1"),
+            checksum_sha256: xml_field(part, "ChecksumSHA256"),
+            ..Default::default()
+        })
+        .collect()
+}
+
 fn e_tag(text: Option<String>) -> Option<ETag> {
     text.and_then(|value| ETag::parse_http_header(value.as_bytes()).ok())
 }
@@ -66,6 +87,26 @@ impl ArunaS3Service {
             bucket: Some(bucket),
             key: Some(key),
             upload_id: Some(upload_id),
+            ..Default::default()
+        }))
+    }
+
+    pub(super) async fn forwarded_list(
+        response: reqwest::Response,
+        bucket: String,
+        key: String,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let body = response.text().await.unwrap_or_default();
+        let number = |tag: &str| xml_field(&body, tag).and_then(|value| value.parse().ok());
+        Ok(S3Response::new(ListPartsOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            upload_id: xml_field(&body, "UploadId"),
+            is_truncated: xml_field(&body, "IsTruncated").map(|value| value == "true"),
+            part_number_marker: number("PartNumberMarker"),
+            next_part_number_marker: number("NextPartNumberMarker"),
+            max_parts: number("MaxParts"),
+            parts: Some(listed_parts(&body)),
             ..Default::default()
         }))
     }
@@ -145,5 +186,20 @@ mod tests {
             completion_body(None),
             "<CompleteMultipartUpload></CompleteMultipartUpload>"
         );
+    }
+
+    #[test]
+    fn listed_parts_parse() {
+        let body = "<ListPartsResult><Bucket>b</Bucket><Part><PartNumber>1</PartNumber>\
+                    <ETag>&quot;abc&quot;</ETag><Size>5</Size>\
+                    <LastModified>2026-10-24T10:00:00.000Z</LastModified></Part>\
+                    <Part><PartNumber>2</PartNumber><Size>7</Size></Part></ListPartsResult>";
+        let parts = listed_parts(body);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].part_number, Some(1));
+        assert_eq!(parts[0].size, Some(5));
+        assert_eq!(parts[0].e_tag.as_ref().map(ETag::value), Some("abc"));
+        assert!(parts[0].last_modified.is_some());
+        assert_eq!(parts[1].part_number, Some(2));
     }
 }

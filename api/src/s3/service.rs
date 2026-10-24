@@ -2045,7 +2045,7 @@ impl S3 for ArunaS3Service {
             "Received LIST PARTS Request"
         );
 
-        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
@@ -2055,6 +2055,24 @@ impl S3 for ArunaS3Service {
                 || req.input.sse_customer_key_md5.is_some(),
         )?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
+        // Uploads live on the coordinator of the key's range, so their parts are listed there.
+        let bucket_info = req.extensions.get::<BucketInfo>();
+        if let Some(forward) = self
+            .forward_target(&req.extensions, bucket_info, &req.input.key)
+            .await?
+        {
+            let request = forward::ForwardRequest {
+                method: http::Method::GET,
+                operation: "ListParts",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: Vec::new(),
+                body: forward::ForwardBody::Empty,
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Self::forwarded_list(response, req.input.bucket, req.input.key).await;
+        }
         let part_number_marker = match req.input.part_number_marker {
             None => None,
             Some(marker) if marker < 0 => {
