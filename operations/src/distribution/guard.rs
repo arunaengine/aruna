@@ -15,6 +15,8 @@ use aruna_core::structs::storage::distribution::{
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::driver::DriverContext;
+
 #[derive(Debug, Error, PartialEq)]
 pub enum GuardError {
     #[error(
@@ -87,6 +89,31 @@ pub fn write_epoch(
             range_id,
             node_id,
         }),
+    }
+}
+
+/// Where a write to `key` of a bound bucket goes, from this node's record; transports use it
+/// to forward a write before its bytes move.
+pub async fn route_write(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+) -> Result<WriteRoute, GuardError> {
+    let read = StorageEffect::Read {
+        key_space: DISTRIBUTION_KEYSPACE.to_string(),
+        key: binding.set_id.to_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            write_target(binding, key, value.as_deref())
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(GuardError::Unreadable(error.to_string()))
+        }
+        other => Err(GuardError::Unreadable(format!(
+            "unexpected answer {other:?}"
+        ))),
     }
 }
 
