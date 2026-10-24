@@ -7,7 +7,7 @@ use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write
 use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};
 use crate::s3::object::copy::{CopySourceConditions, evaluate_source_conditions};
 use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, ObjectRangeRequest, TokenRead, read_local,
+    GetObjectError, GetObjectInput, ObjectRangeRequest, TokenRead, read_source,
 };
 use crate::s3::purge_fence::ensure_write_allowed;
 use aruna_core::effects::StorageEffect;
@@ -92,7 +92,7 @@ pub async fn upload_part_token(
         node_id: input.node_id,
     };
     let restrictions = input.source_auth_context.path_restrictions.clone();
-    let source = read_local(context, source_input, restrictions, token.as_ref()).await?;
+    let source = read_source(context, source_input, restrictions, token.as_ref()).await?;
 
     let source_version_id = source.version_id;
     let source_last_modified = source

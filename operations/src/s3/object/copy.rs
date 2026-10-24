@@ -4,13 +4,14 @@
 
 pub mod sealed;
 
+use crate::distribution::pull::record_only;
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
 use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
 use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, TokenRead, read_local, reference_archive,
+    GetObjectError, GetObjectInput, GetObjectResult, TokenRead, read_source, reference_archive,
 };
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -227,6 +228,27 @@ pub async fn copy_object_tracked(
 }
 
 /// `copy_object` where `token` admits the source read while its bucket key is locked.
+/// Reads a copy source a member streams to the destination's coordinator; the conditions are
+/// checked before any byte moves.
+pub async fn read_copy_source(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    conditions: &CopySourceConditions,
+    token: Option<&TokenRead>,
+) -> Result<GetObjectResult, CopyObjectError> {
+    let source = read_source(context, input, restrictions, token).await?;
+    let last_modified = (source.info.version_created_at)
+        .or_else(|| source.location.as_ref().map(|location| location.created_at))
+        .or_else(|| (source.source_metadata.as_ref()).and_then(|metadata| metadata.last_modified));
+    let etag = (source.location.as_ref())
+        .and_then(|location| location.hashes.get(HASH_MD5))
+        .map(hex::encode)
+        .or_else(|| (source.source_metadata.as_ref()).and_then(|metadata| metadata.etag.clone()));
+    evaluate_source_conditions(conditions, etag.as_deref(), last_modified, true)?;
+    Ok(source)
+}
+
 pub async fn copy_object_token(
     context: &DriverContext,
     input: CopyObjectInput,
@@ -280,7 +302,9 @@ async fn copy_inner(
         source_last_modified,
         true,
     )?;
-    if head.location.is_none() && input.references == CopyReferences::Preserve {
+    // A record-only version of a distributed bucket is read through a holder, never kept.
+    let record_only = (head.source_binding.as_ref()).is_some_and(record_only);
+    if head.location.is_none() && input.references == CopyReferences::Preserve && !record_only {
         // Another bucket reads the reference without the source's lock, so admit it here.
         if input.source_bucket != input.dest_bucket {
             admit_source(context, &input).await?;
@@ -305,7 +329,7 @@ async fn copy_inner(
         node_id: input.node_id,
     };
     let restrictions = input.source_auth_context.path_restrictions.clone();
-    let source = read_local(context, source_input, restrictions, token).await?;
+    let source = read_source(context, source_input, restrictions, token).await?;
 
     let source_version_id = source.version_id;
     let materialized = source.location.is_some();

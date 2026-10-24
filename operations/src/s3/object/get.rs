@@ -2101,6 +2101,37 @@ fn slice_blob(
 
 /// Reads the local copy; with a token, a locked or pending version is read with the object key
 /// that a grant of the credential opens.
+/// Reads a copy source like [`read_local`]; a record-only version of a distributed bucket is
+/// read through a holder of its range under the caller's authority.
+pub(crate) async fn read_source(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    token: Option<&TokenRead>,
+) -> Result<GetObjectResult, GetObjectError> {
+    let (bucket, key, range) = (input.bucket.clone(), input.key.clone(), input.range.clone());
+    let (user_id, realm_id) = (input.user_identity, input.realm_id);
+    match read_local(context, input, restrictions.clone(), token).await {
+        Err(GetObjectError::HeldElsewhere(held)) => {
+            let auth = AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: restrictions,
+                session: None,
+            };
+            let request = PullRequest {
+                bucket,
+                key,
+                range,
+                auth,
+                held: *held,
+            };
+            pull_through(context, request).await
+        }
+        result => result,
+    }
+}
+
 pub(crate) async fn read_local(
     context: &DriverContext,
     input: GetObjectInput,

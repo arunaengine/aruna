@@ -9,6 +9,7 @@ mod bucket;
 mod copy;
 mod encryption;
 mod forward;
+mod forward_copy;
 mod forward_parts;
 mod listing;
 mod payload;
@@ -30,6 +31,7 @@ use self::response::{attach_reference_refresh, object_metadata, reference_metada
 use aruna_core::structs::storage::format::Compression;
 
 use self::copy::{copy_object_response, copy_part_response, copy_source_conditions};
+use self::forward_copy::{CopyPath, CopySource};
 use self::listing::{
     ObjectListingPage, list_parts_output, list_uploads_output, marker_continuation_token,
     next_marker_for,
@@ -1095,6 +1097,58 @@ impl S3 for ArunaS3Service {
             req.input.copy_source_if_unmodified_since.as_ref(),
         )?;
         let token = self.token_read(&req.extensions);
+        // A destination another member coordinates takes the copy there.
+        if let Some(forward) = self
+            .forward_target(&req.extensions, dest_bucket_info.as_ref(), &dest_key)
+            .await?
+        {
+            return match self
+                .copy_path(&source_bucket_info, &source_key, &forward)
+                .await?
+            {
+                CopyPath::Stream => {
+                    let source = CopySource {
+                        bucket: &source_bucket_info,
+                        name: source_bucket,
+                        key: source_key,
+                        version_id: source_version_id,
+                        range: None,
+                        auth: &source_auth_context,
+                        conditions: &conditions,
+                    };
+                    let metadata = metadata_replace.then(|| {
+                        object_metadata(
+                            req.input.metadata.clone().unwrap_or_default(),
+                            req.input.content_type.as_deref(),
+                        )
+                    });
+                    let target = (dest_bucket, dest_key);
+                    self.stream_copy(
+                        &user_access,
+                        &forward,
+                        target,
+                        source,
+                        metadata,
+                        token.as_ref(),
+                    )
+                    .await
+                }
+                CopyPath::Delegate => {
+                    let request = forward::ForwardRequest {
+                        method: http::Method::PUT,
+                        operation: "CopyObject",
+                        bucket: dest_bucket,
+                        key: dest_key,
+                        query: forward::passed_query(req.uri.query()),
+                        headers: forward::passed_headers(&req.headers, None),
+                        body: forward::ForwardBody::Empty,
+                    };
+                    let response = self.forward_write(&user_access, &forward, request).await?;
+                    Self::delegated_copy(response).await
+                }
+            };
+        }
+        self.ensure_source(&source_bucket_info, &source_key).await?;
         let dest_group_id = dest_bucket_info
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
@@ -1447,7 +1501,50 @@ impl S3 for ArunaS3Service {
             .await?;
 
         let token = self.token_read(&req.extensions);
+        // The upload belongs to the coordinator of its key's range.
         let dest_info = req.extensions.get::<BucketInfo>().cloned();
+        if let Some(forward) = self
+            .forward_target(&req.extensions, dest_info.as_ref(), &req.input.key)
+            .await?
+        {
+            return match self
+                .copy_path(&source_bucket_info, &source_key, &forward)
+                .await?
+            {
+                CopyPath::Stream => {
+                    let upload: String =
+                        url::form_urlencoded::byte_serialize(req.input.upload_id.as_bytes())
+                            .collect();
+                    let query = format!("partNumber={}&uploadId={upload}", req.input.part_number);
+                    let source = CopySource {
+                        bucket: &source_bucket_info,
+                        name: source_bucket,
+                        key: source_key,
+                        version_id: source_version_id,
+                        range,
+                        auth: &source_auth_context,
+                        conditions: &conditions,
+                    };
+                    let target = (req.input.bucket, req.input.key, query);
+                    self.stream_part(&user_access, &forward, target, source, token.as_ref())
+                        .await
+                }
+                CopyPath::Delegate => {
+                    let request = forward::ForwardRequest {
+                        method: http::Method::PUT,
+                        operation: "UploadPartCopy",
+                        bucket: req.input.bucket,
+                        key: req.input.key,
+                        query: forward::passed_query(req.uri.query()),
+                        headers: forward::passed_headers(&req.headers, None),
+                        body: forward::ForwardBody::Empty,
+                    };
+                    let response = self.forward_write(&user_access, &forward, request).await?;
+                    Self::delegated_part(response).await
+                }
+            };
+        }
+        self.ensure_source(&source_bucket_info, &source_key).await?;
         let upload_id = self
             .upload_id(dest_info.as_ref(), &req.input.key, &req.input.upload_id)
             .await?;

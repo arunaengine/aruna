@@ -293,6 +293,22 @@ pub async fn delegated_range(
     })
 }
 
+/// The nodes that answer reads of `key`'s range from their own records, coordinator last.
+pub async fn record_holders(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+) -> Result<Vec<NodeId>, GuardError> {
+    let view = bound_view(context, binding).await?;
+    let snapshot = view.snapshot();
+    let range = snapshot
+        .range_for(key)
+        .ok_or(RouteError::NoRange(binding.set_id))?;
+    Ok((snapshot.record_holders(range).into_iter())
+        .map(|member| member.node_id)
+        .collect())
+}
+
 /// Reads the epoch from the answer to [`record_read`].
 pub fn record_epoch(
     binding: &DistributionBinding,

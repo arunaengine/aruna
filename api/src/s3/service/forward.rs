@@ -65,6 +65,14 @@ const PASSED_HEADERS: &[&str] = &[
     "x-amz-checksum-type",
     "x-amz-mp-object-size",
     "x-amz-tagging",
+    "x-amz-copy-source",
+    "x-amz-copy-source-range",
+    "x-amz-copy-source-if-match",
+    "x-amz-copy-source-if-none-match",
+    "x-amz-copy-source-if-modified-since",
+    "x-amz-copy-source-if-unmodified-since",
+    "x-amz-metadata-directive",
+    "x-amz-tagging-directive",
 ];
 
 /// Characters a key keeps unescaped in a forwarded path; `/` separates its segments.
@@ -430,7 +438,9 @@ impl ArunaS3Service {
             operation: request.operation.to_string(),
             bucket: request.bucket.clone(),
             key: request.key.clone(),
-            copy_source: None,
+            copy_source: (request.headers.iter())
+                .find(|(name, _)| name == "x-amz-copy-source")
+                .map(|(_, value)| value.clone()),
             request_digest: digest,
             payload,
         };

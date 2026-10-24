@@ -65,7 +65,7 @@ impl HeldElsewhere {
         source: &VersionSourceBinding,
         identity: Option<[u8; 32]>,
     ) -> Option<(Ulid, [u8; 32])> {
-        if source.descriptor.kind != SourceConnectorKind::ArunaNative {
+        if !record_only(source) {
             return None;
         }
         let set_id = source.descriptor.public_config.get(NATIVE_SET_ID)?;
@@ -84,6 +84,13 @@ impl HeldElsewhere {
             part_count: None,
         }
     }
+}
+
+/// Whether a version is a record a member received without bytes: they stay with the holders
+/// of its range, so a copy reads them there instead of keeping the record as a reference.
+pub fn record_only(source: &VersionSourceBinding) -> bool {
+    source.descriptor.kind == SourceConnectorKind::ArunaNative
+        && source.descriptor.public_config.contains_key(NATIVE_SET_ID)
 }
 
 /// The reads of the copies this member may keep of `held`: its attachment, its cache entry.

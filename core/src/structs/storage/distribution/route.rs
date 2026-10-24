@@ -151,6 +151,19 @@ impl DistributionSnapshot {
         })
     }
 
+    /// The ready members that keep the records of `range`, its coordinator last, so reads of
+    /// the range go to replicas and `all` coverage members first.
+    pub fn record_holders(&self, range: &KeyRange) -> Vec<&DistributionMember> {
+        let ready = |member: &&DistributionMember| member.state == MemberState::Ready;
+        let mut holders: Vec<&DistributionMember> = (self.config.members.iter())
+            .filter(|member| member.member_id != range.coordinator)
+            .filter(|member| keeps_records(range, member))
+            .filter(ready)
+            .collect();
+        holders.extend(self.member(range.coordinator).filter(ready));
+        holders
+    }
+
     /// The ranges whose records `member_id` holds: those it coordinates or replicates, or
     /// every range with `all` coverage.
     pub fn held_ranges(&self, member_id: Ulid) -> Vec<&KeyRange> {

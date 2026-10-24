@@ -112,6 +112,8 @@ const DELEGATED_OPERATIONS: &[&str] = &[
     "CompleteMultipartUpload",
     "AbortMultipartUpload",
     "ListParts",
+    "CopyObject",
+    "UploadPartCopy",
 ];
 
 #[derive(Clone)]
@@ -701,7 +703,10 @@ impl AuthProvider {
             return Err(denied("requests must address an object"));
         };
         let digest = forwarded_digest(cx.method(), &bucket, &key, cx.uri().query(), cx.headers());
+        let copy_source =
+            (cx.headers().get("x-amz-copy-source")).and_then(|value| value.to_str().ok());
         if delegation.operation != operation
+            || delegation.copy_source.as_deref() != copy_source
             || delegation.bucket != bucket
             || delegation.key != key
             || delegation.request_digest != digest
