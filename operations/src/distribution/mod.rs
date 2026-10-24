@@ -31,6 +31,7 @@ pub mod source_keep;
 pub mod split;
 pub mod status;
 pub mod ticket;
+pub mod version_key;
 #[cfg(test)]
 pub(crate) mod test_record;
 #[cfg(test)]

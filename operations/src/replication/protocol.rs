@@ -514,6 +514,15 @@ pub enum VersionReplicationMessage {
     PlacementPolicyDenied {
         policy_ids: Vec<Ulid>,
     },
+    /// Asks a member of a distributed bucket for the key of one version by its version id
+    /// index. Infrastructure peers only; the reader is checked by the summary that follows.
+    VersionKeyRequest {
+        realm_id: RealmId,
+        set_id: Ulid,
+        version_id: Ulid,
+    },
+    /// The key the member's index holds, `None` when it holds no such version.
+    VersionKeyResponse(Option<String>),
 }
 
 /// Read-only question a node asks a peer: do you hold this version, and on
