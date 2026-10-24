@@ -1,7 +1,6 @@
-//! Bootstraps a catching-up member of a distributed bucket from the coordinators of its ranges.
-//! Each range is walked over the ordered inventory in bounded pages with a durable cursor; a page
-//! waits until its jobs were delivered, live publications overlap the walk, and a coordinator
-//! whose walks for the member all ended states the catch-up to the record's publisher.
+//! Bootstraps a catching-up member from its coordinators: bounded pages over the ordered inventory
+//! with a durable cursor, each waiting for its jobs while live publications overlap the walk; a
+//! coordinator whose walks all ended states the catch-up to the record's publisher.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

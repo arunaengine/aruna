@@ -86,7 +86,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keys_group_by_set() {
+    fn keys_group_sets() {
         let (set, other) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
         let key = bootstrap_key(set, Ulid::from_bytes([3; 16]), Ulid::from_bytes([4; 16]));
         assert!(key.starts_with(&bootstrap_prefix(set)));

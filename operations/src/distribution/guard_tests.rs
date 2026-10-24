@@ -50,7 +50,7 @@ fn replaced_bucket_refused() {
 }
 
 #[test]
-fn reads_stay_in_held_ranges() {
+fn reads_held_only() {
     let (snapshot, bytes) = record(true);
     let own = binding(&snapshot, 1, 5);
     assert_eq!(
