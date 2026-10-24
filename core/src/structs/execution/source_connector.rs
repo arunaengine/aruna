@@ -29,6 +29,12 @@ pub enum SourceConnectorKind {
 }
 
 impl SourceConnectorKind {
+    /// Whether a read sent with `If-Match` fails when the source no longer holds that ETag:
+    /// S3 does, while HTTP servers may ignore the condition and other sources have none.
+    pub const fn enforces_if_match(self) -> bool {
+        matches!(self, Self::S3)
+    }
+
     /// Whether the source lists a whole prefix flat and resumes after a key, so an import walks
     /// it with one provider cursor instead of a directory queue.
     pub const fn lists_flat(self) -> bool {

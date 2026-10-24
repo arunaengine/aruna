@@ -1058,16 +1058,25 @@ impl GetObjectOperation {
                 });
                 if let (ObservationMatch::Same, Some(stored)) = (comparison, stored) {
                     // Undrifted: serve the recorded observation, bound to its ETag. Without a
-                    // strong ETag to bind to, recorded digests are checked on the whole bytes.
+                    // source that enforces that binding, recorded digests are checked on the
+                    // whole bytes, and a pinned version without digests is refused.
                     self.last_refresh = self.reference_last_refresh;
                     let content_type = stored.content_type.clone().or(metadata.content_type);
                     let served = SourceMetadata {
                         content_type,
                         ..stored
                     };
-                    let bound = strong_validator(served.etag.as_deref());
+                    let enforces = self.reference_access.as_ref().is_some_and(|access| {
+                        let ResolvedSourceAccess::OpenDal { kind, .. } = access;
+                        kind.enforces_if_match()
+                    });
+                    let bound = enforces && strong_validator(served.etag.as_deref());
                     if !bound {
-                        self.verify_digests = served.enforced_checksums();
+                        let enforced = served.enforced_checksums();
+                        if enforced.is_empty() && self.reference_explicit {
+                            return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                        }
+                        self.verify_digests = enforced;
                     }
                     return self.serve_reference_source(served, bound);
                 }

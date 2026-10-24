@@ -427,7 +427,7 @@ fn reference_range_reads() {
     });
     let txn_id = Ulid::generate();
     let access = ResolvedSourceAccess::OpenDal {
-        kind: SourceConnectorKind::Http,
+        kind: SourceConnectorKind::S3,
         config: HashMap::new(),
         path: "folder/file.txt".to_string(),
         version: None,
@@ -1896,6 +1896,26 @@ fn same_without_etag_verified() {
         operation.step(source_read(stored)).as_slice(),
         [Effect::Blob(BlobEffect::SpoolHidden { .. })]
     ));
+}
+
+// An HTTP server may ignore `If-Match`, so a pinned version it serves needs recorded digests:
+// without them it is refused even when the observation compares as the same.
+#[test]
+fn unbound_pin_refused() {
+    let mut operation = drifted_operation();
+    let stored = observation(9);
+    operation.reference_cached = Some(stored.clone());
+    operation.reference_explicit = true;
+    operation.state = GetObjectState::HeadReferenceSource;
+
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: stored,
+    }));
+
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::HistoricalReferenceUnavailable)
+    );
 }
 
 // A bound read whose condition fails queues a request to observe the source, which the refresh
