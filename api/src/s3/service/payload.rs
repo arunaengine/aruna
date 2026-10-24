@@ -8,22 +8,32 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 
+use aruna_blob::hash::Hasher;
 use aruna_core::NodeId;
+use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::storage::distribution::delegation::{
     BodyTrailer, TRAILER_BYTES, body_hasher,
 };
 use aruna_operations::distribution::delegate::sign_body;
+use std::collections::HashMap;
+
+use crate::s3::checksum::validate_trailer_headers;
+use crate::s3::util::map_checksum_algorithm;
 use aruna_operations::driver::DriverContext;
 use bytes::Bytes;
 use futures_core::Stream;
 use s3s::dto::StreamingBlob;
 use s3s::{S3Result, s3_error};
 
-/// Appends the signed trailer once `body` ends.
+/// Reads the client's verified trailing checksum value once the body ended.
+pub(super) type ChecksumValue = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Appends the signed trailer once `body` ends, with the client's trailing checksum if any.
 pub(super) fn frame_body(
     mut body: StreamingBlob,
     context: Arc<DriverContext>,
     nonce: [u8; 16],
+    checksum: Option<ChecksumValue>,
 ) -> StreamingBlob {
     let mut hasher = body_hasher();
     let mut length = 0u64;
@@ -47,7 +57,7 @@ pub(super) fn frame_body(
                 let trailer = BodyTrailer {
                     length,
                     digest: *hasher.finalize().as_bytes(),
-                    checksum: None,
+                    checksum: checksum.as_ref().and_then(|value| value()),
                 };
                 let encoded = sign_body(&context, &nonce, &trailer)
                     .and_then(|signature| trailer.encode(&signature).ok());
@@ -68,6 +78,8 @@ pub(super) fn frame_body(
 pub(super) struct BodyCheck {
     pub issuer: NodeId,
     pub nonce: [u8; 16],
+    /// The client's trailing checksum the trailer must carry, and whether it is composite.
+    pub checksum: Option<(ChecksumAlgorithm, bool)>,
 }
 
 /// Passes the body without its trailer and fails the stream unless the trailer is the
@@ -75,6 +87,7 @@ pub(super) struct BodyCheck {
 pub(super) fn unframe_body(mut body: StreamingBlob, check: BodyCheck) -> StreamingBlob {
     let mut held: Vec<u8> = Vec::new();
     let mut hasher = body_hasher();
+    let mut sums = check.checksum.map(|_| Hasher::new());
     let mut length = 0u64;
     let mut done = false;
     StreamingBlob::wrap::<_, std::io::Error>(futures_util::stream::poll_fn(move |cx| {
@@ -90,6 +103,9 @@ pub(super) fn unframe_body(mut body: StreamingBlob, check: BodyCheck) -> Streami
                     }
                     let passed: Vec<u8> = held.drain(..held.len() - TRAILER_BYTES).collect();
                     hasher.update(&passed);
+                    if let Some(sums) = sums.as_mut() {
+                        sums.update(&passed);
+                    }
                     length += passed.len() as u64;
                     return Poll::Ready(Some(Ok(Bytes::from(passed))));
                 }
@@ -100,7 +116,8 @@ pub(super) fn unframe_body(mut body: StreamingBlob, check: BodyCheck) -> Streami
                 Poll::Ready(None) => {
                     done = true;
                     let digest = *hasher.finalize().as_bytes();
-                    return match trailer_holds(&check, &held, length, digest) {
+                    let sums = sums.take().map(|sums| sums.to_map());
+                    return match trailer_holds(&check, &held, (length, digest), sums) {
                         true => Poll::Ready(None),
                         false => Poll::Ready(Some(Err(std::io::Error::other(
                             "the forwarded body does not match its signed trailer",
@@ -113,16 +130,51 @@ pub(super) fn unframe_body(mut body: StreamingBlob, check: BodyCheck) -> Streami
     }))
 }
 
-fn trailer_holds(check: &BodyCheck, held: &[u8], length: u64, digest: [u8; 32]) -> bool {
+fn trailer_holds(
+    check: &BodyCheck,
+    held: &[u8],
+    (length, digest): (u64, [u8; 32]),
+    sums: Option<HashMap<String, Vec<u8>>>,
+) -> bool {
     let Some((trailer, signature)) = BodyTrailer::decode(held) else {
         return false;
     };
-    trailer.length == length
+    let signed = trailer.length == length
         && trailer.digest == digest
         && check
             .issuer
             .verify(&trailer.signing_bytes(&check.nonce), &signature)
-            .is_ok()
+            .is_ok();
+    let checksum = match (check.checksum, trailer.checksum, sums) {
+        (None, None, _) => true,
+        (Some((algorithm, composite)), Some(value), Some(sums)) => {
+            checksum_holds(algorithm, composite, &value, &sums)
+        }
+        _ => false,
+    };
+    signed && checksum
+}
+
+/// Whether the client's trailing checksum matches the bytes the coordinator received.
+fn checksum_holds(
+    algorithm: ChecksumAlgorithm,
+    composite: bool,
+    value: &str,
+    sums: &HashMap<String, Vec<u8>>,
+) -> bool {
+    let Some(name) = map_checksum_algorithm(algorithm) else {
+        return false;
+    };
+    let name = format!("x-amz-checksum-{}", name.as_str().to_ascii_lowercase());
+    let mut headers = http::HeaderMap::new();
+    match (
+        http::HeaderName::from_bytes(name.as_bytes()),
+        http::HeaderValue::from_str(value),
+    ) {
+        (Ok(name), Ok(value)) => headers.insert(name, value),
+        _ => return false,
+    };
+    validate_trailer_headers(algorithm, composite, &headers, sums).is_ok()
 }
 
 /// The length of a framed body without its trailer.
@@ -148,10 +200,14 @@ mod tests {
 
     /// A body framed as the issuer would, with a trailer over `signed` instead of `sent`.
     fn framed(sent: &[u8], signed: &[u8]) -> Vec<u8> {
+        framed_with(sent, signed, None)
+    }
+
+    fn framed_with(sent: &[u8], signed: &[u8], checksum: Option<String>) -> Vec<u8> {
         let trailer = BodyTrailer {
             length: signed.len() as u64,
             digest: *body_hasher().update(signed).finalize().as_bytes(),
-            checksum: None,
+            checksum,
         };
         let signature = secret().sign(&trailer.signing_bytes(&[7; 16]));
         let mut bytes = sent.to_vec();
@@ -160,6 +216,14 @@ mod tests {
     }
 
     async fn read(bytes: Vec<u8>, chunk: usize) -> Result<Vec<u8>, String> {
+        read_checked(bytes, chunk, None).await
+    }
+
+    async fn read_checked(
+        bytes: Vec<u8>,
+        chunk: usize,
+        checksum: Option<(ChecksumAlgorithm, bool)>,
+    ) -> Result<Vec<u8>, String> {
         let chunks: Vec<Result<Bytes, std::io::Error>> = bytes
             .chunks(chunk)
             .map(|part| Ok(Bytes::copy_from_slice(part)))
@@ -168,6 +232,7 @@ mod tests {
         let check = BodyCheck {
             issuer: secret().public(),
             nonce: [7; 16],
+            checksum,
         };
         let mut stream = unframe_body(body, check);
         let mut out = Vec::new();
@@ -199,5 +264,22 @@ mod tests {
             unframed_length(Some(TRAILER_BYTES as i64 + 2)).unwrap(),
             Some(2)
         );
+    }
+
+    #[tokio::test]
+    async fn trailing_checksum_checked() {
+        use base64::Engine;
+        let body = b"hello".to_vec();
+        let mut sums = Hasher::new();
+        sums.update(&body);
+        let crc = sums.to_map()[aruna_core::structs::checksum::HASH_CRC32].clone();
+        let crc = base64::engine::general_purpose::STANDARD.encode(crc);
+        let check = Some((ChecksumAlgorithm::Crc32, false));
+        let good = framed_with(&body, &body, Some(crc));
+        assert_eq!(read_checked(good, 2, check).await, Ok(body.clone()));
+        let wrong = framed_with(&body, &body, Some("AAAAAA==".to_string()));
+        assert!(read_checked(wrong, 2, check).await.is_err());
+        // A trailer without the declared checksum fails as well.
+        assert!(read_checked(framed(&body, &body), 2, check).await.is_err());
     }
 }

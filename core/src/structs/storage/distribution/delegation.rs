@@ -38,8 +38,9 @@ pub const TRAILER_BYTES: usize = 8 + 32 + 1 + CHECKSUM_BYTES + 64;
 pub enum Payload {
     /// The request has no body.
     Empty,
-    /// The body streams and ends with a trailer the issuer signs over its length and digest.
-    Framed,
+    /// The body streams and ends with a trailer the issuer signs over its length and digest;
+    /// `checksum` names the algorithm of the client's verified trailing checksum it carries.
+    Framed { checksum: Option<String> },
     /// A small body known in advance, bound by its digest.
     Digest([u8; 32]),
 }
@@ -269,7 +270,7 @@ mod tests {
             key: "a/b".to_string(),
             copy_source: None,
             request_digest: request_digest("PUT", "spire", "a/b", None, &[]),
-            payload: Payload::Framed,
+            payload: Payload::Framed { checksum: None },
             nonce: [7; 16],
             issued_at: 100,
             valid_secs: 10,

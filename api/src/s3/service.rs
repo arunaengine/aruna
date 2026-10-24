@@ -876,11 +876,16 @@ impl S3 for ArunaS3Service {
         )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
-        let trailer_algorithm = declared_trailer_algorithm(
-            &req.headers,
-            req.trailing_headers.is_some(),
-            req.input.checksum_algorithm.as_ref(),
-        )?;
+        // A forwarded body carries the client's trailing checksum in its signed trailer.
+        let delegated_trailer = forward::delegated_trailer(&req.extensions)?;
+        let trailer_algorithm = match delegated_trailer {
+            Some(algorithm) => Some(algorithm),
+            None => declared_trailer_algorithm(
+                &req.headers,
+                req.trailing_headers.is_some(),
+                req.input.checksum_algorithm.as_ref(),
+            )?,
+        };
         let checksum_request = parse_upload_checksum(&req.headers, trailer_algorithm)?;
         let trailing_headers = req.trailing_headers.clone();
         let replication_auth = AuthContext {
@@ -920,7 +925,10 @@ impl S3 for ArunaS3Service {
                 query: forward::passed_query(req.uri.query()),
                 headers: forward::passed_headers(&req.headers, req.input.content_length),
                 body: match req.input.body.take() {
-                    Some(body) => forward::ForwardBody::Stream(body),
+                    Some(body) => forward::ForwardBody::Stream(
+                        body,
+                        forward::trailer_checksum(trailer_algorithm, trailing_headers.clone()),
+                    ),
                     None => forward::ForwardBody::Empty,
                 },
             };
@@ -929,9 +937,11 @@ impl S3 for ArunaS3Service {
         }
         // A forwarded body must end with the issuer's signed trailer.
         if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
+            let composite = checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE;
             let check = payload::BodyCheck {
                 issuer: delegated.issuer,
                 nonce: delegated.nonce,
+                checksum: delegated_trailer.map(|algorithm| (algorithm, composite)),
             };
             req.input.body = req
                 .input
@@ -977,8 +987,9 @@ impl S3 for ArunaS3Service {
         let result = drive(operation, &self.state)
             .await
             .map_err(IntoS3Error::into_s3_error)?;
+        // The unframed stream already checked a forwarded trailing checksum.
         validate_trailing_checksum(
-            trailer_algorithm,
+            trailer_algorithm.filter(|_| delegated_trailer.is_none()),
             &checksum_request.checksum_type,
             trailing_headers.as_ref(),
             &result.location.hashes,
@@ -1249,11 +1260,15 @@ impl S3 for ArunaS3Service {
                 || req.input.sse_customer_key_md5.is_some(),
         )?;
         validate_object_key(&req.input.key)?;
-        let trailer_algorithm = declared_trailer_algorithm(
-            &req.headers,
-            req.trailing_headers.is_some(),
-            req.input.checksum_algorithm.as_ref(),
-        )?;
+        let delegated_trailer = forward::delegated_trailer(&req.extensions)?;
+        let trailer_algorithm = match delegated_trailer {
+            Some(algorithm) => Some(algorithm),
+            None => declared_trailer_algorithm(
+                &req.headers,
+                req.trailing_headers.is_some(),
+                req.input.checksum_algorithm.as_ref(),
+            )?,
+        };
         let checksum_request = parse_upload_checksum(&req.headers, trailer_algorithm)?;
         let trailing_headers = req.trailing_headers.clone();
         let upload_id = parse_upload_id(&req.input.upload_id)?;
@@ -1281,7 +1296,10 @@ impl S3 for ArunaS3Service {
                 query: forward::passed_query(req.uri.query()),
                 headers: forward::passed_headers(&req.headers, req.input.content_length),
                 body: match body {
-                    Some(body) => forward::ForwardBody::Stream(body),
+                    Some(body) => forward::ForwardBody::Stream(
+                        body,
+                        forward::trailer_checksum(trailer_algorithm, trailing_headers.clone()),
+                    ),
                     None => forward::ForwardBody::Empty,
                 },
             };
@@ -1289,9 +1307,11 @@ impl S3 for ArunaS3Service {
             return Ok(Self::forwarded_part(&response));
         }
         if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
+            let composite = checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE;
             let check = payload::BodyCheck {
                 issuer: delegated.issuer,
                 nonce: delegated.nonce,
+                checksum: delegated_trailer.map(|algorithm| (algorithm, composite)),
             };
             req.input.body = req
                 .input
@@ -1330,8 +1350,9 @@ impl S3 for ArunaS3Service {
         let result = drive(operation, &self.state)
             .await
             .map_err(IntoS3Error::into_s3_error)?;
+        // The unframed stream already checked a forwarded trailing checksum.
         validate_trailing_checksum(
-            trailer_algorithm,
+            trailer_algorithm.filter(|_| delegated_trailer.is_none()),
             &checksum_request.checksum_type,
             trailing_headers.as_ref(),
             &result.location.hashes,

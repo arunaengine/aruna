@@ -202,7 +202,7 @@ pub fn validate_trailing_checksum(
     )
 }
 
-fn validate_trailer_headers(
+pub(crate) fn validate_trailer_headers(
     algorithm: ChecksumAlgorithm,
     composite: bool,
     trailers: &HeaderMap,

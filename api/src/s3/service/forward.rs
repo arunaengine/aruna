@@ -4,7 +4,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
@@ -24,9 +24,13 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::ArunaS3Service;
-use super::payload::frame_body;
+use super::payload::{ChecksumValue, frame_body};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
+use crate::s3::util::{map_checksum_algorithm, parse_checksum_algorithm};
+use aruna_core::structs::checksum::ChecksumAlgorithm;
+use s3s::TrailingHeaders;
+use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -94,9 +98,54 @@ pub(super) struct ForwardRequest {
 pub(super) enum ForwardBody {
     Empty,
     /// Streams with a trailer the issuer signs over its length and digest.
-    Stream(StreamingBlob),
+    Stream(StreamingBlob, Option<TrailerChecksum>),
     /// A small body known in advance, bound by its digest.
     Known(Bytes),
+}
+
+/// The client's trailing checksum a forwarded body carries in its signed trailer: the S3
+/// algorithm name and the value the client's trailer named once the body ended.
+pub(super) struct TrailerChecksum {
+    pub algorithm: String,
+    pub value: ChecksumValue,
+}
+
+/// The client's trailing checksum to forward, read from its verified trailer once the body
+/// ended; `None` without a trailer.
+pub(super) fn trailer_checksum(
+    algorithm: Option<ChecksumAlgorithm>,
+    trailing: Option<TrailingHeaders>,
+) -> Option<TrailerChecksum> {
+    let (algorithm, trailing) = (algorithm?, trailing?);
+    let name = map_checksum_algorithm(algorithm)?.as_str().to_string();
+    let header = format!("x-amz-checksum-{}", name.to_ascii_lowercase());
+    let value: ChecksumValue = Arc::new(move || {
+        trailing
+            .read(|headers| {
+                let value = headers.get(&header)?.to_str().ok()?;
+                Some(value.to_string())
+            })
+            .flatten()
+    });
+    Some(TrailerChecksum {
+        algorithm: name,
+        value,
+    })
+}
+
+/// The trailing checksum algorithm a delegated request's framed body carries.
+pub(super) fn delegated_trailer(
+    extensions: &http::Extensions,
+) -> S3Result<Option<ChecksumAlgorithm>> {
+    let payload = extensions
+        .get::<DelegatedRequest>()
+        .map(|delegated| &delegated.payload);
+    match payload {
+        Some(Payload::Framed {
+            checksum: Some(name),
+        }) => parse_checksum_algorithm(&S3ChecksumAlgorithm::from(name.clone())).map(Some),
+        _ => Ok(None),
+    }
 }
 
 /// Whether a header carries request semantics the delegation must bind.
@@ -263,7 +312,10 @@ impl ArunaS3Service {
         };
         let (payload, extra) = match &request.body {
             ForwardBody::Empty => (Payload::Empty, 0),
-            ForwardBody::Stream(_) => (Payload::Framed, TRAILER_BYTES as i64),
+            ForwardBody::Stream(_, checksum) => {
+                let checksum = checksum.as_ref().map(|checksum| checksum.algorithm.clone());
+                (Payload::Framed { checksum }, TRAILER_BYTES as i64)
+            }
             ForwardBody::Known(bytes) => (Payload::Digest(body_digest(bytes)), 0),
         };
         let mut headers = HeaderMap::new();
@@ -323,8 +375,9 @@ impl ArunaS3Service {
             .header(DELEGATION_HEADER, delegation);
         match request.body {
             ForwardBody::Empty => {}
-            ForwardBody::Stream(body) => {
-                let framed = frame_body(body, self.state.clone(), nonce);
+            ForwardBody::Stream(body, checksum) => {
+                let checksum = checksum.map(|checksum| checksum.value);
+                let framed = frame_body(body, self.state.clone(), nonce, checksum);
                 outgoing = outgoing.body(reqwest::Body::wrap_stream(framed));
             }
             ForwardBody::Known(bytes) => outgoing = outgoing.body(bytes),

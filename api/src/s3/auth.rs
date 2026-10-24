@@ -96,7 +96,7 @@ pub(crate) struct DelegatedRequest {
 /// The body binding each forwarded operation must carry.
 fn payload_fits(operation: &str, payload: &Payload) -> bool {
     match operation {
-        "PutObject" | "UploadPart" => matches!(payload, Payload::Framed),
+        "PutObject" | "UploadPart" => matches!(payload, Payload::Framed { .. }),
         "CompleteMultipartUpload" => matches!(payload, Payload::Digest(_)),
         _ => matches!(payload, Payload::Empty),
     }
@@ -1060,15 +1060,24 @@ mod tests {
 
     #[test]
     fn payloads_fit_operations() {
-        assert!(payload_fits("PutObject", &Payload::Framed));
+        assert!(payload_fits(
+            "PutObject",
+            &Payload::Framed { checksum: None }
+        ));
         assert!(!payload_fits("PutObject", &Payload::Empty));
         assert!(payload_fits(
             "CompleteMultipartUpload",
             &Payload::Digest([1; 32])
         ));
-        assert!(!payload_fits("CompleteMultipartUpload", &Payload::Framed));
+        assert!(!payload_fits(
+            "CompleteMultipartUpload",
+            &Payload::Framed { checksum: None }
+        ));
         assert!(payload_fits("DeleteObject", &Payload::Empty));
-        assert!(!payload_fits("DeleteObject", &Payload::Framed));
+        assert!(!payload_fits(
+            "DeleteObject",
+            &Payload::Framed { checksum: None }
+        ));
     }
     use aruna_storage::FjallStorage;
 
