@@ -102,3 +102,16 @@ fn publisher_errors_map() {
         PublishRefusal::Rejected(_)
     ));
 }
+
+#[test]
+fn internal_tokens_refused() {
+    let realm = RealmId::from_bytes([9; 32]);
+    let internal = AuthToken::internal(AuthContext {
+        user_id: UserId::nil(realm),
+        realm_id: realm,
+        path_restrictions: None,
+        session: None,
+    });
+    assert!(!bearer_only(&internal));
+    assert!(bearer_only(&AuthToken::bearer("token").unwrap()));
+}

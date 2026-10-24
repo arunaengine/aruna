@@ -28,7 +28,7 @@ use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::{authorize_peer, authorize_pull};
-use crate::metadata::protocol::MetadataTransportMessage;
+use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
 use crate::placement::process_placements::load_realm_config;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::GetBucketOperation;
@@ -98,6 +98,23 @@ pub(crate) async fn publish_local(
     Err(last)
 }
 
+/// The caller of a forwarded configuration request. Only the caller's own bearer token
+/// counts; a peer-asserted identity never acts as a group admin (D12, K1).
+async fn caller(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: AuthToken,
+) -> Result<AuthContext, SyncRefusal> {
+    match bearer_only(&auth_token) {
+        true => authorize_peer(context, peer, auth_token).await,
+        false => Err(SyncRefusal::Unauthorized),
+    }
+}
+
+fn bearer_only(auth_token: &AuthToken) -> bool {
+    matches!(auth_token, AuthToken::Bearer(_))
+}
+
 /// The publisher's side of a forwarded admin request or member statement.
 pub(crate) async fn serve_publish(
     context: &Arc<DriverContext>,
@@ -110,7 +127,7 @@ pub(crate) async fn serve_publish(
             set_id,
             request_id,
             request,
-        } => match authorize_peer(context, peer, auth_token).await {
+        } => match caller(context, peer, auth_token).await {
             // Statements carry their signer's authority, never a forwarded caller's.
             Ok(_) if !request.admin() => Err(PublishRefusal::Rejected(
                 "statements are submitted without a caller".to_string(),
@@ -169,7 +186,7 @@ pub(crate) async fn serve_admission(
     else {
         return reject("unexpected admission message");
     };
-    let result = match authorize_peer(context, peer, auth_token).await {
+    let result = match caller(context, peer, auth_token).await {
         Ok(auth) => admit_member(context, &auth, &snapshot, member_id).await,
         Err(refusal) => Err(refusal),
     };
