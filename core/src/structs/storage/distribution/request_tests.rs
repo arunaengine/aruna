@@ -205,3 +205,35 @@ fn admission_binds_create() {
     assert!(next_snapshot(realm(), Some(&fork), &admit(2, 2)).is_err());
     assert!(next_snapshot(realm(), Some(&created()), &admit(2, 2)).is_ok());
 }
+
+#[test]
+fn late_edges_catch_up() {
+    use crate::structs::storage::distribution::presets::add_edges;
+    use crate::structs::storage::distribution::{DataStrategy, MemberState};
+    let nodes = [(member_id(1), secret(1).public())];
+    let mut layout = replica_layout(root().set_id(), &nodes).unwrap();
+    let edge = [(member_id(2), secret(2).public())];
+    add_edges(&mut layout, &edge, DataStrategy::Stream).unwrap();
+    let mut config = config();
+    config.members = layout.members;
+    config.ranges = layout.ranges;
+    let create = DistributionRequest::Create {
+        root: root(),
+        config,
+    };
+    let head = next_snapshot(realm(), None, &create).unwrap();
+    let intent = head.config.members[0].intent;
+    let admit = |member: u8| {
+        let signed = statement(member, member + 40, intent, StatementKind::Admit);
+        DistributionRequest::Statement(Box::new(signed.sign(&secret(member))))
+    };
+    let head = step(&head, &admit(1));
+    let head = step(&head, &DistributionRequest::Activate);
+    let head = step(&head, &admit(2));
+    assert_eq!(head.member(member_id(1)).unwrap().state, MemberState::Ready);
+    assert_eq!(
+        head.member(member_id(2)).unwrap().state,
+        MemberState::CatchingUp
+    );
+    assert!(head.serving());
+}

@@ -218,7 +218,13 @@ fn embed(
     next.check_statement(realm_id, signed)?;
     match &statement.kind {
         StatementKind::Admit => {
-            if next.phase != SetPhase::Pending {
+            // After activation only a member that serves no range may still admit itself.
+            let late = next.phase != SetPhase::Pending;
+            let serves = next.config.ranges.iter().any(|range| {
+                range.coordinator == statement.member_id
+                    || range.replicas.contains(&statement.member_id)
+            });
+            if late && serves {
                 return Err(DistributionError::NotPending);
             }
             let member = next
@@ -227,9 +233,12 @@ fn embed(
                 .iter_mut()
                 .find(|member| member.member_id == statement.member_id)
                 .ok_or(DistributionError::NoMember(statement.member_id))?;
-            // A new set holds nothing yet, so an admitted member has nothing to catch up.
+            // A pending set holds nothing yet; a later member catches up first.
             member.incarnation = Some(statement.incarnation);
-            member.state = MemberState::Ready;
+            member.state = match late {
+                true => MemberState::CatchingUp,
+                false => MemberState::Ready,
+            };
             next.statements.retain(|known| {
                 known.statement.member_id != statement.member_id
                     || !matches!(known.statement.kind, StatementKind::Admit)
