@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aruna_core::effects::{IterStart, StorageEffect, StoragePriority};
+use aruna_core::effects::{IterEnd, IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::{NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, prefix_upper_bound};
@@ -59,6 +59,7 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         | StorageEffect::Write { key_space, .. }
         | StorageEffect::Delete { key_space, .. }
         | StorageEffect::Iter { key_space, .. }
+        | StorageEffect::IterRange { key_space, .. }
         | StorageEffect::Last { key_space, .. } => Some(key_space),
         StorageEffect::VaultWrite { .. }
         | StorageEffect::VaultRead { .. }
@@ -250,6 +251,14 @@ impl FjallStorage {
                 limit,
                 txn_id,
             } => self.iterate(key_space, prefix, start, limit, txn_id),
+            StorageEffect::IterRange {
+                key_space,
+                start,
+                end,
+                limit,
+                max_bytes,
+                txn_id,
+            } => self.iterate_range(key_space, start, end, (limit, max_bytes), txn_id),
             StorageEffect::Last {
                 key_space,
                 prefix,
@@ -1270,6 +1279,51 @@ pub(super) fn iterate_page<R: Readable>(
     };
 
     collect_page(iter, limit)
+}
+
+/// Reads one bounded page of `[start, end]`; only this interval joins a transaction's read set.
+pub(super) fn range_page<R: Readable>(
+    reader: &R,
+    keyspace: &OptimisticTxKeyspace,
+    start: &IterStart,
+    end: &IterEnd,
+    (limit, max_bytes): (usize, usize),
+) -> Result<PageResult, StorageError> {
+    let (from, to) = (start.key().as_ref(), end.key().as_ref());
+    let empty = match (start, end) {
+        (IterStart::At(_), IterEnd::Through(_)) => from > to,
+        _ => from >= to,
+    };
+    if empty || limit == 0 {
+        return Ok((Vec::new(), None));
+    }
+    let lower = match start {
+        IterStart::After(key) => Excluded(key.as_ref().to_vec()),
+        IterStart::At(key) => Included(key.as_ref().to_vec()),
+    };
+    let upper = match end {
+        IterEnd::Before(key) => Excluded(key.as_ref().to_vec()),
+        IterEnd::Through(key) => Included(key.as_ref().to_vec()),
+    };
+    let mut iter = reader.range(keyspace, (lower, upper)).peekable();
+    let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit.min(1024));
+    let mut bytes = 0usize;
+    while let Some(guard) = iter.next() {
+        let (key, value) = guard
+            .into_inner()
+            .map_err(|error| StorageError::ReadError(error.to_string()))?;
+        bytes = bytes.saturating_add(key.len() + value.len());
+        if !values.is_empty() && bytes > max_bytes {
+            let last = values.last().map(|(key, _)| key.clone());
+            return Ok((values, last));
+        }
+        values.push((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())));
+        if values.len() == limit || bytes >= max_bytes {
+            let last = iter.peek().and(values.last().map(|(key, _)| key.clone()));
+            return Ok((values, last));
+        }
+    }
+    Ok((values, None))
 }
 
 pub(super) fn collect_page(iter: fjall::Iter, limit: usize) -> Result<PageResult, StorageError> {

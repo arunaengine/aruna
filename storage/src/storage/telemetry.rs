@@ -117,6 +117,20 @@ pub(super) fn record_effect_fields(span: &Span, effect: &StorageEffect) {
                 span.record("txn_id", field::display(txn_id));
             }
         }
+        StorageEffect::IterRange {
+            key_space,
+            start,
+            limit,
+            txn_id,
+            ..
+        } => {
+            span.record("key_space", field::display(key_space));
+            span.record("cursor_len", start.key().as_ref().len() as u64);
+            span.record("limit", *limit as u64);
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
         StorageEffect::Last {
             key_space,
             prefix,
@@ -155,6 +169,7 @@ pub(super) fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
         StorageEffect::AbortTransaction { .. } => "abort_transaction",
         StorageEffect::SyncAll => "sync_all",
         StorageEffect::Iter { .. } => "iter",
+        StorageEffect::IterRange { .. } => "iter_range",
         StorageEffect::Last { .. } => "last",
         StorageEffect::VaultWrite { .. } => "vault_write",
         StorageEffect::VaultRead { .. } => "vault_read",

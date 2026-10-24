@@ -657,6 +657,7 @@ pub(super) fn storage_effect_mutates(effect: &StorageEffect) -> bool {
         StorageEffect::Read { .. }
         | StorageEffect::BatchRead { .. }
         | StorageEffect::Iter { .. }
+        | StorageEffect::IterRange { .. }
         | StorageEffect::Last { .. }
         | StorageEffect::VaultRead { .. }
         | StorageEffect::AbortTransaction { .. }
@@ -694,6 +695,10 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
             txn_id: Some(txn_id),
             ..
         }
+        | StorageEffect::IterRange {
+            txn_id: Some(txn_id),
+            ..
+        }
         | StorageEffect::Last {
             txn_id: Some(txn_id),
             ..
@@ -722,6 +727,7 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
         | StorageEffect::Delete { txn_id: None, .. }
         | StorageEffect::BatchDelete { txn_id: None, .. }
         | StorageEffect::Iter { txn_id: None, .. }
+        | StorageEffect::IterRange { txn_id: None, .. }
         | StorageEffect::Last { txn_id: None, .. }
         | StorageEffect::VaultWrite { txn_id: None, .. }
         | StorageEffect::VaultRead { txn_id: None, .. }

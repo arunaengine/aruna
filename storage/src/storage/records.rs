@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::IterStart;
+use aruna_core::effects::{IterEnd, IterStart};
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use byteview::ByteView;
@@ -10,7 +10,7 @@ use fjall::{OptimisticTxKeyspace, Readable};
 use ulid::Ulid;
 
 use super::{
-    FjallStorage, Txn, batch_read_with, iterate_page, read_last_with, store_batch_read,
+    FjallStorage, Txn, batch_read_with, iterate_page, range_page, read_last_with, store_batch_read,
     store_iterate, store_last, store_read,
 };
 
@@ -324,6 +324,41 @@ impl FjallStorage {
             }
         } else {
             return store_iterate(&self.store, keyspace, prefix, start, limit);
+        };
+        match result {
+            Ok((values, next_start_after)) => StorageEvent::IterResult {
+                values,
+                next_start_after,
+            },
+            Err(error) => StorageEvent::Error { error },
+        }
+    }
+
+    pub(super) fn iterate_range(
+        &mut self,
+        key_space: String,
+        start: IterStart,
+        end: IterEnd,
+        budget: (usize, usize),
+        txn_id: Option<Ulid>,
+    ) -> StorageEvent {
+        let keyspace = match self.read_keyspace(&key_space, txn_id) {
+            Ok(Some(keyspace)) => keyspace,
+            Ok(None) => {
+                return StorageEvent::IterResult {
+                    values: Vec::new(),
+                    next_start_after: None,
+                };
+            }
+            Err(error) => return StorageEvent::Error { error },
+        };
+        let result = match txn_id.map(|txn_id| self.txns.get(&txn_id)) {
+            Some(Some(Txn::Read(txn))) => range_page(txn, &keyspace, &start, &end, budget),
+            Some(Some(Txn::Write(txn))) => {
+                range_page(txn.as_ref(), &keyspace, &start, &end, budget)
+            }
+            Some(None) => Err(StorageError::TransactionNotFound),
+            None => range_page(&self.store.db.read_tx(), &keyspace, &start, &end, budget),
         };
         match result {
             Ok((values, next_start_after)) => StorageEvent::IterResult {

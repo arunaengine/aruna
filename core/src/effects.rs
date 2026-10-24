@@ -593,6 +593,18 @@ pub enum StorageEffect {
         limit: usize,
         txn_id: Option<TxnId>,
     },
+    /// Reads the rows from `start` to `end` in key order, at most `limit` rows and, after the
+    /// first row, at most `max_bytes` of keys and values. In a write transaction only this
+    /// interval joins the read set. Answers `IterResult`; `next_start_after` names the last
+    /// returned key while the interval holds more rows.
+    IterRange {
+        key_space: KeySpace,
+        start: IterStart,
+        end: IterEnd,
+        limit: usize,
+        max_bytes: usize,
+        txn_id: Option<TxnId>,
+    },
     /// Read the lexicographically last entry in a keyspace, optionally by prefix.
     Last {
         key_space: KeySpace,
@@ -639,6 +651,23 @@ impl IterStart {
     pub fn key(&self) -> &Key {
         match self {
             IterStart::After(key) | IterStart::At(key) => key,
+        }
+    }
+}
+
+/// Upper bound of a [`StorageEffect::IterRange`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IterEnd {
+    /// Exclusive: the read stops before this key.
+    Before(Key),
+    /// Inclusive: the read ends with this key if it exists.
+    Through(Key),
+}
+
+impl IterEnd {
+    pub fn key(&self) -> &Key {
+        match self {
+            IterEnd::Before(key) | IterEnd::Through(key) => key,
         }
     }
 }
