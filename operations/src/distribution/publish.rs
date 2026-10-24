@@ -28,6 +28,7 @@ use aruna_core::structs::storage::distribution::{
 };
 use aruna_core::types::{Effects, TxnId, Value};
 use aruna_core::{TaskEvent, UserId};
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -73,6 +74,8 @@ pub enum PublishError {
     Dropped,
     #[error("realm config document missing")]
     ConfigMissing,
+    #[error("the request id was already used for another request or requester")]
+    RequestReused,
     #[error("snapshot signing unavailable: {0}")]
     SignUnavailable(String),
     #[error("operation did not finish")]
@@ -114,6 +117,15 @@ pub struct PublishOperation {
     output: Option<Result<DistributionRevision, PublishError>>,
 }
 
+/// What the publisher keeps per accepted request, so a retry replays only the same request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedRequest {
+    pub revision: DistributionRevision,
+    /// BLAKE3 over the canonical request encoding.
+    pub fingerprint: [u8; 32],
+    pub requester: Option<UserId>,
+}
+
 /// The key of an accepted request: set id then request id.
 pub fn accept_key(set_id: Ulid, request_id: Ulid) -> Vec<u8> {
     let mut key = set_id.to_bytes().to_vec();
@@ -142,6 +154,15 @@ impl PublishOperation {
             next: None,
             output: None,
         }
+    }
+
+    fn fingerprint(&self) -> [u8; 32] {
+        let bytes = postcard::to_allocvec(&self.config.request).unwrap_or_default();
+        *blake3::hash(&bytes).as_bytes()
+    }
+
+    fn requester(&self) -> Option<UserId> {
+        self.config.auth_context.as_ref().map(|auth| auth.user_id)
     }
 
     fn target(&self) -> AdminDocumentTarget {
@@ -193,9 +214,14 @@ impl PublishOperation {
                 got: "a batch of another length".to_string(),
             })?;
         if let Some(accepted) = accepted {
-            let revision: DistributionRevision =
+            let accepted: AcceptedRequest =
                 postcard::from_bytes(accepted.as_ref()).map_err(ConversionError::from)?;
-            self.output = Some(Ok(revision));
+            // A reused request id only replays the same request from the same requester.
+            if accepted.fingerprint != self.fingerprint() || accepted.requester != self.requester()
+            {
+                return Err(PublishError::RequestReused);
+            }
+            self.output = Some(Ok(accepted.revision));
             return Ok(self.abort_replay());
         }
         self.stored = Stored {
@@ -323,7 +349,12 @@ impl PublishOperation {
             placement,
             false,
         );
-        let accepted = postcard::to_allocvec(&revision).map_err(ConversionError::from)?;
+        let accepted = AcceptedRequest {
+            revision,
+            fingerprint: self.fingerprint(),
+            requester: self.requester(),
+        };
+        let accepted = postcard::to_allocvec(&accepted).map_err(ConversionError::from)?;
         let writes = vec![
             (
                 DISTRIBUTION_KEYSPACE.to_string(),

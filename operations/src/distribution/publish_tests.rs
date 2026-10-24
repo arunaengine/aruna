@@ -197,17 +197,36 @@ fn accepted_request_replays() {
         number: 3,
         digest: [8; 32],
     };
-    let accepted: Value = postcard::to_allocvec(&revision).unwrap().into();
-    let mut operation = operation(PUBLISHER, create());
-    let effects = begin(&mut operation, [None, Some(accepted), None, None]);
+    let accepted = |request: &DistributionRequest, requester: Option<UserId>| -> Value {
+        let row = AcceptedRequest {
+            revision,
+            fingerprint: *blake3::hash(&postcard::to_allocvec(request).unwrap()).as_bytes(),
+            requester,
+        };
+        postcard::to_allocvec(&row).unwrap().into()
+    };
+    let mut replay = operation(PUBLISHER, create());
+    let row = accepted(&create(), Some(auth().user_id));
+    let effects = begin(&mut replay, [None, Some(row), None, None]);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::AbortTransaction { .. })]
     ));
-    operation.step(Event::Storage(StorageEvent::TransactionAborted {
+    replay.step(Event::Storage(StorageEvent::TransactionAborted {
         txn_id: Ulid::from_bytes([5; 16]),
     }));
-    assert_eq!(operation.finalize(), Ok(revision));
+    assert_eq!(replay.finalize(), Ok(revision));
+
+    // The same id for another request or another requester is refused.
+    let other = DistributionRequest::Activate;
+    for row in [
+        accepted(&other, Some(auth().user_id)),
+        accepted(&create(), None),
+    ] {
+        let mut reused = operation(PUBLISHER, create());
+        begin(&mut reused, [None, Some(row), None, None]);
+        assert_eq!(reused.finalize(), Err(PublishError::RequestReused));
+    }
 }
 
 #[test]
