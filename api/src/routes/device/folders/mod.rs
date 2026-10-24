@@ -21,16 +21,16 @@ use aruna_core::errors::StagingSourceError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
-    ActionKind, ActionOutcome, ActionScope, FolderMode, FolderState, RemoteBinding, SyncRefusal,
+    ActionKind, ActionOutcome, ActionScope, FolderMode, FolderState, RemoteBinding,
 };
 use aruna_core::types::Key;
-use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{
     ActionError, ApplyActionInput, ExpectedEntry, apply_action,
 };
 use aruna_operations::device::sync::folders::{
     BindFolderInput, FolderError, bind_folder, folder_counters, list_actions, list_entries,
-    list_folders, read_bound, read_entry, set_folder_state, set_propagate_deletes, unbind_folder,
+    list_folders, read_bound, read_entry, request_sync, set_folder_state, set_propagate_deletes,
+    unbind_folder,
 };
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 
@@ -202,23 +202,6 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
         FolderError::RemoteUnreachable { .. } => ServerError::BadGatewayReason(error.to_string()),
         FolderError::Unavailable => ServerError::ServiceUnavailableReason(error.to_string()),
         FolderError::Offer(offer) => map_offer_error(offer),
-    }
-}
-
-fn map_reconcile_error(error: ReconcileFolderError, remote: &RemoteBinding) -> ServerError {
-    let reason = error.describe(remote);
-    match error {
-        ReconcileFolderError::Sweep(error) => map_offer_error(error),
-        ReconcileFolderError::Refused(SyncRefusal::NotFound) => {
-            ServerError::BadRequestReason(reason)
-        }
-        ReconcileFolderError::Refused(SyncRefusal::Unauthorized | SyncRefusal::Forbidden) => {
-            ServerError::Forbidden
-        }
-        ReconcileFolderError::Unreachable(_) => ServerError::BadGatewayReason(reason),
-        ReconcileFolderError::Refused(_)
-        | ReconcileFolderError::Decide(_)
-        | ReconcileFolderError::Unavailable => ServerError::ServiceUnavailableReason(reason),
     }
 }
 
@@ -767,18 +750,21 @@ async fn resume_folder(
     post,
     path = "/device/folders/{folder_id}/sync",
     tag = "device",
-    summary = "Reconcile one folder now",
-    description = r#"Runs one reconciliation of the folder without waiting for the timer.
+    summary = "Start a sync pass now",
+    description = r#"Starts the next sync pass at once instead of waiting for the timer.
 
 **Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
 for.
 
 **Behavior**
+- The answer comes at once with the folder's current status; the pass runs in the background.
+  `GET /device/folders/{folder_id}` and `GET /device/transfers` show its progress, and a failed
+  pass sets `last_error`.
 - The pass observes the directory and the realm heads and applies only what the sync may apply on
   its own; everything else waits for an explicit action."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
-        (status = 200, description = "The folder was reconciled", body = SyncedFolderView,
+        (status = 200, description = "The pass started; the folder as it stands now", body = SyncedFolderView,
             example = json!({
                 "folder_id": "01JFOLDER0123456789ABCDEFG",
                 "root": "/home/ada/data",
@@ -804,13 +790,12 @@ for.
                 "last_reconcile_ms": 1775748191000_i64,
                 "created_at_ms": 1775748000000_i64
             })),
-        (status = 400, description = "Malformed folder id, an unusable local directory, or a missing remote bucket", body = ErrorResponse),
+        (status = 400, description = "Malformed folder id, or the local directory is missing or unusable", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not this device's owner, or the remote bucket refuses the owner", body = ErrorResponse),
+        (status = 403, description = "The caller is not this device's owner", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is paused", body = ErrorResponse),
-        (status = 502, description = "The remote realm node is unreachable", body = ErrorResponse),
-        (status = 503, description = "The folder could not be reconciled right now", body = ErrorResponse)
+        (status = 503, description = "This node cannot read local directories or its store is unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -830,10 +815,7 @@ async fn sync_folder(
             "the folder is not active".to_string(),
         ));
     }
-    aruna_operations::device::sync::reconcile_folder(&context, &folder)
-        .await
-        .map_err(|error| map_reconcile_error(error, &folder.remote))?;
-    let folder = read_bound(&context, folder_id)
+    request_sync(&context, &folder)
         .await
         .map_err(map_folder_error)?;
     Ok(Json(folder_detail(&state, folder).await?))

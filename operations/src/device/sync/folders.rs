@@ -204,6 +204,16 @@ async fn record_binding(
     Ok(folder)
 }
 
+/// Wakes the background pass for a folder whose root is still a usable directory.
+pub async fn request_sync(
+    context: &Arc<DriverContext>,
+    folder: &SyncedFolder,
+) -> Result<(), FolderError> {
+    check_root(context, &folder.root).await?;
+    crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
+    Ok(())
+}
+
 fn map_remote_error(error: ReconcileFolderError, remote: &RemoteBinding) -> FolderError {
     match error {
         ReconcileFolderError::Refused(SyncRefusal::NotFound) => FolderError::RemoteBucketMissing {

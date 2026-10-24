@@ -3,13 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    FolderError, ServerError, folder_name, map_action_error, map_folder_error, map_reconcile_error,
-    parse_hash,
+    FolderError, ServerError, folder_name, map_action_error, map_folder_error, parse_hash,
 };
 use crate::routes::device::dto::hex_hash;
 use aruna_core::id::NodeId;
-use aruna_core::structs::{RemoteBinding, SyncRefusal};
-use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::ActionError;
 use axum::http::StatusCode;
 
@@ -76,17 +73,6 @@ fn maps_folder_errors() {
         reason: "bucket \"test\" belongs to another group".to_string(),
     });
     assert_eq!(conflict.status_code(), StatusCode::CONFLICT);
-    let remote = RemoteBinding {
-        node_id: node,
-        bucket: "test".to_string(),
-        prefix: String::new(),
-    };
-    let sync = map_reconcile_error(
-        ReconcileFolderError::Refused(SyncRefusal::NotFound),
-        &remote,
-    );
-    assert_eq!(sync.status_code(), StatusCode::BAD_REQUEST);
-    assert_eq!(sync.to_string(), missing.to_string());
     let target = map_folder_error(FolderError::NotRealmNode(node));
     assert_eq!(target.status_code(), StatusCode::BAD_REQUEST);
     assert_eq!(

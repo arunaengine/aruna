@@ -11,6 +11,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
+use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
 use aruna_operations::device::sync::repository::{action_entry, base_entry, folder_entry};
 use aruna_operations::driver::DriverContext;
@@ -56,19 +57,25 @@ async fn seed_row(state: &ServerState, row: (String, Key, Value)) {
 async fn setup_with(capabilities: NodeCapabilities) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+    };
+    serve(dir, context, capabilities).await
+}
+
+/// Serves `context` as the owner's device, with a realm config that names it.
+async fn serve(dir: TempDir, context: DriverContext, capabilities: NodeCapabilities) -> Fixture {
     let realm_id = realm_id();
     let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
     let owner = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
     let state = Arc::new(
         ServerState::new(
-            Arc::new(DriverContext {
-                storage_handle: storage,
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: Some(TaskHandle::new()),
-                compute_handle: None,
-            }),
+            Arc::new(context),
             realm_id,
             node_id,
             capabilities,
@@ -104,6 +111,62 @@ async fn setup_with(capabilities: NodeCapabilities) -> Fixture {
 
 async fn setup() -> Fixture {
     setup_with(NodeCapabilities::user_node(realm_id()).unwrap()).await
+}
+
+/// Sends every timer key the scheduler fires, so a wake is awaited instead of slept on.
+struct Fired(tokio::sync::mpsc::UnboundedSender<TaskKey>);
+
+#[async_trait::async_trait]
+impl aruna_tasks::InboundTaskHandler for Fired {
+    async fn handle_timer(&self, key: TaskKey) {
+        let _ = self.0.send(key);
+    }
+}
+
+/// A device that reads local directories and reports the timers it fires. No pass runs.
+async fn local_setup() -> (Fixture, tokio::sync::mpsc::UnboundedReceiver<TaskKey>) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let storage = FjallStorage::open(&path).unwrap();
+    let net = aruna_net::NetHandle::new(
+        aruna_net::NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            realm_id: realm_id(),
+            discovery_method: aruna_net::DiscoveryMethod::None,
+            relay_method: aruna_net::RelayMethod::None,
+            ..aruna_net::NetConfig::default()
+        },
+        storage.clone(),
+    )
+    .await
+    .unwrap();
+    let backend = aruna_core::structs::storage::blob::BackendConfig {
+        backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
+        root: format!("{path}/blobs"),
+        service_config: std::collections::HashMap::new(),
+        bucket_prefix: Some("aruna-".to_string()),
+        max_bucket_size: Some(1_000_000),
+        multipart_bucket: Some("multipart".to_string()),
+        timeouts: Default::default(),
+    };
+    let blob = aruna_blob::blob::BlobHandler::new(backend, storage.clone(), net)
+        .await
+        .unwrap();
+    let (sender, fired) = tokio::sync::mpsc::unbounded_channel();
+    let task_handle = TaskHandle::new();
+    task_handle
+        .set_inbound_handler(Arc::new(Fired(sender)))
+        .await;
+    let context = DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: Some(blob),
+        metadata_handle: None,
+        task_handle: Some(task_handle),
+        compute_handle: None,
+    };
+    let capabilities = NodeCapabilities::user_node(realm_id()).unwrap();
+    (serve(dir, context, capabilities).await, fired)
 }
 
 fn owner_auth(fixture: &Fixture) -> AuthContext {
@@ -473,6 +536,46 @@ async fn sync_needs_active() {
     .await
     .unwrap_err();
     assert_eq!(paused.status_code(), StatusCode::CONFLICT);
+}
+
+/// "Sync now" answers with the folder as it stands and leaves the pass to the timer it wakes.
+#[tokio::test]
+async fn sync_skips_scan() {
+    let (fixture, mut fired) = local_setup().await;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("note.txt"), b"local").unwrap();
+    let id = Ulid::from_bytes([29u8; 16]);
+    let folder = sample_folder(
+        id,
+        &fixture,
+        root.path().to_str().unwrap(),
+        FolderState::Active,
+    );
+    seed_row(&fixture.state, folder_entry(&folder).unwrap()).await;
+
+    let Json(view) = sync_folder(
+        State(fixture.state.clone()),
+        Extension(Some(owner_auth(&fixture))),
+        Path(id.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(view.counters.observed, 0);
+    let offers =
+        aruna_operations::staging::offered_directory::list_offers(&fixture.state.get_ctx())
+            .await
+            .unwrap();
+    assert!(offers.is_empty(), "the request must not walk the folder");
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        while let Some(key) = fired.recv().await {
+            if key == TaskKey::ReconcileSyncedFolders {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(woken, Ok(true), "the folder pass must be woken");
 }
 
 #[tokio::test]
