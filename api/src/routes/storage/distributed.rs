@@ -180,7 +180,7 @@ pub struct DistributedResponse {
     pub serving: bool,
     /// The publisher signed two revisions of one number; configuration changes stopped.
     pub conflicted: bool,
-    /// The publisher is unreachable; data service continues, configuration changes wait.
+    /// The publisher is unreachable or was removed; data service continues, changes wait.
     pub configuration_changes_unavailable: bool,
     /// At least one range has an unreachable coordinator.
     pub degraded: bool,
@@ -565,8 +565,9 @@ async fn owned_status(
 **Behavior**
 - `degraded` marks ranges whose coordinator this node has not heard from recently. Writes to
   them fail with a hint; reads continue from copies.
-- `configuration_changes_unavailable` means the publisher is unreachable: data service
-  continues, but admissions and other configuration changes wait.
+- `configuration_changes_unavailable` means the publisher is unreachable or no longer a realm
+  node that may publish: data service continues, but admissions and other configuration
+  changes wait.
 - `recommended_grant` is the node glob grant that lets reads that pull from another member
   pass that member's own check."#,
     params(

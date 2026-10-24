@@ -56,7 +56,7 @@ fn only(reachable: u8) -> impl Fn(NodeId) -> Reach {
 
 #[test]
 fn coordinator_degrades_range() {
-    let status = summarize(realm(), &view(), only(1));
+    let status = summarize(realm(), &view(), only(1), true);
     assert!(status.degraded);
     assert!(!status.configuration_unavailable);
     assert_eq!(status.ranges[0].degraded, None);
@@ -78,7 +78,7 @@ fn coordinator_degrades_range() {
 
 #[test]
 fn publisher_stops_configuration() {
-    let status = summarize(realm(), &view(), only(2));
+    let status = summarize(realm(), &view(), only(2), true);
     assert!(status.configuration_unavailable);
     assert_eq!(status.ranges[1].degraded, None);
     assert!(status.ranges[0].degraded.is_some());
@@ -101,4 +101,12 @@ fn heartbeats_decide_reach() {
         reach(secret(4).public()),
         Reach::Unreachable { since_ms: None }
     );
+}
+
+#[test]
+fn removed_publisher_stops_configuration() {
+    // Node 1 is reachable, but the realm config no longer lets it publish.
+    let status = summarize(realm(), &view(), only(1), false);
+    assert!(status.configuration_unavailable);
+    assert!(status.ranges[0].degraded.is_none());
 }

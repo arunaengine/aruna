@@ -22,6 +22,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
+use crate::placement::process_placements::load_realm_config;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum StatusError {
@@ -75,7 +76,8 @@ pub struct DistributionStatus {
     pub serving: bool,
     /// The publisher signed two revisions of one number; configuration changes stopped.
     pub conflicted: bool,
-    /// The publisher is unreachable, so configuration changes wait; data service continues.
+    /// The publisher is unreachable or was removed from the realm, so configuration changes
+    /// wait; data service continues.
     pub configuration_unavailable: bool,
     pub degraded: bool,
     pub members: Vec<MemberStatus>,
@@ -85,11 +87,13 @@ pub struct DistributionStatus {
     pub recommended_grant: String,
 }
 
-/// Builds the status from a record; `reach` tells which nodes this node hears from.
+/// Builds the status from a record; `reach` tells which nodes this node hears from and
+/// `eligible` whether the realm config still lets the publisher publish.
 pub fn summarize(
     realm_id: RealmId,
     view: &DistributionView,
     reach: impl Fn(NodeId) -> Reach,
+    eligible: bool,
 ) -> DistributionStatus {
     let snapshot = view.snapshot();
     let node_of = |member_id: Ulid| snapshot.member(member_id).map(|member| member.node_id);
@@ -139,7 +143,7 @@ pub fn summarize(
         phase: snapshot.phase,
         serving: snapshot.serving(),
         conflicted: view.conflicted(),
-        configuration_unavailable: reach(snapshot.root.publisher) != Reach::Reachable,
+        configuration_unavailable: !eligible || reach(snapshot.root.publisher) != Reach::Reachable,
         degraded: ranges.iter().any(|range| range.degraded.is_some()),
         members,
         ranges,
@@ -197,7 +201,13 @@ pub async fn read_status(
         .map(|(node_id, held)| (node_id, (held.age_ms, held.received_at_ms)))
         .collect();
     let reach = heartbeat_reach(net.map(|net| net.node_id()), heard);
-    Ok(Some(summarize(realm_id, &view, reach)))
+    // A publisher removed from the realm accepts no change, reachable or not.
+    let publisher = view.snapshot().root.publisher;
+    let eligible = load_realm_config(context, realm_id)
+        .await
+        .and_then(|config| config.sync_eligible_nodes().ok())
+        .is_some_and(|nodes| nodes.contains(&publisher));
+    Ok(Some(summarize(realm_id, &view, reach, eligible)))
 }
 
 #[cfg(test)]
