@@ -505,11 +505,36 @@ impl RenameRequest {
     }
 }
 
+/// The files a rename planned to rename when it started, kept apart from its request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameTotal {
+    /// The start time of the move the rename belongs to.
+    pub started_at_ms: u64,
+    pub total: u64,
+}
+
+impl RenameTotal {
+    /// The total, only for the move started at `started_at_ms`.
+    pub fn for_move(&self, started_at_ms: u64) -> Option<u64> {
+        (self.started_at_ms == started_at_ms).then_some(self.total)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 /// A write to a fixed path in the tenant's folders; `ulid` names its location.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlainPath {
     pub path: String,
     pub ulid: Ulid,
+    /// The version the write is for; an empty reservation of the path names it.
+    pub version_id: Ulid,
     /// Fails the write with `PathTaken` if a file is already at the path.
     pub if_not_exists: bool,
     /// Only `path` itself may take the file: a storage that cannot create a file only while

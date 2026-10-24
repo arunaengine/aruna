@@ -12,6 +12,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::backend_import::RenameTotal;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
@@ -308,6 +309,25 @@ async fn starts_renames() {
             .unwrap();
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(started.prefix, "imported/");
+    // The plan's count of files, none here, is stored for this move.
+    let read = StorageEffect::Read {
+        key_space: aruna_core::keyspaces::RENAME_TOTAL_KEYSPACE.to_string(),
+        key: started.bucket.as_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    let context = test.state.get_ctx();
+    let stored = context.storage_handle.send_storage_effect(read).await;
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(row), ..
+    }) = stored
+    else {
+        panic!("expected the planned total of the rename");
+    };
+    let planned = RenameTotal {
+        started_at_ms: started.progress.started_at_ms,
+        total: 0,
+    };
+    assert_eq!(RenameTotal::from_bytes(&row).unwrap(), planned);
     let Json(found) = get_renames(
         State(test.state.clone()),
         auth(),

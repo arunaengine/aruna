@@ -117,6 +117,7 @@ async fn writes_plain_paths() {
     let plain = |path: &str, if_not_exists| PlainPath {
         path: path.to_string(),
         ulid: Ulid::generate(),
+        version_id: Ulid::generate(),
         if_not_exists,
         exact: false,
     };
@@ -192,6 +193,7 @@ async fn writes_folder_objects() {
     let plain = |path: &str| PlainPath {
         path: path.to_string(),
         ulid: Ulid::generate(),
+        version_id: Ulid::generate(),
         if_not_exists: false,
         exact: false,
     };
@@ -331,6 +333,7 @@ fn tags_without_condition() {
     let mut plain = PlainPath {
         path: "raw/a.txt".to_string(),
         ulid,
+        version_id: ulid,
         if_not_exists: true,
         exact: false,
     };
@@ -362,6 +365,7 @@ async fn deletes_renamed_files() {
     let plain = PlainPath {
         path: "raw/old.txt".to_string(),
         ulid: Ulid::generate(),
+        version_id: Ulid::generate(),
         if_not_exists: true,
         exact: false,
     };
@@ -406,6 +410,7 @@ async fn copies_plain_files() {
     let plain = PlainPath {
         path: "raw/a.txt~7".to_string(),
         ulid: Ulid::generate(),
+        version_id: Ulid::generate(),
         if_not_exists: true,
         exact: true,
     };
@@ -445,6 +450,7 @@ async fn records_copy_uploads() {
             aruna_core::structs::storage::backend_import::PlainPath {
                 path: "raw/a.txt~7".to_string(),
                 ulid: attempt,
+                version_id: attempt,
                 if_not_exists: true,
                 exact: true,
             },
@@ -488,6 +494,7 @@ async fn keeps_unsettled_uploads() {
     let plain = aruna_core::structs::storage::backend_import::PlainPath {
         path: "raw/a.txt".to_string(),
         ulid: attempt,
+        version_id: attempt,
         if_not_exists: true,
         exact: true,
     };
@@ -611,6 +618,7 @@ async fn copies_missing_source() {
     let plain = PlainPath {
         path: "raw/b.txt".to_string(),
         ulid: Ulid::generate(),
+        version_id: Ulid::generate(),
         if_not_exists: true,
         exact: true,
     };

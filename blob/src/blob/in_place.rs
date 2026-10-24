@@ -583,9 +583,29 @@ impl BlobHandler {
                 Finished::Composed(composed) => return Ok((*composed, None, None)),
             }
         } else {
-            let assembled =
-                self.assemble(&native, &path, upload, parts, etags.clone(), if_not_exists);
-            match assembled.await {
+            // A tenant path is reserved first, as a storage may ignore the completion's
+            // condition; the completion then replaces only that reservation. A taken path may
+            // hold this upload's own completed object, which the recovery below proves.
+            let reserved_for = upload.location.ulid.to_string();
+            let reserved = match if_not_exists && upload.location.is_external() {
+                true => native.reserve(&path, &reserved_for).await.map(|()| true),
+                false => Ok(false),
+            };
+            let condition = match reserved {
+                Ok(true) => Ok((false, Some(reserved_for.as_str()))),
+                // A storage without conditional writes completes as it did before.
+                Ok(false) | Err(BlobError::ConditionalUnsupported) => Ok((if_not_exists, None)),
+                Err(error) => Err(error),
+            };
+            let assembled = match condition {
+                Ok(condition) => {
+                    let etags = etags.clone();
+                    self.assemble(&native, &path, upload, parts, etags, condition)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match assembled {
                 Ok((id, tag)) => {
                     let versioned = operator.info().capability().read_with_version;
                     version = id.filter(|id| versioned && id != "null");
@@ -693,7 +713,8 @@ impl BlobHandler {
         })
     }
 
-    /// Copies staged replacements into the provider upload, then completes it.
+    /// Copies staged replacements into the provider upload, then completes it while the path
+    /// still holds the reservation of `held`, if one is held.
     async fn assemble(
         &self,
         native: &NativeMultipart,
@@ -701,7 +722,7 @@ impl BlobHandler {
         upload: &BackendUpload,
         parts: &[MultipartPart],
         mut etags: Vec<(u16, String)>,
-        if_not_exists: bool,
+        (if_not_exists, held): (bool, Option<&str>),
     ) -> Result<(Option<String>, Option<String>), BlobError> {
         for (slot, part) in etags.iter_mut().zip(parts) {
             if part.location.partial {
@@ -718,6 +739,13 @@ impl BlobHandler {
                     &source_path,
                 )
                 .await?;
+        }
+        // The path must still hold the upload's reservation. Accepted window: a foreign write
+        // after this check is replaced by the completion.
+        if let Some(version) = held
+            && !native.holds(path, version).await?
+        {
+            return Err(BlobError::PathTaken);
         }
         native
             .complete(path, &upload.upload_id, &etags, if_not_exists)
@@ -737,10 +765,14 @@ impl BlobHandler {
             timeout(self.io_timeout(), native.abort(&path, &upload.upload_id))
                 .await
                 .map_err(|_| BlobError::DeleteError("timed out aborting the upload".into()))??;
-            // A tenant path keeps what it holds; only Aruna's own target is deleted.
-            if !upload.location.is_external() {
-                let operator = self.operator_from_location(&upload.location)?;
-                self.delete_path(&operator, &path).await?;
+            // A tenant path keeps what it holds but this upload's own reservation where the storage
+            // keeps versions; only Aruna's own target is deleted.
+            match upload.location.is_external() {
+                true => (native.unreserve(&path, &upload.location.ulid.to_string())).await?,
+                false => {
+                    let operator = self.operator_from_location(&upload.location)?;
+                    self.delete_path(&operator, &path).await?;
+                }
             }
             self.release_reservation(&upload.location).await?;
             // After the release, which removes the reservation row, so this work stays queued.

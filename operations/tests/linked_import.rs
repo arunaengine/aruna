@@ -10,7 +10,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    GROUP_KEYSPACE, IMPORT_INTENT_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobResultPayload};
@@ -20,7 +20,7 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, BackendImportSpec, DEFAULT_PATTERN, PlainPath,
+    BackendImport, BackendImportSpec, DEFAULT_PATTERN, PlainPath, WriteIntent, intent_key,
 };
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
@@ -277,6 +277,7 @@ async fn place(context: &TestContext, name: &str, bytes: &[u8]) {
     let plain = PlainPath {
         path: format!("{}/raw/{name}", context.folder),
         ulid: Ulid::generate(),
+        version_id: Ulid::generate(),
         if_not_exists: false,
         exact: false,
     };
@@ -420,6 +421,44 @@ async fn s3_imports_folder() {
     place(&context, &format!("c.txt~{id}"), b"later").await;
     assert_eq!(run_import(&context, 0xD4).await, (1, 2, 0));
     assert_eq!(current(&context, "c.txt").await, Some(id));
+}
+
+#[tokio::test]
+#[ignore = "requires a real S3 endpoint (ARUNA_TEST_S3_* variables)"]
+async fn s3_skips_reservations() {
+    // An empty file a write's intent names is that write's reservation: a run neither
+    // registers it nor fails on it. Without the intent it is a file like any other.
+    let context = setup_context().await;
+    place(&context, "a.txt", b"").await;
+    let id = Ulid::generate();
+    let intent = WriteIntent {
+        key: "a.txt".to_string(),
+        version_id: id,
+        backend: BackendRef::Group(context.rule.backend_id),
+        created_by: context.auth.user_id,
+        written: None,
+        mover: None,
+    };
+    let path = format!("{}/raw/a.txt", context.folder);
+    let row = intent_key(context.rule.import_id, &path, id);
+    let write = StorageEffect::Write {
+        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+        key: row.clone(),
+        value: intent.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    let storage = &context.driver.storage_handle;
+    storage.send_storage_effect(write).await;
+    assert_eq!(run_import(&context, 0xE1).await, (0, 1, 0));
+    assert!(!has_key(&context, "a.txt").await);
+    let delete = StorageEffect::Delete {
+        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+        key: row,
+        txn_id: None,
+    };
+    storage.send_storage_effect(delete).await;
+    assert_eq!(run_import(&context, 0xE2).await, (1, 0, 0));
+    assert!(has_key(&context, "a.txt").await);
 }
 
 async fn current(context: &TestContext, key: &str) -> Option<Ulid> {

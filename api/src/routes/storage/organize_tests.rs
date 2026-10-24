@@ -266,3 +266,64 @@ async fn hides_unmapped_failures() {
         .unwrap();
     assert!(pending.contains(&"secret/a.faa.gz".to_string()));
 }
+
+#[tokio::test]
+async fn shows_rename_total() {
+    use aruna_core::keyspaces::{
+        COMPRESSION_MIGRATION_KEYSPACE, RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE,
+    };
+    use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal, TokenGrant};
+    use aruna_core::structs::storage::format::{Compression, CompressionMigration};
+    let test = setup_state().await;
+    let ids = rule(&test).await;
+    let context = test.state.get_ctx();
+    let put = |space: &'static str, value: Vec<u8>| {
+        let key = test.bucket.as_bytes().to_vec().into();
+        crate::tests::routes::write_doc(&context, space, key, value.into())
+    };
+    // A running rename of the move started at 7.
+    let mut record = CompressionMigration::new(Compression::Off, 7);
+    record.moving = true;
+    let request = RenameRequest {
+        started_at_ms: 7,
+        auth: test.auth.clone(),
+        node_id: test.state.get_node_id(),
+        grant: TokenGrant {
+            token_hash: "token".to_string(),
+            issuer: test.state.get_realm_id(),
+            issued_at_secs: 1,
+            expires_at_secs: u64::MAX,
+            via: None,
+        },
+        paused: false,
+        aborted_at_ms: None,
+    };
+    put(COMPRESSION_MIGRATION_KEYSPACE, record.to_bytes().unwrap()).await;
+    put(RENAME_MOVE_KEYSPACE, request.to_bytes().unwrap()).await;
+    let shown = || async {
+        let auth = Extension(Some(test.auth.clone()));
+        let Json(job) = get_job(State(test.state.clone()), auth, Path(ids.clone()))
+            .await
+            .unwrap();
+        let job = job.unwrap();
+        (job.kind, job.total, job.counted)
+    };
+    // A rename started without a stored total, as before totals were kept, counts none.
+    assert_eq!(shown().await, ("rename".to_string(), 0, false));
+    // The total of an older move never counts for a newer one; the move's own does.
+    for (started_at_ms, total, counted) in [(6, 0, false), (7, 40, true)] {
+        let row = RenameTotal {
+            started_at_ms,
+            total: 40,
+        };
+        put(RENAME_TOTAL_KEYSPACE, row.to_bytes().unwrap()).await;
+        assert_eq!(shown().await, ("rename".to_string(), total, counted));
+    }
+    // A pause answers the same total.
+    let path = Path((ids.0.clone(), ids.1.clone(), "pause".to_string()));
+    let auth = Extension(Some(test.auth.clone()));
+    let Json(paused) = control_job(State(test.state.clone()), auth, path)
+        .await
+        .unwrap();
+    assert_eq!((paused.total, paused.counted), (40, true));
+}

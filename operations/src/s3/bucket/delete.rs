@@ -12,9 +12,10 @@ use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
     GROUP_ENCRYPTED_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_REMOVAL_KEYSPACE,
-    KEY_COPY_KEYSPACE, LINKED_JOB_KEYSPACE, NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
-    RELATIONSHIP_OUT_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
-    UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
+    KEY_COPY_KEYSPACE, LINKED_JOB_KEYSPACE, MIGRATION_AHEAD_KEYSPACE, NODE_VAULT_KEYSPACE,
+    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, RENAME_MOVE_KEYSPACE,
+    RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
+    USAGE_STATS_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -579,6 +580,8 @@ impl DeleteBucketOperation {
                 bucket.clone().into(),
             ),
             (RENAME_MOVE_KEYSPACE.to_string(), bucket.clone().into()),
+            (RENAME_TOTAL_KEYSPACE.to_string(), bucket.clone().into()),
+            (MIGRATION_AHEAD_KEYSPACE.to_string(), bucket.clone().into()),
             (LINKED_JOB_KEYSPACE.to_string(), bucket.clone().into()),
             (BUCKET_CREATION_KEYSPACE.to_string(), bucket.into()),
             (
@@ -967,6 +970,8 @@ mod link_tests {
         assert!(deletes.contains(&(IMPORT_DISCOVERY_KEYSPACE.to_string(), rule().key())));
         let marker = (RENAME_MOVE_KEYSPACE.to_string(), b"x".to_vec().into());
         assert!(deletes.contains(&marker));
+        let total = (RENAME_TOTAL_KEYSPACE.to_string(), b"x".to_vec().into());
+        assert!(deletes.contains(&total));
         let job = (LINKED_JOB_KEYSPACE.to_string(), b"x".to_vec().into());
         assert!(deletes.contains(&job));
         let record = writes

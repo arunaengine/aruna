@@ -260,6 +260,7 @@ impl CreateMultipartOperation {
         let plain = PlainPath {
             path: target.path.clone(),
             ulid: id,
+            version_id: id,
             if_not_exists: false,
             exact: false,
         };

@@ -124,6 +124,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::CopyPlain { .. } => (EffectClass::Transfer, "copy_plain"),
         BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
         BlobEffect::StatExternal { .. } => (EffectClass::Control, "stat_external"),
+        BlobEffect::DropReservation { .. } => (EffectClass::Control, "drop_reservation"),
         BlobEffect::DeletePlain { .. } => (EffectClass::Local, "delete_plain"),
         BlobEffect::StatCopy { .. } => (EffectClass::Control, "stat_copy"),
         BlobEffect::SettleCopy { .. } => (EffectClass::Control, "settle_copy"),
@@ -161,6 +162,7 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::CopyPlain { .. }
             | BlobEffect::SettleCopy { .. }
             | BlobEffect::DeletePlain { .. }
+            | BlobEffect::DropReservation { .. }
     )
 }
 
@@ -961,6 +963,11 @@ impl BlobHandler {
                 path,
                 created_by,
             } => Box::pin(self.stat_external(resolved, path, created_by)).await,
+            BlobEffect::DropReservation {
+                backend,
+                path,
+                version_id,
+            } => Box::pin(self.drop_reservation(backend, path, version_id)).await,
             BlobEffect::DeletePlain {
                 location,
                 version,

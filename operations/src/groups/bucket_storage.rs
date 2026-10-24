@@ -5,6 +5,7 @@
 use crate::driver::{DriverContext, drive};
 use crate::effect_adapters::routing::node_routing;
 use crate::groups::backends::query::GetBackendOperation;
+use crate::groups::bucket_jobs::{ActiveJob, active_job};
 use crate::groups::storage_routing::GroupInputsOperation;
 use crate::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_core::effects::StorageEffect;
@@ -19,7 +20,7 @@ use aruna_core::types::GroupId;
 use std::collections::HashMap;
 use ulid::Ulid;
 
-/// Where one bucket stores new uploads.
+/// Where one bucket stores new uploads, and the job that runs or is paused on it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BucketStorage {
     pub bucket: String,
@@ -32,12 +33,13 @@ pub struct BucketStorage {
     pub shared: bool,
     pub import_id: Option<Ulid>,
     pub write_pattern: Option<String>,
+    pub job: Option<ActiveJob>,
 }
 
 /// Links and mapping rows of a group the listing reads at most.
 const LINK_CAP: usize = 10_000;
 
-/// One page of the group's buckets with their storage, and the cursor of the next page. The
+/// One page of the group's buckets with their storage and job, and the next page's cursor. The
 /// group's routing inputs load once, as for one upload; each bucket resolves like an upload.
 pub async fn list_bucket_storage(
     context: &DriverContext,
@@ -58,6 +60,9 @@ pub async fn list_bucket_storage(
         .await
         .map_err(|error| error.to_string())?;
     let encrypted = encrypted_buckets(context, &page.buckets).await?;
+    // Jobs show for every rule, also one whose write storage routing leaves out.
+    let rules = crate::groups::imports::list_imports(context, group_id).await;
+    let rules = rules.map_err(|error| error.to_string())?;
     let mut snapshot = node_routing(context)
         .snapshot(group_id)
         .with_group_inputs(inputs);
@@ -75,7 +80,11 @@ pub async fn list_bucket_storage(
             let record = record.map_err(|error| error.to_string())?;
             entry.insert(record.filter(|record| record.group_id == group_id));
         }
-        found.push(named(destination, &storages));
+        let job = active_job(context, &bucket, &rules).await?;
+        found.push(BucketStorage {
+            job,
+            ..named(destination, &storages)
+        });
     }
     Ok((found, page.continuation_token))
 }

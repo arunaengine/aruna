@@ -5,6 +5,7 @@
 pub mod add_member;
 pub mod add_role;
 pub mod backends;
+pub mod bucket_jobs;
 pub mod bucket_storage;
 pub mod create_group;
 pub mod default_rule;
