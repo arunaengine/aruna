@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::distribution::test_store::{apply, context, install, open, range, write};
+use crate::distribution::test_store::{apply, context, counters, install, open, range, write};
 use crate::driver::drive;
 use aruna_core::structs::storage::distribution::accounting::sample_prefix;
 use aruna_storage::storage::StorageHandle;

@@ -148,8 +148,9 @@ async fn purge_returns_to_zero() {
         (total.objects, total.versions, total.delete_markers),
         (0, 1, 1)
     );
-    let (slot, _) = SampleSlot::of_key("a");
-    let sample = sample_key(set(), id(1), slot);
+    let sample = SampleEntry::of_key("a").row_key(set(), id(1));
+    let sampled = || counters(&handle, sample_count_key(set(), id(1)));
+    assert_eq!(sampled().await.sampled, 1);
     assert!(
         get(&handle, KEY_SAMPLE_KEYSPACE, sample.clone())
             .await
@@ -178,6 +179,7 @@ async fn purge_returns_to_zero() {
         get(&handle, KEY_SAMPLE_KEYSPACE, sample).await.is_none(),
         "the key left the sample"
     );
+    assert_eq!(sampled().await.sampled, 0);
 }
 
 #[tokio::test]
@@ -313,4 +315,58 @@ async fn uploads_count_once() {
         assert!(apply(&handle, upload(opened)).await.unwrap());
     }
     assert_eq!(counters(&handle, active(1)).await.open_uploads, 0);
+}
+
+/// A full sample takes a new key only in place of its largest entry, so its size stays.
+#[tokio::test]
+async fn full_sample_evicts() {
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    let txn_id = begin(&handle).await;
+    let full = RangeCounters {
+        sampled: i128::from(SAMPLE_SIZE),
+        ..RangeCounters::default()
+    };
+    let count = sample_count_key(set(), id(1));
+    let event = handle
+        .send_storage_effect(StorageEffect::AddCounters {
+            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+            deltas: vec![(count.clone().into(), full)],
+            txn_id,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+    assert!(commit(&handle, txn_id).await);
+    let largest = SampleEntry {
+        priority: u64::MAX,
+        key: "largest".to_string(),
+    };
+    let row = largest.row_key(set(), id(1));
+    let event = handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: KEY_SAMPLE_KEYSPACE.to_string(),
+            key: row.clone().into(),
+            value: Vec::new().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+
+    assert!(apply(&handle, put("a", 1, 1, 1)).await.unwrap());
+    let taken = SampleEntry::of_key("a").row_key(set(), id(1));
+    assert!(get(&handle, KEY_SAMPLE_KEYSPACE, taken).await.is_some());
+    assert!(
+        get(&handle, KEY_SAMPLE_KEYSPACE, row).await.is_none(),
+        "the largest left"
+    );
+    assert_eq!(
+        counters(&handle, count).await.sampled,
+        i128::from(SAMPLE_SIZE)
+    );
 }

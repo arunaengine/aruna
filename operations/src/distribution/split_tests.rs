@@ -114,11 +114,13 @@ async fn divides_sample() {
     assert!(apply(&handle, write(set(), "x", 2, 1)).await.unwrap());
     drive(split_at("m"), &context(&handle)).await.unwrap();
     for (key, owner) in [("c", id(2)), ("x", id(3))] {
-        let (slot, entry) = SampleSlot::of_key(key);
-        let moved = get(&handle, KEY_SAMPLE_KEYSPACE, sample_key(set(), owner, slot)).await;
-        assert_eq!(moved, Some(entry.to_bytes().unwrap()));
-        let old = get(&handle, KEY_SAMPLE_KEYSPACE, sample_key(set(), id(1), slot)).await;
+        let entry = SampleEntry::of_key(key);
+        let moved = get(&handle, KEY_SAMPLE_KEYSPACE, entry.row_key(set(), owner)).await;
+        assert!(moved.is_some());
+        let old = get(&handle, KEY_SAMPLE_KEYSPACE, entry.row_key(set(), id(1))).await;
         assert!(old.is_none());
+        let count = counters(&handle, sample_count_key(set(), owner)).await;
+        assert_eq!(count.sampled, 1, "each child counts its share");
     }
 }
 

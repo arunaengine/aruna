@@ -3,15 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
-
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE};
+use aruna_core::keyspaces::{
+    INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::accounting::{
-    Charge, Cursor, RangeAccount, SampleSlot, account_key, refill_key, sample_key,
+    Charge, Cursor, RangeAccount, RangeCounters, SAMPLE_SIZE, SampleEntry, account_key, refill_key,
+    sample_count_key, sample_prefix,
 };
 use aruna_core::structs::storage::distribution::inventory::{Entry, Position, range_interval};
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -21,6 +22,8 @@ use ulid::Ulid;
 
 /// Page transactions one run retries after conflicts before it pauses.
 const MAX_CONFLICTS: usize = 16;
+/// Entries concurrent writers may add beyond the sample size before a refill trims them.
+const SAMPLE_SLACK: usize = 64;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum RefillError {
@@ -63,8 +66,11 @@ enum State {
     PageTxn,
     PageCursor,
     PageRead,
-    ReadSlots,
+    ReadSample,
+    ReadCount,
     Write,
+    Delete,
+    Count,
     Commit,
     Abort,
     Done,
@@ -78,8 +84,11 @@ pub struct RefillOperation {
     cursor: Cursor,
     probe_end: Option<Vec<u8>>,
     terminal: bool,
-    /// The best candidate of each slot this page found, and the cursor it ends at.
-    candidates: BTreeMap<u16, SampleSlot>,
+    /// The head keys this page found, the sample it read, and the cursor it ends at.
+    candidates: Vec<SampleEntry>,
+    sample: Vec<SampleEntry>,
+    deletes: Vec<(String, Key)>,
+    delta: i128,
     next_cursor: Cursor,
     txn_id: Option<TxnId>,
     pages: usize,
@@ -96,7 +105,10 @@ impl RefillOperation {
             cursor: Cursor::Start,
             probe_end: None,
             terminal: false,
-            candidates: BTreeMap::new(),
+            candidates: Vec::new(),
+            sample: Vec::new(),
+            deletes: Vec::new(),
+            delta: 0,
             next_cursor: Cursor::Start,
             txn_id: None,
             pages: 0,
@@ -162,7 +174,7 @@ impl RefillOperation {
         }
     }
 
-    /// Keeps the best head key of each slot the page reaches and reads those slots.
+    /// Takes the head keys of the page as candidates and reads the current sample.
     fn collect(
         &mut self,
         values: Vec<(Key, Value)>,
@@ -171,12 +183,8 @@ impl RefillOperation {
         self.candidates.clear();
         for (key, _) in &values {
             let position = Position::decode(key)?;
-            if position.entry != Entry::Head {
-                continue;
-            }
-            let (slot, entry) = SampleSlot::of_key(&position.key);
-            if entry.displaces(self.candidates.get(&slot)) {
-                self.candidates.insert(slot, entry);
+            if position.entry == Entry::Head {
+                self.candidates.push(SampleEntry::of_key(&position.key));
             }
         }
         self.next_cursor = match (truncated, self.terminal, self.probe_end.clone()) {
@@ -185,36 +193,51 @@ impl RefillOperation {
             (None, _, _) => Cursor::End,
         };
         let (set_id, range_id) = (self.config.set_id, self.config.range_id);
-        let reads = (self.candidates.keys())
-            .map(|slot| {
-                (
-                    KEY_SAMPLE_KEYSPACE.to_string(),
-                    sample_key(set_id, range_id, *slot).into(),
-                )
-            })
-            .collect();
-        self.state = State::ReadSlots;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
+        self.state = State::ReadSample;
+        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: KEY_SAMPLE_KEYSPACE.to_string(),
+            prefix: Some(sample_prefix(set_id, range_id).into()),
+            start: None,
+            limit: usize::from(SAMPLE_SIZE) + self.config.page_rows + SAMPLE_SLACK,
             txn_id: self.txn_id,
         })])
     }
 
-    fn write(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<Effects, RefillError> {
-        let mut writes: Vec<(String, Key, Value)> = Vec::new();
-        let candidates = std::mem::take(&mut self.candidates);
-        for ((key, stored), (_, entry)) in values.into_iter().zip(candidates) {
-            let occupant = stored
-                .map(|value| SampleSlot::from_bytes(&value))
-                .transpose()?;
-            if entry.displaces(occupant.as_ref()) {
-                writes.push((
+    /// Keeps the lowest entries of the sample and the candidates, and corrects the count row
+    /// to the kept size.
+    fn write(&mut self, stored: Option<Value>) -> Result<Effects, RefillError> {
+        let (set_id, range_id) = (self.config.set_id, self.config.range_id);
+        let current = std::mem::take(&mut self.sample);
+        let mut kept: Vec<SampleEntry> = current.clone();
+        kept.extend(std::mem::take(&mut self.candidates));
+        kept.sort_by(|left, right| (left.priority, &left.key).cmp(&(right.priority, &right.key)));
+        kept.dedup();
+        kept.truncate(usize::from(SAMPLE_SIZE));
+        let mut writes: Vec<(String, Key, Value)> = (kept.iter())
+            .filter(|entry| !current.contains(entry))
+            .map(|entry| {
+                let key = entry.row_key(set_id, range_id);
+                (
                     KEY_SAMPLE_KEYSPACE.to_string(),
-                    key,
-                    entry.to_bytes()?.into(),
-                ));
-            }
-        }
+                    key.into(),
+                    Value::from(vec![]),
+                )
+            })
+            .collect();
+        self.deletes = (current.iter())
+            .filter(|entry| !kept.contains(entry))
+            .map(|entry| {
+                (
+                    KEY_SAMPLE_KEYSPACE.to_string(),
+                    entry.row_key(set_id, range_id).into(),
+                )
+            })
+            .collect();
+        let counted = stored
+            .map(|value| RangeCounters::from_bytes(&value))
+            .transpose()?;
+        let size = i128::try_from(kept.len()).unwrap_or(i128::MAX);
+        self.delta = size - counted.unwrap_or_default().sampled;
         let cursor = postcard::to_allocvec(&self.next_cursor).map_err(ConversionError::from)?;
         writes.push((
             KEY_SAMPLE_KEYSPACE.to_string(),
@@ -226,6 +249,24 @@ impl RefillOperation {
             writes,
             txn_id: self.txn_id,
         })])
+    }
+
+    fn count(&mut self, txn_id: TxnId) -> Effects {
+        if self.delta == 0 {
+            self.state = State::Commit;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
+        self.state = State::Count;
+        let delta = RangeCounters {
+            sampled: std::mem::take(&mut self.delta),
+            ..RangeCounters::default()
+        };
+        let key = sample_count_key(self.config.set_id, self.config.range_id);
+        smallvec![Effect::Storage(StorageEffect::AddCounters {
+            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+            deltas: vec![(key.into(), delta)],
+            txn_id,
+        })]
     }
 
     fn handle(&mut self, event: Event) -> Result<Effects, RefillError> {
@@ -296,10 +337,36 @@ impl RefillOperation {
                     next_start_after,
                 }),
             ) => self.collect(values, next_start_after),
-            (State::ReadSlots, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.write(values)
+            (State::ReadSample, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.sample = (values.iter())
+                    .filter_map(|(key, _)| SampleEntry::decode(key))
+                    .collect();
+                self.state = State::ReadCount;
+                let key = sample_count_key(self.config.set_id, range_id);
+                Ok(smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+                    key: key.into(),
+                    txn_id: self.txn_id,
+                })])
+            }
+            (State::ReadCount, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.write(value)
             }
             (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                let txn_id = self.txn_id.unwrap_or_default();
+                if self.deletes.is_empty() {
+                    return Ok(self.count(txn_id));
+                }
+                self.state = State::Delete;
+                Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                    deletes: std::mem::take(&mut self.deletes),
+                    txn_id: Some(txn_id),
+                })])
+            }
+            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
+                Ok(self.count(self.txn_id.unwrap_or_default()))
+            }
+            (State::Count, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 self.state = State::Commit;
                 let txn_id = self.txn_id.unwrap_or_default();
                 Ok(smallvec![Effect::Storage(

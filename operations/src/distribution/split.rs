@@ -6,11 +6,13 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{
+    KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::accounting::{
-    Charge, RangeAccount, RangeSlot, Rebuild, SAMPLE_SIZE, SampleSlot, account_key, generation_key,
-    pending_key, sample_key, sample_prefix, slot_key,
+    Charge, RangeAccount, RangeCounters, RangeSlot, Rebuild, SAMPLE_SIZE, SampleEntry, account_key,
+    generation_key, pending_key, sample_count_key, sample_prefix, slot_key,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -49,6 +51,7 @@ enum State {
     ReadSample,
     Write,
     Delete,
+    Count,
     Commit,
     Done,
 }
@@ -60,6 +63,7 @@ pub struct SplitOperation {
     txn_id: Option<TxnId>,
     parent: Option<RangeAccount>,
     deletes: Vec<(String, Key)>,
+    counts: Vec<(Key, RangeCounters)>,
     result: Option<Result<(), SplitError>>,
 }
 
@@ -94,6 +98,7 @@ impl SplitOperation {
             txn_id: None,
             parent: None,
             deletes: Vec::new(),
+            counts: Vec::new(),
             result: None,
         }
     }
@@ -188,19 +193,33 @@ impl SplitOperation {
                 right_slot.to_bytes()?,
             ),
         ];
-        for (key, value) in sample {
-            let entry = SampleSlot::from_bytes(&value)?;
-            let (slot, _) = SampleSlot::of_key(&entry.key);
-            let owner = match entry.key < split {
-                true => config.left,
-                false => config.right,
+        let (mut left_size, mut right_size) = (0, 0);
+        for (key, _) in sample {
+            let Some(entry) = SampleEntry::decode(&key) else {
+                continue;
             };
+            let owner = match entry.key < split {
+                true => (config.left, &mut left_size),
+                false => (config.right, &mut right_size),
+            };
+            *owner.1 += 1;
             writes.push(row(
                 KEY_SAMPLE_KEYSPACE,
-                sample_key(set_id, owner, slot),
-                value.to_vec(),
+                entry.row_key(set_id, owner.0),
+                vec![],
             ));
             self.deletes.push((KEY_SAMPLE_KEYSPACE.to_string(), key));
+        }
+        let parent_count = sample_count_key(set_id, parent_id);
+        self.deletes
+            .push((RANGE_COUNTER_KEYSPACE.to_string(), parent_count.into()));
+        for (child, size) in [(config.left, left_size), (config.right, right_size)] {
+            let counters = RangeCounters {
+                sampled: size,
+                ..RangeCounters::default()
+            };
+            self.counts
+                .push((sample_count_key(set_id, child).into(), counters));
         }
         Ok(writes)
     }
@@ -227,7 +246,7 @@ impl SplitOperation {
                     key_space: KEY_SAMPLE_KEYSPACE.to_string(),
                     prefix: Some(sample_prefix(set_id, range_id).into()),
                     start: None,
-                    limit: usize::from(SAMPLE_SIZE),
+                    limit: usize::from(SAMPLE_SIZE) * 2,
                     txn_id: self.txn_id,
                 })])
             }
@@ -240,9 +259,6 @@ impl SplitOperation {
                 })])
             }
             (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                if self.deletes.is_empty() {
-                    return Ok(self.commit());
-                }
                 self.state = State::Delete;
                 Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
                     deletes: std::mem::take(&mut self.deletes),
@@ -250,6 +266,14 @@ impl SplitOperation {
                 })])
             }
             (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
+                self.state = State::Count;
+                Ok(smallvec![Effect::Storage(StorageEffect::AddCounters {
+                    key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+                    deltas: std::mem::take(&mut self.counts),
+                    txn_id: self.txn_id.unwrap_or_default(),
+                })])
+            }
+            (State::Count, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 Ok(self.commit())
             }
             (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {

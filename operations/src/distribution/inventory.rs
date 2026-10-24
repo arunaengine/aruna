@@ -12,8 +12,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState};
 use aruna_core::structs::storage::distribution::accounting::{
-    Charge, CounterOverflow, RangeAccount, RangeCounters, RangeSlot, SampleSlot, account_key,
-    generation_key, pending_key, sample_key, slot_key, slot_seek,
+    Charge, CounterOverflow, RangeAccount, RangeCounters, RangeSlot, SAMPLE_SIZE, SampleEntry,
+    account_key, generation_key, pending_key, sample_count_key, sample_prefix, slot_key, slot_seek,
 };
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, IndexEntry, Position, VersionEntry, head_position, index_key,
@@ -92,6 +92,8 @@ enum Phase {
     Pending,
     Locate,
     Read { range_id: Ulid },
+    SampleCount { range_id: Ulid },
+    SampleLast { range_id: Ulid },
     Write,
     Delete,
     Count,
@@ -114,6 +116,8 @@ pub struct InventoryUpdate {
     writes: Vec<(String, Key, Value)>,
     deletes: Vec<(String, Key)>,
     counters: Vec<(Key, RangeCounters)>,
+    /// A key that gained a head and may enter the sample once its size is known.
+    candidate: Option<SampleEntry>,
 }
 
 fn row(key_space: &str, key: Vec<u8>, value: Vec<u8>) -> (String, Key, Value) {
@@ -128,6 +132,7 @@ impl InventoryUpdate {
             writes: Vec::new(),
             deletes: Vec::new(),
             counters: Vec::new(),
+            candidate: None,
         }
     }
 
@@ -173,6 +178,46 @@ impl InventoryUpdate {
             ) => {
                 let range_id = *range_id;
                 self.plan(range_id, values)?;
+                if self.candidate.is_none() {
+                    return Ok(self.next_effect(txn_id));
+                }
+                // The size is read outside the transaction, so inserts below it never conflict.
+                self.phase = Phase::SampleCount { range_id };
+                Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+                    key: sample_count_key(self.change.set_id, range_id).into(),
+                    txn_id: None,
+                })]))
+            }
+            (
+                Phase::SampleCount { range_id },
+                Event::Storage(StorageEvent::ReadResult { value, .. }),
+            ) => {
+                let range_id = *range_id;
+                let stored = value
+                    .map(|value| RangeCounters::from_bytes(&value))
+                    .transpose()?;
+                if stored.unwrap_or_default().sampled < i128::from(SAMPLE_SIZE) {
+                    self.admit(range_id, None)?;
+                    return Ok(self.next_effect(txn_id));
+                }
+                self.phase = Phase::SampleLast { range_id };
+                Ok(Some(smallvec![Effect::Storage(StorageEffect::Last {
+                    key_space: KEY_SAMPLE_KEYSPACE.to_string(),
+                    prefix: Some(sample_prefix(self.change.set_id, range_id).into()),
+                    txn_id: Some(txn_id),
+                })]))
+            }
+            (
+                Phase::SampleLast { range_id },
+                Event::Storage(StorageEvent::IterResult { values, .. }),
+            ) => {
+                let range_id = *range_id;
+                let last = values.first().and_then(|(key, _)| SampleEntry::decode(key));
+                match last {
+                    Some(last) => self.admit(range_id, Some(last))?,
+                    None => self.admit(range_id, None)?,
+                }
                 Ok(self.next_effect(txn_id))
             }
             (Phase::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
@@ -208,8 +253,7 @@ impl InventoryUpdate {
                 INVENTORY_KEYSPACE.to_string(),
                 head_position(set_id, key).into(),
             ));
-            let (slot, _) = SampleSlot::of_key(key);
-            let sample = sample_key(set_id, range_id, slot);
+            let sample = SampleEntry::of_key(key).row_key(set_id, range_id);
             reads.push((KEY_SAMPLE_KEYSPACE.to_string(), sample.into()));
         }
         if let Some((upload_id, _)) = self.change.upload {
@@ -241,6 +285,7 @@ impl InventoryUpdate {
             HeadChange::Keep => (None, None),
             _ => (next(), next()),
         };
+        let had_head = head.is_some();
         let mut contributions = Vec::new();
         if let Some((upload_id, opened)) = self.change.upload {
             // Opening an open upload or closing an absent one changes nothing.
@@ -259,8 +304,9 @@ impl InventoryUpdate {
         }
         self.plan_versions(&mut next, &mut contributions)?;
         self.plan_head(head, &mut contributions)?;
-        self.plan_sample(range_id, sample)?;
-        self.counters = route(self.change.set_id, range_id, &account, contributions)?;
+        self.plan_sample(range_id, had_head, sample.is_some());
+        let routed = route(self.change.set_id, range_id, &account, contributions)?;
+        self.counters.extend(routed);
         Ok(())
     }
 
@@ -360,26 +406,51 @@ impl InventoryUpdate {
         Ok(())
     }
 
-    /// A key with a head may hold its sample slot; a key whose head goes leaves it.
-    fn plan_sample(&mut self, range_id: Ulid, stored: Option<Value>) -> Result<(), InventoryError> {
-        let occupant = stored
-            .map(|value| SampleSlot::from_bytes(&value))
-            .transpose()?;
-        let (slot, entry) = SampleSlot::of_key(&self.change.key);
-        let key = sample_key(self.change.set_id, range_id, slot);
-        match &self.change.head {
-            HeadChange::Keep => {}
-            HeadChange::Set(_) if entry.displaces(occupant.as_ref()) => {
-                self.writes
-                    .push(row(KEY_SAMPLE_KEYSPACE, key, entry.to_bytes()?));
-            }
-            HeadChange::Set(_) => {}
-            HeadChange::Remove if occupant.is_some_and(|occupant| occupant.key == entry.key) => {
+    /// A key that gains a head is a sample candidate; a sampled key whose head goes leaves.
+    fn plan_sample(&mut self, range_id: Ulid, had_head: bool, sampled: bool) {
+        let entry = SampleEntry::of_key(&self.change.key);
+        match (&self.change.head, had_head, sampled) {
+            (HeadChange::Set(_), false, false) => self.candidate = Some(entry),
+            (HeadChange::Remove, _, true) => {
+                let key = entry.row_key(self.change.set_id, range_id);
                 self.deletes.push((KEY_SAMPLE_KEYSPACE.into(), key.into()));
+                self.count_sample(range_id, -1);
             }
-            HeadChange::Remove => {}
+            _ => {}
         }
+    }
+
+    /// Takes the candidate into a sample below its size, or in place of a larger `last`.
+    fn admit(&mut self, range_id: Ulid, last: Option<SampleEntry>) -> Result<(), InventoryError> {
+        let Some(entry) = self.candidate.take() else {
+            return Ok(());
+        };
+        let set_id = self.change.set_id;
+        let rank = |entry: &SampleEntry| (entry.priority, entry.key.clone());
+        match last {
+            Some(last) if rank(&entry) >= rank(&last) => return Ok(()),
+            Some(last) => {
+                let evicted = last.row_key(set_id, range_id);
+                self.deletes
+                    .push((KEY_SAMPLE_KEYSPACE.into(), evicted.into()));
+            }
+            None => self.count_sample(range_id, 1),
+        }
+        self.writes.push(row(
+            KEY_SAMPLE_KEYSPACE,
+            entry.row_key(set_id, range_id),
+            vec![],
+        ));
         Ok(())
+    }
+
+    fn count_sample(&mut self, range_id: Ulid, entries: i128) {
+        let delta = RangeCounters {
+            sampled: entries,
+            ..RangeCounters::default()
+        };
+        let key = sample_count_key(self.change.set_id, range_id);
+        self.counters.push((key.into(), delta));
     }
 
     fn next_effect(&mut self, txn_id: TxnId) -> Option<Effects> {

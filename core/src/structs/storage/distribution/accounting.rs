@@ -11,11 +11,12 @@ use super::OriginalEpoch;
 use super::inventory::{HeadEntry, VersionEntry};
 use crate::errors::ConversionError;
 
-/// Distinct keys a range's key sample holds at most.
+/// Distinct keys a range's key sample holds; concurrent writers may exceed it briefly.
 pub const SAMPLE_SIZE: u16 = 1024;
 const GENERATION_TAG: u8 = b'g';
 const PENDING_TAG: u8 = b'p';
 const SLOT_TAG: u8 = b's';
+const COUNT_TAG: u8 = b'n';
 const REFILL_TAG: u8 = b'r';
 /// Above every valid UTF-8 byte, so it is the range index key of the open end.
 const OPEN_END: u8 = 0xFF;
@@ -41,6 +42,8 @@ pub struct RangeCounters {
     /// Sizes of version rows reached through an external reference.
     pub referenced_bytes: i128,
     pub open_uploads: i128,
+    /// Key sample entries; only the sample count row of a range carries them.
+    pub sampled: i128,
     /// The highest original epoch of any version counted; it never decreases.
     pub max_epoch: OriginalEpoch,
 }
@@ -67,6 +70,7 @@ impl RangeCounters {
                 other.referenced_bytes,
             )?,
             open_uploads: add("open_uploads", self.open_uploads, other.open_uploads)?,
+            sampled: add("sampled", self.sampled, other.sampled)?,
             max_epoch: self.max_epoch.max(other.max_epoch),
         })
     }
@@ -81,6 +85,7 @@ impl RangeCounters {
             logical_bytes: neg("logical_bytes", self.logical_bytes)?,
             referenced_bytes: neg("referenced_bytes", self.referenced_bytes)?,
             open_uploads: neg("open_uploads", self.open_uploads)?,
+            sampled: neg("sampled", self.sampled)?,
             max_epoch: OriginalEpoch::default(),
         })
     }
@@ -291,43 +296,43 @@ pub fn slot_seek(set_id: Ulid, key: &str) -> Vec<u8> {
     slot_key(set_id, Some(key))
 }
 
-/// One occupied slot of a key sample.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SampleSlot {
-    pub key: String,
+/// One entry of a range's key sample. Rows sort by (priority, key), so the sample holds the
+/// lowest priorities and its largest entry is the last row; both depend on the key alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SampleEntry {
     pub priority: u64,
+    pub key: String,
 }
 
-impl SampleSlot {
-    /// The slot a key may occupy and its priority there; both depend on the key alone, so
-    /// replays and refills place it the same way.
-    pub fn of_key(key: &str) -> (u16, Self) {
+impl SampleEntry {
+    pub fn of_key(key: &str) -> Self {
         let hash = blake3::hash(key.as_bytes());
-        let bytes = hash.as_bytes();
-        let slot = u16::from_be_bytes([bytes[0], bytes[1]]) % SAMPLE_SIZE;
-        let priority = u64::from_be_bytes(bytes[2..10].try_into().unwrap_or_default());
-        let entry = Self {
+        let mut priority = [0; 8];
+        priority.copy_from_slice(&hash.as_bytes()[..8]);
+        Self {
+            priority: u64::from_be_bytes(priority),
             key: key.to_string(),
-            priority,
-        };
-        (slot, entry)
+        }
     }
 
-    /// Whether this entry takes a slot `occupant` holds: the lowest priority wins.
-    pub fn displaces(&self, occupant: Option<&Self>) -> bool {
-        occupant.is_none_or(|occupant| {
-            (self.priority, self.key.as_str()) < (occupant.priority, occupant.key.as_str())
-        })
+    pub fn row_key(&self, set_id: Ulid, range_id: Ulid) -> Vec<u8> {
+        let mut out = sample_prefix(set_id, range_id);
+        out.extend_from_slice(&self.priority.to_be_bytes());
+        out.extend_from_slice(self.key.as_bytes());
+        out
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+    /// Reads an entry back from its row key.
+    pub fn decode(row: &[u8]) -> Option<Self> {
+        let rest = row.get(SAMPLE_PREFIX_LEN..)?;
+        let priority = u64::from_be_bytes(rest.get(..8)?.try_into().ok()?);
+        let key = String::from_utf8(rest[8..].to_vec()).ok()?;
+        Some(Self { priority, key })
     }
 }
+
+/// Set id, range id and tag.
+const SAMPLE_PREFIX_LEN: usize = 33;
 
 pub fn sample_prefix(set_id: Ulid, range_id: Ulid) -> Vec<u8> {
     let mut out = range_prefix(set_id, range_id);
@@ -335,9 +340,10 @@ pub fn sample_prefix(set_id: Ulid, range_id: Ulid) -> Vec<u8> {
     out
 }
 
-pub fn sample_key(set_id: Ulid, range_id: Ulid, slot: u16) -> Vec<u8> {
-    let mut out = sample_prefix(set_id, range_id);
-    out.extend_from_slice(&slot.to_be_bytes());
+/// The delta-merged row that counts a range's sample entries in [`RangeCounters::sampled`].
+pub fn sample_count_key(set_id: Ulid, range_id: Ulid) -> Vec<u8> {
+    let mut out = range_prefix(set_id, range_id);
+    out.push(COUNT_TAG);
     out
 }
 
@@ -418,19 +424,26 @@ mod tests {
     }
 
     #[test]
-    fn lowest_priority_wins() {
-        let (slot, first) = SampleSlot::of_key("a/1");
-        assert_eq!(SampleSlot::of_key("a/1"), (slot, first.clone()));
-        assert!(slot < SAMPLE_SIZE && first.displaces(None));
-        let lower = SampleSlot {
-            priority: first.priority.saturating_sub(1),
-            key: "z".to_string(),
-        };
-        assert!(lower.displaces(Some(&first)) && !first.displaces(Some(&lower)));
-        assert!(
-            !first.displaces(Some(&first)),
-            "a replay keeps its slot unchanged"
+    fn samples_sort_by_priority() {
+        let (set, range) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
+        let entries: Vec<_> = ["a/1", "a/2", "b"].map(SampleEntry::of_key).into();
+        assert_eq!(
+            SampleEntry::of_key("a/1"),
+            entries[0],
+            "a replay finds the same entry"
         );
+        let mut rows: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.row_key(set, range))
+            .collect();
+        rows.sort();
+        let decoded: Vec<_> = rows
+            .iter()
+            .map(|row| SampleEntry::decode(row).unwrap())
+            .collect();
+        let mut sorted = entries.clone();
+        sorted.sort_by_key(|entry| (entry.priority, entry.key.clone()));
+        assert_eq!(decoded, sorted);
     }
 
     #[test]
