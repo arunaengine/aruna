@@ -13,6 +13,7 @@ use crate::types::GroupId;
 
 const SET_DOMAIN: &[u8] = b"aruna-distribution-set-v1";
 const STATEMENT_DOMAIN: &str = "aruna-distribution-statement-v1";
+const ADMIT_DOMAIN: &[u8] = b"aruna-distribution-admit-v1";
 
 /// The preimage of a set id: whoever creates the set carries it, every receiver recomputes it.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -123,6 +124,34 @@ pub struct Statement {
 }
 
 impl Statement {
+    /// The admission of one member incarnation for `intent`. Its id is derived from them, so
+    /// a retried admission is the same statement and the publisher embeds it once.
+    pub fn admit(
+        realm_id: RealmId,
+        set_id: Ulid,
+        member_id: Ulid,
+        incarnation: u128,
+        intent: [u8; 32],
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(ADMIT_DOMAIN);
+        hasher.update(&set_id.to_bytes());
+        hasher.update(&member_id.to_bytes());
+        hasher.update(&incarnation.to_be_bytes());
+        hasher.update(&intent);
+        let mut id = [0; 16];
+        id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        Self {
+            realm_id,
+            set_id,
+            statement_id: Ulid::from_bytes(id),
+            member_id,
+            incarnation,
+            intent,
+            kind: StatementKind::Admit,
+        }
+    }
+
     pub fn signing_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
         postcard::to_allocvec(&(STATEMENT_DOMAIN, self))
     }
@@ -141,6 +170,13 @@ impl Statement {
             statement: self,
         }
     }
+}
+
+/// A statement a member asks its own node key to sign; the adapter refuses another signer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StatementClaim {
+    pub signer: NodeId,
+    pub statement: Statement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -207,5 +243,17 @@ mod tests {
         moved.signer = iroh::SecretKey::from_bytes(&[12; 32]).public();
         assert!(!moved.verified());
         assert_ne!(forged.statement.digest(), statement.digest());
+    }
+
+    #[test]
+    fn admissions_keep_identity() {
+        let (realm, set) = (RealmId::from_bytes([7; 32]), root(1).set_id());
+        let member = Ulid::from_bytes([9; 16]);
+        let first = Statement::admit(realm, set, member, 10, [1; 32]);
+        assert_eq!(first, Statement::admit(realm, set, member, 10, [1; 32]));
+        let other = Statement::admit(realm, set, member, 11, [1; 32]);
+        assert_ne!(first.statement_id, other.statement_id);
+        let intent = Statement::admit(realm, set, member, 10, [2; 32]);
+        assert_ne!(first.statement_id, intent.statement_id);
     }
 }

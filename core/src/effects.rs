@@ -698,6 +698,8 @@ pub enum NetEffect {
     VaultSign(Box<crate::structs::identity::user::vault::VaultRecords>),
     /// Signs a distribution snapshot; only a snapshot naming this node as publisher.
     SnapshotSign(Box<crate::structs::storage::distribution::snapshot::SnapshotClaim>),
+    /// Signs a member statement; only a claim naming this node as signer.
+    StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

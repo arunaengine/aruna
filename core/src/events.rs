@@ -422,6 +422,7 @@ pub enum NetEvent {
     VaultFetch(VaultFetchEvent),
     VaultSign(VaultSignEvent),
     SnapshotSign(SnapshotSignEvent),
+    StatementSign(StatementSignEvent),
     Error(NetError),
 }
 
@@ -461,6 +462,14 @@ pub enum VaultSignEvent {
 #[derive(Debug, PartialEq)]
 pub enum SnapshotSignEvent {
     Signed(Box<crate::structs::storage::distribution::SignedSnapshot>),
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::StatementSign`]. The adapter signs only a claim
+/// that names this node as signer.
+#[derive(Debug, PartialEq)]
+pub enum StatementSignEvent {
+    Signed(Box<crate::structs::storage::distribution::SignedStatement>),
     Unavailable(String),
 }
 

@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::events::SnapshotSignEvent;
-use aruna_core::structs::storage::distribution::SignedSnapshot;
+use aruna_core::events::{SnapshotSignEvent, StatementSignEvent};
 use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
+use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement, StatementClaim};
 
 use crate::driver::DriverContext;
 
@@ -32,5 +32,23 @@ pub(crate) fn sign_snapshot(context: &DriverContext, claim: SnapshotClaim) -> Sn
     SnapshotSignEvent::Signed(Box::new(SignedSnapshot {
         signature: net_handle.sign(&bytes),
         snapshot: claim.snapshot,
+    }))
+}
+
+/// Signs a member statement with this node's key, only when the claim names this node.
+pub(crate) fn sign_statement(context: &DriverContext, claim: StatementClaim) -> StatementSignEvent {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return StatementSignEvent::Unavailable("net transport unavailable".to_string());
+    };
+    if claim.signer != net_handle.node_id() {
+        return StatementSignEvent::Unavailable("statement names another signer".to_string());
+    }
+    let Ok(bytes) = claim.statement.signing_bytes() else {
+        return StatementSignEvent::Unavailable("statement does not encode".to_string());
+    };
+    StatementSignEvent::Signed(Box::new(SignedStatement {
+        signature: net_handle.sign(&bytes),
+        signer: claim.signer,
+        statement: claim.statement,
     }))
 }

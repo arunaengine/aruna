@@ -16,14 +16,16 @@ pub mod inventory;
 pub mod parking;
 pub mod presets;
 pub mod request;
+pub mod route;
 pub mod snapshot;
 pub mod statement;
 pub mod validate;
 
 pub use hint::{HintIndex, SetHint};
 pub use request::{DistributionRequest, TransferRole, next_snapshot};
+pub use route::{RouteError, WriteRoute};
 pub use snapshot::{DistributionSnapshot, DistributionView, SignedSnapshot};
-pub use statement::{SetRoot, SignedStatement, Statement, StatementKind};
+pub use statement::{SetRoot, SignedStatement, Statement, StatementClaim, StatementKind};
 pub use validate::DistributionError;
 
 /// At most this many key ranges per set (scale rules).
