@@ -9,8 +9,9 @@ use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_eff
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
 };
+use crate::distribution::guard::{GuardError, record_epoch, record_read};
 use crate::distribution::inventory::{
-    AddedVersion, InventoryChange, entry_of, stamp_generation, version_written,
+    AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
@@ -73,6 +74,8 @@ pub enum SealedCopyError {
     #[error(transparent)]
     PolicyGate(#[from] PolicyGateError),
     #[error(transparent)]
+    Distribution(#[from] GuardError),
+    #[error(transparent)]
     ManagedCopy(#[from] ManagedCopyError),
     #[error(transparent)]
     Policy(#[from] PlacementPolicyError),
@@ -116,6 +119,7 @@ enum Step {
     Init,
     ReadBucket,
     Gate,
+    Record,
     ReadAbe,
     ReadEnvelope,
     CreateEnvelope,
@@ -157,6 +161,8 @@ pub struct SealedCopyOperation {
     existing: Option<CurrentVersionPointer>,
     /// The bucket's distribution binding and the head the copy installs, for the inventory.
     binding: Option<DistributionBinding>,
+    /// The coordinator epoch the copy's version carries in a distributed bucket.
+    epoch: aruna_core::structs::storage::distribution::OriginalEpoch,
     head: Option<CurrentVersionPointer>,
     was_live: bool,
     /// Offered directory bytes the replaced head stops charging.
@@ -187,6 +193,7 @@ impl SealedCopyOperation {
             version: None,
             existing: None,
             binding: None,
+            epoch: Default::default(),
             head: None,
             was_live: false,
             released_bytes: 0,
@@ -269,7 +276,24 @@ impl SealedCopyOperation {
     }
 
     /// Reads the source's envelope or pending copy row and the admitted parameters and epoch.
+    /// Only the coordinator of the destination key's range writes the copy.
     fn read_abe(&mut self) -> Result<Effects, SealedCopyError> {
+        match self.binding.as_ref() {
+            Some(binding) => {
+                self.step = Step::Record;
+                Ok(smallvec![record_read(binding)])
+            }
+            None => self.read_abe_rows(),
+        }
+    }
+
+    fn record_checked(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
+        let binding = self.binding.as_ref().ok_or(SealedCopyError::InvalidState)?;
+        self.epoch = record_epoch(binding, &self.input.dest_key, event)?;
+        self.read_abe_rows()
+    }
+
+    fn read_abe_rows(&mut self) -> Result<Effects, SealedCopyError> {
         let Some(key) = self.input.location.format.bucket_key() else {
             return Ok(self.begin());
         };
@@ -516,6 +540,7 @@ impl SealedCopyOperation {
 
     fn write_head(&mut self) -> Result<Effects, SealedCopyError> {
         let pointer = CurrentVersionPointer::next_for(self.existing.as_ref(), self.version_id)?;
+        let pointer = stamp_head(pointer, self.binding.as_ref(), self.epoch);
         self.head = Some(pointer.clone());
         self.step = Step::WriteHead;
         Ok(smallvec![write_head_effect(
@@ -544,7 +569,7 @@ impl SealedCopyOperation {
     fn write_version(&mut self) -> Result<Effects, SealedCopyError> {
         let version = self.version.take().ok_or(SealedCopyError::InvalidState)?;
         let generation = self.head.as_ref().map_or(0, |head| head.generation);
-        let version = stamp_generation(version, self.binding.as_ref(), generation);
+        let version = stamp_version(version, self.binding.as_ref(), generation, self.epoch);
         let effect = write_version_effect(&self.dest_version(), &version, self.txn_id)?;
         self.version = Some(version);
         self.step = Step::WriteVersion;
@@ -765,6 +790,7 @@ impl SealedCopyOperation {
             }
             (Step::ReadBucket, event) => self.bucket_read(event),
             (Step::Gate, event) => self.gate_step(event),
+            (Step::Record, event) => self.record_checked(event),
             (Step::ReadAbe, event) => self.abe_read(event),
             (Step::ReadEnvelope, event) => self.envelope_read(event),
             (Step::CreateEnvelope, event) => self.envelope_created(event),

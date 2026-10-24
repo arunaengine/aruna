@@ -9,7 +9,10 @@ use crate::blob::managed_copy::{
 };
 use crate::blob::records::HeadAliasContext;
 use crate::connectors::repository::connector_reference_write;
-use crate::distribution::inventory::{AddedVersion, entry_of, stamp_generation, version_written};
+use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::inventory::{
+    AddedVersion, entry_of, stamp_head, stamp_version, version_written,
+};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
@@ -138,6 +141,8 @@ pub enum SuccessorError {
     #[error(transparent)]
     Gate(#[from] PolicyGateError),
     #[error(transparent)]
+    Distribution(#[from] GuardError),
+    #[error(transparent)]
     ManagedCopy(#[from] ManagedCopyError),
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -191,6 +196,8 @@ enum MintState {
     ReadIntent,
     ReadHead,
     ReadBucket,
+    /// Reads a distributed bucket's record: only the key's coordinator writes the successor.
+    ReadRecord,
     ReadVersion,
     ReadSuccessor,
     ScanCopies,
@@ -214,6 +221,8 @@ pub struct SuccessorMint {
     group_id: Option<GroupId>,
     /// The bucket's distribution binding, whose inventory the mint maintains.
     binding: Option<DistributionBinding>,
+    /// The coordinator epoch the successor carries in a distributed bucket.
+    epoch: aruna_core::structs::storage::distribution::OriginalEpoch,
     /// The successor's counter change, committed with its records.
     usage: Option<UsageCounterUpdate>,
     /// New logical bytes the successor books; only these need the quota gate.
@@ -233,6 +242,7 @@ impl SuccessorMint {
             outcome: None,
             group_id: None,
             binding: None,
+            epoch: Default::default(),
             usage: None,
             quota_bytes: 0,
             quota_gate: None,
@@ -272,6 +282,7 @@ impl SuccessorMint {
             MintState::ReadIntent => self.handle_intent(event, txn_id),
             MintState::ReadHead => self.handle_head(event, txn_id),
             MintState::ReadBucket => self.handle_bucket(event, txn_id),
+            MintState::ReadRecord => self.handle_record(event, txn_id),
             MintState::ReadVersion => self.handle_version(event, txn_id),
             MintState::ReadSuccessor => self.handle_successor(event, txn_id),
             MintState::ScanCopies => self.handle_copies(event, txn_id),
@@ -415,6 +426,24 @@ impl SuccessorMint {
                 current: bucket.placement_policy_generation,
             });
         }
+        if let Some(binding) = self.binding.as_ref() {
+            self.state = MintState::ReadRecord;
+            return Ok(Some(smallvec![record_read(binding)]));
+        }
+        self.read_version(txn_id)
+    }
+
+    fn handle_record(
+        &mut self,
+        event: Event,
+        txn_id: Option<TxnId>,
+    ) -> Result<Option<Effects>, SuccessorError> {
+        let binding = self.binding.as_ref().ok_or(SuccessorError::InvalidEvent)?;
+        self.epoch = record_epoch(binding, &self.plan.context.key, event)?;
+        self.read_version(txn_id)
+    }
+
+    fn read_version(&mut self, txn_id: Option<TxnId>) -> Result<Option<Effects>, SuccessorError> {
         self.state = MintState::ReadVersion;
         Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -583,7 +612,13 @@ impl SuccessorMint {
         )
         .with_policies(self.effective_refs.clone())?;
         let next = CurrentVersionPointer::next_for(Some(&self.plan.expected_head), version_id)?;
-        let successor = stamp_generation(successor, self.binding.as_ref(), next.generation);
+        let next = stamp_head(next, self.binding.as_ref(), self.epoch);
+        let successor = stamp_version(
+            successor,
+            self.binding.as_ref(),
+            next.generation,
+            self.epoch,
+        );
         let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(7);
         let version_key = self.plan.version_key(version_id);
         writes.extend(connector_reference_write(&successor, &version_key)?);

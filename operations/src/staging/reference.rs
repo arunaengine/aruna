@@ -8,7 +8,10 @@ use crate::connectors::repository::{
     source_connector_key,
 };
 use crate::connectors::resolver::secret_fingerprint;
-use crate::distribution::inventory::{AddedVersion, entry_of, stamp_generation, version_written};
+use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::inventory::{
+    AddedVersion, entry_of, stamp_head, stamp_version, version_written,
+};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
@@ -80,6 +83,8 @@ pub enum MaterializeReferenceError {
     Policy(#[from] PlacementPolicyError),
     #[error(transparent)]
     Purge(#[from] PurgeFenceError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
 }
 
 pub async fn stage_reference_blob(
@@ -183,6 +188,14 @@ pub async fn write_reference_version(
         )
         .await?;
         let set_hint = binding.as_ref().map(DistributionBinding::hint);
+        // Only the coordinator of the key's range writes, at its epoch.
+        let epoch = match binding.as_ref() {
+            Some(binding) => {
+                let event = send_storage_effect(context, record_read(binding)).await?;
+                record_epoch(binding, &write.key, event)?
+            }
+            None => Default::default(),
+        };
         if let (Some(hint), Some(planned)) = (set_hint, write.preassigned_version_id)
             && SetHint::of_version(planned) != hint
         {
@@ -277,6 +290,7 @@ pub async fn write_reference_version(
             .and_then(|version| version.offered_size(&write.bucket, &write.key));
         let was_live = existing_version.is_some_and(|version| !version.is_deleted());
         let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id)?;
+        let next_pointer = stamp_head(next_pointer, binding.as_ref(), epoch);
         let generation = next_pointer.generation;
 
         for effect in build_transition_effects(
@@ -303,7 +317,7 @@ pub async fn write_reference_version(
             now,
         )
         .with_policies(policies)?;
-        let version = stamp_generation(version, binding.as_ref(), generation);
+        let version = stamp_version(version, binding.as_ref(), generation, epoch);
         apply_storage_effect(
             context,
             write_version_effect(&version_key, &version, Some(txn_id))?,

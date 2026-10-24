@@ -8,8 +8,9 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
+use crate::distribution::guard::{GuardError, record_epoch, record_read};
 use crate::distribution::inventory::{
-    AddedVersion, InventoryChange, InventoryUpdate, stamp_generation, version_written,
+    AddedVersion, InventoryChange, InventoryUpdate, stamp_head, stamp_version, version_written,
 };
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
@@ -89,6 +90,8 @@ pub enum CompleteUploadState {
     ReserveCompose,
     ReadUploadParts,
     ReadGateBucket,
+    /// Reads a distributed bucket's record: only the key's coordinator completes, at its epoch.
+    ReadRecord,
     PolicyGate,
     ComposeBlob,
     StartFinalizeTransaction,
@@ -169,6 +172,8 @@ pub enum CompleteUploadError {
     Unmapped,
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
     #[error(transparent)]
     BlobError(#[from] BlobError),
     #[error(transparent)]
@@ -1099,6 +1104,29 @@ impl CompleteUploadOperation {
     }
 
     fn compose_blob(&mut self) -> Effects {
+        match self.binding.as_ref() {
+            Some(binding) => {
+                self.state = CompleteUploadState::ReadRecord;
+                smallvec![record_read(binding)]
+            }
+            None => self.compose_upload(),
+        }
+    }
+
+    fn record_checked(&mut self, event: Event) -> Effects {
+        let Some(binding) = self.binding.as_ref() else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        match record_epoch(binding, &self.input.key, event) {
+            Ok(epoch) => {
+                self.version_epoch = epoch;
+                self.compose_upload()
+            }
+            Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    fn compose_upload(&mut self) -> Effects {
         let Some(upload) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
@@ -1599,7 +1627,7 @@ impl CompleteUploadOperation {
         version_id: Ulid,
     ) -> Effects {
         let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
-            Ok(pointer) => pointer,
+            Ok(pointer) => stamp_head(pointer, self.binding.as_ref(), self.version_epoch),
             Err(err) => return self.schedule_error(err.into()),
         };
         let alias_context = match self.alias_context() {
@@ -1711,7 +1739,12 @@ impl CompleteUploadOperation {
         };
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
         let generation = self.head_pointer.as_ref().map_or(0, |head| head.generation);
-        let version = stamp_generation(version, self.binding.as_ref(), generation);
+        let version = stamp_version(
+            version,
+            self.binding.as_ref(),
+            generation,
+            self.version_epoch,
+        );
         self.stored_policies = version.placement_policies.clone();
         self.version_epoch = version.original_epoch;
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
@@ -2496,6 +2529,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReserveCompose => self.compose_reserved(event),
             CompleteUploadState::ReadUploadParts => self.upload_parts_read(event),
             CompleteUploadState::ReadGateBucket => self.handle_gate_bucket(event),
+            CompleteUploadState::ReadRecord => self.record_checked(event),
             CompleteUploadState::PolicyGate => self.handle_policy_gate(event),
             CompleteUploadState::ComposeBlob => self.handle_blob_composed(event),
             CompleteUploadState::StartFinalizeTransaction => self.finalize_started(event),

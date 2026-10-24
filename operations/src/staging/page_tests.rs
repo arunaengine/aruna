@@ -632,7 +632,6 @@ async fn page_maintains_inventory() {
     use crate::driver::drive;
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-    use aruna_core::structs::storage::distribution::DistributionBinding;
     use aruna_core::structs::storage::distribution::accounting::generation_key;
     use aruna_core::structs::storage::distribution::inventory::head_position;
 
@@ -642,13 +641,11 @@ async fn page_maintains_inventory() {
     let group_id = bucket().group_id;
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
-    let set_id = Ulid::from_bytes([5u8; 16]);
-    bound.distribution = Some(DistributionBinding {
-        set_id,
-        member_id: Ulid::from_bytes([6u8; 16]),
-        incarnation: 1,
-        revision: Default::default(),
-    });
+    // Member 1 of the test set coordinates the keys "a" and "b".
+    let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
+    let set_id = snapshot.set_id();
+    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
         key: b"shared".to_vec().into(),
@@ -689,4 +686,56 @@ async fn page_maintains_inventory() {
     );
     assert!(has_row(handle, head_position(set_id, "a")).await);
     assert!(has_row(handle, head_position(set_id, "b")).await);
+}
+
+// A page whose keys reach a range another member coordinates writes nothing.
+#[tokio::test]
+async fn page_needs_coordinator() {
+    use crate::distribution::guard::GuardError;
+    use crate::distribution::test_record::{binding, record as set_record, store_record};
+    use crate::distribution::test_store::{has_row, install, range};
+    use crate::driver::drive;
+    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_core::structs::storage::distribution::inventory::head_position;
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let group_id = bucket().group_id;
+    let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
+    let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
+    // Member 1 coordinates "a"; member 2 coordinates "x".
+    let (snapshot, record_bytes) = set_record(true);
+    let set_id = snapshot.set_id();
+    store_record(handle, set_id, record_bytes).await;
+    bound.distribution = Some(binding(&snapshot, 1, 5));
+    let write = StorageEffect::Write {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: b"shared".to_vec().into(),
+        value: bound.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    assert!(matches!(
+        handle.send_storage_effect(write).await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    install(handle, set_id, &[range(1, "", None)]).await;
+    crate::jobs::store::insert_job(handle, &record(token()))
+        .await
+        .unwrap();
+    let page = PageImportInput {
+        connector,
+        bucket: "shared".to_string(),
+        expected_bucket: bound,
+        ..input(vec![entry("a"), entry("x")])
+    };
+    let refused = drive(PageImportOperation::new(page), context).await;
+    assert!(matches!(
+        refused,
+        Err(PageImportError::Distribution(
+            GuardError::NotCoordinator { .. }
+        ))
+    ));
+    assert!(!has_row(handle, head_position(set_id, "a")).await);
 }

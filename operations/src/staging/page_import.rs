@@ -4,6 +4,7 @@
 
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
+use crate::distribution::guard::{record_read, write_epoch};
 use crate::node::usage_stats::{UsageCounterUpdate, schedule_snapshot_publish};
 use crate::replication::queue::schedule_blob_drain;
 use crate::staging::page_rows::{
@@ -57,6 +58,15 @@ impl PageImportOperation {
                 smallvec![]
             }
         }
+    }
+
+    fn read_secret(&mut self) -> Result<Effects, PageImportError> {
+        self.state = PageImportState::ReadSecret;
+        let connector_id = self.input.connector.connector_id;
+        Ok(smallvec![read_secret_effect(
+            connector_id,
+            Some(self.txn()?)
+        )])
     }
 
     fn txn(&self) -> Result<TxnId, PageImportError> {
@@ -144,13 +154,34 @@ impl PageImportOperation {
                 PageImportState::ReadGuards,
                 Event::Storage(StorageEvent::BatchReadResult { values }),
             ) => {
-                self.guards = Some(check_guards(&self.input, values)?);
-                self.state = PageImportState::ReadSecret;
-                let connector_id = self.input.connector.connector_id;
-                Ok(smallvec![read_secret_effect(
-                    connector_id,
-                    Some(self.txn()?)
-                )])
+                let guards = check_guards(&self.input, values)?;
+                let record = guards.binding.as_ref().map(record_read);
+                self.guards = Some(guards);
+                match record {
+                    Some(read) => {
+                        self.state = PageImportState::ReadRecord;
+                        Ok(smallvec![read])
+                    }
+                    None => self.read_secret(),
+                }
+            }
+            (
+                PageImportState::ReadRecord,
+                Event::Storage(StorageEvent::ReadResult { value, .. }),
+            ) => {
+                let guards = self.guards.as_mut().ok_or(PageImportError::NotFinished)?;
+                let binding = guards
+                    .binding
+                    .as_ref()
+                    .ok_or(PageImportError::NotFinished)?;
+                // Every key of the page must lie in a range this member coordinates.
+                guards.epochs = self
+                    .input
+                    .entries
+                    .iter()
+                    .map(|entry| write_epoch(binding, &entry.target_key, value.as_deref()))
+                    .collect::<Result<_, _>>()?;
+                self.read_secret()
             }
             (
                 PageImportState::ReadSecret,
@@ -236,6 +267,7 @@ fn expected_event(state: PageImportState) -> &'static str {
         PageImportState::StartTransaction => "TransactionStarted",
         PageImportState::ReadGuards | PageImportState::ReadVersions => "BatchReadResult",
         PageImportState::ReadSecret => "VaultResult",
+        PageImportState::ReadRecord => "ReadResult",
         PageImportState::WriteRows | PageImportState::UpdateUsage => "BatchWriteResult",
         PageImportState::DeleteRows => "BatchDeleteResult",
         PageImportState::Commit => "TransactionCommitted",

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::distribution::guard::{GuardError, record_epoch, record_read};
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::count_upload;
@@ -46,6 +47,8 @@ pub enum CreateMultipartState {
     ReadGateBucket,
     ReadBucketKey,
     PolicyGate,
+    /// Reads a distributed bucket's record: uploads open only on the key's coordinator.
+    ReadRecord,
     CheckOpenFence,
     ReadPlainOwner,
     StatPlain,
@@ -76,6 +79,8 @@ pub enum CreateMultipartError {
     Unmapped,
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
     #[error("Transaction id missing")]
     TransactionMissing,
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
@@ -155,6 +160,8 @@ pub struct CreateMultipartOperation {
     pending_error: Option<CreateMultipartError>,
     /// The inventory update of a distributed bucket, opened with the upload record.
     inventory: Option<InventoryUpdate>,
+    /// The bucket's distribution binding; only the key's coordinator opens an upload.
+    binding: Option<aruna_core::structs::storage::distribution::DistributionBinding>,
     output: Option<Result<CreateMultipartResult, CreateMultipartError>>,
 }
 
@@ -180,6 +187,7 @@ impl CreateMultipartOperation {
             envelope: None,
             pending_error: None,
             inventory: None,
+            binding: None,
             output: None,
         }
     }
@@ -228,6 +236,24 @@ impl CreateMultipartOperation {
 
     /// A fenced destination opens no provider upload; the transaction checks the fence again.
     fn check_open_fence(&mut self) -> Effects {
+        if let Some(binding) = self.binding.as_ref() {
+            self.state = CreateMultipartState::ReadRecord;
+            return smallvec![record_read(binding)];
+        }
+        self.read_open_fence()
+    }
+
+    fn record_checked(&mut self, event: Event) -> Effects {
+        let Some(binding) = self.binding.as_ref() else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        match record_epoch(binding, &self.input.key, event) {
+            Ok(_) => self.read_open_fence(),
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn read_open_fence(&mut self) -> Effects {
         self.state = CreateMultipartState::CheckOpenFence;
         smallvec![write_fence_read(&self.input.bucket, None)]
     }
@@ -496,10 +522,10 @@ impl CreateMultipartOperation {
 
     fn gate_bucket(&mut self, bucket: Option<BucketInfo>) -> Effects {
         self.stored_policies = GatedBucket::observe(bucket.as_ref()).policies;
-        let binding = bucket
+        self.binding = bucket
             .as_ref()
-            .and_then(|bucket| bucket.distribution.as_ref());
-        self.inventory = binding.map(|binding| {
+            .and_then(|bucket| bucket.distribution.clone());
+        self.inventory = self.binding.as_ref().map(|binding| {
             let mut change = InventoryChange::new(binding.set_id, self.input.key.clone());
             change.upload = Some((self.upload_id, true));
             InventoryUpdate::new(change)
@@ -808,6 +834,7 @@ impl Operation for CreateMultipartOperation {
             CreateMultipartState::Init => self.handle_init(),
             CreateMultipartState::ReadGateBucket => self.handle_gate_bucket(event),
             CreateMultipartState::ReadBucketKey => self.handle_bucket_key(event),
+            CreateMultipartState::ReadRecord => self.record_checked(event),
             CreateMultipartState::PolicyGate => self.handle_policy_gate(event),
             CreateMultipartState::CheckOpenFence => self.open_upload(event),
             CreateMultipartState::ReadPlainOwner => self.plain_owner(event),

@@ -24,15 +24,18 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::connectors::repository::connector_reference_write;
-use crate::distribution::inventory::{AddedVersion, entry_of, stamp_generation, version_written};
+use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::inventory::{
+    AddedVersion, entry_of, stamp_head, stamp_version, version_written,
+};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::replication::protocol::ReferenceAdvance;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::object::get::MAX_AUTO_ADVANCES;
 use crate::s3::object::metadata::ReferenceRefresh;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
-use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::mint_version;
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 
 /// One storage row a successor writes.
 type Row = (KeySpace, Key, Value);
@@ -49,6 +52,8 @@ pub enum MintError {
     Usage(#[from] UsageUpdateError),
     #[error(transparent)]
     Purge(#[from] PurgeFenceError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
     #[error("unexpected event in state {state:?}: {received}")]
     UnexpectedEvent { state: MintState, received: String },
 }
@@ -57,6 +62,8 @@ pub enum MintError {
 pub enum MintState {
     Init,
     ReadRows,
+    /// Reads a distributed bucket's record: only the key's coordinator advances it.
+    ReadRecord,
     WriteRows,
     UpdateUsage,
     Finish,
@@ -72,6 +79,8 @@ pub(crate) struct MintSuccessorOperation {
     observation: SourceMetadata,
     predecessor: BlobVersion,
     state: MintState,
+    /// The rows read and the binding whose record decides the successor's epoch.
+    pending: Option<(Vec<(Key, Option<Value>)>, DistributionBinding)>,
     usage: Option<UsageCounterUpdate>,
     output: Option<Result<bool, MintError>>,
 }
@@ -89,6 +98,7 @@ impl MintSuccessorOperation {
             observation,
             predecessor,
             state: MintState::Init,
+            pending: None,
             usage: None,
             output: None,
         }
@@ -104,6 +114,21 @@ impl MintSuccessorOperation {
         self.state = MintState::Error;
         self.output = Some(Err(error));
         smallvec![]
+    }
+
+    fn write_successor(
+        &mut self,
+        values: Vec<(Key, Option<Value>)>,
+        epoch: OriginalEpoch,
+    ) -> Result<Effects, MintError> {
+        let Some(writes) = self.successor_rows(values, epoch)? else {
+            return Ok(self.finish(false));
+        };
+        self.state = MintState::WriteRows;
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(self.txn_id),
+        })])
     }
 
     fn head_key(&self) -> Result<Vec<u8>, ConversionError> {
@@ -131,6 +156,7 @@ impl MintSuccessorOperation {
     fn successor_rows(
         &mut self,
         values: Vec<(Key, Option<Value>)>,
+        epoch: OriginalEpoch,
     ) -> Result<Option<Vec<Row>>, MintError> {
         let mut values = values.into_iter().map(|(_, value)| value);
         let pointer = values
@@ -182,7 +208,8 @@ impl MintSuccessorOperation {
         let version_key = VersionKey::new(&refresh.bucket, &refresh.key, version_id);
         let next = CurrentVersionPointer::next_for(Some(&pointer), version_id)?;
         let binding = bucket.distribution.as_ref();
-        let successor = stamp_generation(successor, binding, next.generation);
+        let next = stamp_head(next, binding, epoch);
+        let successor = stamp_version(successor, binding, next.generation, epoch);
         let obligation = LiveObligationRecord::new(
             refresh.node_id,
             refresh.auth_context.clone(),
@@ -234,14 +261,25 @@ impl MintSuccessorOperation {
     fn step_inner(&mut self, event: Event) -> Result<Effects, MintError> {
         match (self.state, event) {
             (MintState::ReadRows, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let Some(writes) = self.successor_rows(values)? else {
-                    return Ok(self.finish(false));
-                };
-                self.state = MintState::WriteRows;
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: Some(self.txn_id),
-                })])
+                let bucket = values
+                    .get(1)
+                    .and_then(|(_, value)| value.as_ref())
+                    .map(|value| BucketInfo::from_bytes(value.as_ref()))
+                    .transpose()?;
+                match bucket.and_then(|bucket| bucket.distribution) {
+                    Some(binding) => {
+                        self.state = MintState::ReadRecord;
+                        let read = record_read(&binding);
+                        self.pending = Some((values, binding));
+                        Ok(smallvec![read])
+                    }
+                    None => self.write_successor(values, OriginalEpoch::default()),
+                }
+            }
+            (MintState::ReadRecord, event @ Event::Storage(StorageEvent::ReadResult { .. })) => {
+                let (values, binding) = self.pending.take().ok_or(StorageError::InvalidEffect)?;
+                let epoch = record_epoch(&binding, &self.refresh.key, event)?;
+                self.write_successor(values, epoch)
             }
             (MintState::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 match self.usage.as_mut().filter(|usage| !usage.is_noop()) {

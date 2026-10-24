@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
+use crate::distribution::guard::GuardError;
 use crate::distribution::inventory::{
-    AddedVersion, InventoryChange, entry_of, stamp_generation, version_written,
+    AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
 use crate::jobs::store::decode_job_record;
 use crate::node::usage_stats::UsageUpdateError;
@@ -31,8 +32,8 @@ use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPoli
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
@@ -97,6 +98,8 @@ pub enum PageImportState {
     Init,
     StartTransaction,
     ReadGuards,
+    /// Reads a distributed bucket's record: every entry's key must be coordinated here.
+    ReadRecord,
     ReadSecret,
     ReadVersions,
     WriteRows,
@@ -122,6 +125,8 @@ pub enum PageImportError {
     Policy(#[from] PlacementPolicyError),
     #[error(transparent)]
     Usage(#[from] UsageUpdateError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
     #[error("the destination bucket changed after the job was submitted")]
     BucketChanged,
     #[error("the connector changed while the page was imported")]
@@ -160,6 +165,8 @@ pub(crate) struct PageGuards {
     /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
     pub set_hint: Option<SetHint>,
     pub binding: Option<DistributionBinding>,
+    /// The coordinator epoch of each entry's key in a distributed bucket, in entry order.
+    pub epochs: Vec<OriginalEpoch>,
 }
 
 /// The rows of one page, its usage change and its outcome.
@@ -269,6 +276,7 @@ pub(crate) fn check_guards(
         heads,
         set_hint: binding.as_ref().map(DistributionBinding::hint),
         binding,
+        epochs: Vec::new(),
     })
 }
 
@@ -333,7 +341,7 @@ pub(crate) fn page_rows(
         kept: 0,
         checkpoint: input.checkpoint.clone(),
     };
-    for (entry, head) in input.entries.iter().zip(&guards.heads) {
+    for (index, (entry, head)) in input.entries.iter().zip(&guards.heads).enumerate() {
         let existing = head.as_ref().and_then(|_| versions.next().flatten());
         let plan = plan_entry(
             input,
@@ -355,7 +363,8 @@ pub(crate) fn page_rows(
                 }
             }
             EntryPlan::Register => {
-                let (rows, change) = register_rows(input, guards, entry, head.as_ref())?;
+                let epoch = guards.epochs.get(index).copied().unwrap_or_default();
+                let (rows, change) = register_rows(input, guards, (entry, epoch), head.as_ref())?;
                 writes.extend(rows);
                 inventory.extend(change);
                 // An offered directory observation is charged only while it is the head.
@@ -407,7 +416,7 @@ type EntryRows = (Vec<(KeySpace, Key, Value)>, Option<InventoryChange>);
 fn register_rows(
     input: &PageImportInput,
     guards: &PageGuards,
-    entry: &PageEntry,
+    (entry, epoch): (&PageEntry, OriginalEpoch),
     head: Option<&CurrentVersionPointer>,
 ) -> Result<EntryRows, PageImportError> {
     let connector = &input.connector;
@@ -430,7 +439,8 @@ fn register_rows(
     .with_policies(guards.policies.clone())?;
     let version_key = VersionKey::new(&input.bucket, &entry.target_key, version_id);
     let pointer = CurrentVersionPointer::next_for(head, version_id)?;
-    let version = stamp_generation(version, guards.binding.as_ref(), pointer.generation);
+    let pointer = stamp_head(pointer, guards.binding.as_ref(), epoch);
+    let version = stamp_version(version, guards.binding.as_ref(), pointer.generation, epoch);
     let added = AddedVersion {
         version_id,
         epoch: version.original_epoch,

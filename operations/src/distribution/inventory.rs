@@ -530,18 +530,6 @@ fn route(
         .collect())
 }
 
-/// Stamps the head generation a version is written as, inside a distributed bucket only.
-pub fn stamp_generation(
-    version: BlobVersion,
-    binding: Option<&DistributionBinding>,
-    generation: u64,
-) -> BlobVersion {
-    match binding {
-        Some(_) => version.with_generation(generation),
-        None => version,
-    }
-}
-
 /// Stamps the head generation and the coordinator's epoch a version is written as, inside a
 /// distributed bucket only.
 pub fn stamp_version(

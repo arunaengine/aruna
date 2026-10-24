@@ -75,3 +75,23 @@ pub(crate) fn binding(
         revision: snapshot.revision(),
     }
 }
+
+/// Stores record bytes as this node's view of their set.
+pub(crate) async fn store_record(
+    handle: &aruna_storage::storage::StorageHandle,
+    set_id: Ulid,
+    bytes: Vec<u8>,
+) {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    let write = StorageEffect::Write {
+        key_space: aruna_core::keyspaces::DISTRIBUTION_KEYSPACE.to_string(),
+        key: set_id.to_bytes().to_vec().into(),
+        value: bytes.into(),
+        txn_id: None,
+    };
+    assert!(matches!(
+        handle.send_storage_effect(write).await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+}
