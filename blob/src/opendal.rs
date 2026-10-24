@@ -391,64 +391,85 @@ async fn list_operator(
         }
     }
     // One level is listed as flat keys rolled up into directories, so the cursor is always a key
-    // of one sorted listing and never depends on how a provider orders a page.
-    let mut lister = operator
-        .lister_with(path)
-        .recursive(true)
-        .limit(limit - entries.len());
-    if let Some(floor) = floor.as_deref() {
-        lister = lister.start_after(floor);
-    }
-    let mut lister = lister.await.map_err(list_error)?;
+    // of one sorted listing and never depends on how a provider orders a page. After a new
+    // directory the listing seeks past its subtree instead of reading its keys.
+    let budget = limit - entries.len();
+    let mut start = floor.clone();
     let mut highest = floor.clone();
     // A directory the previous page already listed, from the key the cursor names.
     let mut last_directory = floor.as_deref().and_then(|key| child_directory(path, key));
-    let budget = limit - entries.len();
     let mut consumed = 0usize;
-    // A provider page holds `budget` entries, so stopping there never fetches a lookahead page.
-    while consumed < budget {
-        let Some(entry) = lister.try_next().await.map_err(list_error)? else {
-            return Ok((entries, None));
-        };
-        consumed += 1;
-        let entry_path = entry.path();
-        if request
-            .stop
-            .as_deref()
-            .is_some_and(|stop| entry_path >= stop)
-        {
-            return Ok((entries, None));
+    let mut seeks = 0usize;
+    'listing: loop {
+        let mut lister = operator
+            .lister_with(path)
+            .recursive(true)
+            .limit(budget - consumed);
+        if let Some(start) = start.as_deref() {
+            lister = lister.start_after(start);
         }
-        // A provider may repeat the key a cursor named; anything at or below it was served.
-        if floor.as_deref().is_some_and(|floor| entry_path <= floor) {
-            continue;
-        }
-        if highest
-            .as_deref()
-            .is_none_or(|highest| entry_path > highest)
-        {
-            highest = Some(entry_path.to_string());
-        }
-        let directory = (!request.recursive)
-            .then(|| child_directory(path, entry_path))
-            .flatten();
-        match directory {
-            Some(directory) => {
-                if last_directory.as_deref() != Some(directory.as_str()) && !request.files_only {
-                    entries.push(directory_entry(&directory));
-                }
-                last_directory = Some(directory);
+        let mut lister = lister.await.map_err(list_error)?;
+        // A provider page holds the remaining budget, so stopping there never reads ahead.
+        while consumed < budget {
+            let Some(entry) = lister.try_next().await.map_err(list_error)? else {
+                return Ok((entries, None));
+            };
+            consumed += 1;
+            let entry_path = entry.path();
+            if request
+                .stop
+                .as_deref()
+                .is_some_and(|stop| entry_path >= stop)
+            {
+                return Ok((entries, None));
             }
-            None => {
+            // A provider may repeat the key a listing started after; it was served.
+            if start.as_deref().is_some_and(|start| entry_path <= start) {
+                continue;
+            }
+            if highest
+                .as_deref()
+                .is_none_or(|highest| entry_path > highest)
+            {
+                highest = Some(entry_path.to_string());
+            }
+            let directory = (!request.recursive)
+                .then(|| child_directory(path, entry_path))
+                .flatten();
+            let Some(directory) = directory else {
                 if let Some(entry) =
                     source_entry(entry_path, entry.metadata(), path, request.files_only)
                 {
                     entries.push(entry);
                 }
+                continue;
+            };
+            if last_directory.as_deref() == Some(directory.as_str()) {
+                continue;
             }
+            if !request.files_only {
+                entries.push(directory_entry(&directory));
+            }
+            let beyond = past_subtree(&directory);
+            last_directory = Some(directory);
+            highest = Some(beyond.clone());
+            start = Some(beyond);
+            seeks += 1;
+            if seeks < MAX_PAGE_SEEKS && consumed < budget {
+                continue 'listing;
+            }
+            break;
         }
+        return Ok((entries, highest.map(ListCursor::After)));
     }
-    Ok((entries, highest.map(ListCursor::After)))
+}
+
+/// Provider requests one browse page may spend seeking past directories.
+const MAX_PAGE_SEEKS: usize = 32;
+
+/// A key after every descendant a directory can practically hold.
+fn past_subtree(directory: &str) -> String {
+    format!("{directory}{}", char::MAX)
 }
 
 /// The direct child directory of `path` that `key` lies in, with a trailing slash.

@@ -967,7 +967,22 @@ async fn browse_keeps_files() {
     const NESTED: &[&str] = &["d/b/1", "d/b/2", "d/b/3"];
     let server = ListingServer::bind_with(NESTED, true).await;
     let pages = all_pages(&server.operator(), "d/", list_request(2, false, false)).await;
-    assert_eq!(pages, [vec!["d/b"], vec![]]);
+    assert_eq!(pages, [vec!["d/b"]]);
+}
+
+// A directory's subtree is skipped with one seek, so the files after it come at once.
+#[tokio::test]
+async fn browse_skips_subtrees() {
+    const KEYS: &[&str] = &[
+        "d/a/1", "d/a/2", "d/a/3", "d/a/4", "d/a/5", "d/a/6", "d/b.txt", "d/c/1", "d/z.txt",
+    ];
+    let server = ListingServer::bind(KEYS).await;
+
+    let pages = all_pages(&server.operator(), "d/", list_request(3, false, false)).await;
+
+    assert_eq!(pages, [vec!["d/a", "d/b.txt", "d/c"], vec!["d/z.txt"]]);
+    // The first request, one seek past `a/` and the second page; `c/` ends the first page.
+    assert_eq!(server.lists.load(Ordering::SeqCst), 3);
 }
 
 // The probed lower key takes one entry of the page, so a page never exceeds its limit.
