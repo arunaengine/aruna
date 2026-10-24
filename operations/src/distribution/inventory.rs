@@ -9,8 +9,9 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
-    RANGE_INDEX_KEYSPACE, SOURCE_ROOT_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
+    CONTENT_INDEX_KEYSPACE, INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
+    RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE, SOURCE_ROOT_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE,
+    VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::accounting::{
@@ -18,7 +19,7 @@ use aruna_core::structs::storage::distribution::accounting::{
     account_key, generation_key, pending_key, sample_count_key, sample_prefix, slot_key, slot_seek,
 };
 use aruna_core::structs::storage::distribution::inventory::{
-    Entry, HeadEntry, IndexEntry, Position, VersionEntry, head_position, index_key,
+    Entry, HeadEntry, IndexEntry, Position, VersionEntry, content_key, head_position, index_key,
     logical_identity, upload_position, version_position,
 };
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, root_key};
@@ -399,6 +400,11 @@ impl InventoryUpdate {
                 if existing.version == added.entry {
                     continue;
                 }
+                if let Some(identity) = existing.version.identity {
+                    let content = content_key(set_id, &identity, added.version_id);
+                    self.deletes
+                        .push((CONTENT_INDEX_KEYSPACE.into(), content.into()));
+                }
                 old = Some(RangeCounters::of_version(added.epoch, &existing.version));
                 position = existing.position;
             }
@@ -416,6 +422,11 @@ impl InventoryUpdate {
                 .push(row(INVENTORY_KEYSPACE, position.clone(), value));
             self.writes
                 .push(row(VERSION_INDEX_KEYSPACE, index, entry.to_bytes()?));
+            if let Some(identity) = added.entry.identity {
+                let content = content_key(set_id, &identity, added.version_id);
+                self.writes
+                    .push(row(CONTENT_INDEX_KEYSPACE, content, Vec::new()));
+            }
             contributions.push((Walk::Versions, position, counters));
         }
         for version_id in self.change.removed.clone() {
@@ -431,6 +442,11 @@ impl InventoryUpdate {
                 .push((INVENTORY_KEYSPACE.into(), entry.position.clone().into()));
             self.deletes
                 .push((VERSION_INDEX_KEYSPACE.into(), index.into()));
+            if let Some(identity) = entry.version.identity {
+                let content = content_key(set_id, &identity, version_id);
+                self.deletes
+                    .push((CONTENT_INDEX_KEYSPACE.into(), content.into()));
+            }
             let counters = RangeCounters::of_version(epoch, &entry.version).negate()?;
             contributions.push((Walk::Versions, entry.position, counters));
         }

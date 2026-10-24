@@ -72,6 +72,8 @@ pub const INVENTORY_KEYSPACE: &str = "distribution_inventory";
 pub const UPLOAD_INVENTORY_KEYSPACE: &str = "distribution_uploads";
 /// Version id to inventory position, by set id and version id.
 pub const VERSION_INDEX_KEYSPACE: &str = "distribution_version_index";
+/// Versions of a distributed bucket by content identity: set id, identity, version id.
+pub const CONTENT_INDEX_KEYSPACE: &str = "distribution_content_index";
 /// The installed key ranges of each set by set id and exclusive upper bound.
 pub const RANGE_INDEX_KEYSPACE: &str = "distribution_ranges";
 /// The accounting row of each range: active generation, rebuild cursors and split state.
@@ -738,6 +740,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DISTRIBUTION_PURGE_KEYSPACE,
     SOURCE_ROOT_KEYSPACE,
     BUCKET_FREE_INDEX,
+    CONTENT_INDEX_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

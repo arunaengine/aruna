@@ -102,6 +102,21 @@ pub fn index_key(set_id: Ulid, version_id: Ulid) -> Vec<u8> {
     out
 }
 
+/// The versions of one content identity in a set: set id, then the identity.
+pub fn content_prefix(set_id: Ulid, identity: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&set_id.to_bytes());
+    out.extend_from_slice(identity);
+    out
+}
+
+/// The content index key of a version; the version id is its last 16 bytes.
+pub fn content_key(set_id: Ulid, identity: &[u8; 32], version_id: Ulid) -> Vec<u8> {
+    let mut out = content_prefix(set_id, identity);
+    out.extend_from_slice(&version_id.to_bytes());
+    out
+}
+
 /// What one inventory row is, read back from its position.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Entry {

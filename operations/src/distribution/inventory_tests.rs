@@ -121,6 +121,31 @@ async fn reference_records_its_root() {
 }
 
 #[tokio::test]
+async fn indexes_content_identity() {
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
+    let identity = stored(10).identity.unwrap();
+    let content = content_key(set(), &identity, id(1));
+    assert!(
+        get(&handle, CONTENT_INDEX_KEYSPACE, content.clone())
+            .await
+            .is_some(),
+        "the version is found by its content identity"
+    );
+    let mut purge = InventoryChange::new(set(), "a");
+    purge.removed = vec![id(1)];
+    purge.head = HeadChange::Remove;
+    assert!(apply(&handle, InventoryUpdate::new(purge)).await.unwrap());
+    assert!(
+        get(&handle, CONTENT_INDEX_KEYSPACE, content)
+            .await
+            .is_none(),
+        "a removed version leaves the content index"
+    );
+}
+
+#[tokio::test]
 async fn replay_changes_nothing() {
     let (_dir, handle) = open();
     single_range(&handle).await;
