@@ -1583,6 +1583,70 @@ async fn transient_spool_cleanup() {
     );
 }
 
+// A spool being read is left out of hidden listings and cannot be deleted, so the sweep never
+// reclaims it; once the reader is gone the spool is deleted and its charge freed.
+#[tokio::test]
+async fn live_spool_protected() {
+    let context = setup_blob_handle(5).await;
+    let namespace = Ulid::from_bytes([14u8; 16]);
+    let budget = context.blob_handle.handler.spool_budget.clone();
+    let full = budget.available_permits();
+    let list = || BlobEffect::ListHidden {
+        namespace: Some(namespace),
+        cursor: None,
+    };
+    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::SpoolHidden {
+            namespace,
+            name: "live".to_string(),
+            created_by: test_user_id(),
+            max_bytes: Some(4),
+            deadline: None,
+            blob: stream_from_bytes(b"four"),
+            transient: true,
+        })
+        .await
+    else {
+        panic!("transient spool failed")
+    };
+    let key = HiddenBlobKey::try_from(&location).unwrap();
+    let Event::Blob(BlobEvent::HiddenRead { blob, .. }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::ReadHiddenRange {
+            location,
+            range: 0..4,
+        })
+        .await
+    else {
+        panic!("transient read failed")
+    };
+
+    let Event::Blob(BlobEvent::HiddenListed { entries, .. }) =
+        context.blob_handle.send_blob_effect(list()).await
+    else {
+        panic!("hidden list failed")
+    };
+    assert!(entries.is_empty());
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(BlobEffect::DeleteHidden { key })
+            .await,
+        Event::Blob(BlobEvent::Error(BlobError::DeleteError(_)))
+    ));
+    assert_eq!(budget.available_permits(), full - 1);
+
+    drop(blob);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while budget.available_permits() < full {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a closed read must delete its spool");
+}
+
 // Spool charges outlive the process: a restart charges leftover spools again and drops
 // charges whose spools are gone, and a failed spool settles its own charge.
 #[tokio::test]

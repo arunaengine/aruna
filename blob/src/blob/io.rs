@@ -422,6 +422,9 @@ struct SpoolCleanup {
 
 impl Drop for SpoolCleanup {
     fn drop(&mut self) {
+        if let Some(charge) = charge_key(&self.key.backend_path) {
+            self.handler.mark_live(charge, false);
+        }
         let Ok(runtime) = Handle::try_current() else {
             tracing::warn!("transient spool cleanup deferred to the orphan sweep");
             return;
@@ -1975,6 +1978,7 @@ impl BlobHandler {
             Ok(charge) => charge,
             Err(error) => return BlobEvent::Error(error),
         };
+        self.mark_live(&charge, true);
         let mut settle = ChargeSettle {
             handler: self.clone(),
             namespace,
@@ -1995,10 +1999,13 @@ impl BlobHandler {
             Ok(key) => key,
             Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
         };
-        let transient = charge_key(&key.backend_path).is_some_and(|charge| self.charged(charge));
-        let cleanup = transient.then(|| SpoolCleanup {
-            handler: self.clone(),
-            key,
+        let charge = charge_key(&key.backend_path).filter(|charge| self.charged(charge));
+        let cleanup = charge.map(|charge| {
+            self.mark_live(charge, true);
+            SpoolCleanup {
+                handler: self.clone(),
+                key: key.clone(),
+            }
         });
         if range.start > range.end || range.end > location.blob_size {
             return BlobEvent::Error(BlobError::ReadError(
@@ -2022,6 +2029,11 @@ impl BlobHandler {
     }
 
     pub async fn delete_hidden_blob(&self, key: HiddenBlobKey) -> BlobEvent {
+        if self.spool_live(&key.backend_path) {
+            return BlobEvent::Error(BlobError::DeleteError(
+                "the transient spool is still being written or read".to_string(),
+            ));
+        }
         let operator = match self.operator_from_hidden(&key) {
             Ok(operator) => operator,
             Err(error) => return BlobEvent::Error(error),

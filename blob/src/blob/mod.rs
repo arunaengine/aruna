@@ -100,6 +100,8 @@ pub struct BlobHandler {
     /// Transient spool budget in MiB permits, and the permits held by spool charge.
     spool_budget: Arc<Semaphore>,
     transient_spools: Arc<StdMutex<HashMap<String, OwnedSemaphorePermit>>>,
+    /// Charges of transient spools being written or read, which the sweep must not reclaim.
+    live_spools: Arc<StdMutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Debug)]

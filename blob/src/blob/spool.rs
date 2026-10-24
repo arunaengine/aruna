@@ -31,6 +31,7 @@ pub(super) struct ChargeSettle {
 
 impl Drop for ChargeSettle {
     fn drop(&mut self) {
+        self.handler.mark_live(&self.charge, false);
         if !self.armed {
             return;
         }
@@ -79,6 +80,42 @@ impl BlobHandler {
             held.insert(charge.clone(), permit);
         }
         Ok(charge)
+    }
+
+    /// Marks the spools of `charge` in use, so the sweep neither lists nor deletes them.
+    pub(super) fn mark_live(&self, charge: &str, live: bool) {
+        if let Ok(mut spools) = self.live_spools.lock() {
+            match live {
+                true => spools.insert(charge.to_string()),
+                false => spools.remove(charge),
+            };
+        }
+    }
+
+    /// Whether the transient spool at `backend_path` is being written or read.
+    pub(super) fn spool_live(&self, backend_path: &str) -> bool {
+        charge_key(backend_path).is_some_and(|charge| {
+            self.live_spools
+                .lock()
+                .is_ok_and(|spools| spools.contains(charge))
+        })
+    }
+
+    /// Leaves spools in use out of a hidden listing, so the sweep never reclaims them.
+    pub(super) fn hide_live(&self, event: BlobEvent) -> BlobEvent {
+        match event {
+            BlobEvent::HiddenListed {
+                mut entries,
+                next_cursor,
+            } => {
+                entries.retain(|entry| !self.spool_live(&entry.key.backend_path));
+                BlobEvent::HiddenListed {
+                    entries,
+                    next_cursor,
+                }
+            }
+            other => other,
+        }
     }
 
     /// Whether `charge` is still held by this node.

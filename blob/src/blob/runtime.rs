@@ -618,6 +618,7 @@ impl BlobHandler {
             pithos_budget: Arc::new(Semaphore::new(super::pithos::budget_permits())),
             spool_budget: Arc::new(Semaphore::new(SPOOL_BUDGET_MIB)),
             transient_spools: Arc::default(),
+            live_spools: Arc::default(),
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;
@@ -842,7 +843,8 @@ impl BlobHandler {
             }
             BlobEffect::DeleteHidden { key } => Box::pin(self.delete_hidden_blob(key)).await,
             BlobEffect::ListHidden { namespace, cursor } => {
-                Box::pin(self.list_hidden_blobs(namespace, cursor)).await
+                let listed = Box::pin(self.list_hidden_blobs(namespace, cursor)).await;
+                self.hide_live(listed)
             }
             BlobEffect::CheckGroupBackend { record, secret } => {
                 Box::pin(self.check_group_backend(record, secret)).await
