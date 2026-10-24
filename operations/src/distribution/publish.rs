@@ -25,7 +25,7 @@ use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 use aruna_core::structs::storage::distribution::{
     DistributionError, DistributionRequest, DistributionRevision, DistributionSnapshot,
-    DistributionView, SignedSnapshot, next_snapshot, publisher_key,
+    DistributionView, SetPhase, SignedSnapshot, next_snapshot, publisher_key,
 };
 use aruna_core::types::{Effects, TxnId, Value};
 use aruna_core::{TaskEvent, UserId};
@@ -115,6 +115,8 @@ pub struct PublishOperation {
     txn_id: Option<TxnId>,
     stored: Stored,
     next: Option<DistributionSnapshot>,
+    /// The head revision an already applied activation answers with.
+    current: Option<DistributionRevision>,
     output: Option<Result<DistributionRevision, PublishError>>,
 }
 
@@ -153,6 +155,7 @@ impl PublishOperation {
             txn_id: None,
             stored: Stored::default(),
             next: None,
+            current: None,
             output: None,
         }
     }
@@ -253,18 +256,29 @@ impl PublishOperation {
         }
         let head = head.map(DistributionView::snapshot);
         let request = &self.config.request;
-        let next = match next_snapshot(self.config.realm_id, head, request) {
-            Ok(next) => next,
-            Err(DistributionError::StaleRevision) if !request.admin() => {
+        let owner = match (next_snapshot(self.config.realm_id, head, request), head) {
+            (Ok(next), _) => {
+                if next.root.publisher != self.config.node_id || next.set_id() != self.config.set_id
+                {
+                    return Err(PublishError::NotPublisher);
+                }
+                let owner = next.root.owner_group;
+                self.next = Some(next);
+                owner
+            }
+            (Err(DistributionError::StaleRevision), _) if !request.admin() => {
                 return Err(PublishError::Dropped);
             }
-            Err(error) => return Err(error.into()),
+            // Activating an active set again answers, once authorized, with its head revision.
+            (Err(DistributionError::NotPending), Some(head))
+                if matches!(request, DistributionRequest::Activate)
+                    && head.phase == SetPhase::Active =>
+            {
+                self.current = Some(head.revision());
+                head.root.owner_group
+            }
+            (Err(error), _) => return Err(error.into()),
         };
-        if next.root.publisher != self.config.node_id || next.set_id() != self.config.set_id {
-            return Err(PublishError::NotPublisher);
-        }
-        let owner = next.root.owner_group;
-        self.next = Some(next);
         if !request.admin() {
             return Ok(self.sign());
         }
@@ -444,7 +458,13 @@ impl Operation for PublishOperation {
                 PublishState::Authorize,
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
             ) => match allowed {
-                Ok(true) => self.sign(),
+                Ok(true) => match self.current {
+                    Some(revision) => {
+                        self.output = Some(Ok(revision));
+                        self.abort_replay()
+                    }
+                    None => self.sign(),
+                },
                 Ok(false) => self.fail(PublishError::Unauthorized),
                 Err(AuthorizationError::StorageError(error)) => self.fail(error.into()),
                 Err(_) => self.fail(PublishError::Unauthorized),

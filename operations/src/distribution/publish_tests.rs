@@ -291,3 +291,45 @@ fn conflicted_set_stops() {
     );
     assert_eq!(operation.finalize(), Err(PublishError::Conflicted));
 }
+
+/// The create revision with both members admitted and the set activated.
+fn active() -> DistributionSnapshot {
+    let mut head = next_snapshot(realm(), None, &create()).unwrap();
+    for seed in [1, 2] {
+        let member_id = Ulid::from_bytes([seed; 16]);
+        let intent = head.member(member_id).unwrap().intent;
+        let statement = Statement::admit(realm(), head.set_id(), member_id, 5, intent);
+        let request = DistributionRequest::Statement(Box::new(statement.sign(&secret(seed))));
+        head = next_snapshot(realm(), Some(&head), &request).unwrap();
+    }
+    next_snapshot(realm(), Some(&head), &DistributionRequest::Activate).unwrap()
+}
+
+#[test]
+fn repeated_activation_answers() {
+    let head = active();
+    let mut operation = operation(PUBLISHER, DistributionRequest::Activate);
+    let values = [
+        Some(view_value(head.clone())),
+        None,
+        Some(config_value()),
+        None,
+    ];
+    let effects = begin(&mut operation, values);
+    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    let effects = operation.step(authorized(true));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    operation.step(Event::Storage(StorageEvent::TransactionAborted {
+        txn_id: Ulid::from_bytes([5; 16]),
+    }));
+    assert_eq!(operation.finalize(), Ok(head.revision()));
+    // Without group admin WRITE the caller learns nothing.
+    let mut denied = self::operation(PUBLISHER, DistributionRequest::Activate);
+    let values = [Some(view_value(head)), None, Some(config_value()), None];
+    begin(&mut denied, values);
+    denied.step(authorized(false));
+    assert_eq!(denied.finalize(), Err(PublishError::Unauthorized));
+}
