@@ -1045,6 +1045,28 @@ fn advance_retry_matches() {
 }
 
 #[test]
+fn refreshed_advance_matches() {
+    // A local refresh after the first apply moves only `last_refresh`, so a retry still matches.
+    let (manifest, _, publisher) = advance_fixture();
+    let op = advance_operation(manifest, publisher);
+    let incoming = op.reference_version().unwrap();
+    let mut refreshed = incoming.clone();
+    let BlobVersionState::Reference { last_refresh, .. } = &mut refreshed.state else {
+        panic!("expected a reference")
+    };
+    *last_refresh += Duration::from_secs(60);
+    assert!(super::same_reference(&refreshed, &incoming));
+    let mut other = refreshed.clone();
+    other
+        .metadata
+        .insert("changed".to_string(), "yes".to_string());
+    assert!(
+        !super::same_reference(&other, &incoming),
+        "other fields still count"
+    );
+}
+
+#[test]
 fn advance_replay_orders() {
     // A head written at a later epoch already supersedes a replayed advance, whatever its
     // generation; comparing generations alone would refuse the replay as invalid lineage.

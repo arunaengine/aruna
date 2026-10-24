@@ -2729,7 +2729,7 @@ impl IncomingVersionOperation {
                     Ok(incoming) => incoming,
                     Err(error) => return self.reject_negotiation(error),
                 };
-                if existing != incoming {
+                if !same_reference(&existing, &incoming) {
                     return self.reject_negotiation(IncomingVersionError::InvalidReferenceAdvance);
                 }
                 self.replaced_reference_bytes = self
@@ -2752,7 +2752,7 @@ impl IncomingVersionOperation {
                             Ok(incoming) => incoming,
                             Err(error) => return self.fail(error),
                         };
-                        if existing == incoming {
+                        if same_reference(&existing, &incoming) {
                             return self.send_negotiation(
                                 ReplicationNegotiationResult::AlreadyReplicatedVersion,
                             );
@@ -3738,6 +3738,22 @@ impl IncomingVersionOperation {
         );
         smallvec![]
     }
+}
+
+/// Whether a stored version is the incoming one; a local refresh changes only `last_refresh`.
+fn same_reference(existing: &BlobVersion, incoming: &BlobVersion) -> bool {
+    let mut existing = existing.clone();
+    if let (
+        BlobVersionState::Reference { last_refresh, .. },
+        BlobVersionState::Reference {
+            last_refresh: incoming_refresh,
+            ..
+        },
+    ) = (&mut existing.state, &incoming.state)
+    {
+        *last_refresh = *incoming_refresh;
+    }
+    existing == *incoming
 }
 
 #[cfg(test)]
