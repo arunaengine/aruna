@@ -578,6 +578,53 @@ async fn sync_skips_scan() {
     assert_eq!(woken, Ok(true), "the folder pass must be woken");
 }
 
+/// A root that is gone, or runs through a file, is the owner's input error on bind and sync now.
+#[tokio::test]
+async fn refuses_missing_root() {
+    let (fixture, _fired) = local_setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("note.txt"), b"local").unwrap();
+    let unusable = |error: &ServerError| {
+        matches!(error, ServerError::BadRequestReason(reason)
+            if reason.starts_with("the directory is unusable"))
+    };
+    for (index, root) in [dir.path().join("missing"), dir.path().join("note.txt/sub")]
+        .iter()
+        .enumerate()
+    {
+        let root = root.to_string_lossy().to_string();
+        let bind = bind_synced_folder(
+            State(fixture.state.clone()),
+            Extension(Some(owner_auth(&fixture))),
+            Json(BindFolderRequest {
+                root: root.clone(),
+                group_id: Ulid::from_bytes([10u8; 16]).to_string(),
+                remote_node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public().to_string(),
+                remote_bucket: "lab".to_string(),
+                create_bucket: true,
+                remote_prefix: String::new(),
+                mode: None,
+                propagate_deletes: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(unusable(&bind), "bind of {root}: {bind:?}");
+
+        let id = Ulid::from_bytes([30 + index as u8; 16]);
+        let folder = sample_folder(id, &fixture, &root, FolderState::Active);
+        seed_row(&fixture.state, folder_entry(&folder).unwrap()).await;
+        let sync = sync_folder(
+            State(fixture.state.clone()),
+            Extension(Some(owner_auth(&fixture))),
+            Path(id.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(unusable(&sync), "sync of {root}: {sync:?}");
+    }
+}
+
 #[tokio::test]
 async fn list_entries() {
     let fixture = setup().await;

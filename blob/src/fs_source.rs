@@ -44,7 +44,10 @@ pub(crate) fn is_local_access(access: &ResolvedSourceAccess) -> bool {
 
 pub(crate) async fn check_local(access: &ResolvedSourceAccess) -> Result<(), StagingSourceError> {
     let (root, _) = access_parts(access)?;
-    let resolved = canonical_root(&root).await?;
+    // A root that does not resolve is as unusable as one that is not a directory.
+    let resolved = tokio::fs::canonicalize(&root)
+        .await
+        .map_err(|error| StagingSourceError::CheckError(error.to_string()))?;
     // Every sweep starts by dropping the spool a crashed write left behind.
     // Those bytes are this node's own, never the owner's.
     crate::fs_write::sweep_spool(&root).await;
