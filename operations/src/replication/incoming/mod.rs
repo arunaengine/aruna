@@ -8,6 +8,7 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, build_transition_effects,
     write_location_effect, write_version_effect,
 };
+use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::load_group_inputs;
 use crate::node::usage_stats::{
@@ -55,7 +56,8 @@ use aruna_core::structs::storage::blob::{
     VersionKey, WriteOwner, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
-use aruna_core::structs::storage::distribution::OriginalEpoch;
+use aruna_core::structs::storage::distribution::inventory::VersionEntry;
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
@@ -345,6 +347,10 @@ pub struct IncomingVersionOperation {
     destination_compression: Compression,
     /// Only a bucket bound to a distributed set orders its heads by original epoch.
     destination_bound: bool,
+    /// The destination's binding, whose inventory the apply transaction maintains.
+    destination_binding: Option<DistributionBinding>,
+    /// The head this apply installs, for the inventory.
+    installed_head: Option<CurrentVersionPointer>,
     destination_inputs: GroupRoutingInputs,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
@@ -439,6 +445,8 @@ impl IncomingVersionOperation {
             replaced_reference_bytes: 0,
             replaced_envelope: Vec::new(),
             pending_head: None,
+            destination_binding: None,
+            installed_head: None,
             head_transition_effects: VecDeque::new(),
             pending_version_effects: VecDeque::new(),
             release_id: None,
@@ -984,6 +992,7 @@ impl IncomingVersionOperation {
             Some(pending) => (Some(pending.pointer), pending.current_hash),
             None => (None, None),
         };
+        self.installed_head = pointer.clone();
         let effects = match build_transition_effects(&context, pointer, current_hash, self.txn_id) {
             Ok(effects) => effects,
             Err(err) => return self.fail(err.into()),
@@ -2215,6 +2224,32 @@ impl IncomingVersionOperation {
         })
     }
 
+    /// The received version and, when this apply installs it, the head of a distributed bucket.
+    fn inventory_change(&self) -> Option<InventoryChange> {
+        let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
+        let size = match marker {
+            true => 0,
+            false => self.incoming_logical_bytes().unwrap_or_default(),
+        };
+        let added = AddedVersion {
+            version_id: self.manifest.version_id,
+            epoch: self.original_epoch(),
+            generation: self.manifest.current_version_generation.unwrap_or_default(),
+            entry: VersionEntry {
+                marker,
+                size,
+                referenced: self.is_reference_item(),
+            },
+        };
+        let head = self.installed_head.is_some();
+        version_written(
+            self.destination_binding.as_ref(),
+            &self.manifest.key,
+            added,
+            head,
+        )
+    }
+
     fn start_commit_quota(&mut self) -> Effects {
         let Some(group_id) = self.destination_group_id else {
             return self.fail(IncomingVersionError::DestinationNotFound);
@@ -2225,9 +2260,11 @@ impl IncomingVersionOperation {
         };
         let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
         let row = RowChange::written(self.existing_marker, marker);
+        let inventory = self.inventory_change();
         if marker {
             let update = UsageCounterUpdate::for_group(group_id, group_delta)
-                .in_bucket(&self.manifest.bucket, row);
+                .in_bucket(&self.manifest.bucket, row)
+                .with_inventory(inventory);
             if update.is_noop() {
                 return self.commit_or_cleanup();
             }
@@ -2236,7 +2273,8 @@ impl IncomingVersionOperation {
         }
         if self.is_reference_item() {
             let update = UsageCounterUpdate::for_group(group_id, group_delta)
-                .in_bucket(&self.manifest.bucket, row);
+                .in_bucket(&self.manifest.bucket, row)
+                .with_inventory(inventory);
             if self.manifest.reference_advance.is_some() && update.is_noop() {
                 return self.commit_or_cleanup();
             }
@@ -2253,7 +2291,11 @@ impl IncomingVersionOperation {
                 None => return self.fail(IncomingVersionError::MissingBlobInfo),
             },
         };
-        self.usage_update = Some(update.in_bucket(&self.manifest.bucket, row));
+        self.usage_update = Some(
+            update
+                .in_bucket(&self.manifest.bucket, row)
+                .with_inventory(inventory),
+        );
         let Some(txn_id) = self.txn_id else {
             return self.fail(IncomingVersionError::StorageError(
                 StorageError::TransactionNotFound,
@@ -2544,6 +2586,7 @@ impl IncomingVersionOperation {
         self.destination_rules = bucket_info.storage_routing;
         self.destination_compression = bucket_info.compression;
         self.destination_bound = bucket_info.distribution.is_some();
+        self.destination_binding = bucket_info.distribution.clone();
         let Some(key) = settings
             .active_key()
             .filter(|_| self.manifest.kind == ReplicationItemKind::Materialized)
