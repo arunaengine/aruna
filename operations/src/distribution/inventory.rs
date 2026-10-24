@@ -206,6 +206,10 @@ impl InventoryUpdate {
             let sample = sample_key(set_id, range_id, slot);
             reads.push((KEY_SAMPLE_KEYSPACE.to_string(), sample.into()));
         }
+        if let Some((upload_id, _)) = self.change.upload {
+            let position = upload_position(set_id, key, upload_id);
+            reads.push((UPLOAD_INVENTORY_KEYSPACE.to_string(), position.into()));
+        }
         let ids = self.change.added.iter().map(|added| added.version_id);
         for version_id in ids.chain(self.change.removed.iter().copied()) {
             let index = index_key(set_id, version_id);
@@ -232,22 +236,24 @@ impl InventoryUpdate {
             _ => (next(), next()),
         };
         let mut contributions = Vec::new();
+        if let Some((upload_id, opened)) = self.change.upload {
+            // Opening an open upload or closing an absent one changes nothing.
+            if next().is_some() != opened {
+                let position = upload_position(self.change.set_id, &self.change.key, upload_id);
+                let space = UPLOAD_INVENTORY_KEYSPACE.to_string();
+                match opened {
+                    true => self
+                        .writes
+                        .push((space, position.clone().into(), Value::from(vec![]))),
+                    false => self.deletes.push((space, position.clone().into())),
+                }
+                let counters = RangeCounters::of_upload(if opened { 1 } else { -1 });
+                contributions.push((Walk::Uploads, position, counters));
+            }
+        }
         self.plan_versions(&mut next, &mut contributions)?;
         self.plan_head(head, &mut contributions)?;
         self.plan_sample(range_id, sample)?;
-        if let Some((upload_id, opened)) = self.change.upload {
-            let position = upload_position(self.change.set_id, &self.change.key, upload_id);
-            match opened {
-                true => self
-                    .writes
-                    .push(row(UPLOAD_INVENTORY_KEYSPACE, position.clone(), vec![])),
-                false => {
-                    (self.deletes).push((UPLOAD_INVENTORY_KEYSPACE.into(), position.clone().into()))
-                }
-            }
-            let uploads = if opened { 1 } else { -1 };
-            contributions.push((Walk::Uploads, position, RangeCounters::of_upload(uploads)));
-        }
         self.counters = route(self.change.set_id, range_id, &account, contributions)?;
         Ok(())
     }

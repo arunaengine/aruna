@@ -293,3 +293,23 @@ async fn account_change_conflicts() {
     assert!(!commit(&handle, writer).await);
     assert!(counters(&handle, active(1)).await.is_zero());
 }
+
+/// Opening an open upload or closing a closed one changes no counter.
+#[tokio::test]
+async fn uploads_count_once() {
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    let upload = |opened| {
+        let mut change = InventoryChange::new(set(), "k");
+        change.upload = Some((id(3), opened));
+        InventoryUpdate::new(change)
+    };
+    for opened in [true, true] {
+        assert!(apply(&handle, upload(opened)).await.unwrap());
+    }
+    assert_eq!(counters(&handle, active(1)).await.open_uploads, 1);
+    for opened in [false, false] {
+        assert!(apply(&handle, upload(opened)).await.unwrap());
+    }
+    assert_eq!(counters(&handle, active(1)).await.open_uploads, 0);
+}
