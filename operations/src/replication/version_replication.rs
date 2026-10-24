@@ -1497,7 +1497,10 @@ impl ReplicateObjectOperation {
 
         self.replication_version = Some(version);
         self.state = ReplicateObjectState::ResolveReferenceAccess;
-        smallvec![resolve_binding_effect(ResolveBindingInput { source },)]
+        smallvec![resolve_binding_effect(ResolveBindingInput {
+            source,
+            group_id: None,
+        },)]
     }
 
     fn accept_reference_encryption(&mut self, event: Event) -> Effects {

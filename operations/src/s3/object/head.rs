@@ -523,7 +523,10 @@ impl HeadObjectOperation {
             self.txn_id = None;
             if let Some(source) = self.reference_source.take() {
                 self.state = HeadObjectState::ResolveReferenceAccess;
-                return smallvec![resolve_binding_effect(ResolveBindingInput { source },)];
+                return smallvec![resolve_binding_effect(ResolveBindingInput {
+                    source,
+                    group_id: None,
+                },)];
             }
             self.state = HeadObjectState::Finish;
             smallvec![]

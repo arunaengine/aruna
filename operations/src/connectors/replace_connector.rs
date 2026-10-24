@@ -1028,7 +1028,10 @@ mod tests {
         assert_eq!(replaced.connector.name, "new");
 
         let access = drive(
-            ResolveBindingOperation::new(ResolveBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput {
+                source,
+                group_id: None,
+            }),
             &context,
         )
         .await

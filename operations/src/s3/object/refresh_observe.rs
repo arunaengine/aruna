@@ -99,7 +99,8 @@ impl ObserveSourceOperation {
                 };
                 self.state = ObserveState::ResolveAccess;
                 Ok(smallvec![resolve_binding_effect(ResolveBindingInput {
-                    source
+                    source,
+                    group_id: None,
                 })])
             }
             (

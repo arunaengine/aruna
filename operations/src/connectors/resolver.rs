@@ -25,8 +25,8 @@ use smallvec::smallvec;
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    StorageReadError, parse_connector_read, parse_secret_read, read_connector_effect,
-    read_secret_effect,
+    StorageReadError, iter_connectors_effect, parse_connector_iter, parse_connector_read,
+    parse_secret_read, read_connector_effect, read_secret_effect,
 };
 use crate::harvest::create_connector::INVENIO_TOKEN;
 
@@ -46,7 +46,13 @@ pub struct ResolveConnectorInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolveBindingInput {
     pub source: VersionSourceBinding,
+    /// The group whose connector of the same source root reads a reference that names no
+    /// connector, as a member of a distributed bucket receives it.
+    pub group_id: Option<GroupId>,
 }
+
+/// Connector pages one source root match reads; a group has few connectors.
+const MATCH_PAGES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResolveConnectorState {
@@ -60,6 +66,8 @@ enum ResolveConnectorState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResolveBindingState {
     Init,
+    /// Looks for a connector of the group with the reference's source root.
+    MatchConnector,
     ReadSecret,
     ReadOfferedDirectory,
     ReadRepository,
@@ -90,6 +98,7 @@ pub struct ResolveBindingOperation {
     input: ResolveBindingInput,
     state: ResolveBindingState,
     output: Option<Result<ResolvedSourceAccess, SourceResolutionError>>,
+    pages: usize,
 }
 
 impl ResolveConnectorOperation {
@@ -173,6 +182,7 @@ impl ResolveBindingOperation {
             input,
             state: ResolveBindingState::Init,
             output: None,
+            pages: 0,
         }
     }
 
@@ -211,6 +221,17 @@ impl ResolveBindingOperation {
             return smallvec![effect];
         }
 
+        if self.input.source.connector_id.is_none()
+            && let Some(group_id) = self.input.group_id
+        {
+            self.state = ResolveBindingState::MatchConnector;
+            self.pages = 1;
+            return smallvec![iter_connectors_effect(group_id, None, None)];
+        }
+        self.read_secret()
+    }
+
+    fn read_secret(&mut self) -> Effects {
         let effect = match binding_secret_effect(&self.input.source, None) {
             Ok(effect) => effect,
             Err(error) => return self.emit_error(error),
@@ -218,6 +239,32 @@ impl ResolveBindingOperation {
 
         self.state = ResolveBindingState::ReadSecret;
         smallvec![effect]
+    }
+
+    /// Takes the group's connector with the reference's source root: the same kind, public
+    /// configuration and login namespace. The path stays the reference's own.
+    fn handle_match(&mut self, event: Event) -> Effects {
+        let (connectors, next) = match parse_connector_iter(event) {
+            Ok(page) => page,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let descriptor = &self.input.source.descriptor;
+        let matched = connectors.iter().find(|connector| {
+            connector.kind == descriptor.kind
+                && connector.public_config == descriptor.public_config
+                && connector.namespace == descriptor.namespace
+        });
+        if let Some(connector) = matched {
+            self.input.source.connector_id = Some(connector.connector_id);
+            return self.read_secret();
+        }
+        match (next, self.input.group_id) {
+            (Some(next), Some(group_id)) if self.pages < MATCH_PAGES => {
+                self.pages += 1;
+                smallvec![iter_connectors_effect(group_id, Some(next), None)]
+            }
+            _ => self.emit_error(SourceResolutionError::ResolveFailed),
+        }
     }
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
@@ -340,6 +387,7 @@ impl Operation for ResolveBindingOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             ResolveBindingState::Init => self.handle_init(),
+            ResolveBindingState::MatchConnector => self.handle_match(event),
             ResolveBindingState::ReadSecret => self.handle_secret_read(event),
             ResolveBindingState::ReadOfferedDirectory => self.handle_offered_read(event),
             ResolveBindingState::ReadRepository => self.handle_repository_read(event),
@@ -738,6 +786,75 @@ mod tests {
         assert_eq!(config.get("root").map(String::as_str), Some("/datasets"));
     }
 
+    // A reference that names no connector, as a member of a distributed bucket receives it,
+    // reads through the group's connector of the same source root and login, never another.
+    #[tokio::test]
+    async fn matches_source_root() {
+        let tempdir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let group_id = Ulid::generate();
+        let connector = |user: &str| SourceConnectorInput {
+            group_id,
+            created_by: Default::default(),
+            name: format!("dav-{user}"),
+            kind: SourceConnectorKind::Webdav,
+            public_config: HashMap::from([(
+                "endpoint".to_string(),
+                "https://dav.example.org".to_string(),
+            )]),
+            secret_config: HashMap::from([
+                ("username".to_string(), user.to_string()),
+                ("password".to_string(), "secret".to_string()),
+            ]),
+        };
+        let bob = drive(SourceConnectorOperation::new(connector("bob")), &context)
+            .await
+            .unwrap();
+        let alice = drive(SourceConnectorOperation::new(connector("alice")), &context)
+            .await
+            .unwrap();
+        let metadata = aruna_core::structs::execution::source_access::SourceMetadata {
+            content_length: 42,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let source = build_source_binding(
+            aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            &alice.connector,
+            &metadata,
+            "run-1/data.txt".to_string(),
+            None,
+            None,
+        );
+        assert_ne!(bob.connector.namespace, alice.connector.namespace);
+
+        let resolve = |group_id| {
+            ResolveBindingOperation::new(ResolveBindingInput {
+                source: source.clone(),
+                group_id,
+            })
+        };
+        let ResolvedSourceAccess::OpenDal { config, .. } =
+            drive(resolve(Some(group_id)), &context).await.unwrap();
+        assert_eq!(config.get("username").map(String::as_str), Some("alice"));
+        assert_eq!(
+            drive(resolve(Some(Ulid::generate())), &context).await,
+            Err(SourceResolutionError::ResolveFailed)
+        );
+    }
+
     #[test]
     fn merges_descriptor_secret() {
         let source = VersionSourceBinding {
@@ -924,7 +1041,10 @@ mod tests {
         );
 
         let access = drive(
-            ResolveBindingOperation::new(ResolveBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput {
+                source,
+                group_id: None,
+            }),
             &context,
         )
         .await
@@ -1003,7 +1123,10 @@ mod tests {
             connector_id: None,
         };
 
-        let mut operation = ResolveBindingOperation::new(ResolveBindingInput { source });
+        let mut operation = ResolveBindingOperation::new(ResolveBindingInput {
+            source,
+            group_id: None,
+        });
         assert!(operation.start().is_empty());
         assert!(operation.is_complete());
         assert_eq!(
@@ -1143,6 +1266,7 @@ mod tests {
         let resolve = || {
             ResolveBindingOperation::new(ResolveBindingInput {
                 source: source.clone(),
+                group_id: None,
             })
         };
         let bound = drive(resolve(), &context).await.unwrap();

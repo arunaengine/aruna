@@ -1308,7 +1308,10 @@ impl IncomingBaoOperation {
             .exact_target()
             .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
         self.state = IncomingBaoState::ResolveSource;
-        smallvec![resolve_binding_effect(ResolveBindingInput { source },)]
+        smallvec![resolve_binding_effect(ResolveBindingInput {
+            source,
+            group_id: None,
+        },)]
     }
 
     /// An observation of an encrypting bucket is served only under its bucket lease.

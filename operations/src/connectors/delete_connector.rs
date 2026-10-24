@@ -822,7 +822,10 @@ mod tests {
         assert_eq!(result, Err(DeleteSourceError::ReferencedObjectVersion));
 
         let access = drive(
-            ResolveBindingOperation::new(ResolveBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput {
+                source,
+                group_id: None,
+            }),
             &context,
         )
         .await
@@ -856,7 +859,10 @@ mod tests {
         .unwrap();
 
         let access = drive(
-            ResolveBindingOperation::new(ResolveBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput {
+                source,
+                group_id: None,
+            }),
             &context,
         )
         .await

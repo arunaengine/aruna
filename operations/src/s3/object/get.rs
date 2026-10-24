@@ -678,7 +678,11 @@ impl GetObjectOperation {
                 self.last_refresh = None;
                 self.version_created_at = None;
                 self.state = GetObjectState::ResolveReferenceAccess;
-                smallvec![resolve_binding_effect(ResolveBindingInput { source },)]
+                let group_id = Some(self.input.group_id);
+                smallvec![resolve_binding_effect(ResolveBindingInput {
+                    source,
+                    group_id
+                })]
             }
             BlobVersionState::PendingContent { archive, .. }
                 if self.token || self.object.is_some() =>
