@@ -444,20 +444,19 @@ mod tests {
         let missing = resolve_id(State(state.clone()), uri.clone()).await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-store");
-        let entry = |verified| Entry {
-            registration: registration("https://realm.example.org", now),
+        // Each renewal is issued later than the one before.
+        let entry = |verified, issued_at| Entry {
+            registration: registration("https://realm.example.org", issued_at),
             received_at: now,
             verified,
         };
-        state
-            .store
-            .register(&realm_id(), &entry(false), now)
-            .unwrap();
+        let earlier = entry(false, now - 10);
+        state.store.register(&realm_id(), &earlier, now).unwrap();
         let private = resolve_id(State(state.clone()), uri.clone()).await;
         assert_eq!(private.status(), StatusCode::NOT_FOUND);
         state
             .store
-            .register(&realm_id(), &entry(true), now)
+            .register(&realm_id(), &entry(true, now), now)
             .unwrap();
         let found = resolve_id(State(state), uri).await;
         assert_eq!(found.status(), StatusCode::TEMPORARY_REDIRECT);
