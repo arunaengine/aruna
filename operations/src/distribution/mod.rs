@@ -30,6 +30,7 @@ pub mod sharding;
 pub mod source_keep;
 pub mod split;
 pub mod status;
+pub mod ticket;
 #[cfg(test)]
 pub(crate) mod test_record;
 #[cfg(test)]

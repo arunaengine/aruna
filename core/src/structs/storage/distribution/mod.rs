@@ -28,6 +28,7 @@ pub mod snapshot;
 pub mod source_root;
 pub mod split;
 pub mod statement;
+pub mod ticket;
 pub mod upload;
 pub mod validate;
 
