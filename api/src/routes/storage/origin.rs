@@ -5,12 +5,14 @@
 
 use std::sync::Arc;
 
+use aruna_core::structs::SyncMode;
 use aruna_core::structs::execution::source_access::{DigestOrigin, DigestScope};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, VersionOrigin,
 };
+use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
 use aruna_operations::s3::object::origin::{OriginError, OriginView, read_origin};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -31,7 +33,9 @@ use crate::server::state::ServerState;
 pub struct OriginApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(OriginApiDoc::openapi()).routes(routes!(get_origin))
+    OpenApiRouter::with_openapi(OriginApiDoc::openapi())
+        .routes(routes!(get_origin))
+        .routes(routes!(get_sources))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -249,7 +253,7 @@ pub async fn get_origin(
     ensure_permission(&state, &auth, path, Permission::READ).await?;
     let view = read_origin(
         state.get_ctx().as_ref(),
-        state.get_realm_id(),
+        (state.get_realm_id(), state.get_node_id()),
         &bucket,
         &params.key,
         params.version_id,
@@ -260,4 +264,117 @@ pub async fn get_origin(
         OriginError::Storage(reason) => ServerError::InternalError(reason),
     })?;
     Ok(Json(view.into()))
+}
+
+/// One way files get into the bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileSourceBody {
+    /// Another bucket's files are copied in by a sync (`once`, `reference`, `continuous`).
+    Sync {
+        relationship_id: String,
+        source: String,
+        mode: String,
+    },
+    /// A storage backend folder of the group is registered without copying.
+    Storage {
+        import_id: String,
+        backend_id: String,
+        backend_prefix: String,
+        key_prefix: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FileSourcesResponse {
+    pub sources: Vec<FileSourceBody>,
+    /// False when more rows exist than one answer reads.
+    pub complete: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/sources",
+    tag = "data/storage",
+    summary = "List how files get into a bucket",
+    description = r#"Lists the incoming paths of a bucket on this node: syncs that copy files into it
+and storage folders registered into it.
+
+**Authentication**: realm bearer token with READ on the bucket.
+
+**Behavior**
+- Answered from configuration only; the bucket's objects are never read. Direct uploads are
+  always possible and not listed. Files registered from an external source or a database
+  show it in their own origin.
+- Outgoing syncs and the nodes a bucket is stored on are not sources.
+
+**Limits**
+- At most 256 syncs and 256 import rules are read; `complete` says whether that was all."#,
+    params(("bucket" = String, Path, description = "Bucket name on this node")),
+    responses(
+        (status = 200, description = "Incoming paths of the bucket", body = FileSourcesResponse, example = json!({
+            "sources": [{
+                "kind": "sync",
+                "relationship_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2",
+                "source": "arn:aruna:k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay:ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6:s3/spire-staging",
+                "mode": "continuous"
+            }],
+            "complete": true
+        })),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No READ on the bucket", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_sources(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+) -> ServerResult<Json<FileSourcesResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let info = bucket_info(&state, &bucket).await?;
+    let path = bucket_permission_path(
+        state.get_realm_id(),
+        info.group_id,
+        state.get_node_id(),
+        &bucket,
+    );
+    ensure_permission(&state, &auth, path, Permission::READ).await?;
+    let (sources, complete) = bucket_sources(state.get_ctx().as_ref(), info.group_id, &bucket)
+        .await
+        .map_err(ServerError::InternalError)?;
+    Ok(Json(FileSourcesResponse {
+        sources: sources
+            .into_iter()
+            .map(|source| match source {
+                FileSource::Sync {
+                    relationship_id,
+                    source,
+                    mode,
+                } => FileSourceBody::Sync {
+                    relationship_id: relationship_id.to_string(),
+                    source,
+                    mode: match mode {
+                        SyncMode::Once => "once",
+                        SyncMode::Reference => "reference",
+                        SyncMode::Continuous => "continuous",
+                    }
+                    .to_string(),
+                },
+                FileSource::Storage {
+                    import_id,
+                    backend_id,
+                    backend_prefix,
+                    key_prefix,
+                } => FileSourceBody::Storage {
+                    import_id: import_id.to_string(),
+                    backend_id: backend_id.to_string(),
+                    backend_prefix,
+                    key_prefix,
+                },
+            })
+            .collect(),
+        complete,
+    }))
 }

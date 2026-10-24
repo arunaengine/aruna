@@ -21,6 +21,7 @@ pub mod rotate;
 pub mod routing;
 pub mod seal_missing;
 pub mod search;
+pub mod sources;
 pub mod storage_check;
 pub mod storage_move;
 pub mod token_list;

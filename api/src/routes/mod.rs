@@ -268,6 +268,7 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/distribution"),
         ("GET", "/data/buckets/{bucket}/links"),
         ("GET", "/data/buckets/{bucket}/objects/origin"),
+        ("GET", "/data/buckets/{bucket}/sources"),
         ("GET", "/data/databases"),
         ("POST", "/system/realm/databases"),
         ("DELETE", "/system/realm/databases/{entry_id}"),

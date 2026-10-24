@@ -5,12 +5,12 @@
 
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::source_access::SourceDigest;
+use aruna_core::structs::identity::database::DatabaseTarget;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
@@ -19,10 +19,12 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
     OriginProjection, SyncHop, VersionOrigin, project, public_source_url,
 };
+use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
+use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 #[derive(Debug, Error)]
@@ -62,7 +64,7 @@ pub struct OriginView {
 /// Reads the origin of `version_id`, or of the current version, of a local bucket's key.
 pub async fn read_origin(
     context: &DriverContext,
-    realm_id: RealmId,
+    (realm_id, node_id): (RealmId, NodeId),
     bucket: &str,
     key: &str,
     version_id: Option<Ulid>,
@@ -99,7 +101,28 @@ pub async fn read_origin(
         realm_id,
         version_id,
     });
-    Ok(view(version_id, global, version))
+    let mut view = view(version_id, global, version);
+    // A source origin names the bucket's database entry when the bucket is listed.
+    if let Some(VersionOrigin::Source { database }) = view.origin.as_mut()
+        && database.is_none()
+        && let Ok(config) = drive(GetConfigOperation::new(realm_id), context).await
+    {
+        *database = config
+            .databases
+            .iter()
+            .find(|entry| match &entry.target {
+                DatabaseTarget::Distributed { set_id } => info
+                    .distribution
+                    .as_ref()
+                    .is_some_and(|binding| binding.set_id == *set_id),
+                DatabaseTarget::Ordinary {
+                    node_id: entry_node,
+                    bucket: name,
+                } => *entry_node == node_id && name == bucket,
+            })
+            .map(|entry| entry.entry_id);
+    }
+    Ok(view)
 }
 
 fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> OriginView {
