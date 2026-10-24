@@ -121,8 +121,8 @@ pub struct InventoryUpdate {
     counters: Vec<(Key, RangeCounters)>,
     /// A key that gained a head and may enter the sample once its size is known.
     candidate: Option<SampleEntry>,
-    /// Entries earlier updates of the same transaction added to each range's sample; the
-    /// committed count does not show them yet.
+    /// Entries earlier updates of the same transaction added to each range's sample, keyed by
+    /// every range they changed; the committed rows do not show them yet.
     sampled_before: BTreeMap<Ulid, i128>,
     /// The entries this update adds to or removes from its range's sample.
     sample_change: Option<(Ulid, i128)>,
@@ -159,7 +159,7 @@ impl InventoryUpdate {
         self.sampled_before = sampled;
     }
 
-    /// The range and the number of sample entries this update added (or removed, negative).
+    /// The range whose sample this update changed and the net entries it added (or removed).
     pub fn sample_change(&self) -> Option<(Ulid, i128)> {
         self.sample_change
     }
@@ -226,6 +226,11 @@ impl InventoryUpdate {
                 if size < i128::from(SAMPLE_SIZE) {
                     self.admit(range_id, None)?;
                     return Ok(self.next_effect(txn_id));
+                }
+                // Entries staged earlier in this transaction are visible only inside it.
+                if self.sampled_before.contains_key(&range_id) {
+                    self.phase = Phase::SampleLast { range_id };
+                    return Ok(Some(smallvec![self.read_largest(range_id, Some(txn_id))]));
                 }
                 // A full sample is probed outside the transaction first, so keys that cannot
                 // enter never conflict on its largest entry.
@@ -489,6 +494,7 @@ impl InventoryUpdate {
                 let evicted = last.row_key(set_id, range_id);
                 self.deletes
                     .push((KEY_SAMPLE_KEYSPACE.into(), evicted.into()));
+                self.touch_sample(range_id, 0);
             }
             None => self.count_sample(range_id, 1),
         }
@@ -507,6 +513,11 @@ impl InventoryUpdate {
         };
         let key = sample_count_key(self.change.set_id, range_id);
         self.counters.push((key.into(), delta));
+        self.touch_sample(range_id, entries);
+    }
+
+    /// Records that this update changed the range's sample, even when its size stays.
+    fn touch_sample(&mut self, range_id: Ulid, entries: i128) {
         let total = self.sample_change.map_or(0, |(_, total)| total);
         self.sample_change = Some((range_id, total.saturating_add(entries)));
     }

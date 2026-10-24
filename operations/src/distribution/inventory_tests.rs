@@ -504,3 +504,60 @@ async fn counts_own_admissions() {
         i128::from(SAMPLE_SIZE)
     );
 }
+
+/// A key staged earlier in the transaction may be the sample's largest entry, so a later key
+/// below it enters in its place although it ranks above the committed largest entry.
+#[tokio::test]
+async fn sees_staged_entry() {
+    use crate::node::usage_stats::UsageCounterUpdate;
+    use aruna_core::structs::storage::usage::UsageDelta;
+
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    let (first, second) = ("a", "b");
+    let (high, low) =
+        match SampleEntry::of_key(first).priority > SampleEntry::of_key(second).priority {
+            true => (first, second),
+            false => (second, first),
+        };
+    let floor = SampleEntry::of_key(low).priority.saturating_sub(1);
+    fill_sample(&handle, floor).await;
+    let txn_id = begin(&handle).await;
+    let almost = RangeCounters {
+        sampled: -1,
+        ..RangeCounters::default()
+    };
+    let count = sample_count_key(set(), id(1));
+    handle
+        .send_storage_effect(StorageEffect::AddCounters {
+            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+            deltas: vec![(count.clone().into(), almost)],
+            txn_id,
+        })
+        .await;
+    assert!(commit(&handle, txn_id).await);
+
+    let changes = [put(high, 1, 1, 1), put(low, 2, 1, 1)].map(|update| update.change().clone());
+    let mut update =
+        UsageCounterUpdate::for_group(Ulid::nil(), UsageDelta::default()).with_inventories(changes);
+    let txn_id = begin(&handle).await;
+    let mut effects = update.start(txn_id);
+    while let Some(effect) = effects.pop() {
+        let event = crate::distribution::test_store::send(&handle, effect).await;
+        match update.step(event, txn_id).unwrap() {
+            Some(next) => effects = next,
+            None => break,
+        }
+    }
+    assert!(commit(&handle, txn_id).await);
+    let row = |key: &str| SampleEntry::of_key(key).row_key(set(), id(1));
+    assert!(get(&handle, KEY_SAMPLE_KEYSPACE, row(low)).await.is_some());
+    assert!(
+        get(&handle, KEY_SAMPLE_KEYSPACE, row(high)).await.is_none(),
+        "the staged largest entry left"
+    );
+    assert_eq!(
+        counters(&handle, count).await.sampled,
+        i128::from(SAMPLE_SIZE)
+    );
+}
