@@ -1365,6 +1365,7 @@ async fn device_source(
         // owner-bound device read, which refuses governed content outright.
         destination: None,
         known_refs: Vec::new(),
+        range: None,
     };
     match managed_read(context, source, request).await {
         Ok(BaoReadOutput::Stream { blob, size, .. }) => Ok(StagedSource {

@@ -255,6 +255,8 @@ pub struct BaoReadRequest {
     /// Refs the requester has already resolved. Echoing one is never authority:
     /// the source evaluates the destination independently.
     pub known_refs: Vec<PlacementPolicyRef>,
+    /// Reads only these bytes; bao verifies each chunk against the object's BLAKE3 root.
+    pub range: Option<std::ops::Range<u64>>,
 }
 
 impl BaoReadRequest {
@@ -808,6 +810,7 @@ mod pure_tests {
             metadata_only: false,
             destination: None,
             known_refs: Vec::new(),
+            range: None,
         });
         let accepted = VersionReplicationMessage::BaoReadAccepted {
             size: 42,

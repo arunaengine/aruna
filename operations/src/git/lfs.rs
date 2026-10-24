@@ -90,6 +90,7 @@ fn described(auth: &AuthContext, object: &StoredObject) -> BaoReadRequest {
         metadata_only: true,
         destination: None,
         known_refs: Vec::new(),
+        range: None,
     }
 }
 

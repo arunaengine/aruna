@@ -461,6 +461,7 @@ async fn commit_pull(
         metadata_only: false,
         destination: None,
         known_refs: Vec::new(),
+        range: None,
     };
     let blob = match managed_read(context, request.source.node_id, read).await {
         Ok(BaoReadOutput::Stream { blob, .. }) => counted(blob, bytes_done.clone()),

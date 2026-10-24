@@ -235,6 +235,9 @@ impl Operation for BaoReadOperation {
                         {
                             return self.fail(BaoReadError::Refused(BaoReadRefusal::HashMismatch));
                         }
+                        if !range_fits(self.request.range.as_ref(), size) {
+                            return self.fail(BaoReadError::Refused(BaoReadRefusal::InvalidTarget));
+                        }
                         if self.request.metadata_only {
                             self.output = Some(Ok(BaoReadOutput::Metadata {
                                 size,
@@ -255,6 +258,7 @@ impl Operation for BaoReadOperation {
                             stream_id,
                             size,
                             expected_blake3: blake3,
+                            range: self.request.range.clone(),
                         })]
                     }
                     Ok(VersionReplicationMessage::BaoReadRefused(reason)) => {
@@ -337,6 +341,11 @@ impl Operation for BaoReadOperation {
             }
         }
     }
+}
+
+/// Whether a requested byte range is non-empty and inside a `size` byte object.
+fn range_fits(range: Option<&std::ops::Range<u64>>, size: u64) -> bool {
+    range.is_none_or(|range| range.start < range.end && range.end <= size)
 }
 
 /// One teach-then-retry round. The source only ever teaches the refs it needs,
@@ -891,6 +900,9 @@ impl IncomingBaoOperation {
         let Some(blake3) = self.blob_hash else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
+        if !range_fits(self.request.range.as_ref(), location.blob_size) {
+            return self.send_refusal(BaoReadRefusal::InvalidTarget);
+        }
         let payload = match (VersionReplicationMessage::BaoReadAccepted {
             size: location.blob_size,
             blake3,
@@ -1135,8 +1147,9 @@ impl IncomingBaoOperation {
         if !self.version_refs.is_empty() {
             return self.send_refusal(BaoReadRefusal::ReadDenied);
         }
-        // A probe would have to echo an identity this node has not verified.
-        if self.request.metadata_only {
+        // A probe would have to echo an identity this node has not verified, and an observation
+        // is only ever served whole.
+        if self.request.metadata_only || self.request.range.is_some() {
             return self.send_refusal(BaoReadRefusal::ReadDenied);
         }
         // The requester names the expected bytes; serving refuses anything that
@@ -1522,12 +1535,14 @@ impl Operation for IncomingBaoOperation {
                         location,
                         expected_blake3,
                         lease: Box::new(lease),
+                        range: self.request.range.clone(),
                     })];
                 }
                 smallvec![Effect::Blob(BlobEffect::ServeRead {
                     stream_id: self.stream_id,
                     location,
                     expected_blake3,
+                    range: self.request.range.clone(),
                 })]
             }
             IncomingBaoState::ServeRead => {
@@ -1659,6 +1674,7 @@ mod pure_tests {
             metadata_only: false,
             destination: None,
             known_refs: Vec::new(),
+            range: None,
         }
     }
 
@@ -1955,6 +1971,48 @@ mod pure_tests {
         }));
         operation.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
         operation
+    }
+
+    // A range outside the announced object is refused before any byte is received.
+    #[test]
+    fn ranged_read_bounds() {
+        let remote_node = node_from_seed(1);
+        let stream_id = Ulid::from(9u128);
+        let mut request = read_request(remote_node, [4u8; 32]);
+        request.range = Some(40..43);
+        let mut operation = BaoReadOperation::new(remote_node, request.clone());
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
+        operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        let accepted = VersionReplicationMessage::BaoReadAccepted {
+            size: 42,
+            blake3: [4u8; 32],
+            etag: None,
+            hashes: Default::default(),
+        };
+        let effects = operation.step(Event::Blob(BlobEvent::MessageReceived {
+            stream_id,
+            payload: accepted.to_bytes().unwrap(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::CloseConnection { .. })]
+        ));
+
+        request.range = Some(2..10);
+        let mut operation = BaoReadOperation::new(remote_node, request);
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
+        operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        let effects = operation.step(Event::Blob(BlobEvent::MessageReceived {
+            stream_id,
+            payload: accepted.to_bytes().unwrap(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::ReceiveRead { size: 42, range: Some(range), .. })]
+                if *range == (2..10)
+        ));
     }
 
     #[test]
@@ -2356,6 +2414,7 @@ mod pure_tests {
                 stream_id: id,
                 location: selected,
                 expected_blake3,
+                range: None,
             })] if *id == stream_id && selected == &location && expected_blake3 == &hash
         ));
         assert!(

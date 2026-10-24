@@ -166,6 +166,7 @@ async fn resolve(
             metadata_only: true,
             destination: None,
             known_refs: Vec::new(),
+            range: None,
         };
         match managed_read(context, exact.node_id, request).await {
             Ok(BaoReadOutput::Metadata { size, hashes, .. }) => (size, hashes, None),

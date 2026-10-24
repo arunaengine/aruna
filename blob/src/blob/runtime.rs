@@ -1012,9 +1012,10 @@ impl BlobHandler {
                 location,
                 expected_blake3,
                 lease,
+                range,
             } => {
-                let serve = self.serve_sealed_read(stream_id, location, expected_blake3, *lease);
-                Box::pin(serve).await
+                let target = (location, expected_blake3, range);
+                Box::pin(self.serve_sealed_read(stream_id, target, *lease)).await
             }
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
             BlobEffect::SendMessage { stream_id, payload } => {
@@ -1049,7 +1050,8 @@ impl BlobHandler {
                 stream_id,
                 location,
                 expected_blake3,
-            } => Box::pin(self.serve_read(stream_id, location, expected_blake3)).await,
+                range,
+            } => Box::pin(self.serve_read(stream_id, (location, expected_blake3, range))).await,
             BlobEffect::ServeSourceRead {
                 stream_id,
                 access,
@@ -1070,7 +1072,8 @@ impl BlobHandler {
                 stream_id,
                 size,
                 expected_blake3,
-            } => Box::pin(self.receive_read(stream_id, size, expected_blake3)).await,
+                range,
+            } => Box::pin(self.receive_read(stream_id, size, expected_blake3, range)).await,
             BlobEffect::ReplicateLeased {
                 replication_id,
                 stream_id,

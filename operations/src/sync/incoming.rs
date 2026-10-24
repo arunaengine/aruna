@@ -2115,6 +2115,7 @@ mod tests {
                 metadata_only: false,
                 destination: None,
                 known_refs: Vec::new(),
+                range: None,
             }
         };
 

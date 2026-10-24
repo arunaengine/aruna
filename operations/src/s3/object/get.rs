@@ -2280,6 +2280,7 @@ async fn routed_blob(
             metadata_only: false,
             destination: None,
             known_refs: Vec::new(),
+            range: None,
         };
         match failures.consider(managed_read(context, holder, request).await) {
             Some(BaoReadOutput::Stream {
@@ -2330,6 +2331,7 @@ async fn routed_metadata(
             metadata_only: true,
             destination: None,
             known_refs: Vec::new(),
+            range: None,
         };
         match managed_read(context, holder, request).await {
             Ok(BaoReadOutput::Metadata {

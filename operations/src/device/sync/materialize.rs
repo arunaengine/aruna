@@ -414,6 +414,7 @@ pub(crate) async fn fetch_remote(
         metadata_only: false,
         destination: None,
         known_refs: Vec::new(),
+        range: None,
     };
     match managed_read(context, folder.remote.node_id, request).await {
         Ok(BaoReadOutput::Stream { blob, .. }) => Ok(blob),

@@ -8,7 +8,9 @@ use super::control_plane::{
     parse_replication_init, read_replication_message, send_replication_message, validate_init_ack,
 };
 use super::frames::SliceReader;
-use crate::bao_tree::{BaoReadWriter, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper};
+use crate::bao_tree::{
+    BaoReadWriter, OpenDalWriter, RangeWriter, RecvStreamWrapper, SendStreamWrapper,
+};
 use crate::error::BlobLibError;
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::effects::StorageEffect;
@@ -29,8 +31,12 @@ use bao_tree::io::round_up_to_chunks;
 use bao_tree::{BaoTree, ByteRanges};
 use bytes::BytesMut;
 use std::collections::HashMap;
+use std::ops::Range;
 use tracing::{debug, warn};
 use ulid::Ulid;
+
+/// A copy to serve: its location, the root it must hash to, and the range to serve of it.
+pub(super) type ServeTarget = (BackendLocation, [u8; 32], Option<Range<u64>>);
 
 use super::BAO_BLOCK_SIZE;
 
@@ -73,11 +79,11 @@ impl BlobHandler {
         }
     }
 
+    /// Serves a copy, or with a range only the chunks covering it.
     pub async fn serve_read(
         &self,
         stream_id: Ulid,
-        location: BackendLocation,
-        expected_blake3: [u8; 32],
+        (location, expected_blake3, range): ServeTarget,
     ) -> BlobEvent {
         if location.get_blake3() != Some(expected_blake3.as_slice()) {
             return BlobEvent::Error(BlobError::IntegrityCheckFailed(
@@ -89,7 +95,7 @@ impl BlobHandler {
             Ok(reader) => reader,
             Err(error) => return BlobEvent::Error(error),
         };
-        self.serve_from(stream_id, location, expected_blake3, reader)
+        self.serve_from(stream_id, (location, expected_blake3, range), reader)
             .await
     }
 
@@ -98,8 +104,7 @@ impl BlobHandler {
     pub async fn serve_sealed_read(
         &self,
         stream_id: Ulid,
-        location: BackendLocation,
-        expected_blake3: [u8; 32],
+        (location, expected_blake3, range): ServeTarget,
         lease: ReadLease,
     ) -> BlobEvent {
         if location.get_blake3() != Some(expected_blake3.as_slice()) {
@@ -118,17 +123,23 @@ impl BlobHandler {
                 Err(error) => return BlobEvent::Error(error),
             },
         };
-        self.serve_from(stream_id, location, expected_blake3, reader)
+        self.serve_from(stream_id, (location, expected_blake3, range), reader)
             .await
     }
 
     async fn serve_from(
         &self,
         stream_id: Ulid,
-        location: BackendLocation,
-        expected_blake3: [u8; 32],
+        (location, expected_blake3, range): ServeTarget,
         mut reader: SliceReader,
     ) -> BlobEvent {
+        let size = location.blob_size;
+        let range = range.unwrap_or(0..size);
+        if range.start > range.end || range.end > size || (range.is_empty() && size > 0) {
+            return BlobEvent::Error(BlobError::ReadError(
+                "bao read range is outside the object".to_string(),
+            ));
+        }
         let mut outboard =
             match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
                 Ok(outboard) if outboard.root.as_bytes() == &expected_blake3 => outboard,
@@ -147,7 +158,7 @@ impl BlobHandler {
                     return BlobEvent::Error(BlobError::OutboardCreationFailed(error.to_string()));
                 }
             };
-        self.stream_encoding(stream_id, reader, &mut outboard, location.blob_size)
+        self.stream_encoding(stream_id, reader, &mut outboard, range)
             .await
     }
     /// Streams one bao encoding to the peer and tears the connection down,
@@ -157,14 +168,14 @@ impl BlobHandler {
         stream_id: Ulid,
         reader: R,
         outboard: &mut PreOrderOutboard<BytesMut>,
-        size: u64,
+        range: Range<u64>,
     ) -> BlobEvent {
         let stream = match self.connection_handle(stream_id).await {
             Ok(stream) => stream,
             Err(event) => return event,
         };
         let mut stream = stream.lock().await;
-        let ranges = round_up_to_chunks(&ByteRanges::from(0..size));
+        let ranges = round_up_to_chunks(&ByteRanges::from(range));
         let mut sender = SendStreamWrapper::new(&mut stream.0, self.transfer_idle_timeout());
         let result = encode_ranges_validated(reader, outboard, &ranges, &mut sender).await;
         _ = stream.0.finish();
@@ -195,7 +206,7 @@ impl BlobHandler {
                 Err(event) => return event,
             };
         let served = self
-            .stream_encoding(stream_id, reader, &mut outboard, size)
+            .stream_encoding(stream_id, reader, &mut outboard, 0..size)
             .await;
         // The encoder validates every chunk against the outboard, so a file
         // rewritten mid-stream already fails; this only names the cause.
@@ -207,12 +218,22 @@ impl BlobHandler {
         served
     }
 
+    /// Receives a bao read; with `range`, only those bytes, every chunk verified on arrival.
     pub async fn receive_read(
         &self,
         stream_id: Ulid,
         size: u64,
         expected_blake3: [u8; 32],
+        range: Option<Range<u64>>,
     ) -> BlobEvent {
+        if range
+            .as_ref()
+            .is_some_and(|range| range.start >= range.end || range.end > size)
+        {
+            return BlobEvent::Error(BlobError::ReadError(
+                "bao read range is outside the object".to_string(),
+            ));
+        }
         let Some(connection) = self.connections.lock().await.remove(&stream_id) else {
             return BlobEvent::Error(BlobError::ReplicationRejected(
                 "Stream not available".to_string(),
@@ -221,24 +242,38 @@ impl BlobHandler {
         let (writer, reader) = tokio::io::duplex(64 * 1024);
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let transfer_timeout = self.transfer_idle_timeout();
+        let stream_size = range.as_ref().map_or(size, |range| range.end - range.start);
+        let wanted = range;
 
         tokio::spawn(async move {
             let result: Result<(), BlobError> = async {
                 let mut stream = connection.stream.lock().await;
                 let receiver = RecvStreamWrapper::new(&mut stream.1, transfer_timeout);
-                let mut writer = BaoReadWriter::new(writer);
                 let mut outboard = PreOrderOutboard {
                     tree: BaoTree::new(size, BAO_BLOCK_SIZE),
                     root: expected_blake3.into(),
                     data: BytesMut::new(),
                 };
-                let ranges = round_up_to_chunks(&ByteRanges::from(0..size));
-                decode_ranges(receiver, ranges, &mut writer, &mut outboard)
-                    .await
-                    .map_err(|error| BlobError::ReplicationFailed(error.to_string()))?;
-                writer
-                    .finish(size, expected_blake3)
-                    .map_err(|error| BlobError::IntegrityCheckFailed(error.to_string()))?;
+                let failed =
+                    |error: std::io::Error| BlobError::IntegrityCheckFailed(error.to_string());
+                match wanted {
+                    None => {
+                        let mut writer = BaoReadWriter::new(writer);
+                        let ranges = round_up_to_chunks(&ByteRanges::from(0..size));
+                        decode_ranges(receiver, ranges, &mut writer, &mut outboard)
+                            .await
+                            .map_err(|error| BlobError::ReplicationFailed(error.to_string()))?;
+                        writer.finish(size, expected_blake3).map_err(failed)?;
+                    }
+                    Some(range) => {
+                        let ranges = round_up_to_chunks(&ByteRanges::from(range.clone()));
+                        let mut writer = RangeWriter::new(writer, range);
+                        decode_ranges(receiver, ranges, &mut writer, &mut outboard)
+                            .await
+                            .map_err(|error| BlobError::ReplicationFailed(error.to_string()))?;
+                        writer.finish().map_err(failed)?;
+                    }
+                }
                 _ = stream.0.finish();
                 _ = stream.1.stop(0u32.into());
                 Ok(())
@@ -255,10 +290,7 @@ impl BlobHandler {
                     .map_err(|error| StreamError(Box::new(error)))
             },
         );
-        BlobEvent::ReadFinished {
-            blob,
-            stream_size: size,
-        }
+        BlobEvent::ReadFinished { blob, stream_size }
     }
 
     pub async fn replicate_blob(

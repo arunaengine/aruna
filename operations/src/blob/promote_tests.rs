@@ -1012,6 +1012,7 @@ pub(crate) mod received {
                 stream_id: id,
                 size: data.len() as u64,
                 expected_blake3: *blake3::hash(&data).as_bytes(),
+                range: None,
             })
             .await;
         let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = event else {

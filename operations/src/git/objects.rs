@@ -318,6 +318,7 @@ pub async fn open(
             metadata_only: false,
             destination: None,
             known_refs: Vec::new(),
+            range: None,
         };
         if let Ok(BaoReadOutput::Stream { blob, size, .. }) =
             managed_read(context, source, request).await

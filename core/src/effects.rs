@@ -188,6 +188,8 @@ pub enum BlobEffect {
         stream_id: Ulid,
         location: BackendLocation,
         expected_blake3: [u8; 32],
+        /// Serves only the chunks of this byte range, each verifiable against the root.
+        range: Option<Range<u64>>,
     },
     /// Serves one version this node never copied into its blob store: a device
     /// streams the owner's own file. The file is refused unless it still
@@ -199,10 +201,13 @@ pub enum BlobEffect {
         expected_blake3: [u8; 32],
         fingerprint: String,
     },
+    /// Receives a verified bao read of a `size` byte object; with `range`, only those bytes,
+    /// each chunk checked against `expected_blake3`.
     ReceiveRead {
         stream_id: Ulid,
         size: u64,
         expected_blake3: [u8; 32],
+        range: Option<Range<u64>>,
     },
     /// Create-time reachability proof for a tenant backend: build the guarded
     /// operator and round-trip a sentinel object.
@@ -322,6 +327,7 @@ pub enum BlobEffect {
         location: BackendLocation,
         expected_blake3: [u8; 32],
         lease: Box<ReadLease>,
+        range: Option<Range<u64>>,
     },
     /// Reserves the working set of composing at most `content` bytes, before the piece records
     /// are loaded. Answers `ComposeReserved`.

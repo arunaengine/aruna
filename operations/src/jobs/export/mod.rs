@@ -2245,6 +2245,7 @@ async fn open_remote(
             metadata_only,
             destination: None,
             known_refs: Vec::new(),
+            range: None,
         },
     )
     .await
