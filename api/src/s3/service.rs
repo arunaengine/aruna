@@ -10,6 +10,7 @@ mod copy;
 mod encryption;
 mod forward;
 mod forward_copy;
+mod forward_list;
 mod forward_parts;
 mod listing;
 mod payload;
@@ -32,6 +33,7 @@ use aruna_core::structs::storage::format::Compression;
 
 use self::copy::{copy_object_response, copy_part_response, copy_source_conditions};
 use self::forward_copy::{CopyPath, CopySource};
+use self::forward_list::{decode_bound, encode_bound};
 use self::listing::{
     ObjectListingPage, list_parts_output, list_uploads_output, marker_continuation_token,
     next_marker_for,
@@ -268,6 +270,7 @@ impl ArunaS3Service {
                 },
                 None,
                 false,
+                None,
                 None,
             )
             .await?;
@@ -637,8 +640,23 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let bounds = self
+            .delegated_listing(&req.extensions, bucket_info.as_ref(), req.uri.query())
+            .await?;
+        // A distributed bucket merges every range under the prefix into one page.
+        let merged = (bucket_info.as_ref())
+            .and_then(|bucket_info| bucket_info.distribution.clone())
+            .filter(|_| bounds.is_none());
         let requested_continuation_token = req.input.continuation_token.clone();
-        let continuation_token = Self::decode_list_token(requested_continuation_token.as_deref())?;
+        let query = (req.input.prefix.as_deref(), req.input.delimiter.as_deref());
+        let continuation_token = match &merged {
+            Some(binding) => decode_bound(
+                binding.set_id,
+                query,
+                requested_continuation_token.as_deref(),
+            )?,
+            None => Self::decode_list_token(requested_continuation_token.as_deref())?,
+        };
         let max_keys = match req.input.max_keys {
             None => ListBucketOperation::DEFAULT_MAX_KEYS,
             Some(max_keys) => usize::try_from(max_keys)
@@ -649,8 +667,6 @@ impl S3 for ArunaS3Service {
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
         let start_after = req.input.start_after.clone();
-        let listed = prefix.as_deref().unwrap_or_default();
-        self.read_scope(bucket_info.as_ref(), listed, true).await?;
 
         let group_id = bucket_info
             .as_ref()
@@ -687,22 +703,26 @@ impl S3 for ArunaS3Service {
             }
         };
 
-        let page = self
-            .run_object_listing(
-                LOV2I {
-                    bucket: bucket.clone(),
-                    group_id,
-                    continuation_token,
-                    max_keys: Some(max_keys),
-                    prefix: prefix.clone(),
-                    delimiter: delimiter.clone(),
-                    start_after: start_after.clone(),
-                },
-                owner,
-                url_encoded,
-                scope.as_ref(),
-            )
-            .await?;
+        let input = LOV2I {
+            bucket: bucket.clone(),
+            group_id,
+            continuation_token,
+            max_keys: Some(max_keys),
+            prefix: prefix.clone(),
+            delimiter: delimiter.clone(),
+            start_after: start_after.clone(),
+        };
+        let page = match &merged {
+            Some(binding) => {
+                let shape = (owner, url_encoded, scope.as_ref());
+                self.merged_objects(&user_access, binding, input, shape)
+                    .await?
+            }
+            None => {
+                self.run_object_listing(input, owner, url_encoded, scope.as_ref(), bounds)
+                    .await?
+            }
+        };
 
         let ObjectListingPage {
             contents,
@@ -710,7 +730,13 @@ impl S3 for ArunaS3Service {
             continuation_token: result_token,
         } = page;
         let key_count = contents.len() + common_prefixes.len();
-        let next_continuation_token = Self::encode_list_token(result_token.as_ref())?;
+        let next_continuation_token = match &merged {
+            Some(binding) => {
+                let query = (prefix.as_deref(), delimiter.as_deref());
+                encode_bound(binding.set_id, query, result_token.as_ref())?
+            }
+            None => Self::encode_list_token(result_token.as_ref())?,
+        };
         let is_truncated = next_continuation_token.is_some();
 
         Ok(S3Response::new(ListObjectsV2Output {
@@ -758,8 +784,8 @@ impl S3 for ArunaS3Service {
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
         let marker = req.input.marker.clone();
-        let listed = prefix.as_deref().unwrap_or_default();
-        self.read_scope(bucket_info.as_ref(), listed, true).await?;
+        let merged =
+            (bucket_info.as_ref()).and_then(|bucket_info| bucket_info.distribution.clone());
 
         let group_id = bucket_info
             .as_ref()
@@ -807,22 +833,26 @@ impl S3 for ArunaS3Service {
             }
         };
 
-        let page = self
-            .run_object_listing(
-                LOV2I {
-                    bucket: bucket.clone(),
-                    group_id,
-                    continuation_token,
-                    max_keys: Some(max_keys),
-                    prefix: prefix.clone(),
-                    delimiter: delimiter.clone(),
-                    start_after,
-                },
-                owner,
-                url_encoded,
-                scope.as_ref(),
-            )
-            .await?;
+        let input = LOV2I {
+            bucket: bucket.clone(),
+            group_id,
+            continuation_token,
+            max_keys: Some(max_keys),
+            prefix: prefix.clone(),
+            delimiter: delimiter.clone(),
+            start_after,
+        };
+        let page = match &merged {
+            Some(binding) => {
+                let shape = (owner, url_encoded, scope.as_ref());
+                self.merged_objects(&user_access, binding, input, shape)
+                    .await?
+            }
+            None => {
+                self.run_object_listing(input, owner, url_encoded, scope.as_ref(), None)
+                    .await?
+            }
+        };
 
         let ObjectListingPage {
             contents,

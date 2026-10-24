@@ -114,7 +114,13 @@ const DELEGATED_OPERATIONS: &[&str] = &[
     "ListParts",
     "CopyObject",
     "UploadPartCopy",
+    "ListObjectsV2",
 ];
+
+/// Forwarded listings address a bucket and name their key range in the query.
+fn delegated_listing(operation: &str) -> bool {
+    operation == "ListObjectsV2"
+}
 
 #[derive(Clone)]
 pub struct AuthProvider {
@@ -695,11 +701,15 @@ impl AuthProvider {
             }
             Err(error) => return Err(denied(&error.to_string())),
         };
-        let Some((bucket, key)) = cx
-            .s3_path()
-            .as_object()
-            .map(|(bucket, key)| (bucket.to_owned(), key.to_owned()))
-        else {
+        let listing = delegated_listing(operation);
+        let addressed =
+            match listing {
+                true => (cx.s3_path().get_bucket_name())
+                    .map(|bucket| (bucket.to_owned(), String::new())),
+                false => (cx.s3_path().as_object())
+                    .map(|(bucket, key)| (bucket.to_owned(), key.to_owned())),
+            };
+        let Some((bucket, key)) = addressed else {
             return Err(denied("requests must address an object"));
         };
         let digest = forwarded_digest(cx.method(), &bucket, &key, cx.uri().query(), cx.headers());
@@ -730,7 +740,7 @@ impl AuthProvider {
             ));
         }
         // The named range may predate a split; it must lead to the key's range coordinated here.
-        if let Some(binding) = bucket_info.distribution.as_ref() {
+        if let Some(binding) = bucket_info.distribution.as_ref().filter(|_| !listing) {
             delegated_range(self.driver_ctx.as_ref(), binding, delegation.range_id, &key)
                 .await
                 .map_err(|error| crate::s3::error::guard_error(&error))?;
@@ -741,20 +751,35 @@ impl AuthProvider {
             path_restrictions: delegation.restrictions.clone(),
             session: None,
         };
-        let path = object_permission_path(
-            self.realm_id,
-            bucket_info.group_id,
-            self.node_id,
-            &bucket,
-            &key,
-        );
+        let path = match listing {
+            true => {
+                bucket_permission_path(self.realm_id, bucket_info.group_id, self.node_id, &bucket)
+            }
+            false => object_permission_path(
+                self.realm_id,
+                bucket_info.group_id,
+                self.node_id,
+                &bucket,
+                &key,
+            ),
+        };
         let extras = request_extras(cx, operation);
         // A forwarded listing needs READ, every forwarded write WRITE, on this node's path.
         let required = match action {
             Action::Read => Permission::READ,
             Action::Write => Permission::WRITE,
         };
-        authorize(
+        let user_access = UserAccess {
+            access_key: delegation.credential_id.clone(),
+            user_identity: delegation.user_id,
+            group_id: delegation.group_id,
+            secret: EncryptedS3Secret::empty(),
+            expiry: SystemTime::UNIX_EPOCH + Duration::from_secs(delegation.credential_expiry),
+            path_restrictions: delegation.restrictions.clone(),
+            issued_by: *delegation.issuer.as_bytes(),
+            revoked_at: None,
+        };
+        let authorized = authorize(
             self.driver_ctx.as_ref(),
             self.realm_id,
             &auth_context,
@@ -762,8 +787,16 @@ impl AuthProvider {
             &required,
             extras.clone(),
         )
-        .await
-        .map_err(map_authorize_error)?;
+        .await;
+        match authorized {
+            Ok(()) => {}
+            // A caller with grants below the bucket lists only what they may read.
+            Err(AuthorizeError::PermissionDenied) if operation == "ListObjectsV2" => {
+                self.admit_subpath_listing(cx, &user_access, &auth_context, &path, extras.clone())
+                    .await?;
+            }
+            Err(error) => return Err(map_authorize_error(error)),
+        }
         cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(bucket_info);
         cx.extensions_mut().insert(DelegatedRequest {
@@ -771,16 +804,7 @@ impl AuthProvider {
             nonce: delegation.nonce,
             payload: delegation.payload.clone(),
         });
-        cx.extensions_mut().insert(UserAccess {
-            access_key: delegation.credential_id,
-            user_identity: delegation.user_id,
-            group_id: delegation.group_id,
-            secret: EncryptedS3Secret::empty(),
-            expiry: SystemTime::UNIX_EPOCH + Duration::from_secs(delegation.credential_expiry),
-            path_restrictions: delegation.restrictions,
-            issued_by: *delegation.issuer.as_bytes(),
-            revoked_at: None,
-        });
+        cx.extensions_mut().insert(user_access);
         Ok(())
     }
 
