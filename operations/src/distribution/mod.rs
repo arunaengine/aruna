@@ -9,6 +9,7 @@ use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 
 use crate::driver::DriverContext;
 
+pub mod inventory;
 pub mod publish;
 
 /// Signs a snapshot with this node's key, only when this node is the set's bound publisher.
