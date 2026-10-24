@@ -115,11 +115,12 @@ const DELEGATED_OPERATIONS: &[&str] = &[
     "CopyObject",
     "UploadPartCopy",
     "ListObjectsV2",
+    "ListObjectVersions",
 ];
 
 /// Forwarded listings address a bucket and name their key range in the query.
 fn delegated_listing(operation: &str) -> bool {
-    operation == "ListObjectsV2"
+    matches!(operation, "ListObjectsV2" | "ListObjectVersions")
 }
 
 #[derive(Clone)]

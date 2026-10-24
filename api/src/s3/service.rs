@@ -12,6 +12,7 @@ mod forward;
 mod forward_copy;
 mod forward_list;
 mod forward_parts;
+mod forward_versions;
 mod listing;
 mod payload;
 
@@ -2344,8 +2345,9 @@ impl S3 for ArunaS3Service {
         let delimiter = req.input.delimiter.clone();
         let key_marker = req.input.key_marker.clone();
         let requested_version_marker = req.input.version_id_marker.clone();
-        let listed = prefix.as_deref().unwrap_or_default();
-        self.read_scope(bucket_info.as_ref(), listed, true).await?;
+        let bounds = self
+            .delegated_listing(&req.extensions, bucket_info.as_ref(), req.uri.query())
+            .await?;
         let version_id_marker = match requested_version_marker.as_deref() {
             None => None,
             Some(marker) => Some(
@@ -2363,6 +2365,21 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
+        // A distributed bucket seeks in its ordered inventory, range by range.
+        if let Some(binding) = bucket_info.and_then(|bucket_info| bucket_info.distribution) {
+            let output = match bounds {
+                Some(bounds) => {
+                    let shape = (group_id, max_keys, version_id_marker);
+                    self.range_versions(&binding, req.input, bounds, shape)
+                        .await?
+                }
+                None => {
+                    self.merged_versions(&user_access, &binding, req.input, (group_id, max_keys))
+                        .await?
+                }
+            };
+            return Ok(S3Response::new(output));
+        }
 
         let result = drive(
             ListVersionsOperation::new(LOVI {
