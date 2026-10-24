@@ -528,6 +528,8 @@ pub struct LocationSummary {
     pub group_id: Option<Ulid>,
     pub blob_size: Option<u64>,
     pub hashes: BTreeMap<String, Vec<u8>>,
+    /// The device the resolved version was published from, as its origin tag names it.
+    pub origin_device: Option<String>,
 }
 
 impl LocationSummary {
@@ -542,6 +544,7 @@ impl LocationSummary {
             group_id: None,
             blob_size: None,
             hashes: BTreeMap::new(),
+            origin_device: None,
         }
     }
 }

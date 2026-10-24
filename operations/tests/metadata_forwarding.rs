@@ -881,7 +881,7 @@ impl Realm {
     fn bearer_string(&self) -> String {
         match self.bearer_token() {
             AuthToken::Bearer(token) => token.as_str().to_string(),
-            AuthToken::Internal(_) => unreachable!(),
+            AuthToken::Internal(_) | AuthToken::Replay { .. } => unreachable!(),
         }
     }
 }

@@ -14,8 +14,11 @@ use aruna_core::compute::{
     LogTails, NOBODY, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec, UserSpec,
 };
 use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
+};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{
@@ -32,6 +35,7 @@ use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
@@ -49,6 +53,7 @@ use aruna_operations::s3::object::versions::{
     ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
 use aruna_storage::storage;
+use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use futures_util::StreamExt;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -61,6 +66,9 @@ const INPUT_PATH: &str = "/in/data.csv";
 const RESULTS: &str = "results";
 const OUTPUT_PATH: &str = "/out/report.txt";
 const OUTPUT_BYTES: &[u8] = b"captured-report";
+
+/// Detects a wakeup that never arrives, not a slow machine.
+const WAKEUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 struct Harness {
     _temp_dir: TempDir,
@@ -752,6 +760,129 @@ async fn captures_without_workspace() {
     assert!(
         buckets.iter().all(|bucket| !bucket.starts_with("ws-")),
         "{buckets:?}"
+    );
+}
+
+/// Reports every timer key the scheduler fires.
+struct Fired(tokio::sync::mpsc::UnboundedSender<TaskKey>);
+
+#[async_trait::async_trait]
+impl InboundTaskHandler for Fired {
+    async fn handle_timer(&self, key: TaskKey) {
+        let _ = self.0.send(key);
+    }
+}
+
+#[tokio::test]
+async fn output_wakes_replication() {
+    // A captured output is a committed write, so continuous sync must not wait for another one.
+    let mut harness = setup().await;
+    seed_auth(&harness).await;
+    create_bucket(&harness, RESULTS).await;
+    let (sender, mut fired) = tokio::sync::mpsc::unbounded_channel();
+    let task = TaskHandle::new();
+    task.set_inbound_handler(Arc::new(Fired(sender))).await;
+    harness.driver.task_handle = Some(task);
+
+    run_capture(&harness, InputMode::Snapshot, "report.txt", None).await;
+    let woke = tokio::time::timeout(WAKEUP_LIMIT, async {
+        while let Some(key) = fired.recv().await {
+            if key == TaskKey::DrainReplicationQueue {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(matches!(woke, Ok(true)), "the replication drain never woke");
+}
+
+/// Live replication obligations this node holds.
+async fn obligations(harness: &Harness) -> Vec<aruna_core::types::Key> {
+    let scan = StorageEffect::Iter {
+        key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: 64,
+        txn_id: None,
+    };
+    match harness
+        .driver
+        .storage_handle
+        .send_storage_effect(scan)
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => {
+            values.into_iter().map(|(key, _)| key).collect()
+        }
+        other => panic!("the obligation scan failed: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn replay_skips_announce() {
+    // A capture retried after its output committed hands back the same version. That write was
+    // announced once, so the retry must not queue continuous sync for it again.
+    let harness = setup().await;
+    seed_auth(&harness).await;
+    create_bucket(&harness, RESULTS).await;
+    let pinned = put_version(&harness, b"input-bytes", None).await;
+    let mut spec = pinned_spec(&harness, pinned.version_id, InputMode::Snapshot);
+    spec.file_outputs.push(OutputSelection {
+        container_path: OUTPUT_PATH.to_string(),
+        path_prefix: None,
+        destination_node_id: Some(harness.node_id),
+        destination: OutputDestination::S3 {
+            bucket: RESULTS.to_string(),
+            key: "retried.txt".to_string(),
+        },
+        name: None,
+        description: None,
+    });
+    let (record, control) = seed_execution(&harness, spec.clone()).await;
+    let fence = FenceContext {
+        attempt: AttemptRef::new(record.job_id.to_string().to_lowercase(), 1),
+        attempt_epoch: control.attempt_epoch,
+        controller_generation: 1,
+    };
+    let backend: Arc<dyn ExecutorBackend> = Arc::new(StubBackend);
+    let capture = || {
+        capture_outputs(
+            &harness.driver,
+            &backend,
+            &fence,
+            &spec,
+            &record,
+            harness.node_id,
+        )
+    };
+
+    let first = capture().await.unwrap();
+    // The replication drain takes the obligations the commits left.
+    let drained = obligations(&harness).await;
+    assert!(
+        !drained.is_empty(),
+        "the committed output owes continuous sync"
+    );
+    let deletes = drained.into_iter();
+    let deletes = deletes.map(|key| (REPLICATION_OBLIGATION_KEYSPACE.to_string(), key));
+    assert!(matches!(
+        harness
+            .driver
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchDelete {
+                deletes: deletes.collect(),
+                txn_id: None,
+            })
+            .await,
+        Event::Storage(StorageEvent::BatchDeleteResult { .. })
+    ));
+
+    let second = capture().await.unwrap();
+    assert_eq!(first[0].version_id, second[0].version_id);
+    assert!(
+        obligations(&harness).await.is_empty(),
+        "the replay recreated a drained obligation"
     );
 }
 

@@ -37,6 +37,7 @@ use crate::metadata::update_document::update_metadata_document;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::process_placements::load_realm_config;
 use crate::placement::resolve_shard_holders;
+use crate::realm::mutate_placement::node_kind;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataBatch;
@@ -286,16 +287,28 @@ pub async fn route_metadata_update(
         .ok_or_else(|| {
             MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
         })?;
-    // On a device a selected document is edited locally and queued; a holder sees the change set
-    // when the intake drain forwards it. Only a holder can check an expected revision.
+    // On a device a selected or read document is edited locally and queued; a holder sees the
+    // change set when the intake drain forwards it. Only a holder can check an expected revision
+    // or change visibility, so those always go to a holder and fail while none answers.
+    let by_owner =
+        node_kind(&config, actor.node_id).and_then(|kind| kind.owner()) == Some(actor.user_id);
     if expected_revision.is_none()
+        && public.is_none()
         && let Some(replica) =
             device_replica(context, &config, Some(actor.node_id), document_id).await
-        && accepts_edits(&replica)
+        && accepts_edits(&replica, by_owner)
     {
-        return apply_local_edit(context, actor.user_id, actor.node_id, &replica, mutation)
-            .await
-            .map_err(device_edit_error);
+        let issued_at = crate::device::publish_queue::token_issued_at(auth_token.as_ref());
+        return apply_local_edit(
+            context,
+            actor.user_id,
+            actor.node_id,
+            &replica,
+            mutation,
+            issued_at,
+        )
+        .await
+        .map_err(device_edit_error);
     }
     let placement = resolve_metadata_id(
         &config,

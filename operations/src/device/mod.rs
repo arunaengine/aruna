@@ -13,6 +13,7 @@ pub mod forward;
 pub mod inspect_draft;
 pub mod list_drafts;
 pub mod publish_queue;
+pub mod publish_run;
 pub mod realm_documents;
 pub mod refresh;
 pub mod remove_node;

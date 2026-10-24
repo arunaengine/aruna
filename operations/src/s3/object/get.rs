@@ -1658,7 +1658,7 @@ impl Operation for GetObjectOperation {
 
 /// Reads an object, continuing against the realm's holders when this node holds
 /// the version record but not its bytes. Only User nodes route, since elsewhere a
-/// missing local blob is a fault; ranged requests are not routed (bao serves whole blobs).
+/// missing local blob is a fault; a routed range streams the whole blob and skips to it.
 pub async fn get_object_routed(
     context: &DriverContext,
     input: GetObjectInput,
@@ -1682,7 +1682,7 @@ pub async fn get_object_token(
     restrictions: Option<Vec<PathRestriction>>,
     token: Option<TokenRead>,
 ) -> Result<GetObjectResult, GetObjectError> {
-    let ranged = input.range.is_some();
+    let range = input.range.clone();
     let (user_id, realm_id) = (input.user_identity, input.realm_id);
     let result = read_local(context, input, restrictions.clone(), token.as_ref()).await;
     let Err(GetObjectError::BlobNotLocal {
@@ -1695,7 +1695,7 @@ pub async fn get_object_token(
     else {
         return result;
     };
-    if ranged || !local_is_user(context, realm_id).await {
+    if !local_is_user(context, realm_id).await {
         return Err(GetObjectError::GetObjectFailed);
     }
     let read = RoutedRead {
@@ -1708,7 +1708,39 @@ pub async fn get_object_token(
         source_policies,
         restrictions,
     };
-    routed_blob(context, read).await
+    let mut result = routed_blob(context, read).await?;
+    if let Some(range) = range {
+        let resolved = range.resolve(result.info.size)?;
+        result.blob = slice_blob(result.blob, resolved.range.clone());
+        result.resolved_range = Some(resolved);
+    }
+    Ok(result)
+}
+
+/// The bytes of `range` from a stream of the whole object; the rest is skipped.
+fn slice_blob(
+    blob: BackendStream<Result<Bytes, StreamError>>,
+    range: Range<u64>,
+) -> BackendStream<Result<Bytes, StreamError>> {
+    let sliced = blob
+        .0
+        .scan(0u64, move |offset, chunk| {
+            let start = *offset;
+            let item = match chunk {
+                Ok(_) if start >= range.end => return futures_util::future::ready(None),
+                Ok(chunk) => {
+                    let len = chunk.len() as u64;
+                    *offset = start + len;
+                    let from = range.start.saturating_sub(start).min(len) as usize;
+                    let to = (range.end - start).min(len) as usize;
+                    (from < to).then(|| Ok(chunk.slice(from..to)))
+                }
+                Err(error) => Some(Err(error)),
+            };
+            futures_util::future::ready(Some(item))
+        })
+        .filter_map(futures_util::future::ready);
+    BackendStream(Box::pin(sliced))
 }
 
 /// Reads the local copy; with a token, a locked or pending version is read with the object key

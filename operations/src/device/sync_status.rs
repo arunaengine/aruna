@@ -6,11 +6,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_STATE_KEYSPACE};
 use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
-use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key};
 use byteview::ByteView;
@@ -24,6 +25,7 @@ use super::drain::claim_state;
 use super::publish_queue::{PublishEntry, PublishState, scan_publish_queue};
 use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state, list_replicas};
 use super::sync::folders::{list_folders, list_transfers};
+use super::sync::outbox::requeue_uploads;
 use super::sync::repository::{scan_folder, scan_page};
 
 /// How recently the realm must have answered for the device to call it
@@ -41,6 +43,8 @@ const SYNC_STATE_KEY: [u8; 1] = [0];
 /// is in flight.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSyncState {
+    /// When the realm last answered. A failed contact attempt clears it, so the device shows
+    /// disconnected at once and connected again after the next answer.
     pub last_contact_ms: Option<u64>,
     pub last_sync_ms: Option<u64>,
     pub run_started_ms: Option<u64>,
@@ -246,6 +250,7 @@ pub async fn start_sync_run(context: &Arc<DriverContext>) -> bool {
         return false;
     }
     requeue_publish(context, now).await;
+    requeue_uploads(context, now).await;
     state.run_started_ms = Some(now);
     write_sync_state(context, &state).await;
     for key in [
@@ -268,13 +273,14 @@ async fn requeue_publish(context: &Arc<DriverContext>, now_ms: u64) {
     }
 }
 
+/// Moves the timer to now. An idle arm would keep the beat a device always has pending.
 async fn arm(context: &Arc<DriverContext>, key: TaskKey) {
     let Some(task_handle) = context.task_handle.as_ref() else {
         return;
     };
-    if let TaskEvent::Error { message, .. } =
-        task_handle.schedule_idle_timer(key, Duration::ZERO).await
-    {
+    let after = Duration::ZERO;
+    let now = Effect::Task(TaskEffect::ShortenTimer { key, after });
+    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(now).await {
         warn!(message = %message, "Failed to arm a device sync timer");
     }
 }
@@ -284,6 +290,14 @@ pub async fn note_contact(context: &Arc<DriverContext>) {
     let mut state = read_sync_state(context).await;
     state.last_contact_ms = Some(unix_timestamp_millis());
     write_sync_state(context, &state).await;
+}
+
+/// Records that the realm did not answer this device's last contact attempt.
+pub async fn note_failure(context: &Arc<DriverContext>) {
+    let mut state = read_sync_state(context).await;
+    if state.last_contact_ms.take().is_some() {
+        write_sync_state(context, &state).await;
+    }
 }
 
 /// Records that a sync pass finished, which also ends the run it belonged to.
@@ -551,6 +565,71 @@ mod tests {
         assert!(!stale.realm_reachable(now));
         assert!(!stale.run_active(now));
         assert!(!DeviceSyncState::default().realm_reachable(now));
+    }
+
+    #[tokio::test]
+    async fn runs_pending_beat() {
+        // A device always has its folder beat pending, so an explicit run must move it to now.
+        use crate::tests::incoming::RecordingTaskHandler;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (seen, mut fired) = tokio::sync::mpsc::channel(16);
+        let task = aruna_tasks::TaskHandle::new();
+        task.set_inbound_handler(Arc::new(RecordingTaskHandler { seen }))
+            .await;
+        let key = TaskKey::ReconcileSyncedFolders;
+        let after = Duration::from_secs(3600);
+        let later = Effect::Task(TaskEffect::ResetTimer { key, after });
+        assert!(matches!(
+            task.send_effect(later).await,
+            Event::Task(TaskEvent::TimerScheduled { .. })
+        ));
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(task),
+            compute_handle: None,
+        });
+
+        assert!(start_sync_run(&context).await);
+        // Detects a wakeup that never arrives, not a slow machine.
+        let woke = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(key) = fired.recv().await {
+                if key == TaskKey::ReconcileSyncedFolders {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert!(
+            matches!(woke, Ok(true)),
+            "the folder beat kept its later deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn drops_failed_contact() {
+        // The first failed attempt shows the realm as unreachable; the next answer restores it.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        note_contact(&context).await;
+        let now = unix_timestamp_millis();
+        assert!(read_sync_state(&context).await.realm_reachable(now));
+        note_failure(&context).await;
+        assert!(!read_sync_state(&context).await.realm_reachable(now));
+        note_contact(&context).await;
+        assert!(read_sync_state(&context).await.realm_reachable(now));
     }
 
     #[tokio::test]

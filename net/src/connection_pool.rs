@@ -432,7 +432,10 @@ impl PoolContext {
             }
         }
 
-        if let Ok(connection) = state {
+        // A closed connection keeps the peer's reason; closing it again would replace it.
+        if let Ok(connection) = state
+            && connection.close_reason().is_none()
+        {
             let reason = if counter.is_idle() { b"idle" } else { b"drop" };
             connection.close(0u32.into(), reason);
         }

@@ -1278,7 +1278,8 @@ fn map_put_error(error: PutObjectError) -> CallToolResult {
         error @ (PutObjectError::HeadChanged
         | PutObjectError::ImportRemoved
         | PutObjectError::VersionExists
-        | PutObjectError::HistoryDeleted) => internal_error(error),
+        | PutObjectError::HistoryDeleted
+        | PutObjectError::FenceTaken) => internal_error(error),
     }
 }
 

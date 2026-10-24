@@ -22,10 +22,9 @@ use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
-use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{
     PathClaimRecord, PersistentIdFailure, PersistentIdMapping, SyncListCursor, SyncPageLimit,
-    SyncPullAck, SyncRefusal, SyncRelationship, SyncVersionPage,
+    SyncPull, SyncPullStatus, SyncRefusal, SyncRelationship, SyncVersionPage,
 };
 use aruna_core::types::GroupId;
 use aruna_net::streams::BiStream;
@@ -403,16 +402,11 @@ pub enum MetadataTransportMessage {
     /// own copy, so the device never pushes. Appended to keep indices stable.
     ForwardSyncPull {
         auth_token: AuthToken,
-        source: Box<VersionedObjectArn>,
-        blake3: Option<[u8; 32]>,
-        size: u64,
-        target_bucket: String,
-        target_key: String,
-        /// A local delete asks for a delete marker instead of a version.
-        deleted: bool,
+        pull: Box<SyncPull>,
     },
+    /// Answers a pull request and each poll of it.
     ForwardedSyncPull {
-        result: Result<SyncPullAck, SyncRefusal>,
+        status: SyncPullStatus,
     },
     /// Bounded listing of the current heads under one bucket prefix, served as
     /// a routed read with the requesting owner's authority.
@@ -521,6 +515,21 @@ pub enum MetadataTransportMessage {
     /// An empty answer means this holder has no records, never that the vault is absent.
     FetchedVaultRecords {
         result: Result<aruna_core::structs::identity::user::vault::VaultRecords, MetadataReadError>,
+    },
+    /// Whether the device owner may write under `prefix` of one bucket the realm node holds,
+    /// asked before a publish copies anything. Appended last to keep discriminants stable.
+    ForwardCheckBucket {
+        auth_token: AuthToken,
+        bucket: String,
+        prefix: String,
+    },
+    ForwardedBucketChecked {
+        result: Result<(), SyncRefusal>,
+    },
+    /// Asks how far an accepted sync pull has come; answered by `ForwardedSyncPull`.
+    ForwardPullStatus {
+        auth_token: AuthToken,
+        pull: Box<SyncPull>,
     },
 }
 

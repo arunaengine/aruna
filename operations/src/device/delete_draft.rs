@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
+use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
@@ -133,10 +133,16 @@ impl Operation for DeleteDraftOperation {
                     entry: Box::new(entry),
                 };
                 smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: vec![(
-                        DEVICE_INTAKE_KEYSPACE.to_string(),
-                        publish_key(self.draft_id)
-                    )],
+                    deletes: vec![
+                        (
+                            DEVICE_INTAKE_KEYSPACE.to_string(),
+                            publish_key(self.draft_id)
+                        ),
+                        (
+                            DEVICE_FENCE_KEYSPACE.to_string(),
+                            publish_key(self.draft_id)
+                        ),
+                    ],
                     txn_id: Some(txn_id),
                 })]
             }

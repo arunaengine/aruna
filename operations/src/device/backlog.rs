@@ -54,13 +54,14 @@ impl RetryView for UploadState {
     fn due_at_ms(&self) -> Option<u64> {
         match self {
             Self::Pending { due_at_ms, .. } => Some(*due_at_ms),
+            Self::Transferring { .. } => Some(0),
             Self::Failed { .. } => None,
         }
     }
 
     fn attempts(&self) -> u32 {
         match self {
-            Self::Pending { attempts, .. } => *attempts,
+            Self::Pending { attempts, .. } | Self::Transferring { attempts, .. } => *attempts,
             Self::Failed { .. } => 0,
         }
     }

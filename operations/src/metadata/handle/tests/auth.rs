@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::peer_auth::{authorize_peer, remote_auth_context};
+use super::super::WritePeerError;
+use super::super::peer_auth::{authorize_peer, remote_auth_context, replay_authority};
 use super::*;
 use crate::auth::bearer_token::decode_bearer_token;
 use crate::auth::bearer_token::validate_bearer_token;
@@ -487,4 +488,42 @@ async fn auth_allows_missing() {
             .expect("missing token is anonymous"),
         None
     );
+}
+
+// A replay older than the owner's token cutoff is refused; a newer one keeps its authority.
+#[tokio::test]
+async fn replay_respects_cutoff() {
+    let realm_id = RealmId([21; 32]);
+    let user_id = UserId::new(Ulid::from_bytes([22; 16]), realm_id);
+    let cutoff = aruna_core::time::unix_timestamp_secs() - 60;
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.revoked_tokens.push(TokenRevocation {
+        token_hash: aruna_core::auth::user_cutoff_hash(&user_id),
+        expires_at: aruna_core::auth::user_cutoff_expiry(cutoff),
+    });
+    let (_dir, storage) = auth_storage();
+    write_realm_config(&storage, realm_id, &config).await;
+    let auth = AuthContext {
+        user_id,
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let replay = |issued: u64, authored_ms: u64| AuthToken::Replay {
+        auth: auth.clone(),
+        issued_at: issued,
+        authored_at_ms: authored_ms,
+    };
+
+    let fresh = replay_authority(&storage, replay(cutoff, (cutoff + 5) * 1000)).await;
+    assert!(matches!(fresh, Ok(AuthToken::Internal(ref kept)) if *kept == auth));
+    assert!(matches!(
+        replay_authority(&storage, replay(cutoff - 1, (cutoff + 5) * 1000)).await,
+        Err(WritePeerError::Unauthorized)
+    ));
+    // An authoring time before the cutoff is as old as the replay gets.
+    assert!(matches!(
+        replay_authority(&storage, replay(cutoff, (cutoff - 1) * 1000)).await,
+        Err(WritePeerError::Unauthorized)
+    ));
 }

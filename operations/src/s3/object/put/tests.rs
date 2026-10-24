@@ -557,6 +557,85 @@ fn conflict_exhausts_retries() {
 }
 
 #[test]
+fn fence_refuses_replay() {
+    // Two pulls of one device version race: the loser's commit conflicts, its retry reads
+    // the winner's receipt and drops its own bytes instead of minting a second version.
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let node_id = iroh::SecretKey::generate().public();
+    let receipt: aruna_core::types::Key = b"receipt".to_vec().into();
+    let space = "receipts".to_string();
+    let mut op = PutObjectOperation::new(put_config(realm_id, Ulid::generate(), node_id))
+        .with_fence(
+            vec![(space.clone(), receipt.clone(), None)],
+            vec![(space, receipt.clone())],
+        );
+    let mut location = test_location(op.config.user_id);
+    location.hashes.insert(
+        aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+        vec![7u8; 32],
+    );
+    let (txn_id, version_id) = (Ulid::generate(), Ulid::generate());
+    op.txn_id = Some(txn_id);
+    op.version_id = Some(version_id);
+    op.written_location = Some(location.clone());
+
+    // Both transactions find the receipt free, so both record their version id.
+    assert!(matches!(
+        op.write_cleanup_row(txn_id).as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { txn_id: Some(observed), .. })]
+            if *observed == txn_id
+    ));
+    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(receipt.clone(), None)],
+    }));
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the receipt write, got {effects:?}")
+    };
+    assert_eq!(writes[0].2.as_ref(), version_id.to_bytes());
+    // The cleanup row follows in the same transaction, then the commit conflicts.
+    assert!(matches!(
+        op.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }))
+        .as_slice(),
+        [Effect::Storage(StorageEffect::Write { .. })]
+    ));
+    op.state = PutObjectState::CommitTransaction;
+    assert!(matches!(
+        op.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }))
+        .as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+    ));
+
+    // The retry reads the guard again and finds the other pull's receipt.
+    let retry = Ulid::generate();
+    op.txn_id = Some(retry);
+    assert!(matches!(
+        op.write_cleanup_row(retry).as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { .. })]
+    ));
+    let winner: aruna_core::types::Value = Ulid::generate().to_bytes().to_vec().into();
+    let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(receipt, Some(winner))],
+    }));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Blob(BlobEffect::Delete { location: deleted }) if *deleted == location
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Storage(StorageEffect::AbortTransaction { txn_id }) if *txn_id == retry
+    )));
+    assert!(op.is_complete());
+    assert!(matches!(
+        op.finalize(),
+        Err(crate::s3::object::put::PutObjectError::FenceTaken)
+    ));
+}
+
+#[test]
 fn writes_before_commit() {
     // The reconciliation row must commit atomically with metadata ownership.
     let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -1112,7 +1191,10 @@ pub async fn test_put_object() {
     )
     .await
     .unwrap();
-    assert_eq!(retry, result);
+    assert_eq!(retry.location, result.location);
+    assert_eq!(retry.version_id, result.version_id);
+    // Only the first put committed; the retry hands the same version back.
+    assert!(!result.replayed && retry.replayed);
     assert_eq!(
         read_to_string(retry.location.get_full_path().unwrap()).unwrap(),
         String::from_utf8_lossy(&data[..]).to_string()
@@ -1164,8 +1246,12 @@ pub async fn test_put_object() {
         })
         .create_only()
     };
-    let replay = drive(create(preassigned_version_id), &context).await;
-    assert_eq!(replay.unwrap(), result);
+    let replay = drive(create(preassigned_version_id), &context)
+        .await
+        .unwrap();
+    assert_eq!(replay.location, result.location);
+    assert_eq!(replay.version_id, result.version_id);
+    assert!(replay.replayed);
     let other = drive(create(Ulid::generate()), &context).await;
     assert!(matches!(other, Err(PutObjectError::ObjectExists)));
 }

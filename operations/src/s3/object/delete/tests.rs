@@ -155,6 +155,60 @@ fn audits_delete_marker() {
 }
 
 #[test]
+fn fence_refuses_marker() {
+    // A pulled delete whose receipt another commit already wrote rolls back instead of
+    // stacking a second marker; a free receipt records the marker id before the commit.
+    let receipt: aruna_core::types::Key = b"receipt".to_vec().into();
+    let space = "receipts".to_string();
+    let marker = Ulid::generate();
+    let fenced = || {
+        let mut operation = audit_op(None).with_fence(
+            vec![(space.clone(), receipt.clone(), None)],
+            vec![(space.clone(), receipt.clone())],
+        );
+        operation.version_id = Some(marker);
+        operation.write_delete_audit();
+        operation
+    };
+    let audited = || {
+        Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        })
+    };
+    let read = |value| {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(receipt.clone(), value)],
+        })
+    };
+
+    let mut free = fenced();
+    let txn_id = free.txn_id;
+    assert!(matches!(
+        free.step(audited()).as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { txn_id: observed, .. })] if *observed == txn_id
+    ));
+    let effects = free.step(read(None));
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the receipt write, got {effects:?}")
+    };
+    assert_eq!(writes[0].2.as_ref(), marker.to_bytes());
+    assert!(matches!(
+        free.step(audited()).as_slice(),
+        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+    ));
+
+    let mut taken = fenced();
+    taken.step(audited());
+    let winner: aruna_core::types::Value = Ulid::generate().to_bytes().to_vec().into();
+    let effects = taken.step(read(Some(winner)));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+    ));
+    assert_eq!(taken.finalize(), Err(DeleteObjectError::FenceTaken));
+}
+
+#[test]
 fn audits_version_delete() {
     let version_id = Ulid::generate();
     let mut operation = audit_op(Some(version_id));

@@ -32,9 +32,10 @@ use aruna_operations::jobs::workflow::reconcile::ComputeReconciler;
 use aruna_operations::jobs::workflow::run_execution_job;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
+use serde_json::{Value, json};
 use shared::{
     S3Credentials, TestResult, create_bearer_token, create_group_http, create_s3_credentials,
-    s3_client, spawn_complete_seed, wait_group_http,
+    s3_client, spawn_complete_seed, spawn_compute_seed, wait_group_http,
 };
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -545,5 +546,190 @@ async fn execution_restart_adopts() -> TestResult<()> {
     assert_eq!(state, JobState::Succeeded);
 
     fixture.seed.shutdown().await;
+    Ok(())
+}
+
+const NEXTFLOW_WORK: &str = "work/ab/task";
+// Mirrors Nextflow's `.command.run`: run the script in /work and record its exit status.
+const NEXTFLOW_WRAPPER: &str =
+    "cd /work\nsh .command.sh > .command.out 2> .command.err\necho $? > .exitcode\n";
+// Like SEQTK_TRIM and MULTIQC: one glob also matches the staged input, one matches a directory.
+// `results` is a `type: 'dir'` output sent as DIRECTORY; `*.{bam,bai}` is a Java glob.
+const NEXTFLOW_SCRIPT: &str = "cp sample.fastq.gz trimmed.fastq.gz\nmkdir -p report_data/plots\n\
+    echo log > report_data/report.log\necho plot > report_data/plots/a.txt\n\
+    mkdir -p results/deep\necho table > results/deep/t.tsv\n\
+    echo bam > aln.bam\necho bai > aln.bai\n\
+    printf 'SEQTK=1.4\\n/SEQTK/=exit:0\\n' > .command.env\n";
+// What an `eval` output leaves in `.command.env`; no `.command.trace` is written.
+const EVAL_ENV: &str = "SEQTK=1.4\n/SEQTK/=exit:0\n";
+const READS: &str = "@read\nACGT\n+\nIIII\n";
+
+/// The body nf-ga4gh 1.5.0 builds: control files in and out, and every glob under the
+/// task directory with `path_prefix` `/work`. Only `bash` is replaced by `sh`.
+fn nextflow_task(bucket: &str) -> Value {
+    let url = |key: &str| format!("s3://{bucket}/{key}");
+    let work = |name: &str| url(&format!("{NEXTFLOW_WORK}/{name}"));
+    let input = |url: String, path: &str| json!({ "url": url, "path": path, "type": "FILE" });
+    let output =
+        |name: &str| json!({ "url": work(name), "path": format!("/work/{name}"), "type": "FILE" });
+    let pattern = |glob: &str| {
+        json!({
+            "url": url(NEXTFLOW_WORK),
+            "path": format!("/work/{glob}"),
+            "path_prefix": "/work",
+            "type": "FILE"
+        })
+    };
+    json!({
+        "name": "SEQTK_TRIM (sample)",
+        "executors": [{
+            "image": "busybox:latest",
+            "command": [
+                "sh", "-o", "pipefail", "-c",
+                "sh /work/.command.run 2>&1 | tee /work/.command.log"
+            ],
+            "workdir": "/work"
+        }],
+        "inputs": [
+            input(work(".command.sh"), "/work/.command.sh"),
+            input(work(".command.run"), "/work/.command.run"),
+            input(url("work/cd/prev/sample.fastq.gz"), "/work/sample.fastq.gz")
+        ],
+        "outputs": [
+            output(".command.out"),
+            output(".command.err"),
+            output(".command.log"),
+            output(".exitcode"),
+            pattern("*.fastq.gz"),
+            pattern("*_data"),
+            pattern("*.{bam,bai}"),
+            json!({ "url": work("results"), "path": "/work/results", "type": "DIRECTORY" })
+        ],
+        "resources": { "cpu_cores": 1, "ram_gb": 0.25 }
+    })
+}
+
+/// Polls one TES task until its state is terminal; the caller bounds the wait.
+async fn wait_task(client: &reqwest::Client, url: &str, creds: &S3Credentials) -> Value {
+    loop {
+        let task: Value = client
+            .get(format!("{url}?view=FULL"))
+            .basic_auth(&creds.access_key_id, Some(&creds.access_secret))
+            .send()
+            .await
+            .expect("task read")
+            .json()
+            .await
+            .unwrap_or_default();
+        let state = task["state"].as_str().map(str::to_string);
+        if matches!(
+            state.as_deref(),
+            Some("COMPLETE" | "EXECUTOR_ERROR" | "SYSTEM_ERROR" | "CANCELED")
+        ) {
+            return task;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn read_object(s3: &aws_sdk_s3::Client, bucket: &str, key: String) -> Option<Vec<u8>> {
+    let object = s3.get_object().bucket(bucket).key(key).send().await.ok()?;
+    Some(object.body.collect().await.ok()?.into_bytes().to_vec())
+}
+
+// A Nextflow task through the TES route: a glob keeps the staged input it matches out of the
+// results, and a glob that matches a directory captures every file below it.
+#[tokio::test]
+async fn runs_nextflow_task() -> TestResult<()> {
+    let Some(backend) = docker_or_skip().await else {
+        return Ok(());
+    };
+    // One absolute cap over setup, every request and the polling keeps a hang under five minutes.
+    tokio::time::timeout(Duration::from_secs(240), check_nextflow_task(backend))
+        .await
+        .map_err(|_| "Nextflow task did not finish within 240 s")?
+}
+
+async fn check_nextflow_task(backend: DockerBackend) -> TestResult<()> {
+    let registry = Arc::new(ExecutorRegistry::new().with_backend(Arc::new(backend)));
+    let seed = spawn_compute_seed(registry).await?;
+    let endpoint = seed.s3.clone().expect("full node exposes S3");
+    let bearer = create_bearer_token(
+        &seed.context,
+        seed.user_id,
+        seed.realm_id,
+        seed.capabilities.clone(),
+    )
+    .await?;
+    let group = create_group_http(&seed.base_url, &bearer, "nextflow-tes").await?;
+    wait_group_http(&seed.base_url, &bearer, &group.group_id).await?;
+    let creds = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
+    let bucket = format!("nf-{}", Ulid::generate().to_string().to_lowercase());
+    let s3 = s3_client(&endpoint, &creds);
+    s3.create_bucket().bucket(&bucket).send().await?;
+    for (key, body) in [
+        (format!("{NEXTFLOW_WORK}/.command.sh"), NEXTFLOW_SCRIPT),
+        (format!("{NEXTFLOW_WORK}/.command.run"), NEXTFLOW_WRAPPER),
+        ("work/cd/prev/sample.fastq.gz".to_string(), READS),
+    ] {
+        s3.put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body.as_bytes().to_vec()))
+            .send()
+            .await?;
+    }
+
+    let client = reqwest::Client::new();
+    let tasks = format!("{}/api/v1/ga4gh/tes/v1/tasks", seed.base_url);
+    let created = client
+        .post(&tasks)
+        .basic_auth(&creds.access_key_id, Some(&creds.access_secret))
+        .json(&nextflow_task(&bucket))
+        .send()
+        .await?;
+    let status = created.status();
+    let created: Value = created.json().await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "{created}");
+    let id = created["id"].as_str().expect("task id");
+    let task = wait_task(&client, &format!("{tasks}/{id}"), &creds).await;
+    assert_eq!(task["state"], "COMPLETE", "{task}");
+
+    let read = |name: &str| read_object(&s3, &bucket, format!("{NEXTFLOW_WORK}/{name}"));
+    assert_eq!(read(".exitcode").await.as_deref(), Some(&b"0\n"[..]));
+    assert_eq!(
+        read("trimmed.fastq.gz").await.as_deref(),
+        Some(READS.as_bytes())
+    );
+    assert_eq!(
+        read("sample.fastq.gz").await,
+        None,
+        "staged input written back"
+    );
+    assert_eq!(
+        read("report_data/report.log").await.as_deref(),
+        Some(&b"log\n"[..])
+    );
+    assert_eq!(
+        read("report_data/plots/a.txt").await.as_deref(),
+        Some(&b"plot\n"[..])
+    );
+    assert_eq!(
+        read("results/deep/t.tsv").await.as_deref(),
+        Some(&b"table\n"[..])
+    );
+    assert_eq!(read("aln.bam").await.as_deref(), Some(&b"bam\n"[..]));
+    assert_eq!(read("aln.bai").await.as_deref(), Some(&b"bai\n"[..]));
+    assert_eq!(
+        read(".command.env").await.as_deref(),
+        Some(EVAL_ENV.as_bytes())
+    );
+    assert_eq!(
+        read(".command.trace").await,
+        None,
+        "an absent optional file"
+    );
+
+    seed.shutdown().await;
     Ok(())
 }

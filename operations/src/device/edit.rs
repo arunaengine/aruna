@@ -51,6 +51,7 @@ pub async fn apply_local_edit(
     node_id: NodeId,
     replica: &ReplicaRecord,
     mutation: UpdateDocumentMutation,
+    issued_at: u64,
 ) -> Result<MetadataRegistryRecord, DeviceEditError> {
     let record = replica
         .record
@@ -78,7 +79,9 @@ pub async fn apply_local_edit(
     actor.strip(&mut batch.base_clock);
     let entry = PublishEntry::edit(draft_id, owner, &record, batch.clone(), authored);
     drive(
-        EnqueueDraftOperation::new(EnqueueDraftInput { entry }).with_actor(actor),
+        EnqueueDraftOperation::new(EnqueueDraftInput { entry })
+            .with_actor(actor)
+            .with_fence(issued_at),
         context.as_ref(),
     )
     .await
@@ -333,15 +336,15 @@ pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
     replayed
 }
 
-/// Whether this replica may take the edit locally: the owner selected it and
-/// a refresh has left it something to edit.
-pub fn accepts_edits(replica: &ReplicaRecord) -> bool {
-    replica.selected && replica.record.is_some()
+/// Whether this replica may take the edit locally: the owner selected it, or it is a usable copy
+/// the owner read and the owner edits it, and a refresh has left it something to edit.
+pub fn accepts_edits(replica: &ReplicaRecord, by_owner: bool) -> bool {
+    replica.record.is_some() && (replica.selected || by_owner && replica.serves_reads())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceEditError, apply_local_edit, read_actor, replays_edit};
+    use super::{DeviceEditError, accepts_edits, apply_local_edit, read_actor, replays_edit};
     use crate::device::publish_queue::{
         MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, PublishState, publish_entry,
     };
@@ -479,15 +482,102 @@ mod tests {
         replica
     }
 
+    // A copy the owner read is edited offline by the owner alone; a selected one as before.
+    #[tokio::test]
+    async fn admits_read_copy() {
+        let (_dir, _context, record) = device().await;
+        let mut read = replica(&record);
+        read.selected = false;
+        read.displayed_jsonld = r#"{"@graph":[]}"#.to_string();
+        assert!(accepts_edits(&read, true));
+        assert!(!accepts_edits(&read, false));
+        read.displayed_jsonld.clear();
+        assert!(
+            !accepts_edits(&read, true),
+            "an empty copy has nothing to edit"
+        );
+        assert!(accepts_edits(&replica(&record), false));
+    }
+
+    // A visibility change only a holder can apply is never queued as a local edit: offline it
+    // fails, while a plain edit of the same read copy still queues.
+    #[tokio::test]
+    async fn forwards_visibility_change() {
+        use crate::metadata::forward::route_metadata_update;
+        use aruna_core::document::DocumentTarget;
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+
+        let (_dir, context, record) = device().await;
+        let owner = UserId::local(Ulid::generate(), record.realm_id);
+        let actor = Actor {
+            node_id: node(1),
+            user_id: owner,
+            realm_id: record.realm_id,
+        };
+        let mut config = RealmConfigDocument::new(record.realm_id, Vec::new(), 1);
+        config.ensure_node(node(1), RealmNodeKind::User { owner });
+        let target = DocumentTarget::RealmConfig {
+            realm_id: record.realm_id,
+        };
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let mut read = replica(&record);
+        read.selected = false;
+        read.displayed_jsonld = r#"{"@graph":[]}"#.to_string();
+        assert!(crate::device::replica::store_replica(&context, &read).await);
+        let update = |public: Option<bool>| {
+            route_metadata_update(
+                &context,
+                actor.clone(),
+                None,
+                record.document_id,
+                public,
+                contact("ada"),
+                None,
+                None,
+                None,
+            )
+        };
+
+        assert!(update(Some(false)).await.is_err());
+        assert!(
+            crate::device::sync_status::read_publish_entries(&context)
+                .await
+                .is_empty()
+        );
+        update(None).await.expect("a plain edit queues locally");
+        assert_eq!(
+            crate::device::sync_status::read_publish_entries(&context)
+                .await
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn edits_share_actor() {
         // Reusing the device's actor keeps clocks small; its dots must stay ordered.
         let (_dir, context, record) = device().await;
         let owner = UserId::local(Ulid::generate(), record.realm_id);
         for name in ["ada", "grace"] {
-            apply_local_edit(&context, owner, node(1), &replica(&record), contact(name))
-                .await
-                .expect("edit applies");
+            apply_local_edit(
+                &context,
+                owner,
+                node(1),
+                &replica(&record),
+                contact(name),
+                0,
+            )
+            .await
+            .expect("edit applies");
         }
         let batches: Vec<MetadataBatch> =
             crate::device::sync_status::read_publish_entries(&context)
@@ -564,6 +654,7 @@ mod tests {
                 crate::metadata::update_document::UpdateDocumentMutation::UpsertContextualEntity {
                     jsonld: r##"{"@id":"#ada","@type":"Person","name":"Ada"}"##.to_string(),
                 },
+                0,
             )
             .await,
             Err(DeviceEditError::QueueFull {

@@ -11,7 +11,9 @@ use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use super::publish_queue::{MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, publish_entry};
+use super::publish_queue::{
+    MAX_PUBLISH_ENTRIES, PublishEntry, PublishKind, fence_entry, publish_entry,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnqueueDraftInput {
@@ -23,6 +25,8 @@ pub struct EnqueueDraftOperation {
     input: EnqueueDraftInput,
     /// The edit's advanced CRDT actor, stored atomically with the entry.
     actor: Option<aruna_core::metadata::MetadataActor>,
+    /// Issue time of the token that authored the entry, stored atomically with it.
+    issued_at: u64,
     state: EnqueueDraftState,
     output: Option<Result<PublishEntry, EnqueueDraftError>>,
 }
@@ -65,6 +69,7 @@ impl EnqueueDraftOperation {
         Self {
             input,
             actor: None,
+            issued_at: 0,
             state: EnqueueDraftState::Init,
             output: None,
         }
@@ -75,13 +80,21 @@ impl EnqueueDraftOperation {
         self
     }
 
+    pub fn with_fence(mut self, issued_at: u64) -> Self {
+        self.issued_at = issued_at;
+        self
+    }
+
     fn emit_write(&mut self, txn_id: TxnId) -> Effects {
         self.state = EnqueueDraftState::WriteEntry { txn_id };
         let entry = match publish_entry(&self.input.entry) {
             Ok(entry) => entry,
             Err(error) => return fail(self, EnqueueDraftError::ConversionError(error)),
         };
-        let mut writes = vec![entry];
+        let mut writes = vec![
+            entry,
+            fence_entry(self.input.entry.draft_id, self.issued_at),
+        ];
         if let Some(actor) = &self.actor {
             match aruna_core::storage_entries::metadata_actor_entry(actor) {
                 Ok(entry) => writes.push(entry),

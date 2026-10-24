@@ -28,6 +28,12 @@ use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
 use crate::telemetry::{duration_ms, record_duration_ms, warn_iroh_phase, warn_iroh_request};
 
+/// Reason a node closes an open connection once its realm configuration stops admitting the peer.
+pub const MEMBERSHIP_CLOSE: &str = "realm membership";
+
+/// Reason a node refuses a new connection from a peer its realm configuration does not admit.
+pub const ADMISSION_CLOSE: &str = "realm admission";
+
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const INBOUND_CONNECTION_LIMIT: usize = 256;
 const CONNECTION_PEER_LIMIT: usize = 8;
@@ -533,6 +539,15 @@ pub struct BiStream(
 );
 
 impl BiStream {
+    /// Why the peer closed this stream's connection, once it has. A lost stream reports only
+    /// that it was lost; the reason stays on the connection.
+    pub fn close_reason(&self) -> Option<String> {
+        self.2
+            .as_ref()?
+            .close_reason()
+            .map(|reason| reason.to_string())
+    }
+
     pub fn into_recv(self) -> impl AsyncRead + Send + Sync + Unpin + 'static {
         LeasedRecvStream {
             recv: self.1,
@@ -810,7 +825,7 @@ pub async fn run_accept_loop(
                             node_id = %peer_id,
                             "Dropping inbound Iroh connection: realm admission rejected"
                         );
-                        conn.close(0u32.into(), b"realm admission");
+                        conn.close(0u32.into(), ADMISSION_CLOSE.as_bytes());
                         return;
                     }
                     if !inbound_admission.allows_alpn(peer_id, alpn) {
@@ -934,7 +949,7 @@ async fn run_admitted(
     let close_conn = conn.clone();
     let mut membership = admission.membership_watch();
     if !admission.admits(peer_id, alpn) {
-        close_conn.close(0u32.into(), b"realm membership");
+        close_conn.close(0u32.into(), MEMBERSHIP_CLOSE.as_bytes());
         return;
     }
 
@@ -952,7 +967,7 @@ async fn run_admitted(
             _ = &mut session => return,
             changed = membership.changed() => {
                 if changed.is_err() || !admission.admits(peer_id, alpn) {
-                    close_conn.close(0u32.into(), b"realm membership");
+                    close_conn.close(0u32.into(), MEMBERSHIP_CLOSE.as_bytes());
                     return;
                 }
             }

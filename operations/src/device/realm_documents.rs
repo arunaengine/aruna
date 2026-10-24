@@ -15,7 +15,9 @@ use aruna_core::auth::revocation_live;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{GROUP_KEYSPACE, MANAGEMENT_URL_KEYSPACE, REALM_MARKER_KEYSPACE};
+use aruna_core::keyspaces::{
+    GROUP_KEYSPACE, MANAGEMENT_URL_KEYSPACE, REALM_MARKER_KEYSPACE, REALM_REMOVAL_KEYSPACE,
+};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -24,6 +26,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{Key, Value};
+use aruna_net::streams::{ADMISSION_CLOSE, MEMBERSHIP_CLOSE};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -40,6 +43,10 @@ use crate::realm::mutate_placement::node_kind;
 /// cover before the marker is treated as wrong. The realm agreeing against a
 /// too-high marker is evidence a peer lied.
 const REBASE_ATTEMPTS: u32 = 3;
+
+/// Fetches every realm node refused for realm membership, with no successful fetch between
+/// them, before the device reports itself removed.
+const REMOVAL_REFUSALS: u32 = 2;
 
 /// How many cached groups one reconciliation looks at. Above
 /// [`MAX_DEVICE_GROUPS`] so a group installed outside a fetch is still seen.
@@ -78,6 +85,8 @@ struct Selection {
     current: Option<Accepted>,
     behind: Option<Accepted>,
     candidates: Vec<Accepted>,
+    /// Peers that closed the connection because their realm no longer admits this device.
+    membership_refusals: usize,
 }
 
 impl Selection {
@@ -114,7 +123,10 @@ pub async fn fetch_realm_documents(context: &Arc<DriverContext>, budget: Duratio
     let Some(plan) = fetch_plan(context).await else {
         return false;
     };
-    fetch_with_plan(context, plan, budget).await
+    let realm_id = plan.realm_id;
+    let (installed, refused) = fetch_with_plan(context, plan, budget).await;
+    note_membership(context, realm_id, refused, installed).await;
+    installed
 }
 
 /// The same fetch for a device that holds no realm configuration yet: owner and
@@ -129,20 +141,96 @@ pub async fn fetch_from_peers(
     let Some(plan) = build_plan(context, owner, peers).await else {
         return false;
     };
-    fetch_with_plan(context, plan, budget).await
+    fetch_with_plan(context, plan, budget).await.0
 }
 
-async fn fetch_with_plan(context: &Arc<DriverContext>, plan: FetchPlan, budget: Duration) -> bool {
+/// Whether the documents were installed, and whether every realm peer refused this device's
+/// realm membership.
+async fn fetch_with_plan(
+    context: &Arc<DriverContext>,
+    plan: FetchPlan,
+    budget: Duration,
+) -> (bool, bool) {
     let Ok(selection) = tokio::time::timeout(budget, ask_realm(context, &plan)).await else {
-        return false;
+        return (false, false);
     };
+    let refused = !plan.peers.is_empty() && selection.membership_refusals == plan.peers.len();
     // The install is deliberately outside the budget: half of it would leave the
     // device with a configuration and an authorization document from two ages.
-    match (selection.current, selection.behind) {
+    let installed = match (selection.current, selection.behind) {
         (Some(accepted), _) => install_documents(context, &plan, accepted, 0).await,
         (None, Some(behind)) => rebase_or_wait(context, &plan, behind).await,
         (None, None) => false,
+    };
+    (installed, refused)
+}
+
+/// Whether a request error is a peer closing the connection because its realm does not admit
+/// this device: a new connection is refused at admission, an open one on a membership change.
+fn membership_refused(error: &str) -> bool {
+    [ADMISSION_CLOSE, MEMBERSHIP_CLOSE]
+        .iter()
+        .any(|reason| error.contains(&format!("closed by peer: {reason}")))
+}
+
+/// Counts fetches that every realm peer refused for realm membership; a fetch that installed
+/// the documents clears the count. A restarting peer refuses once, so one count proves nothing.
+async fn note_membership(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    refused: bool,
+    installed: bool,
+) {
+    let key = Key::from(realm_id.as_bytes().to_vec());
+    let effect = match (installed, refused) {
+        (true, _) => StorageEffect::Delete {
+            key_space: REALM_REMOVAL_KEYSPACE.to_string(),
+            key,
+            txn_id: None,
+        },
+        (false, true) => {
+            let refusals = membership_refusals(context, realm_id)
+                .await
+                .saturating_add(1);
+            if refusals == REMOVAL_REFUSALS {
+                warn!("Every realm node refused this device's realm membership");
+            }
+            StorageEffect::Write {
+                key_space: REALM_REMOVAL_KEYSPACE.to_string(),
+                key,
+                value: Value::from(refusals.to_be_bytes().to_vec()),
+                txn_id: None,
+            }
+        }
+        (false, false) => return,
+    };
+    if let Event::Storage(StorageEvent::Error { error }) =
+        context.storage_handle.send_storage_effect(effect).await
+    {
+        warn!(error = %error, "Failed to record the realm membership state");
     }
+}
+
+async fn membership_refusals(context: &Arc<DriverContext>, realm_id: RealmId) -> u32 {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: REALM_REMOVAL_KEYSPACE.to_string(),
+            key: Key::from(realm_id.as_bytes().to_vec()),
+            txn_id: None,
+        })
+        .await;
+    match event {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => <[u8; 4]>::try_from(bytes.as_ref()).map_or(0, u32::from_be_bytes),
+        _ => 0,
+    }
+}
+
+/// Whether the realm has removed this device, as repeated membership refusals show.
+pub async fn realm_removed(context: &Arc<DriverContext>, realm_id: RealmId) -> bool {
+    membership_refusals(context, realm_id).await >= REMOVAL_REFUSALS
 }
 
 /// Takes a copy the marker does not cover only once the realm has answered the
@@ -252,6 +340,9 @@ async fn ask_realm(context: &Arc<DriverContext>, plan: &FetchPlan) -> Selection 
                 );
             }
             Err(error) => {
+                if membership_refused(&error.to_string()) {
+                    selection.membership_refusals += 1;
+                }
                 debug!(peer = %peer, error = %error, "Could not reach a realm node for the documents");
             }
         }
@@ -851,6 +942,27 @@ mod tests {
         // A copy is stored under the trimmed clock, so nothing forged is kept.
         let accepted = answer(&[1, 2], &[(1, 4), (7, u64::MAX)]);
         assert_eq!(accepted.clock, clock(&[(1, 4)]));
+    }
+
+    // One refusal round proves nothing, two report removal, and a working fetch clears it.
+    #[tokio::test]
+    async fn reports_realm_removal() {
+        let (_dir, context) = device(&config(&[1, 2])).await;
+        assert!(membership_refused(
+            "connection lost: closed by peer: realm membership (code 0)"
+        ));
+        assert!(membership_refused(
+            "connection lost: closed by peer: realm admission (code 0)"
+        ));
+        assert!(!membership_refused("connection lost: closed"));
+
+        note_membership(&context, realm(), true, false).await;
+        assert!(!realm_removed(&context, realm()).await);
+        note_membership(&context, realm(), false, false).await;
+        note_membership(&context, realm(), true, false).await;
+        assert!(realm_removed(&context, realm()).await);
+        note_membership(&context, realm(), false, true).await;
+        assert!(!realm_removed(&context, realm()).await);
     }
 
     // A marker can only be too high because a peer lied, so the realm agreeing

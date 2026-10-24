@@ -5,8 +5,8 @@
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
-use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
-use aruna_core::metadata::{MetadataBatch, MetadataBatchSource};
+use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
+use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::backlog::RetryView;
+use crate::auth::bearer_token::token_grant;
 
 /// Entries one device may hold. A device authors for one person, so the queue
 /// is a human-sized backlog rather than an unbounded spool.
@@ -231,6 +232,26 @@ pub fn publish_entry(entry: &PublishEntry) -> Result<(String, Key, Value), Conve
         publish_key(entry.draft_id),
         ByteView::from(entry.to_bytes()?),
     ))
+}
+
+/// The issue time of the token that authored one queued draft.
+pub fn fence_entry(draft_id: Ulid, issued_at: u64) -> (String, Key, Value) {
+    (
+        DEVICE_FENCE_KEYSPACE.to_string(),
+        publish_key(draft_id),
+        ByteView::from(issued_at.to_be_bytes().to_vec()),
+    )
+}
+
+/// The issue time of the bearer token a write came with. Zero without one, so only an owner
+/// without any token cutoff can replay it.
+pub fn token_issued_at(auth_token: Option<&AuthToken>) -> u64 {
+    match auth_token {
+        Some(AuthToken::Bearer(token)) => token_grant(token.as_str())
+            .map(|grant| grant.issued_at_secs)
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 pub fn scan_publish_queue(start_after: Option<Key>, txn_id: Option<TxnId>) -> Effect {

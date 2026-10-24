@@ -690,51 +690,11 @@ pub fn has_wildcard(path: &str) -> bool {
     path.contains(WILDCARDS)
 }
 
-/// POSIX gives a run of `*` the meaning of a single `*`, so `**` must not turn
-/// into the recursive wildcard of the glob engine.
-fn collapse_stars(pattern: &str) -> String {
-    let mut collapsed = String::with_capacity(pattern.len());
-    let (mut escaped, mut star) = (false, false);
-    for character in pattern.chars() {
-        match character {
-            _ if escaped => (escaped, star) = (false, false),
-            '\\' => (escaped, star) = (true, false),
-            '*' if star => continue,
-            '*' => star = true,
-            _ => star = false,
-        }
-        collapsed.push(character);
-    }
-    collapsed
-}
-
-/// POSIX 12.13 has no brace alternation, so `{` and `}` stay literal file name
-/// characters instead of expanding into alternates the caller never declared.
-fn escape_braces(pattern: &str) -> String {
-    let mut escaped = String::with_capacity(pattern.len());
-    let (mut skip, mut class) = (false, false);
-    for character in pattern.chars() {
-        match character {
-            _ if skip => skip = false,
-            '\\' => skip = true,
-            '[' if !class => class = true,
-            ']' if class => class = false,
-            '{' | '}' if !class => {
-                escaped.push('[');
-                escaped.push(character);
-                escaped.push(']');
-                continue;
-            }
-            _ => {}
-        }
-        escaped.push(character);
-    }
-    escaped
-}
-
+/// Brace alternatives such as `*.{bam,bai}` expand and a `**` component spans
+/// directories, as in Nextflow's Java globs.
 fn build_glob(pattern: &str) -> Result<Glob, String> {
     // `literal_separator` keeps `*` and `?` inside one path component, as POSIX requires.
-    GlobBuilder::new(&escape_braces(&collapse_stars(pattern)))
+    GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()
         .map_err(|error| error.to_string())
@@ -746,8 +706,13 @@ pub fn output_glob(pattern: &str) -> Result<GlobMatcher, String> {
     Ok(build_glob(pattern)?.compile_matcher())
 }
 
-/// Deepest wildcard-free ancestor of a pattern, which is the directory a backend
-/// enumerates. A wildcard-free path yields itself.
+/// The pattern that selects every file below the literal directory `path`.
+pub fn directory_pattern(path: &str) -> String {
+    format!("{}/*", globset::escape(path))
+}
+
+/// Deepest ancestor of a pattern free of wildcards and braces, which is the directory
+/// a backend enumerates. A path without either yields itself.
 pub fn literal_prefix(pattern: &str) -> Result<PathBuf, String> {
     let normalized = normalize_container_path(pattern)?;
     let mut prefix = PathBuf::from("/");
@@ -755,7 +720,8 @@ pub fn literal_prefix(pattern: &str) -> Result<PathBuf, String> {
         let Component::Normal(part) = component else {
             continue;
         };
-        if part.to_string_lossy().contains(WILDCARDS) {
+        let name = part.to_string_lossy();
+        if name.contains(WILDCARDS) || name.contains('{') {
             break;
         }
         prefix.push(part);
@@ -773,7 +739,7 @@ pub fn output_suffix(path: &str, prefix: &str) -> Option<String> {
 }
 
 /// The declared outputs of one attempt: a wildcard path selects every file it
-/// matches, a wildcard-free path only itself.
+/// matches or that lies below a directory it matches, a wildcard-free path only itself.
 #[derive(Debug)]
 pub struct OutputMatcher {
     literals: Vec<String>,
@@ -799,7 +765,10 @@ impl OutputMatcher {
     }
 
     pub fn is_match(&self, path: &str) -> bool {
-        self.literals.iter().any(|literal| literal == path) || self.patterns.is_match(path)
+        self.literals.iter().any(|literal| literal == path)
+            || Path::new(path)
+                .ancestors()
+                .any(|ancestor| self.patterns.is_match(ancestor))
     }
 }
 
@@ -998,29 +967,45 @@ mod tests {
         assert_eq!(matched("/out/[ab].txt"), vec!["/out/a.txt", "/out/b.txt"]);
         assert_eq!(matched("/out/sub/*.txt"), vec!["/out/sub/c.txt"]);
         assert!(matched("/out/*.md").is_empty());
-        // A repeated `*` stays one POSIX wildcard instead of recursing.
-        assert_eq!(matched("/out/**/*.txt"), vec!["/out/sub/c.txt"]);
+        // A `**` component spans any number of directories; inside a name it is one `*`.
+        assert_eq!(
+            matched("/out/**/*.txt"),
+            vec![
+                "/out/a.txt",
+                "/out/b.txt",
+                "/out/ab.txt",
+                "/out/sub/c.txt",
+                "/out/sub/deep/d.txt"
+            ]
+        );
+        assert_eq!(matched("/out/a**.txt"), vec!["/out/a.txt", "/out/ab.txt"]);
         assert!(output_glob("/out/[a.txt").is_err());
     }
 
     #[test]
-    fn braces_stay_literal() {
-        // Brace alternation is undeclared, so `{a,b}` names one directory.
-        let glob = output_glob("/out/{a,b}/x.txt").unwrap();
-        assert!(glob.is_match("/out/{a,b}/x.txt"));
-        assert!(!glob.is_match("/out/a/x.txt"));
-        assert!(!glob.is_match("/out/b/x.txt"));
-        assert!(!has_wildcard("/out/{a,b}/x.txt"));
+    fn expands_brace_alternatives() {
+        // Nextflow sends Java globs, so `*.{bam,bai}` selects both suffixes.
+        let glob = output_glob("/out/*.{bam,bai}").unwrap();
+        assert!(glob.is_match("/out/a.bam"));
+        assert!(glob.is_match("/out/a.bai"));
+        assert!(!glob.is_match("/out/a.sam"));
+        assert!(!glob.is_match("/out/a.{bam,bai}"));
+        let glob = output_glob("/out/{a,b}/*.txt").unwrap();
+        assert!(glob.is_match("/out/a/x.txt"));
+        assert!(!glob.is_match("/out/c/x.txt"));
+        // Enumeration starts above the brace, so `{a,b}` is never created as a directory.
         assert_eq!(
-            literal_prefix("/out/{a,b}/x.txt").unwrap(),
-            Path::new("/out/{a,b}/x.txt")
+            literal_prefix("/out/{a,b}/*.txt").unwrap(),
+            Path::new("/out")
         );
 
-        let matcher = OutputMatcher::new(["/out/{a,b}.csv", "/out/[ab]{x}.txt"]).unwrap();
+        // Without a wildcard the path is one literal file, braces included.
+        assert!(!has_wildcard("/out/{a,b}.csv"));
+        let matcher = OutputMatcher::new(["/out/{a,b}.csv", "/out/[ab]{x,y}.txt"]).unwrap();
         assert!(matcher.is_match("/out/{a,b}.csv"));
         assert!(!matcher.is_match("/out/a.csv"));
-        assert!(matcher.is_match("/out/a{x}.txt"));
-        assert!(!matcher.is_match("/out/ax.txt"));
+        assert!(matcher.is_match("/out/ay.txt"));
+        assert!(!matcher.is_match("/out/a{x,y}.txt"));
     }
 
     #[test]
@@ -1199,5 +1184,25 @@ mod tests {
         assert!(matcher.is_match("/out/report.csv"));
         assert!(!matcher.is_match("/out/sub/report.csv"));
         assert!(!matcher.is_match("/out/other.txt"));
+    }
+
+    #[test]
+    fn matches_directory_files() {
+        // A pattern naming a directory, like Nextflow's `*_data`, selects every file below it.
+        let matcher = OutputMatcher::new(["/work/*_data"]).unwrap();
+        assert!(matcher.is_match("/work/multiqc_data/multiqc.log"));
+        assert!(matcher.is_match("/work/multiqc_data/plots/a.txt"));
+        assert!(!matcher.is_match("/work/multiqc_report.html"));
+        assert!(!matcher.is_match("/other/multiqc_data/multiqc.log"));
+    }
+
+    #[test]
+    fn selects_directory_files() {
+        // A directory name keeps its glob characters literal.
+        let matcher = OutputMatcher::new([directory_pattern("/out/a{b,c}").as_str()]).unwrap();
+        assert!(matcher.is_match("/out/a{b,c}/report.txt"));
+        assert!(matcher.is_match("/out/a{b,c}/deep/plot.txt"));
+        assert!(!matcher.is_match("/out/ab/report.txt"));
+        assert!(!matcher.is_match("/out/a{b,c}"));
     }
 }

@@ -170,9 +170,15 @@ impl ReconcileFolderOperation {
             {
                 local.blake3 = Some(synced.blake3);
             }
-            if base
-                .as_ref()
-                .is_some_and(|base| base.holds_pending(local.as_ref(), remote.as_ref()))
+            // A local deletion held while it did not propagate is decided again once it does.
+            let reopened = policy.propagate_deletes
+                && base
+                    .as_ref()
+                    .is_some_and(|base| base.entry == EntryState::LocalDeleted);
+            if !reopened
+                && base
+                    .as_ref()
+                    .is_some_and(|base| base.holds_pending(local.as_ref(), remote.as_ref()))
             {
                 self.plan.pending += 1;
                 continue;
@@ -405,8 +411,10 @@ impl ReconcileFolderOperation {
             .get(index)
             .and_then(Option::as_ref)
             .is_some_and(|queued| {
-                matches!(&queued.state, UploadState::Pending { .. })
-                    && queued.deleted == upload.deleted
+                matches!(
+                    &queued.state,
+                    UploadState::Pending { .. } | UploadState::Transferring { .. }
+                ) && queued.deleted == upload.deleted
                     && queued.local_version == upload.local_version
             })
         {
@@ -694,8 +702,10 @@ impl ReconcileFolderOperation {
             .get(index)
             .and_then(Option::as_ref)
             .is_some_and(|queued| {
-                matches!(&queued.state, UploadState::Pending { .. })
-                    && !queued.deleted
+                matches!(
+                    &queued.state,
+                    UploadState::Pending { .. } | UploadState::Transferring { .. }
+                ) && !queued.deleted
                     && queued.local_version == Some(version)
             })
     }
@@ -1058,6 +1068,24 @@ mod pure_tests {
         assert_eq!(plan.downloads.len(), 1);
         assert!(plan.downloads[0].conflicted);
         assert_eq!(plan.downloads[0].guard, WriteGuard::MustNotExist);
+    }
+
+    #[test]
+    fn reopens_held_delete() {
+        // The owner turned propagation on after a deletion was held: it now publishes.
+        let version = Ulid::from_bytes([4u8; 16]);
+        let held = SyncBase {
+            entry: EntryState::LocalDeleted,
+            pending_at: Some(PendingMark {
+                fingerprint: None,
+                remote_version: Some(version),
+            }),
+            ..base("5-1-1-1", Some(version))
+        };
+        let (operation, base) = operation(None, Some(held), Some(head(version, false)));
+        let plan = run(operation, base);
+        assert_eq!(plan.uploads, 1);
+        assert_eq!(plan.pending, 0);
     }
 
     #[test]

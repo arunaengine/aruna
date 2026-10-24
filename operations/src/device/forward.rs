@@ -10,6 +10,7 @@ use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::ensure_record_readable;
 use crate::metadata::api::load_live_record;
+use crate::metadata::get_document::record_materialized_read;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::DeviceGroupDocuments;
@@ -37,6 +38,7 @@ use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::metadata::MetadataEffect;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataEvent;
+use aruna_core::metadata::graph_version;
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::SyncRefusal;
@@ -47,6 +49,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use craqle::GraphReplicaSnapshot;
 use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
@@ -360,15 +363,68 @@ pub(super) async fn read_graph_state(
     };
     let raw = load_raw_view(context.as_ref(), document_id, None)
         .await
-        .map_err(|_| SyncRefusal::Unavailable)?
-        .ok_or(SyncRefusal::NotFound)?;
+        .map_err(|_| SyncRefusal::Unavailable)?;
+    // A document created as a scaffold has no authored text yet; its graph is what it shows.
+    let (displayed_jsonld, dataset_digest, findings) = match raw {
+        Some(raw) => (
+            raw.revision.jsonld,
+            raw.revision.dataset_digest,
+            raw.revision.merged.map_or(0, |merged| merged.findings),
+        ),
+        None => {
+            let jsonld = scaffold_display(context, &record, &snapshot).await?;
+            let digest = craqle::canonicalize_jsonld(&jsonld)
+                .ok()
+                .map(|canonical| canonical.digest);
+            (jsonld, digest, 0)
+        }
+    };
     Ok(GraphState {
         record,
         snapshot,
-        displayed_jsonld: raw.revision.jsonld,
-        dataset_digest: raw.revision.dataset_digest,
-        findings: raw.revision.merged.map_or(0, |merged| merged.findings),
+        displayed_jsonld,
+        dataset_digest,
+        findings,
     })
+}
+
+/// The render of a document without authored text, taken from the graph the snapshot holds.
+/// Anything that may have moved between the two is refused, so the device asks again.
+async fn scaffold_display(
+    context: &Arc<DriverContext>,
+    record: &MetadataRegistryRecord,
+    snapshot: &GraphReplicaSnapshot,
+) -> Result<String, SyncRefusal> {
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(SyncRefusal::Unavailable)?;
+    if !record_materialized_read(context.as_ref(), record)
+        .await
+        .map_err(|_| SyncRefusal::Unavailable)?
+    {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let Event::Metadata(MetadataEvent::VersionedExport {
+        jsonld, version, ..
+    }) = metadata
+        .send_metadata_effect(MetadataEffect::ExportVersioned {
+            graph_iri: record.graph_iri.clone(),
+        })
+        .await
+    else {
+        return Err(SyncRefusal::Unavailable);
+    };
+    if version != graph_version(&snapshot.clock) {
+        return Err(SyncRefusal::Unavailable);
+    }
+    let current = load_live_record(context.as_ref(), record.document_id)
+        .await
+        .map_err(sync_refusal)?;
+    match current.last_event_id == record.last_event_id {
+        true => Ok(jsonld),
+        false => Err(SyncRefusal::Unavailable),
+    }
 }
 
 pub(super) fn sync_refusal(error: MetadataApiError) -> SyncRefusal {

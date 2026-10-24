@@ -14,9 +14,10 @@ use crate::driver::DriverContext;
 
 use super::refresh::{RefreshOutcome, refresh_replica, refusal_reason};
 use super::replica::{
-    MAX_DEVICE_REPLICAS, ReplicaOrigin, ReplicaRecord, ReplicaState, delete_replica, list_replicas,
+    ReplicaOrigin, ReplicaRecord, ReplicaState, cache_budget, cache_usage, delete_replica,
     read_replica, store_replica,
 };
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum SelectionError {
@@ -24,8 +25,6 @@ pub enum SelectionError {
     NotFound,
     #[error("{0}")]
     Refused(String),
-    #[error("this device already keeps the maximum of {limit} documents offline")]
-    TooManyReplicas { limit: usize },
     #[error("the document has edits this device has not published yet")]
     PendingEdits,
     #[error("the device store is unavailable")]
@@ -48,14 +47,6 @@ pub async fn select_document(
         return read_replica(context, document_id)
             .await
             .ok_or(SelectionError::Unavailable);
-    }
-    let held = list_replicas(context)
-        .await
-        .ok_or(SelectionError::Unavailable)?;
-    if held.len() >= MAX_DEVICE_REPLICAS {
-        return Err(SelectionError::TooManyReplicas {
-            limit: MAX_DEVICE_REPLICAS,
-        });
     }
     // The row goes in first because the refresh fills it from the holder's
     // answer; a refresh that brings nothing leaves no half-selected document.
@@ -105,6 +96,46 @@ pub async fn deselect_document(
         selected: false,
         ..replica
     })
+}
+
+/// Keeps a document the owner just read online as an unselected replica, so it stays readable
+/// offline. A stale copy is refreshed; a new one is kept only while the cache budget allows.
+pub async fn keep_read(context: &Arc<DriverContext>, record: &MetadataRegistryRecord) {
+    let document_id = record.document_id;
+    match read_replica(context, document_id).await {
+        // A pinned or edited copy follows the refresh beat instead.
+        Some(replica) if replica.selected || replica.pending_edits > 0 => {}
+        Some(replica)
+            if replica
+                .record
+                .as_ref()
+                .is_some_and(|held| held.last_event_id == record.last_event_id) => {}
+        Some(_) => {
+            refresh_replica(context, document_id).await;
+        }
+        None => {
+            // A graph cannot be removed locally yet, so a full cache takes no new copy.
+            if cache_usage(context)
+                .await
+                .is_none_or(|used| used >= cache_budget())
+            {
+                return;
+            }
+            let mut provisional = ReplicaRecord::new(
+                document_id,
+                record.group_id,
+                record.document_path.clone(),
+                ReplicaOrigin::Realm,
+            );
+            provisional.selected = false;
+            if !store_replica(context, &provisional).await {
+                return;
+            }
+            if refresh_replica(context, document_id).await != RefreshOutcome::Installed {
+                delete_replica(context, document_id).await;
+            }
+        }
+    }
 }
 
 /// Selects a document this device created, once the realm has accepted it.

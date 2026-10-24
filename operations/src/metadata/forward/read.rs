@@ -4,6 +4,7 @@
 
 use crate::device::replica::ReplicaRecord;
 use crate::device::replica::read_replica;
+use crate::device::selection::keep_read;
 use crate::driver::DriverContext;
 use crate::metadata::api::ExportMetadataRequest;
 use crate::metadata::api::ExportMetadataResult;
@@ -24,6 +25,7 @@ use crate::metadata::raw_revision::MetadataRawView;
 use crate::metadata::raw_revision::load_raw_view;
 use crate::placement::process_placements::load_realm_config;
 use crate::placement::read_holder_sets;
+use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::PeerTrust;
 use crate::realm::peer_trust::ensure_peer_trust;
 use aruna_core::NodeId;
@@ -211,23 +213,84 @@ pub async fn get_metadata_routed(
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    // A device answers from its own replica, so a selected document stays
-    // readable while the realm is out of reach.
-    if let Some(replica) = device_replica(context, &config, local_node, request.document_id).await {
-        let record = replica
-            .record
-            .map(|record| *record)
-            .ok_or(MetadataApiError::ServiceUnavailable)?;
-        ensure_record_readable(
-            context.as_ref(),
-            realm_id,
-            request.auth.as_ref(),
-            &record,
-            None,
-        )
-        .await?;
-        return Ok(record);
+    // A device answers from its pinned replica, so a selected document stays readable while the
+    // realm is out of reach; an unselected one is a cache the realm's answer refreshes.
+    let cached = device_replica(context, &config, local_node, request.document_id).await;
+    if let Some(replica) = cached
+        .clone()
+        .filter(|replica| replica.selected || replica.pending_edits > 0)
+    {
+        return replica_record(context, realm_id, &request, replica).await;
     }
+    let keeps = owner_reads(&config, local_node, request.auth.as_ref());
+    let routed = read_routed(
+        context,
+        realm_id,
+        config,
+        local_node,
+        request.clone(),
+        auth_token,
+    )
+    .await;
+    match (routed, cached) {
+        (Ok(record), _) => {
+            if keeps {
+                keep_read(context, &record).await;
+            }
+            Ok(record)
+        }
+        (Err(MetadataApiError::ServiceUnavailable), Some(replica)) => {
+            replica_record(context, realm_id, &request, replica).await
+        }
+        (result, _) => result,
+    }
+}
+
+/// Whether a read fills this device's cache: only the owner's own unrestricted read does.
+fn owner_reads(
+    config: &RealmConfigDocument,
+    local_node: Option<NodeId>,
+    auth: Option<&AuthContext>,
+) -> bool {
+    let owner = local_node
+        .and_then(|node| node_kind(config, node))
+        .and_then(|kind| kind.owner());
+    auth.is_some_and(|auth| {
+        Some(auth.user_id) == owner && auth.path_restrictions.is_none() && !auth.federated()
+    })
+}
+
+/// The registry record a device replica holds, after the caller's own READ check.
+async fn replica_record(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    request: &GetVisibleRequest,
+    replica: ReplicaRecord,
+) -> Result<MetadataRegistryRecord, MetadataApiError> {
+    let record = replica
+        .record
+        .map(|record| *record)
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    ensure_record_readable(
+        context.as_ref(),
+        realm_id,
+        request.auth.as_ref(),
+        &record,
+        None,
+    )
+    .await?;
+    Ok(record)
+}
+
+/// Reads one registry record from the document's holders.
+async fn read_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    config: RealmConfigDocument,
+    local_node: Option<NodeId>,
+    request: GetVisibleRequest,
+    auth_token: Option<AuthToken>,
+) -> Result<MetadataRegistryRecord, MetadataApiError> {
     let config_digest = config
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
@@ -485,11 +548,57 @@ pub async fn export_rocrate_routed(
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    if let Some(replica) = device_replica(context, &config, local_node, request.document_id).await {
-        let export = device_export(context, replica, &request).await?;
-        ensure_export_limit(&export, metadata_bytes)?;
-        return Ok(export);
+    // Like a read, an unselected replica answers only while the realm is out of reach.
+    let cached = device_replica(context, &config, local_node, request.document_id).await;
+    let pinned = cached
+        .as_ref()
+        .is_some_and(|replica| replica.selected || replica.pending_edits > 0);
+    let keeps = owner_reads(&config, local_node, request.auth.as_ref());
+    let routed = match pinned {
+        true => Err(MetadataApiError::ServiceUnavailable),
+        false => {
+            export_routed(
+                context,
+                realm_id,
+                config,
+                local_node,
+                request.clone(),
+                forward_token,
+                metadata_bytes,
+            )
+            .await
+        }
+    };
+    match (routed, cached) {
+        (Ok(export), _) => {
+            if keeps {
+                let (ExportMetadataResult::Full { record, .. }
+                | ExportMetadataResult::Summary { record, .. }
+                | ExportMetadataResult::Page { record, .. }
+                | ExportMetadataResult::Raw { record, .. }) = &export;
+                keep_read(context, record).await;
+            }
+            Ok(export)
+        }
+        (Err(MetadataApiError::ServiceUnavailable), Some(replica)) => {
+            let export = device_export(context, replica, &request).await?;
+            ensure_export_limit(&export, metadata_bytes)?;
+            Ok(export)
+        }
+        (result, _) => result,
     }
+}
+
+/// Exports one document on its holders.
+async fn export_routed(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    config: RealmConfigDocument,
+    local_node: Option<NodeId>,
+    request: ExportMetadataRequest,
+    forward_token: Option<AuthToken>,
+    metadata_bytes: u64,
+) -> Result<ExportMetadataResult, MetadataApiError> {
     let config_digest = config
         .digest()
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;

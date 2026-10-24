@@ -880,9 +880,21 @@ impl MetadataHandle {
                 })
                 .await
             }
+            poll @ MetadataTransportMessage::ForwardPullStatus { .. } => {
+                Box::pin(async {
+                    super::super::device_pull::serve_pull_status(context, peer, poll).await
+                })
+                .await
+            }
             listing @ MetadataTransportMessage::ForwardListVersions { .. } => {
                 Box::pin(async {
                     super::super::device_pull::serve_list_versions(context, peer, listing).await
+                })
+                .await
+            }
+            check @ MetadataTransportMessage::ForwardCheckBucket { .. } => {
+                Box::pin(async {
+                    crate::s3::bucket::forward::check_bucket_write(context, peer, check).await
                 })
                 .await
             }
@@ -1034,8 +1046,10 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardJobSubmission { .. }
             | MetadataTransportMessage::ForwardCreatePolicy { .. }
             | MetadataTransportMessage::ForwardSyncPull { .. }
+            | MetadataTransportMessage::ForwardPullStatus { .. }
             | MetadataTransportMessage::ForwardListVersions { .. }
             | MetadataTransportMessage::ForwardCreateBucket { .. }
+            | MetadataTransportMessage::ForwardCheckBucket { .. }
             | MetadataTransportMessage::FetchRealmDocuments { .. }
             | MetadataTransportMessage::FetchGraphState { .. }
             | MetadataTransportMessage::ForwardApplyBatch { .. }

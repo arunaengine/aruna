@@ -15,9 +15,11 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::parse_group_id;
+use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{ProfilePreviewRequest, ProfilePreviewResponse, ensure_metadata_scope};
+use crate::metadata::{
+    ProfilePreviewRequest, ProfilePreviewResponse, ensure_metadata_scope, forwarded_auth_token,
+};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
@@ -26,7 +28,7 @@ use aruna_operations::device::enqueue_draft::{
 };
 use aruna_operations::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
 use aruna_operations::device::list_drafts::ListDraftsOperation;
-use aruna_operations::device::publish_queue::{PublishEntry, PublishState};
+use aruna_operations::device::publish_queue::{PublishEntry, PublishState, token_issued_at};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::profile::validation::preview_submission;
 use aruna_operations::metadata::public_preview::restricted_files;
@@ -166,6 +168,8 @@ for.
   so a crash between forward and outcome cannot create a second document.
 - The realm document id is unknown while the entry is pending; the local draft id is the stable
   reference for the desktop.
+- The entry keeps the issue time of the token that queued it. If the owner revokes their tokens
+  before the entry is published, the realm refuses it and the entry fails without retrying.
 
 **Limits**
 - The device holds at most 256 queued drafts.
@@ -203,9 +207,11 @@ for.
 async fn queue_draft(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<QueueDraftRequest>,
 ) -> ServerResult<(StatusCode, Json<DeviceDraft>)> {
     let auth = require_owner(&state, auth).await?;
+    let issued_at = token_issued_at(forwarded_auth_token(bearer)?.as_ref());
     let group_id = parse_group_id(&request.group_id)?;
     let jsonld = rocrate_jsonld(&request.rocrate)?;
     let entry = PublishEntry::new(
@@ -217,7 +223,7 @@ async fn queue_draft(
         jsonld,
     );
     let queued = drive(
-        EnqueueDraftOperation::new(EnqueueDraftInput { entry }),
+        EnqueueDraftOperation::new(EnqueueDraftInput { entry }).with_fence(issued_at),
         &state.get_ctx(),
     )
     .await

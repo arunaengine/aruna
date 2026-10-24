@@ -75,6 +75,7 @@ pub(super) async fn send_request(
     let write_started = Instant::now();
     write_framed_message(&mut stream, frame_class(&message), &bytes)
         .await
+        .map_err(|error| with_close(&stream, error))
         .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "write_ms", write_started);
 
@@ -82,13 +83,14 @@ pub(super) async fn send_request(
     stream
         .0
         .finish()
-        .map_err(|error| MetadataError::Backend(error.to_string()))
+        .map_err(|error| with_close(&stream, MetadataError::Backend(error.to_string())))
         .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "finish_ms", finish_started);
 
     let read_started = Instant::now();
     let response = read_transport_cap(&mut stream, max_response_size)
         .await
+        .map_err(|error| with_close(&stream, error))
         .map_err(MetadataRequestError::possibly_sent)?;
     record_elapsed_ms(&span, "read_ms", read_started);
 
@@ -180,6 +182,14 @@ pub(super) async fn write_transport_message(
     result
         .map_err(|_| MetadataError::Backend("timed out writing metadata message".to_string()))?
         .map_err(MetadataError::Backend)
+}
+
+/// A lost stream with the peer's close reason, which the stream error itself omits.
+fn with_close(stream: &BiStream, error: MetadataError) -> MetadataError {
+    match stream.close_reason() {
+        Some(reason) => MetadataError::Backend(format!("{error}: {reason}")),
+        None => error,
+    }
 }
 
 async fn write_framed_message(
@@ -474,10 +484,13 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::FetchedVaultRecords { .. } => "fetched_vault_records",
         MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
         MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
+        MetadataTransportMessage::ForwardPullStatus { .. } => "forward_pull_status",
         MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",
         MetadataTransportMessage::ForwardedVersions { .. } => "forwarded_versions",
         MetadataTransportMessage::ForwardCreateBucket { .. } => "forward_create_bucket",
         MetadataTransportMessage::ForwardedBucketCreated { .. } => "forwarded_bucket_created",
+        MetadataTransportMessage::ForwardCheckBucket { .. } => "forward_check_bucket",
+        MetadataTransportMessage::ForwardedBucketChecked { .. } => "forwarded_bucket_checked",
         MetadataTransportMessage::FetchRealmDocuments { .. } => "fetch_realm_documents",
         MetadataTransportMessage::FetchedRealmDocuments { .. } => "fetched_realm_documents",
         MetadataTransportMessage::FetchGraphState { .. } => "fetch_graph_state",

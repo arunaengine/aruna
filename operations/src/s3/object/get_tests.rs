@@ -10,7 +10,7 @@ use crate::replication::queue::LiveObligationRecord;
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
     MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, RoutedRead,
-    get_object_routed, promote_leased, routed_info,
+    get_object_routed, promote_leased, routed_info, slice_blob,
 };
 use aruna_blob::blob::BlobHandler;
 use aruna_blob::hash::Hasher;
@@ -2373,4 +2373,30 @@ async fn promotes_serving_realm() {
         };
         assert_eq!(value.is_some(), indexed);
     }
+}
+
+// A routed range is cut from the whole stream, across chunk borders, and stops early.
+#[tokio::test]
+async fn slices_routed_range() {
+    use futures_util::StreamExt;
+    let read = |range: std::ops::Range<u64>| async move {
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = ["abc", "def", "gh"]
+            .into_iter()
+            .map(|chunk| Ok(bytes::Bytes::from_static(chunk.as_bytes())))
+            .collect();
+        let mut blob = slice_blob(
+            BackendStream::new(futures_util::stream::iter(chunks)),
+            range,
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = blob.0.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        bytes
+    };
+    assert_eq!(read(2..7).await, b"cdefg");
+    assert_eq!(read(0..3).await, b"abc");
+    assert_eq!(read(6..8).await, b"gh");
+    let suffix = ObjectRangeRequest::Suffix { length: 3 }.resolve(8).unwrap();
+    assert_eq!(read(suffix.range).await, b"fgh");
 }

@@ -200,6 +200,19 @@ fn maps_upload_state() {
     );
     assert_eq!(failed.state, TransferState::Failed);
     assert_eq!(failed.message.as_deref(), Some("rejected"));
+
+    // A running pull reports the bytes its realm node has received so far.
+    let running = transfer_view(
+        upload(UploadState::Transferring {
+            attempts: 1,
+            bytes_done: 3,
+        }),
+        "bucket".to_string(),
+        "a.txt".to_string(),
+    );
+    assert_eq!(running.state, TransferState::Running);
+    assert_eq!(running.bytes_done, 3);
+    assert_eq!(running.bytes_total, 5);
 }
 
 #[test]

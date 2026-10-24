@@ -16,7 +16,8 @@ use serde::de::DeserializeOwned;
 
 use super::{MetadataHandle, RevocationBlindValidation, WritePeerError};
 use crate::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, decode_bearer_token, validate_bearer_token,
+    ArunaBearerError, ArunaValidationState, decode_bearer_token, realm_user_cutoff,
+    validate_bearer_token,
 };
 use crate::driver::DriverContext;
 use crate::metadata::contact::PeerContacts;
@@ -94,6 +95,7 @@ impl MetadataHandle {
             return Err(WritePeerError::Unauthorized);
         };
         let AuthToken::Bearer(token) = auth_token else {
+            let auth_token = replay_authority(&self.inner.storage_handle, auth_token).await?;
             let auth = self
                 .authorize_remote_peer(peer, Some(auth_token))
                 .await
@@ -149,6 +151,31 @@ impl MetadataHandle {
             token,
         )
         .await
+    }
+}
+
+/// Unwraps a device replay into the owner authority it carries. A replay is as old as the
+/// earlier of its token issue time and its authoring time; one older than the owner's token
+/// cutoff is refused.
+pub(super) async fn replay_authority(
+    storage_handle: &StorageHandle,
+    auth_token: AuthToken,
+) -> Result<AuthToken, WritePeerError> {
+    let AuthToken::Replay {
+        auth,
+        issued_at,
+        authored_at_ms,
+    } = auth_token
+    else {
+        return Ok(auth_token);
+    };
+    let cutoff = realm_user_cutoff(storage_handle, auth.realm_id, &auth.user_id)
+        .await
+        .map_err(|error| WritePeerError::Unavailable(MetadataError::Backend(error.to_string())))?;
+    let issued = issued_at.min(authored_at_ms / 1000);
+    match cutoff.is_some_and(|cutoff| issued < cutoff) {
+        true => Err(WritePeerError::Unauthorized),
+        false => Ok(AuthToken::Internal(auth)),
     }
 }
 

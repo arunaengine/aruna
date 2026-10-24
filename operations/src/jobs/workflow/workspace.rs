@@ -47,6 +47,7 @@ use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, m
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReplicationMode,
 };
+use crate::replication::queue::complete_put;
 use crate::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
     SourceAuthorizationError,
@@ -655,8 +656,9 @@ pub async fn capture_outputs(
 ) -> Result<Vec<OutputObject>, JobError> {
     let mut selections = Vec::with_capacity(spec.file_outputs.len());
     for declared in &spec.file_outputs {
-        selections.extend(resolve_output(backend, fence, declared).await?);
+        selections.extend(resolve_output(backend, fence, declared, &spec.inputs).await?);
     }
+    let selections = distinct_selections(selections)?;
     if selections.len() > MAX_EXECUTION_OUTPUTS {
         return Err(JobError::permanent(format!(
             "output manifest exceeds {MAX_EXECUTION_OUTPUTS} objects"
@@ -754,6 +756,31 @@ fn destination_of(selection: &OutputSelection) -> Result<(NodeId, String, String
     Ok((node_id, bucket.clone(), key.clone()))
 }
 
+/// One selection per destination object: a file several globs match is captured once,
+/// and two files that would land on one object fail the job instead of losing one.
+fn distinct_selections(selections: Vec<OutputSelection>) -> Result<Vec<OutputSelection>, JobError> {
+    let mut sources: HashMap<(Option<NodeId>, String, String), String> = HashMap::new();
+    let mut distinct = Vec::with_capacity(selections.len());
+    for selection in selections {
+        let OutputDestination::S3 { bucket, key } = &selection.destination;
+        let target = (selection.destination_node_id, bucket.clone(), key.clone());
+        match sources.get(&target) {
+            Some(source) if *source == selection.container_path => {}
+            Some(source) => {
+                return Err(JobError::permanent(format!(
+                    "outputs `{source}` and `{}` both target {bucket}/{key}",
+                    selection.container_path
+                )));
+            }
+            None => {
+                sources.insert(target, selection.container_path.clone());
+                distinct.push(selection);
+            }
+        }
+    }
+    Ok(distinct)
+}
+
 /// Resolve one declared output into the concrete files to upload. A wildcard
 /// path is expanded against the terminal attempt; a literal path is uploaded as
 /// declared and still fails the job when it is missing.
@@ -761,6 +788,7 @@ async fn resolve_output(
     backend: &Arc<dyn ExecutorBackend>,
     fence: &FenceContext,
     output: &OutputSelection,
+    inputs: &[InputSelection],
 ) -> Result<Vec<OutputSelection>, JobError> {
     if !has_wildcard(&output.container_path) {
         return Ok(vec![output.clone()]);
@@ -776,14 +804,16 @@ async fn resolve_output(
         matched = matched.len(),
         "Expanded wildcard output"
     );
-    expand_selection(output, matched)
+    expand_selection(output, matched, inputs)
 }
 
 /// One selection per matched file, keyed by the match with `path_prefix` stripped.
 /// Zero matches captures nothing, which the spec allows for a selection pattern.
+/// A staged input the pattern also matches is not an output and is skipped.
 fn expand_selection(
     output: &OutputSelection,
     matched: Vec<String>,
+    inputs: &[InputSelection],
 ) -> Result<Vec<OutputSelection>, JobError> {
     let prefix = output.path_prefix.as_deref().ok_or_else(|| {
         JobError::permanent(format!(
@@ -800,6 +830,11 @@ fn expand_selection(
     let OutputDestination::S3 { bucket, key } = &output.destination;
     matched
         .into_iter()
+        .filter(|path| {
+            !inputs
+                .iter()
+                .any(|input| input.container_path.as_deref() == Some(path.as_str()))
+        })
         .map(|path| {
             let suffix = output_suffix(&path, prefix).ok_or_else(|| {
                 JobError::permanent(format!("output `{path}` is outside path_prefix `{prefix}`"))
@@ -972,6 +1007,26 @@ async fn put_file_output(
             result.version_id,
         ))
         .await?;
+    } else if !result.replayed {
+        // A retried capture hands back a committed version; its write was already announced.
+        let auth = AuthContext {
+            user_id: record.created_by,
+            realm_id: context.serving_realm(record.created_by.realm_id),
+            path_restrictions: None,
+            session: None,
+        };
+        Box::pin(complete_put(
+            context,
+            auth.realm_id,
+            node_id,
+            auth,
+            spec.group_id,
+            write_bucket.clone(),
+            write_key.clone(),
+            result.version_id,
+            size,
+        ))
+        .await;
     }
     Ok(output_object(
         output,
@@ -2409,7 +2464,7 @@ mod tests {
     }
 
     fn expanded_keys(output: &OutputSelection, matched: Vec<String>) -> Vec<String> {
-        expand_selection(output, matched)
+        expand_selection(output, matched, &[])
             .unwrap()
             .iter()
             .map(|output| {
@@ -2424,7 +2479,7 @@ mod tests {
         let output = wildcard_output("/out/*.txt");
         let matched = vec!["/out/a.txt".to_string(), "/out/b.txt".to_string()];
 
-        let expanded = expand_selection(&output, matched).unwrap();
+        let expanded = expand_selection(&output, matched, &[]).unwrap();
 
         assert_eq!(expanded[1].container_path, "/out/b.txt");
         assert_eq!(expanded[1].name.as_deref(), Some("reports"));
@@ -2447,16 +2502,90 @@ mod tests {
     fn empty_expansion_captures() {
         // Zero matches is a legitimate empty selection, not a job failure.
         assert!(
-            expand_selection(&wildcard_output("/out/*.txt"), Vec::new())
+            expand_selection(&wildcard_output("/out/*.txt"), Vec::new(), &[])
                 .unwrap()
                 .is_empty()
         );
     }
 
     #[test]
+    fn skips_staged_inputs() {
+        // Nextflow globs the work directory that also holds the staged inputs.
+        let input = InputSelection {
+            source: InputSource::S3 {
+                bucket: "input".to_string(),
+                key: "reads.txt".to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: "out/reads.txt".to_string(),
+            mode: InputMode::Mount,
+            container_path: Some("/out/reads.txt".to_string()),
+            name: None,
+            description: None,
+        };
+        let matched = vec!["/out/reads.txt".to_string(), "/out/trimmed.txt".to_string()];
+
+        let expanded = expand_selection(&wildcard_output("/out/*.txt"), matched, &[input]).unwrap();
+
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].container_path, "/out/trimmed.txt");
+    }
+
+    #[test]
+    fn counts_shared_matches() {
+        // Two globs over the same 600 files fill a manifest of 600, not 1,200.
+        let matched: Vec<String> = (0..600).map(|index| format!("/out/{index}.txt")).collect();
+        let mut selections =
+            expand_selection(&wildcard_output("/out/*.txt"), matched.clone(), &[]).unwrap();
+        selections
+            .extend(expand_selection(&wildcard_output("/out/*[0-9].txt"), matched, &[]).unwrap());
+
+        let distinct = distinct_selections(selections).unwrap();
+
+        assert_eq!(distinct.len(), 600);
+    }
+
+    #[test]
+    fn refuses_colliding_files() {
+        // Two files whose suffixes meet under one url must not overwrite each other.
+        let glob = |directory: &str| OutputSelection {
+            container_path: format!("{directory}/*.txt"),
+            path_prefix: Some(directory.to_string()),
+            ..wildcard_output("/out/*.txt")
+        };
+        let mut selections = expand_selection(
+            &glob("/work/a"),
+            vec!["/work/a/report.txt".to_string()],
+            &[],
+        )
+        .unwrap();
+        selections.extend(
+            expand_selection(
+                &glob("/work/b"),
+                vec!["/work/b/report.txt".to_string()],
+                &[],
+            )
+            .unwrap(),
+        );
+
+        let error = distinct_selections(selections).unwrap_err();
+
+        assert_eq!(
+            error.kind,
+            aruna_core::structs::execution::job::JobErrorKind::Permanent
+        );
+        assert!(
+            error.message.contains("results/report.txt"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
     fn rejects_foreign_match() {
         let output = wildcard_output("/out/*.txt");
-        let error = expand_selection(&output, vec!["/other/a.txt".to_string()]).unwrap_err();
+        let error = expand_selection(&output, vec!["/other/a.txt".to_string()], &[]).unwrap_err();
         assert_eq!(
             error.kind,
             aruna_core::structs::execution::job::JobErrorKind::Permanent
@@ -2464,7 +2593,7 @@ mod tests {
 
         let mut output = output;
         output.path_prefix = None;
-        let error = expand_selection(&output, vec!["/out/a.txt".to_string()]).unwrap_err();
+        let error = expand_selection(&output, vec!["/out/a.txt".to_string()], &[]).unwrap_err();
         assert_eq!(
             error.kind,
             aruna_core::structs::execution::job::JobErrorKind::Permanent

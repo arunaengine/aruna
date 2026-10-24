@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use crate::routes::routes_at;
 use aruna_core::compute::{
-    has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
+    directory_pattern, has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId, JobPayload,
@@ -19,6 +19,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::storage::blob::group_permission_path;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::auth::bearer_token::realm_user_cutoff;
 use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
@@ -173,11 +174,12 @@ pub struct TesOutput {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Destination URL; a directory prefix when `path` contains wildcards.
+    /// Destination URL; a directory prefix when `path` contains wildcards or names a `DIRECTORY`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Absolute container path, optionally with POSIX (IEEE Std 1003.1-2017,
-    /// 12.13) wildcards `*`, `?`, and `[...]` selecting several files.
+    /// 12.13) wildcards `*`, `?`, and `[...]` selecting several files. Within such a pattern,
+    /// brace alternatives like `*.{bam,bai}` select each form and `**` spans directories.
     #[serde(default)]
     pub path: String,
     /// Literal ancestor stripped from every matched path before it is appended
@@ -560,6 +562,10 @@ naming a different one; a bearer token requires that tag.
   bucket its `s3://` url names, which must belong to the execution group and grant the owner WRITE;
   the run's own workspace bucket holds the staged inputs. Nothing about it is forwarded or
   replicated.
+- An input url may instead be a versioned object ARN,
+  `arn:aruna:<realm>:<node>:s3/<bucket>/<key>@<version>`. A local task then copies that exact
+  version from the named realm node while staging; an unreachable node fails the run, not the
+  submission. The task reports such an input by its bucket and key.
 - A realm task reads every input from the bucket its `s3://` url names, at the version resolved
   when the task was accepted, so a later write to the source key never changes what a running task
   reads. Each declared output is written to the bucket its own url names. No bucket is created for
@@ -571,12 +577,17 @@ naming a different one; a bearer token requires that tag.
   `aruna-engine.org/job-id`, `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind`
   and `aruna-engine.org/estimated-transfer-bytes`; naming one is refused with error code
   `reserved_tag`.
-- Input and output urls must be `s3://bucket/key`; container paths must be absolute, canonical and
+- Input urls must be `s3://bucket/key` or a versioned object ARN, output urls `s3://bucket/key`;
+  container paths must be absolute, canonical and
   may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound
   the immutable output record carries.
 - An output path with POSIX wildcards additionally requires `path_prefix`, the literal ancestor
-  stripped from each match before it is appended to the destination url.
-- Unsupported: directory entries, inline input content, wildcards in an input path, volumes,
+  stripped from each match before it is appended to the destination url. Such outputs may share
+  one url. A pattern that matches a directory captures every file below it, and a staged input it
+  matches is never captured. A `DIRECTORY` output captures every file below its path under its url.
+  Within a pattern, brace alternatives such as `*.{bam,bai}` select each listed form and a `**`
+  component spans any number of directories, as in Nextflow.
+- Unsupported: directory inputs, inline input content, wildcards in an input path, volumes,
   executor stdin/stdout/stderr redirection and resource zones."#,
     request_body(
         content = TesTask,
@@ -1355,7 +1366,7 @@ fn map_task_outputs(
         return Err(TesError::bad_request("too many task outputs"));
     }
     let mut file_outputs: Vec<OutputSelection> = Vec::with_capacity(task.outputs.len());
-    for output in &task.outputs {
+    for output in task.outputs.iter().chain(&nextflow_output(task)) {
         let output = map_output(output)?;
         if file_outputs
             .iter()
@@ -1363,10 +1374,11 @@ fn map_task_outputs(
         {
             return Err(TesError::bad_request("duplicate output path"));
         }
-        if file_outputs
-            .iter()
-            .any(|existing| existing.destination == output.destination)
-        {
+        // Globs share their url, the directory each match is written below; a literal never does.
+        if file_outputs.iter().any(|existing| {
+            existing.destination == output.destination
+                && (existing.path_prefix.is_none() || output.path_prefix.is_none())
+        }) {
             return Err(TesError::bad_request("duplicate output destination"));
         }
         file_outputs.push(output);
@@ -1374,11 +1386,7 @@ fn map_task_outputs(
     for output in &file_outputs {
         // A pattern is captured under its literal prefix, which is the directory
         // the container must be able to write.
-        let pattern = has_wildcard(&output.container_path)
-            .then(|| output_glob(&output.container_path))
-            .transpose()
-            .map_err(|_| TesError::bad_request("invalid output path"))?;
-        let parent = if pattern.is_some() {
+        let parent = if has_wildcard(&output.container_path) {
             literal_prefix(&output.container_path)
                 .map_err(|_| TesError::bad_request("invalid output parent path"))?
         } else {
@@ -1393,10 +1401,10 @@ fn map_task_outputs(
         if parent == "/" {
             return Err(TesError::bad_request("root output parent is forbidden"));
         }
+        // A glob may match a staged input; capture skips it, as Nextflow globs its work dir.
         for input in inputs {
             if let Some(path) = input.container_path.as_deref()
                 && (path == output.container_path
-                    || pattern.as_ref().is_some_and(|glob| glob.is_match(path))
                     || paths_overlap(path, parent)
                         .map_err(|_| TesError::bad_request("invalid input or output path"))?)
             {
@@ -1406,6 +1414,30 @@ fn map_task_outputs(
     }
 
     Ok(file_outputs)
+}
+
+/// Nextflow keeps eval and env outputs in `.command.env` and metrics in `.command.trace`, which
+/// its TES plugin never declares; a Nextflow task gets them as one optional glob.
+fn nextflow_output(task: &TesTask) -> Option<TesOutput> {
+    let exitcode = task
+        .outputs
+        .iter()
+        .find(|output| output.path == "/work/.exitcode");
+    let wrapper = task
+        .inputs
+        .iter()
+        .find(|input| input.path == "/work/.command.run");
+    let url = exitcode.and_then(|output| output.url.as_deref());
+    let (directory, _) = url
+        .or_else(|| wrapper.and_then(|input| input.url.as_deref()))?
+        .rsplit_once('/')?;
+    // The one-letter classes make it a pattern, so a file the task never wrote is no error.
+    Some(TesOutput {
+        url: Some(directory.to_string()),
+        path: "/work/.command.{en[v],trac[e]}".to_string(),
+        path_prefix: Some("/work".to_string()),
+        ..Default::default()
+    })
 }
 
 fn map_task_resources(task: &TesTask) -> Result<ComputeResources, TesError> {
@@ -1459,7 +1491,7 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
         .url
         .as_deref()
         .ok_or_else(|| TesError::bad_request("input url is required"))?;
-    let (bucket, key) = parse_s3_url(url, "input")?;
+    let (source, source_node_id) = parse_input_url(url)?;
     validate_path(&input.path, "input path", false)?;
     // TES 1.1 defines wildcards for outputs only; an input path is one file.
     if has_wildcard(&input.path) {
@@ -1468,12 +1500,8 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
         ));
     }
     Ok(InputSelection {
-        source: InputSource::S3 {
-            bucket,
-            key,
-            version_id: None,
-        },
-        source_node_id: None,
+        source,
+        source_node_id,
         dest_key: input.path[1..].to_string(),
         mode,
         container_path: Some(input.path.clone()),
@@ -1483,18 +1511,21 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
 }
 
 fn map_output(output: &TesOutput) -> Result<OutputSelection, TesError> {
-    if output.kind != TesFileType::File {
-        return Err(TesError::bad_request("directory outputs are not supported"));
-    }
     validate_path(&output.path, "output path", false)?;
-    let path_prefix = output_prefix(output)?;
+    let mut path_prefix = output_prefix(output)?;
+    let mut container_path = output.path.clone();
+    // A literal directory is captured as every file below it, keyed under its url.
+    if output.kind == TesFileType::Directory && path_prefix.is_none() {
+        container_path = directory_pattern(&output.path);
+        path_prefix = Some(output.path.clone());
+    }
     let url = output
         .url
         .as_deref()
         .ok_or_else(|| TesError::bad_request("output url is required"))?;
     let (bucket, key) = parse_s3_url(url, "output")?;
     Ok(OutputSelection {
-        container_path: output.path.clone(),
+        container_path,
         path_prefix,
         destination_node_id: None,
         destination: OutputDestination::S3 { bucket, key },
@@ -1529,6 +1560,29 @@ fn output_prefix(output: &TesOutput) -> Result<Option<String>, TesError> {
         )));
     }
     Ok(Some(prefix.to_string()))
+}
+
+/// An input url is `s3://bucket/key` on this node, or a versioned object ARN naming the node
+/// that holds the exact version to read.
+fn parse_input_url(url: &str) -> Result<(InputSource, Option<aruna_core::NodeId>), TesError> {
+    if !url.starts_with("arn:") {
+        let (bucket, key) = parse_s3_url(url, "input")?;
+        let source = InputSource::S3 {
+            bucket,
+            key,
+            version_id: None,
+        };
+        return Ok((source, None));
+    }
+    let arn = VersionedObjectArn::parse(url).map_err(|_| {
+        TesError::bad_request("an input arn must name a node, bucket, key and version")
+    })?;
+    let source = InputSource::S3 {
+        bucket: arn.bucket,
+        key: arn.key,
+        version_id: Some(arn.version.to_string()),
+    };
+    Ok((source, Some(arn.node_id)))
 }
 
 fn parse_s3_url(url: &str, role: &str) -> Result<(String, String), TesError> {

@@ -30,7 +30,7 @@ use aruna_operations::device::sync::actions::{
 };
 use aruna_operations::device::sync::folders::{
     BindFolderInput, FolderError, bind_folder, folder_counters, list_actions, list_entries,
-    list_folders, read_bound, read_entry, set_folder_state, unbind_folder,
+    list_folders, read_bound, read_entry, set_folder_state, set_propagate_deletes, unbind_folder,
 };
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 
@@ -43,7 +43,11 @@ use crate::auth::require_owner;
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
         .routes(routes!(bind_synced_folder, list_synced_folders))
-        .routes(routes!(get_synced_folder, unbind_synced_folder))
+        .routes(routes!(
+            get_synced_folder,
+            unbind_synced_folder,
+            update_synced_folder
+        ))
         .routes(routes!(pause_folder))
         .routes(routes!(resume_folder))
         .routes(routes!(sync_folder))
@@ -68,10 +72,11 @@ pub struct BindFolderRequest {
     /// Key prefix inside the remote bucket. Empty binds the whole bucket.
     #[serde(default)]
     pub remote_prefix: String,
-    /// `two_way` (default) or `upload_only`.
+    /// `two_way` (default), `upload_only` or `download_only`.
     #[serde(default)]
     pub mode: Option<super::dto::FolderModeName>,
-    /// Whether a local delete becomes a realm delete marker. Default true.
+    /// Whether a local delete becomes a realm delete marker. Default true; always false for
+    /// `download_only`.
     #[serde(default)]
     pub propagate_deletes: Option<bool>,
 }
@@ -107,6 +112,14 @@ pub struct ExpectedBytes {
     pub blake3: String,
     #[serde(default)]
     pub remote_version: Option<String>,
+}
+
+/// The folder settings the owner may change after binding.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateFolderRequest {
+    /// Whether a local delete becomes a realm delete marker.
+    pub propagate_deletes: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -185,6 +198,7 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
             ServerError::BadRequestReason(error.to_string())
         }
         FolderError::RemoteForbidden { .. } => ServerError::Forbidden,
+        FolderError::DownloadOnly => ServerError::Conflict(error.to_string()),
         FolderError::RemoteUnreachable { .. } => ServerError::BadGatewayReason(error.to_string()),
         FolderError::Unavailable => ServerError::ServiceUnavailableReason(error.to_string()),
         FolderError::Offer(offer) => map_offer_error(offer),
@@ -270,7 +284,8 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
 - `create_bucket` creates a missing remote bucket through the node plane before the listing probe.
 - The directory is walked once and every file becomes one read-only object of that bucket; no byte
   is copied into this node's blob store.
-- `two_way` syncs both directions; `upload_only` never writes to disk.
+- `two_way` syncs both directions; `upload_only` never writes to disk; `download_only` never
+  publishes: local edits and deletions stay local, and `propagate_deletes` is always false.
 - Local data always wins locally: a file is replaced automatically only while its fingerprint and
   its blake3 still equal the recorded synced base. Anything else is preserved and reported, the
   incoming version lands beside it as a conflicted copy, and replacing or removing local bytes is an
@@ -343,6 +358,11 @@ async fn bind_synced_folder(
     let node_id = NodeId::from_str(&request.remote_node_id).map_err(|_| {
         ServerError::BadRequestReason("remote_node_id is not a node id".to_string())
     })?;
+    let mode = match request.mode {
+        Some(super::dto::FolderModeName::UploadOnly) => FolderMode::UploadOnly,
+        Some(super::dto::FolderModeName::DownloadOnly) => FolderMode::DownloadOnly,
+        _ => FolderMode::TwoWay,
+    };
     let folder = bind_folder(
         &state.get_ctx(),
         BindFolderInput {
@@ -355,11 +375,10 @@ async fn bind_synced_folder(
                 prefix: request.remote_prefix,
             },
             create_bucket: request.create_bucket,
-            mode: match request.mode {
-                Some(super::dto::FolderModeName::UploadOnly) => FolderMode::UploadOnly,
-                _ => FolderMode::TwoWay,
-            },
-            propagate_deletes: request.propagate_deletes.unwrap_or(true),
+            mode,
+            // A download-only folder never publishes, so it propagates no deletion either.
+            propagate_deletes: mode != FolderMode::DownloadOnly
+                && request.propagate_deletes.unwrap_or(true),
             realm_id: state.get_realm_id(),
             node_id: state.get_node_id(),
             user_id: auth.user_id,
@@ -493,6 +512,73 @@ async fn get_synced_folder(
     require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let folder = read_bound(&state.get_ctx(), folder_id)
+        .await
+        .map_err(map_folder_error)?;
+    Ok(Json(folder_detail(&state, folder).await?))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/device/folders/{folder_id}",
+    tag = "device",
+    summary = "Change one folder's settings",
+    description = r#"Turns the propagation of local deletions on or off for one bound folder.
+
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
+
+**Behavior**
+- The change is written atomically to the stored folder and applies from the next sync pass on; a
+  pass already running finishes with the setting it started with and keeps the new one.
+- Turning `propagate_deletes` off never restores realm objects an earlier pass already deleted.
+- A `download_only` folder never publishes, so turning `propagate_deletes` on is refused with 409."#,
+    params(("folder_id" = String, Path, description = "Folder ULID")),
+    request_body(content = UpdateFolderRequest, example = json!({"propagate_deletes": false})),
+    responses(
+        (status = 200, description = "The folder with its new settings", body = SyncedFolderView,
+            example = json!({
+                "folder_id": "01JFOLDER0123456789ABCDEFG",
+                "root": "/home/ada/data",
+                "local_bucket": "folder-01jfolder0123456789abcdefg",
+                "group_id": "01JGROUP0123456789ABCDEFGH",
+                "remote": {
+                    "node_id": "k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga",
+                    "bucket": "lab-data",
+                    "prefix": "ada"
+                },
+                "mode": "two_way",
+                "propagate_deletes": false,
+                "state": "active",
+                "counters": {
+                    "observed": 131,
+                    "in_sync": 128,
+                    "uploading": 2,
+                    "conflicts": 1,
+                    "pending_replacements": 0,
+                    "remote_deleted": 0,
+                    "errors": 0
+                },
+                "last_reconcile_ms": 1775748191000_i64,
+                "created_at_ms": 1775748000000_i64
+            })),
+        (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
+        (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
+        (status = 409, description = "A download-only folder cannot propagate deletions", body = ErrorResponse),
+        (status = 503, description = "The device store or the realm configuration is not available", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_synced_folder(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(folder_id): Path<String>,
+    Json(request): Json<UpdateFolderRequest>,
+) -> ServerResult<Json<SyncedFolderView>> {
+    require_owner(&state, auth).await?;
+    let folder_id = parse_folder_id(&folder_id)?;
+    let folder = set_propagate_deletes(&state.get_ctx(), folder_id, request.propagate_deletes)
         .await
         .map_err(map_folder_error)?;
     Ok(Json(folder_detail(&state, folder).await?))
@@ -829,7 +915,8 @@ for.
 **Behavior**
 - `replace_local` writes the remote version over the local file, but only while the file still
   carries exactly the bytes `expected` names.
-- `keep_local` publishes the local bytes as the next realm version and clears the pending state.
+- `keep_local` publishes the local bytes as the next realm version and clears the pending state;
+  in a `download_only` folder it only clears the pending state.
 - `remove_local` moves the file into the folder's `.aruna/trash/` directory; nothing is ever
   unlinked.
 - `resolve` accepts the current state without touching either side.

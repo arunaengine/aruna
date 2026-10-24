@@ -2,15 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use aruna_core::StructuredId;
+use aruna_core::UserId;
 use aruna_core::errors::AuthorizationError;
+use aruna_core::id::NodeId;
+use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
-    ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord, JobResultPayload, JobState,
-    RunCrateStatus,
+    CapturedInput, ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord,
+    JobResultPayload, JobState, RunCrateStatus,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_core::structs::storage::data_identity::{
     DataEntity, ObjectLocation, normalized_id, parse_hash,
@@ -29,7 +34,7 @@ const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket"
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{put_crate_status, read_crate_status, read_job_record};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::drive;
+use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
@@ -37,6 +42,11 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::forward::route_metadata_create;
 use crate::notifications::watch::emit::emit_metadata_created;
+use crate::realm::get_config::GetConfigOperation;
+use crate::realm::mutate_placement::node_kind;
+use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
+use crate::replication::protocol::LocationSummaryRequest;
+use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
 /// records a durable status and never fails the parent; this internal job succeeds
@@ -84,7 +94,56 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
             resource: "not-execution".to_string(),
         });
     };
+    // A device run stays local: its crate is written when the owner publishes it.
+    let device = match node_owner(
+        context,
+        ctx.driver.serving_realm(parent.created_by.realm_id),
+    )
+    .await
+    {
+        Ok(owner) => owner.is_some(),
+        Err(reason) => return JobRunOutcome::Deferred(JobError::retryable(reason)),
+    };
+    if device {
+        if saved_id.is_none()
+            && let Err(error) = put_crate_status(storage, for_job, &RunCrateStatus::Local).await
+        {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "run crate status write failed: {error}"
+            )));
+        }
+        return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
+            resource: RunCrateStatus::Local.name().to_string(),
+        });
+    }
+    record_crate(&ctx.driver, for_job, &parent, spec, saved_id).await
+}
 
+/// The owner this node is bound to, `None` for realm infrastructure. A node the stored realm
+/// configuration does not name is undecided, so no crate leaves it before that is known.
+async fn node_owner(context: &DriverContext, realm_id: RealmId) -> Result<Option<UserId>, String> {
+    // Without a net handle nothing can be forwarded; the crate write fails retryably instead.
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return Ok(None);
+    };
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .map_err(|error| format!("run crate needs the realm configuration: {error}"))?;
+    node_kind(&config, net_handle.node_id())
+        .map(|kind| kind.owner())
+        .ok_or_else(|| "the realm configuration does not name this node yet".to_string())
+}
+
+/// Mints, authorizes and writes the crate of one finished execution, then records the outcome.
+pub(crate) async fn record_crate(
+    driver: &Arc<DriverContext>,
+    for_job: JobId,
+    parent: &JobRecord,
+    spec: &ExecutionSpec,
+    saved_id: Option<Ulid>,
+) -> JobRunOutcome {
+    let context = driver.as_ref();
+    let storage = &context.storage_handle;
     let Some(net_handle) = context.net_handle.as_ref() else {
         return JobRunOutcome::Failed(JobError::retryable("run crate needs a net handle"));
     };
@@ -93,7 +152,7 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
     let actor = Actor {
         node_id,
         user_id: parent.created_by,
-        realm_id: ctx.driver.serving_realm(parent.created_by.realm_id),
+        realm_id: driver.serving_realm(parent.created_by.realm_id),
     };
     // Persist the first minted id before create so retries survive policy changes.
     let document_id = match saved_id {
@@ -119,12 +178,12 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
                 user_id: parent.created_by,
-                realm_id: ctx.driver.serving_realm(parent.created_by.realm_id),
+                realm_id: driver.serving_realm(parent.created_by.realm_id),
                 path_restrictions: None,
                 session: None,
             },
             path: MetadataRegistryRecord::permission_path_for(
-                &ctx.driver.serving_realm(parent.created_by.realm_id),
+                &driver.serving_realm(parent.created_by.realm_id),
                 spec.group_id,
                 &document_path,
                 document_id,
@@ -162,7 +221,15 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         });
     }
 
-    let jsonld = build_crate_jsonld(&parent, spec, document_id);
+    let devices = match input_devices(context, parent, spec, node_id).await {
+        Ok(devices) => devices,
+        Err(error) => {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "run crate input provenance read failed: {error}"
+            )));
+        }
+    };
+    let jsonld = build_crate_jsonld(parent, spec, document_id, &devices);
 
     let (status, resource) = match route_metadata_create(
         CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
@@ -173,10 +240,10 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
             public: false,
             payload: CreateDocumentPayload::RoCrate { jsonld },
         }),
-        ctx.driver.clone(),
+        driver.clone(),
         Some(AuthToken::internal(AuthContext {
             user_id: parent.created_by,
-            realm_id: ctx.driver.serving_realm(parent.created_by.realm_id),
+            realm_id: driver.serving_realm(parent.created_by.realm_id),
             path_restrictions: None,
             session: None,
         })),
@@ -186,8 +253,8 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         Ok(result) => {
             let resource = result.record.document_id.to_string();
             emit_metadata_created(
-                &ctx.driver,
-                ctx.driver.serving_realm(parent.created_by.realm_id),
+                driver,
+                driver.serving_realm(parent.created_by.realm_id),
                 parent.created_by,
                 result.record.group_id,
                 result.record.document_id,
@@ -229,9 +296,109 @@ fn is_transient(error: &MetadataWriteError) -> bool {
     crate::jobs::metadata_class::metadata_is_transient(error)
 }
 
+/// The device each input version was published from, by input destination key. A version on
+/// another node is asked of that node as the job owner. A version that is gone or not readable
+/// names no device; any other read failure retries the crate.
+async fn input_devices(
+    context: &DriverContext,
+    record: &JobRecord,
+    spec: &ExecutionSpec,
+    node_id: NodeId,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut devices = BTreeMap::new();
+    for input in &spec.inputs {
+        let InputSource::S3 { bucket, key, .. } = &input.source;
+        let Some(captured) = record
+            .captured_inputs
+            .iter()
+            .find(|captured| captured.destination_key == input.dest_key)
+        else {
+            continue;
+        };
+        let device = match captured.source_node_id == node_id {
+            true => local_device(context, bucket, key, captured.version_id).await?,
+            false => remote_device(context, record, bucket, key, captured).await?,
+        };
+        if let Some(device) = device {
+            devices.insert(input.dest_key.clone(), device);
+        }
+    }
+    Ok(devices)
+}
+
+async fn local_device(
+    context: &DriverContext,
+    bucket: &str,
+    key: &str,
+    version_id: Ulid,
+) -> Result<Option<String>, String> {
+    let head = HeadObjectOperation::new(HeadObjectInput {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id: Some(version_id),
+    });
+    match drive(head, context).await {
+        Ok(head) => Ok(head.metadata.get(ORIGIN_DEVICE_TAG).cloned()),
+        Err(
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker,
+        ) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Asks the node an input was captured from, under the owner's own READ, which device its
+/// exact version came from.
+async fn remote_device(
+    context: &DriverContext,
+    record: &JobRecord,
+    bucket: &str,
+    key: &str,
+    captured: &CapturedInput,
+) -> Result<Option<String>, String> {
+    let realm_id = context.serving_realm(record.created_by.realm_id);
+    let summary = drive(
+        RemoteLocationOperation::new(
+            captured.source_node_id,
+            LocationSummaryRequest {
+                realm_id,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: Some(captured.version_id),
+                auth_context: AuthContext {
+                    user_id: record.created_by,
+                    realm_id,
+                    path_restrictions: None,
+                    session: None,
+                },
+            },
+        ),
+        context,
+    )
+    .await;
+    match summary {
+        Ok(summary) if summary.version_id == Some(captured.version_id) => Ok(summary.origin_device),
+        Ok(_) | Err(LocationSummaryError::Denied | LocationSummaryError::BucketNotFound) => {
+            Ok(None)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// The contextual entity id of one device an input came from.
+fn device_entity(device: &str) -> String {
+    format!("#device-{device}")
+}
+
 /// RO-Crate 1.2 JSON-LD conforming to the Process Run Crate 0.5 profile. No
 /// secrets are included (spec 16.10).
-fn build_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Ulid) -> String {
+fn build_crate_jsonld(
+    record: &JobRecord,
+    spec: &ExecutionSpec,
+    document_id: Ulid,
+    devices: &BTreeMap<String, String>,
+) -> String {
     let root = format!("https://w3id.org/aruna/{document_id}");
     let action_id = format!("#run-{}", record.job_id);
     let agent_id = format!("#agent-{}", record.created_by);
@@ -296,6 +463,7 @@ fn build_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Uli
         .apply(&mut file);
         (id, serde_json::Value::Object(file))
     };
+    let mut used_devices = BTreeSet::new();
     let mut object_ids = Vec::with_capacity(spec.inputs.len());
     let mut part_ids = Vec::new();
     let mut files = Vec::new();
@@ -309,6 +477,11 @@ fn build_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Uli
         let mut file = json!({ "@type": "File", "name": name });
         if let Some(captured) = captured {
             file["contentSize"] = json!(captured.bytes.to_string());
+        }
+        // Only the device a version came from is named, never the local path it had there.
+        if let Some(device) = devices.get(&input.dest_key) {
+            file["isBasedOn"] = json!({ "@id": device_entity(device) });
+            used_devices.insert(device.clone());
         }
         let location = ObjectLocation {
             bucket: bucket.clone(),
@@ -458,6 +631,14 @@ fn build_crate_jsonld(record: &JobRecord, spec: &ExecutionSpec, document_id: Uli
         }),
     ];
     graph.extend(files);
+    graph.extend(used_devices.iter().map(|device| {
+        json!({
+            "@id": device_entity(device),
+            "@type": "IndividualProduct",
+            "name": "Aruna device",
+            "identifier": device
+        })
+    }));
     if let Some(property) = workspace_property {
         graph.push(property);
     }
@@ -671,7 +852,7 @@ mod pure_tests {
 
     fn parse(record: &JobRecord, spec: &ExecutionSpec) -> serde_json::Value {
         let doc = Ulid::from_bytes(record.job_id.to_bytes());
-        serde_json::from_str(&build_crate_jsonld(record, spec, doc)).unwrap()
+        serde_json::from_str(&build_crate_jsonld(record, spec, doc, &BTreeMap::new())).unwrap()
     }
 
     pub(super) fn entity_id(value: &Value) -> Option<&str> {
@@ -849,7 +1030,7 @@ mod tests {
         let (record, spec) = execution_record();
         let document_id = Ulid::from_bytes(record.job_id.to_bytes());
         let root_id = format!("https://w3id.org/aruna/{document_id}");
-        let jsonld = build_crate_jsonld(&record, &spec, document_id);
+        let jsonld = build_crate_jsonld(&record, &spec, document_id, &BTreeMap::new());
         let directory = tempfile::tempdir().unwrap();
         let node = craqle::CraqleNode::open(directory.path()).unwrap();
         let graph_id = craqle::GraphId::new(&root_id);
@@ -905,6 +1086,37 @@ mod tests {
         }));
     }
 
+    fn device_id() -> String {
+        iroh::SecretKey::from_bytes(&[8; 32]).public().to_string()
+    }
+
+    #[test]
+    fn names_input_device() {
+        // An input published from a device points at one entity naming only that device.
+        let (record, spec) = execution_record();
+        let devices = BTreeMap::from([("inputs/in.txt".to_string(), device_id())]);
+        let document_id = Ulid::from_bytes(record.job_id.to_bytes());
+        let jsonld: Value =
+            serde_json::from_str(&build_crate_jsonld(&record, &spec, document_id, &devices))
+                .unwrap();
+        let graph = jsonld["@graph"].as_array().unwrap();
+        let input = graph
+            .iter()
+            .find(|entity| entity["name"] == "Input sample")
+            .expect("the input file is described");
+        let device = format!("#device-{}", device_id());
+        assert_eq!(entity_id(&input["isBasedOn"]), Some(device.as_str()));
+        let entity = graph
+            .iter()
+            .find(|entity| entity["@id"] == device.as_str())
+            .expect("the device is a contextual entity");
+        assert_eq!(entity["@type"], "IndividualProduct");
+        assert_eq!(entity["identifier"], device_id().as_str());
+        // An input from no device names none.
+        let plain = build_crate_jsonld(&record, &spec, document_id, &BTreeMap::new());
+        assert!(!plain.contains("IndividualProduct"));
+    }
+
     #[test]
     fn meets_builtin_profile() {
         // The built-in shapes must accept what this generator writes.
@@ -912,7 +1124,10 @@ mod tests {
         use crate::metadata::profile::shacl::{ProfileShaclEngine, ProfileShapes};
 
         let (record, spec) = execution_record();
-        let jsonld = build_crate_jsonld(&record, &spec, Ulid::from_bytes(record.job_id.to_bytes()));
+        // An input from a device carries its provenance entity, which the shapes must accept.
+        let devices = BTreeMap::from([("inputs/in.txt".to_string(), device_id())]);
+        let document_id = Ulid::from_bytes(record.job_id.to_bytes());
+        let jsonld = build_crate_jsonld(&record, &spec, document_id, &devices);
         let directory = tempfile::tempdir().unwrap();
         let engine = ProfileShaclEngine::open(directory.path()).unwrap();
         let report = engine

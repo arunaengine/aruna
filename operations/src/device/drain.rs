@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
+use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -34,7 +34,7 @@ use super::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue, exhaust
 use super::edit::{refused_edit, reject_edit};
 use super::publish_queue::{
     MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishKind, PublishState, entry_with_state, publish_entry,
-    read_publish_entry, scan_publish_queue,
+    publish_key, read_publish_entry, scan_publish_queue,
 };
 use super::replica::{read_replica, store_replica};
 use super::selection::track_created;
@@ -315,8 +315,11 @@ async fn forward_entry(
         path_restrictions: None,
         session: None,
     };
+    let Some(token) = replay_token(context, entry, auth).await else {
+        return publishing_retry(document_id, attempts, "replay fence unreadable".to_string());
+    };
     if matches!(entry.kind, PublishKind::Edit { .. }) {
-        return publish_edit(context, realm_id, entry, claim, auth).await;
+        return publish_edit(context, realm_id, entry, claim, token).await;
     }
     let operation = CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
         actor,
@@ -328,7 +331,7 @@ async fn forward_entry(
             jsonld: entry.jsonld.clone(),
         },
     });
-    match route_metadata_create(operation, context.clone(), Some(AuthToken::internal(auth))).await {
+    match route_metadata_create(operation, context.clone(), Some(token)).await {
         Ok(_) => {
             info!(draft_id = %entry.draft_id, document_id = %document_id, "Published a queued draft");
             track_created(
@@ -363,6 +366,35 @@ async fn forward_entry(
     }
 }
 
+/// The owner's authority for one replay, with the issue time of the token that authored it.
+/// `None` when the fence row is unreadable; an entry without one replays as issued at zero.
+async fn replay_token(
+    context: &Arc<DriverContext>,
+    entry: &PublishEntry,
+    auth: AuthContext,
+) -> Option<AuthToken> {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: DEVICE_FENCE_KEYSPACE.to_string(),
+            key: publish_key(entry.draft_id),
+            txn_id: None,
+        })
+        .await;
+    let issued_at = match event {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => u64::from_be_bytes(bytes.as_ref().try_into().ok()?),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => 0,
+        _ => return None,
+    };
+    Some(AuthToken::Replay {
+        auth,
+        issued_at,
+        authored_at_ms: entry.created_at_ms,
+    })
+}
+
 /// Forwards one claimed edit. The batch is what the owner already applied
 /// locally, so a holder that accepts it converges with this device.
 async fn publish_edit(
@@ -370,7 +402,7 @@ async fn publish_edit(
     realm_id: RealmId,
     entry: &PublishEntry,
     claim: &Claim,
-    auth: AuthContext,
+    token: AuthToken,
 ) -> PublishState {
     let PublishKind::Edit {
         document_id,
@@ -398,7 +430,7 @@ async fn publish_edit(
         *document_id,
         batch.clone(),
         authored.clone(),
-        AuthToken::internal(auth),
+        token,
     )
     .await
     {
@@ -514,9 +546,11 @@ pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHa
 #[cfg(test)]
 mod tests {
     use super::{
-        DrainOutcome, claim_state, drain_publish_queue, permanent, publishing_retry, retry_state,
+        DrainOutcome, claim_state, drain_publish_queue, permanent, publishing_retry, replay_token,
+        retry_state,
     };
     use crate::device::delete_draft::DeleteDraftOperation;
+    use crate::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
     use crate::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
     use crate::device::publish_queue::{
         MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishState, publish_entry,
@@ -526,6 +560,8 @@ mod tests {
     use crate::tests::device::context;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::metadata::AuthToken;
+    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use std::sync::Arc;
     use ulid::Ulid;
@@ -641,6 +677,45 @@ mod tests {
             drive(InspectDraftOperation::new(entry.draft_id), context.as_ref()).await,
             Err(InspectDraftError::NotFound)
         );
+    }
+
+    // A replay carries the issue time stored with its entry; a deleted entry keeps no fence.
+    #[tokio::test]
+    async fn replays_stored_fence() {
+        let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
+        let entry = entry();
+        drive(
+            EnqueueDraftOperation::new(EnqueueDraftInput {
+                entry: entry.clone(),
+            })
+            .with_fence(42),
+            context.as_ref(),
+        )
+        .await
+        .unwrap();
+        let auth = AuthContext {
+            user_id: entry.owner,
+            realm_id: entry.owner.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        assert_eq!(
+            replay_token(&context, &entry, auth.clone()).await,
+            Some(AuthToken::Replay {
+                auth: auth.clone(),
+                issued_at: 42,
+                authored_at_ms: entry.created_at_ms,
+            })
+        );
+
+        drive(DeleteDraftOperation::new(entry.draft_id), context.as_ref())
+            .await
+            .unwrap();
+        assert!(matches!(
+            replay_token(&context, &entry, auth).await,
+            Some(AuthToken::Replay { issued_at: 0, .. })
+        ));
     }
 
     #[tokio::test]

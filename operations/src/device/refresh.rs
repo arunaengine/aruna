@@ -27,7 +27,9 @@ use crate::metadata::protocol::{GraphState, MetadataTransportMessage};
 use crate::placement::read_holder_sets;
 use crate::realm::mutate_placement::node_kind;
 
-use super::replica::{ReplicaRecord, ReplicaState, list_replicas, read_replica, store_replica};
+use super::replica::{
+    ReplicaRecord, ReplicaState, list_replicas, read_replica, record_graph, store_replica,
+};
 
 /// Replicas one pass refreshes. The rest follow on the next beat, so a large
 /// working set converges instead of blocking one pass.
@@ -205,6 +207,7 @@ async fn install_state(
     };
     let graph_iri = state.record.graph_iri.clone();
     let clock = state.snapshot.clock.clone();
+    let graph_bytes = postcard::to_allocvec(&state.snapshot).map_or(0, |bytes| bytes.len() as u64);
     let preserve_display = local_is_ahead(&replica.local_clock, &clock);
     match metadata
         .send_metadata_effect(MetadataEffect::InstallSnapshot {
@@ -219,6 +222,7 @@ async fn install_state(
             return false;
         }
     }
+    record_graph(context, replica.document_id, graph_bytes).await;
     replica.local_clock.merge(&clock);
     replica.realm_clock = clock;
     replica.last_synced_ms = Some(unix_timestamp_millis());

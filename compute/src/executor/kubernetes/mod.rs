@@ -2229,6 +2229,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selects_matched_directory() {
+        // MultiQC's `*_data` names a directory, so the files below it are the outputs.
+        let glob = OutputMatcher::new(["/work/*_data"]).expect("build matcher");
+        let listing = listing(&[b"/work/multiqc_data/a.log", b"/work/multiqc_report.html"]);
+
+        assert_eq!(
+            select_listed(&listing, &glob).expect("accept listing"),
+            vec!["/work/multiqc_data/a.log".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn tombstones_absent_job() {
         // Cancel between ready and submit leaves no Job; terminal cleanup

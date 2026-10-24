@@ -13,6 +13,7 @@ use crate::node::usage_stats::{
 };
 use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::row_fence::{FenceError, RowFence};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -75,6 +76,8 @@ pub enum DeleteObjectState {
     /// Reads the bucket's creation row for the incarnation its delete trail belongs to.
     ReadAuditBucket,
     WriteDeleteAudit,
+    /// Reads the row fence's guards or writes its receipts in the delete transaction.
+    RowFence,
     CommitTransaction,
     Finish,
     Error,
@@ -148,6 +151,8 @@ pub enum DeleteObjectError {
     VersionChanged,
     #[error("operation did not finish")]
     NotFinished,
+    #[error("a guarded row changed before the delete committed")]
+    FenceTaken,
 }
 
 #[derive(Debug, PartialEq)]
@@ -203,6 +208,7 @@ pub struct DeleteObjectOperation {
     expected_head: Option<Ulid>,
     /// The bucket incarnation the delete is made in, read in its transaction for the trail.
     incarnation: Option<u128>,
+    row_fence: Option<RowFence>,
 }
 
 impl DeleteObjectOperation {
@@ -237,6 +243,7 @@ impl DeleteObjectOperation {
             expected: None,
             expected_head: None,
             incarnation: None,
+            row_fence: None,
         }
     }
 
@@ -251,6 +258,17 @@ impl DeleteObjectOperation {
     /// minting a second marker.
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Refuses the delete with `FenceTaken` unless its transaction still reads each guard as
+    /// given; each receipt key then records the delete marker's id in that transaction.
+    pub fn with_fence(
+        mut self,
+        guards: Vec<(String, Key, Option<Value>)>,
+        receipts: Vec<(String, Key)>,
+    ) -> Self {
+        self.row_fence = Some(RowFence::new(guards, receipts));
         self
     }
 
@@ -966,11 +984,36 @@ impl DeleteObjectOperation {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
+        self.commit_fenced()
+    }
+
+    /// Commits once the row fence, if any, has read its guards and written its receipts.
+    fn commit_fenced(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(DeleteObjectError::NoTransactionFound);
         };
+        let next = match (self.row_fence.as_mut(), self.version_id) {
+            (Some(fence), Some(version_id)) => fence.next(txn_id, version_id),
+            (Some(_), None) => return self.emit_error(DeleteObjectError::InvalidOperationState),
+            (None, _) => None,
+        };
+        if let Some(effect) = next {
+            self.state = DeleteObjectState::RowFence;
+            return smallvec![effect];
+        }
         self.state = DeleteObjectState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn fence_answered(&mut self, event: Event) -> Effects {
+        match self.row_fence.as_mut().map(|fence| fence.answer(event)) {
+            Some(Ok(())) => self.commit_fenced(),
+            Some(Err(FenceError::Taken)) => self.emit_error(DeleteObjectError::FenceTaken),
+            Some(Err(FenceError::Storage(error))) => self.emit_error(error.into()),
+            Some(Err(FenceError::Unexpected)) | None => {
+                self.emit_error(DeleteObjectError::InvalidOperationState)
+            }
+        }
     }
 
     fn delete_next_part(&mut self) -> Effects {
@@ -1152,6 +1195,7 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::UpdateUsage => self.handle_usage_update(event),
             DeleteObjectState::ReadAuditBucket => self.audit_bucket_read(event),
             DeleteObjectState::WriteDeleteAudit => self.handle_delete_audit(event),
+            DeleteObjectState::RowFence => self.fence_answered(event),
             DeleteObjectState::CommitTransaction => self.handle_transaction_committed(event),
             DeleteObjectState::Finish => smallvec![],
             DeleteObjectState::Error => self.abort(),

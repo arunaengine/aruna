@@ -7,6 +7,7 @@ use crate::UserId;
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::execution::offered_directory::FileStat;
+use crate::structs::storage::replication::VersionedObjectArn;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -18,6 +19,10 @@ pub const MAX_SYNC_PAGE: usize = 256;
 /// from. It makes a replayed pull idempotent instead of a second version.
 pub const SYNC_VERSION_TAG: &str = "aruna-sync-source-version";
 
+/// Version metadata tag naming the device a pulled realm version came from. The realm keeps
+/// only the device; which local file it was stays on that device.
+pub const ORIGIN_DEVICE_TAG: &str = "aruna-engine.org/origin-device";
+
 /// Directory a folder's move-aside puts files into, relative to the root.
 pub const SYNC_TRASH_DIR: &str = ".aruna/trash";
 
@@ -27,6 +32,8 @@ pub enum FolderMode {
     /// The device publishes its files and never writes to disk.
     UploadOnly,
     TwoWay,
+    /// The device takes the realm's files and never publishes; local edits stay local.
+    DownloadOnly,
 }
 
 /// Whether a folder currently reconciles.
@@ -381,6 +388,29 @@ pub fn decide(
     match policy.mode {
         FolderMode::UploadOnly => decide_upload(policy, local, base),
         FolderMode::TwoWay => decide_two_way(policy, local, base, remote),
+        FolderMode::DownloadOnly => decide_download(policy, local, base, remote),
+    }
+}
+
+/// A download-only folder decides like a two-way one that never publishes: a
+/// local change or deletion stays local, and a remote change beside it becomes a sibling.
+fn decide_download(
+    policy: SyncPolicy,
+    local: Option<&Observed>,
+    base: Option<&SyncBase>,
+    remote: Option<&RemoteHead>,
+) -> SyncAction {
+    let policy = SyncPolicy {
+        propagate_deletes: false,
+        ..policy
+    };
+    match decide_two_way(policy, local, base, remote) {
+        SyncAction::Upload { .. } => SyncAction::Nothing,
+        SyncAction::ConflictCopy { remote_version, .. } => SyncAction::ConflictCopy {
+            remote_version,
+            upload: false,
+        },
+        action => action,
     }
 }
 
@@ -540,6 +570,52 @@ impl SyncActionRecord {
     }
 }
 
+/// One device version a synced folder asks its realm node to pull and commit as the owner.
+/// The realm node reads it back from the device and writes its own copy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncPull {
+    pub source: VersionedObjectArn,
+    pub blake3: Option<[u8; 32]>,
+    pub size: u64,
+    pub target_bucket: String,
+    pub target_key: String,
+    /// A local delete asks for a delete marker instead of a version.
+    pub deleted: bool,
+}
+
+impl SyncPull {
+    /// Key of the receipt a realm node keeps once this device version committed.
+    pub fn receipt_key(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&(
+            &self.target_bucket,
+            &self.target_key,
+            self.source.node_id.as_bytes(),
+            self.source.version,
+            self.deleted,
+        ))?)
+    }
+}
+
+/// The local file one realm version this device published came from. Device-local only: the
+/// path never leaves the machine.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocalOrigin {
+    pub folder_id: Ulid,
+    pub relative: String,
+    pub modified_at_ms: Option<u64>,
+    pub fingerprint: String,
+}
+
+impl LocalOrigin {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 /// What a realm node answers to one accepted sync pull.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncPullAck {
@@ -556,6 +632,21 @@ pub enum SyncRefusal {
     NotFound,
     Invalid(String),
     Unavailable,
+}
+
+/// Where a realm node stands with one sync pull. A pull is accepted at once and polled until
+/// it is done, so its length is bounded by progress, not by one exchange.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SyncPullStatus {
+    /// Running; `bytes_done` of the device's `total` bytes have arrived.
+    Pending {
+        bytes_done: u64,
+        total: u64,
+    },
+    Done(SyncPullAck),
+    Refused(SyncRefusal),
+    /// The node runs no such pull and holds no receipt for it, as after a restart.
+    Unknown,
 }
 
 /// Opaque continuation of a bounded head listing.
@@ -938,6 +1029,62 @@ mod tests {
         assert_eq!(
             decide(policy, Some(&local), None, Some(&remote)),
             SyncAction::Upload { deleted: false }
+        );
+    }
+
+    #[test]
+    fn download_never_publishes() {
+        let policy = SyncPolicy {
+            mode: FolderMode::DownloadOnly,
+            propagate_deletes: true,
+        };
+        let synced = Ulid::from_bytes([2u8; 16]);
+        let base = base("4-1", 9, Some(synced));
+        let edited = observed("4-2", Some(8));
+        let newer = head(Ulid::from_bytes([3u8; 16]), Some(7), false);
+        // A local edit or a new local file stays local.
+        assert_eq!(
+            decide(
+                policy,
+                Some(&edited),
+                Some(&base),
+                Some(&head(synced, Some(9), false))
+            ),
+            SyncAction::Nothing
+        );
+        assert_eq!(
+            decide(policy, Some(&edited), None, None),
+            SyncAction::Nothing
+        );
+        // A local deletion is reported, never propagated.
+        assert_eq!(
+            decide(
+                policy,
+                None,
+                Some(&base),
+                Some(&head(synced, Some(9), false))
+            ),
+            SyncAction::Report(EntryState::LocalDeleted)
+        );
+        // A remote update replaces only the unchanged base, else lands beside the edit.
+        assert_eq!(
+            decide(
+                policy,
+                Some(&observed("4-1", Some(9))),
+                Some(&base),
+                Some(&newer)
+            ),
+            SyncAction::Materialize {
+                remote_version: newer.version_id,
+                guard: base.synced.as_ref().expect("synced").guard(),
+            }
+        );
+        assert_eq!(
+            decide(policy, Some(&edited), Some(&base), Some(&newer)),
+            SyncAction::ConflictCopy {
+                remote_version: newer.version_id,
+                upload: false,
+            }
         );
     }
 

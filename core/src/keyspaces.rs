@@ -272,6 +272,10 @@ pub const OFFERED_DIRECTORY_KEYSPACE: &str = "offered_directories";
 /// realm state only when the drain forwards it as an ordinary create.
 pub const DEVICE_INTAKE_KEYSPACE: &str = "device_intake";
 
+/// Issue time of the token that authored each queued draft, keyed like `device_intake`.
+/// The drain sends it along, so a holder can apply the owner's token cutoff.
+pub const DEVICE_FENCE_KEYSPACE: &str = "device_intake_fence";
+
 /// The realm-config clock the realm documents this device holds were copied at,
 /// keyed by realm id. It is what keeps a later copy from rolling the device
 /// back, and it is never replicated.
@@ -282,6 +286,10 @@ pub const REALM_MARKER_KEYSPACE: &str = "device_realm_marker";
 /// only address it has for a management-only route.
 pub const MANAGEMENT_URL_KEYSPACE: &str = "device_management_urls";
 
+/// Realm-document fetches that every realm node refused for realm membership, keyed by realm
+/// id. Two without a successful fetch between them report the device as removed.
+pub const REALM_REMOVAL_KEYSPACE: &str = "device_realm_removal";
+
 /// The one row a device keeps about its exchange with the realm: when the realm
 /// last answered, when the last pass finished, and whether one is in flight.
 pub const SYNC_STATE_KEYSPACE: &str = "device_sync_state";
@@ -290,6 +298,10 @@ pub const SYNC_STATE_KEYSPACE: &str = "device_sync_state";
 /// by document id. Never replicated: it records what the owner selected and
 /// how far this device has synced each replica.
 pub const DEVICE_REPLICA_KEYSPACE: &str = "device_replica";
+
+/// Bytes of the local graph each device replica installed, keyed like `device_replica`. The
+/// graph stays when its replica row goes, so its bytes stay counted against the cache budget.
+pub const DEVICE_GRAPH_KEYSPACE: &str = "device_graph_size";
 
 /// Device-local bindings of a directory to a realm bucket prefix, keyed by
 /// folder id. Never replicated: the root path must not leave the machine.
@@ -306,6 +318,14 @@ pub const SYNC_UPLOAD_KEYSPACE: &str = "sync_upload_outbox";
 /// Append-only record of the explicit owner actions that replaced or removed
 /// local bytes, keyed by `folder id || action id`.
 pub const SYNC_LOG_KEYSPACE: &str = "sync_action_log";
+
+/// The realm version a node committed for one device version, keyed by target bucket and
+/// key, source device and version, and the delete flag. Written with the version it names.
+pub const SYNC_RECEIPT_KEYSPACE: &str = "sync_pull_receipts";
+
+/// Which local file each realm version this device published came from, keyed by realm
+/// version id. Never replicated: the path must not leave the machine.
+pub const SYNC_ORIGIN_KEYSPACE: &str = "sync_local_origins";
 
 pub const SOURCE_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_SECRET_KEYSPACE: &str = "source_connector_secret";
@@ -335,6 +355,10 @@ pub const JOB_INDEX_KEYSPACE: &str = "job_owner_index";
 pub const ACTIVE_USER_KEYSPACE: &str = "job_active_user";
 pub const DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const RUN_CRATE_KEYSPACE: &str = "job_run_crate";
+
+/// The realm target a device froze for publishing one local run, and the copies it made,
+/// keyed like `job_run_crate`. Device-local and never replicated.
+pub const RUN_PUBLISH_KEYSPACE: &str = "job_run_publish";
 pub const ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
 /// Signed immutable output records, keyed by ExecutionId.
 pub const OUTPUT_RECORD_KEYSPACE: &str = "job_output_records";
@@ -541,14 +565,19 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     IMPORT_DISCOVERY_KEYSPACE,
     OFFERED_DIRECTORY_KEYSPACE,
     DEVICE_INTAKE_KEYSPACE,
+    DEVICE_FENCE_KEYSPACE,
     REALM_MARKER_KEYSPACE,
     MANAGEMENT_URL_KEYSPACE,
+    REALM_REMOVAL_KEYSPACE,
     SYNC_STATE_KEYSPACE,
     DEVICE_REPLICA_KEYSPACE,
+    DEVICE_GRAPH_KEYSPACE,
     SYNCED_FOLDER_KEYSPACE,
     SYNC_BASE_KEYSPACE,
     SYNC_UPLOAD_KEYSPACE,
     SYNC_LOG_KEYSPACE,
+    SYNC_RECEIPT_KEYSPACE,
+    SYNC_ORIGIN_KEYSPACE,
     SOURCE_INDEX_KEYSPACE,
     SOURCE_SECRET_KEYSPACE,
     CONNECTOR_INDEX_KEYSPACE,
@@ -567,6 +596,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ACTIVE_USER_KEYSPACE,
     DEDUP_INDEX_KEYSPACE,
     RUN_CRATE_KEYSPACE,
+    RUN_PUBLISH_KEYSPACE,
     ATTEMPT_CONTROL_KEYSPACE,
     OUTPUT_RECORD_KEYSPACE,
     JOB_ENTRY_KEYSPACE,

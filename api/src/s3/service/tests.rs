@@ -433,6 +433,7 @@ async fn put_survives_queue() {
             PutObjectResult {
                 location: response_location(user_id),
                 version_id,
+                replayed: false,
             },
         )
         .await
@@ -626,6 +627,7 @@ async fn put_expands_watch() {
             PutObjectResult {
                 location: response_location(user_id),
                 version_id: Ulid::generate(),
+                replayed: false,
             },
         )
         .await
@@ -702,6 +704,7 @@ async fn anonymous_put_silent() {
             PutObjectResult {
                 location: response_location(anonymous),
                 version_id: Ulid::generate(),
+                replayed: false,
             },
         )
         .await

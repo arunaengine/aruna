@@ -120,6 +120,13 @@ pub fn weak_fingerprint(stat: &FileStat) -> String {
     format!("{size:x}-{modified}-{changed}-{inode}")
 }
 
+/// Modification time in milliseconds a weak fingerprint carries, where the filesystem kept one.
+pub fn modified_ms(fingerprint: &str) -> Option<u64> {
+    let modified = fingerprint.split('-').nth(1)?;
+    let nanos = u128::from_str_radix(modified, 16).ok()?;
+    u64::try_from(nanos / 1_000_000).ok()
+}
+
 fn field(value: Option<u128>) -> String {
     match value {
         Some(value) => format!("{value:x}"),
@@ -170,6 +177,24 @@ mod tests {
             changed_ns: Some(2_000_000_000),
             inode: Some(42),
         }
+    }
+
+    #[test]
+    fn reads_modified_time() {
+        // The modification time comes back out of the fingerprint it went into.
+        let known = FileStat {
+            modified_ns: Some(1_775_748_191_123_456_789),
+            ..stat()
+        };
+        assert_eq!(
+            modified_ms(&weak_fingerprint(&known)),
+            Some(1_775_748_191_123)
+        );
+        let unknown = FileStat {
+            modified_ns: None,
+            ..stat()
+        };
+        assert_eq!(modified_ms(&weak_fingerprint(&unknown)), None);
     }
 
     // The fingerprint includes every stat value: size and mtime can be restored after a rewrite,

@@ -18,7 +18,7 @@ use aruna_operations::auth::bearer_token::realm_token_revoked;
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
-use aruna_operations::device::realm_documents::fetch_realm_documents;
+use aruna_operations::device::realm_documents::{fetch_realm_documents, realm_removed};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::node::node_info::{read_info_documents, seed_info_document};
@@ -285,6 +285,75 @@ async fn cache_stale_group(realm: &Topology, device: &TestNode) -> TestResult<Ul
     )
     .await?;
     Ok(group_id)
+}
+
+/// A device the realm removed learns it from the membership refusals, keeps its cache, and
+/// forgets the state again once the realm admits it back.
+#[tokio::test]
+async fn device_learns_removal() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, 0, REPLICATION_FACTOR).await?;
+    let realm_id = realm.realm_id;
+    let device = join_device(&realm).await?;
+    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+
+    set_listed(&realm, &device, false).await?;
+    assert!(!fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(
+        !realm_removed(&device.context, realm_id).await,
+        "one refusal round may be a restarting realm"
+    );
+    assert!(!fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(realm_removed(&device.context, realm_id).await);
+    assert!(
+        read_realm_config(&device, realm_id).await.is_ok(),
+        "nothing on the device is wiped"
+    );
+
+    set_listed(&realm, &device, true).await?;
+    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(!realm_removed(&device.context, realm_id).await);
+    Ok(())
+}
+
+/// A device removed while it was away is refused at admission on its first contact, and
+/// learns its removal from that alone.
+#[tokio::test]
+async fn offline_learns_removal() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, 0, REPLICATION_FACTOR).await?;
+    let device = join_device(&realm).await?;
+    set_listed(&realm, &device, false).await?;
+    for _ in 0..2 {
+        assert!(!fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    }
+    assert!(realm_removed(&device.context, realm.realm_id).await);
+    Ok(())
+}
+
+/// Lists the device in every realm node's configuration, or removes it from all of them.
+async fn set_listed(realm: &Topology, device: &TestNode, listed: bool) -> TestResult<()> {
+    for node in &realm.nodes {
+        let mut known = read_realm_config(node, realm.realm_id).await?;
+        match listed {
+            true => known.ensure_node(
+                device.node_id(),
+                RealmNodeKind::User {
+                    owner: realm.user_id,
+                },
+            ),
+            false => known
+                .nodes
+                .retain(|entry| entry.node_id != device.node_id().to_string()),
+        }
+        write(
+            node,
+            aruna_core::keyspaces::REALM_CONFIG_KEYSPACE,
+            realm.realm_id.as_bytes().to_vec(),
+            known.to_bytes(&realm.actor(node))?,
+        )
+        .await?;
+        node.net.refresh_document_peers(&known).await?;
+    }
+    Ok(())
 }
 
 /// Spawns a device of the realm's user, meshes it with every realm node and
