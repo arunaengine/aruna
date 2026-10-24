@@ -18,6 +18,7 @@ pub mod handoff;
 pub mod inventory;
 pub mod keep;
 pub mod publish;
+pub mod pull;
 pub mod rebuild;
 pub mod refill;
 pub mod split;

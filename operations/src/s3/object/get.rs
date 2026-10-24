@@ -11,6 +11,9 @@ use crate::blob::promote::{
 use crate::blob::records::blob_location_read;
 use crate::connectors::repository::connector_reference_write;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
+use crate::distribution::pull::{
+    HeldElsewhere, PullRequest, kept_location, kept_reads, pull_through,
+};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
@@ -91,6 +94,8 @@ pub enum GetObjectState {
     CheckManagedCopy,
     GetBlobLocation,
     GetCurrentVersion,
+    /// A distributed version kept elsewhere first looks for this member's kept copy.
+    ReadKept,
     ResolveReferenceAccess,
     ReadMultipartSummary,
     CommitTransaction,
@@ -183,6 +188,10 @@ pub enum GetObjectError {
     /// infrastructure failure, so this is a fault, never object absence.
     #[error("The object bytes are unavailable from every holder.")]
     HoldersUnavailable,
+    /// This member keeps the version's record but not its bytes; they are read through a
+    /// holder of its range, per the member's data strategy.
+    #[error("The object bytes are kept by other members of the distributed bucket.")]
+    HeldElsewhere(Box<HeldElsewhere>),
     /// At least one holder returned bytes that failed integrity verification.
     #[error("Object bytes from a holder failed integrity verification.")]
     HolderIntegrityFailure,
@@ -357,6 +366,8 @@ pub struct GetObjectOperation {
     pending_copy: Option<ManagedCopyKey>,
     /// Refs of the version being read, carried to copy and advance writes.
     source_policies: Vec<PlacementPolicyRef>,
+    /// A distributed version this member keeps no bytes of, unless a kept copy turns up.
+    held: Option<HeldElsewhere>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
     /// Active key of an encrypting bucket whose reference or unsealed copy is read.
     reference_key: Option<BucketKeyRef>,
@@ -407,6 +418,7 @@ impl GetObjectOperation {
             pending_location: None,
             pending_copy: None,
             source_policies: Vec::new(),
+            held: None,
             output: None,
             reference_key: None,
             reference_lease: None,
@@ -623,6 +635,32 @@ impl GetObjectOperation {
             BlobVersionState::Reference {
                 source,
                 cached_metadata,
+                ..
+            } if HeldElsewhere::of(&source, version.identity).is_some() => {
+                let Some((set_id, blake3)) = HeldElsewhere::of(&source, version.identity) else {
+                    return self.emit_error(GetObjectError::GetObjectFailed);
+                };
+                let held = HeldElsewhere {
+                    set_id,
+                    version_id,
+                    blake3,
+                    size: cached_metadata.content_length,
+                    metadata: version.metadata,
+                    version_created_at: Some(version.created_at),
+                    source_policies: version.placement_policies,
+                };
+                self.version_created_at = held.version_created_at;
+                self.state = GetObjectState::ReadKept;
+                let reads = kept_reads(&held);
+                self.held = Some(held);
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: self.txn_id,
+                })]
+            }
+            BlobVersionState::Reference {
+                source,
+                cached_metadata,
                 last_refresh,
                 ..
             } => {
@@ -650,6 +688,24 @@ impl GetObjectOperation {
             BlobVersionState::PendingContent { .. } => {
                 self.emit_error(ConversionError::BucketKey(BucketKeyError::Unsupported).into())
             }
+        }
+    }
+
+    /// Reads this member's kept copy, or hands the read to the holders of the version.
+    fn kept_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                received: event,
+            });
+        };
+        let Some(held) = self.held.take() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        match kept_location(&held, &values) {
+            Some(location) => self.read_multipart_summary(location, Some(held.version_id)),
+            None => self.emit_error(GetObjectError::HeldElsewhere(Box::new(held))),
         }
     }
 
@@ -1797,6 +1853,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::CheckManagedCopy => self.handle_managed_copy(event),
             GetObjectState::GetBlobLocation => self.location_read(event),
             GetObjectState::GetCurrentVersion => self.current_version_received(event),
+            GetObjectState::ReadKept => self.kept_read(event),
             GetObjectState::ResolveReferenceAccess => self.reference_access_resolved(event),
             GetObjectState::ReadMultipartSummary => self.summary_read(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
@@ -1871,7 +1928,24 @@ pub async fn get_object_token(
 ) -> Result<GetObjectResult, GetObjectError> {
     let range = input.range.clone();
     let (user_id, realm_id) = (input.user_identity, input.realm_id);
+    let (bucket, key) = (input.bucket.clone(), input.key.clone());
     let result = read_local(context, input, restrictions.clone(), token.as_ref()).await;
+    if let Err(GetObjectError::HeldElsewhere(held)) = result {
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: restrictions,
+            session: None,
+        };
+        let request = PullRequest {
+            bucket,
+            key,
+            range,
+            auth,
+            held: *held,
+        };
+        return pull_through(context, request).await;
+    }
     let Err(GetObjectError::BlobNotLocal {
         blake3,
         version_id,
@@ -2134,6 +2208,7 @@ pub async fn get_object_info(
     let operation = GetObjectOperation::new(input).with_restrictions(restrictions.clone());
     match drive(operation, context).await {
         Ok(result) => Ok(result.info),
+        Err(GetObjectError::HeldElsewhere(held)) => Ok(held.info()),
         Err(GetObjectError::BlobNotLocal {
             blake3,
             version_id,
@@ -2174,7 +2249,7 @@ struct RoutedRead {
 /// informative cause. A read where no holder served is absence only when every
 /// holder confirmed absence.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct HolderFailures {
+pub(crate) struct HolderFailures {
     /// Whether at least one holder answered at all, so zero holders stay
     /// distinguishable from every holder confirming absence.
     contacted: bool,
@@ -2215,7 +2290,7 @@ impl HolderFailures {
         }
     }
 
-    fn into_error(self) -> GetObjectError {
+    pub(crate) fn into_error(self) -> GetObjectError {
         if let Some(bucket_id) = self.locked {
             return locked(BucketKeyError::Locked(bucket_id));
         }
@@ -2232,7 +2307,10 @@ impl HolderFailures {
         }
     }
 
-    fn consider(&mut self, result: Result<BaoReadOutput, BaoReadError>) -> Option<BaoReadOutput> {
+    pub(crate) fn consider(
+        &mut self,
+        result: Result<BaoReadOutput, BaoReadError>,
+    ) -> Option<BaoReadOutput> {
         match result {
             Ok(output @ BaoReadOutput::Stream { .. }) => Some(output),
             Ok(BaoReadOutput::Metadata { .. }) => {

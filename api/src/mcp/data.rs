@@ -1200,7 +1200,9 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
         GetObjectError::StagingSourceError(error) => internal_error(error),
         GetObjectError::ManagedCopyError(error) => internal_error(error),
         GetObjectError::PolicyError(error) => internal_error(error),
-        error @ GetObjectError::BlobNotLocal { .. } => internal_error(error),
+        error @ (GetObjectError::BlobNotLocal { .. } | GetObjectError::HeldElsewhere(_)) => {
+            internal_error(error)
+        }
         GetObjectError::HolderAccessDenied => server_error(crate::error::ServerError::Forbidden),
         error @ (GetObjectError::HoldersUnavailable | GetObjectError::HolderIntegrityFailure) => {
             internal_error(error)
