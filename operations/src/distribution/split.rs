@@ -318,3 +318,6 @@ impl Operation for SplitOperation {
     }
 }
 
+#[cfg(test)]
+#[path = "split_tests.rs"]
+mod tests;
