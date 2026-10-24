@@ -509,6 +509,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardApplyBatch { .. } => "forward_apply_batch",
         MetadataTransportMessage::ForwardedApplyBatch { .. } => "forwarded_apply_batch",
         MetadataTransportMessage::GroupCreateConflict { .. } => "forwarded_group_create_conflict",
+        MetadataTransportMessage::DataLinks { .. } => "data_links",
+        MetadataTransportMessage::DataLinkResults { .. } => "data_link_results",
     }
 }
 
@@ -632,6 +634,29 @@ impl MetadataHandle {
     }
 
     /// Asks one node which readable documents its reverse index lists for the identifier.
+    pub async fn request_data_links(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<AuthToken>,
+        request: crate::metadata::api::LinkNodeRequest,
+    ) -> Result<crate::metadata::api::LinkNodePage, MetadataReadError> {
+        match send_remote_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::DataLinks {
+                auth_token,
+                request: Box::new(request),
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::DataLinkResults { result } => result.map(|page| *page),
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
     pub async fn request_identifier_lookup(
         &self,
         node_id: NodeId,

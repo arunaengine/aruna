@@ -1038,6 +1038,27 @@ impl MetadataHandle {
                 };
                 (MetadataTransportMessage::IdentifierMatches { result }, None)
             }
+            MetadataTransportMessage::DataLinks {
+                auth_token,
+                request,
+            } => {
+                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                    Ok(auth) => match self.inner.net_handle.as_ref() {
+                        Some(net_handle) => crate::metadata::api::links_local(
+                            context.as_ref(),
+                            *net_handle.realm_id(),
+                            auth.as_ref(),
+                            *request,
+                        )
+                        .await
+                        .map(Box::new)
+                        .map_err(crate::forward::transport::read_error),
+                        None => Err(MetadataReadError::Unavailable),
+                    },
+                    Err(error) => Err(error),
+                };
+                (MetadataTransportMessage::DataLinkResults { result }, None)
+            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)

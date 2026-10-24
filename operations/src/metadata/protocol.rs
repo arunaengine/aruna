@@ -568,6 +568,14 @@ pub enum MetadataTransportMessage {
     DistributionAccepted {
         result: Result<DistributionRevision, crate::distribution::forward::PublishRefusal>,
     },
+    /// One node's data link postings for the caller's lookup, read under the caller's token.
+    DataLinks {
+        auth_token: Option<AuthToken>,
+        request: Box<crate::metadata::api::LinkNodeRequest>,
+    },
+    DataLinkResults {
+        result: Result<Box<crate::metadata::api::LinkNodePage>, MetadataReadError>,
+    },
 }
 
 /// One document as a holder serves it to a device.

@@ -115,6 +115,7 @@ mod bucket_page;
 mod distributed;
 mod export;
 mod fanout;
+mod links;
 mod list;
 mod path;
 mod preflight;
@@ -128,6 +129,10 @@ pub use self::export::{
 use self::fanout::MetadataFanoutScope;
 pub use self::fanout::MetadataFanoutStats;
 pub(crate) use self::fanout::RealmNodeDiscovery;
+pub use self::links::{
+    LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,
+    file_queries, links_distributed, links_local, merge_pages,
+};
 pub use self::list::{
     ListVisibleRequest, ListVisibleResult, ListedMetadataDocument, MetadataListOrder,
     list_visible_documents,
