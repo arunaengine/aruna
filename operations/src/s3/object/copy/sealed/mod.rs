@@ -9,6 +9,7 @@ use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_eff
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
 };
+use crate::distribution::inventory::{AddedVersion, InventoryChange, entry_of, version_written};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
@@ -38,6 +39,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
     CopyOrigin, CopyOwner, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::with_hint;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::usage::UsageDelta;
@@ -151,6 +153,9 @@ pub struct SealedCopyOperation {
     version_id: Ulid,
     version: Option<BlobVersion>,
     existing: Option<CurrentVersionPointer>,
+    /// The bucket's distribution binding and the head the copy installs, for the inventory.
+    binding: Option<DistributionBinding>,
+    head: Option<CurrentVersionPointer>,
     was_live: bool,
     /// Offered directory bytes the replaced head stops charging.
     released_bytes: u64,
@@ -179,6 +184,8 @@ impl SealedCopyOperation {
             version_id: Ulid::generate(),
             version: None,
             existing: None,
+            binding: None,
+            head: None,
             was_live: false,
             released_bytes: 0,
             quota: None,
@@ -209,10 +216,10 @@ impl SealedCopyOperation {
         let bucket = value
             .map(|value| BucketInfo::from_bytes(value.as_ref()))
             .transpose()?;
-        if let Some(binding) = bucket
+        self.binding = bucket
             .as_ref()
-            .and_then(|bucket| bucket.distribution.as_ref())
-        {
+            .and_then(|bucket| bucket.distribution.clone());
+        if let Some(binding) = self.binding.as_ref() {
             self.version_id = with_hint(self.version_id, binding.hint());
         }
         let observed = GatedBucket::observe(bucket.as_ref());
@@ -507,6 +514,7 @@ impl SealedCopyOperation {
 
     fn write_head(&mut self) -> Result<Effects, SealedCopyError> {
         let pointer = CurrentVersionPointer::next_for(self.existing.as_ref(), self.version_id)?;
+        self.head = Some(pointer.clone());
         self.step = Step::WriteHead;
         Ok(smallvec![write_head_effect(
             &self.alias_context(),
@@ -670,7 +678,8 @@ impl SealedCopyOperation {
             ..Default::default()
         };
         let usage = UsageCounterUpdate::for_group(self.input.group_id, delta);
-        self.usage = Some(usage.in_bucket(&self.input.bucket, RowChange::AddedVersion));
+        let usage = usage.in_bucket(&self.input.bucket, RowChange::AddedVersion);
+        self.usage = Some(usage.with_inventory(self.inventory_change()));
         match self.input.quota_ceiling.filter(|_| added > 0) {
             Some(ceiling) => {
                 let mut gate = QuotaGate::new_for_realm(
@@ -687,6 +696,18 @@ impl SealedCopyOperation {
             }
             None => self.start_usage(),
         }
+    }
+
+    /// The copied version and the head it becomes in a distributed bucket.
+    fn inventory_change(&self) -> Option<InventoryChange> {
+        let (version, head) = (self.version.as_ref()?, self.head.as_ref()?);
+        let added = AddedVersion {
+            version_id: self.version_id,
+            epoch: version.original_epoch,
+            generation: head.generation,
+            entry: entry_of(version, self.input.size),
+        };
+        version_written(self.binding.as_ref(), &self.input.dest_key, added, true)
     }
 
     fn quota_step(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
