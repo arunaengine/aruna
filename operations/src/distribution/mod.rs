@@ -31,12 +31,12 @@ pub mod sharding;
 pub mod source_keep;
 pub mod split;
 pub mod status;
-pub mod ticket;
-pub mod version_key;
 #[cfg(test)]
 pub(crate) mod test_record;
 #[cfg(test)]
 pub(crate) mod test_store;
+pub mod ticket;
+pub mod version_key;
 pub mod versions;
 
 /// Signs a snapshot with this node's key, only when this node is the set's bound publisher.
