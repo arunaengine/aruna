@@ -73,11 +73,11 @@ fn rocrate_location(document_id: Ulid) -> String {
 
 **Behavior**: a Profile resolves under `/profile/{document_id}`, so this path answers 404 for a
 Profile and never acts as a duplicate PID. A public document redirects to the RO-Crate route of
-one of its holders: two random holders with a fresh heartbeat, the less loaded one wins, and the
-chosen holder serves its own copy. Without a fresh holder the redirect stays on this node."#,
+one of its holders: two random holders with a fresh heartbeat, the one with more free download
+slots wins, and the chosen holder serves its own copy. Without a fresh holder the redirect stays on this node."#,
     params(("document_id" = String, Path, description = "Document ULID carried by the w3id PID, for example 01JMETADATA0123456789ABCDE")),
     responses(
-        (status = 302, description = "Active public identifier; the Location header points at the document's RO-Crate read route, which applies its own authorization: on one holder chosen by fresh heartbeat and load (absolute URL with `here=true`), or on this node"),
+        (status = 302, description = "Active public identifier; the Location header points at the document's RO-Crate read route, which applies its own authorization: on one holder chosen by fresh heartbeat and free download slots (absolute URL with `here=true`), or on this node"),
         (status = 404, description = "Unknown, malformed, private or Profile identifier, or a mapping still in `requested`, `processing` or `failed`"),
         (
             status = 410,
@@ -112,7 +112,12 @@ async fn resolve_pid(
         && let Some(holder) =
             choose_holder(ctx.as_ref(), state.get_node_id(), document_id, now_ms()).await
     {
-        let api = holder.api_url.trim_end_matches('/');
+        let api = holder
+            .urls
+            .api
+            .as_deref()
+            .unwrap_or_default()
+            .trim_end_matches('/');
         return redirect(&format!("{api}/metadata/{document_id}/rocrate?here=true"));
     }
     landing_response(document_id, resolved)
