@@ -5,11 +5,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REFRESH_JOB_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REFRESH_DUE_KEYSPACE, REFRESH_JOB_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
@@ -126,15 +126,35 @@ pub fn job_key(refresh: &ReferenceRefresh) -> Result<Key, ConversionError> {
     Ok(ByteView::from(key))
 }
 
+/// Big-endian due milliseconds, then the job key, so the due index sorts by due time.
+fn due_key(due_at_ms: u64, job_key: &[u8]) -> Key {
+    let mut key = due_at_ms.to_be_bytes().to_vec();
+    key.extend_from_slice(job_key);
+    ByteView::from(key)
+}
+
+fn split_due(row: &[u8]) -> Option<(u64, &[u8])> {
+    let (due, job_key) = row.split_first_chunk::<8>()?;
+    Some((u64::from_be_bytes(*due), job_key))
+}
+
+/// The job row and its due index row.
 fn job_entries(
     record: &ReferenceRefreshRecord,
 ) -> Result<Vec<(String, Key, ByteView)>, ConversionError> {
     let key = job_key(&record.refresh)?;
-    Ok(vec![(
-        REFRESH_JOB_KEYSPACE.to_string(),
-        key,
-        ByteView::from(postcard::to_allocvec(record)?),
-    )])
+    Ok(vec![
+        (
+            REFRESH_DUE_KEYSPACE.to_string(),
+            due_key(record.due_at_ms, &key),
+            ByteView::from(Vec::new()),
+        ),
+        (
+            REFRESH_JOB_KEYSPACE.to_string(),
+            key,
+            ByteView::from(postcard::to_allocvec(record)?),
+        ),
+    ])
 }
 
 pub fn schedule_drain() -> Effect {
@@ -554,34 +574,17 @@ pub async fn restore_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
 }
 
 pub async fn jobs_exist(storage: &StorageHandle) -> Result<bool, ReferenceRefreshError> {
-    match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: REFRESH_JOB_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
-    }
+    Ok(!first_due(storage, 1).await?.0.is_empty())
 }
 
 pub async fn next_timer(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, ReferenceRefreshError> {
-    let now_ms = unix_timestamp_millis();
-    let scan = scan_due_jobs(storage, now_ms, 1).await?;
-    if !scan.jobs.is_empty() || scan.has_more_due {
-        return Ok(Some(Duration::ZERO));
-    }
-
-    Ok(scan
-        .next_due_ms
-        .map(|due_at_ms| due_after(now_ms, due_at_ms)))
+    let (rows, _) = first_due(storage, 1).await?;
+    Ok(rows
+        .first()
+        .and_then(|(row, _)| split_due(row))
+        .map(|(due_at_ms, _)| due_after(unix_timestamp_millis(), due_at_ms)))
 }
 
 pub async fn process_batch(
@@ -645,70 +648,78 @@ pub async fn process_batch(
     })
 }
 
+/// The first `limit` due index rows and whether more follow.
+async fn first_due(
+    storage: &StorageHandle,
+    limit: usize,
+) -> Result<(Vec<(Key, ByteView)>, bool), ReferenceRefreshError> {
+    let event = send(
+        storage,
+        StorageEffect::Iter {
+            key_space: REFRESH_DUE_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit,
+            txn_id: None,
+        },
+    )
+    .await?;
+    match event {
+        StorageEvent::IterResult {
+            values,
+            next_start_after,
+        } => Ok((values, next_start_after.is_some())),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+    }
+}
+
+/// Walks one page of the due index in due order, with a point read per due row.
 async fn scan_due_jobs(
     storage: &StorageHandle,
     now_ms: u64,
     limit: usize,
 ) -> Result<ReferenceRefreshScan, ReferenceRefreshError> {
-    let mut start_after = None;
+    let (rows, more_rows) = first_due(storage, REFRESH_SCAN_PAGE).await?;
     let mut jobs = Vec::new();
-    let mut next_due_ms = None;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: REFRESH_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: REFRESH_SCAN_PAGE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}")));
-            }
+    for (row, _) in rows {
+        let Some((due_at_ms, key)) = split_due(&row) else {
+            delete_rows(storage, vec![(REFRESH_DUE_KEYSPACE.to_string(), row)], None).await?;
+            continue;
         };
-
-        for (key, value) in values {
-            let job = match postcard::from_bytes::<ReferenceRefreshRecord>(&value) {
-                Ok(job) => job,
-                Err(error) => {
-                    warn!(error = %error, key = ?key, "Deleting malformed reference metadata refresh job");
-                    let deletes = vec![(REFRESH_JOB_KEYSPACE.to_string(), key)];
-                    delete_rows(storage, deletes, None).await?;
-                    continue;
-                }
-            };
-            if job.due_at_ms > now_ms {
-                next_due_ms = min_due_at(next_due_ms, job.due_at_ms);
+        if due_at_ms > now_ms {
+            return Ok(ReferenceRefreshScan {
+                jobs,
+                has_more_due: false,
+                next_due_ms: Some(due_at_ms),
+            });
+        }
+        if jobs.len() >= limit {
+            return Ok(ReferenceRefreshScan {
+                jobs,
+                has_more_due: true,
+                next_due_ms: None,
+            });
+        }
+        let mut stale = vec![(REFRESH_DUE_KEYSPACE.to_string(), row.clone())];
+        match read_job(storage, key, None).await? {
+            Some(Ok(job)) if job.due_at_ms == due_at_ms => {
+                jobs.push((key.to_vec(), job));
                 continue;
             }
-            jobs.push((key.to_vec(), job));
-            if jobs.len() >= limit {
-                return Ok(ReferenceRefreshScan {
-                    jobs,
-                    has_more_due: true,
-                    next_due_ms,
-                });
+            Some(Ok(_)) | None => {}
+            Some(Err(error)) => {
+                warn!(error = %error, key = ?key, "Deleting malformed reference metadata refresh job");
+                let key = ByteView::from(key.to_vec());
+                stale.push((REFRESH_JOB_KEYSPACE.to_string(), key));
             }
         }
-
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => {
-                return Ok(ReferenceRefreshScan {
-                    jobs,
-                    has_more_due: false,
-                    next_due_ms,
-                });
-            }
-        }
+        delete_rows(storage, stale, None).await?;
     }
+    Ok(ReferenceRefreshScan {
+        jobs,
+        has_more_due: more_rows,
+        next_due_ms: None,
+    })
 }
 
 async fn send(
@@ -767,10 +778,16 @@ async fn settle_job(
         {
             return Ok(());
         }
+        let mut deletes = vec![(
+            REFRESH_DUE_KEYSPACE.to_string(),
+            due_key(job.due_at_ms, key),
+        )];
         let Some(next) = next else {
-            let deletes = vec![(REFRESH_JOB_KEYSPACE.to_string(), ByteView::from(key.to_vec()))];
+            let key = ByteView::from(key.to_vec());
+            deletes.push((REFRESH_JOB_KEYSPACE.to_string(), key));
             return delete_rows(storage, deletes, Some(txn_id)).await;
         };
+        delete_rows(storage, deletes, Some(txn_id)).await?;
         let writes = job_entries(next)?;
         match send(storage, StorageEffect::BatchWrite { writes, txn_id: Some(txn_id) }).await? {
             StorageEvent::BatchWriteResult { .. } => Ok(()),
@@ -1012,11 +1029,18 @@ mod tests {
     }
 
     async fn write_corrupt_job(storage: &StorageHandle, key: &str) {
-        let writes = vec![(
-            REFRESH_JOB_KEYSPACE.to_string(),
-            ByteView::from(key.as_bytes().to_vec()),
-            ByteView::from(Vec::new()),
-        )];
+        let writes = vec![
+            (
+                REFRESH_DUE_KEYSPACE.to_string(),
+                due_key(0, key.as_bytes()),
+                ByteView::from(Vec::new()),
+            ),
+            (
+                REFRESH_JOB_KEYSPACE.to_string(),
+                ByteView::from(key.as_bytes().to_vec()),
+                ByteView::from(Vec::new()),
+            ),
+        ];
         write_rows(storage, writes).await;
     }
 
