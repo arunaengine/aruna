@@ -381,7 +381,7 @@ async fn replay_token(
             txn_id: None,
         })
         .await;
-    let token_issued_at_secs = match event {
+    let issued_at = match event {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
         }) => u64::from_be_bytes(bytes.as_ref().try_into().ok()?),
@@ -390,7 +390,7 @@ async fn replay_token(
     };
     Some(AuthToken::Replay {
         auth,
-        token_issued_at_secs,
+        issued_at,
         authored_at_ms: entry.created_at_ms,
     })
 }
@@ -704,7 +704,7 @@ mod tests {
             replay_token(&context, &entry, auth.clone()).await,
             Some(AuthToken::Replay {
                 auth: auth.clone(),
-                token_issued_at_secs: 42,
+                issued_at: 42,
                 authored_at_ms: entry.created_at_ms,
             })
         );
@@ -714,10 +714,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             replay_token(&context, &entry, auth).await,
-            Some(AuthToken::Replay {
-                token_issued_at_secs: 0,
-                ..
-            })
+            Some(AuthToken::Replay { issued_at: 0, .. })
         ));
     }
 

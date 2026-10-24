@@ -122,7 +122,7 @@ pub async fn serve_pull_status(
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> MetadataTransportMessage {
-    let MetadataTransportMessage::ForwardSyncPullStatus { auth_token, pull } = message else {
+    let MetadataTransportMessage::ForwardPullStatus { auth_token, pull } = message else {
         return MetadataTransportMessage::Reject("unexpected metadata control message".to_string());
     };
     let status = pull_status(context, peer, auth_token, &pull).await;

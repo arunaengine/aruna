@@ -87,7 +87,7 @@ pub enum AuthToken {
     /// is later than the authoring token's issue time or the authoring time.
     Replay {
         auth: AuthContext,
-        token_issued_at_secs: u64,
+        issued_at: u64,
         authored_at_ms: u64,
     },
 }

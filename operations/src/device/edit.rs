@@ -51,7 +51,7 @@ pub async fn apply_local_edit(
     node_id: NodeId,
     replica: &ReplicaRecord,
     mutation: UpdateDocumentMutation,
-    token_issued_at_secs: u64,
+    issued_at: u64,
 ) -> Result<MetadataRegistryRecord, DeviceEditError> {
     let record = replica
         .record
@@ -81,7 +81,7 @@ pub async fn apply_local_edit(
     drive(
         EnqueueDraftOperation::new(EnqueueDraftInput { entry })
             .with_actor(actor)
-            .with_fence(token_issued_at_secs),
+            .with_fence(issued_at),
         context.as_ref(),
     )
     .await

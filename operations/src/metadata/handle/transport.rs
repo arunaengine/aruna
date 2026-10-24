@@ -484,7 +484,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::FetchedVaultRecords { .. } => "fetched_vault_records",
         MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
         MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
-        MetadataTransportMessage::ForwardSyncPullStatus { .. } => "forward_sync_pull_status",
+        MetadataTransportMessage::ForwardPullStatus { .. } => "forward_pull_status",
         MetadataTransportMessage::ForwardListVersions { .. } => "forward_list_versions",
         MetadataTransportMessage::ForwardedVersions { .. } => "forwarded_versions",
         MetadataTransportMessage::ForwardCreateBucket { .. } => "forward_create_bucket",

@@ -68,7 +68,7 @@ where
         tokio::time::sleep(watch.wait).await;
         let message = match ask_again {
             true => request(),
-            false => MetadataTransportMessage::ForwardSyncPullStatus {
+            false => MetadataTransportMessage::ForwardPullStatus {
                 auth_token: auth_token.clone(),
                 pull: Box::new(pull.clone()),
             },

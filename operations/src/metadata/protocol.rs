@@ -527,7 +527,7 @@ pub enum MetadataTransportMessage {
         result: Result<(), SyncRefusal>,
     },
     /// Asks how far an accepted sync pull has come; answered by `ForwardedSyncPull`.
-    ForwardSyncPullStatus {
+    ForwardPullStatus {
         auth_token: AuthToken,
         pull: Box<SyncPull>,
     },

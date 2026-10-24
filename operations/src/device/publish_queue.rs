@@ -235,11 +235,11 @@ pub fn publish_entry(entry: &PublishEntry) -> Result<(String, Key, Value), Conve
 }
 
 /// The issue time of the token that authored one queued draft.
-pub fn fence_entry(draft_id: Ulid, token_issued_at_secs: u64) -> (String, Key, Value) {
+pub fn fence_entry(draft_id: Ulid, issued_at: u64) -> (String, Key, Value) {
     (
         DEVICE_FENCE_KEYSPACE.to_string(),
         publish_key(draft_id),
-        ByteView::from(token_issued_at_secs.to_be_bytes().to_vec()),
+        ByteView::from(issued_at.to_be_bytes().to_vec()),
     )
 }
 

@@ -26,7 +26,7 @@ pub struct EnqueueDraftOperation {
     /// The edit's advanced CRDT actor, stored atomically with the entry.
     actor: Option<aruna_core::metadata::MetadataActor>,
     /// Issue time of the token that authored the entry, stored atomically with it.
-    token_issued_at_secs: u64,
+    issued_at: u64,
     state: EnqueueDraftState,
     output: Option<Result<PublishEntry, EnqueueDraftError>>,
 }
@@ -69,7 +69,7 @@ impl EnqueueDraftOperation {
         Self {
             input,
             actor: None,
-            token_issued_at_secs: 0,
+            issued_at: 0,
             state: EnqueueDraftState::Init,
             output: None,
         }
@@ -80,8 +80,8 @@ impl EnqueueDraftOperation {
         self
     }
 
-    pub fn with_fence(mut self, token_issued_at_secs: u64) -> Self {
-        self.token_issued_at_secs = token_issued_at_secs;
+    pub fn with_fence(mut self, issued_at: u64) -> Self {
+        self.issued_at = issued_at;
         self
     }
 
@@ -93,7 +93,7 @@ impl EnqueueDraftOperation {
         };
         let mut writes = vec![
             entry,
-            fence_entry(self.input.entry.draft_id, self.token_issued_at_secs),
+            fence_entry(self.input.entry.draft_id, self.issued_at),
         ];
         if let Some(actor) = &self.actor {
             match aruna_core::storage_entries::metadata_actor_entry(actor) {

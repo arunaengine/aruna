@@ -511,7 +511,7 @@ async fn replay_respects_cutoff() {
     };
     let replay = |issued: u64, authored_ms: u64| AuthToken::Replay {
         auth: auth.clone(),
-        token_issued_at_secs: issued,
+        issued_at: issued,
         authored_at_ms: authored_ms,
     };
 

@@ -163,7 +163,7 @@ pub(super) async fn replay_authority(
 ) -> Result<AuthToken, WritePeerError> {
     let AuthToken::Replay {
         auth,
-        token_issued_at_secs,
+        issued_at,
         authored_at_ms,
     } = auth_token
     else {
@@ -172,7 +172,7 @@ pub(super) async fn replay_authority(
     let cutoff = realm_user_cutoff(storage_handle, auth.realm_id, &auth.user_id)
         .await
         .map_err(|error| WritePeerError::Unavailable(MetadataError::Backend(error.to_string())))?;
-    let issued = token_issued_at_secs.min(authored_at_ms / 1000);
+    let issued = issued_at.min(authored_at_ms / 1000);
     match cutoff.is_some_and(|cutoff| issued < cutoff) {
         true => Err(WritePeerError::Unauthorized),
         false => Ok(AuthToken::Internal(auth)),
