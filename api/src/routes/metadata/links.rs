@@ -8,7 +8,8 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data_link::{DataLink, LinkScope};
 use aruna_operations::metadata::api::{
-    LINKS_MAX_LIMIT, LinkNodeRequest, LinkPage, LinkQuery, file_queries, links_distributed, part_of,
+    LINKS_MAX_LIMIT, LinkNodeRequest, LinkPage, LinkQuery, file_queries, links_distributed,
+    part_of, resolve_part,
 };
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -419,5 +420,85 @@ pub async fn file_part_of(
         complete: found.complete,
         hidden_references_exist: found.hidden,
         more_datasets: format!("/api/v1/data/buckets/{bucket}/links?key={encoded}&parts_only=true"),
+    }))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct PartTargetParams {
+    /// A bucket or prefix global id URL, or a bucket-prefix ARN of an ordinary bucket.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PartTargetResponse {
+    /// The canonical identifier of the part.
+    pub id: String,
+    /// The bucket name; absent for a distributed bucket this node has no record of yet.
+    pub bucket: Option<String>,
+    pub prefix: String,
+    /// The set of a distributed bucket.
+    pub set_id: Option<String>,
+    /// The node of an ordinary bucket.
+    pub node_id: Option<String>,
+    /// This node holds the bucket and can list the part's files itself.
+    pub held_here: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/metadata/links/target",
+    tag = "metadata/references",
+    summary = "Resolve a linked part to the bucket that holds its files",
+    description = r#"Resolves the identifier of a linked part, a bucket root or a folder, to the
+bucket and prefix whose files it covers.
+
+**Authentication**: realm bearer token. Listing the files afterwards needs READ on the bucket
+on the node that serves them; resolving grants nothing.
+
+**Behavior**
+- A distributed bucket is named by its set and browsed on any member; `held_here` says whether
+  this node is one. An ordinary bucket is named by its node.
+- Parts are always live: the listing shows the bucket's current files.
+
+**Limits**
+- One identifier per call; at most two point reads."#,
+    params(PartTargetParams),
+    responses(
+        (status = 200, description = "The bucket and prefix of the part", body = PartTargetResponse, example = json!({
+            "id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8Y2B6D8F0H2K4M6P8R0T2V4/cmF3LzIwMjYv",
+            "bucket": "bakrep",
+            "prefix": "raw/2026/",
+            "set_id": "01K8Y2B6D8F0H2K4M6P8R0T2V4",
+            "node_id": null,
+            "held_here": true
+        })),
+        (status = 400, description = "`id` names no bucket or prefix", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn part_target(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(params): Query<PartTargetParams>,
+) -> ServerResult<Json<PartTargetResponse>> {
+    require_realm_auth(&state, auth)?;
+    let link = DataLink::parse(params.id.trim())
+        .filter(|link| link.scope().is_some())
+        .ok_or_else(|| ServerError::BadRequestReason("id names no bucket or prefix".to_string()))?;
+    let target = resolve_part(state.get_ctx().as_ref(), state.get_node_id(), link)
+        .await
+        .map_err(map_api_error)?;
+    let set_id = match &target.link {
+        DataLink::SetPrefix { set_id, .. } => Some(set_id.to_string()),
+        _ => None,
+    };
+    Ok(Json(PartTargetResponse {
+        id: target.link.to_id(),
+        bucket: target.bucket,
+        prefix: target.prefix,
+        set_id,
+        node_id: target.node_id.map(|node| node.to_string()),
+        held_here: target.held_here,
     }))
 }

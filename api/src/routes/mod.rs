@@ -403,6 +403,7 @@ pub(crate) mod tests {
         ("GET", "/compute/jobs/{job_id}/session/scratch/read"),
         ("GET", "/metadata"),
         ("GET", "/metadata/links"),
+        ("GET", "/metadata/links/target"),
         ("GET", "/metadata/profile/validation/capabilities"),
         ("GET", "/metadata/references"),
         ("GET", "/metadata/search"),

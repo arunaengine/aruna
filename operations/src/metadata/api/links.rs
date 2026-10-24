@@ -387,6 +387,79 @@ fn record_links_result(span: &Span, result: &Result<LinkNodePage, MetadataReadEr
     }
 }
 
+/// Where a linked part's files are browsed: the bucket name, its prefix, and whether this
+/// node holds the bucket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartTarget {
+    pub link: DataLink,
+    pub bucket: Option<String>,
+    pub prefix: String,
+    /// The node of an ordinary bucket; a distributed bucket is browsed on any member.
+    pub node_id: Option<NodeId>,
+    pub held_here: bool,
+}
+
+/// Resolves a bucket or prefix identifier to the bucket that holds its files. A set this node
+/// has no record of yet resolves without a bucket name.
+pub async fn resolve_part(
+    context: &DriverContext,
+    node_id: NodeId,
+    link: DataLink,
+) -> Result<PartTarget, MetadataApiError> {
+    let Some((scope, prefix)) = link.scope() else {
+        return Err(MetadataApiError::BadRequest);
+    };
+    let prefix = prefix.to_string();
+    match scope {
+        LinkScope::Node {
+            node_id: owner,
+            bucket,
+            ..
+        } => {
+            let held_here = owner == node_id
+                && crate::driver::drive(GetBucketOperation::new(bucket.clone()), context)
+                    .await
+                    .is_ok_and(|info| info.distribution.is_none());
+            Ok(PartTarget {
+                link,
+                bucket: Some(bucket),
+                prefix,
+                node_id: Some(owner),
+                held_here,
+            })
+        }
+        LinkScope::Set { set_id, .. } => {
+            let record = read_row(
+                context,
+                aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+                set_id.to_bytes().to_vec(),
+            )
+            .await?
+            .and_then(|value| {
+                aruna_core::structs::storage::distribution::DistributionView::from_bytes(&value)
+                    .ok()
+            });
+            let bucket = record.map(|view| view.snapshot().config.bucket.clone());
+            let held_here = match &bucket {
+                Some(name) => crate::driver::drive(GetBucketOperation::new(name.clone()), context)
+                    .await
+                    .is_ok_and(|info| {
+                        info.distribution
+                            .is_some_and(|binding| binding.set_id == set_id)
+                    }),
+                None => false,
+            };
+            Ok(PartTarget {
+                link,
+                bucket,
+                prefix,
+                node_id: None,
+                held_here,
+            })
+        }
+    }
+}
+
 /// At most this many datasets a file names as derived `isPartOf`; the paged listing has all.
 pub const PART_OF_LIMIT: usize = 10;
 
