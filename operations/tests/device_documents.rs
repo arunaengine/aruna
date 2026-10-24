@@ -287,9 +287,6 @@ async fn cache_stale_group(realm: &Topology, device: &TestNode) -> TestResult<Ul
     Ok(group_id)
 }
 
-/// Spawns a device of the realm's user, meshes it with every realm node and
-/// registers it in their configurations. The device itself starts from the
-/// fixture's configuration: what a device that was closed comes back with.
 /// A device the realm removed learns it from the membership refusals, keeps its cache, and
 /// forgets the state again once the realm admits it back.
 #[tokio::test]
@@ -359,6 +356,9 @@ async fn set_listed(realm: &Topology, device: &TestNode, listed: bool) -> TestRe
     Ok(())
 }
 
+/// Spawns a device of the realm's user, meshes it with every realm node and
+/// registers it in their configurations. The device itself starts from the
+/// fixture's configuration: what a device that was closed comes back with.
 async fn join_device(realm: &Topology) -> TestResult<TestNode> {
     let realm_id = realm.realm_id;
     let kind = RealmNodeKind::User {
