@@ -4,7 +4,7 @@
 
 use super::*;
 use aruna_core::NodeId;
-use aruna_core::keyspaces::{IRI_INDEX_KEYSPACE, RAW_REVISION_KEYSPACE};
+use aruna_core::keyspaces::{DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, RAW_REVISION_KEYSPACE};
 use aruna_core::storage_entries::{create_event_entry, raw_revision_key};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -1564,12 +1564,19 @@ async fn finish_not_regress() {
 
 #[tokio::test]
 async fn supersedes_prior_rows() {
-    // A second revision must leave only its own cursor's IRI index rows.
+    // A second revision replaces the document's postings: rows it does not write are deleted
+    // in the same commit, found through the document's own rows.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let document_id = Ulid::from_bytes([5u8; 16]);
-
-    let build = |event_id: Ulid| {
+    let record = |event_id: Ulid, object: &str| aruna_core::metadata::IriIndexRecord {
+        document_id,
+        document_cursor: event_id,
+        predicate_iri: "p".to_string(),
+        object_iri: object.to_string(),
+        subject_iris: vec!["s".to_string()],
+    };
+    let build = |event_id: Ulid, rows: super::super::data_links::LinkRows| {
         let event = create_event(document_id, event_id, "rev");
         let job = MetadataMaterializationRecord {
             document_id,
@@ -1583,11 +1590,8 @@ async fn supersedes_prior_rows() {
             job_key: materialization_job_entry(&job).unwrap().1.to_vec(),
             document_job_key: Some(document_job_key(document_id, event_id).to_vec()),
             status: Some(materialization_success_status(&job, &event, None)),
-            iri_index_writes: vec![(
-                IRI_INDEX_KEYSPACE.to_string(),
-                aruna_core::storage_entries::iri_reference_key("p", "o", document_id, event_id),
-                ByteView::from(vec![1u8]),
-            )],
+            iri_index_writes: rows.writes,
+            link_deletes: rows.deletes,
             raw_state_write: Some((
                 RAW_REVISION_KEYSPACE.to_string(),
                 raw_revision_key(document_id),
@@ -1600,32 +1604,40 @@ async fn supersedes_prior_rows() {
 
     let first = Ulid::from_parts(1, 1);
     let second = Ulid::from_parts(2, 1);
-    finish_completed_jobs(
-        &storage,
-        vec![FinishedMaterializationJob::Completed(build(first))],
-    )
-    .await
-    .unwrap();
-    finish_completed_jobs(
-        &storage,
-        vec![FinishedMaterializationJob::Completed(build(second))],
-    )
-    .await
-    .unwrap();
+    for (event_id, object) in [(first, "o1"), (second, "o2")] {
+        let rows = super::super::iri_index::plan_iri_rows(
+            &storage,
+            document_id,
+            &[record(event_id, object)],
+        )
+        .await
+        .unwrap();
+        finish_completed_jobs(
+            &storage,
+            vec![FinishedMaterializationJob::Completed(build(event_id, rows))],
+        )
+        .await
+        .unwrap();
+    }
 
-    let key_of = |cursor: Ulid| {
-        aruna_core::storage_entries::iri_reference_key("p", "o", document_id, cursor)
+    let key_of = |object: &str| {
+        aruna_core::storage_entries::iri_reference_key("p", object, document_id)
             .as_ref()
             .to_vec()
     };
+    let document_row = |object: &str| {
+        aruna_core::structs::storage::data_link::document_key(document_id, &key_of(object))
+    };
     assert!(
-        !storage_key_exists(&storage, IRI_INDEX_KEYSPACE, key_of(first)).await,
-        "prior cursor rows must be removed"
+        !storage_key_exists(&storage, IRI_INDEX_KEYSPACE, key_of("o1")).await,
+        "prior revision rows must be removed"
     );
+    assert!(!storage_key_exists(&storage, DOCUMENT_IRI_KEYSPACE, document_row("o1")).await);
     assert!(
-        storage_key_exists(&storage, IRI_INDEX_KEYSPACE, key_of(second)).await,
-        "current cursor rows must remain"
+        storage_key_exists(&storage, IRI_INDEX_KEYSPACE, key_of("o2")).await,
+        "current revision rows must remain"
     );
+    assert!(storage_key_exists(&storage, DOCUMENT_IRI_KEYSPACE, document_row("o2")).await);
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: RAW_REVISION_KEYSPACE.to_string(),
@@ -1639,43 +1651,6 @@ async fn supersedes_prior_rows() {
         }) => assert_eq!(value.as_ref(), second.to_bytes()),
         other => panic!("unexpected storage event: {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn prune_resumes_parked() {
-    // Park the cursor when deleted jobs leave no other way to retry a failed prune.
-    let dir = tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let document_id = Ulid::from_bytes([57u8; 16]);
-    let stale = Ulid::from_parts(1, 1);
-    let current = Ulid::from_parts(2, 1);
-    let stale_key = aruna_core::storage_entries::iri_reference_key("p", "o", document_id, stale);
-    write_entries(
-        &storage,
-        vec![
-            (
-                IRI_INDEX_KEYSPACE.to_string(),
-                stale_key.clone(),
-                ByteView::from(vec![1u8]),
-            ),
-            materialization_prune_entry(document_id, current).unwrap(),
-        ],
-    )
-    .await;
-
-    prune_superseded_rows(&storage, HashMap::new())
-        .await
-        .unwrap();
-
-    assert!(!storage_key_exists(&storage, IRI_INDEX_KEYSPACE, stale_key.to_vec()).await);
-    assert!(
-        !storage_key_exists(
-            &storage,
-            MATERIALIZATION_PRUNE_KEYSPACE,
-            materialization_prune_key(document_id).to_vec()
-        )
-        .await
-    );
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE};
 use aruna_core::metadata::{
     IriIndexRecord, MaterializationState, MaterializationStatusRecord, MetadataError,
 };
-use aruna_core::storage_entries::{iri_reference_entry, iri_reference_ids, iri_reference_prefix};
+use aruna_core::storage_entries::{iri_reference_entry, iri_reference_prefix};
 use aruna_core::structs::storage::data_link::document_key;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::StorageHandle;
@@ -24,6 +24,10 @@ use crate::driver::DriverContext;
 
 use super::data_links::{DataLinkError, LinkRows, document_rows};
 use super::handle::REGISTRY_CANDIDATE_LIMIT;
+use super::queue_storage::{
+    MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
+    start_write_transaction,
+};
 use super::repository::{StorageReadError, parse_status_read, read_status_effect};
 
 const INDEX_PAGE_SIZE: usize = 128;
@@ -222,13 +226,7 @@ pub(crate) async fn iri_index_freshness(
             );
         }
         match status {
-            Some(status)
-                if status.event_id == record.last_event_id
-                    && status.graph_iri == record.graph_iri
-                    && status.state == MaterializationState::Materialized =>
-            {
-                current = true;
-            }
+            Some(status) if status_current(&status, record) => current = true,
             Some(status) if status.state == MaterializationState::Failed => {
                 failed = true;
             }
@@ -297,29 +295,30 @@ async fn scan_records(
     Ok(records)
 }
 
+fn status_current(status: &MaterializationStatusRecord, record: &MetadataRegistryRecord) -> bool {
+    status.event_id == record.last_event_id
+        && status.graph_iri == record.graph_iri
+        && status.state == MaterializationState::Materialized
+}
+
+/// Re-projects each live materialized document on its own and replaces its postings.
 pub(crate) async fn rebuild_index(context: &DriverContext) -> Result<usize, MetadataError> {
     let metadata_handle = context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataError::HandleMissing)?;
+    let storage = &context.storage_handle;
     let registry_records = metadata_handle.list_cached_records().await?;
-    let registry_records =
-        super::api::filter_live_records(&context.storage_handle, registry_records.as_ref())
-            .await
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let registry_records = super::api::filter_live_records(storage, registry_records.as_ref())
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
     let mut written = 0usize;
-    let mut reprojected: HashMap<Ulid, Ulid> = HashMap::new();
 
     for record in registry_records.iter() {
-        let Some(status) =
-            read_materialization_status(&context.storage_handle, record.document_id).await?
-        else {
+        let Some(status) = read_materialization_status(storage, record.document_id).await? else {
             continue;
         };
-        if status.state != MaterializationState::Materialized
-            || status.event_id != record.last_event_id
-            || status.graph_iri != record.graph_iri
-        {
+        if !status_current(&status, record) {
             continue;
         }
 
@@ -328,98 +327,89 @@ pub(crate) async fn rebuild_index(context: &DriverContext) -> Result<usize, Meta
             .await?;
         let mut links =
             super::data_links::project_links(&record.graph_iri, record.last_event_id, &references);
-        super::data_links::associate_versions(&context.storage_handle, &mut links).await?;
-        let link_rows =
-            super::data_links::plan_link_rows(&context.storage_handle, record.document_id, &links)
-                .await?;
-        super::data_links::apply_rows(&context.storage_handle, link_rows).await?;
+        super::data_links::associate_versions(storage, &mut links).await?;
+        let mut rows =
+            super::data_links::plan_link_rows(storage, record.document_id, &links).await?;
         let projected =
             project_iri_references(record.document_id, record.last_event_id, references);
-        let iri_rows =
-            plan_iri_rows(&context.storage_handle, record.document_id, &projected).await?;
-        super::data_links::apply_rows(&context.storage_handle, iri_rows).await?;
-        reprojected.insert(record.document_id, record.last_event_id);
-        written = written.saturating_add(projected.len());
+        let iri_rows = plan_iri_rows(storage, record.document_id, &projected).await?;
+        rows.writes.extend(iri_rows.writes);
+        rows.deletes.extend(iri_rows.deletes);
+        if replace_rows(storage, record, rows).await? {
+            written = written.saturating_add(projected.len());
+        }
     }
-
-    // Re-read the registry so cleanup cannot delete rows from a newer materialization.
-    let registered = metadata_handle
-        .list_cached_records()
-        .await?
-        .as_ref()
-        .to_vec();
-    let registered = super::api::filter_live_records(&context.storage_handle, &registered)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?
-        .into_iter()
-        .map(|record| (record.document_id, record.last_event_id))
-        .collect::<HashMap<_, _>>();
-    let stale = stale_rebuild_keys(&context.storage_handle, &reprojected, &registered).await?;
-    delete_keys(&context.storage_handle, stale).await?;
-
     Ok(written)
 }
 
-/// Scans the IRI reference index and returns the keyspace-qualified keys for
-/// which `select` accepts the row's document id and cursor.
-async fn select_keys<F>(
+/// Commits one document's rows only while its status still names the projected event, so a
+/// newer materialization is never overwritten; `false` when one got there first.
+async fn replace_rows(
     storage: &StorageHandle,
-    txn_id: Option<Ulid>,
-    mut select: F,
-) -> Result<Vec<(String, ByteView)>, MetadataIriError>
-where
-    F: FnMut(Ulid, Ulid) -> bool,
-{
-    let mut start_after = None;
-    let mut selected = Vec::new();
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: IRI_INDEX_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: INDEX_PAGE_SIZE,
-                txn_id,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(MetadataIriError::UnexpectedEvent(format!("{other:?}")));
-            }
-        };
-        for (key, _) in values {
-            if let Some((document_id, cursor)) = iri_reference_ids(key.as_ref())
-                && select(document_id, cursor)
-            {
-                selected.push((IRI_INDEX_KEYSPACE.to_string(), key));
-            }
+    record: &MetadataRegistryRecord,
+    rows: LinkRows,
+) -> Result<bool, MetadataError> {
+    let backend = |error: MetadataQueueError| MetadataError::Backend(error.to_string());
+    let txn_id = start_write_transaction(storage).await.map_err(backend)?;
+    let result = async {
+        let status = parse_status_read(
+            storage
+                .send_effect(read_status_effect(record.document_id, Some(txn_id)))
+                .await,
+        )
+        .map_err(status_error)?;
+        if !status.is_some_and(|status| status_current(&status, record)) {
+            return Ok(false);
         }
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => break,
+        if !rows.writes.is_empty() {
+            expect_batch(
+                storage
+                    .send_storage_effect(StorageEffect::BatchWrite {
+                        writes: rows.writes,
+                        txn_id: Some(txn_id),
+                    })
+                    .await,
+            )?;
+        }
+        if !rows.deletes.is_empty() {
+            expect_batch(
+                storage
+                    .send_storage_effect(StorageEffect::BatchDelete {
+                        deletes: rows.deletes,
+                        txn_id: Some(txn_id),
+                    })
+                    .await,
+            )?;
+        }
+        Ok::<_, MetadataIriError>(true)
+    }
+    .await;
+    match result {
+        Ok(true) => match commit_storage_transaction(storage, txn_id).await {
+            Ok(()) => Ok(true),
+            Err(MetadataQueueError::Storage(StorageError::TransactionConflict)) => Ok(false),
+            Err(error) => Err(backend(error)),
+        },
+        other => {
+            abort_storage_transaction(
+                storage,
+                txn_id,
+                "Failed to abort IRI index rebuild transaction",
+                "Unexpected IRI index rebuild transaction abort result",
+            )
+            .await;
+            Ok(other?)
         }
     }
-    Ok(selected)
 }
 
-/// Keys the full rebuild must drop: a row survives only at the cursor just
-/// projected or the document's current registry cursor, so a raced-ahead
-/// materialization keeps its rows; rows in neither map (deleted, reverted) are pruned.
-async fn stale_rebuild_keys(
-    storage: &StorageHandle,
-    reprojected: &HashMap<Ulid, Ulid>,
-    registered: &HashMap<Ulid, Ulid>,
-) -> Result<Vec<(String, ByteView)>, MetadataIriError> {
-    select_keys(storage, None, |document_id, cursor| {
-        reprojected.get(&document_id) != Some(&cursor)
-            && registered.get(&document_id) != Some(&cursor)
-    })
-    .await
+fn expect_batch(event: Event) -> Result<(), MetadataIriError> {
+    match event {
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+        | Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataIriError::UnexpectedEvent(format!("{other:?}"))),
+    }
 }
 
 /// Postings and per-document rows of one document, from its own rows. Each posting comes
@@ -455,21 +445,14 @@ pub(crate) async fn delete_keys(
     keys: Vec<(String, ByteView)>,
 ) -> Result<(), MetadataError> {
     for chunk in keys.chunks(INDEX_BATCH_SIZE) {
-        match storage
-            .send_storage_effect(StorageEffect::BatchDelete {
-                deletes: chunk.to_vec(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MetadataIriError::from(error).into());
-            }
-            other => {
-                return Err(MetadataIriError::UnexpectedEvent(format!("{other:?}")).into());
-            }
-        }
+        expect_batch(
+            storage
+                .send_storage_effect(StorageEffect::BatchDelete {
+                    deletes: chunk.to_vec(),
+                    txn_id: None,
+                })
+                .await,
+        )?;
     }
     Ok(())
 }
@@ -536,6 +519,13 @@ fn collect_iri_backlinks(
         .collect()
 }
 
+fn status_error(error: StorageReadError) -> MetadataIriError {
+    match error {
+        StorageReadError::Storage(error) => error.into(),
+        StorageReadError::Conversion(error) => error.into(),
+    }
+}
+
 async fn read_materialization_status(
     storage: &StorageHandle,
     document_id: Ulid,
@@ -543,10 +533,7 @@ async fn read_materialization_status(
     let event = storage
         .send_effect(read_status_effect(document_id, None))
         .await;
-    parse_status_read(event).map_err(|error| match error {
-        StorageReadError::Storage(error) => error.into(),
-        StorageReadError::Conversion(error) => error.into(),
-    })
+    parse_status_read(event).map_err(status_error)
 }
 
 #[cfg(test)]

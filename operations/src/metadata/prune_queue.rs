@@ -951,15 +951,23 @@ mod tests {
             "https://schema.org/conformsTo",
             "https://example.test/profile",
             record.document_id,
-            Ulid::from_parts(3, 1),
         );
+        let document_row =
+            aruna_core::structs::storage::data_link::document_key(record.document_id, &index_key);
         write_entries(
             &storage,
-            vec![(
-                aruna_core::keyspaces::IRI_INDEX_KEYSPACE.to_string(),
-                index_key.clone(),
-                ByteView::from(vec![1u8]),
-            )],
+            vec![
+                (
+                    aruna_core::keyspaces::IRI_INDEX_KEYSPACE.to_string(),
+                    index_key.clone(),
+                    ByteView::from(vec![1u8]),
+                ),
+                (
+                    aruna_core::keyspaces::DOCUMENT_IRI_KEYSPACE.to_string(),
+                    ByteView::from(document_row),
+                    ByteView::from(Vec::new()),
+                ),
+            ],
         )
         .await;
         let tombstone = GraphLifecycleRecord::deleted(

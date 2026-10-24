@@ -133,41 +133,33 @@ pub fn metadata_document_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
+/// Prefix of the IRI index rows that name `object_iri`, under any predicate.
+pub fn iri_object_prefix(object_iri: &str) -> Key {
+    ByteView::from(blake3::hash(object_iri.as_bytes()).as_bytes().to_vec())
+}
+
+/// Prefix of the IRI index rows that name `object_iri` under `predicate_iri`: object first.
 pub fn iri_reference_prefix(predicate_iri: &str, object_iri: &str) -> Key {
     let mut bytes = Vec::with_capacity(64);
-    bytes.extend_from_slice(blake3::hash(predicate_iri.as_bytes()).as_bytes());
     bytes.extend_from_slice(blake3::hash(object_iri.as_bytes()).as_bytes());
+    bytes.extend_from_slice(blake3::hash(predicate_iri.as_bytes()).as_bytes());
     ByteView::from(bytes)
 }
 
-pub fn iri_reference_key(
-    predicate_iri: &str,
-    object_iri: &str,
-    document_id: Ulid,
-    document_cursor: Ulid,
-) -> Key {
+/// One row per object, predicate and document; the document cursor lives in the value.
+pub fn iri_reference_key(predicate_iri: &str, object_iri: &str, document_id: Ulid) -> Key {
     let mut bytes = iri_reference_prefix(predicate_iri, object_iri)
         .as_ref()
         .to_vec();
     bytes.extend_from_slice(&document_id.to_bytes());
-    bytes.extend_from_slice(&document_cursor.to_bytes());
     ByteView::from(bytes)
 }
 
-/// Document id and cursor packed into an IRI reference index key, or `None` when
-/// the key is not the expected 96-byte layout.
-pub fn iri_reference_ids(key: &[u8]) -> Option<(Ulid, Ulid)> {
-    if key.len() != 96 {
-        return None;
-    }
-    let mut document_id = [0u8; 16];
-    document_id.copy_from_slice(&key[64..80]);
-    let mut document_cursor = [0u8; 16];
-    document_cursor.copy_from_slice(&key[80..96]);
-    Some((
-        Ulid::from_bytes(document_id),
-        Ulid::from_bytes(document_cursor),
-    ))
+/// Document id at the end of an IRI index key, or `None` when the key is not the expected
+/// 80-byte layout.
+pub fn iri_reference_document(key: &[u8]) -> Option<Ulid> {
+    let bytes: [u8; 16] = key.get(64..)?.try_into().ok()?;
+    Some(Ulid::from_bytes(bytes))
 }
 
 pub fn create_acceptance_key(document_id: Ulid) -> Key {
@@ -677,7 +669,6 @@ pub fn iri_reference_entry(
             &record.predicate_iri,
             &record.object_iri,
             record.document_id,
-            record.document_cursor,
         ),
         postcard::to_allocvec(record)?.into(),
     ))
@@ -931,12 +922,12 @@ mod tests {
     use ulid::Ulid;
 
     use super::{
-        conflict_write_entries, graph_revision_change, iri_reference_entry, iri_reference_key,
-        iri_reference_prefix, metadata_document_key, metadata_registry_key, reducer_conflict_key,
-        reducer_conflict_prefix, reducer_state_entry, reducer_state_key, registry_write_entries,
-        shard_manifest_entry, shard_manifest_key, shard_manifest_prefix, stale_conflict_deletes,
-        sync_conflict_entry, sync_conflict_key, sync_revision_entry, sync_revision_key,
-        updated_index_key,
+        conflict_write_entries, graph_revision_change, iri_object_prefix, iri_reference_document,
+        iri_reference_entry, iri_reference_key, iri_reference_prefix, metadata_document_key,
+        metadata_registry_key, reducer_conflict_key, reducer_conflict_prefix, reducer_state_entry,
+        reducer_state_key, registry_write_entries, shard_manifest_entry, shard_manifest_key,
+        shard_manifest_prefix, stale_conflict_deletes, sync_conflict_entry, sync_conflict_key,
+        sync_revision_entry, sync_revision_key, updated_index_key,
     };
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
     use crate::document::ShardManifestEntry;
@@ -994,25 +985,16 @@ mod tests {
 
         assert_eq!(keyspace, IRI_INDEX_KEYSPACE);
         assert_eq!(prefix.as_ref().len(), 64);
-        assert_eq!(key.as_ref().len(), 96);
+        assert_eq!(key.as_ref().len(), 80);
         assert!(key.as_ref().starts_with(prefix.as_ref()));
+        assert!(
+            key.as_ref()
+                .starts_with(iri_object_prefix(&record.object_iri).as_ref())
+        );
+        assert_eq!(iri_reference_document(key.as_ref()), Some(document_id));
         assert_eq!(
             key,
-            iri_reference_key(
-                &record.predicate_iri,
-                &record.object_iri,
-                document_id,
-                record.document_cursor,
-            )
-        );
-        assert_ne!(
-            key,
-            iri_reference_key(
-                &record.predicate_iri,
-                &record.object_iri,
-                document_id,
-                Ulid::from_bytes([9; 16]),
-            )
+            iri_reference_key(&record.predicate_iri, &record.object_iri, document_id)
         );
         assert_eq!(decoded, record);
     }
