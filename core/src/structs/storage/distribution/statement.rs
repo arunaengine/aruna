@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::TransferRole;
+use super::request::TransferRole;
 use crate::NodeId;
 use crate::structs::identity::realm::RealmId;
 use crate::types::GroupId;

@@ -10,9 +10,16 @@ use super::snapshot::{DistributionSnapshot, Lifecycle};
 use super::validate::validate_config;
 use super::{
     DistributionConfig, DistributionError, DistributionMember, DistributionSettings,
-    MAX_RECORD_BYTES, MemberState, SetPhase, SetRoot, SignedStatement, StatementKind, TransferRole,
+    MAX_RECORD_BYTES, MemberState, SetPhase, SetRoot, SignedStatement, StatementKind,
 };
 use crate::structs::identity::realm::RealmId;
+
+/// What the former coordinator becomes after a transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum TransferRole {
+    Replica,
+    Leave,
+}
 
 /// Room the signature and envelope take next to an encoded snapshot.
 const SIGNED_OVERHEAD: usize = 128;

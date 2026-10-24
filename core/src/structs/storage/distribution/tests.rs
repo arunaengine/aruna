@@ -232,3 +232,15 @@ fn combinations_are_checked() {
         Err(DistributionError::InvalidBucket)
     );
 }
+
+#[test]
+fn range_behaviour_falls_back() {
+    let config = sharded(2, &["m"], 0);
+    let member = &config.members[0];
+    assert_eq!(config.range_behaviour(member), RangeBehaviour::ServeAndFill);
+    let mut stream = member.clone();
+    stream.strategy = DataStrategy::Stream;
+    assert_eq!(config.range_behaviour(&stream), RangeBehaviour::Passthrough);
+    stream.range_behaviour = Some(RangeBehaviour::FillFirst);
+    assert_eq!(config.range_behaviour(&stream), RangeBehaviour::FillFirst);
+}

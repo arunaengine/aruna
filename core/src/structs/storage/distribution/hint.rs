@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::{DistributionBinding, DistributionRecord};
+use super::{DistributionBinding, DistributionSnapshot};
 
 /// Hint bits sit right below the 48 timestamp bits, leaving 60 random bits.
 pub const HINT_BITS: u32 = 20;
@@ -66,17 +66,19 @@ pub fn with_hint(id: Ulid, hint: SetHint) -> Ulid {
     hinted_id(id.timestamp_ms(), id.random(), hint)
 }
 
-/// Local index from hint to the sets that share it, built from distribution records.
+/// Local index from hint to the sets that share it, built from distribution snapshots.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HintIndex {
     sets: BTreeMap<SetHint, BTreeSet<Ulid>>,
 }
 
 impl HintIndex {
-    pub fn from_records<'a>(records: impl IntoIterator<Item = &'a DistributionRecord>) -> Self {
+    pub fn from_snapshots<'a>(
+        snapshots: impl IntoIterator<Item = &'a DistributionSnapshot>,
+    ) -> Self {
         let mut index = Self::default();
-        for record in records {
-            index.insert(record.set_id);
+        for snapshot in snapshots {
+            index.insert(snapshot.set_id());
         }
         index
     }

@@ -9,8 +9,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::{
-    DataStrategy, DistributionConfig, DistributionRecord, KeyRange, MAX_BOUND_BYTES, MAX_MEMBERS,
-    MAX_RANGES, MAX_RECORD_BYTES, MetadataCoverage,
+    DataStrategy, DistributionConfig, KeyRange, MAX_BOUND_BYTES, MAX_MEMBERS, MAX_RANGES,
+    MetadataCoverage,
 };
 
 const MAX_BUCKET_BYTES: usize = 63;
@@ -60,8 +60,6 @@ pub enum DistributionError {
     SetMismatch(Ulid),
     #[error("set {0} does not belong to the group that creates it")]
     ForeignSet(Ulid),
-    #[error("the origin already has the most changes waiting for their predecessor")]
-    TooManyPending,
     #[error("the distribution change predecessor is stale or unknown")]
     StaleRevision,
     #[error("the distributed bucket is not pending")]
@@ -70,8 +68,6 @@ pub enum DistributionError {
     NoMember(Ulid),
     #[error("member {0} may only be admitted by its own node")]
     AdmissionOrigin(Ulid),
-    #[error("member {0} has already admitted another incarnation")]
-    IncarnationChanged(Ulid),
     #[error("member {0} has not admitted itself yet")]
     MissingAdmission(Ulid),
     #[error("a new member must start in the created state without an incarnation")]
@@ -128,16 +124,6 @@ pub fn validate_config(config: &DistributionConfig) -> Result<(), DistributionEr
         member.coverage == MetadataCoverage::Assigned && !active.contains(&member.member_id)
     }) {
         return Err(DistributionError::IdleMember(idle.member_id));
-    }
-    Ok(())
-}
-
-/// Checks a whole record, including the bound on its encoded size.
-pub fn validate_record(record: &DistributionRecord) -> Result<(), DistributionError> {
-    validate_config(&record.config)?;
-    let bytes = postcard::to_allocvec(record).map_err(|_| DistributionError::TooLarge)?;
-    if bytes.len() > MAX_RECORD_BYTES {
-        return Err(DistributionError::TooLarge);
     }
     Ok(())
 }
