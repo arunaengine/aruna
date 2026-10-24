@@ -209,3 +209,35 @@ pub(crate) fn exact(objects: i128, bytes: i128) -> RangeCounters {
         ..RangeCounters::default()
     }
 }
+
+/// Writes `count` sample entries of range `range_seed` with priorities from 1 upwards.
+pub(crate) async fn crowd_sample(handle: &StorageHandle, set_id: Ulid, range_seed: u8, count: u64) {
+    use aruna_core::keyspaces::KEY_SAMPLE_KEYSPACE;
+    use aruna_core::structs::storage::distribution::accounting::SampleEntry;
+
+    let range_id = Ulid::from_bytes([range_seed; 16]);
+    let writes = (1..=count)
+        .map(|priority| {
+            let entry = SampleEntry {
+                priority,
+                key: format!("k/{priority:05}"),
+            };
+            let key = entry.row_key(set_id, range_id);
+            (
+                KEY_SAMPLE_KEYSPACE.to_string(),
+                key.into(),
+                Vec::new().into(),
+            )
+        })
+        .collect();
+    let event = handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+}

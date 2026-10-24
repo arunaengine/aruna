@@ -89,6 +89,8 @@ pub struct RefillOperation {
     sample: Vec<SampleEntry>,
     deletes: Vec<(String, Key)>,
     delta: i128,
+    /// The sample read stopped before its end, so the count is not corrected yet.
+    truncated: bool,
     next_cursor: Cursor,
     txn_id: Option<TxnId>,
     pages: usize,
@@ -109,6 +111,7 @@ impl RefillOperation {
             sample: Vec::new(),
             deletes: Vec::new(),
             delta: 0,
+            truncated: false,
             next_cursor: Cursor::Start,
             txn_id: None,
             pages: 0,
@@ -237,7 +240,10 @@ impl RefillOperation {
             .map(|value| RangeCounters::from_bytes(&value))
             .transpose()?;
         let size = i128::try_from(kept.len()).unwrap_or(i128::MAX);
-        self.delta = size - counted.unwrap_or_default().sampled;
+        self.delta = match self.truncated {
+            true => 0,
+            false => size - counted.unwrap_or_default().sampled,
+        };
         let cursor = postcard::to_allocvec(&self.next_cursor).map_err(ConversionError::from)?;
         writes.push((
             KEY_SAMPLE_KEYSPACE.to_string(),
@@ -337,7 +343,18 @@ impl RefillOperation {
                     next_start_after,
                 }),
             ) => self.collect(values, next_start_after),
-            (State::ReadSample, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+            (
+                State::ReadSample,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                // A truncated read trims what it saw and repeats the page before it counts.
+                self.truncated = next_start_after.is_some();
+                if self.truncated {
+                    self.next_cursor = self.cursor.clone();
+                }
                 self.sample = (values.iter())
                     .filter_map(|(key, _)| SampleEntry::decode(key))
                     .collect();

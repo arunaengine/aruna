@@ -460,3 +460,47 @@ async fn full_sample_evicts() {
         i128::from(SAMPLE_SIZE)
     );
 }
+
+/// Updates of one transaction count each other's admissions, so a nearly full sample takes
+/// the second new key only in place of its largest entry.
+#[tokio::test]
+async fn counts_own_admissions() {
+    use crate::node::usage_stats::UsageCounterUpdate;
+    use aruna_core::structs::storage::usage::UsageDelta;
+
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    fill_sample(&handle, u64::MAX).await;
+    let txn_id = begin(&handle).await;
+    let almost = RangeCounters {
+        sampled: -1,
+        ..RangeCounters::default()
+    };
+    let count = sample_count_key(set(), id(1));
+    handle
+        .send_storage_effect(StorageEffect::AddCounters {
+            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+            deltas: vec![(count.clone().into(), almost)],
+            txn_id,
+        })
+        .await;
+    assert!(commit(&handle, txn_id).await);
+
+    let changes = [put("a", 1, 1, 1), put("b", 2, 1, 1)].map(|update| update.change().clone());
+    let mut update =
+        UsageCounterUpdate::for_group(Ulid::nil(), UsageDelta::default()).with_inventories(changes);
+    let txn_id = begin(&handle).await;
+    let mut effects = update.start(txn_id);
+    while let Some(effect) = effects.pop() {
+        let event = crate::distribution::test_store::send(&handle, effect).await;
+        match update.step(event, txn_id).unwrap() {
+            Some(next) => effects = next,
+            None => break,
+        }
+    }
+    assert!(commit(&handle, txn_id).await);
+    assert_eq!(
+        counters(&handle, count).await.sampled,
+        i128::from(SAMPLE_SIZE)
+    );
+}

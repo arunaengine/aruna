@@ -250,7 +250,20 @@ impl SplitOperation {
                     txn_id: self.txn_id,
                 })])
             }
-            (State::ReadSample, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+            (
+                State::ReadSample,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                // Entries beyond the read would stay behind under the retired parent.
+                if next_start_after.is_some() {
+                    return Err(SplitError::Refused(
+                        range_id,
+                        "the key sample needs a refill",
+                    ));
+                }
                 let writes = self.plan(values)?;
                 self.state = State::Write;
                 Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {

@@ -38,7 +38,7 @@ use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
@@ -77,6 +77,8 @@ pub struct UsageCounterUpdate {
     dirty_group: Option<GroupId>,
     /// The distributed bucket rows of each changed key, maintained in the same transaction.
     inventory: VecDeque<InventoryUpdate>,
+    /// Sample entries the finished inventory updates added, per range, for the next ones.
+    sampled: BTreeMap<ulid::Ulid, i128>,
     phase: UsageUpdatePhase,
 }
 
@@ -230,6 +232,7 @@ impl UsageCounterUpdate {
             bucket: None,
             dirty_group: Some(group_id),
             inventory: VecDeque::new(),
+            sampled: BTreeMap::new(),
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -250,6 +253,7 @@ impl UsageCounterUpdate {
             bucket: None,
             dirty_group: Some(group_id),
             inventory: VecDeque::new(),
+            sampled: BTreeMap::new(),
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -287,6 +291,7 @@ impl UsageCounterUpdate {
             bucket: None,
             dirty_group: None,
             inventory: VecDeque::new(),
+            sampled: BTreeMap::new(),
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -362,7 +367,12 @@ impl UsageCounterUpdate {
                 match inventory.step(event, txn_id)? {
                     Some(effects) => Ok(Some(effects)),
                     None => {
-                        self.inventory.pop_front();
+                        let finished = self.inventory.pop_front();
+                        if let Some((range_id, entries)) =
+                            finished.and_then(|update| update.sample_change())
+                        {
+                            *self.sampled.entry(range_id).or_default() += entries;
+                        }
                         Ok(self.next_inventory(txn_id))
                     }
                 }
@@ -378,7 +388,10 @@ impl UsageCounterUpdate {
     /// Starts the next key's inventory update, or ends the update when none is left.
     fn next_inventory(&mut self, txn_id: TxnId) -> Option<Effects> {
         match self.inventory.front_mut() {
-            Some(inventory) => Some(inventory.start(txn_id)),
+            Some(inventory) => {
+                inventory.set_sampled(self.sampled.clone());
+                Some(inventory.start(txn_id))
+            }
             None => {
                 self.phase = UsageUpdatePhase::Done;
                 None

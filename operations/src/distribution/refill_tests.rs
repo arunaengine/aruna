@@ -80,3 +80,18 @@ async fn restores_lost_sample() {
     let count = counters(&handle, sample_count_key(set(), range_id())).await;
     assert_eq!(count.sampled, 60, "the refill corrects the count row");
 }
+
+/// A sample larger than one read is trimmed over repeated pages, and only a complete read
+/// corrects the count.
+#[tokio::test]
+async fn trims_crowded_sample() {
+    use crate::distribution::test_store::crowd_sample;
+
+    let (_dir, handle) = open();
+    install(&handle, set(), &[range(1, "", None)]).await;
+    crowd_sample(&handle, set(), 1, 1200).await;
+    assert_eq!(refill(&handle, 100).await, RefillOutcome::Done);
+    assert_eq!(sample(&handle).await.len(), usize::from(SAMPLE_SIZE));
+    let count = counters(&handle, sample_count_key(set(), range_id())).await;
+    assert_eq!(count.sampled, i128::from(SAMPLE_SIZE));
+}

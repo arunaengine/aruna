@@ -194,3 +194,15 @@ async fn children_keep_epoch() {
         assert_eq!(charged(&handle, child).await.max_epoch, OriginalEpoch(7));
     }
 }
+
+/// A sample larger than one read is refused, so no entry stays behind under the parent.
+#[tokio::test]
+async fn refuses_crowded_sample() {
+    use crate::distribution::test_store::crowd_sample;
+
+    let (_dir, handle) = open();
+    install(&handle, set(), &[range(1, "", None)]).await;
+    crowd_sample(&handle, set(), 1, u64::from(SAMPLE_SIZE) * 2 + 1).await;
+    let result = drive(split_at("m"), &context(&handle)).await;
+    assert!(matches!(result, Err(SplitError::Refused(..))));
+}

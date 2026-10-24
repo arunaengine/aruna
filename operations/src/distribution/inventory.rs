@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -119,6 +121,11 @@ pub struct InventoryUpdate {
     counters: Vec<(Key, RangeCounters)>,
     /// A key that gained a head and may enter the sample once its size is known.
     candidate: Option<SampleEntry>,
+    /// Entries earlier updates of the same transaction added to each range's sample; the
+    /// committed count does not show them yet.
+    sampled_before: BTreeMap<Ulid, i128>,
+    /// The entries this update adds to or removes from its range's sample.
+    sample_change: Option<(Ulid, i128)>,
 }
 
 fn row(key_space: &str, key: Vec<u8>, value: Vec<u8>) -> (String, Key, Value) {
@@ -134,6 +141,8 @@ impl InventoryUpdate {
             deletes: Vec::new(),
             counters: Vec::new(),
             candidate: None,
+            sampled_before: BTreeMap::new(),
+            sample_change: None,
         }
     }
 
@@ -143,6 +152,16 @@ impl InventoryUpdate {
 
     pub fn change(&self) -> &InventoryChange {
         &self.change
+    }
+
+    /// Counts what earlier updates of the same transaction added to each range's sample.
+    pub fn set_sampled(&mut self, sampled: BTreeMap<Ulid, i128>) {
+        self.sampled_before = sampled;
+    }
+
+    /// The range and the number of sample entries this update added (or removed, negative).
+    pub fn sample_change(&self) -> Option<(Ulid, i128)> {
+        self.sample_change
     }
 
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
@@ -198,7 +217,13 @@ impl InventoryUpdate {
                 let stored = value
                     .map(|value| RangeCounters::from_bytes(&value))
                     .transpose()?;
-                if stored.unwrap_or_default().sampled < i128::from(SAMPLE_SIZE) {
+                let pending = self
+                    .sampled_before
+                    .get(&range_id)
+                    .copied()
+                    .unwrap_or_default();
+                let size = stored.unwrap_or_default().sampled.saturating_add(pending);
+                if size < i128::from(SAMPLE_SIZE) {
                     self.admit(range_id, None)?;
                     return Ok(self.next_effect(txn_id));
                 }
@@ -482,6 +507,8 @@ impl InventoryUpdate {
         };
         let key = sample_count_key(self.change.set_id, range_id);
         self.counters.push((key.into(), delta));
+        let total = self.sample_change.map_or(0, |(_, total)| total);
+        self.sample_change = Some((range_id, total.saturating_add(entries)));
     }
 
     fn next_effect(&mut self, txn_id: TxnId) -> Option<Effects> {
