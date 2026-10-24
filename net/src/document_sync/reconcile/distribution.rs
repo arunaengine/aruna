@@ -107,7 +107,7 @@ pub(in crate::document_sync) async fn apply_distribution_operation(
     storage: &StorageHandle,
     document_target: DocumentTarget,
     event: AdminDocumentEvent,
-) -> Result<()> {
+) -> Result<Handled> {
     let (
         DocumentTarget::RealmConfig { realm_id },
         AdminDocumentTarget::Distribution {
@@ -135,11 +135,13 @@ pub(in crate::document_sync) async fn apply_distribution_operation(
         .await?
         .authority(snapshot)
     {
-        Authority::Current => install_snapshot(storage, &event, set_id).await,
-        Authority::Unknown => park_snapshot(storage, &event, snapshot).await.map(|_| ()),
+        Authority::Current => install_snapshot(storage, &event, set_id)
+            .await
+            .map(|()| Handled::Done),
+        Authority::Unknown => park_snapshot(storage, &event, snapshot).await,
         Authority::Ended(reason) => {
             warn!(%set_id, %reason, "Dropping a distribution snapshot without authority");
-            Ok(())
+            Ok(Handled::Done)
         }
     }
 }

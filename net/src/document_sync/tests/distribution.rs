@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, PARKED_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, DISTRIBUTION_KEYSPACE, PARKED_INDEX_KEYSPACE};
 use aruna_core::structs::storage::distribution::presets::replica_layout;
 use aruna_core::structs::storage::distribution::publisher_key;
 use aruna_core::structs::storage::distribution::{
@@ -596,5 +596,80 @@ async fn local_membership_retries() {
     service.reconcile_document_topics([topic_id]).await.unwrap();
     assert_eq!(parked(&storage).await, None);
     assert_eq!(stored(&storage).await.unwrap().head.snapshot, created());
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn overflow_replays_snapshot() {
+    // With parking full the cursor still moves on; the overflow checkpoint replays the
+    // skipped snapshot once room frees, so it is never lost.
+    use aruna_core::structs::storage::distribution::parking::MAX_PARKED;
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    const LOCAL: u8 = 46;
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(LOCAL).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm(),
+    )
+    .expect("document sync service opens");
+    let target = DocumentTarget::RealmConfig { realm_id: realm() };
+    let topic_id = target.sync_topic_id(realm(), &PlacementRef::NIL);
+    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    config.ensure_node(node(LOCAL), RealmNodeKind::Management);
+    let mut rows = vec![target_write_entry(
+        target.clone(),
+        config.to_bytes(&actor(LOCAL)).unwrap().into(),
+    )];
+    // Index rows without bodies fill the bound; the retry later drops them as unreadable.
+    for index in 0..MAX_PARKED as u32 {
+        let mut key = vec![0u8; 48];
+        key[..4].copy_from_slice(&index.to_be_bytes());
+        rows.push((
+            PARKED_INDEX_KEYSPACE.to_string(),
+            key.into(),
+            1u64.to_be_bytes().to_vec().into(),
+        ));
+    }
+    batch_write_to(&storage, rows).await.unwrap();
+
+    let snapshot = published(PUBLISHER, created(), PUBLISHER);
+    let signature = secret(PUBLISHER).sign(&snapshot.signing_bytes(&PlacementRef::NIL).unwrap());
+    let published = service
+        .publish_documents(
+            vec![DocumentSyncPublish::AdminOperation {
+                target: target.clone(),
+                event: Box::new(snapshot),
+                placement: PlacementRef::NIL,
+                allow_genesis: true,
+                origin_signature: Some(signature),
+            }],
+            Vec::new(),
+        )
+        .await;
+    assert!(matches!(
+        published,
+        DocumentNetEvent::DocumentsPublished { .. }
+    ));
+    reset_test_cursor(&service, topic_id).await;
+    service.reconcile_document_topics([topic_id]).await.unwrap();
+    let cursor = read_test_cursor(&storage, topic_id).await.expect("cursor");
+    let clock = service.node().storage().actor_clock(&topic_id).unwrap();
+    assert!(cursor.dominates(&clock));
+    assert_eq!(parked(&storage).await, Some(1));
+    let mut overflow = b"overflow-cursor/".to_vec();
+    overflow.extend_from_slice(topic_id.as_bytes());
+    let checkpoint = storage_read_from(&storage, APPLIED_OPS_KEYSPACE.to_string(), overflow.into())
+        .await
+        .unwrap();
+    assert_eq!(
+        checkpoint, None,
+        "the replay reached the cursor and cleared its checkpoint"
+    );
     service.shutdown().await;
 }

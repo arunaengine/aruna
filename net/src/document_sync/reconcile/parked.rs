@@ -10,10 +10,10 @@ use aruna_core::structs::storage::distribution::parking::{
 };
 use aruna_core::structs::storage::distribution::{SignedSnapshot, publisher_key};
 
-/// Whether a parked snapshot was kept, or must be revisited because the bound is reached.
+/// Whether a snapshot was handled, or must be revisited because the parking bound is reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::document_sync) enum Parked {
-    Kept,
+pub(in crate::document_sync) enum Handled {
+    Done,
     Full,
 }
 
@@ -22,7 +22,7 @@ pub(in crate::document_sync) async fn park_snapshot(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
     signed: &SignedSnapshot,
-) -> Result<Parked> {
+) -> Result<Handled> {
     let snapshot = &signed.snapshot;
     let key: ByteView = publisher_key(&snapshot.root.publisher, snapshot.set_id()).into();
     for _ in 0..APPLY_CONFLICT_ATTEMPTS {
@@ -36,11 +36,11 @@ pub(in crate::document_sync) async fn park_snapshot(
         let entry = match decided {
             Ok(ParkDecision::Store(entry)) => entry,
             Ok(ParkDecision::Unchanged) => {
-                return abort_txn(storage, txn_id).await.map(|()| Parked::Kept);
+                return abort_txn(storage, txn_id).await.map(|()| Handled::Done);
             }
             Ok(ParkDecision::Full) => {
                 warn!(set_id = %snapshot.set_id(), "Parked distribution snapshots reached their bound");
-                return abort_txn(storage, txn_id).await.map(|()| Parked::Full);
+                return abort_txn(storage, txn_id).await.map(|()| Handled::Full);
             }
             Err(error) => return Err(abort_error(storage, txn_id, error).await),
         };
@@ -59,7 +59,7 @@ pub(in crate::document_sync) async fn park_snapshot(
             ),
         ];
         match replace_batch_in(storage, txn_id, Vec::new(), writes).await {
-            Ok(()) => return Ok(Parked::Kept),
+            Ok(()) => return Ok(Handled::Done),
             Err(NetError::Storage(StorageError::TransactionConflict)) => {
                 let _ = abort_txn(storage, txn_id).await;
             }

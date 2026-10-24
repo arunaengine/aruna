@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::admin_documents::AdminDocumentEvent;
+use aruna_core::admin_documents::{AdminDocumentEvent, AdminDocumentTarget};
 use aruna_core::document::{DocumentEvent, DocumentTarget};
 use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::structs::SyncQuarantineIdentity;
@@ -18,9 +18,11 @@ use crate::document_sync::{
 use crate::error::{NetError, Result};
 
 use super::admin::{apply_admin_operation, coalescible_config_op, flush_config_run};
+use super::distribution::apply_distribution_operation;
 use super::links::apply_link_event;
 use super::materialize::reduced_admin_target;
 use super::metadata::{MetadataOutcome, apply_metadata_event, apply_policy_event};
+use super::parked::Handled;
 use super::satisfied_dependencies;
 use super::shared::{SharedOutcome, apply_shared_event, apply_watch_event};
 use super::validate::{AdminEventValidation, ConfigValidationCache, validate_admin_event};
@@ -34,6 +36,8 @@ pub(super) struct BatchOutcome {
     pub(super) cross_topic: BTreeSet<DocumentSyncDependency>,
     pub(super) satisfied: BTreeSet<DocumentSyncDependency>,
     pub(super) deferred_creates: bool,
+    /// A distribution snapshot could not be parked because the bound was reached.
+    pub(super) overflowed: bool,
 }
 
 struct DeferredAdmin {
@@ -336,6 +340,12 @@ pub(super) async fn apply_admin_event(
                 *run = Some((target.clone(), vec![*event]));
             }
         }
+    } else if matches!(event.target, AdminDocumentTarget::Distribution { .. }) {
+        let handled =
+            apply_distribution_operation(&service.storage, target.clone(), *event).await?;
+        // The cursor still moves on; an overflow replay revisits this batch later.
+        state.outcome.overflowed |= handled == Handled::Full;
+        state.validation_cache.invalidate();
     } else {
         apply_admin_operation(&service.storage, target.clone(), *event).await?;
         state.validation_cache.invalidate();

@@ -42,6 +42,8 @@ use super::{dependency_available, register_deferred_topic, remove_deferred_topic
 /// under. The cursor is already advanced past the batch.
 struct ReconcileBatch {
     genesis: ::irokle::OpId,
+    /// The cursor the batch starts from, where an overflow replay resumes.
+    start: ::irokle::ActorClock,
     cursor_key: ByteView,
     cursor: ::irokle::ActorClock,
     rejections: Vec<SyncRejection>,
@@ -85,7 +87,11 @@ impl DocumentSyncService {
             let genesis = batch.genesis;
             let cursor = batch.cursor.clone();
             let cursor_key = batch.cursor_key.clone();
+            let start = batch.start.clone();
             let mut outcome = self.apply_reconcile_batch(topic_id, batch).await?;
+            if outcome.overflowed {
+                self.record_overflow(topic_id, genesis, &start).await?;
+            }
             applied_targets.append(&mut outcome.applied_targets);
             metadata_graph_tombstones.append(&mut outcome.graph_tombstones);
             pending_metadata_creates.append(&mut outcome.pending_creates);
@@ -172,6 +178,7 @@ impl DocumentSyncService {
         // Every pass, with or without new events, gives parked snapshots another chance:
         // a local membership change never passes through the replicated apply path.
         super::retry_parked(&self.storage, self.realm_id).await?;
+        self.replay_overflow().await?;
         Ok(DocumentReconcileResult {
             targets: applied_targets,
             metadata_create_events,
@@ -250,6 +257,7 @@ impl DocumentSyncService {
         }
         Ok(Some(ReconcileBatch {
             genesis,
+            start: cursor,
             cursor_key,
             cursor: batch.cursor,
             rejections: batch.rejections,
