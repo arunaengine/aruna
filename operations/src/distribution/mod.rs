@@ -29,6 +29,7 @@ pub mod status;
 pub(crate) mod test_record;
 #[cfg(test)]
 pub(crate) mod test_store;
+pub mod versions;
 
 /// Signs a snapshot with this node's key, only when this node is the set's bound publisher.
 pub(crate) fn sign_snapshot(context: &DriverContext, claim: SnapshotClaim) -> SnapshotSignEvent {
