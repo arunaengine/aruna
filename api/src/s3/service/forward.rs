@@ -46,6 +46,9 @@ const PASSED_HEADERS: &[&str] = &[
     "expires",
     "if-match",
     "if-none-match",
+    "x-amz-checksum-algorithm",
+    "x-amz-checksum-type",
+    "x-amz-mp-object-size",
     "x-amz-tagging",
 ];
 
@@ -149,7 +152,7 @@ fn unreachable_error(forward: &Forward) -> S3Error {
 }
 
 /// The text between `<tag>` and `</tag>` of an S3 error body, with basic entities decoded.
-fn xml_field(body: &str, tag: &str) -> Option<String> {
+pub(super) fn xml_field(body: &str, tag: &str) -> Option<String> {
     let start = body.find(&format!("<{tag}>"))? + tag.len() + 2;
     let end = start + body.get(start..)?.find(&format!("</{tag}>"))?;
     let text = body.get(start..end)?;
@@ -185,7 +188,7 @@ fn coordinator_error(forward: &Forward, status: http::StatusCode, body: &str) ->
     error
 }
 
-fn header(response: &reqwest::Response, name: &str) -> Option<String> {
+pub(super) fn header(response: &reqwest::Response, name: &str) -> Option<String> {
     response
         .headers()
         .get(name)

@@ -87,7 +87,14 @@ impl Display for Action {
 pub(crate) struct DelegatedRequest;
 
 /// The S3 operations a member forwards to a range's coordinator.
-const DELEGATED_OPERATIONS: &[&str] = &["PutObject", "DeleteObject"];
+const DELEGATED_OPERATIONS: &[&str] = &[
+    "PutObject",
+    "DeleteObject",
+    "CreateMultipartUpload",
+    "UploadPart",
+    "CompleteMultipartUpload",
+    "AbortMultipartUpload",
+];
 
 #[derive(Clone)]
 pub struct AuthProvider {

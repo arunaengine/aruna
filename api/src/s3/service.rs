@@ -9,6 +9,7 @@ mod bucket;
 mod copy;
 mod encryption;
 mod forward;
+mod forward_parts;
 mod listing;
 
 pub(crate) use forward::forwarded_digest;
@@ -1142,6 +1143,23 @@ impl S3 for ArunaS3Service {
         )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        // Uploads run on the coordinator of the key's range.
+        if let Some(forward) = self
+            .forward_target(&req.extensions, bucket_info.as_ref(), &req.input.key)
+            .await?
+        {
+            let request = forward::ForwardRequest {
+                method: http::Method::POST,
+                operation: "CreateMultipartUpload",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: forward::passed_headers(&req.headers, None),
+                body: None,
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Self::forwarded_create(response, req.input.bucket, req.input.key).await;
+        }
         let checksum_hint = parse_checksum_hint(&req.input)?;
 
         let group_id = bucket_info
@@ -1219,6 +1237,34 @@ impl S3 for ArunaS3Service {
         let checksum_request = parse_upload_checksum(&req.headers, trailer_algorithm)?;
         let trailing_headers = req.trailing_headers.clone();
         let upload_id = parse_upload_id(&req.input.upload_id)?;
+        let bucket_info = req.extensions.get::<BucketInfo>();
+        if let Some(forward) = self
+            .forward_target(&req.extensions, bucket_info, &req.input.key)
+            .await?
+        {
+            let body = req.input.body.take().map(|body| {
+                match (trailer_algorithm, trailing_headers.clone()) {
+                    (Some(algorithm), Some(headers)) => verify_trailer_stream(
+                        body,
+                        algorithm,
+                        checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE,
+                        move || headers.read(Clone::clone),
+                    ),
+                    _ => body,
+                }
+            });
+            let request = forward::ForwardRequest {
+                method: http::Method::PUT,
+                operation: "UploadPart",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: forward::passed_headers(&req.headers, req.input.content_length),
+                body,
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Ok(Self::forwarded_part(&response));
+        }
         let body = req
             .input
             .body
@@ -1384,6 +1430,26 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
+        if let Some(forward) = self
+            .forward_target(&req.extensions, bucket_info.as_ref(), &req.input.key)
+            .await?
+        {
+            let body = forward_parts::completion_body(req.input.multipart_upload.as_ref());
+            let mut headers = forward::passed_headers(&req.headers, Some(body.len() as i64));
+            headers.retain(|(name, _)| name != "content-type");
+            headers.push(("content-type".to_string(), "application/xml".to_string()));
+            let request = forward::ForwardRequest {
+                method: http::Method::POST,
+                operation: "CompleteMultipartUpload",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers,
+                body: Some(StreamingBlob::from(bytes::Bytes::from(body))),
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Self::forwarded_complete(response).await;
+        }
         let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
         let checksum_request = parse_completion_checksum(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
@@ -1509,11 +1575,28 @@ impl S3 for ArunaS3Service {
             "Received ABORT MULTIPART Request"
         );
 
-        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
+        let bucket_info = req.extensions.get::<BucketInfo>();
+        if let Some(forward) = self
+            .forward_target(&req.extensions, bucket_info, &req.input.key)
+            .await?
+        {
+            let request = forward::ForwardRequest {
+                method: http::Method::DELETE,
+                operation: "AbortMultipartUpload",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: Vec::new(),
+                body: None,
+            };
+            self.forward_write(&user_access, &forward, request).await?;
+            return Ok(S3Response::new(AbortMultipartUploadOutput::default()));
+        }
         let operation = AbortUploadOperation::new(AMUI {
             bucket: req.input.bucket,
             key: req.input.key,
