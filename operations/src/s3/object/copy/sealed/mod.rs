@@ -45,6 +45,9 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::with_hint;
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -268,6 +271,27 @@ impl SealedCopyOperation {
         let outcome = gate.finalize().map_err(PolicyGateError::from)?;
         gate_decision(outcome)?;
         self.read_abe()
+    }
+
+    /// The copy names its exact source version: by global id in a distributed bucket.
+    fn copy_origin(&self) -> Option<VersionOrigin> {
+        let from = match self.binding {
+            Some(_) => OriginVersion::Global(GlobalId::Version {
+                realm_id: self.input.realm_id,
+                version_id: self.input.source_version_id,
+            }),
+            None => OriginVersion::Node(
+                VersionedObjectArn::new(
+                    self.input.realm_id,
+                    self.input.node_id,
+                    &self.input.bucket,
+                    &self.input.source_key,
+                    self.input.source_version_id,
+                )
+                .ok()?,
+            ),
+        };
+        Some(VersionOrigin::Copy { from })
     }
 
     fn source_version(&self) -> VersionKey {
@@ -512,6 +536,7 @@ impl SealedCopyOperation {
         self.version = Some(
             version
                 .with_metadata(metadata)
+                .with_origin(self.copy_origin())
                 .with_policies(self.refs.clone())?,
         );
         self.existing = head

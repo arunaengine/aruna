@@ -39,6 +39,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use std::time::SystemTime;
@@ -318,6 +319,7 @@ pub async fn write_reference_version(
             write.user_id,
             now,
         )
+        .with_origin(Some(VersionOrigin::Source { database: None }))
         .with_policies(policies)?;
         let version = stamp_version(version, binding.as_ref(), generation, epoch);
         apply_storage_effect(

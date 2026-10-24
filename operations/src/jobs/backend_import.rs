@@ -1741,6 +1741,12 @@ async fn put_version(
         routing: run.routing.clone(),
     })
     .without_envelope()
+    .with_version_origin(Some(
+        aruna_core::structs::storage::origin::VersionOrigin::Storage {
+            backend_id: run.rule.backend_id,
+            key: location.backend_path.clone(),
+        },
+    ))
     .with_adopted(discovered_copy(&run.rule, location))
     .with_bucket_guard(run.bucket.clone())
     .with_restrictions(spec.auth_context.path_restrictions.clone())

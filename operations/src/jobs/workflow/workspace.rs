@@ -1009,7 +1009,12 @@ async fn put_file_output(
         routing,
     })
     .with_inherited_policies(inherited.to_vec())
-    .with_metadata(output_metadata(key));
+    .with_metadata(output_metadata(key))
+    .with_version_origin(Some(
+        aruna_core::structs::storage::origin::VersionOrigin::Job {
+            run_id: ulid::Ulid::from_bytes(record.job_id.to_bytes()),
+        },
+    ));
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }

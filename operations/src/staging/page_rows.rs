@@ -34,6 +34,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
@@ -436,6 +437,7 @@ fn register_rows(
         input.user_id,
         input.now,
     )
+    .with_origin(Some(VersionOrigin::Source { database: None }))
     .with_policies(guards.policies.clone())?;
     let version_key = VersionKey::new(&input.bucket, &entry.target_key, version_id);
     let pointer = CurrentVersionPointer::next_for(head, version_id)?;

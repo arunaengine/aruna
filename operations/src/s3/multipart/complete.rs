@@ -63,6 +63,7 @@ use aruna_core::structs::storage::multipart::{
     MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload,
     MultipartUploadStatus, WorkingShare,
 };
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::{PlainTarget, RoutingSnapshot};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -1737,7 +1738,11 @@ impl CompleteUploadOperation {
                 None,
             ),
         }
-        .with_metadata(upload_record.metadata.clone());
+        .with_metadata(upload_record.metadata.clone())
+        .with_origin(Some(VersionOrigin::Upload {
+            node_id: self.input.node_id,
+            device: None,
+        }));
         // Union with what part copies inherited: a part-wise copy of a governed
         // source can only add refs to the composed object.
         let mut policies = self.bucket_policies.clone();

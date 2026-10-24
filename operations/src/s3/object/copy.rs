@@ -9,6 +9,7 @@ use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
+use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectResult, TokenRead, read_source, reference_archive,
@@ -36,6 +37,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::resolve_backend;
 use aruna_core::types::GroupId;
 use futures_util::StreamExt;
@@ -318,6 +322,7 @@ async fn copy_inner(
         return sealed_copy(context, input, head, location, source_last_modified).await;
     }
 
+    let source_names = (input.source_bucket.clone(), input.source_key.clone());
     let source_input = GetObjectInput {
         bucket: input.source_bucket,
         key: input.source_key,
@@ -378,6 +383,13 @@ async fn copy_inner(
         .map(SourceMetadata::enforced_checksums)
         .unwrap_or_default();
     let gate = gate_context(context, input.realm_id, now_ms()).await?;
+    let origin = copy_origin(
+        context,
+        (input.realm_id, input.node_id),
+        (&source_names.0, &source_names.1),
+        source_version_id,
+    )
+    .await;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: input.user_id,
         group_id: input.group_id,
@@ -399,6 +411,7 @@ async fn copy_inner(
     })
     .without_envelope()
     .with_metadata(metadata)
+    .with_version_origin(origin)
     .with_inherited_policies(source.source_policies.clone())
     .with_restrictions(input.restrictions.clone());
     if let Some(location) = adopt {
@@ -421,6 +434,29 @@ async fn copy_inner(
         source_version_id,
         source_last_modified,
     })
+}
+
+/// A copy's origin: its exact source version, by global id in a distributed bucket.
+async fn copy_origin(
+    context: &DriverContext,
+    (realm_id, node_id): (RealmId, NodeId),
+    (bucket, key): (&str, &str),
+    version_id: Option<Ulid>,
+) -> Option<VersionOrigin> {
+    let version_id = version_id?;
+    let source = drive(GetBucketOperation::new(bucket.to_string()), context)
+        .await
+        .ok()?;
+    let from = match source.distribution {
+        Some(_) => OriginVersion::Global(GlobalId::Version {
+            realm_id,
+            version_id,
+        }),
+        None => OriginVersion::Node(
+            VersionedObjectArn::new(realm_id, node_id, bucket, key, version_id).ok()?,
+        ),
+    };
+    Some(VersionOrigin::Copy { from })
 }
 
 /// Publishes the destination as a new version of the source's archive and grants.

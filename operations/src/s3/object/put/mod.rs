@@ -58,6 +58,7 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key, Value};
@@ -303,6 +304,8 @@ pub struct PutObjectOperation {
     /// observed after streaming cannot commit a stale ref set.
     bucket_policies: Vec<PlacementPolicyRef>,
     inherited_policies: Vec<PlacementPolicyRef>,
+    /// The origin a caller names, such as a copy's source; an upload by default.
+    version_origin: Option<VersionOrigin>,
     /// Destination details of this node. Absent means no governed byte may be
     /// materialized here at all.
     gate_context: Option<GateContext>,
@@ -388,6 +391,7 @@ impl PutObjectOperation {
             stored_policies: Vec::new(),
             bucket_policies: Vec::new(),
             inherited_policies: Vec::new(),
+            version_origin: None,
             gate_context: None,
             gate: None,
             gated_bucket: None,
@@ -471,6 +475,12 @@ impl PutObjectOperation {
     /// constrained as what it was copied from.
     pub fn with_inherited_policies(mut self, policies: Vec<PlacementPolicyRef>) -> Self {
         self.inherited_policies = policies;
+        self
+    }
+
+    /// The origin the new version records instead of an upload.
+    pub fn with_version_origin(mut self, origin: Option<VersionOrigin>) -> Self {
+        self.version_origin = origin;
         self
     }
 
@@ -1443,7 +1453,16 @@ impl PutObjectOperation {
                 created_by,
                 self.config.version_source.clone(),
             )
-            .with_metadata(self.metadata.clone());
+            .with_metadata(self.metadata.clone())
+            .with_origin(Some(self.version_origin.clone().unwrap_or(
+                match self.config.version_source {
+                    Some(_) => VersionOrigin::Source { database: None },
+                    None => VersionOrigin::Upload {
+                        node_id: self.config.node_id,
+                        device: None,
+                    },
+                },
+            )));
             let version = match version.with_policies(self.effective_policies()) {
                 Ok(version) => version,
                 Err(err) => return self.emit_error(err.into()),

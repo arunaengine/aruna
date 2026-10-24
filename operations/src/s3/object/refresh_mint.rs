@@ -206,6 +206,8 @@ impl MintSuccessorOperation {
             now,
         )
         .with_metadata(self.predecessor.metadata.clone())
+        .with_origin(self.predecessor.origin.clone())
+        .with_hop(self.predecessor.hop.clone())
         .with_advance_count(advance_count + 1)
         .with_policies(self.predecessor.placement_policies.clone())?;
         let version_key = VersionKey::new(&refresh.bucket, &refresh.key, version_id);
