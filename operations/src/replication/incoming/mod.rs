@@ -2511,7 +2511,8 @@ impl IncomingVersionOperation {
     }
 
     fn register_blob_dht(&mut self) -> Effects {
-        if self.is_reference_item() {
+        // Distributed buckets are found through their content indexes, not the DHT.
+        if self.is_reference_item() || self.destination_bound {
             return self.send_apply_complete();
         }
         let Ok(location) = self.effective_materialized_location() else {

@@ -1948,6 +1948,10 @@ impl PutObjectOperation {
         let Some(blake3_hash) = location.get_blake3() else {
             return self.continue_after_registration();
         };
+        // Distributed buckets are found through their content indexes, not the DHT.
+        if self.binding.is_some() {
+            return self.continue_after_registration();
+        }
         self.state = PutObjectState::RegisterBlobDht;
         match dht_registration_effect(blake3_hash, self.config.realm_id, &self.rocrate_limits) {
             Ok(effect) => smallvec![effect],

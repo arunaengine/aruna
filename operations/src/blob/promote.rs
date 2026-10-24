@@ -118,6 +118,9 @@ pub struct PromotePendingOperation {
     output: Option<Result<Promotion, PromoteError>>,
     /// A read admitted outside the unlock registry, such as with a token credential.
     lease: Option<ReadLease>,
+    /// Whether an owner sits in an ordinary bucket; `None` before any owner bucket was read.
+    /// Only owners all in distributed buckets keep the hash out of the DHT.
+    announced: Option<bool>,
 }
 
 impl PromotePendingOperation {
@@ -146,6 +149,7 @@ impl PromotePendingOperation {
             promoted: 0,
             output: None,
             lease: None,
+            announced: None,
         }
     }
 
@@ -459,8 +463,10 @@ impl PromotePendingOperation {
         for (key, value) in buckets {
             let bucket = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
             if let Some(value) = value {
-                self.groups
-                    .insert(bucket, BucketInfo::from_bytes(&value)?.group_id);
+                let info = BucketInfo::from_bytes(&value)?;
+                let ordinary = info.distribution.is_none();
+                self.announced = Some(self.announced.unwrap_or(false) || ordinary);
+                self.groups.insert(bucket, info.group_id);
             }
         }
         let backend = self
@@ -642,6 +648,11 @@ impl PromotePendingOperation {
             return self.start_page();
         }
         let blake3 = self.blake3.unwrap_or_default();
+        // Distributed buckets are found through their content indexes, not the DHT.
+        if self.announced == Some(false) {
+            let versions = self.promoted;
+            return self.finish(Ok(Promotion::Promoted { blake3, versions }));
+        }
         match dht_registration_effect(&blake3, self.realm_id, &self.limits) {
             Ok(effect) => {
                 self.state = State::Register;
