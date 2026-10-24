@@ -80,6 +80,14 @@ pub const DELEGATION_NONCE_KEYSPACE: &str = "distribution_delegation_nonces";
 pub const CATCH_UP_KEYSPACE: &str = "distribution_catch_up";
 /// Bootstrap cursors of catching-up members by set id, member id and range id.
 pub const BOOTSTRAP_KEYSPACE: &str = "distribution_bootstrap";
+/// Copy-on-use attachments by set id and version id: a verified local copy a GET reads.
+pub const ATTACHMENT_KEYSPACE: &str = "distribution_attachments";
+/// Cache-on-use entries by BLAKE3, and the cache totals row.
+pub const CACHE_ENTRY_KEYSPACE: &str = "distribution_cache_entries";
+/// Cache entries in admission order, by entry ULID, so eviction starts at the oldest.
+pub const CACHE_ORDER_KEYSPACE: &str = "distribution_cache_order";
+/// Claims on filling one kept copy, so concurrent reads fetch it once.
+pub const FILL_CLAIM_KEYSPACE: &str = "distribution_fill_claims";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
@@ -510,6 +518,10 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DELEGATION_NONCE_KEYSPACE,
     CATCH_UP_KEYSPACE,
     BOOTSTRAP_KEYSPACE,
+    ATTACHMENT_KEYSPACE,
+    CACHE_ENTRY_KEYSPACE,
+    CACHE_ORDER_KEYSPACE,
+    FILL_CLAIM_KEYSPACE,
     DOCUMENT_CONFLICT_KEYSPACE,
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,

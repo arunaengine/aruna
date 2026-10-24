@@ -16,6 +16,7 @@ pub mod delegation;
 pub mod delivery;
 pub mod hint;
 pub mod inventory;
+pub mod on_use;
 pub mod parking;
 pub mod presets;
 pub mod request;
