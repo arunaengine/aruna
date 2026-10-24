@@ -210,8 +210,15 @@ impl PublishOperation {
                 .transpose()
                 .map_err(ConversionError::from)?,
         };
-        if self.stored.config.is_none() {
+        let Some(config) = self.stored.config.as_ref() else {
             return Err(PublishError::ConfigMissing);
+        };
+        // A publisher removed from the realm, or never able to publish, accepts nothing.
+        let member = config
+            .sync_eligible_nodes()
+            .is_ok_and(|nodes| nodes.contains(&self.config.node_id));
+        if !member {
+            return Err(PublishError::NotPublisher);
         }
         let head = self.stored.view.as_ref();
         if head.is_some_and(DistributionView::conflicted) {

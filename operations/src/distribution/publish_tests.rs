@@ -3,6 +3,7 @@
 
 use super::*;
 use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::distribution::presets::replica_layout;
 use aruna_core::structs::storage::distribution::snapshot::install;
 use aruna_core::structs::storage::distribution::{
@@ -73,8 +74,24 @@ fn config_value() -> Value {
         user_id: auth().user_id,
         realm_id: realm(),
     };
-    let document = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    let mut document = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    document.ensure_node(secret(PUBLISHER).public(), RealmNodeKind::Server);
     document.to_bytes(&actor).unwrap().into()
+}
+
+#[test]
+fn removed_publisher_refuses() {
+    let actor = Actor {
+        node_id: secret(2).public(),
+        user_id: auth().user_id,
+        realm_id: realm(),
+    };
+    let mut document = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    document.ensure_node(secret(2).public(), RealmNodeKind::Server);
+    let config: Value = document.to_bytes(&actor).unwrap().into();
+    let mut operation = operation(PUBLISHER, create());
+    begin(&mut operation, [None, None, Some(config), None]);
+    assert_eq!(operation.finalize(), Err(PublishError::NotPublisher));
 }
 
 fn view_value(snapshot: DistributionSnapshot) -> Value {
