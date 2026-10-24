@@ -387,6 +387,82 @@ fn record_links_result(span: &Span, result: &Result<LinkNodePage, MetadataReadEr
     }
 }
 
+/// At most this many datasets a file names as derived `isPartOf`; the paged listing has all.
+pub const PART_OF_LIMIT: usize = 10;
+
+/// The datasets whose live linked parts contain a file: its derived `isPartOf`, computed now
+/// and never stored per file.
+#[derive(Clone, Debug, Default)]
+pub struct PartOf {
+    pub datasets: Vec<LinkDocument>,
+    /// More datasets exist than this answer names.
+    pub more: bool,
+    pub complete: bool,
+    pub hidden: bool,
+}
+
+/// The derived `isPartOf` of a file of a local bucket, as `auth` may see it.
+#[allow(clippy::too_many_arguments)]
+pub async fn part_of(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    auth: Option<AuthContext>,
+    bearer_token: Option<String>,
+    bucket: &str,
+    key: &str,
+) -> Result<PartOf, MetadataApiError> {
+    let info = crate::driver::drive(GetBucketOperation::new(bucket.to_string()), context)
+        .await
+        .map_err(|error| match error {
+            GetBucketError::NotFound => MetadataApiError::NotFound,
+            other => MetadataApiError::Internal(other.to_string()),
+        })?;
+    let page = links_distributed(
+        context,
+        realm_id,
+        node_id,
+        auth,
+        bearer_token,
+        LinkNodeRequest {
+            queries: vec![LinkQuery::KeyPrefixes {
+                scope: bucket_scope(realm_id, node_id, bucket, &info),
+                key: key.to_string(),
+            }],
+            parts_only: true,
+            after: None,
+            limit: PART_OF_LIMIT,
+        },
+    )
+    .await?;
+    Ok(PartOf {
+        more: page.next_after.is_some(),
+        complete: page.complete,
+        hidden: page.hidden,
+        datasets: page.documents,
+    })
+}
+
+/// A distributed bucket is named by its set, an ordinary one by this node and its name.
+fn bucket_scope(
+    realm_id: RealmId,
+    node_id: NodeId,
+    bucket: &str,
+    info: &aruna_core::structs::storage::blob::BucketInfo,
+) -> LinkScope {
+    match &info.distribution {
+        Some(binding) => LinkScope::Set {
+            realm_id,
+            set_id: binding.set_id,
+        },
+        None => LinkScope::Node {
+            realm_id,
+            node_id,
+            bucket: bucket.to_string(),
+        },
+    }
+}
+
 /// The queries for a file of a local bucket: its version and content, and the prefixes of
 /// its key. A distributed bucket is named by its set, an ordinary one by this node.
 pub async fn file_queries(
@@ -411,17 +487,7 @@ pub async fn file_queries(
         Some(version_id) => read_version(context, bucket, key, version_id).await?,
         None => None,
     };
-    let scope = match &info.distribution {
-        Some(binding) => LinkScope::Set {
-            realm_id,
-            set_id: binding.set_id,
-        },
-        None => LinkScope::Node {
-            realm_id,
-            node_id,
-            bucket: bucket.to_string(),
-        },
-    };
+    let scope = bucket_scope(realm_id, node_id, bucket, &info);
     let mut queries = vec![LinkQuery::KeyPrefixes {
         scope,
         key: key.to_string(),

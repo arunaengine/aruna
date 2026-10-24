@@ -48,6 +48,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(references::metadata_reference_preflight))
         .routes(routes!(links::data_links))
         .routes(routes!(links::bucket_links))
+        .routes(routes!(links::file_part_of))
         .routes(routes!(query::query_all_metadata))
         .routes(routes!(documents::list_metadata_documents))
         .routes(routes!(documents::get_metadata_path))

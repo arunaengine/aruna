@@ -144,6 +144,19 @@ pub struct DrsObjectResponse {
     aliases: Vec<String>,
     access_methods: Vec<DrsAccessMethod>,
     contents: Option<Vec<Value>>,
+    /// Datasets whose linked parts contain the object, as the caller may see them; absent
+    /// when the bytes are not on this node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_part_of: Option<DrsPartOf>,
+}
+
+/// The derived `isPartOf` of an object: at most ten dataset w3ids.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DrsPartOf {
+    datasets: Vec<String>,
+    /// More datasets contain the object than are named here.
+    more: bool,
+    complete: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -374,6 +387,9 @@ objects.
   direct download URL on this node; no redirect is issued and no signed or time-limited URL is
   minted, so the caller must send its own bearer token to that URL.
 - `contents` is always null because bundles are not served.
+- For an object held here, `is_part_of` names the w3ids of at most ten datasets whose linked
+  parts contain it, as the caller may read them, with `more` and `complete` flags. It is
+  absent when no metadata node answered.
 
 **Limits**
 - The identifier is an Aruna data W3ID, a content-hash `ch` ARN or a versioned `s3` ARN:
@@ -424,6 +440,7 @@ objects.
 pub async fn get_object(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Path(object_id): Path<String>,
@@ -437,7 +454,13 @@ pub async fn get_object(
 
     match resolve_object(state.as_ref(), &auth, &object_id, routed_deadline()).await {
         Ok(ResolveOutcome::Found(resolved)) => {
-            drs_json_response(StatusCode::OK, build_object_response(&base_url, &resolved))
+            let mut object = build_object_response(&base_url, &resolved);
+            if resolved.location.is_some() {
+                let caller = (!anonymous).then_some(auth);
+                let bearer = crate::metadata::bearer_token_string(bearer);
+                object.is_part_of = drs_part_of(state.as_ref(), caller, bearer, &resolved).await;
+            }
+            drs_json_response(StatusCode::OK, object)
         }
         Ok(ResolveOutcome::Denied) => drs_denied_error(anonymous).into_response(),
         Ok(ResolveOutcome::NotFound) => DrsError::not_found("DRS object not found").into_response(),
@@ -723,6 +746,36 @@ pub async fn download_object(
     response
 }
 
+/// The datasets whose linked parts contain a local object; `None` when no metadata node
+/// could answer, so the object itself is still served.
+async fn drs_part_of(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    bearer: Option<String>,
+    resolved: &ResolvedObject,
+) -> Option<DrsPartOf> {
+    let found = aruna_operations::metadata::api::part_of(
+        state.get_ctx().as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        auth,
+        bearer,
+        &resolved.bucket,
+        &resolved.key,
+    )
+    .await
+    .ok()?;
+    Some(DrsPartOf {
+        datasets: found
+            .datasets
+            .into_iter()
+            .map(|document| document.graph_iri)
+            .collect(),
+        more: found.more,
+        complete: found.complete,
+    })
+}
+
 fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObjectResponse {
     let self_uri = format!(
         "{base_url}/api/v1/ga4gh/drs/v1/objects/{}",
@@ -781,6 +834,7 @@ fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObject
         aliases,
         access_methods,
         contents: None,
+        is_part_of: None,
     }
 }
 
