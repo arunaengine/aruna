@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::count_upload;
 use crate::placement::policy::{
@@ -58,6 +59,8 @@ pub enum CreateMultipartState {
     WriteUpload,
     /// Books the new record on the bucket's open upload count.
     CountUpload,
+    /// Opens the upload in the upload inventory of a distributed bucket.
+    CountInventory,
     WritePending,
     CommitTransaction,
     AbortBackendUpload,
@@ -99,6 +102,8 @@ pub enum CreateMultipartError {
     UnsupportedChecksum(&'static str),
     #[error("operation did not finish")]
     NotFinished,
+    #[error(transparent)]
+    Inventory(#[from] InventoryError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +153,8 @@ pub struct CreateMultipartOperation {
     /// The pending envelope of an encrypted upload, stored beside its record.
     envelope: Option<ObjectEnvelope>,
     pending_error: Option<CreateMultipartError>,
+    /// The inventory update of a distributed bucket, opened with the upload record.
+    inventory: Option<InventoryUpdate>,
     output: Option<Result<CreateMultipartResult, CreateMultipartError>>,
 }
 
@@ -172,6 +179,7 @@ impl CreateMultipartOperation {
             encryption: None,
             envelope: None,
             pending_error: None,
+            inventory: None,
             output: None,
         }
     }
@@ -488,6 +496,14 @@ impl CreateMultipartOperation {
 
     fn gate_bucket(&mut self, bucket: Option<BucketInfo>) -> Effects {
         self.stored_policies = GatedBucket::observe(bucket.as_ref()).policies;
+        let binding = bucket
+            .as_ref()
+            .and_then(|bucket| bucket.distribution.as_ref());
+        self.inventory = binding.map(|binding| {
+            let mut change = InventoryChange::new(binding.set_id, self.input.key.clone());
+            change.upload = Some((self.upload_id, true));
+            InventoryUpdate::new(change)
+        });
         let compression = bucket.as_ref().map(|bucket| bucket.compression);
         self.resolved = self
             .resolved
@@ -684,7 +700,24 @@ impl CreateMultipartOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(CreateMultipartError::TransactionMissing);
         };
-        self.write_rest(txn_id)
+        match self.inventory.as_mut() {
+            Some(inventory) => {
+                self.state = CreateMultipartState::CountInventory;
+                inventory.start(txn_id)
+            }
+            None => self.write_rest(txn_id),
+        }
+    }
+
+    fn inventory_counted(&mut self, event: Event) -> Effects {
+        let (Some(txn_id), Some(inventory)) = (self.txn_id, self.inventory.as_mut()) else {
+            return self.emit_error(CreateMultipartError::TransactionMissing);
+        };
+        match inventory.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => self.write_rest(txn_id),
+            Err(error) => self.emit_error(error.into()),
+        }
     }
 
     /// Writes the pending envelope, if any, then commits.
@@ -790,6 +823,7 @@ impl Operation for CreateMultipartOperation {
                 self.handle_record_written(event)
             }
             CreateMultipartState::CountUpload => self.upload_counted(event),
+            CreateMultipartState::CountInventory => self.inventory_counted(event),
             CreateMultipartState::CommitTransaction => self.handle_transaction_committed(event),
             CreateMultipartState::AbortBackendUpload => self.backend_aborted(event),
             CreateMultipartState::Finish => smallvec![],
