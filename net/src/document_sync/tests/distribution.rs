@@ -8,8 +8,8 @@ use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
 use aruna_core::structs::storage::distribution::presets::replica_layout;
 use aruna_core::structs::storage::distribution::{
     DistributionConfig, DistributionRequest, DistributionSettings, DistributionSnapshot,
-    DistributionView, MemberState, SetRoot, SignedSnapshot, Statement, StatementKind,
-    next_snapshot,
+    DistributionView, MemberState, PublisherCutoff, SetRoot, SignedSnapshot, Statement,
+    StatementKind, next_snapshot,
 };
 
 const PUBLISHER: u8 = 41;
@@ -238,7 +238,10 @@ async fn membership_gaps_defer() {
     };
     let removed = AdminDocumentOperation::ConfigNodeRemoved {
         node_id: node(PUBLISHER),
-        cutoffs: Vec::new(),
+        cutoffs: vec![PublisherCutoff {
+            set_id: root().set_id(),
+            revision: created().revision(),
+        }],
     };
     state.apply_operation(&actor(OTHER), ensure).unwrap();
     state.apply_operation(&actor(OTHER), removed).unwrap();
@@ -247,6 +250,14 @@ async fn membership_gaps_defer() {
         .unwrap();
     let relayed = receive(&storage, published(PUBLISHER, created(), PUBLISHER)).await;
     assert_eq!(relayed, AdminEventValidation::Accepted);
+    // Anything it signs beyond its cutoff carries no authority any more.
+    let later = admitted(&created(), MEMBER);
+    let beyond = receive(&storage, published(PUBLISHER, later, PUBLISHER)).await;
+    assert!(rejected(beyond));
+    let mut forked = created();
+    forked.config.settings.public = true;
+    let fork = receive(&storage, published(PUBLISHER, forked, PUBLISHER)).await;
+    assert!(rejected(fork));
 
     // A device can never publish a set's revisions.
     config.ensure_node(
