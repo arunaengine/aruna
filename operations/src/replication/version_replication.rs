@@ -1160,6 +1160,7 @@ pub struct ReplicateObjectOperation {
     version_policies: Vec<PlacementPolicyRef>,
     /// The stored version's original epoch, carried onto the manifest unchanged.
     version_epoch: OriginalEpoch,
+    version_generation: u64,
     pending_copy: Option<ManagedCopyKey>,
     /// Destination details of this node, evaluated before reference bytes are
     /// materialized locally.
@@ -1213,6 +1214,7 @@ impl ReplicateObjectOperation {
             reference_advance: None,
             version_policies: Vec::new(),
             version_epoch: OriginalEpoch::default(),
+            version_generation: 0,
             pending_copy: None,
             gate_context: None,
             gate: None,
@@ -2084,6 +2086,7 @@ impl ReplicateObjectOperation {
             reference_advance_count,
             placement_policies: self.version_policies.clone(),
             original_epoch: self.version_epoch,
+            version_generation: self.version_generation,
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -2343,9 +2346,11 @@ impl ReplicateObjectOperation {
             published_by: _,
             placement_policies,
             original_epoch,
+            generation,
         } = version;
         self.version_policies = placement_policies;
         self.version_epoch = original_epoch;
+        self.version_generation = generation;
 
         match state {
             BlobVersionState::Materialized {

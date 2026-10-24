@@ -530,6 +530,18 @@ fn route(
         .collect())
 }
 
+/// Stamps the head generation a version is written as, inside a distributed bucket only.
+pub fn stamp_generation(
+    version: BlobVersion,
+    binding: Option<&DistributionBinding>,
+    generation: u64,
+) -> BlobVersion {
+    match binding {
+        Some(_) => version.with_generation(generation),
+        None => version,
+    }
+}
+
 /// What a version row of `size` bytes contributes.
 pub fn entry_of(version: &BlobVersion, size: u64) -> VersionEntry {
     VersionEntry {

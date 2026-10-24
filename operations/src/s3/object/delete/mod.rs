@@ -8,7 +8,9 @@ use crate::blob::records::{
     delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,
     write_version_effect,
 };
-use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
+use crate::distribution::inventory::{
+    AddedVersion, InventoryChange, stamp_generation, version_written,
+};
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
@@ -1138,6 +1140,8 @@ impl DeleteObjectOperation {
             .to_owned();
         let mut version = BlobVersion::deleted(created_at, self.input.deleted_by);
         version.metadata = self.metadata.clone();
+        let generation = self.marker_head.as_ref().map_or(0, |head| head.generation);
+        let version = stamp_generation(version, self.binding.as_ref(), generation);
         self.marker_epoch = version.original_epoch;
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {

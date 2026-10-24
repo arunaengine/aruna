@@ -25,7 +25,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::connector_reference_write;
-use crate::distribution::inventory::{AddedVersion, entry_of, version_written};
+use crate::distribution::inventory::{AddedVersion, entry_of, stamp_generation, version_written};
 use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use crate::replication::protocol::ReferenceAdvance;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
@@ -179,6 +179,8 @@ impl MintSuccessorOperation {
         .with_policies(self.predecessor.placement_policies.clone())?;
         let version_key = VersionKey::new(&refresh.bucket, &refresh.key, version_id);
         let next = CurrentVersionPointer::next_for(Some(&pointer), version_id)?;
+        let binding = bucket.distribution.as_ref();
+        let successor = stamp_generation(successor, binding, next.generation);
         let obligation = LiveObligationRecord::new(
             refresh.node_id,
             refresh.auth_context.clone(),

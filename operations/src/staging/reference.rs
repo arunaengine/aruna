@@ -8,7 +8,7 @@ use crate::connectors::repository::{
     source_connector_key,
 };
 use crate::connectors::resolver::secret_fingerprint;
-use crate::distribution::inventory::{AddedVersion, entry_of, version_written};
+use crate::distribution::inventory::{AddedVersion, entry_of, stamp_generation, version_written};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
@@ -303,6 +303,7 @@ pub async fn write_reference_version(
             now,
         )
         .with_policies(policies)?;
+        let version = stamp_generation(version, binding.as_ref(), generation);
         apply_storage_effect(
             context,
             write_version_effect(&version_key, &version, Some(txn_id))?,

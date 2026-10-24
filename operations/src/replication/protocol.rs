@@ -73,6 +73,8 @@ pub struct VersionReplicationManifest {
     pub placement_policies: Vec<PlacementPolicyRef>,
     /// The version's original epoch; it orders heads and never changes in transit.
     pub original_epoch: OriginalEpoch,
+    /// The generation the version was written as in a distributed bucket, current or not.
+    pub version_generation: u64,
 }
 
 impl VersionReplicationManifest {
@@ -707,6 +709,7 @@ mod pure_tests {
             reference_advance_count: None,
             placement_policies: Vec::new(),
             original_epoch: Default::default(),
+            version_generation: 0,
         }
     }
 

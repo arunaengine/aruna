@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
-use crate::distribution::inventory::{AddedVersion, InventoryChange, entry_of, version_written};
+use crate::distribution::inventory::{
+    AddedVersion, InventoryChange, entry_of, stamp_generation, version_written,
+};
 use crate::jobs::store::decode_job_record;
 use crate::node::usage_stats::UsageUpdateError;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
@@ -428,6 +430,7 @@ fn register_rows(
     .with_policies(guards.policies.clone())?;
     let version_key = VersionKey::new(&input.bucket, &entry.target_key, version_id);
     let pointer = CurrentVersionPointer::next_for(head, version_id)?;
+    let version = stamp_generation(version, guards.binding.as_ref(), pointer.generation);
     let added = AddedVersion {
         version_id,
         epoch: version.original_epoch,

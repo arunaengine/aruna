@@ -1182,6 +1182,9 @@ pub struct BlobVersion {
     pub placement_policies: Vec<PlacementPolicyRef>,
     /// The coordinator epoch this version was written under; 0 in an ordinary bucket.
     pub original_epoch: OriginalEpoch,
+    /// The key's head generation this version was written as in a distributed bucket, so
+    /// history keeps its order on every member; 0 in an ordinary bucket.
+    pub generation: u64,
 }
 
 impl BlobVersion {
@@ -1206,6 +1209,7 @@ impl BlobVersion {
             published_by: None,
             placement_policies: Vec::new(),
             original_epoch: OriginalEpoch::default(),
+            generation: 0,
         }
     }
 
@@ -1223,6 +1227,7 @@ impl BlobVersion {
             published_by: None,
             placement_policies: Vec::new(),
             original_epoch: OriginalEpoch::default(),
+            generation: 0,
         }
     }
 
@@ -1235,6 +1240,7 @@ impl BlobVersion {
             published_by: None,
             placement_policies: Vec::new(),
             original_epoch: OriginalEpoch::default(),
+            generation: 0,
         }
     }
 
@@ -1258,6 +1264,7 @@ impl BlobVersion {
             published_by: None,
             placement_policies: Vec::new(),
             original_epoch: OriginalEpoch::default(),
+            generation: 0,
         }
     }
 
@@ -1282,6 +1289,11 @@ impl BlobVersion {
 
     pub fn with_epoch(mut self, epoch: OriginalEpoch) -> Self {
         self.original_epoch = epoch;
+        self
+    }
+
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
         self
     }
 

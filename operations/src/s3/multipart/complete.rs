@@ -8,7 +8,9 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
-use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
+use crate::distribution::inventory::{
+    AddedVersion, InventoryChange, stamp_generation, version_written,
+};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
@@ -1703,6 +1705,8 @@ impl CompleteUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        let generation = self.head_pointer.as_ref().map_or(0, |head| head.generation);
+        let version = stamp_generation(version, self.binding.as_ref(), generation);
         self.stored_policies = version.placement_policies.clone();
         self.version_epoch = version.original_epoch;
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {

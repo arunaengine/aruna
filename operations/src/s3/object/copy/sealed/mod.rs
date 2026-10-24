@@ -9,7 +9,9 @@ use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_eff
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
 };
-use crate::distribution::inventory::{AddedVersion, InventoryChange, entry_of, version_written};
+use crate::distribution::inventory::{
+    AddedVersion, InventoryChange, entry_of, stamp_generation, version_written,
+};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
@@ -540,8 +542,11 @@ impl SealedCopyOperation {
     }
 
     fn write_version(&mut self) -> Result<Effects, SealedCopyError> {
-        let version = self.version.as_ref().ok_or(SealedCopyError::InvalidState)?;
-        let effect = write_version_effect(&self.dest_version(), version, self.txn_id)?;
+        let version = self.version.take().ok_or(SealedCopyError::InvalidState)?;
+        let generation = self.head.as_ref().map_or(0, |head| head.generation);
+        let version = stamp_generation(version, self.binding.as_ref(), generation);
+        let effect = write_version_effect(&self.dest_version(), &version, self.txn_id)?;
+        self.version = Some(version);
         self.step = Step::WriteVersion;
         Ok(smallvec![effect])
     }

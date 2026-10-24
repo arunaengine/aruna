@@ -1920,6 +1920,16 @@ impl IncomingVersionOperation {
         }
     }
 
+    /// The generation the version was written as, kept inside a distributed bucket whether
+    /// or not it is the current version; an ordinary bucket keeps 0.
+    fn version_generation(&self) -> u64 {
+        match (self.destination_bound, self.manifest.version_generation) {
+            (false, _) => 0,
+            (true, 0) => self.manifest.current_version_generation.unwrap_or_default(),
+            (true, generation) => generation,
+        }
+    }
+
     fn write_blob_version(&mut self) -> Effects {
         self.state = IncomingVersionState::WriteBlobVersion;
         let version_key = VersionKey::new(
@@ -2008,7 +2018,9 @@ impl IncomingVersionOperation {
             ),
         };
 
-        let version = version.with_epoch(self.original_epoch());
+        let version = version
+            .with_epoch(self.original_epoch())
+            .with_generation(self.version_generation());
         self.written_identity = content_identity(&version);
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
@@ -2237,7 +2249,7 @@ impl IncomingVersionOperation {
         let added = AddedVersion {
             version_id: self.manifest.version_id,
             epoch: self.original_epoch(),
-            generation: self.manifest.current_version_generation.unwrap_or_default(),
+            generation: self.version_generation(),
             entry: VersionEntry {
                 marker,
                 size,
