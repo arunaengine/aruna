@@ -13,7 +13,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
-    MATERIALIZATION_PRUNE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+    MATERIALIZATION_STATUS_KEYSPACE,
 };
 use aruna_core::metadata::{
     ApplyRoCrateRequest, DeadLetterRecord, MaterializationState, MaterializationStatusRecord,
@@ -23,9 +23,8 @@ use aruna_core::metadata::{
 };
 use aruna_core::storage_entries::{
     dead_letter_entry, dead_letter_key, document_job_entry, document_job_key, document_job_prefix,
-    event_log_key, materialization_job_entry, materialization_job_key, materialization_prune_entry,
-    materialization_prune_key, materialization_status_entry, materialization_status_key,
-    profile_validation_entry,
+    event_log_key, materialization_job_entry, materialization_job_key,
+    materialization_status_entry, materialization_status_key, profile_validation_entry,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -43,6 +42,7 @@ use crate::driver::DriverContext;
 
 use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_after_ms, retry_delay_ms};
 
+use super::data_links::DataLinkError;
 use super::iri_index::MetadataIriError;
 use super::profile::validation::{assess_render, violation_count};
 use super::queue_storage::{
@@ -101,7 +101,7 @@ struct CompletedMaterializationJob {
     document_job_key: Option<Vec<u8>>,
     status: Option<MaterializationStatusRecord>,
     iri_index_writes: Vec<(String, ByteView, ByteView)>,
-    /// Older data link rows of the document that this materialization replaces.
+    /// Older IRI index and data link rows of the document that this materialization replaces.
     link_deletes: Vec<(String, ByteView)>,
     raw_state_write: Option<(String, ByteView, ByteView)>,
     validation_write: Option<(String, ByteView, ByteView)>,
@@ -203,7 +203,12 @@ impl From<MetadataIriError> for MetadataMaterializationError {
         match error {
             MetadataIriError::Storage(error) => Self::Storage(error),
             MetadataIriError::Conversion(error) => Self::Conversion(error),
+            MetadataIriError::DataLink(DataLinkError::Storage(error)) => Self::Storage(error),
+            MetadataIriError::DataLink(DataLinkError::Conversion(error)) => Self::Conversion(error),
             MetadataIriError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
+            error @ MetadataIriError::DataLink(DataLinkError::UnexpectedEvent(_)) => {
+                Self::UnexpectedEvent(error.to_string())
+            }
         }
     }
 }
@@ -496,9 +501,6 @@ async fn schedule_completed_syncs(
 struct FinishPlan {
     writes: Vec<(String, ByteView, ByteView)>,
     deletes: Vec<(String, ByteView)>,
-    /// Documents whose winning cursor advanced; their prior index rows are
-    /// pruned once per batch rather than once per chunk.
-    superseding: HashMap<Ulid, Ulid>,
 }
 
 // Chunked so a failure costs one chunk instead of the whole batch, and the craqle work
@@ -507,156 +509,28 @@ async fn finish_completed_jobs(
     storage: &StorageHandle,
     finished: Vec<FinishedMaterializationJob>,
 ) -> Result<(), MetadataMaterializationError> {
-    let mut superseding = HashMap::new();
-    let finish = finish_chunks(storage, finished, &mut superseding).await;
-    let prune = prune_superseded_rows(storage, superseding).await;
-    finish.and(prune)
-}
-
-async fn finish_chunks(
-    storage: &StorageHandle,
-    finished: Vec<FinishedMaterializationJob>,
-    superseding: &mut HashMap<Ulid, Ulid>,
-) -> Result<(), MetadataMaterializationError> {
     let mut chunk = Vec::with_capacity(MATERIALIZATION_FINISH_CHUNK);
     for job in finished {
         chunk.push(job);
         if chunk.len() >= MATERIALIZATION_FINISH_CHUNK {
             let taken = std::mem::take(&mut chunk);
-            superseding.extend(finish_chunk(storage, taken).await?);
+            finish_chunk(storage, taken).await?;
             chunk.reserve(MATERIALIZATION_FINISH_CHUNK);
         }
     }
     if !chunk.is_empty() {
-        superseding.extend(finish_chunk(storage, chunk).await?);
+        finish_chunk(storage, chunk).await?;
     }
     Ok(())
 }
 
-// The IRI index cannot be scanned per document, so this walks the whole keyspace once per
-// batch.
-async fn prune_superseded_rows(
-    storage: &StorageHandle,
-    mut superseding: HashMap<Ulid, Ulid>,
-) -> Result<(), MetadataMaterializationError> {
-    let pending = read_pending_prunes(storage).await?;
-    for (document_id, cursor) in pending.iter() {
-        superseding.entry(*document_id).or_insert(*cursor);
-    }
-    if superseding.is_empty() {
-        return Ok(());
-    }
-    match prune_index_rows(storage, &superseding).await {
-        Ok(()) if pending.is_empty() => Ok(()),
-        Ok(()) => delete_pending_prunes(storage, pending.keys().copied().collect()).await,
-        Err(error) => {
-            warn!(
-                error = %error,
-                documents = superseding.len(),
-                "Deferring metadata materialization index pruning"
-            );
-            persist_pending_prunes(storage, &superseding).await
-        }
-    }
-}
-
-async fn prune_index_rows(
-    storage: &StorageHandle,
-    superseding: &HashMap<Ulid, Ulid>,
-) -> Result<(), MetadataMaterializationError> {
-    let stale = super::iri_index::superseded_keys(storage, None, superseding).await?;
-    delete_materialization_entries(storage, stale).await
-}
-
-// One page per batch: leftovers stay parked for the next drain, so a long
-// backlog cannot make a single batch scan unboundedly.
-async fn read_pending_prunes(
-    storage: &StorageHandle,
-) -> Result<HashMap<Ulid, Ulid>, MetadataMaterializationError> {
-    match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
-            limit: MATERIALIZATION_PAGE_SIZE,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => {
-            let mut pending = HashMap::new();
-            for (key, value) in values {
-                let (Ok(document_id), Ok(cursor)) = (
-                    <[u8; 16]>::try_from(key.as_ref()),
-                    postcard::from_bytes::<Ulid>(&value),
-                ) else {
-                    warn!(key = ?key.to_vec(), "Deleting malformed metadata materialization prune entry");
-                    delete_materialization_entries(
-                        storage,
-                        vec![(MATERIALIZATION_PRUNE_KEYSPACE.to_string(), key.clone())],
-                    )
-                    .await?;
-                    continue;
-                };
-                pending.insert(Ulid::from_bytes(document_id), cursor);
-            }
-            Ok(pending)
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
-}
-
-async fn persist_pending_prunes(
-    storage: &StorageHandle,
-    superseding: &HashMap<Ulid, Ulid>,
-) -> Result<(), MetadataMaterializationError> {
-    let mut writes = Vec::with_capacity(superseding.len());
-    for (document_id, cursor) in superseding {
-        writes.push(materialization_prune_entry(*document_id, *cursor)?);
-    }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
-}
-
-async fn delete_pending_prunes(
-    storage: &StorageHandle,
-    document_ids: Vec<Ulid>,
-) -> Result<(), MetadataMaterializationError> {
-    let deletes = document_ids
-        .into_iter()
-        .map(|document_id| {
-            (
-                MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
-                materialization_prune_key(document_id),
-            )
-        })
-        .collect();
-    delete_materialization_entries(storage, deletes).await
-}
-
-/// Returns the documents whose projection this chunk advanced, so the batch can
-/// prune their prior-cursor index rows once.
 async fn finish_chunk(
     storage: &StorageHandle,
     finished: Vec<FinishedMaterializationJob>,
-) -> Result<HashMap<Ulid, Ulid>, MetadataMaterializationError> {
+) -> Result<(), MetadataMaterializationError> {
     let plan = plan_finish_chunk(storage, finished).await?;
     if plan.writes.is_empty() && plan.deletes.is_empty() {
-        return Ok(plan.superseding);
+        return Ok(());
     }
     let txn_id = start_write_transaction(storage).await?;
     let result = async {
@@ -667,7 +541,7 @@ async fn finish_chunk(
     match result {
         Ok(()) => {
             commit_storage_transaction(storage, txn_id).await?;
-            Ok(plan.superseding)
+            Ok(())
         }
         Err(error) => {
             abort_storage_transaction(
@@ -828,7 +702,6 @@ async fn plan_finish_chunk(
         Ok(rows) => plan.writes.extend(rows),
         Err(error) => warn!(%error, "Failed to queue repository link pushes after materialization"),
     }
-    plan.superseding = superseding;
     Ok(plan)
 }
 
@@ -2249,7 +2122,7 @@ async fn merge_batch_event(
     })
 }
 
-/// The IRI index and data link rows of one materialization, and the stale link rows it drops.
+/// The IRI index and data link rows of one materialization, and the stale rows it drops.
 async fn project_materialized_iris(
     context: &DriverContext,
     event: &MetadataEventRecord,
@@ -2281,9 +2154,15 @@ async fn project_materialized_iris(
         event.event_id,
         references,
     );
-    let mut writes = super::iri_index::iri_write_entries(&records)?;
-    writes.extend(link_rows.writes);
-    Ok((writes, link_rows.deletes))
+    let mut rows = super::iri_index::plan_iri_rows(
+        &context.storage_handle,
+        event.record.document_id,
+        &records,
+    )
+    .await?;
+    rows.writes.extend(link_rows.writes);
+    rows.deletes.extend(link_rows.deletes);
+    Ok((rows.writes, rows.deletes))
 }
 
 fn graph_materialization_effect(

@@ -132,7 +132,7 @@ pub(crate) async fn plan_link_rows(
         ));
         written.insert(key);
     }
-    for key in document_rows(storage, document_id).await? {
+    for key in document_rows(storage, DOCUMENT_LINK_KEYSPACE, document_id).await? {
         if !written.contains(&key) {
             rows.deletes.push((
                 DOCUMENT_LINK_KEYSPACE.to_string(),
@@ -145,23 +145,18 @@ pub(crate) async fn plan_link_rows(
     Ok(rows)
 }
 
-/// The posting keys a document has rows for, from its per-document rows.
-async fn document_rows(
+/// The posting keys a document has rows for, from its per-document rows in `key_space`.
+pub(crate) async fn document_rows(
     storage: &StorageHandle,
+    key_space: &str,
     document_id: Ulid,
 ) -> Result<Vec<Vec<u8>>, DataLinkError> {
     let prefix = ByteView::from(document_id.to_bytes().to_vec());
     let mut start = None;
     let mut keys = Vec::new();
     loop {
-        let (values, next) = iter_page(
-            storage,
-            DOCUMENT_LINK_KEYSPACE,
-            Some(prefix.clone()),
-            start,
-            PAGE_SIZE,
-        )
-        .await?;
+        let (values, next) =
+            iter_page(storage, key_space, Some(prefix.clone()), start, PAGE_SIZE).await?;
         keys.extend(
             values
                 .into_iter()
@@ -182,7 +177,7 @@ pub(crate) async fn delete_documents(
 ) -> Result<(), DataLinkError> {
     let mut deletes = Vec::new();
     for document_id in document_ids {
-        for key in document_rows(storage, *document_id).await? {
+        for key in document_rows(storage, DOCUMENT_LINK_KEYSPACE, *document_id).await? {
             deletes.push((
                 DOCUMENT_LINK_KEYSPACE.to_string(),
                 ByteView::from(document_key(*document_id, &key)),
@@ -237,7 +232,7 @@ fn expect_ok(event: Event) -> Result<(), DataLinkError> {
     }
 }
 
-async fn iter_page(
+pub(crate) async fn iter_page(
     storage: &StorageHandle,
     key_space: &str,
     prefix: Option<ByteView>,
@@ -276,7 +271,7 @@ impl LinkBudget {
         self.seeks == 0 || self.rows == 0
     }
 
-    fn take_seek(&mut self) -> bool {
+    pub(crate) fn take_seek(&mut self) -> bool {
         if self.seeks == 0 {
             return false;
         }

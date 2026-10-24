@@ -2,17 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::IRI_INDEX_KEYSPACE;
+use aruna_core::keyspaces::{DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE};
 use aruna_core::metadata::{
     IriIndexRecord, MaterializationState, MaterializationStatusRecord, MetadataError,
 };
 use aruna_core::storage_entries::{iri_reference_entry, iri_reference_ids, iri_reference_prefix};
+use aruna_core::structs::storage::data_link::document_key;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -21,6 +22,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
+use super::data_links::{DataLinkError, LinkRows, document_rows};
 use super::handle::REGISTRY_CANDIDATE_LIMIT;
 use super::repository::{StorageReadError, parse_status_read, read_status_effect};
 
@@ -37,6 +39,8 @@ pub(crate) enum MetadataIriError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    DataLink(#[from] DataLinkError),
     #[error("unexpected metadata IRI reference index event: {0}")]
     UnexpectedEvent(String),
 }
@@ -74,10 +78,35 @@ pub(crate) fn project_iri_references(
         .collect()
 }
 
-pub(crate) fn iri_write_entries(
+/// Replaces the document's IRI postings: writes the projection and deletes every older row
+/// of the document that the projection does not write again.
+pub(crate) async fn plan_iri_rows(
+    storage: &StorageHandle,
+    document_id: Ulid,
     records: &[IriIndexRecord],
-) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
-    records.iter().map(iri_reference_entry).collect()
+) -> Result<LinkRows, MetadataIriError> {
+    let mut rows = LinkRows::default();
+    let mut written = HashSet::new();
+    for record in records {
+        let (key_space, key, value) = iri_reference_entry(record)?;
+        rows.writes.push((
+            DOCUMENT_IRI_KEYSPACE.to_string(),
+            document_key(document_id, &key).into(),
+            ByteView::from(Vec::new()),
+        ));
+        written.insert(key.to_vec());
+        rows.writes.push((key_space, key, value));
+    }
+    for key in document_rows(storage, DOCUMENT_IRI_KEYSPACE, document_id).await? {
+        if !written.contains(&key) {
+            let document_row = document_key(document_id, &key).into();
+            rows.deletes
+                .push((IRI_INDEX_KEYSPACE.to_string(), key.into()));
+            rows.deletes
+                .push((DOCUMENT_IRI_KEYSPACE.to_string(), document_row));
+        }
+    }
+    Ok(rows)
 }
 
 pub(crate) async fn lookup_iri_references(
@@ -306,7 +335,9 @@ pub(crate) async fn rebuild_index(context: &DriverContext) -> Result<usize, Meta
         super::data_links::apply_rows(&context.storage_handle, link_rows).await?;
         let projected =
             project_iri_references(record.document_id, record.last_event_id, references);
-        write_iri_references(&context.storage_handle, &projected).await?;
+        let iri_rows =
+            plan_iri_rows(&context.storage_handle, record.document_id, &projected).await?;
+        super::data_links::apply_rows(&context.storage_handle, iri_rows).await?;
         reprojected.insert(record.document_id, record.last_event_id);
         written = written.saturating_add(projected.len());
     }
@@ -376,22 +407,6 @@ where
     Ok(selected)
 }
 
-/// Keys of index rows whose document is re-projected under a newer cursor.
-/// Superseded rows are already fenced from results but bloat storage and the
-/// predicate-less scan, so callers delete them alongside the current projection.
-pub(crate) async fn superseded_keys(
-    storage: &StorageHandle,
-    txn_id: Option<Ulid>,
-    current_cursors: &HashMap<Ulid, Ulid>,
-) -> Result<Vec<(String, ByteView)>, MetadataIriError> {
-    select_keys(storage, txn_id, |document_id, cursor| {
-        current_cursors
-            .get(&document_id)
-            .is_some_and(|current| *current != cursor)
-    })
-    .await
-}
-
 /// Keys the full rebuild must drop: a row survives only at the cursor just
 /// projected or the document's current registry cursor, so a raced-ahead
 /// materialization keeps its rows; rows in neither map (deleted, reverted) are pruned.
@@ -407,16 +422,32 @@ async fn stale_rebuild_keys(
     .await
 }
 
-/// Keys for the given documents at every cursor, so a deletion can prune the
-/// rows it would otherwise leak into the predicate-less backlink scan.
+/// Postings and per-document rows of one document, from its own rows. Each posting comes
+/// before its per-document row, so an interrupted deletion never orphans a posting.
+async fn document_keys(
+    storage: &StorageHandle,
+    document_id: Ulid,
+) -> Result<Vec<(String, ByteView)>, MetadataIriError> {
+    let mut keys = Vec::new();
+    for key in document_rows(storage, DOCUMENT_IRI_KEYSPACE, document_id).await? {
+        let document_row = ByteView::from(document_key(document_id, &key));
+        keys.push((IRI_INDEX_KEYSPACE.to_string(), ByteView::from(key)));
+        keys.push((DOCUMENT_IRI_KEYSPACE.to_string(), document_row));
+    }
+    Ok(keys)
+}
+
+/// Keys for the given documents, read through each document's own rows, so a deletion
+/// prunes its postings without touching any other document.
 pub(crate) async fn document_iri_keys(
     storage: &StorageHandle,
     document_ids: &BTreeSet<Ulid>,
 ) -> Result<Vec<(String, ByteView)>, MetadataError> {
-    Ok(select_keys(storage, None, |document_id, _| {
-        document_ids.contains(&document_id)
-    })
-    .await?)
+    let mut keys = Vec::new();
+    for document_id in document_ids {
+        keys.extend(document_keys(storage, *document_id).await?);
+    }
+    Ok(keys)
 }
 
 pub(crate) async fn delete_keys(
@@ -516,29 +547,6 @@ async fn read_materialization_status(
         StorageReadError::Storage(error) => error.into(),
         StorageReadError::Conversion(error) => error.into(),
     })
-}
-
-async fn write_iri_references(
-    storage: &StorageHandle,
-    records: &[IriIndexRecord],
-) -> Result<(), MetadataIriError> {
-    for records in records.chunks(INDEX_BATCH_SIZE) {
-        let writes = iri_write_entries(records)?;
-        match storage
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(MetadataIriError::UnexpectedEvent(format!("{other:?}")));
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -483,6 +483,8 @@ pub const DISTRIBUTION_LIFECYCLE_KEYSPACE: &str = "distribution_lifecycle";
 pub const DISTRIBUTION_PURGE_KEYSPACE: &str = "distribution_purge";
 /// Source roots of a set's external references by set id and root digest, with check markers.
 pub const SOURCE_ROOT_KEYSPACE: &str = "distribution_source_roots";
+/// IRI index postings by document first, so a materialization replaces exactly its own rows.
+pub const DOCUMENT_IRI_KEYSPACE: &str = "metadata_document_iris";
 
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
@@ -741,6 +743,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SOURCE_ROOT_KEYSPACE,
     BUCKET_FREE_INDEX,
     CONTENT_INDEX_KEYSPACE,
+    DOCUMENT_IRI_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

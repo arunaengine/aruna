@@ -18,12 +18,11 @@ use crate::keyspaces::{
     DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE,
     DOCUMENT_LIFECYCLE_KEYSPACE, DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
     GRAPH_LIFECYCLE_KEYSPACE, IRI_INDEX_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
-    MATERIALIZATION_PRUNE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-    METADATA_INDEX_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE,
-    PENDING_PROJECTION_KEYSPACE, PRUNE_INDEX_KEYSPACE, PRUNE_JOB_KEYSPACE, RAW_BUDGET_KEYSPACE,
-    SHARD_MANIFEST_KEYSPACE, SUBJECT_INDEX_KEYSPACE, SYNC_CONFLICT_KEYSPACE,
-    SYNC_REVISION_KEYSPACE, UPDATED_INDEX_KEYSPACE, VALIDATION_STATUS_KEYSPACE,
-    WATCH_SUBSCRIPTIONS_KEYSPACE,
+    MATERIALIZATION_STATUS_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
+    PRUNE_INDEX_KEYSPACE, PRUNE_JOB_KEYSPACE, RAW_BUDGET_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+    SUBJECT_INDEX_KEYSPACE, SYNC_CONFLICT_KEYSPACE, SYNC_REVISION_KEYSPACE, UPDATED_INDEX_KEYSPACE,
+    VALIDATION_STATUS_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
 };
 use crate::metadata::{
     DeadLetterRecord, EventSize, GraphLifecycleRecord, GraphPruneRecord, IriIndexRecord,
@@ -719,23 +718,6 @@ pub fn dead_letter_entry(
         dead_letter_key(record.job.document_id, record.job.event_id),
         postcard::to_allocvec(record)?.into(),
     ))
-}
-
-/// A document whose superseded IRI index rows still have to be dropped. Kept
-/// durable so cleanup survives the batch that scheduled it.
-pub fn materialization_prune_entry(
-    document_id: Ulid,
-    cursor: Ulid,
-) -> Result<(KeySpace, Key, Value), ConversionError> {
-    Ok((
-        MATERIALIZATION_PRUNE_KEYSPACE.to_string(),
-        materialization_prune_key(document_id),
-        postcard::to_allocvec(&cursor)?.into(),
-    ))
-}
-
-pub fn materialization_prune_key(document_id: Ulid) -> Key {
-    ByteView::from(document_id.to_bytes().to_vec())
 }
 
 pub fn graph_prune_entry(

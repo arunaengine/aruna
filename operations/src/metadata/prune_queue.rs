@@ -300,8 +300,8 @@ pub async fn process_graph_tombstones(
         }
     }
 
-    // A deleted document is absent from the registry, so its IRI index rows are
-    // pruned here rather than left to leak into the predicate-less backlink scan.
+    // A deleted document is absent from the registry, so its IRI index rows are pruned here,
+    // read through the document's own rows.
     if let Err(error) = prune_deleted_index(context, &deleted_documents).await {
         warn!(error = ?error, "Failed to prune IRI index rows for deleted documents");
     }
