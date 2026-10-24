@@ -5,16 +5,21 @@
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{INVENTORY_KEYSPACE, RANGE_COUNTER_KEYSPACE};
-use aruna_core::structs::storage::distribution::KeyRange;
-use aruna_core::structs::storage::distribution::accounting::RangeCounters;
+use aruna_core::keyspaces::{INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
+use aruna_core::structs::storage::distribution::accounting::{
+    RangeAccount, RangeCounters, account_key,
+};
+use aruna_core::structs::storage::distribution::inventory::{HeadEntry, VersionEntry};
+use aruna_core::structs::storage::distribution::{KeyRange, OriginalEpoch};
 use aruna_core::types::{Effects, TxnId};
 use aruna_storage::storage::{FjallStorage, StorageHandle};
 use byteview::ByteView;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-use super::inventory::{InventoryError, InventoryUpdate, open_ranges};
+use super::inventory::{
+    AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, open_ranges,
+};
 
 pub(crate) fn open() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("tempdir must be created");
@@ -129,4 +134,76 @@ pub(crate) async fn counters(handle: &StorageHandle, key: Vec<u8>) -> RangeCount
 
 pub(crate) async fn has_row(handle: &StorageHandle, position: Vec<u8>) -> bool {
     get(handle, INVENTORY_KEYSPACE, position).await.is_some()
+}
+
+pub(crate) fn context(handle: &StorageHandle) -> crate::driver::DriverContext {
+    crate::driver::DriverContext {
+        storage_handle: handle.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    }
+}
+
+pub(crate) async fn account(
+    handle: &StorageHandle,
+    set_id: Ulid,
+    range_id: Ulid,
+) -> Option<RangeAccount> {
+    get(
+        handle,
+        RANGE_ACCOUNT_KEYSPACE,
+        account_key(set_id, range_id),
+    )
+    .await
+    .map(|value| RangeAccount::from_bytes(&value).expect("account decodes"))
+}
+
+/// A write of a new current version `seed` of `size` bytes at generation 1.
+pub(crate) fn write(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryUpdate {
+    let version_id = Ulid::from_bytes([seed; 16]);
+    let entry = VersionEntry {
+        marker: false,
+        size,
+        referenced: false,
+    };
+    let mut change = InventoryChange::new(set_id, key);
+    change.added.push(AddedVersion {
+        version_id,
+        epoch: OriginalEpoch(1),
+        generation: 1,
+        entry,
+    });
+    change.head = HeadChange::Set(HeadEntry {
+        version_id,
+        epoch: OriginalEpoch(1),
+        generation: 1,
+        version: entry,
+    });
+    InventoryUpdate::new(change)
+}
+
+/// Removes a key's head and the versions `seeds`.
+pub(crate) fn purge(set_id: Ulid, key: &str, seeds: &[u8]) -> InventoryUpdate {
+    let mut change = InventoryChange::new(set_id, key);
+    change.removed = seeds
+        .iter()
+        .map(|seed| Ulid::from_bytes([*seed; 16]))
+        .collect();
+    change.head = HeadChange::Remove;
+    InventoryUpdate::new(change)
+}
+
+/// Counters of `objects` current versions holding `bytes`, one version each, at epoch 1.
+pub(crate) fn exact(objects: i64, bytes: i64) -> RangeCounters {
+    RangeCounters {
+        objects,
+        current_bytes: bytes,
+        versions: objects,
+        logical_bytes: bytes,
+        max_epoch: OriginalEpoch(1),
+        ..RangeCounters::default()
+    }
 }

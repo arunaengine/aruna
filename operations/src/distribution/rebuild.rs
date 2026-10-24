@@ -521,3 +521,6 @@ impl Operation for RebuildOperation {
     }
 }
 
+#[cfg(test)]
+#[path = "rebuild_tests.rs"]
+mod tests;
