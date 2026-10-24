@@ -468,3 +468,7 @@ impl Operation for InventoryVersionsOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+#[path = "versions_tests.rs"]
+mod tests;
