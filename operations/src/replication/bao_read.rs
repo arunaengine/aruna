@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
+use crate::distribution::pull::{HeldElsewhere, kept_location, kept_reads};
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -460,6 +461,8 @@ enum IncomingBaoState {
     /// A logical version target is looked up in this node's member bucket of the set.
     LocateVersion,
     ReadExactVersion,
+    /// A record-only version is served from this node's attachment or cache entry.
+    ReadKept,
     ReadExactBucket,
     ResolveSource,
     ReadPolicy,
@@ -542,6 +545,8 @@ pub struct IncomingBaoOperation {
     plain_key: Option<BucketKeyRef>,
     /// Where a logical version target lies in this node's member bucket.
     located: Option<VersionedObjectArn>,
+    /// A record-only version whose kept copy is being looked up.
+    kept: Option<HeldElsewhere>,
 }
 
 impl IncomingBaoOperation {
@@ -591,6 +596,7 @@ impl IncomingBaoOperation {
             lease: None,
             plain_key: None,
             located: None,
+            kept: None,
         }
     }
 
@@ -1008,6 +1014,7 @@ impl IncomingBaoOperation {
             IncomingBaoState::ReadRealm => "read_realm",
             IncomingBaoState::LocateVersion => "locate_version",
             IncomingBaoState::ReadExactVersion => "read_exact_version",
+            IncomingBaoState::ReadKept => "read_kept",
             IncomingBaoState::ReadExactBucket => "read_exact_bucket",
             IncomingBaoState::ResolveSource => "resolve_source",
             IncomingBaoState::ReadPolicy => "read_policy",
@@ -1154,6 +1161,9 @@ impl IncomingBaoOperation {
             Err(_) => return self.send_refusal(BaoReadRefusal::BackendFailure),
         };
         self.version_refs = version.placement_policies.clone();
+        if let Some(held) = self.held_version(&version) {
+            return self.read_kept(held);
+        }
         let Some(blob_hash) = version.blob_hash().copied() else {
             return self.serve_observation(version);
         };
@@ -1175,6 +1185,76 @@ impl IncomingBaoOperation {
             .exact_target()
             .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
         self.read_location()
+    }
+
+    /// A record-only version of a distributed bucket this node may keep a copy of.
+    fn held_version(&self, version: &BlobVersion) -> Option<HeldElsewhere> {
+        let BlobVersionState::Reference {
+            source,
+            cached_metadata,
+            ..
+        } = &version.state
+        else {
+            return None;
+        };
+        let (set_id, blake3) = HeldElsewhere::of(source, version.identity)?;
+        Some(HeldElsewhere {
+            set_id,
+            version_id: self.exact_target()?.version,
+            blake3,
+            size: cached_metadata.content_length,
+            metadata: HashMap::new(),
+            version_created_at: None,
+            source_policies: Vec::new(),
+        })
+    }
+
+    /// Serves an attachment or cache entry of a version this node keeps only the record of,
+    /// under the same checks as a materialized copy; governed versions are never kept.
+    fn read_kept(&mut self, held: HeldElsewhere) -> Effects {
+        if !self.policy_allowed {
+            return self.send_refusal(BaoReadRefusal::ReadDenied);
+        }
+        if self
+            .request
+            .expected_blake3
+            .is_some_and(|expected| expected != held.blake3)
+        {
+            return self.send_refusal(BaoReadRefusal::HashMismatch);
+        }
+        if !self.version_refs.is_empty() {
+            return self.send_refusal(BaoReadRefusal::NotFound);
+        }
+        self.blob_hash = Some(held.blake3);
+        self.version_key = self
+            .exact_target()
+            .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
+        self.state = IncomingBaoState::ReadKept;
+        let reads = kept_reads(&held);
+        self.kept = Some(held);
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_kept(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected(event);
+        };
+        let location = self
+            .kept
+            .take()
+            .and_then(|held| kept_location(&held, &values));
+        match location {
+            Some(location)
+                if location.get_blake3() == self.blob_hash.as_ref().map(|hash| &hash[..]) =>
+            {
+                self.send_accepted(location)
+            }
+            Some(_) => self.send_refusal(BaoReadRefusal::HashMismatch),
+            None => self.send_refusal(BaoReadRefusal::NotFound),
+        }
     }
 
     /// Whether this node may answer out of its own observations at all: only a
@@ -1534,6 +1614,7 @@ impl Operation for IncomingBaoOperation {
             IncomingBaoState::ReadRealm => self.handle_realm(event),
             IncomingBaoState::LocateVersion => self.handle_located(event),
             IncomingBaoState::ReadExactVersion => self.handle_exact_version(event),
+            IncomingBaoState::ReadKept => self.handle_kept(event),
             IncomingBaoState::ReadExactBucket => self.handle_exact_bucket(event),
             IncomingBaoState::ResolveSource => match event {
                 Event::SubOperation(SubOperationEvent::VersionAccessResolved {
@@ -2525,6 +2606,94 @@ mod pure_tests {
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+    }
+
+    // A node that keeps only the record of a distributed version serves its verified attachment.
+    #[test]
+    fn serves_kept_copy() {
+        use aruna_core::structs::execution::source_access::SourceMetadata;
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_core::structs::execution::staging::{
+            PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+        };
+        use aruna_core::structs::storage::distribution::on_use::Attachment;
+        let (local_node, peer) = (node_from_seed(1), node_from_seed(2));
+        let hash = [4u8; 32];
+        let set_id = Ulid::from(8u128);
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::ArunaNative,
+                public_config: HashMap::from([("set_id".to_string(), set_id.to_string())]),
+                source_path: "bucket/path/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+                namespace: None,
+            },
+            connector_id: None,
+        };
+        let observed = SourceMetadata {
+            content_length: 42,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let record_only = BlobVersion::reference(
+            source,
+            observed,
+            SystemTime::UNIX_EPOCH,
+            UserId::nil(test_realm()),
+            SystemTime::UNIX_EPOCH,
+        )
+        .with_identity(Some(hash));
+        let mut operation = IncomingBaoOperation::new(
+            peer,
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            read_request(local_node, hash),
+        )
+        .with_policy_paths(HashSet::from([read_path(local_node)]));
+        operation.start();
+        for value in [realm_value(peer), bucket_value()] {
+            operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: Vec::<u8>::new().into(),
+                value: Some(value),
+            }));
+        }
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(record_only.to_bytes().unwrap().into()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 2
+        ));
+        let (location, _) = location_value(hash);
+        let attached = Attachment {
+            blake3: hash,
+            location: location.clone(),
+        };
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Vec::new().into(), Some(attached.to_bytes().unwrap().into())),
+                (Vec::new().into(), None),
+            ],
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: None,
+        }));
+        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+            panic!("expected accepted frame")
+        };
+        assert!(matches!(
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::BaoReadAccepted { size: 42, blake3, .. } if blake3 == hash
         ));
     }
 
