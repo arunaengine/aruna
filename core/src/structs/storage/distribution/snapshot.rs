@@ -149,6 +149,9 @@ impl DistributionSnapshot {
             }
             self.check_statement(realm_id, signed)?;
         }
+        for member in &self.config.members {
+            self.check_admission(member)?;
+        }
         if self.phase == SetPhase::Active {
             let missing = self
                 .config
@@ -164,6 +167,37 @@ impl DistributionSnapshot {
             }
         }
         Ok(())
+    }
+
+    /// An admitted member needs its own signed admission for its incarnation; a member that
+    /// serves or catches up must be admitted, a created one must not be.
+    fn check_admission(&self, member: &DistributionMember) -> Result<(), DistributionError> {
+        let serving = matches!(
+            member.state,
+            MemberState::CatchingUp | MemberState::Ready | MemberState::Leaving
+        );
+        let Some(incarnation) = member.incarnation else {
+            return match serving {
+                true => Err(DistributionError::MissingAdmission(member.member_id)),
+                false => Ok(()),
+            };
+        };
+        if member.state == MemberState::Created {
+            return Err(DistributionError::Malformed(
+                "a created member has no incarnation yet",
+            ));
+        }
+        // `check_statement` already verified each statement's signer, intent and incarnation.
+        let proven = self.statements.iter().any(|signed| {
+            let statement = &signed.statement;
+            matches!(statement.kind, StatementKind::Admit)
+                && statement.member_id == member.member_id
+                && statement.incarnation == incarnation
+        });
+        match proven {
+            true => Ok(()),
+            false => Err(DistributionError::MissingAdmission(member.member_id)),
+        }
     }
 
     /// A statement holds only with its own signer's signature, from the member's node, for

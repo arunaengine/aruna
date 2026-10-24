@@ -8,7 +8,8 @@ use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
 use aruna_core::structs::storage::distribution::presets::replica_layout;
 use aruna_core::structs::storage::distribution::{
     DistributionConfig, DistributionRequest, DistributionSettings, DistributionSnapshot,
-    DistributionView, SetRoot, SignedSnapshot, Statement, StatementKind, next_snapshot,
+    DistributionView, MemberState, SetRoot, SignedSnapshot, Statement, StatementKind,
+    next_snapshot,
 };
 
 const PUBLISHER: u8 = 41;
@@ -75,6 +76,7 @@ fn admitted(head: &DistributionSnapshot, signer: u8) -> DistributionSnapshot {
     next.number += 1;
     next.previous = Some(head.digest());
     next.config.members[1].incarnation = Some(6);
+    next.config.members[1].state = MemberState::Ready;
     next.statements.push(statement);
     next
 }

@@ -95,6 +95,7 @@ fn statements_checked_inside() {
     let admitted = |statement: SignedStatement, incarnation: Option<u128>| {
         signed(successor(&created(), |next| {
             next.config.members[1].incarnation = incarnation;
+            next.config.members[1].state = MemberState::Ready;
             next.statements.push(statement);
         }))
         .verify(realm())
@@ -115,6 +116,7 @@ fn statements_checked_inside() {
     assert!(admitted(resigned, Some(5)).is_err());
     let twice = signed(successor(&created(), |next| {
         next.config.members[1].incarnation = Some(5);
+        next.config.members[1].state = MemberState::Ready;
         next.statements = vec![admission(2, 5, 2), admission(2, 5, 2)];
     }));
     assert!(matches!(
@@ -219,4 +221,30 @@ fn ranges_resolve_keys() {
     assert_eq!(coordinator("g"), Some(member_id(2)));
     assert_eq!(coordinator("zzz"), Some(member_id(1)));
     assert!(!snapshot.serving());
+}
+
+#[test]
+fn admissions_need_proofs() {
+    // The publisher cannot declare a member admitted without the member's own statement.
+    let unproven = signed(successor(&created(), |next| {
+        next.config.members[1].incarnation = Some(5);
+        next.config.members[1].state = MemberState::Ready;
+    }));
+    assert_eq!(
+        unproven.verify(realm()),
+        Err(DistributionError::MissingAdmission(member_id(2)))
+    );
+    let unadmitted = signed(successor(&created(), |next| {
+        next.config.members[1].state = MemberState::Ready;
+    }));
+    assert_eq!(
+        unadmitted.verify(realm()),
+        Err(DistributionError::MissingAdmission(member_id(2)))
+    );
+    let proven = signed(successor(&created(), |next| {
+        next.config.members[1].incarnation = Some(5);
+        next.config.members[1].state = MemberState::Ready;
+        next.statements.push(admission(2, 5, 2));
+    }));
+    assert_eq!(proven.verify(realm()), Ok(()));
 }
