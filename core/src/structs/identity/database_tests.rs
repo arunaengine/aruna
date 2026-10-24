@@ -98,3 +98,43 @@ fn ordinary_bucket_name_checked() {
     };
     assert_eq!(ordinary.validate(), Err(DatabaseError::InvalidBucket));
 }
+
+#[test]
+fn removal_leaves_new_version() {
+    // A removal must change the register version, so a consent given before it cannot be
+    // replayed onto the empty entry.
+    use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+    use crate::reducer::AdminDocumentState;
+    use crate::structs::identity::auth::Actor;
+    let actor = Actor {
+        node_id: iroh::SecretKey::from_bytes(&[7; 32]).public(),
+        user_id: crate::UserId::local(Ulid::from_bytes([3; 16]), realm()),
+        realm_id: realm(),
+    };
+    let mut state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id: realm() });
+    state
+        .apply_operation(
+            &actor,
+            AdminDocumentOperation::DatabaseSet {
+                entry: entry(1),
+                predecessor: None,
+                consent: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(state.materialized_databases(), vec![entry(1)]);
+    let marked = state.database_version(entry(1).entry_id);
+    assert!(marked.is_some());
+    state
+        .apply_operation(
+            &actor,
+            AdminDocumentOperation::DatabaseRemoved {
+                entry_id: entry(1).entry_id,
+            },
+        )
+        .unwrap();
+    assert!(state.materialized_databases().is_empty());
+    let removed = state.database_version(entry(1).entry_id);
+    assert!(removed.is_some());
+    assert_ne!(removed, marked);
+}
