@@ -342,10 +342,41 @@ mod tests {
         }
     }
 
+    /// An encoded, signed download ticket whose object id carries `marker`.
+    fn canary_ticket(marker: &str) -> String {
+        use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::storage::backend_import::TokenGrant;
+        use aruna_core::structs::storage::distribution::ticket::{SignedTicket, Ticket};
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let issuer = iroh::SecretKey::from_bytes(&[2; 32]);
+        let ticket = Ticket {
+            realm_id,
+            issuer: issuer.public(),
+            target: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            user_id: aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            grant: TokenGrant {
+                token_hash: marker.to_string(),
+                issuer: realm_id,
+                issued_at_secs: 1,
+                expires_at_secs: 20,
+                via: None,
+            },
+            restrictions: None,
+            session: None,
+            object_id: marker.to_string(),
+            nonce: [5; 16],
+            issued_at: 10,
+            expires_at: 20,
+        };
+        let signature = issuer.sign(&ticket.signing_bytes().unwrap());
+        SignedTicket { ticket, signature }.encode().unwrap()
+    }
+
     #[test]
     fn ticket_canary_unlogged() {
-        // A ticket with a known marker must not appear in any log line the request writes.
-        let marker = "CANARY0TICKET0MARKER";
+        // An issued ticket with a known marker must not appear in any log line.
+        let marker = canary_ticket("CANARY0TICKET0MARKER");
+        let marker = marker.as_str();
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()
