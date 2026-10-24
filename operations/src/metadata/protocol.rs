@@ -20,6 +20,9 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::storage::distribution::{
+    DistributionRequest, DistributionRevision, SignedSnapshot, SignedStatement,
+};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::{
@@ -541,6 +544,29 @@ pub enum MetadataTransportMessage {
     /// `Ok(false)`: the node already held a bucket of that name and created nothing.
     ForwardedNewBucket {
         result: Result<bool, SyncRefusal>,
+    },
+    /// A member's node creates and admits its local bucket for the forwarded caller (D12).
+    ForwardAdmitMember {
+        auth_token: AuthToken,
+        snapshot: Box<SignedSnapshot>,
+        member_id: Ulid,
+    },
+    AdmittedMember {
+        result: Result<Box<SignedStatement>, SyncRefusal>,
+    },
+    /// A group admin request for the set's publisher with the caller's bearer token (D33).
+    ForwardDistributionRequest {
+        auth_token: AuthToken,
+        set_id: Ulid,
+        request_id: Ulid,
+        request: Box<DistributionRequest>,
+    },
+    /// A member-signed statement for the set's publisher to embed.
+    SubmitDistributionStatement {
+        statement: Box<SignedStatement>,
+    },
+    DistributionAccepted {
+        result: Result<DistributionRevision, crate::distribution::forward::PublishRefusal>,
     },
 }
 

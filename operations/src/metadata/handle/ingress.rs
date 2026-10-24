@@ -914,6 +914,19 @@ impl MetadataHandle {
                 })
                 .await
             }
+            admit @ MetadataTransportMessage::ForwardAdmitMember { .. } => {
+                Box::pin(async {
+                    crate::distribution::forward::serve_admission(context, peer, admit).await
+                })
+                .await
+            }
+            publish @ (MetadataTransportMessage::ForwardDistributionRequest { .. }
+            | MetadataTransportMessage::SubmitDistributionStatement { .. }) => {
+                Box::pin(async {
+                    crate::distribution::forward::serve_publish(context, peer, publish).await
+                })
+                .await
+            }
             fetch @ MetadataTransportMessage::FetchRealmDocuments { .. } => {
                 Box::pin(async {
                     crate::device::forward::serve_realm_documents(context, peer, fetch).await
@@ -1061,6 +1074,9 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardCreateBucket { .. }
             | MetadataTransportMessage::ForwardNewBucket { .. }
             | MetadataTransportMessage::ForwardCheckBucket { .. }
+            | MetadataTransportMessage::ForwardAdmitMember { .. }
+            | MetadataTransportMessage::ForwardDistributionRequest { .. }
+            | MetadataTransportMessage::SubmitDistributionStatement { .. }
             | MetadataTransportMessage::FetchRealmDocuments { .. }
             | MetadataTransportMessage::FetchGraphState { .. }
             | MetadataTransportMessage::ForwardApplyBatch { .. }

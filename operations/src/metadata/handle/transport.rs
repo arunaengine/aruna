@@ -482,6 +482,15 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedVaultChange { .. } => "forwarded_vault_change",
         MetadataTransportMessage::FetchVaultRecords { .. } => "fetch_vault_records",
         MetadataTransportMessage::FetchedVaultRecords { .. } => "fetched_vault_records",
+        MetadataTransportMessage::ForwardAdmitMember { .. } => "forward_admit_member",
+        MetadataTransportMessage::AdmittedMember { .. } => "admitted_member",
+        MetadataTransportMessage::ForwardDistributionRequest { .. } => {
+            "forward_distribution_request"
+        }
+        MetadataTransportMessage::SubmitDistributionStatement { .. } => {
+            "submit_distribution_statement"
+        }
+        MetadataTransportMessage::DistributionAccepted { .. } => "distribution_accepted",
         MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
         MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
         MetadataTransportMessage::ForwardPullStatus { .. } => "forward_pull_status",
