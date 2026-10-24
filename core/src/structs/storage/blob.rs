@@ -1188,6 +1188,10 @@ pub struct BlobVersion {
     /// The logical content identity a distributed bucket fixed when it minted the version; it
     /// stays when the bytes change form, as a reference materialized on another member.
     pub identity: Option<[u8; 32]>,
+    /// Where the content came from, set by the server when the version is minted.
+    pub origin: Option<crate::structs::storage::origin::VersionOrigin>,
+    /// The last sync that delivered this version here; the origin stays the source's.
+    pub hop: Option<crate::structs::storage::origin::SyncHop>,
 }
 
 impl BlobVersion {
@@ -1214,6 +1218,8 @@ impl BlobVersion {
             original_epoch: OriginalEpoch::default(),
             generation: 0,
             identity: None,
+            origin: None,
+            hop: None,
         }
     }
 
@@ -1233,6 +1239,8 @@ impl BlobVersion {
             original_epoch: OriginalEpoch::default(),
             generation: 0,
             identity: None,
+            origin: None,
+            hop: None,
         }
     }
 
@@ -1247,6 +1255,8 @@ impl BlobVersion {
             original_epoch: OriginalEpoch::default(),
             generation: 0,
             identity: None,
+            origin: None,
+            hop: None,
         }
     }
 
@@ -1272,6 +1282,8 @@ impl BlobVersion {
             original_epoch: OriginalEpoch::default(),
             generation: 0,
             identity: None,
+            origin: None,
+            hop: None,
         }
     }
 
@@ -1306,6 +1318,19 @@ impl BlobVersion {
 
     pub fn with_identity(mut self, identity: Option<[u8; 32]>) -> Self {
         self.identity = identity;
+        self
+    }
+
+    pub fn with_origin(
+        mut self,
+        origin: Option<crate::structs::storage::origin::VersionOrigin>,
+    ) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    pub fn with_hop(mut self, hop: Option<crate::structs::storage::origin::SyncHop>) -> Self {
+        self.hop = hop;
         self
     }
 

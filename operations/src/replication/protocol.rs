@@ -80,6 +80,10 @@ pub struct VersionReplicationManifest {
     /// A coordinator's publication to a member of a distributed bucket; the member admits it
     /// against its own record instead of a relationship or a writer's permissions.
     pub distribution: Option<Publication>,
+    /// Where the version's content came from; every copy keeps it unchanged.
+    pub version_origin: Option<aruna_core::structs::storage::origin::VersionOrigin>,
+    /// The sync hop the sender's version carries; a sync destination records its own.
+    pub version_hop: Option<aruna_core::structs::storage::origin::SyncHop>,
 }
 
 impl VersionReplicationManifest {
@@ -99,6 +103,15 @@ impl VersionReplicationManifest {
         }
         check_text(&mut budget, &self.bucket, MAX_VALUE_BYTES)?;
         check_text(&mut budget, &self.key, MAX_VALUE_BYTES)?;
+        if self
+            .version_origin
+            .as_ref()
+            .is_some_and(|origin| !origin.bounded())
+        {
+            return Err(ConversionError::FromStrError(
+                "replication manifest origin exceeds its size budget".to_string(),
+            ));
+        }
         check_map(&mut budget, &self.metadata)?;
 
         if self.upstream_sources.len() > MAX_REPLICATION_SOURCES {
@@ -737,6 +750,8 @@ mod pure_tests {
             version_generation: 0,
             logical_identity: None,
             distribution: None,
+            version_origin: None,
+            version_hop: None,
         }
     }
 

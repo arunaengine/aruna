@@ -406,6 +406,8 @@ pub async fn refresh_with_context(
                 original_epoch,
                 generation,
                 identity,
+                origin,
+                hop,
             } = version;
             let BlobVersionState::Reference {
                 source,
@@ -454,6 +456,8 @@ pub async fn refresh_with_context(
                         original_epoch,
                         generation,
                         identity,
+                        origin,
+                        hop,
                         ..BlobVersion::reference(
                             source,
                             cached_metadata,

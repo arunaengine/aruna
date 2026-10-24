@@ -76,6 +76,8 @@ impl From<LegacyVersion> for BlobVersion {
             original_epoch: Default::default(),
             generation: 0,
             identity: None,
+            origin: None,
+            hop: None,
         }
     }
 }

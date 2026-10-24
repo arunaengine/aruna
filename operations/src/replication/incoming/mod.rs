@@ -65,7 +65,10 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
 use aruna_core::structs::storage::format::{Compression, EncodingClass, StoredLayout};
+use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
+use aruna_core::structs::storage::origin::{OriginVersion, SyncHop};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
 };
@@ -214,6 +217,8 @@ pub enum IncomingVersionError {
     CurrentVersionMissing,
     #[error("Invalid reference advance")]
     InvalidReferenceAdvance,
+    #[error("A version with this id is stored with another origin")]
+    OriginMismatch,
     #[error("Materialized replication manifest is missing blob info")]
     MissingBlobInfo,
     #[error("Materialized replication manifest is missing local blob location")]
@@ -997,7 +1002,9 @@ impl IncomingVersionOperation {
     fn stamped(&self, version: BlobVersion) -> BlobVersion {
         let version = version
             .with_epoch(self.original_epoch())
-            .with_generation(self.version_generation());
+            .with_generation(self.version_generation())
+            .with_origin(self.manifest.version_origin.clone())
+            .with_hop(self.hop());
         match self.destination_bound {
             true => {
                 let identity = self.manifest.logical_identity;
@@ -1006,6 +1013,35 @@ impl IncomingVersionOperation {
             }
             false => version,
         }
+    }
+
+    /// A sync destination records the hop from the sender's exact version; member replication
+    /// keeps the hop the version already carries.
+    fn hop(&self) -> Option<SyncHop> {
+        let Some(sync) = &self.manifest.origin else {
+            return self.manifest.version_hop.clone();
+        };
+        let from = if self.manifest.original_epoch.0 > 0 {
+            OriginVersion::Global(GlobalId::Version {
+                realm_id: self.local_realm_id,
+                version_id: self.manifest.version_id,
+            })
+        } else {
+            OriginVersion::Node(
+                VersionedObjectArn::new(
+                    self.local_realm_id,
+                    self.publisher_node_id,
+                    &self.manifest.bucket,
+                    &self.manifest.key,
+                    self.manifest.version_id,
+                )
+                .ok()?,
+            )
+        };
+        Some(SyncHop {
+            relationship_id: sync.relationship_id,
+            from,
+        })
     }
 
     fn incoming_logical_bytes(&self) -> Result<u64, IncomingVersionError> {
@@ -2757,6 +2793,10 @@ impl IncomingVersionOperation {
                 Err(error) => return self.fail(error.into()),
             };
             self.existing_marker = Some(existing.is_deleted());
+            // The origin is fixed at mint, so a replay must carry the stored one.
+            if existing.origin.is_some() && existing.origin != self.manifest.version_origin {
+                return self.reject_negotiation(IncomingVersionError::OriginMismatch);
+            }
             if self.manifest.reference_advance.is_some() {
                 let incoming = match self.reference_version() {
                     Ok(incoming) => incoming,

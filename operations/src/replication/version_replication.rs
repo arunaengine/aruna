@@ -54,6 +54,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::{
     MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
 };
+use aruna_core::structs::storage::origin::{SyncHop, VersionOrigin};
 use aruna_core::structs::storage::replication::{
     ArunaArn, ReplicationFailure, ReplicationItemError, ReplicationItemKind,
     ReplicationNegotiationResult, ReplicationSuboperationResult,
@@ -1196,6 +1197,8 @@ pub struct ReplicateObjectOperation {
     version_epoch: OriginalEpoch,
     version_generation: u64,
     version_identity: Option<[u8; 32]>,
+    version_origin: Option<VersionOrigin>,
+    version_hop: Option<SyncHop>,
     pending_copy: Option<ManagedCopyKey>,
     /// Destination details of this node, evaluated before reference bytes are
     /// materialized locally.
@@ -1251,6 +1254,8 @@ impl ReplicateObjectOperation {
             version_epoch: OriginalEpoch::default(),
             version_generation: 0,
             version_identity: None,
+            version_origin: None,
+            version_hop: None,
             pending_copy: None,
             gate_context: None,
             gate: None,
@@ -2140,6 +2145,8 @@ impl ReplicateObjectOperation {
                 .sync
                 .as_ref()
                 .and_then(|sync| sync.distribution.clone()),
+            version_origin: self.version_origin.clone(),
+            version_hop: self.version_hop.clone(),
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
@@ -2408,7 +2415,11 @@ impl ReplicateObjectOperation {
             original_epoch,
             generation,
             identity,
+            origin,
+            hop,
         } = version;
+        self.version_origin = origin;
+        self.version_hop = hop;
         self.version_policies = placement_policies;
         self.version_epoch = original_epoch;
         self.version_generation = generation;
