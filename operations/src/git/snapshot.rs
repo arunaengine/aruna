@@ -9,6 +9,7 @@ use super::{GitError, document, objects, publish, records};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::permission_paths::ResolvePathsOperation;
+use crate::distribution::resolve::version_holders;
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
@@ -259,17 +260,28 @@ async fn located(
     }
     let mut found = Vec::new();
     let node = context.net_handle.as_ref().map(|net| net.node_id());
-    // A global id resolves on a member of its set; other holders are the resolver's to choose.
+    // A global id resolves on a member of its set, elsewhere through the resolver's holders.
     if let (Some(GlobalId::Version { version_id, .. }), Some(node)) = (
         identity
             .global
             .as_ref()
             .filter(|global| global.realm_id() == realm_id),
         node,
-    ) && let Ok(Some((bucket, key))) =
-        crate::metadata::global_entries::local_version(context, *version_id).await
-    {
-        found.extend(VersionedObjectArn::new(realm_id, node, bucket, key, *version_id).ok());
+    ) {
+        match crate::metadata::global_entries::local_version(context, *version_id).await {
+            Ok(Some((bucket, key))) => {
+                found
+                    .extend(VersionedObjectArn::new(realm_id, node, bucket, key, *version_id).ok());
+            }
+            _ => {
+                if let Some(resolved) = version_holders(context, *version_id).await {
+                    found.extend(resolved.holders.iter().take(4).filter_map(|holder| {
+                        let (bucket, key) = (&resolved.bucket, &resolved.key);
+                        VersionedObjectArn::new(realm_id, *holder, bucket, key, *version_id).ok()
+                    }));
+                }
+            }
+        }
     }
     if let (Some(location), Some(node)) = (&identity.location, node)
         && let Ok(bucket) = drive(GetBucketOperation::new(location.bucket.clone()), context).await

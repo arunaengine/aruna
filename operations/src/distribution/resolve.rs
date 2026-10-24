@@ -27,6 +27,8 @@ const MAX_SETS: usize = 4096;
 const MAX_CANDIDATES: usize = 4;
 /// At most this many members are asked for one id, over all candidate sets.
 pub const MAX_PROBES: usize = 16;
+/// How long resolving one id inside a longer request may take.
+pub const RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where one global version id lives.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -276,6 +278,14 @@ pub async fn resolve_version(
         (Some(found), _) => GlobalResolution::Found(found),
         (None, true) => GlobalResolution::NotFound,
         (None, false) => GlobalResolution::Unavailable,
+    }
+}
+
+/// Where `version_id` lives, within [`RESOLVE_BUDGET`]; `None` when it is not resolvable now.
+pub async fn version_holders(context: &DriverContext, version_id: Ulid) -> Option<ResolvedVersion> {
+    match resolve_version(context, version_id, Instant::now() + RESOLVE_BUDGET).await {
+        GlobalResolution::Found(found) => Some(found),
+        _ => None,
     }
 }
 
