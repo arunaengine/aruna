@@ -30,6 +30,7 @@ use crate::forward::transport::reject;
 use crate::metadata::device_pull::{authorize_peer, authorize_pull};
 use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
 use crate::placement::process_placements::load_realm_config;
+use crate::replication::bootstrap::wake_bootstrap;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::GetBucketOperation;
 
@@ -88,7 +89,10 @@ pub(crate) async fn publish_local(
     let mut last = PublishRefusal::Unavailable("no attempt was made".to_string());
     for _ in 0..PUBLISH_ATTEMPTS {
         match drive(PublishOperation::new(config.clone()), context.as_ref()).await {
-            Ok(revision) => return Ok(revision),
+            Ok(revision) => {
+                wake_bootstrap(context).await;
+                return Ok(revision);
+            }
             Err(PublishError::Storage(StorageError::TransactionConflict)) => {
                 last = PublishRefusal::Unavailable("the record changed concurrently".to_string());
             }

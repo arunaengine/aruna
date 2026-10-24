@@ -40,6 +40,7 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
+use super::bootstrap::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
 use super::members::{MemberTarget, bound_record, member_jobs, member_publication};
 use super::parking::{PARKED_DUE, park_job};
 use super::plaintext::{consent_delete, consent_write, job_consent, plaintext_allowed};
@@ -1185,7 +1186,7 @@ pub async fn relationship_job_stats(
 }
 
 pub async fn next_blob_timer(storage: &StorageHandle) -> Result<Option<Duration>, BlobQueueError> {
-    if live_obligations_exist(storage).await? {
+    if live_obligations_exist(storage).await? || bootstrap_waiting(storage).await {
         return Ok(Some(Duration::ZERO));
     }
 
@@ -1227,6 +1228,10 @@ pub async fn process_blob_batch(
 ) -> Result<BlobDrainResult, BlobQueueError> {
     let batch_started = Instant::now();
     let repair = process_live_obligations(context).await?;
+    let bootstrap = process_bootstrap(context).await.unwrap_or_else(|error| {
+        warn!(%error, "Distributed bucket bootstrap failed; retrying");
+        true
+    });
     let now_ms = unix_timestamp_millis();
     let scan = scan_due_jobs(&context.storage_handle, now_ms, REPLICATION_BATCH_SIZE).await?;
     let mut next_due_ms = scan.next_due_ms;
@@ -1299,7 +1304,12 @@ pub async fn process_blob_batch(
         next_due_after: if has_more_due {
             None
         } else {
-            next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
+            let next = next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms));
+            // A bootstrap waiting for its jobs or the publisher is looked at again soon.
+            match bootstrap {
+                true => Some(next.map_or(BOOTSTRAP_POLL, |after| after.min(BOOTSTRAP_POLL))),
+                false => next,
+            }
         },
     })
 }

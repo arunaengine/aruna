@@ -248,7 +248,7 @@ pub async fn admit_pending(
 }
 
 /// Hands a member's statement to the publisher; one it already embedded counts as done.
-async fn submit(
+pub(crate) async fn submit(
     context: &Arc<DriverContext>,
     publisher: NodeId,
     local: NodeId,

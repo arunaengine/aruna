@@ -29,6 +29,7 @@ use crate::placement::process_placements::reconcile_shard_topics;
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::IncomingBaoOperation;
+use crate::replication::bootstrap::wake_bootstrap;
 use crate::replication::incoming::{IncomingVersionOperation, IncomingVersionResult};
 use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::{
@@ -895,6 +896,8 @@ async fn reconcile_inbound_topics(
         crate::federation::publish::publish_soon(context, realm_id, node_id).await;
     }
     refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
+    // An installed record may name a member this node bootstraps.
+    wake_bootstrap(context).await;
     refresh_target_interest(context, &targets.targets).await;
     let project_started = Instant::now();
     project_inbound_events(context, targets).await;

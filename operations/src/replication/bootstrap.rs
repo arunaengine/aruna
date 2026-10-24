@@ -1,35 +1,62 @@
 //! Bootstraps a catching-up member of a distributed bucket from the coordinators of its ranges.
 //! Each range is walked over the ordered inventory in bounded pages with a durable cursor; a page
-//! waits until its jobs were delivered, and live publications overlap the walk.
+//! waits until its jobs were delivered, live publications overlap the walk, and a coordinator
+//! whose walks for the member all ended states the catch-up to the record's publisher.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BOOTSTRAP_KEYSPACE, INVENTORY_KEYSPACE, REPLICATION_JOB_KEYSPACE};
+use aruna_core::events::{Event, StatementSignEvent, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::{
+    BOOTSTRAP_KEYSPACE, CATCH_UP_KEYSPACE, INVENTORY_KEYSPACE, REPLICATION_JOB_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::distribution::KeyRange;
-use aruna_core::structs::storage::distribution::bootstrap::{BootstrapCursor, bootstrap_key};
+use aruna_core::structs::storage::distribution::bootstrap::{
+    BootstrapCursor, bootstrap_key, bootstrap_prefix,
+};
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, Position, VersionEntry, range_interval,
 };
+use aruna_core::structs::storage::distribution::{
+    DistributionMember, DistributionSnapshot, KeyRange, MAX_RANGES, Statement, StatementClaim,
+};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_storage::StorageHandle;
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::members::MemberTarget;
+use super::members::{MemberTarget, read_record};
 use super::protocol::ReplicationMode;
-use super::queue::{BlobJobRecord, blob_job_key};
+use super::queue::{BlobJobRecord, blob_job_key, schedule_blob_drain};
 use super::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
+use crate::distribution::create::submit;
+use crate::distribution::sign_statement;
+use crate::driver::{DriverContext, drive};
+use crate::s3::bucket::get::GetBucketOperation;
 
 /// Inventory rows one page queues at most; the next page waits until they are delivered.
 const PAGE_ROWS: usize = 64;
 const PAGE_BYTES: usize = 1 << 20;
+/// Sets and pages one drain works on at most.
+const SET_BATCH: usize = 16;
+const PAGE_BUDGET: usize = 32;
+/// Rows one drain deletes at most while it clears the cursors of a settled set.
+const CLEAR_BATCH: usize = 1024;
+/// How soon the drain looks again while a bootstrap waits for its jobs.
+pub const BOOTSTRAP_POLL: Duration = Duration::from_secs(5);
+
 /// One page of one range's walk for one catching-up member.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageConfig {
@@ -351,6 +378,250 @@ impl Operation for BootstrapPage {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],
         }
+    }
+}
+
+/// Rows of one keyspace under `prefix`, at most `limit`.
+async fn scan(
+    context: &DriverContext,
+    key_space: &str,
+    prefix: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Value)>, String> {
+    let iter = StorageEffect::Iter {
+        key_space: key_space.to_string(),
+        prefix: prefix.map(Key::from),
+        start: None,
+        limit,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(iter).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values
+            .into_iter()
+            .map(|(key, value)| (key.to_vec(), value))
+            .collect()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected scan answer {other:?}")),
+    }
+}
+
+async fn delete(context: &DriverContext, deletes: Vec<(String, Key)>) -> Result<(), String> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    let effect = StorageEffect::BatchDelete {
+        deletes,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected delete answer {other:?}")),
+    }
+}
+
+/// Wakes the replication drain when a set waits for its bootstrap.
+pub async fn wake_bootstrap(context: &DriverContext) {
+    if let Some(task) = context.task_handle.as_ref()
+        && bootstrap_waiting(&context.storage_handle).await
+    {
+        task.send_effect(schedule_blob_drain()).await;
+    }
+}
+
+/// Whether any set still waits for its bootstrap here.
+pub async fn bootstrap_waiting(storage: &StorageHandle) -> bool {
+    let iter = StorageEffect::Iter {
+        key_space: CATCH_UP_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: 1,
+        txn_id: None,
+    };
+    matches!(
+        storage.send_storage_effect(iter).await,
+        Event::Storage(StorageEvent::IterResult { values, .. }) if !values.is_empty()
+    )
+}
+
+/// Works on the sets that name catching-up members, within the drain's page budget. Returns
+/// whether some bootstrap still waits, so the drain looks again soon.
+pub async fn process_bootstrap(context: &DriverContext) -> Result<bool, String> {
+    let Some(net) = context.net_handle.as_ref() else {
+        return Ok(false);
+    };
+    let (realm_id, local) = (*net.realm_id(), net.node_id());
+    let mut budget = PAGE_BUDGET;
+    let mut waiting = false;
+    for (key, _) in scan(context, CATCH_UP_KEYSPACE, None, SET_BATCH).await? {
+        let Ok(set_id) = <[u8; 16]>::try_from(key.as_slice()).map(Ulid::from_bytes) else {
+            delete(context, vec![(CATCH_UP_KEYSPACE.to_string(), key.into())]).await?;
+            continue;
+        };
+        let walk = SetWalk {
+            realm_id,
+            local,
+            set_id,
+        };
+        match walk.run(context, &mut budget).await {
+            Ok(true) => delete(context, vec![(CATCH_UP_KEYSPACE.to_string(), key.into())]).await?,
+            Ok(false) => waiting = true,
+            Err(error) => {
+                warn!(%set_id, %error, "Distributed bucket bootstrap failed; retrying");
+                waiting = true;
+            }
+        }
+    }
+    Ok(waiting)
+}
+
+/// One set's bootstraps as seen by this node.
+struct SetWalk {
+    realm_id: RealmId,
+    local: NodeId,
+    set_id: Ulid,
+}
+
+impl SetWalk {
+    /// Returns `true` once nothing is left for this node to do for the set.
+    async fn run(&self, context: &DriverContext, budget: &mut usize) -> Result<bool, String> {
+        let Some(view) = read_record(context, self.set_id).await? else {
+            return Ok(true);
+        };
+        let snapshot = view.head.snapshot;
+        let targets = snapshot.catching_up();
+        let local = snapshot
+            .config
+            .members
+            .iter()
+            .find(|m| m.node_id == self.local);
+        let (Some(local), false) = (local, targets.is_empty()) else {
+            return self.clear(context).await;
+        };
+        // Only the admitted incarnation of this member's bucket publishes.
+        let info = drive(
+            GetBucketOperation::new(snapshot.config.bucket.clone()),
+            context,
+        )
+        .await;
+        let bound = info
+            .ok()
+            .and_then(|info| info.distribution)
+            .is_some_and(|binding| {
+                binding.member_id == local.member_id
+                    && local.incarnation == Some(binding.incarnation)
+            });
+        if !bound {
+            return Ok(true);
+        }
+        let mut settled = true;
+        for target in targets {
+            settled &= self.walk(context, &snapshot, local, target, budget).await?;
+        }
+        Ok(settled)
+    }
+
+    /// Walks the ranges this node publishes to `target`; when every walk ended, states the
+    /// catch-up. Returns whether nothing waits for another drain.
+    async fn walk(
+        &self,
+        context: &DriverContext,
+        snapshot: &DistributionSnapshot,
+        local: &DistributionMember,
+        target: &DistributionMember,
+        budget: &mut usize,
+    ) -> Result<bool, String> {
+        let ranges = snapshot.catch_up_ranges(local.member_id, target.member_id);
+        if ranges.is_empty() {
+            return Ok(true);
+        }
+        let mut prefix = bootstrap_prefix(self.set_id);
+        prefix.extend_from_slice(&target.member_id.to_bytes());
+        let cursors: HashMap<Vec<u8>, BootstrapCursor> =
+            (scan(context, BOOTSTRAP_KEYSPACE, Some(prefix), MAX_RANGES + 1).await?)
+                .into_iter()
+                .filter_map(|(key, value)| Some((key, BootstrapCursor::from_bytes(&value).ok()?)))
+                .collect();
+        let mut watermark = u64::MAX;
+        let mut done = true;
+        for range in ranges {
+            let key = bootstrap_key(self.set_id, target.member_id, range.range_id);
+            if let Some(cursor) = cursors.get(&key)
+                && cursor.done
+                && cursor.intent == target.intent
+            {
+                watermark = watermark.min(cursor.watermark);
+                continue;
+            }
+            if *budget == 0 {
+                done = false;
+                continue;
+            }
+            *budget -= 1;
+            let page = BootstrapPage::new(PageConfig {
+                realm_id: self.realm_id,
+                bucket: snapshot.config.bucket.clone(),
+                set_id: self.set_id,
+                member_id: target.member_id,
+                node_id: target.node_id,
+                intent: target.intent,
+                range: range.clone(),
+                now_ms: unix_timestamp_millis(),
+            });
+            match drive(page, context)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                PageProgress::Done { watermark: ended } => watermark = watermark.min(ended),
+                PageProgress::Waiting | PageProgress::Queued(_) => done = false,
+            }
+        }
+        if !done {
+            return Ok(false);
+        }
+        self.state(context, snapshot, local, target, watermark)
+            .await
+    }
+
+    /// Hands the signed catch-up to the publisher; the next record makes the member ready.
+    async fn state(
+        &self,
+        context: &DriverContext,
+        snapshot: &DistributionSnapshot,
+        local: &DistributionMember,
+        target: &DistributionMember,
+        watermark: u64,
+    ) -> Result<bool, String> {
+        let statement = Statement::caught_up(self.realm_id, self.set_id, local, target, watermark);
+        let claim = StatementClaim {
+            signer: self.local,
+            statement,
+        };
+        let signed = match sign_statement(context, claim) {
+            StatementSignEvent::Signed(signed) => *signed,
+            StatementSignEvent::Unavailable(reason) => return Err(reason),
+        };
+        let publisher = snapshot.root.publisher;
+        let shared = Arc::new(context.clone());
+        match submit(&shared, publisher, self.local, signed).await {
+            Ok(()) => Ok(true),
+            Err(refusal) => {
+                debug!(set_id = %self.set_id, member_id = %target.member_id, %refusal, "Catch-up statement not taken yet");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Deletes the set's cursors in bounded batches; settled once none is left.
+    async fn clear(&self, context: &DriverContext) -> Result<bool, String> {
+        let prefix = bootstrap_prefix(self.set_id);
+        let rows = scan(context, BOOTSTRAP_KEYSPACE, Some(prefix), CLEAR_BATCH).await?;
+        let settled = rows.len() < CLEAR_BATCH;
+        let deletes = (rows.into_iter())
+            .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), Key::from(key)))
+            .collect();
+        delete(context, deletes).await?;
+        Ok(settled)
     }
 }
 
