@@ -21,6 +21,7 @@ pub mod publish;
 pub mod pull;
 pub mod rebuild;
 pub mod refill;
+pub mod sharding;
 pub mod source_keep;
 pub mod split;
 pub mod status;

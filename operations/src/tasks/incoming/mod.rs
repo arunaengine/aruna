@@ -936,6 +936,10 @@ impl OperationsTaskHandler {
                     }
                 }
             }),
+            TaskKey::MaintainRanges => Box::pin(async move {
+                let after = crate::distribution::sharding::maintain_ranges(&self.context).await;
+                self.reschedule_timer(TaskKey::MaintainRanges, after).await;
+            }),
             TaskKey::RunBackendImports => Box::pin(async move {
                 let Some(net_handle) = self.context.net_handle.as_ref() else {
                     warn!("Cannot start backend imports without net handle");

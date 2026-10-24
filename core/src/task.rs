@@ -86,6 +86,8 @@ pub enum TaskKey {
     RunBackendImports,
     /// Prunes stale connector reference rows queued by a bounded dependency check.
     PruneConnectorReferences,
+    /// Accounts recorded splits, rebuilds split children and splits ranges above thresholds.
+    MaintainRanges,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

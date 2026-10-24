@@ -54,6 +54,7 @@ fn timer_is_restored(effect: &TaskEffect) -> bool {
             | TaskKey::DrainDeviceIntake
             | TaskKey::DrainLinkQueue
             | TaskKey::PruneConnectorReferences
+            | TaskKey::MaintainRanges
     )
 }
 

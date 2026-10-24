@@ -303,6 +303,10 @@ impl TaskQueues {
             handler
                 .reschedule_timer(TaskKey::RunBackendImports, Duration::ZERO)
                 .await;
+            // Each pass re-arms itself; a node without distributed buckets finds no accounts.
+            handler
+                .reschedule_timer(TaskKey::MaintainRanges, Duration::ZERO)
+                .await;
         }
         if refresh_holders {
             handler
