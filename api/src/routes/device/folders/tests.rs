@@ -68,6 +68,19 @@ fn maps_folder_errors() {
         missing.to_string(),
         format!("the bucket \"test\" does not exist on node {node}")
     );
+    let exists = map_folder_error(FolderError::BucketExists {
+        node,
+        bucket: "test".to_string(),
+    });
+    assert_eq!(exists.status_code(), StatusCode::CONFLICT);
+    assert_eq!(
+        exists.response_body().code.as_deref(),
+        Some("bucket_exists")
+    );
+    assert_eq!(
+        exists.to_string(),
+        format!("the bucket \"test\" already exists on node {node}")
+    );
     let conflict = map_folder_error(FolderError::RemoteBucketConflict {
         bucket: "test".to_string(),
         reason: "bucket \"test\" belongs to another group".to_string(),

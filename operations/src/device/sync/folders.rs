@@ -1,4 +1,4 @@
-//! Binds, lists and unbinds the realm folders this device keeps in sync.
+//! Binds, lists and unbinds the realm folders this device keeps in sync, and creates realm buckets.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -48,6 +48,16 @@ pub struct BindFolderInput {
     pub user_id: UserId,
 }
 
+/// A bucket the owner creates on a realm node without binding a folder to it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmBucketInput {
+    pub bucket: String,
+    pub group_id: GroupId,
+    pub node_id: NodeId,
+    pub realm_id: RealmId,
+    pub user_id: UserId,
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum FolderError {
     #[error("this device already binds the maximum of {0} folders")]
@@ -70,6 +80,8 @@ pub enum FolderError {
     RemoteBucketConflict { bucket: String, reason: String },
     #[error("node {node} is unreachable: {reason}")]
     RemoteUnreachable { node: NodeId, reason: String },
+    #[error("the bucket \"{bucket}\" already exists on node {node}")]
+    BucketExists { node: NodeId, bucket: String },
     #[error(transparent)]
     Offer(#[from] OfferedDirectoryError),
     #[error("a download-only folder never propagates deletions")]
@@ -223,6 +235,48 @@ async fn forward_create(
         Err(error) => Err(error),
     };
     creation.map_err(|error| map_remote_error(error, remote))
+}
+
+/// Creates a bucket on a realm node for the owner without binding a folder to it. A bucket of
+/// that name the node already holds is refused, never adopted.
+pub async fn create_realm_bucket(
+    context: &Arc<DriverContext>,
+    input: RealmBucketInput,
+) -> Result<(), FolderError> {
+    ensure_realm_node(context, input.realm_id, input.node_id).await?;
+    let auth = AuthContext {
+        user_id: input.user_id,
+        realm_id: input.realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let remote = RemoteBinding {
+        node_id: input.node_id,
+        bucket: input.bucket,
+        prefix: String::new(),
+    };
+    let probe = request_versions(
+        context,
+        remote.node_id,
+        auth.clone(),
+        remote.bucket.clone(),
+        String::new(),
+        None,
+        SyncPageLimit::new(1),
+    )
+    .await;
+    // The node answers NotFound only for a bucket it does not hold; Forbidden means it holds one.
+    match probe {
+        Err(ReconcileFolderError::Refused(SyncRefusal::NotFound)) => {}
+        Ok(_) | Err(ReconcileFolderError::Refused(SyncRefusal::Forbidden)) => {
+            return Err(FolderError::BucketExists {
+                node: remote.node_id,
+                bucket: remote.bucket,
+            });
+        }
+        Err(error) => return Err(map_remote_error(error, &remote)),
+    }
+    forward_create(context, auth, &remote, input.group_id).await
 }
 
 /// Wakes the background pass for a folder whose root is still a usable directory.

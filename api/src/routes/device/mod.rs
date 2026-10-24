@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod buckets;
 pub mod documents;
 pub mod drafts;
 pub mod dto;
@@ -27,6 +28,7 @@ pub struct DeviceApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(DeviceApiDoc::openapi())
+        .merge(buckets::router())
         .merge(documents::router())
         .merge(drafts::router())
         .merge(folders::router())
@@ -42,6 +44,7 @@ mod tests {
     fn lists_device_routes() {
         let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
         for path in [
+            "/device/buckets",
             "/device/documents",
             "/device/documents/{document_id}/selection",
             "/device/sync/status",

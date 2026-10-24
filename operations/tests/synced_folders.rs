@@ -25,7 +25,8 @@ use aruna_core::types::GroupId;
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
 use aruna_operations::device::sync::folders::{
-    BindFolderInput, FolderError, bind_folder, list_entries, list_transfers, read_bound,
+    BindFolderInput, FolderError, RealmBucketInput, bind_folder, create_realm_bucket, list_entries,
+    list_transfers, read_bound,
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::reconcile_folder;
@@ -633,6 +634,47 @@ async fn refuses_missing_root() -> TestResult<()> {
             Err(GetBucketError::NotFound)
         ),
         "a refused bind must not leave the bucket behind"
+    );
+    Ok(())
+}
+
+/// A bucket the owner asks for lands on the realm node without a folder; a name the node
+/// already holds is refused whichever group holds it, and this computer holds no realm bucket.
+#[tokio::test]
+async fn creates_realm_bucket() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let other_group = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    let input = |group_id, node_id| RealmBucketInput {
+        bucket: REMOTE_BUCKET.to_string(),
+        group_id,
+        node_id,
+        realm_id: realm.realm_id,
+        user_id: realm.user_id,
+    };
+
+    create_realm_bucket(&device.context, input(group_id, server.node_id())).await?;
+    let bucket = drive(
+        GetBucketOperation::new(REMOTE_BUCKET.to_string()),
+        &server.context,
+    )
+    .await?;
+    assert_eq!(bucket.group_id, group_id);
+
+    for group in [group_id, other_group] {
+        assert_eq!(
+            create_realm_bucket(&device.context, input(group, server.node_id())).await,
+            Err(FolderError::BucketExists {
+                node: server.node_id(),
+                bucket: REMOTE_BUCKET.to_string(),
+            })
+        );
+    }
+    assert_eq!(
+        create_realm_bucket(&device.context, input(group_id, device.node_id())).await,
+        Err(FolderError::NotRealmNode(device.node_id()))
     );
     Ok(())
 }

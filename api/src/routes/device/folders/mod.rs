@@ -200,6 +200,9 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
         FolderError::RemoteForbidden { .. } => ServerError::Forbidden,
         FolderError::DownloadOnly => ServerError::Conflict(error.to_string()),
         FolderError::RemoteUnreachable { .. } => ServerError::BadGatewayReason(error.to_string()),
+        FolderError::BucketExists { .. } => {
+            ServerError::Refused(StatusCode::CONFLICT, "bucket_exists", error.to_string())
+        }
         FolderError::Unavailable => ServerError::ServiceUnavailableReason(error.to_string()),
         FolderError::Offer(offer) => map_offer_error(offer),
     }

@@ -437,6 +437,7 @@ pub(crate) mod tests {
         ("POST", "/data/buckets/{bucket}/placement/runs"),
         ("POST", "/data/sync/relationships"),
         ("POST", "/data/sync/relationships/{id}/run"),
+        ("POST", "/device/buckets"),
         ("POST", "/device/compute/runs/{job_id}/publish"),
         ("POST", "/device/drafts"),
         ("POST", "/device/drafts/preview"),

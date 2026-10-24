@@ -1,8 +1,10 @@
-//! Tests the synced folder routes for owner checks, binding, pausing, entries and actions.
+//! Tests the synced folder routes and the bucket route for owner checks, binding, pausing,
+//! entries and actions.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::routes::device::buckets::{CreateBucketRequest, create_device_bucket};
 use crate::routes::device::dto::FolderStateName;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -622,6 +624,60 @@ async fn refuses_missing_root() {
         .await
         .unwrap_err();
         assert!(unusable(&sync), "sync of {root}: {sync:?}");
+    }
+}
+
+/// The bucket route admits only the owner and refuses bad input, this computer and nodes outside
+/// the realm before it forwards anything.
+#[tokio::test]
+async fn bucket_bad_input() {
+    let fixture = setup().await;
+    let group = Ulid::from_bytes([10u8; 16]).to_string();
+    let outsider = iroh::SecretKey::from_bytes(&[5u8; 32]).public().to_string();
+    let own = fixture.state.get_node_id().to_string();
+    let create = |auth: AuthContext, name: &str, group: &str, node: &str| {
+        create_device_bucket(
+            State(fixture.state.clone()),
+            Extension(Some(auth)),
+            Json(CreateBucketRequest {
+                name: name.to_string(),
+                group_id: group.to_string(),
+                node_id: node.to_string(),
+            }),
+        )
+    };
+    let stranger = AuthContext {
+        user_id: UserId::local(Ulid::from_bytes([1u8; 16]), fixture.realm_id),
+        ..owner_auth(&fixture)
+    };
+    let foreign = create(stranger, "lab-data", &group, &outsider)
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.status_code(), StatusCode::FORBIDDEN);
+
+    for (name, group, node) in [
+        ("Lab_Data", group.as_str(), outsider.as_str()),
+        ("lab-data", "nope", outsider.as_str()),
+        ("lab-data", group.as_str(), "not-a-node"),
+    ] {
+        let bad = create(owner_auth(&fixture), name, group, node)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            bad.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{name} {group} {node}"
+        );
+    }
+    for node in [&own, &outsider] {
+        let refused = create(owner_auth(&fixture), "lab-data", &group, node)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            refused.to_string(),
+            format!("node {node} is not a realm server")
+        );
     }
 }
 
