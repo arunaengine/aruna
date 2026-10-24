@@ -2708,7 +2708,7 @@ mod decision_tests {
             operation.step(read(None));
             let mut info = BucketInfo::from_bytes(&bucket(Vec::new(), 0)).unwrap();
             info.distribution = Some(DistributionBinding {
-                set_id: set_id,
+                set_id,
                 member_id: Ulid::from_bytes([6u8; 16]),
                 incarnation: 1,
                 revision: Default::default(),

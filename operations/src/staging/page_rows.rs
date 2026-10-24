@@ -399,12 +399,15 @@ pub(crate) fn page_rows(
     })
 }
 
+/// The rows that register one entry and its inventory change in a distributed bucket.
+type EntryRows = (Vec<(KeySpace, Key, Value)>, Option<InventoryChange>);
+
 fn register_rows(
     input: &PageImportInput,
     guards: &PageGuards,
     entry: &PageEntry,
     head: Option<&CurrentVersionPointer>,
-) -> Result<(Vec<(KeySpace, Key, Value)>, Option<InventoryChange>), PageImportError> {
+) -> Result<EntryRows, PageImportError> {
     let connector = &input.connector;
     let binding = build_source_binding(
         StagingStrategy::Reference,
