@@ -985,6 +985,22 @@ async fn browse_skips_subtrees() {
     assert_eq!(server.lists.load(Ordering::SeqCst), 3);
 }
 
+// A seek lands on the first key after the subtree: keys sorting after any sentinel stay
+// skipped, and a sibling named like the successor itself is still listed.
+#[tokio::test]
+async fn browse_seeks_successor() {
+    const KEYS: &[&str] = &["d/a/1", "d/a/\u{10FFFF}0001", "d/a0", "d/a1/x", "d/b"];
+    let server = ListingServer::bind(KEYS).await;
+
+    let pages = all_pages(&server.operator(), "d/", list_request(2, false, false)).await;
+
+    assert_eq!(
+        pages,
+        [vec!["d/a", "d/a0"], vec!["d/a1", "d/b"], Vec::<&str>::new()]
+    );
+    assert_eq!(subtree_successor("d/a/"), "d/a0");
+}
+
 // The probed lower key takes one entry of the page, so a page never exceeds its limit.
 #[tokio::test]
 async fn probe_counts_once() {

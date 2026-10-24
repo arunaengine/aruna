@@ -392,7 +392,7 @@ async fn list_operator(
     }
     // One level is listed as flat keys rolled up into directories, so the cursor is always a key
     // of one sorted listing and never depends on how a provider orders a page. After a new
-    // directory the listing seeks past its subtree instead of reading its keys.
+    // directory the listing seeks to the first key after its subtree instead of reading its keys.
     let budget = limit - entries.len();
     let mut start = floor.clone();
     let mut highest = floor.clone();
@@ -450,10 +450,15 @@ async fn list_operator(
             if !request.files_only {
                 entries.push(directory_entry(&directory));
             }
-            let beyond = past_subtree(&directory);
+            // `start_after` skips the successor itself, so it is read on its own.
+            let successor = subtree_successor(&directory);
+            if let Some(entry) = probe_lower(operator, path, &successor, request).await? {
+                entries.push(entry);
+                consumed += 1;
+            }
             last_directory = Some(directory);
-            highest = Some(beyond.clone());
-            start = Some(beyond);
+            highest = Some(successor.clone());
+            start = Some(successor);
             seeks += 1;
             if seeks < MAX_PAGE_SEEKS && consumed < budget {
                 continue 'listing;
@@ -467,9 +472,10 @@ async fn list_operator(
 /// Provider requests one browse page may spend seeking past directories.
 const MAX_PAGE_SEEKS: usize = 32;
 
-/// A key after every descendant a directory can practically hold.
-fn past_subtree(directory: &str) -> String {
-    format!("{directory}{}", char::MAX)
+/// The smallest key after every descendant of `directory`: its trailing `/` becomes `0`.
+fn subtree_successor(directory: &str) -> String {
+    let parent = directory.strip_suffix('/').unwrap_or(directory);
+    format!("{parent}0")
 }
 
 /// The direct child directory of `path` that `key` lies in, with a trailing slash.
