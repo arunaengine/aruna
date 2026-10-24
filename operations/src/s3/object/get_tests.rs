@@ -1827,25 +1827,12 @@ fn digested(content_length: u64, digest: u8) -> SourceMetadata {
 }
 
 fn spooled(sha256: u8) -> Event {
-    let location = BackendLocation {
-        backend: BackendRef::node_default(),
-        storage_class: None,
-        root: "/tmp".to_string(),
-        storage_bucket: "aruna_test".to_string(),
-        backend_path: format!("_jobs/{}/reference_{}", Ulid::nil(), Ulid::nil()),
-        ulid: Ulid::generate(),
-        format: StoredFormat::default(),
-        created_by: Default::default(),
-        created_at: SystemTime::UNIX_EPOCH,
-        staging: false,
-        partial: false,
-        blob_size: 9,
+    Event::Blob(BlobEvent::LocalSpooled {
         hashes: HashMap::from([(HASH_SHA256.to_string(), vec![sha256; 32])]),
-    };
-    Event::Blob(BlobEvent::HiddenSpooled {
-        location,
-        blake3: [0; 32],
         size: 9,
+        blob: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(
+            Bytes::from_static(b"body"),
+        )])),
     })
 }
 
@@ -1872,25 +1859,21 @@ fn unknown_keeps_digests() {
     ));
     assert!(matches!(
         operation.step(source_read(fresh)).as_slice(),
-        [Effect::Blob(BlobEffect::SpoolHidden { .. })]
+        [Effect::Blob(BlobEffect::SpoolLocal {
+            size: 9,
+            range: None,
+            ..
+        })]
     ));
-    assert!(matches!(
-        operation.step(spooled(7)).as_slice(),
-        [Effect::Blob(BlobEffect::ReadHiddenRange { range, .. })] if *range == (0..9)
-    ));
-    operation.step(Event::Blob(BlobEvent::HiddenRead {
-        blob: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(
-            Bytes::from_static(b"body"),
-        )])),
-        stream_size: 9,
-    }));
+    assert!(operation.step(spooled(7)).is_empty());
 
     let result = operation.finalize().unwrap();
     assert_eq!(result.source_metadata.unwrap().digests, stored.digests);
     assert_eq!(result.last_refresh, None);
 }
 
-// Bytes that miss the recorded digests are never served: the spool is dropped and the read fails.
+// Bytes that miss the recorded digests are never served: the spool stream is dropped, the read
+// fails.
 #[test]
 fn pinned_unknown_verified() {
     let mut operation = drifted_operation();
@@ -1904,11 +1887,7 @@ fn pinned_unknown_verified() {
         metadata: observation(9),
     }));
     operation.step(source_read(observation(9)));
-    assert!(matches!(
-        operation.step(spooled(8)).as_slice(),
-        [Effect::Blob(BlobEffect::DeleteHidden { .. })]
-    ));
-    operation.step(Event::Blob(BlobEvent::HiddenDeleted));
+    assert!(operation.step(spooled(8)).is_empty());
 
     assert_eq!(
         operation.finalize(),
@@ -1939,7 +1918,7 @@ fn same_without_etag_verified() {
     ));
     assert!(matches!(
         operation.step(source_read(stored)).as_slice(),
-        [Effect::Blob(BlobEffect::SpoolHidden { .. })]
+        [Effect::Blob(BlobEffect::SpoolLocal { .. })]
     ));
 }
 
@@ -1956,10 +1935,7 @@ fn spool_budget_refused() {
     }));
     assert!(matches!(
         operation.step(source_read(stored)).as_slice(),
-        [Effect::Blob(BlobEffect::SpoolHidden {
-            transient: true,
-            ..
-        })]
+        [Effect::Blob(BlobEffect::SpoolLocal { size: 9, .. })]
     ));
 
     operation.step(Event::Blob(BlobEvent::Error(

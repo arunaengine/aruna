@@ -53,7 +53,7 @@ use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::abe_access::{KeyGrant, MAX_REQUESTS};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, BucketInfo, CurrentVersionPointer, HiddenBlobKey, ManagedCopyKey, VersionKey,
+    BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease, TokenCredential,
@@ -75,8 +75,6 @@ use tracing::warn;
 
 /// Maximum successors attempted before a still-changing current read fails.
 const MAX_DRIFT_ATTEMPTS: u8 = 3;
-/// Hidden blob namespace of spooled reference reads; the hidden sweep removes old spools.
-const REFERENCE_SPOOL: Ulid = Ulid::from_bytes(*b"reference-spool!");
 /// Minimum age of the current reference version before a read may mint another
 /// successor. Rate-limits a READ-only caller pointing at a source they control.
 pub const MIN_ADVANCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -111,10 +109,8 @@ pub enum GetObjectState {
     ReadReferenceSource,
     /// The bound read failed its condition: a refresh is queued to observe the source.
     QueueChangedRefresh,
-    /// Unconfirmed bytes are spooled and checked against the recorded digests first.
+    /// Unconfirmed bytes are spooled locally and checked against the recorded digests first.
     SpoolReference,
-    ReadSpool,
-    DropSpool,
     /// A sealed copy waits for a read lease of its bucket key.
     AdmitRead,
     /// A plain copy of an encrypting bucket reads its settings, then waits for a bucket lease.
@@ -1689,59 +1685,46 @@ impl GetObjectOperation {
         self.emit_error(GetObjectError::ReferenceSourceChanged)
     }
 
-    /// Spools the whole source bytes to a hidden blob, so nothing is served before they match
-    /// the recorded digests. The read stream deletes the spool; the sweep removes crash leftovers.
+    /// Spools the whole source bytes to a local unnamed file, so nothing is served before they
+    /// match the recorded digests; the served stream owns the file until it ends or drops.
     fn spool_reference(
         &mut self,
         stream: BackendStream<Result<Bytes, StreamError>>,
         size: u64,
     ) -> Effects {
         self.state = GetObjectState::SpoolReference;
-        smallvec![Effect::Blob(BlobEffect::SpoolHidden {
-            namespace: REFERENCE_SPOOL,
-            name: "reference".to_string(),
-            created_by: self.input.user_identity,
-            max_bytes: Some(size),
+        let range = self
+            .resolved_range
+            .as_ref()
+            .map(|resolved| resolved.range.clone());
+        smallvec![Effect::Blob(BlobEffect::SpoolLocal {
+            size,
             deadline: None,
+            range,
             blob: stream,
-            transient: true,
         })]
     }
 
     fn handle_reference_spooled(&mut self, event: Event) -> Effects {
-        let (location, size) = match event {
-            Event::Blob(BlobEvent::HiddenSpooled { location, size, .. }) => (location, size),
+        let (hashes, blob) = match event {
+            Event::Blob(BlobEvent::LocalSpooled { hashes, blob, .. }) => (hashes, blob),
             Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. })) => {
                 return self.emit_error(GetObjectError::SpoolBudgetExhausted);
             }
             Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit })) => {
                 return self.emit_error(GetObjectError::ReferenceTooLarge { limit });
             }
+            // A source that sent other bytes than it announced changed behind the version.
+            Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
+                return self.emit_error(GetObjectError::ReferenceSourceChanged);
+            }
             _ => return self.emit_error(GetObjectError::GetObjectFailed),
         };
         let expected = std::mem::take(&mut self.verify_digests);
-        if unmatched_checksum(&expected, &location.hashes).is_some() {
-            let Ok(key) = HiddenBlobKey::try_from(&location) else {
-                return self.emit_error(GetObjectError::ReferenceSourceChanged);
-            };
-            self.state = GetObjectState::DropSpool;
-            return smallvec![Effect::Blob(BlobEffect::DeleteHidden { key })];
+        // Dropping the stream of a spool that missed the digests removes the spool.
+        if unmatched_checksum(&expected, &hashes).is_some() {
+            return self.emit_error(GetObjectError::ReferenceSourceChanged);
         }
-        let range = self
-            .resolved_range
-            .as_ref()
-            .map_or(0..size, |resolved| resolved.range.clone());
-        self.state = GetObjectState::ReadSpool;
-        smallvec![Effect::Blob(BlobEffect::ReadHiddenRange {
-            location,
-            range
-        })]
-    }
-
-    fn handle_spool_read(&mut self, event: Event) -> Effects {
-        let Event::Blob(BlobEvent::HiddenRead { blob, .. }) = event else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
         self.reference_stream = Some(blob);
         self.finish_reference_output()
     }
@@ -1831,9 +1814,6 @@ impl Operation for GetObjectOperation {
             GetObjectState::ReadReferenceSource => self.reference_source_received(event),
             GetObjectState::QueueChangedRefresh => self.handle_refresh_queued(event),
             GetObjectState::SpoolReference => self.handle_reference_spooled(event),
-            GetObjectState::ReadSpool => self.handle_spool_read(event),
-            // A spool that missed the digests is gone; the source changed behind the version.
-            GetObjectState::DropSpool => self.emit_error(GetObjectError::ReferenceSourceChanged),
             GetObjectState::AdmitRead => self.read_admitted(event),
             GetObjectState::ReadContentSettings => self.content_settings_read(event),
             GetObjectState::AdmitPlain => self.plain_admitted(event),
