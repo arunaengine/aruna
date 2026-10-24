@@ -188,6 +188,11 @@ impl VersionEntry {
     }
 }
 
+/// The identity a version keeps: the one the set fixed, else what its content gives.
+pub fn logical_identity(version: &BlobVersion) -> Option<[u8; 32]> {
+    version.identity.or_else(|| content_identity(version))
+}
+
 const IDENTITY_DOMAIN: &[u8] = b"aruna-reference-identity-v2";
 
 /// What one version holds, independent of where its bytes are: the BLAKE3 of stored bytes,

@@ -16,8 +16,8 @@ use aruna_core::structs::storage::distribution::accounting::{
     account_key, generation_key, pending_key, sample_count_key, sample_prefix, slot_key, slot_seek,
 };
 use aruna_core::structs::storage::distribution::inventory::{
-    Entry, HeadEntry, IndexEntry, Position, VersionEntry, content_identity, head_position,
-    index_key, upload_position, version_position,
+    Entry, HeadEntry, IndexEntry, Position, VersionEntry, head_position, index_key,
+    logical_identity, upload_position, version_position,
 };
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange, OriginalEpoch};
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -539,7 +539,13 @@ pub fn stamp_version(
     epoch: OriginalEpoch,
 ) -> BlobVersion {
     match binding {
-        Some(_) => version.with_generation(generation).with_epoch(epoch),
+        Some(_) => {
+            let identity = logical_identity(&version);
+            version
+                .with_generation(generation)
+                .with_epoch(epoch)
+                .with_identity(identity)
+        }
         None => version,
     }
 }
@@ -562,7 +568,7 @@ pub fn entry_of(version: &BlobVersion, size: u64) -> VersionEntry {
         marker: version.is_deleted(),
         size,
         referenced: matches!(version.state, BlobVersionState::Reference { .. }),
-        identity: content_identity(version),
+        identity: logical_identity(version),
     }
 }
 

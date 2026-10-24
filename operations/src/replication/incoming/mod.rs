@@ -56,7 +56,7 @@ use aruna_core::structs::storage::blob::{
     VersionKey, WriteOwner, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
-use aruna_core::structs::storage::distribution::inventory::{VersionEntry, content_identity};
+use aruna_core::structs::storage::distribution::inventory::{VersionEntry, logical_identity};
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
@@ -2021,7 +2021,16 @@ impl IncomingVersionOperation {
         let version = version
             .with_epoch(self.original_epoch())
             .with_generation(self.version_generation());
-        self.written_identity = content_identity(&version);
+        // A preserved reference materialized here keeps the identity the set fixed for it.
+        let version = match self.destination_bound {
+            true => {
+                let identity = self.manifest.logical_identity;
+                let identity = identity.or_else(|| logical_identity(&version));
+                version.with_identity(identity)
+            }
+            false => version,
+        };
+        self.written_identity = logical_identity(&version);
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),

@@ -1185,6 +1185,9 @@ pub struct BlobVersion {
     /// The key's head generation this version was written as in a distributed bucket, so
     /// history keeps its order on every member; 0 in an ordinary bucket.
     pub generation: u64,
+    /// The logical content identity a distributed bucket fixed when it minted the version; it
+    /// stays when the bytes change form, as a reference materialized on another member.
+    pub identity: Option<[u8; 32]>,
 }
 
 impl BlobVersion {
@@ -1210,6 +1213,7 @@ impl BlobVersion {
             placement_policies: Vec::new(),
             original_epoch: OriginalEpoch::default(),
             generation: 0,
+            identity: None,
         }
     }
 
@@ -1228,6 +1232,7 @@ impl BlobVersion {
             placement_policies: Vec::new(),
             original_epoch: OriginalEpoch::default(),
             generation: 0,
+            identity: None,
         }
     }
 
@@ -1241,6 +1246,7 @@ impl BlobVersion {
             placement_policies: Vec::new(),
             original_epoch: OriginalEpoch::default(),
             generation: 0,
+            identity: None,
         }
     }
 
@@ -1265,6 +1271,7 @@ impl BlobVersion {
             placement_policies: Vec::new(),
             original_epoch: OriginalEpoch::default(),
             generation: 0,
+            identity: None,
         }
     }
 
@@ -1294,6 +1301,11 @@ impl BlobVersion {
 
     pub fn with_generation(mut self, generation: u64) -> Self {
         self.generation = generation;
+        self
+    }
+
+    pub fn with_identity(mut self, identity: Option<[u8; 32]>) -> Self {
+        self.identity = identity;
         self
     }
 

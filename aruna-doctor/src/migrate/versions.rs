@@ -75,6 +75,7 @@ impl From<LegacyVersion> for BlobVersion {
             placement_policies: old.placement_policies,
             original_epoch: Default::default(),
             generation: 0,
+            identity: None,
         }
     }
 }

@@ -398,6 +398,7 @@ pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationMani
         placement_policies: Vec::new(),
         original_epoch: Default::default(),
         version_generation: 0,
+        logical_identity: None,
     }
 }
 
@@ -928,6 +929,30 @@ fn history_keeps_generation() {
         BlobVersion::from_bytes(value.as_ref()).unwrap().generation
     };
     assert_eq!((stored(false), stored(true)), (0, 5));
+}
+
+#[test]
+fn keeps_logical_identity() {
+    // The identity the set fixed travels with the version, whatever form its bytes take here.
+    let mut manifest = make_reference_manifest();
+    manifest.writer_auth_context = None;
+    manifest.logical_identity = Some([9; 32]);
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(12, 12),
+        iroh::SecretKey::from_bytes(&[70; 32]).public(),
+        test_realm_id(),
+        manifest,
+    )
+    .with_publisher_node(iroh::SecretKey::from_bytes(&[42u8; 32]).public());
+    op.txn_id = Some(Ulid::from_parts(13, 13));
+    op.destination_bound = true;
+    let effects = op.write_blob_version();
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected reference version write")
+    };
+    let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+    assert_eq!(version.identity, Some([9; 32]));
+    assert_eq!(op.written_identity, Some([9; 32]));
 }
 
 #[test]

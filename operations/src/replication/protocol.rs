@@ -75,6 +75,8 @@ pub struct VersionReplicationManifest {
     pub original_epoch: OriginalEpoch,
     /// The generation the version was written as in a distributed bucket, current or not.
     pub version_generation: u64,
+    /// The logical identity the set fixed for the version, whatever form its bytes take.
+    pub logical_identity: Option<[u8; 32]>,
 }
 
 impl VersionReplicationManifest {
@@ -710,6 +712,7 @@ mod pure_tests {
             placement_policies: Vec::new(),
             original_epoch: Default::default(),
             version_generation: 0,
+            logical_identity: None,
         }
     }
 
