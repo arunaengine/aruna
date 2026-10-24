@@ -302,6 +302,31 @@ impl OperationsInboundHandler {
         }
     }
 
+    /// Answers which key this member's version id index holds for one version.
+    async fn answer_version_key(
+        &self,
+        blob_handle: &aruna_blob::blob::BlobHandle,
+        stream_id: Ulid,
+        set_id: Ulid,
+        version_id: Ulid,
+    ) {
+        let key = crate::distribution::resolve::indexed_key(&self.context, set_id, version_id)
+            .await
+            .ok()
+            .flatten();
+        let Ok(payload) = VersionReplicationMessage::VersionKeyResponse(key).to_bytes() else {
+            close_failed_bao(blob_handle, stream_id).await;
+            return;
+        };
+        let sent = blob_handle
+            .send_blob_effect(BlobEffect::SendMessage { stream_id, payload })
+            .await;
+        if let Event::Blob(BlobEvent::Error(error)) = sent {
+            debug!(error = ?error, "Failed to answer a version key lookup");
+        }
+        close_failed_bao(blob_handle, stream_id).await;
+    }
+
     /// The bao plane input boundary: admission, bounded frame reads, and
     /// family-specific refusals all happen here or in the family handlers.
     async fn handle_bao_stream(&self, stream: BiStream, node_id: NodeId) {
@@ -414,6 +439,20 @@ impl OperationsInboundHandler {
                             request,
                         )
                         .await;
+                    }
+                    Ok(VersionReplicationMessage::VersionKeyRequest {
+                        realm_id: asked,
+                        set_id,
+                        version_id,
+                    }) => {
+                        // Keys of a set are told to realm infrastructure only.
+                        if admission != BaoAdmission::Infra || asked != realm_id {
+                            warn!(peer = %node_id, "Refusing a version key lookup");
+                            close_failed_bao(&blob_handle, stream_id).await;
+                            return;
+                        }
+                        self.answer_version_key(&blob_handle, stream_id, set_id, version_id)
+                            .await;
                     }
                     _ => {
                         error!(

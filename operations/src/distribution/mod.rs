@@ -25,6 +25,7 @@ pub mod pull;
 pub mod purge;
 pub mod rebuild;
 pub mod refill;
+pub mod resolve;
 pub mod roots;
 pub mod sharding;
 pub mod source_keep;
