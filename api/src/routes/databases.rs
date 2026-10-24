@@ -96,6 +96,7 @@ fn list_example() -> serde_json::Value {
     view["title"] = "SPIRE database".into();
     view["graph_iri"] = "https://w3id.org/aruna/01K8Z0DB0SP1RE000000000004".into();
     view["document_path"] = "databases/spire".into();
+    view["public"] = true.into();
     serde_json::json!({"databases": [view], "next_after": null})
 }
 

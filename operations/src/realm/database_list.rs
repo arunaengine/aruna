@@ -218,6 +218,8 @@ pub struct DatabaseListing {
     pub title: Option<String>,
     pub graph_iri: Option<String>,
     pub document_path: Option<String>,
+    /// Anyone, also without a login, may read the bucket.
+    pub public: bool,
 }
 
 /// Databases after `after` the caller may see: entries whose bucket the caller may read and
@@ -294,6 +296,10 @@ pub async fn list_databases(
             }
             None => (None, None, None),
         };
+        let anonymous = AuthContext::anonymous(realm_id);
+        let public = can_read_bucket(context, realm_id, &anonymous, &entry)
+            .await?
+            .is_some();
         listed.push(DatabaseListing {
             entry,
             bucket,
@@ -301,6 +307,7 @@ pub async fn list_databases(
             title,
             graph_iri,
             document_path,
+            public,
         });
     }
     Ok((listed, None))

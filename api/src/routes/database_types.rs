@@ -84,6 +84,8 @@ pub struct DatabaseView {
     pub title: Option<String>,
     pub graph_iri: Option<String>,
     pub document_path: Option<String>,
+    /// Anyone, also without a login, may read the bucket; otherwise realm users with access.
+    pub public: bool,
 }
 
 impl From<DatabaseListing> for DatabaseView {
@@ -101,6 +103,7 @@ impl From<DatabaseListing> for DatabaseView {
             title: listing.title,
             graph_iri: listing.graph_iri,
             document_path: listing.document_path,
+            public: listing.public,
         }
     }
 }
