@@ -1741,7 +1741,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
                     validate_group_authority(storage, event, previous_state.as_ref()).await?
                 }
                 AdminOperationFamily::Distribution => {
-                    validate_distribution_authority(storage, event, previous_state.as_ref()).await?
+                    validate_distribution_authority(storage, event).await?
                 }
                 _ => validate_user_authority(storage, event, previous_state.as_ref()).await?,
             };
