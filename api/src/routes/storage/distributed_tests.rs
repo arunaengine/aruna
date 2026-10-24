@@ -13,6 +13,62 @@ fn node_text(seed: u8) -> String {
         .to_string()
 }
 
+fn request(layout: LayoutName) -> CreateDistributedRequest {
+    CreateDistributedRequest {
+        bucket: "spire".to_string(),
+        layout,
+        nodes: vec![node_text(1), node_text(2)],
+        boundaries: Vec::new(),
+        replicas: 0,
+        edges: vec![EdgeRequest {
+            node_id: node_text(3),
+            strategy: StrategyName::Stream,
+        }],
+        settings: SettingsRequest::default(),
+    }
+}
+
+#[test]
+fn create_request_converts() {
+    let group_id = Ulid::from_bytes([9; 16]);
+    let input = create_input(group_id, request(LayoutName::Replica)).unwrap();
+    assert_eq!(input.layout, LayoutKind::Replica);
+    assert_eq!(input.owner_group, group_id);
+    assert_eq!(input.nodes.len(), 2);
+    assert_eq!(input.edges[0].1, DataStrategy::Stream);
+    let mut bounded = request(LayoutName::Replica);
+    bounded.boundaries = vec!["m".to_string()];
+    assert!(matches!(
+        create_input(group_id, bounded),
+        Err(ServerError::BadRequestMessage(_))
+    ));
+    let mut unknown = request(LayoutName::Sharding);
+    unknown.nodes.push("not-a-node".to_string());
+    assert!(matches!(
+        create_input(group_id, unknown),
+        Err(ServerError::BadRequestMessage(_))
+    ));
+}
+
+#[test]
+fn publisher_outage_is_unavailable() {
+    let unavailable = PublishRefusal::Unavailable("publisher node x is unreachable".to_string());
+    let ServerError::ServiceUnavailableReason(message) =
+        map_create_error(CreateError::Publish(unavailable))
+    else {
+        panic!("an unreachable publisher answers 503");
+    };
+    assert!(message.starts_with("configuration changes unavailable"));
+    assert!(matches!(
+        map_create_error(CreateError::Publish(PublishRefusal::Forbidden)),
+        ServerError::Forbidden
+    ));
+    assert!(matches!(
+        map_create_error(CreateError::UnknownSet(Ulid::nil())),
+        ServerError::NotFound
+    ));
+}
+
 #[test]
 fn degraded_ranges_name_coordinator() {
     let node: NodeId = node_text(2).parse().unwrap();
