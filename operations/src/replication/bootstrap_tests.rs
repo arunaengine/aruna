@@ -95,11 +95,12 @@ async fn continues_inside_key() {
     for seed in 1..=count {
         assert!(apply(&handle, write(set(), "k", seed, 3)).await.unwrap());
     }
-    assert_eq!(page(&handle, 1).await, PageProgress::Queued(PAGE_ROWS));
+    // The key's head row takes one place of the first page; it queues nothing.
+    assert_eq!(page(&handle, 1).await, PageProgress::Queued(PAGE_ROWS - 1));
     let first = cursor(&handle).await;
     assert!(!first.walked);
     deliver(&handle).await;
-    assert_eq!(page(&handle, 1).await, PageProgress::Queued(6));
+    assert_eq!(page(&handle, 1).await, PageProgress::Queued(7));
     let second = cursor(&handle).await;
     assert!(second.walked);
     assert!(

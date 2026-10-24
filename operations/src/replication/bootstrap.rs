@@ -464,8 +464,11 @@ pub async fn process_bootstrap(context: &DriverContext) -> Result<bool, String> 
             set_id,
         };
         match walk.run(context, &mut budget).await {
-            Ok(true) => delete(context, vec![(CATCH_UP_KEYSPACE.to_string(), key.into())]).await?,
-            Ok(false) => waiting = true,
+            Ok(Outcome::Settled) => {
+                delete(context, vec![(CATCH_UP_KEYSPACE.to_string(), key.into())]).await?
+            }
+            Ok(Outcome::Waiting) => waiting = true,
+            Ok(Outcome::Stated) => {}
             Err(error) => {
                 warn!(%set_id, %error, "Distributed bucket bootstrap failed; retrying");
                 waiting = true;
@@ -473,6 +476,27 @@ pub async fn process_bootstrap(context: &DriverContext) -> Result<bool, String> 
         }
     }
     Ok(waiting)
+}
+
+/// What a drain left of one set's bootstraps on this node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Outcome {
+    /// Nothing is left to do; the set's row goes.
+    Settled,
+    /// A walk waits for its jobs or the drain's budget; the drain looks again soon.
+    Waiting,
+    /// The catch-up was stated; the record that makes the member ready settles the set.
+    Stated,
+}
+
+impl Outcome {
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Waiting, _) | (_, Self::Waiting) => Self::Waiting,
+            (Self::Stated, _) | (_, Self::Stated) => Self::Stated,
+            (Self::Settled, Self::Settled) => Self::Settled,
+        }
+    }
 }
 
 /// One set's bootstraps as seen by this node.
@@ -483,10 +507,9 @@ struct SetWalk {
 }
 
 impl SetWalk {
-    /// Returns `true` once nothing is left for this node to do for the set.
-    async fn run(&self, context: &DriverContext, budget: &mut usize) -> Result<bool, String> {
+    async fn run(&self, context: &DriverContext, budget: &mut usize) -> Result<Outcome, String> {
         let Some(view) = read_record(context, self.set_id).await? else {
-            return Ok(true);
+            return Ok(Outcome::Settled);
         };
         let snapshot = view.head.snapshot;
         let targets = snapshot.catching_up();
@@ -512,17 +535,18 @@ impl SetWalk {
                     && local.incarnation == Some(binding.incarnation)
             });
         if !bound {
-            return Ok(true);
+            return self.clear(context).await;
         }
-        let mut settled = true;
+        let mut outcome = Outcome::Settled;
         for target in targets {
-            settled &= self.walk(context, &snapshot, local, target, budget).await?;
+            let walked = self.walk(context, &snapshot, local, target, budget).await?;
+            outcome = outcome.and(walked);
         }
-        Ok(settled)
+        Ok(outcome)
     }
 
     /// Walks the ranges this node publishes to `target`; when every walk ended, states the
-    /// catch-up. Returns whether nothing waits for another drain.
+    /// catch-up.
     async fn walk(
         &self,
         context: &DriverContext,
@@ -530,10 +554,10 @@ impl SetWalk {
         local: &DistributionMember,
         target: &DistributionMember,
         budget: &mut usize,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome, String> {
         let ranges = snapshot.catch_up_ranges(local.member_id, target.member_id);
         if ranges.is_empty() {
-            return Ok(true);
+            return Ok(Outcome::Settled);
         }
         let mut prefix = bootstrap_prefix(self.set_id);
         prefix.extend_from_slice(&target.member_id.to_bytes());
@@ -577,7 +601,7 @@ impl SetWalk {
             }
         }
         if !done {
-            return Ok(false);
+            return Ok(Outcome::Waiting);
         }
         self.state(context, snapshot, local, target, watermark)
             .await
@@ -591,7 +615,7 @@ impl SetWalk {
         local: &DistributionMember,
         target: &DistributionMember,
         watermark: u64,
-    ) -> Result<bool, String> {
+    ) -> Result<Outcome, String> {
         let statement = Statement::caught_up(self.realm_id, self.set_id, local, target, watermark);
         let claim = StatementClaim {
             signer: self.local,
@@ -604,16 +628,16 @@ impl SetWalk {
         let publisher = snapshot.root.publisher;
         let shared = Arc::new(context.clone());
         match submit(&shared, publisher, self.local, signed).await {
-            Ok(()) => Ok(true),
+            Ok(()) => Ok(Outcome::Stated),
             Err(refusal) => {
                 debug!(set_id = %self.set_id, member_id = %target.member_id, %refusal, "Catch-up statement not taken yet");
-                Ok(false)
+                Ok(Outcome::Waiting)
             }
         }
     }
 
     /// Deletes the set's cursors in bounded batches; settled once none is left.
-    async fn clear(&self, context: &DriverContext) -> Result<bool, String> {
+    async fn clear(&self, context: &DriverContext) -> Result<Outcome, String> {
         let prefix = bootstrap_prefix(self.set_id);
         let rows = scan(context, BOOTSTRAP_KEYSPACE, Some(prefix), CLEAR_BATCH).await?;
         let settled = rows.len() < CLEAR_BATCH;
@@ -621,7 +645,10 @@ impl SetWalk {
             .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), Key::from(key)))
             .collect();
         delete(context, deletes).await?;
-        Ok(settled)
+        Ok(match settled {
+            true => Outcome::Settled,
+            false => Outcome::Waiting,
+        })
     }
 }
 
