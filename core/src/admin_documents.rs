@@ -388,10 +388,6 @@ pub enum AdminDocumentOperation {
     ConfigPortalSet {
         features: BTreeMap<String, bool>,
     },
-    /// One change of a distributed bucket's record, naming its set and predecessor revision.
-    DistributionChanged {
-        change: Box<crate::structs::storage::distribution::DistributionChange>,
-    },
     /// The publisher's signed full snapshot of one distributed bucket's revision.
     DistributionPublished {
         snapshot: Box<crate::structs::storage::distribution::SignedSnapshot>,
@@ -657,16 +653,6 @@ mod tests {
             },
             AdminDocumentOperation::GroupPoliciesSet {
                 policies: vec![request_policy("anonymous")],
-            },
-            AdminDocumentOperation::DistributionChanged {
-                change: Box::new(crate::structs::storage::distribution::DistributionChange {
-                    set_id: Ulid::from_bytes([5; 16]),
-                    predecessor: Some(Default::default()),
-                    op: crate::structs::storage::distribution::DistributionOp::Admit {
-                        member_id: Ulid::from_bytes([6; 16]),
-                        incarnation: 7,
-                    },
-                }),
             },
         ];
 

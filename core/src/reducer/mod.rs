@@ -41,14 +41,12 @@ use crate::user::validation::{
 };
 
 mod apply;
-mod distribution;
 mod paths;
 mod placement;
 mod revocation;
 mod snapshot;
 mod targets;
 
-pub use distribution::{FINALITY_WINDOW, MAX_PENDING};
 pub use paths::*;
 use paths::{event_observes_dot, operation_paths, role_definition_value};
 pub use placement::*;

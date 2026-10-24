@@ -42,7 +42,6 @@ impl AdminDocumentState {
                 | AdminDocumentOperation::TransitionBucketForced { .. }
                 | AdminDocumentOperation::TransitionStallReported { .. }
                 | AdminDocumentOperation::TransitionDrainReported { .. }
-                | AdminDocumentOperation::DistributionChanged { .. }
         ) && operation_paths(&event.op)
             .iter()
             .all(|path| self.event_path_stale(event, path));

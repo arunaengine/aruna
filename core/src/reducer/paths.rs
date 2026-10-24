@@ -216,8 +216,7 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
             vec![revoked_token_path(token_hash, *expires_at, token_owner)]
         }
         // Stored per event by the distribution reducer, never as an attribute path.
-        AdminDocumentOperation::DistributionChanged { .. }
-        | AdminDocumentOperation::DistributionPublished { .. } => Vec::new(),
+        AdminDocumentOperation::DistributionPublished { .. } => Vec::new(),
     }
 }
 

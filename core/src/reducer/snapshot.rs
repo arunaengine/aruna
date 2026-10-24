@@ -21,9 +21,6 @@ impl AdminDocumentState {
             AdminDocumentOperation::DistributionPublished { snapshot } => {
                 self.install_snapshot(event, *realm_id, *set_id, snapshot)
             }
-            AdminDocumentOperation::DistributionChanged { .. } => {
-                self.apply_distribution(event, set_id)
-            }
             _ => Err(AdminDocumentError::UnsupportedTarget),
         }
     }
