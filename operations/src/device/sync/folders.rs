@@ -31,7 +31,7 @@ use crate::staging::offered_directory::{
 
 use super::repository::{
     MAX_SYNCED_FOLDERS, SyncUpload, abort_txn, commit_txn, delete_rows, folder_entry, folder_key,
-    key_path, read_value, scan_folder, scan_folders, scan_page, start_txn, write_rows,
+    key_path, read_value, scan_folder, scan_folders, scan_page, start_txn, sync_all, write_rows,
 };
 use super::{ReconcileFolderError, request_versions};
 
@@ -206,6 +206,8 @@ pub(crate) async fn finish_binding(
         session: None,
     };
     let remote = match create_bucket {
+        // The binding must be on disk before the realm node may create a bucket for it.
+        true if !sync_all(context).await => Err(FolderError::Unavailable),
         true => forward_create(context, auth, &folder.remote, folder.group_id).await,
         false => request_versions(
             context,
