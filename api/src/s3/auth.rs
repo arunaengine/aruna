@@ -28,6 +28,7 @@ use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
 use aruna_operations::distribution::delegate::{DelegateError, accept_delegation};
+use aruna_operations::distribution::guard::delegated_range;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
@@ -722,6 +723,12 @@ impl AuthProvider {
             return Err(denied(
                 "the bucket is not this member of the distributed bucket",
             ));
+        }
+        // The named range may predate a split; it must lead to the key's range coordinated here.
+        if let Some(binding) = bucket_info.distribution.as_ref() {
+            delegated_range(self.driver_ctx.as_ref(), binding, delegation.range_id, &key)
+                .await
+                .map_err(|error| crate::s3::error::guard_error(&error))?;
         }
         let auth_context = AuthContext {
             user_id: delegation.user_id,

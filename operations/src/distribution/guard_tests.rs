@@ -70,3 +70,36 @@ fn reads_held_only() {
         Err(GuardError::Unbound(snapshot.set_id()))
     );
 }
+
+#[tokio::test]
+async fn uploads_follow_authority() {
+    use crate::distribution::test_record::store_record;
+    use crate::distribution::test_store::{context, open};
+    let (_dir, handle) = open();
+    let context = context(&handle);
+    let (snapshot, bytes) = record(true);
+    store_record(&handle, snapshot.set_id(), bytes).await;
+    let own = binding(&snapshot, 1, 5);
+    let upload = Ulid::from_bytes([4; 16]);
+    let tag = upload_tag(&context, &own, "a", upload).await.unwrap();
+    assert_eq!(tag.range_id, snapshot.config.ranges[0].range_id);
+    assert_eq!(upload_route(&context, &own, "a", &tag).await, Ok(()));
+    assert!(matches!(
+        upload_tag(&context, &own, "x", upload).await,
+        Err(GuardError::NotCoordinator { .. })
+    ));
+    let moved = UploadTag { epoch: 2, ..tag };
+    assert_eq!(
+        upload_route(&context, &own, "a", &moved).await,
+        Err(GuardError::Route(RouteError::StaleRange(tag.range_id)))
+    );
+    assert_eq!(
+        delegated_range(&context, &own, tag.range_id, "a").await,
+        Ok(())
+    );
+    let upper = snapshot.config.ranges[1].range_id;
+    assert_eq!(
+        delegated_range(&context, &own, upper, "a").await,
+        Err(GuardError::Route(RouteError::StaleRange(upper)))
+    );
+}

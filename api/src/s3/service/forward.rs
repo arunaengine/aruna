@@ -9,12 +9,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
+use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::distribution::delegation::{
     DELEGATION_HEADER, Payload, TRAILER_BYTES, body_digest, request_digest,
 };
+use aruna_core::structs::storage::distribution::upload::UploadTag;
 use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
 use aruna_operations::distribution::delegate::{DelegationInput, issue_delegation, node_urls};
-use aruna_operations::distribution::guard::{route_read, route_write};
+use aruna_operations::distribution::guard::{
+    GuardError, route_read, route_write, upload_route, upload_tag, upload_tags,
+};
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use bytes::Bytes;
 use http::{HeaderMap, Method};
@@ -30,7 +34,7 @@ use super::ArunaS3Service;
 use super::payload::{ChecksumValue, frame_body};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
-use crate::s3::util::{map_checksum_algorithm, parse_checksum_algorithm};
+use crate::s3::util::{map_checksum_algorithm, parse_checksum_algorithm, parse_upload_id};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use s3s::TrailingHeaders;
 use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
@@ -473,6 +477,63 @@ impl ArunaS3Service {
         }
         let body = response.text().await.unwrap_or_default();
         Err(coordinator_error(forward, status, &body))
+    }
+
+    /// The stored upload a request names. A distributed bucket's upload id names its set, range
+    /// and epoch, and only the coordinator still holding that authority takes it.
+    pub(super) async fn upload_id(
+        &self,
+        bucket: Option<&BucketInfo>,
+        key: &str,
+        value: &str,
+    ) -> S3Result<Ulid> {
+        let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
+            return parse_upload_id(value);
+        };
+        let missing = || s3_error!(NoSuchUpload, "The specified upload does not exist.");
+        let tag = UploadTag::parse(value).ok_or_else(missing)?;
+        match upload_route(self.state.as_ref(), binding, key, &tag).await {
+            Ok(()) => Ok(tag.upload_id),
+            Err(GuardError::Route(RouteError::StaleRange(_))) => Err(s3_error!(
+                NoSuchUpload,
+                "The upload was opened under another coordinator of the key's range."
+            )),
+            Err(error) => Err(guard_error(&error)),
+        }
+    }
+
+    /// The upload id a client sees for a new upload of `key`.
+    pub(super) async fn shown_upload(
+        &self,
+        bucket: Option<&BucketInfo>,
+        key: &str,
+        upload_id: Ulid,
+    ) -> S3Result<String> {
+        let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
+            return Ok(upload_id.to_string());
+        };
+        upload_tag(self.state.as_ref(), binding, key, upload_id)
+            .await
+            .map(|tag| tag.encode())
+            .map_err(|error| guard_error(&error))
+    }
+
+    /// The upload ids a listing shows, by stored upload id.
+    pub(super) async fn shown_uploads(
+        &self,
+        bucket: Option<&BucketInfo>,
+        uploads: &[(String, Ulid)],
+    ) -> S3Result<std::collections::HashMap<String, String>> {
+        let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
+            return Ok(std::collections::HashMap::new());
+        };
+        let tags = upload_tags(self.state.as_ref(), binding, uploads)
+            .await
+            .map_err(|error| guard_error(&error))?;
+        Ok(tags
+            .into_iter()
+            .map(|tag| (tag.upload_id.to_string(), tag.encode()))
+            .collect())
     }
 
     pub(super) fn forwarded_put(response: &reqwest::Response) -> S3Response<PutObjectOutput> {

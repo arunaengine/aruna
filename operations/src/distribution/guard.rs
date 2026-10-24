@@ -9,6 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+use aruna_core::structs::storage::distribution::upload::UploadTag;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionView, OriginalEpoch, ReadRoute, RouteError, WriteRoute,
 };
@@ -165,6 +166,131 @@ pub async fn route_write(
             "unexpected answer {other:?}"
         ))),
     }
+}
+
+/// This node's record of the bound set, when the bucket is still the admitted member.
+pub async fn bound_view(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+) -> Result<DistributionView, GuardError> {
+    let set_id = binding.set_id;
+    let read = StorageEffect::Read {
+        key_space: DISTRIBUTION_KEYSPACE.to_string(),
+        key: set_id.to_bytes().to_vec().into(),
+        txn_id: None,
+    };
+    let view = match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| DistributionView::from_bytes(&value))
+            .transpose()?
+            .ok_or(GuardError::RecordMissing(set_id))?,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(GuardError::Unreadable(error.to_string()));
+        }
+        other => {
+            return Err(GuardError::Unreadable(format!(
+                "unexpected answer {other:?}"
+            )));
+        }
+    };
+    let member = view
+        .snapshot()
+        .member(binding.member_id)
+        .ok_or(RouteError::NotMember(set_id))?;
+    if member
+        .incarnation
+        .is_some_and(|admitted| admitted != binding.incarnation)
+    {
+        return Err(GuardError::Unbound(set_id));
+    }
+    Ok(view)
+}
+
+/// Names a new upload of `key` by the range and epoch this member coordinates it under.
+pub async fn upload_tag(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+    upload_id: Ulid,
+) -> Result<UploadTag, GuardError> {
+    match route_write(context, binding, key).await? {
+        WriteRoute::Local { range_id, epoch } => Ok(UploadTag {
+            upload_id,
+            set_id: binding.set_id,
+            range_id,
+            epoch: epoch.0,
+        }),
+        WriteRoute::Forward {
+            range_id, node_id, ..
+        } => Err(GuardError::NotCoordinator {
+            set_id: binding.set_id,
+            range_id,
+            node_id,
+        }),
+    }
+}
+
+/// Whether this member still holds the authority the upload `tag` was opened under: the key's
+/// range descends from the named one, at the same epoch, coordinated here.
+pub async fn upload_route(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+    tag: &UploadTag,
+) -> Result<(), GuardError> {
+    let view = bound_view(context, binding).await?;
+    Ok(view
+        .snapshot()
+        .upload_authority(binding.member_id, key, tag)?)
+}
+
+/// The tags of listed uploads, from the range and epoch that hold each key now.
+pub async fn upload_tags(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    uploads: &[(String, Ulid)],
+) -> Result<Vec<UploadTag>, GuardError> {
+    let view = bound_view(context, binding).await?;
+    let snapshot = view.snapshot();
+    uploads
+        .iter()
+        .map(|(key, upload_id)| {
+            let range = snapshot
+                .range_for(key)
+                .ok_or(RouteError::NoRange(binding.set_id))?;
+            Ok(UploadTag {
+                upload_id: *upload_id,
+                set_id: binding.set_id,
+                range_id: range.range_id,
+                epoch: range.epoch,
+            })
+        })
+        .collect()
+}
+
+/// Resolves the range a forwarded request names to the key's range, which this member must
+/// coordinate; an ancestor id from before a split resolves to its descendant.
+pub async fn delegated_range(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    range_id: Ulid,
+    key: &str,
+) -> Result<(), GuardError> {
+    let view = bound_view(context, binding).await?;
+    let snapshot = view.snapshot();
+    let range = snapshot.resolve(range_id, key)?;
+    if range.coordinator == binding.member_id {
+        return Ok(());
+    }
+    let node_id = snapshot
+        .member(range.coordinator)
+        .map(|member| member.node_id)
+        .ok_or(RouteError::NoRange(binding.set_id))?;
+    Err(GuardError::NotCoordinator {
+        set_id: binding.set_id,
+        range_id: range.range_id,
+        node_id,
+    })
 }
 
 /// Reads the epoch from the answer to [`record_read`].
