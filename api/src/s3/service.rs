@@ -8,7 +8,10 @@ mod attributes;
 mod bucket;
 mod copy;
 mod encryption;
+mod forward;
 mod listing;
+
+pub(crate) use forward::forwarded_digest;
 mod multipart;
 mod object;
 mod response;

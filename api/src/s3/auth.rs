@@ -4,6 +4,7 @@
 
 use super::scope::resolve_scope;
 use super::server::S3OpLabel;
+use super::service::forwarded_digest;
 use super::util::{anonymous_read_allowed, operation_permission};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
@@ -16,6 +17,7 @@ use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX
 use aruna_core::structs::storage::blob::{
     BucketInfo, UserAccess, bucket_permission_path, group_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::distribution::delegation::{DELEGATION_HEADER, SignedDelegation};
 use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::auth::bearer_token::realm_user_cutoff;
@@ -23,6 +25,7 @@ use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
 use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
+use aruna_operations::distribution::delegate::{DelegateError, accept_delegation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
@@ -40,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tracing::debug;
 use zeroize::Zeroizing;
 
@@ -78,6 +81,13 @@ impl Display for Action {
         }
     }
 }
+
+/// Marks a request that arrived with a delegation; it is never forwarded again.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DelegatedRequest;
+
+/// The S3 operations a member forwards to a range's coordinator.
+const DELEGATED_OPERATIONS: &[&str] = &["PutObject", "DeleteObject"];
 
 #[derive(Clone)]
 pub struct AuthProvider {
@@ -151,6 +161,9 @@ impl S3Access for AuthProvider {
             .map(|credentials| credentials.access_key.clone())
         {
             Some(access_key_id) => access_key_id,
+            None if cx.headers().contains_key(DELEGATION_HEADER) => {
+                return self.check_delegated(cx, action).await;
+            }
             None => return self.check_anonymous(cx, action).await,
         };
 
@@ -624,6 +637,104 @@ fn map_offered_error(error: OfferedDirectoryError) -> s3s::S3Error {
 impl AuthProvider {
     /// Anonymous access permits only concrete object bytes granted to Everyone.
     /// The bucket's group scopes the permission path.
+    /// A write another member verified and forwarded: the delegation must come from a realm
+    /// infrastructure node, match this exact request and be unused, and the user must hold
+    /// the permission on this node's own path (D33).
+    async fn check_delegated(&self, cx: &mut S3AccessContext<'_>, action: Action) -> S3Result<()> {
+        let denied = |reason: &str| s3_error!(AccessDenied, "Delegation refused: {reason}");
+        let operation = cx.s3_op().name();
+        if !matches!(action, Action::Write) || !DELEGATED_OPERATIONS.contains(&operation) {
+            return Err(denied("operation is not forwarded"));
+        }
+        let mut values = cx.headers().get_all(DELEGATION_HEADER).iter();
+        let (Some(value), None) = (values.next(), values.next()) else {
+            return Err(denied("one delegation header is required"));
+        };
+        let signed = value
+            .to_str()
+            .ok()
+            .and_then(|value| SignedDelegation::decode(value).ok())
+            .ok_or_else(|| denied("malformed delegation"))?;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let delegation = match accept_delegation(&self.driver_ctx, &signed, now).await {
+            Ok(delegation) => delegation,
+            Err(DelegateError::Busy) => {
+                return Err(s3_error!(SlowDown, "Reduce your request rate"));
+            }
+            Err(error) => return Err(denied(&error.to_string())),
+        };
+        let Some((bucket, key)) = cx
+            .s3_path()
+            .as_object()
+            .map(|(bucket, key)| (bucket.to_owned(), key.to_owned()))
+        else {
+            return Err(denied("requests must address an object"));
+        };
+        let digest = forwarded_digest(cx.method(), &bucket, &key, cx.uri().query(), cx.headers());
+        if delegation.operation != operation
+            || delegation.bucket != bucket
+            || delegation.key != key
+            || delegation.request_digest != digest
+        {
+            return Err(denied("the delegation names another request"));
+        }
+        let Some(bucket_info) = self.find_bucket_info(&bucket).await? else {
+            return Err(s3_error!(
+                NoSuchBucket,
+                "The specified bucket does not exist."
+            ));
+        };
+        let member = bucket_info
+            .distribution
+            .as_ref()
+            .is_some_and(|binding| binding.set_id == delegation.set_id);
+        if !member || bucket_info.group_id != delegation.group_id {
+            return Err(denied(
+                "the bucket is not this member of the distributed bucket",
+            ));
+        }
+        let auth_context = AuthContext {
+            user_id: delegation.user_id,
+            realm_id: self.realm_id,
+            path_restrictions: delegation.restrictions.clone(),
+            session: None,
+        };
+        let path = object_permission_path(
+            self.realm_id,
+            bucket_info.group_id,
+            self.node_id,
+            &bucket,
+            &key,
+        );
+        let extras = request_extras(cx, operation);
+        authorize(
+            self.driver_ctx.as_ref(),
+            self.realm_id,
+            &auth_context,
+            &path,
+            &Permission::WRITE,
+            extras.clone(),
+        )
+        .await
+        .map_err(map_authorize_error)?;
+        cx.extensions_mut().insert(extras);
+        cx.extensions_mut().insert(bucket_info);
+        cx.extensions_mut().insert(DelegatedRequest);
+        cx.extensions_mut().insert(UserAccess {
+            access_key: delegation.credential_id,
+            user_identity: delegation.user_id,
+            group_id: delegation.group_id,
+            secret: EncryptedS3Secret::empty(),
+            expiry: SystemTime::UNIX_EPOCH + Duration::from_secs(delegation.credential_expiry),
+            path_restrictions: delegation.restrictions,
+            issued_by: *delegation.issuer.as_bytes(),
+            revoked_at: None,
+        });
+        Ok(())
+    }
+
     async fn check_anonymous(&self, cx: &mut S3AccessContext<'_>, action: Action) -> S3Result<()> {
         if !matches!(action, Action::Read) || !anonymous_read_allowed(cx.s3_op().name()) {
             return Err(s3_error!(
