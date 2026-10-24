@@ -15,6 +15,7 @@ use crate::distribution::pull::{
     HeldElsewhere, PullRequest, kept_location, kept_reads, kept_source_location, kept_source_reads,
     pull_through,
 };
+use crate::distribution::source_keep::{SourceKeep, keep_later};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
@@ -2002,8 +2003,28 @@ pub async fn get_object_token(
 ) -> Result<GetObjectResult, GetObjectError> {
     let range = input.range.clone();
     let (user_id, realm_id) = (input.user_identity, input.realm_id);
-    let (bucket, key) = (input.bucket.clone(), input.key.clone());
+    let (bucket, key, group_id) = (input.bucket.clone(), input.key.clone(), input.group_id);
     let result = read_local(context, input, restrictions.clone(), token.as_ref()).await;
+    // A member of a distributed bucket receives references without a connector id; the one it
+    // read from the source may be kept.
+    if let Ok(read) = &result
+        && read.source_metadata.is_some()
+        && read.location.is_none()
+        && read
+            .source_binding
+            .as_ref()
+            .is_some_and(|source| source.connector_id.is_none())
+        && let Some(version_id) = read.resolved_version_id.or(read.version_id)
+    {
+        let keep = SourceKeep {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            group_id,
+            user_id,
+        };
+        keep_later(context, keep);
+    }
     if let Err(GetObjectError::HeldElsewhere(held)) = result {
         let auth = AuthContext {
             user_id,
