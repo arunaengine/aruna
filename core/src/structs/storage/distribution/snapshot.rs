@@ -199,6 +199,13 @@ impl DistributionSnapshot {
     }
 }
 
+/// A snapshot the publisher asks its own node key to sign for one realm.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotClaim {
+    pub realm_id: RealmId,
+    pub snapshot: DistributionSnapshot,
+}
+
 /// A snapshot with the publisher's signature over the realm and its canonical encoding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignedSnapshot {

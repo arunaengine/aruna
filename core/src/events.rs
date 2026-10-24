@@ -421,6 +421,7 @@ pub enum NetEvent {
     PolicySign(PolicySignEvent),
     VaultFetch(VaultFetchEvent),
     VaultSign(VaultSignEvent),
+    SnapshotSign(SnapshotSignEvent),
     Error(NetError),
 }
 
@@ -452,6 +453,14 @@ pub enum PolicyFetchEvent {
 #[derive(Debug, PartialEq)]
 pub enum VaultSignEvent {
     Signed(Box<VaultRecords>),
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::SnapshotSign`]. The adapter signs only a snapshot
+/// whose set names this node as publisher.
+#[derive(Debug, PartialEq)]
+pub enum SnapshotSignEvent {
+    Signed(Box<crate::structs::storage::distribution::SignedSnapshot>),
     Unavailable(String),
 }
 

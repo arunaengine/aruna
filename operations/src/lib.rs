@@ -13,6 +13,7 @@ pub mod auth;
 pub mod blob;
 pub mod connectors;
 pub mod device;
+pub mod distribution;
 pub mod document_repository;
 pub mod driver;
 pub(crate) mod effect_adapters;
