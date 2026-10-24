@@ -10,13 +10,18 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    DATA_LINK_KEYSPACE, DEAD_LETTER_KEYSPACE, DOCUMENT_LINK_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    DATA_LINK_KEYSPACE, DEAD_LETTER_KEYSPACE, DISTRIBUTION_KEYSPACE, DOCUMENT_LINK_KEYSPACE,
+    MATERIALIZATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataError;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::data_link::{
     DataLink, LinkPosting, LinkScope, MAX_DOCUMENT_LINKS, MAX_LINK_SUBJECTS, document_key,
     posting_document, posting_key,
 };
+use aruna_core::structs::storage::data_link::{set_versions_key, unverified_key};
+use aruna_core::structs::storage::distribution::inventory::index_key;
+use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
 use aruna_core::structs::storage::global_id::MAX_PREFIX_BYTES;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -372,6 +377,178 @@ pub(crate) async fn key_prefixes(
         .map(|prefix| scope.link(prefix))
         .collect();
     Ok((links, complete))
+}
+
+/// At most this many distribution records are read to verify one document's versions.
+const MAX_SETS: usize = 4096;
+
+/// Adds a derived posting per version link: verified in its set when a local member's version
+/// id index holds it (only then does it carry a set), otherwise unverified and counted.
+pub(crate) async fn associate_versions(
+    storage: &StorageHandle,
+    links: &mut BTreeMap<DataLink, LinkPosting>,
+) -> Result<(), DataLinkError> {
+    let versions: Vec<_> = links
+        .iter()
+        .filter_map(|(link, posting)| match link {
+            DataLink::Version {
+                realm_id,
+                version_id,
+            } => Some((*realm_id, *version_id, posting.clone())),
+            _ => None,
+        })
+        .collect();
+    if versions.is_empty() {
+        return Ok(());
+    }
+    let members = local_members(storage).await?;
+    for (realm_id, version_id, posting) in versions {
+        let hint = SetHint::of_version(version_id);
+        let mut verified = false;
+        for set_id in members.get(&hint).into_iter().flatten() {
+            let index = read_value(
+                storage,
+                VERSION_INDEX_KEYSPACE,
+                index_key(*set_id, version_id),
+            )
+            .await?;
+            if index.is_some() {
+                links.insert(
+                    DataLink::SetVersion {
+                        realm_id,
+                        set_id: *set_id,
+                        version_id,
+                    },
+                    posting.clone(),
+                );
+                verified = true;
+            }
+        }
+        if !verified {
+            links.insert(
+                DataLink::Unverified {
+                    realm_id,
+                    version_id,
+                },
+                posting,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The sets this node holds a bound member bucket of, by hint.
+async fn local_members(
+    storage: &StorageHandle,
+) -> Result<BTreeMap<SetHint, Vec<Ulid>>, DataLinkError> {
+    let mut members = BTreeMap::<SetHint, Vec<Ulid>>::new();
+    let mut start = None;
+    let mut seen = 0usize;
+    loop {
+        let (values, next) =
+            iter_page(storage, DISTRIBUTION_KEYSPACE, None, start, PAGE_SIZE).await?;
+        for (_, value) in values {
+            seen += 1;
+            let Ok(view) = DistributionView::from_bytes(&value) else {
+                continue;
+            };
+            let snapshot = view.snapshot();
+            let set_id = snapshot.set_id();
+            let bucket = read_value(
+                storage,
+                S3_BUCKET_KEYSPACE,
+                snapshot.config.bucket.as_bytes().to_vec(),
+            )
+            .await?
+            .map(|value| BucketInfo::from_bytes(&value))
+            .transpose()?;
+            if bucket
+                .and_then(|info| info.distribution)
+                .is_some_and(|binding| binding.set_id == set_id)
+            {
+                members
+                    .entry(SetHint::of_set(set_id))
+                    .or_default()
+                    .push(set_id);
+            }
+        }
+        match next {
+            Some(next) if seen < MAX_SETS => start = Some(IterStart::After(next)),
+            _ => return Ok(members),
+        }
+    }
+}
+
+async fn read_value(
+    storage: &StorageHandle,
+    key_space: &str,
+    key: Vec<u8>,
+) -> Result<Option<ByteView>, DataLinkError> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(DataLinkError::UnexpectedEvent(format!("{other:?}"))),
+    }
+}
+
+/// Version links on this node no member could verify yet, counted up to `cap`.
+pub(crate) async fn unverified_versions(
+    storage: &StorageHandle,
+    cap: usize,
+) -> Result<usize, DataLinkError> {
+    let prefix = ByteView::from(unverified_key());
+    let (rows, _) = iter_page(storage, DATA_LINK_KEYSPACE, Some(prefix), None, cap).await?;
+    Ok(rows.len())
+}
+
+/// One page of the postings that name a set: its prefix links, then its verified versions,
+/// in key order after `after`. The next position is the last key read.
+pub(crate) async fn set_postings(
+    storage: &StorageHandle,
+    scope: &LinkScope,
+    set_id: Ulid,
+    after: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<(Vec<(Vec<u8>, Ulid, LinkPosting)>, Option<Vec<u8>>), DataLinkError> {
+    let mut rows = Vec::new();
+    let mut last = None;
+    for range in [scope.key(), set_versions_key(set_id)] {
+        if rows.len() >= limit {
+            break;
+        }
+        let start = match &after {
+            Some(after) if after.starts_with(&range) => {
+                Some(IterStart::After(after.clone().into()))
+            }
+            Some(after) if after.as_slice() > range.as_slice() => continue,
+            _ => None,
+        };
+        let (values, next) = iter_page(
+            storage,
+            DATA_LINK_KEYSPACE,
+            Some(range.into()),
+            start,
+            limit - rows.len(),
+        )
+        .await?;
+        for (key, value) in values {
+            last = Some(key.to_vec());
+            if let Some(document_id) = posting_document(&key) {
+                rows.push((key.to_vec(), document_id, LinkPosting::from_bytes(&value)?));
+            }
+        }
+        if next.is_some() {
+            return Ok((rows, last));
+        }
+    }
+    Ok((rows, None))
 }
 
 /// Queued and parked materializations on this node, each counted up to `cap`: postings of

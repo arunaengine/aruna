@@ -216,3 +216,52 @@ async fn deleted_documents_leave_nothing() {
         .unwrap();
     assert!(postings.is_empty());
 }
+
+#[tokio::test]
+async fn set_postings_page_both_ranges() {
+    let dir = tempdir().unwrap();
+    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let set_id = Ulid::from_bytes([5; 16]);
+    let mut links = project_links(
+        GRAPH,
+        Ulid::nil(),
+        &[triple(GRAPH, HAS_PART, &set_url("a/"))],
+    );
+    links.insert(
+        DataLink::SetVersion {
+            realm_id: realm(),
+            set_id,
+            version_id: Ulid::from_bytes([8; 16]),
+        },
+        LinkPosting::default(),
+    );
+    links.insert(
+        DataLink::Unverified {
+            realm_id: realm(),
+            version_id: Ulid::from_bytes([6; 16]),
+        },
+        LinkPosting::default(),
+    );
+    let rows = plan_link_rows(&storage, Ulid::from_bytes([1; 16]), &links)
+        .await
+        .unwrap();
+    stored(rows, &storage).await;
+
+    // One row per page walks the prefix range first, then the verified versions.
+    let (first, next) = set_postings(&storage, &scope(), set_id, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(first[0].0.starts_with(&scope().key()));
+    let (second, next) = set_postings(&storage, &scope(), set_id, next, 1)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(second[0].0.starts_with(&set_versions_key(set_id)));
+    let (rest, end) = set_postings(&storage, &scope(), set_id, next, 1)
+        .await
+        .unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(end, None);
+    assert_eq!(unverified_versions(&storage, 10).await.unwrap(), 1);
+}

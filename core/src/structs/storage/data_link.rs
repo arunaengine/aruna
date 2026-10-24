@@ -25,6 +25,8 @@ const VERSION_TAG: u8 = 1;
 const HASH_TAG: u8 = 2;
 const SET_TAG: u8 = 3;
 const NODE_TAG: u8 = 4;
+const SET_VERSION_TAG: u8 = 5;
+const UNVERIFIED_TAG: u8 = 6;
 
 /// One Aruna data identifier a document names.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -46,6 +48,27 @@ pub enum DataLink {
         bucket: String,
         prefix: String,
     },
+    /// Derived, never parsed: a version link verified in its set on this node, so the set's
+    /// deletion preview finds it by set.
+    SetVersion {
+        realm_id: RealmId,
+        set_id: Ulid,
+        version_id: Ulid,
+    },
+    /// Derived, never parsed: a version link no local member could verify yet.
+    Unverified { realm_id: RealmId, version_id: Ulid },
+}
+
+/// The key all derived set-version postings of one set start with.
+pub fn set_versions_key(set_id: Ulid) -> Vec<u8> {
+    let mut key = vec![SET_VERSION_TAG];
+    key.extend_from_slice(&set_id.to_bytes());
+    key
+}
+
+/// The key all unverified version postings start with.
+pub fn unverified_key() -> Vec<u8> {
+    vec![UNVERIFIED_TAG]
 }
 
 /// The bucket a prefix link lives in: postings of one scope sort together by prefix length.
@@ -168,7 +191,10 @@ impl DataLink {
                 },
                 prefix,
             )),
-            Self::Version { .. } | Self::Hash(_) => None,
+            Self::Version { .. }
+            | Self::Hash(_)
+            | Self::SetVersion { .. }
+            | Self::Unverified { .. } => None,
         }
     }
 
@@ -176,6 +202,15 @@ impl DataLink {
     pub fn to_id(&self) -> String {
         match self {
             Self::Version {
+                realm_id,
+                version_id,
+            }
+            | Self::SetVersion {
+                realm_id,
+                version_id,
+                ..
+            }
+            | Self::Unverified {
                 realm_id,
                 version_id,
             } => GlobalId::Version {
@@ -218,6 +253,22 @@ impl DataLink {
             Self::Hash(hash) => {
                 let mut key = vec![HASH_TAG];
                 key.extend_from_slice(hash);
+                key
+            }
+            Self::SetVersion {
+                set_id, version_id, ..
+            } => {
+                let mut key = set_versions_key(*set_id);
+                key.extend_from_slice(&version_id.to_bytes());
+                key
+            }
+            Self::Unverified {
+                realm_id,
+                version_id,
+            } => {
+                let mut key = unverified_key();
+                key.extend_from_slice(realm_id.as_bytes());
+                key.extend_from_slice(&version_id.to_bytes());
                 key
             }
             Self::SetPrefix { .. } | Self::NodePrefix { .. } => {

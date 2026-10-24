@@ -2264,8 +2264,11 @@ async fn project_materialized_iris(
     let references = metadata_handle
         .snapshot_iri_references(event.record.graph_iri.clone())
         .await?;
-    let links =
+    let mut links =
         super::data_links::project_links(&event.record.graph_iri, event.event_id, &references);
+    super::data_links::associate_versions(&context.storage_handle, &mut links)
+        .await
+        .map_err(|error| MetadataMaterializationError::UnexpectedEvent(error.to_string()))?;
     let link_rows = super::data_links::plan_link_rows(
         &context.storage_handle,
         event.record.document_id,

@@ -17,7 +17,9 @@ use super::{
     can_read_record, fanout_bearer, load_live_record, map_read_error, metadata_node_call,
     reference_document_title, run_metadata_fanout,
 };
-use crate::metadata::data_links::{LinkBudget, key_prefixes, read_postings, unsettled_documents};
+use crate::metadata::data_links::{
+    LinkBudget, key_prefixes, read_postings, set_postings, unsettled_documents, unverified_versions,
+};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 /// Documents one page returns at most.
@@ -141,7 +143,26 @@ pub async fn links_local(
     if matches.len() > limit {
         page.more = true;
     }
-    for (document_id, postings) in matches.into_iter().take(limit) {
+    let documents: BTreeMap<_, _> = matches.into_iter().take(limit).collect();
+    describe(context, realm_id, auth, documents, &mut page).await?;
+    let (pending, failed) = unsettled_documents(storage, UNSETTLED_CAP)
+        .await
+        .map_err(internal)?;
+    page.pending_materializations = pending;
+    page.failed_materializations = failed;
+    Ok(page)
+}
+
+/// Adds the readable documents of `matches` to `page`: postings of an older document event
+/// are dropped, unreadable documents only set `hidden`.
+async fn describe(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: Option<&AuthContext>,
+    matches: BTreeMap<Ulid, Vec<(DataLink, LinkPosting)>>,
+    page: &mut LinkNodePage,
+) -> Result<(), MetadataApiError> {
+    for (document_id, postings) in matches {
         let record = match load_live_record(context, document_id).await {
             Ok(record) => record,
             Err(MetadataApiError::NotFound) => continue,
@@ -174,12 +195,88 @@ pub async fn links_local(
                 .collect(),
         });
     }
+    Ok(())
+}
+
+/// One node's page of the documents that link a distributed set: its prefix links and its
+/// verified version links, in posting key order. For the set's deletion preview.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetPreviewPage {
+    pub page: LinkNodePage,
+    /// The posting key to continue after; `None` once both ranges are read.
+    pub next: Option<Vec<u8>>,
+    /// Version links on this node that no member could verify, counted up to a cap; while
+    /// any exist the preview is incomplete.
+    pub unverified: usize,
+}
+
+/// Reads one page of the postings that name `set_id` on this node.
+pub async fn set_preview_local(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: Option<&AuthContext>,
+    set_id: Ulid,
+    after: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<SetPreviewPage, MetadataApiError> {
+    let internal = |error: crate::metadata::data_links::DataLinkError| {
+        MetadataApiError::Internal(error.to_string())
+    };
+    let storage = &context.storage_handle;
+    let scope = LinkScope::Set { realm_id, set_id };
+    let limit = limit.clamp(1, LINKS_MAX_LIMIT);
+    let (rows, next) = set_postings(storage, &scope, set_id, after, limit)
+        .await
+        .map_err(internal)?;
+    let mut matches = BTreeMap::<Ulid, Vec<(DataLink, LinkPosting)>>::new();
+    let scope_key = scope.key();
+    for (key, document_id, posting) in rows {
+        let length = key
+            .starts_with(&scope_key)
+            .then(|| scope.length_of(&key))
+            .flatten();
+        let link = match length {
+            Some(length) => {
+                let start = scope_key.len() + 2;
+                let prefix = key
+                    .get(start..start + usize::from(length))
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                    .unwrap_or_default();
+                scope.link(&prefix)
+            }
+            None => DataLink::SetVersion {
+                realm_id,
+                set_id,
+                version_id: version_of(&key).unwrap_or_default(),
+            },
+        };
+        matches
+            .entry(document_id)
+            .or_default()
+            .push((link, posting));
+    }
+    let mut preview = SetPreviewPage {
+        next,
+        ..SetPreviewPage::default()
+    };
+    preview.page.more = preview.next.is_some();
+    describe(context, realm_id, auth, matches, &mut preview.page).await?;
+    preview.unverified = unverified_versions(storage, UNSETTLED_CAP)
+        .await
+        .map_err(internal)?;
     let (pending, failed) = unsettled_documents(storage, UNSETTLED_CAP)
         .await
         .map_err(internal)?;
-    page.pending_materializations = pending;
-    page.failed_materializations = failed;
-    Ok(page)
+    preview.page.pending_materializations = pending;
+    preview.page.failed_materializations = failed;
+    Ok(preview)
+}
+
+/// The version id of a set-version posting key: the 16 bytes before the document.
+fn version_of(key: &[u8]) -> Option<Ulid> {
+    let end = key.len().checked_sub(16)?;
+    let bytes: [u8; 16] = key.get(end.checked_sub(16)?..end)?.try_into().ok()?;
+    Some(Ulid::from_bytes(bytes))
 }
 
 /// Asks every metadata node and merges their pages by document id.
