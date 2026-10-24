@@ -16,6 +16,7 @@ pub mod forward;
 pub mod guard;
 pub mod handoff;
 pub mod inventory;
+pub mod keep;
 pub mod publish;
 pub mod rebuild;
 pub mod refill;
