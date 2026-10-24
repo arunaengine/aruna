@@ -1184,6 +1184,7 @@ async fn hidden_bucket_registered() {
                 max_bytes: Some(0),
                 deadline: None,
                 blob: stream_from_bytes(b"x"),
+                transient: false,
             })
             .await,
         Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 0 }))
@@ -1364,6 +1365,7 @@ async fn hidden_spool_roundtrip() {
             max_bytes: Some(16),
             deadline: None,
             blob: stream_from_bytes(b"hidden"),
+            transient: false,
         })
         .await
     else {
@@ -1459,6 +1461,7 @@ async fn hidden_spool_limits() {
             max_bytes: None,
             deadline: None,
             blob: stream_from_bytes(b"seed"),
+            transient: false,
         })
         .await
     else {
@@ -1481,6 +1484,7 @@ async fn hidden_spool_limits() {
                 max_bytes: Some(3),
                 deadline: None,
                 blob: stream_from_bytes(b"four"),
+                transient: false,
             })
             .await,
         Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 3 }))
@@ -1496,6 +1500,71 @@ async fn hidden_spool_limits() {
         panic!("hidden list failed")
     };
     assert!(entries.is_empty());
+}
+
+// A transient spool holds spool budget until its read stream is dropped, which deletes it.
+#[tokio::test]
+async fn transient_spool_cleanup() {
+    let context = setup_blob_handle(5).await;
+    let namespace = Ulid::from_bytes([12u8; 16]);
+    let budget = context.blob_handle.handler.spool_budget.clone();
+    let full = budget.available_permits();
+    let spool = |name: &str| BlobEffect::SpoolHidden {
+        namespace,
+        name: name.to_string(),
+        created_by: test_user_id(),
+        max_bytes: Some(4),
+        deadline: None,
+        blob: stream_from_bytes(b"four"),
+        transient: true,
+    };
+    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) =
+        context.blob_handle.send_blob_effect(spool("first")).await
+    else {
+        panic!("transient spool failed")
+    };
+    assert_eq!(budget.available_permits(), full - 1);
+
+    let Event::Blob(BlobEvent::HiddenRead { blob, .. }) = context
+        .blob_handle
+        .send_blob_effect(BlobEffect::ReadHiddenRange {
+            location,
+            range: 0..2,
+        })
+        .await
+    else {
+        panic!("transient read failed")
+    };
+    drop(blob);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let event = context
+                .blob_handle
+                .send_blob_effect(BlobEffect::ListHidden {
+                    namespace: Some(namespace),
+                    cursor: None,
+                })
+                .await;
+            match event {
+                Event::Blob(BlobEvent::HiddenListed { entries, .. }) if entries.is_empty() => break,
+                Event::Blob(BlobEvent::HiddenListed { .. }) => tokio::task::yield_now().await,
+                other => panic!("hidden list failed: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a dropped read must delete its transient spool");
+    assert_eq!(budget.available_permits(), full);
+
+    let held = budget
+        .clone()
+        .try_acquire_many_owned(u32::try_from(full).unwrap())
+        .unwrap();
+    assert!(matches!(
+        context.blob_handle.send_blob_effect(spool("second")).await,
+        Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. }))
+    ));
+    drop(held);
 }
 
 #[tokio::test]
@@ -1542,6 +1611,7 @@ async fn sweeps_demoted_backend() {
             max_bytes: None,
             deadline: None,
             blob: stream_from_bytes(b"leftover"),
+            transient: false,
         })
         .await
     else {
@@ -1585,6 +1655,7 @@ async fn range_passes_writes() {
             max_bytes: None,
             deadline: None,
             blob: stream_from_bytes(b"source"),
+            transient: false,
         })
         .await
     else {
@@ -2610,6 +2681,7 @@ async fn cancelled_spool_releases() {
             max_bytes: None,
             deadline: None,
             blob: stream_from_bytes(b"partial"),
+            transient: false,
         })
         .await
     else {

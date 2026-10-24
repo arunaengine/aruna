@@ -460,6 +460,7 @@ async fn spool_fixture(handle: &BlobHandle, bytes: Vec<u8>, seed: u8) -> (Backen
             max_bytes: Some(1024 * 1024),
             deadline: None,
             blob: fixture_stream(bytes),
+            transient: false,
         })
         .await
     else {

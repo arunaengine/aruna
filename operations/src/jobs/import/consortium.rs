@@ -67,6 +67,7 @@ async fn spool_archive(
             blob: BackendStream::new(stream::iter([Ok::<Bytes, std::io::Error>(
                 Bytes::from_static(bytes),
             )])),
+            transient: false,
         })
         .await
     else {

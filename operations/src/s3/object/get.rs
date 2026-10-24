@@ -196,6 +196,9 @@ pub enum GetObjectError {
     /// an honest 403, not a fault a retry could clear.
     #[error("Governed content is not available on a user node.")]
     GovernedUnavailable,
+    /// Unverified reference reads already hold the node's spool budget; a retry may fit.
+    #[error("Too many unverified reference reads are in progress.")]
+    SpoolBudgetExhausted,
     #[error("GetObject failed (miserably)")]
     GetObjectFailed,
     #[error("operation did not finish")]
@@ -1654,7 +1657,7 @@ impl GetObjectOperation {
     }
 
     /// Spools the whole source bytes to a hidden blob, so nothing is served before they match
-    /// the recorded digests. Memory stays bounded; the sweep removes spools left behind.
+    /// the recorded digests. The read stream deletes the spool; the sweep removes crash leftovers.
     fn spool_reference(
         &mut self,
         stream: BackendStream<Result<Bytes, StreamError>>,
@@ -1668,12 +1671,17 @@ impl GetObjectOperation {
             max_bytes: Some(size),
             deadline: None,
             blob: stream,
+            transient: true,
         })]
     }
 
     fn handle_reference_spooled(&mut self, event: Event) -> Effects {
-        let Event::Blob(BlobEvent::HiddenSpooled { location, size, .. }) = event else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
+        let (location, size) = match event {
+            Event::Blob(BlobEvent::HiddenSpooled { location, size, .. }) => (location, size),
+            Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. })) => {
+                return self.emit_error(GetObjectError::SpoolBudgetExhausted);
+            }
+            _ => return self.emit_error(GetObjectError::GetObjectFailed),
         };
         let expected = std::mem::take(&mut self.verify_digests);
         if unmatched_checksum(&expected, &location.hashes).is_some() {

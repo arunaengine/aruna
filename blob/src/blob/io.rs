@@ -413,6 +413,28 @@ impl HiddenReservation {
     }
 }
 
+/// Deletes a transient spool once its read stream ends or is dropped.
+struct SpoolCleanup {
+    handler: BlobHandler,
+    key: HiddenBlobKey,
+}
+
+impl Drop for SpoolCleanup {
+    fn drop(&mut self) {
+        let Ok(runtime) = Handle::try_current() else {
+            tracing::warn!("transient spool cleanup deferred to the orphan sweep");
+            return;
+        };
+        let handler = self.handler.clone();
+        let key = self.key.clone();
+        runtime.spawn(async move {
+            if let BlobEvent::Error(error) = handler.delete_hidden_blob(key).await {
+                tracing::warn!(%error, "transient spool cleanup deferred to the orphan sweep");
+            }
+        });
+    }
+}
+
 impl Drop for HiddenReservation {
     fn drop(&mut self) {
         if self.key.lock().map_or(true, |key| key.is_none()) && self.writer.is_none() {
@@ -1928,14 +1950,48 @@ impl BlobHandler {
         }
     }
 
+    /// Reserves `max_bytes` of the spool budget for `spool`; deleting the spool releases it.
+    pub(super) async fn spool_transient(
+        &self,
+        max_bytes: Option<u64>,
+        spool: impl Future<Output = BlobEvent>,
+    ) -> BlobEvent {
+        let limit = super::runtime::SPOOL_BUDGET_MIB as u64 * 1024 * 1024;
+        let Some(max_bytes) = max_bytes else {
+            return BlobEvent::Error(BlobError::WriteError(
+                "a transient spool needs a byte limit".to_string(),
+            ));
+        };
+        let units = u32::try_from(max_bytes.div_ceil(1024 * 1024)).unwrap_or(u32::MAX);
+        let Ok(permit) = self.spool_budget.clone().try_acquire_many_owned(units) else {
+            return BlobEvent::Error(BlobError::SpoolBudgetExhausted { limit });
+        };
+        let event = spool.await;
+        if let BlobEvent::HiddenSpooled { location, .. } = &event
+            && let Ok(mut held) = self.transient_spools.lock()
+        {
+            held.insert(location.backend_path.clone(), permit);
+        }
+        event
+    }
+
     pub async fn read_hidden_range(
         &self,
         location: BackendLocation,
         range: std::ops::Range<u64>,
     ) -> BlobEvent {
-        if let Err(error) = HiddenBlobKey::try_from(&location) {
-            return BlobEvent::Error(BlobError::ConversionError(error));
-        }
+        let key = match HiddenBlobKey::try_from(&location) {
+            Ok(key) => key,
+            Err(error) => return BlobEvent::Error(BlobError::ConversionError(error)),
+        };
+        let transient = self
+            .transient_spools
+            .lock()
+            .is_ok_and(|held| held.contains_key(&key.backend_path));
+        let cleanup = transient.then(|| SpoolCleanup {
+            handler: self.clone(),
+            key,
+        });
         if range.start > range.end || range.end > location.blob_size {
             return BlobEvent::Error(BlobError::ReadError(
                 "hidden blob range is outside the stored size".to_string(),
@@ -1943,7 +1999,16 @@ impl BlobHandler {
         }
         let stream_size = range.end - range.start;
         match self.read_blob_range(location, range).await {
-            BlobEvent::ReadFinished { blob, .. } => BlobEvent::HiddenRead { blob, stream_size },
+            BlobEvent::ReadFinished { blob, .. } => {
+                let Some(cleanup) = cleanup else {
+                    return BlobEvent::HiddenRead { blob, stream_size };
+                };
+                let blob = BackendStream(Box::pin(blob.0.map(move |chunk| {
+                    let _cleanup = &cleanup;
+                    chunk
+                })));
+                BlobEvent::HiddenRead { blob, stream_size }
+            }
             other => other,
         }
     }
@@ -1959,6 +2024,9 @@ impl BlobHandler {
         };
         if let Err(error) = self.delete_path(&operator, &storage_path).await {
             return BlobEvent::Error(BlobError::DeleteError(error.to_string()));
+        }
+        if let Ok(mut held) = self.transient_spools.lock() {
+            held.remove(&key.backend_path);
         }
         if let Err(error) = self.release_hidden(&key).await {
             return BlobEvent::Error(error);

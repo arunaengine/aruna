@@ -17,7 +17,7 @@ use aruna_blob::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
-use aruna_core::errors::{ConversionError, StagingSourceError};
+use aruna_core::errors::{BlobError, ConversionError, StagingSourceError};
 use aruna_core::events::SubOperationEvent;
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
@@ -1896,6 +1896,35 @@ fn same_without_etag_verified() {
         operation.step(source_read(stored)).as_slice(),
         [Effect::Blob(BlobEffect::SpoolHidden { .. })]
     ));
+}
+
+// A spool that does not fit the node's spool budget fails the read as retryable.
+#[test]
+fn spool_budget_refused() {
+    let mut operation = drifted_operation();
+    let mut stored = digested(9, 7);
+    stored.etag = None;
+    operation.reference_cached = Some(stored.clone());
+    operation.state = GetObjectState::HeadReferenceSource;
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: stored.clone(),
+    }));
+    assert!(matches!(
+        operation.step(source_read(stored)).as_slice(),
+        [Effect::Blob(BlobEffect::SpoolHidden {
+            transient: true,
+            ..
+        })]
+    ));
+
+    operation.step(Event::Blob(BlobEvent::Error(
+        BlobError::SpoolBudgetExhausted { limit: 1 },
+    )));
+
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::SpoolBudgetExhausted)
+    );
 }
 
 // An HTTP server may ignore `If-Match`, so a pinned version it serves needs recorded digests:

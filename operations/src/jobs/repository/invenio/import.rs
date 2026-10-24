@@ -143,6 +143,7 @@ pub(crate) async fn acquire(
         max_bytes: Some(spec.limits.import_source_bytes),
         deadline: None,
         blob: BackendStream::new(tokio_util::io::ReaderStream::new(reader)),
+        transient: false,
     });
     let (written, event) = tokio::join!(write, spool);
     match event {

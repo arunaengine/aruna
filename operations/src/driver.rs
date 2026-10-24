@@ -968,6 +968,7 @@ mod test {
                                 Result<bytes::Bytes, aruna_core::stream::StreamError>,
                             >(),
                         ),
+                        transient: false,
                     })]
                 }
                 (Event::Blob(_), 3) => {
@@ -1624,6 +1625,7 @@ mod test {
             blob: aruna_core::stream::BackendStream::new(futures_util::stream::pending::<
                 Result<bytes::Bytes, aruna_core::stream::StreamError>,
             >()),
+            transient: false,
         })
     }
 

@@ -133,6 +133,9 @@ pub enum BlobEffect {
         max_bytes: Option<u64>,
         deadline: Option<Instant>,
         blob: BackendStream<Result<Bytes, StreamError>>,
+        /// Reserves `max_bytes` from the shared spool budget until the spool is deleted;
+        /// its read stream deletes it when that stream ends or is dropped.
+        transient: bool,
     },
     ReadHiddenRange {
         location: BackendLocation,

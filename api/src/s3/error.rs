@@ -547,6 +547,12 @@ impl IntoS3Error for GetObjectError {
                 )
             }
             GetObjectError::ReferenceAdvanceExhausted => reference_exhausted_error(),
+            GetObjectError::SpoolBudgetExhausted => {
+                s3_error!(
+                    SlowDown,
+                    "Too many unverified reference reads are in progress; retry the request."
+                )
+            }
             // A device is never a legal destination for governed data, so this
             // is a refusal (403), not a fault: retrying cannot change it.
             GetObjectError::GovernedUnavailable => {

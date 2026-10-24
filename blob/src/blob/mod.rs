@@ -11,7 +11,7 @@ use bao_tree::BlockSize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
@@ -96,6 +96,9 @@ pub struct BlobHandler {
     unlocks: Arc<StdMutex<unlock::UnlockRegistry>>,
     /// Pithos working set in MiB permits, shared by archive opens, encoders and compositions.
     pithos_budget: Arc<Semaphore>,
+    /// Transient spool budget in MiB permits, and the permits held by spool path.
+    spool_budget: Arc<Semaphore>,
+    transient_spools: Arc<StdMutex<HashMap<String, OwnedSemaphorePermit>>>,
 }
 
 #[derive(Clone, Debug)]

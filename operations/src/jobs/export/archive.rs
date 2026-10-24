@@ -911,6 +911,7 @@ pub(super) async fn assemble_export(
             max_bytes: Some(spec.limits.export_artifact_bytes),
             deadline: None,
             blob: BackendStream::new(tokio_util::io::ReaderStream::new(reader)),
+            transient: false,
         })
         .await;
     let write_result = match writer_task.await {
