@@ -215,6 +215,10 @@ fn node(value: &str) -> ServerResult<NodeId> {
 }
 
 fn create_input(group_id: Ulid, request: CreateDistributedRequest) -> ServerResult<CreateInput> {
+    // Every member serves the bucket over S3, so its name follows the S3 rules.
+    if let Some(reason) = crate::s3::util::bucket_name_reason(&request.bucket) {
+        return Err(ServerError::BadRequestMessage(reason.to_string()));
+    }
     let nodes = request
         .nodes
         .iter()

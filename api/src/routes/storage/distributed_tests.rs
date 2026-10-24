@@ -42,6 +42,17 @@ fn create_request_converts() {
         create_input(group_id, bounded),
         Err(ServerError::BadRequestMessage(_))
     ));
+    for invalid in ["Spire", "ab", "a..b", "-spire", "192.168.0.1"] {
+        let mut named = request(LayoutName::Replica);
+        named.bucket = invalid.to_string();
+        assert!(
+            matches!(
+                create_input(group_id, named),
+                Err(ServerError::BadRequestMessage(_))
+            ),
+            "{invalid} must be refused"
+        );
+    }
     let mut unknown = request(LayoutName::Sharding);
     unknown.nodes.push("not-a-node".to_string());
     assert!(matches!(
