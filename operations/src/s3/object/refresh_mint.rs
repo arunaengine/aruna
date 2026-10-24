@@ -40,6 +40,9 @@ use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEp
 /// One storage row a successor writes.
 type Row = (KeySpace, Key, Value);
 
+/// The rows read for a successor, in read order.
+type ReadRows = Vec<(Key, Option<Value>)>;
+
 #[derive(Debug, Error, PartialEq)]
 pub enum MintError {
     #[error(transparent)]
@@ -80,7 +83,7 @@ pub(crate) struct MintSuccessorOperation {
     predecessor: BlobVersion,
     state: MintState,
     /// The rows read and the binding whose record decides the successor's epoch.
-    pending: Option<(Vec<(Key, Option<Value>)>, DistributionBinding)>,
+    pending: Option<(ReadRows, DistributionBinding)>,
     usage: Option<UsageCounterUpdate>,
     output: Option<Result<bool, MintError>>,
 }
