@@ -26,7 +26,7 @@ use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
 use aruna_operations::device::sync::folders::{
     BindFolderInput, FolderError, RealmBucketInput, bind_folder, create_realm_bucket, list_entries,
-    list_folders, list_transfers, read_bound,
+    list_folders, list_transfers, read_bound, unbind_folder,
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
@@ -42,7 +42,7 @@ use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::staging::offered_directory::{
-    OfferDirectoryInput, OfferedDirectoryError, offer_directory,
+    OfferDirectoryInput, OfferedDirectoryError, list_offers, offer_directory,
 };
 use futures_util::StreamExt;
 use topology::{TestResult, Topology, hang_cap, wait_for_convergence, wait_until};
@@ -705,6 +705,40 @@ async fn creates_realm_bucket() -> TestResult<()> {
             bucket: "fresh-data".to_string(),
         })
     );
+    Ok(())
+}
+
+/// A pass that listed a folder before its unbind writes nothing for it afterwards: the offered
+/// bucket and the sync rows do not come back.
+#[tokio::test]
+async fn skips_unbound_folder() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let device = realm.user_node();
+    let server = realm.node(0);
+    create_bucket(&server.context, group_id, realm.user_id).await?;
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("note.txt"), b"from the device")?;
+    let listed = bind(&realm, root.path(), group_id).await?;
+
+    unbind_folder(
+        &device.context,
+        listed.folder_id,
+        realm.realm_id,
+        device.node_id(),
+        realm.user_id,
+    )
+    .await?;
+    let plan = reconcile_folder(&device.context, &listed).await?;
+    assert_eq!(plan.uploads, 0);
+    let offers = list_offers(&device.context).await?;
+    assert!(
+        offers
+            .iter()
+            .all(|offer| offer.bucket != listed.local_bucket)
+    );
+    let (entries, _) = list_entries(&device.context, listed.folder_id, None, None).await?;
+    assert!(entries.is_empty());
     Ok(())
 }
 

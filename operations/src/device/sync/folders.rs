@@ -507,6 +507,8 @@ pub async fn unbind_folder(
         )
         .await?;
     }
+    // A pass already in flight finishes first; a pass that starts later skips the folder.
+    let _pass = super::folder_lock(folder_id).await;
     for key_space in [SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNC_LOG_KEYSPACE] {
         clear_rows(context, key_space, folder_id).await?;
     }
@@ -992,6 +994,47 @@ mod tests {
             .expect("row stored");
         assert_eq!(
             set_folder_state(&context, folder.folder_id, FolderState::Active).await,
+            Err(FolderError::NotFound)
+        );
+    }
+
+    // An unbind waits for the pass in flight on its folder, so rows that pass still writes are
+    // cleared too instead of outliving the folder.
+    #[tokio::test]
+    async fn unbind_awaits_pass() {
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let folder = bound_folder(FolderState::Active);
+        store_folder(&context, &folder).await.expect("row stored");
+
+        let pass = super::super::folder_lock(folder.folder_id).await;
+        let unbind = tokio::spawn({
+            let context = context.clone();
+            let (folder_id, user_id) = (folder.folder_id, folder.created_by);
+            async move { unbind_folder(&context, folder_id, realm(), node(), user_id).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            while !read_bound(&context, folder.folder_id)
+                .await
+                .is_ok_and(|current| current.state == FolderState::Deleting)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the unbind marks the folder before it waits");
+        let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())
+            .expect("base encodes");
+        assert!(super::super::repository::write_rows(&context, vec![row], None).await);
+        drop(pass);
+
+        assert_eq!(unbind.await.expect("the unbind task ends"), Ok(0));
+        let (entries, _) = list_entries(&context, folder.folder_id, None, None)
+            .await
+            .expect("the entries read");
+        assert!(entries.is_empty());
+        assert_eq!(
+            read_bound(&context, folder.folder_id).await,
             Err(FolderError::NotFound)
         );
     }
