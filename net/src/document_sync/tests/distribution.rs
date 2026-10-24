@@ -187,3 +187,24 @@ async fn missing_config_defers() {
     let outcome = receive(&storage, published(PUBLISHER, created(), PUBLISHER)).await;
     assert!(matches!(outcome, AdminEventValidation::Deferred { .. }));
 }
+
+#[tokio::test]
+async fn gap_recovers_by_snapshot() {
+    // A node that missed revisions installs the latest snapshot without replaying them.
+    let (_dir, storage) = test_storage();
+    realm_nodes(&storage).await;
+    let first = created();
+    let second = admitted(&first, MEMBER);
+    let settings = DistributionRequest::ChangeSettings {
+        settings: DistributionSettings {
+            public: true,
+            ..DistributionSettings::default()
+        },
+    };
+    let third = next_snapshot(realm(), Some(&second), &settings).unwrap();
+    let outcome = receive(&storage, published(PUBLISHER, third.clone(), PUBLISHER)).await;
+    assert_eq!(outcome, AdminEventValidation::Accepted);
+    let view = stored(&storage).await.expect("latest snapshot stored");
+    assert_eq!(view.head.snapshot, third);
+    assert_eq!(view.head.snapshot.number, 3);
+}

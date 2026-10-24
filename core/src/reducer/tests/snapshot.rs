@@ -155,3 +155,24 @@ fn equivocation_stops_changes() {
     );
     assert_eq!(head_number(&state), Some(2));
 }
+
+#[test]
+fn fences_survive_installs() {
+    // Installing a snapshot never clears a fence a newer installed snapshot holds.
+    use crate::structs::storage::distribution::snapshot::Deletion;
+    let mut state = AdminDocumentState::new(target());
+    let first = created();
+    let mut fenced = settings(&first, true);
+    fenced.lifecycle.deletion = Some(Deletion {
+        members: vec![(Ulid::from_bytes([1; 16]), 1)],
+        fenced: vec![Ulid::from_bytes([1; 16])],
+        committed: false,
+    });
+    state.apply(&published(1, 1, fenced.clone(), 1)).unwrap();
+    assert_eq!(
+        state.apply(&published(2, 1, first, 1)),
+        Ok(AdminApplyStatus::Duplicate)
+    );
+    let view = state.distribution_view().unwrap();
+    assert_eq!(view.snapshot().lifecycle, fenced.lifecycle);
+}
