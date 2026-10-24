@@ -157,7 +157,8 @@ fn head_and_outbox_atomic() {
             DISTRIBUTION_KEYSPACE,
             DOCUMENT_STATE_KEYSPACE,
             DISTRIBUTION_ACCEPT_KEYSPACE,
-            SYNC_OUTBOX_KEYSPACE
+            SYNC_OUTBOX_KEYSPACE,
+            DISTRIBUTION_PUBLISHER_KEYSPACE
         ]
     );
     // Nothing is published before the commit; the drain follows it.

@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE};
+use aruna_core::structs::storage::distribution::publisher_key;
 
 /// Content rules that need no stored state: the target's set, the publisher as origin, the
 /// publisher's signature and every embedded statement. A failure is invalid input.
@@ -164,7 +165,15 @@ async fn distribution_writes(
     let bytes = view
         .to_bytes()
         .map_err(|error| bootstrap(error.to_string()))?;
+    let head = view.snapshot();
+    let revision =
+        postcard::to_allocvec(&head.revision()).map_err(|error| bootstrap(error.to_string()))?;
     Ok(Some(vec![
+        (
+            DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
+            publisher_key(&head.root.publisher, set_id).into(),
+            revision.into(),
+        ),
         reducer_state_entry(&state).map_err(|error| bootstrap(error.to_string()))?,
         (
             DISTRIBUTION_KEYSPACE.to_string(),

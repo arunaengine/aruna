@@ -54,6 +54,8 @@ pub const DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
 pub const DISTRIBUTION_KEYSPACE: &str = "distribution_records";
 /// Requests a set's publisher accepted, by set id and request id, with the revision they made.
 pub const DISTRIBUTION_ACCEPT_KEYSPACE: &str = "distribution_accepted";
+/// The installed head revision of each set by publisher then set id, for removal cutoffs.
+pub const DISTRIBUTION_PUBLISHER_KEYSPACE: &str = "distribution_publishers";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
@@ -473,6 +475,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DOCUMENT_STATE_KEYSPACE,
     DISTRIBUTION_KEYSPACE,
     DISTRIBUTION_ACCEPT_KEYSPACE,
+    DISTRIBUTION_PUBLISHER_KEYSPACE,
     DOCUMENT_CONFLICT_KEYSPACE,
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,

@@ -13,7 +13,8 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, SnapshotSignEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+    DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE,
+    DOCUMENT_STATE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminApplyStatus, AdminDocumentError, AdminDocumentState};
@@ -24,7 +25,7 @@ use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 use aruna_core::structs::storage::distribution::{
     DistributionError, DistributionRequest, DistributionRevision, DistributionSnapshot,
-    DistributionView, SignedSnapshot, next_snapshot,
+    DistributionView, SignedSnapshot, next_snapshot, publisher_key,
 };
 use aruna_core::types::{Effects, TxnId, Value};
 use aruna_core::{TaskEvent, UserId};
@@ -368,6 +369,13 @@ impl PublishOperation {
                 accepted.into(),
             ),
             outbox_write_entry(&record).map_err(ConversionError::from)?,
+            (
+                DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
+                publisher_key(&self.config.node_id, set_id).into(),
+                postcard::to_allocvec(&revision)
+                    .map_err(ConversionError::from)?
+                    .into(),
+            ),
         ];
         self.output = Some(Ok(revision));
         self.state = PublishState::Write;

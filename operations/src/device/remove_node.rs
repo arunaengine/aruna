@@ -9,7 +9,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
+use aruna_core::keyspaces::{DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -18,6 +18,7 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group_delete::MembershipFence;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::distribution::{MAX_CUTOFFS, PublisherCutoff, cutoff_from_row};
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -52,6 +53,7 @@ pub struct RemoveNodeConfig {
 #[derive(Debug, PartialEq)]
 pub struct RemoveNodeOperation {
     config: RemoveNodeConfig,
+    cutoffs: Vec<PublisherCutoff>,
     txn_id: Option<TxnId>,
     state: RemoveNodeState,
     output: Option<Result<RealmConfigDocument, RemoveNodeError>>,
@@ -62,6 +64,11 @@ enum RemoveNodeState {
     Init,
     StartTransaction,
     ReadCurrent,
+    /// Reads the removed node's published sets as this node holds them, for its cutoffs.
+    ReadCutoffs {
+        document_value: Option<Value>,
+        reducer_state_value: Option<Value>,
+    },
     WriteDocumentState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
@@ -91,6 +98,8 @@ pub enum RemoveNodeError {
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
     ConfigMissing,
+    #[error("the node published more distributed buckets than one removal can cut off")]
+    TooManySets,
     #[error("no device {node_id} belongs to this caller")]
     DeviceNotFound { node_id: NodeId },
     #[error("this node is not a realm management node")]
@@ -111,6 +120,7 @@ impl RemoveNodeOperation {
     pub fn new(config: RemoveNodeConfig) -> Self {
         Self {
             config,
+            cutoffs: Vec::new(),
             txn_id: None,
             state: RemoveNodeState::Init,
             output: None,
@@ -209,7 +219,7 @@ impl RemoveNodeOperation {
             &self.config.actor,
             AdminDocumentOperation::ConfigNodeRemoved {
                 node_id: self.config.node_id,
-                cutoffs: Vec::new(),
+                cutoffs: std::mem::take(&mut self.cutoffs),
             },
         )?;
         // The stored document is derived from the reducer, exactly as the
@@ -317,15 +327,40 @@ impl Operation for RemoveNodeOperation {
                     if !membership.pending.is_empty() {
                         return self.fail(RemoveNodeError::DeletionPending);
                     }
-                    match self
-                        .emit_removal_writes(document_value.clone(), reducer_state_value.clone())
-                    {
+                    self.state = RemoveNodeState::ReadCutoffs {
+                        document_value: document_value.clone(),
+                        reducer_state_value: reducer_state_value.clone(),
+                    };
+                    smallvec![Effect::Storage(StorageEffect::Iter {
+                        key_space: DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
+                        prefix: Some(self.config.node_id.as_bytes().to_vec().into()),
+                        start: None,
+                        limit: MAX_CUTOFFS + 1,
+                        txn_id: self.txn_id,
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+            },
+            RemoveNodeState::ReadCutoffs {
+                document_value,
+                reducer_state_value,
+            } => match event {
+                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                    if values.len() > MAX_CUTOFFS {
+                        return self.fail(RemoveNodeError::TooManySets);
+                    }
+                    self.cutoffs = values
+                        .iter()
+                        .filter_map(|(key, value)| cutoff_from_row(key, value))
+                        .collect();
+                    match self.emit_removal_writes(document_value, reducer_state_value) {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("publisher index rows", format!("{other:?}")),
             },
             RemoveNodeState::WriteDocumentState {
                 document,
@@ -610,5 +645,60 @@ mod tests {
         .await
         .expect_err("a server node is refused");
         assert_eq!(error, RemoveNodeError::NotManagementNode);
+    }
+
+    #[tokio::test]
+    async fn removal_carries_cutoffs() {
+        // The removal names each set the node published as this node holds it.
+        use aruna_core::structs::storage::distribution::{DistributionRevision, publisher_key};
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let actor = actor(realm_id);
+        seed(
+            &ctx,
+            &actor,
+            &realm_with_device(realm_id, &actor, actor.user_id),
+        )
+        .await;
+        let set_id = Ulid::from_bytes([7u8; 16]);
+        let revision = DistributionRevision {
+            number: 4,
+            digest: [5u8; 32],
+        };
+        ctx.storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
+                key: publisher_key(&node(2), set_id).into(),
+                value: postcard::to_allocvec(&revision).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        drive(
+            RemoveNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
+            &ctx,
+        )
+        .await
+        .expect("device removal applies");
+        let key = reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id });
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: DOCUMENT_STATE_KEYSPACE.to_string(),
+                key,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("reducer state stored");
+        };
+        let state = aruna_core::reducer::decode_reducer_state(value.as_ref()).unwrap();
+        assert_eq!(
+            state.publisher_cutoffs(&node(2)),
+            Some(vec![PublisherCutoff { set_id, revision }])
+        );
     }
 }

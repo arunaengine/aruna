@@ -191,6 +191,22 @@ pub struct PublisherCutoff {
     pub revision: DistributionRevision,
 }
 
+/// The publisher index key: publisher node id, then set id.
+pub fn publisher_key(publisher: &NodeId, set_id: Ulid) -> Vec<u8> {
+    let mut key = publisher.as_bytes().to_vec();
+    key.extend_from_slice(&set_id.to_bytes());
+    key
+}
+
+/// Reads one publisher index row back into the set's cutoff.
+pub fn cutoff_from_row(key: &[u8], value: &[u8]) -> Option<PublisherCutoff> {
+    let set_id = <[u8; 16]>::try_from(key.get(32..48)?).ok()?;
+    Some(PublisherCutoff {
+        set_id: Ulid::from_bytes(set_id),
+        revision: postcard::from_bytes(value).ok()?,
+    })
+}
+
 /// One revision of a set: its number and the digest of its canonical snapshot.
 #[derive(
     Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
