@@ -648,6 +648,7 @@ pub(super) fn storage_effect_mutates(effect: &StorageEffect) -> bool {
         StorageEffect::Write { .. }
         | StorageEffect::BatchWrite { .. }
         | StorageEffect::AddUsage { .. }
+        | StorageEffect::AddCounters { .. }
         | StorageEffect::Delete { .. }
         | StorageEffect::BatchDelete { .. }
         | StorageEffect::VaultWrite { .. }
@@ -716,6 +717,7 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
             ..
         }
         | StorageEffect::AddUsage { txn_id, .. }
+        | StorageEffect::AddCounters { txn_id, .. }
         | StorageEffect::CommitTransaction { txn_id }
         | StorageEffect::AbortTransaction { txn_id } => Some(*txn_id),
         StorageEffect::StartTransaction { .. }

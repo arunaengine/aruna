@@ -16,6 +16,8 @@ mod tests;
 #[cfg(test)]
 mod tests_config;
 #[cfg(test)]
+mod tests_counters;
+#[cfg(test)]
 mod tests_persistence;
 #[cfg(test)]
 mod tests_range;

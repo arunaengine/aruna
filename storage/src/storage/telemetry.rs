@@ -92,6 +92,15 @@ pub(super) fn record_effect_fields(span: &Span, effect: &StorageEffect) {
             span.record("batch_len", (deltas.len() + buckets.len()) as u64);
             span.record("txn_id", field::display(txn_id));
         }
+        StorageEffect::AddCounters {
+            key_space,
+            deltas,
+            txn_id,
+        } => {
+            span.record("key_space", field::display(key_space));
+            span.record("batch_len", deltas.len() as u64);
+            span.record("txn_id", field::display(txn_id));
+        }
         StorageEffect::BatchDelete { deletes, txn_id } => {
             span.record("batch_len", deletes.len() as u64);
             if let Some(txn_id) = txn_id {
@@ -164,6 +173,7 @@ pub(super) fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
         StorageEffect::Write { .. } => "write",
         StorageEffect::BatchWrite { .. } => "batch_write",
         StorageEffect::AddUsage { .. } => "add_usage",
+        StorageEffect::AddCounters { .. } => "add_counters",
         StorageEffect::Delete { .. } => "delete",
         StorageEffect::BatchDelete { .. } => "batch_delete",
         StorageEffect::AbortTransaction { .. } => "abort_transaction",

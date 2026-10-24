@@ -70,7 +70,8 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         StorageEffect::BatchWrite { writes, .. } => {
             writes.first().map(|(key_space, _, _)| key_space.as_str())
         }
-        StorageEffect::AddUsage { key_space, .. } => Some(key_space),
+        StorageEffect::AddUsage { key_space, .. }
+        | StorageEffect::AddCounters { key_space, .. } => Some(key_space),
         StorageEffect::BatchDelete { deletes, .. } => {
             deletes.first().map(|(key_space, _)| key_space.as_str())
         }
@@ -237,6 +238,11 @@ impl FjallStorage {
                 buckets,
                 txn_id,
             } => self.add_usage(key_space, deltas, buckets, txn_id),
+            StorageEffect::AddCounters {
+                key_space,
+                deltas,
+                txn_id,
+            } => self.add_counters(key_space, deltas, txn_id),
             StorageEffect::CommitTransaction { txn_id } => self.commit_transaction(txn_id),
             StorageEffect::Delete {
                 key_space,

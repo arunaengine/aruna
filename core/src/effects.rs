@@ -26,6 +26,7 @@ use crate::structs::storage::backend_import::PlainPath;
 use crate::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, HiddenBlobKey, ResolvedBackend,
 };
+use crate::structs::storage::distribution::accounting::RangeCounters;
 use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket, ReadLease};
 use crate::structs::storage::format::Compression;
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
@@ -568,6 +569,13 @@ pub enum StorageEffect {
         deltas: Vec<(Key, UsageDelta)>,
         /// Changes of `BucketCounters` rows, applied the same way.
         buckets: Vec<(Key, BucketDelta)>,
+        txn_id: TxnId,
+    },
+    /// Adds range counter deltas to the latest stored rows when the write transaction commits,
+    /// like `AddUsage`; the rows never join its read set. Answers `BatchWriteResult`.
+    AddCounters {
+        key_space: KeySpace,
+        deltas: Vec<(Key, RangeCounters)>,
         txn_id: TxnId,
     },
     Delete {

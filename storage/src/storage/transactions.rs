@@ -5,6 +5,7 @@
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
+use aruna_core::structs::storage::distribution::accounting::RangeCounters;
 use aruna_core::structs::storage::usage::{
     BucketCounters, BucketDelta, CounterShortfall, UsageCounters, UsageDelta,
 };
@@ -22,6 +23,7 @@ use super::{CleanupEntry, CleanupKind, FjallStorage, MAX_TRANSACTION_CLEANUP, Tx
 pub(super) enum CounterChange {
     Usage(UsageDelta),
     Bucket(BucketDelta),
+    Range(RangeCounters),
 }
 
 impl CounterChange {
@@ -30,6 +32,7 @@ impl CounterChange {
         match (self, other) {
             (Self::Usage(left), Self::Usage(right)) => Self::Usage(left.merge(right)),
             (Self::Bucket(left), Self::Bucket(right)) => Self::Bucket(left.merge(right)),
+            (Self::Range(left), Self::Range(right)) => Self::Range(left.merge(right)),
             (_, other) => other,
         }
     }
@@ -49,6 +52,41 @@ impl FjallStorage {
         buckets: Vec<(ByteView, BucketDelta)>,
         txn_id: Ulid,
     ) -> StorageEvent {
+        let usage = deltas
+            .into_iter()
+            .map(|(key, delta)| (key, CounterChange::Usage(delta)));
+        let rows = buckets
+            .into_iter()
+            .map(|(key, delta)| (key, CounterChange::Bucket(delta)));
+        self.pend_changes(key_space, usage.chain(rows).collect(), txn_id)
+    }
+
+    #[tracing::instrument(
+        name = "storage.add_counters",
+        level = "debug",
+        skip(self, deltas),
+        fields(key_space = %key_space, delta_count = deltas.len(), txn_id = %txn_id)
+    )]
+    pub(super) fn add_counters(
+        &mut self,
+        key_space: String,
+        deltas: Vec<(ByteView, RangeCounters)>,
+        txn_id: Ulid,
+    ) -> StorageEvent {
+        let changes = deltas
+            .into_iter()
+            .map(|(key, delta)| (key, CounterChange::Range(delta)))
+            .collect();
+        self.pend_changes(key_space, changes, txn_id)
+    }
+
+    /// Queues counter changes of an open write transaction for its commit.
+    fn pend_changes(
+        &mut self,
+        key_space: String,
+        changes: Vec<(ByteView, CounterChange)>,
+        txn_id: Ulid,
+    ) -> StorageEvent {
         if let Err(error) = self.store.resolve_keyspace(&key_space) {
             return StorageEvent::Error { error };
         }
@@ -58,14 +96,8 @@ impl FjallStorage {
             };
         }
         let pending = self.txn_usage.entry(txn_id).or_default();
-        let mut entries = Vec::with_capacity(deltas.len() + buckets.len());
-        let usage = deltas
-            .into_iter()
-            .map(|(key, delta)| (key, CounterChange::Usage(delta)));
-        let rows = buckets
-            .into_iter()
-            .map(|(key, delta)| (key, CounterChange::Bucket(delta)));
-        for (key, change) in usage.chain(rows) {
+        let mut entries = Vec::with_capacity(changes.len());
+        for (key, change) in changes {
             entries.push((key_space.clone(), key.clone()));
             match pending
                 .iter_mut()
@@ -108,6 +140,12 @@ impl FjallStorage {
                     let mut counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
                     let shortfalls = counters.apply(&delta).map_err(|e| failed(&e))?;
                     (counters.to_bytes().map_err(|e| failed(&e))?, shortfalls)
+                }
+                CounterChange::Range(delta) => {
+                    let counters = stored.map(RangeCounters::from_bytes).transpose();
+                    let counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
+                    let value = counters.merge(delta).to_bytes();
+                    (value.map_err(|e| failed(&e))?, Vec::new())
                 }
             };
             warn_clamped(&key, shortfalls);
