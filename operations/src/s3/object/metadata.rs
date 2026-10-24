@@ -95,7 +95,6 @@ struct ReferenceRefreshIdentity<'a> {
     bucket: &'a str,
     key: &'a str,
     version_id: Ulid,
-    refreshed_at: SystemTime,
 }
 
 struct ReferenceRefreshScan {
@@ -115,28 +114,27 @@ impl ReferenceRefreshRecord {
     }
 }
 
+/// One job per version: a newer request replaces the payload of the queued one.
 pub fn job_key(refresh: &ReferenceRefresh) -> Result<Key, ConversionError> {
     let identity = ReferenceRefreshIdentity {
         bucket: &refresh.bucket,
         key: &refresh.key,
         version_id: refresh.version_id,
-        refreshed_at: refresh.refreshed_at,
     };
-    let mut key = b"v1".to_vec();
+    let mut key = b"v2".to_vec();
     key.extend(postcard::to_allocvec(&identity)?);
     Ok(ByteView::from(key))
 }
 
-fn job_entry(record: &ReferenceRefreshRecord) -> Result<(String, Key, ByteView), ConversionError> {
-    Ok((
+fn job_entries(
+    record: &ReferenceRefreshRecord,
+) -> Result<Vec<(String, Key, ByteView)>, ConversionError> {
+    let key = job_key(&record.refresh)?;
+    Ok(vec![(
         REFRESH_JOB_KEYSPACE.to_string(),
-        job_key(&record.refresh)?,
+        key,
         ByteView::from(postcard::to_allocvec(record)?),
-    ))
-}
-
-fn job_preferred(candidate: &ReferenceRefreshRecord, current: &ReferenceRefreshRecord) -> bool {
-    (candidate.attempts, candidate.due_at_ms) > (current.attempts, current.due_at_ms)
+    )])
 }
 
 pub fn schedule_drain() -> Effect {
@@ -149,8 +147,10 @@ pub fn schedule_drain() -> Effect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueRefreshState {
     Init,
+    StartTransaction,
     ReadExisting,
     WriteJob,
+    Commit,
     ScheduleDrain,
     Finish,
     Error,
@@ -159,6 +159,7 @@ enum QueueRefreshState {
 #[derive(Debug, PartialEq)]
 pub struct QueueRefreshOperation {
     refresh: ReferenceRefresh,
+    txn_id: Option<Ulid>,
     state: QueueRefreshState,
     output: Option<Result<QueueRefreshResult, ReferenceRefreshError>>,
 }
@@ -167,6 +168,7 @@ impl QueueRefreshOperation {
     pub fn new(refresh: ReferenceRefresh) -> Self {
         Self {
             refresh,
+            txn_id: None,
             state: QueueRefreshState::Init,
             output: None,
         }
@@ -178,35 +180,64 @@ impl QueueRefreshOperation {
         smallvec![]
     }
 
-    fn read_existing(&mut self) -> Effects {
+    fn start_transaction(&mut self) -> Effects {
+        self.state = QueueRefreshState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn read_existing(&mut self, txn_id: Ulid) -> Effects {
         let key = match job_key(&self.refresh) {
             Ok(key) => key,
             Err(error) => return self.fail(error.into()),
         };
+        self.txn_id = Some(txn_id);
         self.state = QueueRefreshState::ReadExisting;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: REFRESH_JOB_KEYSPACE.to_string(),
             key,
-            txn_id: None,
+            txn_id: Some(txn_id),
         })]
     }
 
-    fn write_job(&mut self) -> Effects {
-        let record = ReferenceRefreshRecord::new(self.refresh.clone(), unix_timestamp_millis());
-        let (key_space, key, value) = match job_entry(&record) {
-            Ok(entry) => entry,
+    /// A queued job keeps its due time and attempts; only a newer request replaces its payload.
+    fn merge_job(&mut self, existing: Option<&[u8]>) -> Effects {
+        let record = match existing.map(postcard::from_bytes::<ReferenceRefreshRecord>) {
+            Some(Ok(existing)) if existing.refresh.refreshed_at >= self.refresh.refreshed_at => {
+                return self.commit();
+            }
+            Some(Ok(existing)) => ReferenceRefreshRecord {
+                refresh: self.refresh.clone(),
+                ..existing
+            },
+            Some(Err(_)) | None => {
+                ReferenceRefreshRecord::new(self.refresh.clone(), unix_timestamp_millis())
+            }
+        };
+        let writes = match job_entries(&record) {
+            Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
         self.state = QueueRefreshState::WriteJob;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: None,
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: self.txn_id,
         })]
     }
 
+    fn commit(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(ReferenceRefreshError::UnexpectedEvent(
+                "refresh queue transaction is missing".to_string(),
+            ));
+        };
+        self.state = QueueRefreshState::Commit;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
     fn schedule_drain(&mut self) -> Effects {
+        self.txn_id = None;
         self.state = QueueRefreshState::ScheduleDrain;
         smallvec![schedule_drain()]
     }
@@ -223,42 +254,41 @@ impl Operation for QueueRefreshOperation {
     type Error = ReferenceRefreshError;
 
     fn start(&mut self) -> Effects {
-        self.read_existing()
+        self.start_transaction()
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            QueueRefreshState::Init => self.read_existing(),
-            QueueRefreshState::ReadExisting => match event {
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => {
-                    let record =
-                        ReferenceRefreshRecord::new(self.refresh.clone(), unix_timestamp_millis());
-                    match postcard::from_bytes::<ReferenceRefreshRecord>(&value) {
-                        Ok(existing) if job_preferred(&existing, &record) => self.schedule_drain(),
-                        Ok(_) | Err(_) => self.write_job(),
+        let event = match (&self.state, event) {
+            (QueueRefreshState::Finish | QueueRefreshState::Error, _) => return smallvec![],
+            (QueueRefreshState::Init, _) => return self.start_transaction(),
+            (QueueRefreshState::ScheduleDrain, event) => {
+                return match event {
+                    Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(true, true),
+                    Event::Task(TaskEvent::Error { .. }) => self.finish(true, false),
+                    other => {
+                        warn!(event = ?other, "Reference metadata refresh job persisted but drain scheduling returned an unexpected event");
+                        self.finish(true, false)
                     }
-                }
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_job(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
-            },
-            QueueRefreshState::WriteJob => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.schedule_drain(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
-            },
-            QueueRefreshState::ScheduleDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(true, true),
-                Event::Task(TaskEvent::Error { .. }) => self.finish(true, false),
-                other => {
-                    warn!(event = ?other, "Reference metadata refresh job persisted but drain scheduling returned an unexpected event");
-                    self.finish(true, false)
-                }
-            },
-            QueueRefreshState::Finish => smallvec![],
-            QueueRefreshState::Error => smallvec![],
+                };
+            }
+            (_, Event::Storage(StorageEvent::Error { error })) => return self.fail(error.into()),
+            (_, Event::Storage(event)) => event,
+            (_, other) => {
+                return self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}")));
+            }
+        };
+        match (&self.state, event) {
+            (QueueRefreshState::StartTransaction, StorageEvent::TransactionStarted { txn_id }) => {
+                self.read_existing(txn_id)
+            }
+            (QueueRefreshState::ReadExisting, StorageEvent::ReadResult { value, .. }) => {
+                self.merge_job(value.as_deref())
+            }
+            (QueueRefreshState::WriteJob, StorageEvent::BatchWriteResult { .. }) => self.commit(),
+            (QueueRefreshState::Commit, StorageEvent::TransactionCommitted { .. }) => {
+                self.schedule_drain()
+            }
+            (_, other) => self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
         }
     }
 
@@ -280,7 +310,10 @@ impl Operation for QueueRefreshOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        smallvec![]
+        match self.txn_id.take() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
     }
 }
 
@@ -573,12 +606,12 @@ pub async fn process_batch(
     for (job_key, job) in scan.jobs {
         match observe_and_refresh(context, job.refresh.clone()).await {
             Ok(()) => {
-                delete_job(&context.storage_handle, job_key).await?;
+                settle_job(&context.storage_handle, &job_key, &job, None).await?;
                 succeeded = succeeded.saturating_add(1);
             }
             Err(error) => {
                 let retry_due_at =
-                    reschedule_job(&context.storage_handle, job_key, &job, error).await?;
+                    reschedule_job(&context.storage_handle, &job_key, &job, error).await?;
                 next_due_ms = min_due_at(next_due_ms, retry_due_at);
                 failed = failed.saturating_add(1);
             }
@@ -642,71 +675,20 @@ async fn scan_due_jobs(
         };
 
         for (key, value) in values {
-            let mut key = key.to_vec();
             let job = match postcard::from_bytes::<ReferenceRefreshRecord>(&value) {
                 Ok(job) => job,
                 Err(error) => {
                     warn!(error = %error, key = ?key, "Deleting malformed reference metadata refresh job");
-                    delete_job(storage, key).await?;
+                    let deletes = vec![(REFRESH_JOB_KEYSPACE.to_string(), key)];
+                    delete_rows(storage, deletes, None).await?;
                     continue;
                 }
             };
-            let canonical_key = job_key(&job.refresh)?.to_vec();
-            if canonical_key.as_slice() != key.as_slice() {
-                warn!(key = ?key, "Repairing reference metadata refresh job stored under non-canonical key");
-                if let Some(existing) = read_job(storage, &canonical_key).await?
-                    && job_preferred(&existing, &job)
-                {
-                    delete_job(storage, key).await?;
-                    if existing.due_at_ms > now_ms {
-                        next_due_ms = min_due_at(next_due_ms, existing.due_at_ms);
-                        continue;
-                    }
-                    jobs.push((canonical_key, existing));
-                    if jobs.len() >= limit {
-                        return Ok(ReferenceRefreshScan {
-                            jobs,
-                            has_more_due: true,
-                            next_due_ms,
-                        });
-                    }
-                    continue;
-                }
-                write_job(storage, &job).await?;
-                delete_job(storage, key).await?;
-                key = canonical_key;
-            }
-            if let Some((existing_key, existing)) =
-                find_duplicate(storage, &job, Some(key.as_slice())).await?
-                && job_preferred(&existing, &job)
-            {
-                let existing_canonical_key = job_key(&existing.refresh)?.to_vec();
-                write_job(storage, &existing).await?;
-                if existing_key.as_slice() != existing_canonical_key.as_slice() {
-                    delete_job(storage, existing_key).await?;
-                }
-                if key.as_slice() != existing_canonical_key.as_slice() {
-                    delete_job(storage, key).await?;
-                }
-                if existing.due_at_ms > now_ms {
-                    next_due_ms = min_due_at(next_due_ms, existing.due_at_ms);
-                    continue;
-                }
-                jobs.push((existing_canonical_key, existing));
-                if jobs.len() >= limit {
-                    return Ok(ReferenceRefreshScan {
-                        jobs,
-                        has_more_due: true,
-                        next_due_ms,
-                    });
-                }
-                continue;
-            }
             if job.due_at_ms > now_ms {
                 next_due_ms = min_due_at(next_due_ms, job.due_at_ms);
                 continue;
             }
-            jobs.push((key, job));
+            jobs.push((key.to_vec(), job));
             if jobs.len() >= limit {
                 return Ok(ReferenceRefreshScan {
                     jobs,
@@ -729,122 +711,89 @@ async fn scan_due_jobs(
     }
 }
 
-async fn find_duplicate(
+async fn send(
     storage: &StorageHandle,
-    job: &ReferenceRefreshRecord,
-    skip_key: Option<&[u8]>,
-) -> Result<Option<(Vec<u8>, ReferenceRefreshRecord)>, ReferenceRefreshError> {
-    let canonical_key = job_key(&job.refresh)?.to_vec();
-    let mut selected = None;
-    let mut start_after = None;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: REFRESH_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: REFRESH_SCAN_PAGE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}")));
-            }
-        };
-
-        for (key, value) in values {
-            if skip_key.is_some_and(|skip_key| key.as_ref() == skip_key) {
-                continue;
-            }
-            let Ok(candidate) = postcard::from_bytes::<ReferenceRefreshRecord>(&value) else {
-                continue;
-            };
-            if job_key(&candidate.refresh)?.as_ref() != canonical_key.as_slice() {
-                continue;
-            }
-            match selected.as_mut() {
-                Some((_, selected_job)) if job_preferred(&candidate, selected_job) => {
-                    selected = Some((key.to_vec(), candidate));
-                }
-                Some(_) => {}
-                None => selected = Some((key.to_vec(), candidate)),
-            }
-        }
-
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => return Ok(selected),
-        }
+    effect: StorageEffect,
+) -> Result<StorageEvent, ReferenceRefreshError> {
+    match storage.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        Event::Storage(event) => Ok(event),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 async fn read_job(
     storage: &StorageHandle,
     key: &[u8],
-) -> Result<Option<ReferenceRefreshRecord>, ReferenceRefreshError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REFRESH_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(key.to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => Ok(Some(
-            postcard::from_bytes(&value).map_err(ConversionError::from)?,
-        )),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+    txn_id: Option<Ulid>,
+) -> Result<Option<Result<ReferenceRefreshRecord, postcard::Error>>, ReferenceRefreshError> {
+    let effect = StorageEffect::Read {
+        key_space: REFRESH_JOB_KEYSPACE.to_string(),
+        key: ByteView::from(key.to_vec()),
+        txn_id,
+    };
+    match send(storage, effect).await? {
+        StorageEvent::ReadResult { value, .. } => {
+            Ok(value.map(|value| postcard::from_bytes(&value)))
+        }
         other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
-async fn write_job(
+async fn delete_rows(
     storage: &StorageHandle,
-    job: &ReferenceRefreshRecord,
+    deletes: Vec<(String, Key)>,
+    txn_id: Option<Ulid>,
 ) -> Result<(), ReferenceRefreshError> {
-    let (key_space, key, value) = job_entry(job)?;
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+    match send(storage, StorageEffect::BatchDelete { deletes, txn_id }).await? {
+        StorageEvent::BatchDeleteResult { .. } => Ok(()),
         other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
-async fn delete_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), ReferenceRefreshError> {
-    match storage
-        .send_storage_effect(StorageEffect::Delete {
-            key_space: REFRESH_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+/// Removes a finished job, or replaces it with `next`, unless a newer request replaced it.
+async fn settle_job(
+    storage: &StorageHandle,
+    key: &[u8],
+    job: &ReferenceRefreshRecord,
+    next: Option<&ReferenceRefreshRecord>,
+) -> Result<(), ReferenceRefreshError> {
+    let txn_id = match send(storage, StorageEffect::StartTransaction { read: false }).await? {
+        StorageEvent::TransactionStarted { txn_id } => txn_id,
+        other => return Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+    };
+    let result = async {
+        if !matches!(read_job(storage, key, Some(txn_id)).await?, Some(Ok(stored)) if stored == *job)
+        {
+            return Ok(());
+        }
+        let Some(next) = next else {
+            let deletes = vec![(REFRESH_JOB_KEYSPACE.to_string(), ByteView::from(key.to_vec()))];
+            return delete_rows(storage, deletes, Some(txn_id)).await;
+        };
+        let writes = job_entries(next)?;
+        match send(storage, StorageEffect::BatchWrite { writes, txn_id: Some(txn_id) }).await? {
+            StorageEvent::BatchWriteResult { .. } => Ok(()),
+            other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+        }
+    }
+    .await;
+    let effect = match result {
+        Ok(()) => StorageEffect::CommitTransaction { txn_id },
+        Err(error) => {
+            let _ = send(storage, StorageEffect::AbortTransaction { txn_id }).await;
+            return Err(error);
+        }
+    };
+    match send(storage, effect).await? {
+        StorageEvent::TransactionCommitted { .. } => Ok(()),
         other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 async fn reschedule_job(
     storage: &StorageHandle,
-    key: Vec<u8>,
+    key: &[u8],
     job: &ReferenceRefreshRecord,
     error: String,
 ) -> Result<u64, ReferenceRefreshError> {
@@ -856,19 +805,8 @@ async fn reschedule_job(
         attempts,
         last_error: Some(error),
     };
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: REFRESH_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            value: ByteView::from(postcard::to_allocvec(&next_job).map_err(ConversionError::from)?),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(due_at_ms),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
-    }
+    settle_job(storage, key, job, Some(&next_job)).await?;
+    Ok(due_at_ms)
 }
 
 #[cfg(test)]
@@ -1060,19 +998,26 @@ mod tests {
         }
     }
 
-    async fn write_corrupt_job(storage: &StorageHandle, key: &str) {
+    async fn write_rows(storage: &StorageHandle, writes: Vec<(String, Key, ByteView)>) {
         match storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space: REFRESH_JOB_KEYSPACE.to_string(),
-                key: ByteView::from(key.as_bytes().to_vec()),
-                value: ByteView::from(Vec::new()),
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
                 txn_id: None,
             })
             .await
         {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected corrupt refresh job write event: {other:?}"),
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected refresh job write event: {other:?}"),
         }
+    }
+
+    async fn write_corrupt_job(storage: &StorageHandle, key: &str) {
+        let writes = vec![(
+            REFRESH_JOB_KEYSPACE.to_string(),
+            ByteView::from(key.as_bytes().to_vec()),
+            ByteView::from(Vec::new()),
+        )];
+        write_rows(storage, writes).await;
     }
 
     #[tokio::test]
@@ -1278,11 +1223,42 @@ mod tests {
         .expect("older queue succeeds");
 
         let jobs = read_jobs(&test.context.storage_handle).await;
-        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].refresh.refreshed_at, newer);
 
         let result = process_batch(&test.context).await.expect("drain succeeds");
-        assert_eq!(result.succeeded, 2);
+        assert_eq!(result.succeeded, 1);
         assert_reference_state(&test, &original, newer).await;
+    }
+
+    // A drain that finishes a request a newer one replaced keeps the newer job queued.
+    #[tokio::test]
+    async fn replaced_job_kept() {
+        let test = setup_state();
+        let original = source_metadata(1, "original");
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        for refreshed_at in [older, newer] {
+            crate::driver::drive(
+                QueueRefreshOperation::new(refresh(&test, original.clone(), refreshed_at)),
+                &test.context,
+            )
+            .await
+            .expect("queue succeeds");
+        }
+        let storage = &test.context.storage_handle;
+        let queued = read_jobs(storage).await;
+        let older_job = ReferenceRefreshRecord {
+            refresh: refresh(&test, original, older),
+            ..queued[0].clone()
+        };
+        let key = job_key(&older_job.refresh).unwrap();
+
+        settle_job(storage, &key, &older_job, None).await.unwrap();
+
+        assert_eq!(read_jobs(storage).await, queued);
+        assert_eq!(queued[0].refresh.refreshed_at, newer);
+        assert!(jobs_exist(storage).await.unwrap());
     }
 
     #[tokio::test]
@@ -1296,21 +1272,8 @@ mod tests {
             attempts: 1,
             last_error: Some("transient".to_string()),
         };
-        let (key_space, key, value) = job_entry(&future_job).expect("future job serializes");
-        match test
-            .context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected future refresh job write event: {other:?}"),
-        }
+        let writes = job_entries(&future_job).expect("future job serializes");
+        write_rows(&test.context.storage_handle, writes).await;
 
         crate::driver::drive(QueueRefreshOperation::new(refresh), &test.context)
             .await
@@ -1334,21 +1297,7 @@ mod tests {
             ),
             due_at_ms,
         );
-        let (key_space, key, value) = job_entry(&record).unwrap();
-        match test
-            .context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected job write event: {other:?}"),
-        }
+        write_rows(&test.context.storage_handle, job_entries(&record).unwrap()).await;
 
         let result = process_batch(&test.context)
             .await
