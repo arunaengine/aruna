@@ -13,8 +13,8 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, SnapshotSignEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE,
-    DOCUMENT_STATE_KEYSPACE,
+    CATCH_UP_KEYSPACE, DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE,
+    DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminApplyStatus, AdminDocumentError, AdminDocumentState};
@@ -370,7 +370,8 @@ impl PublishOperation {
             requester: self.requester(),
         };
         let accepted = postcard::to_allocvec(&accepted).map_err(ConversionError::from)?;
-        let writes = vec![
+        let catch_up = !view.snapshot().catching_up().is_empty();
+        let mut writes = vec![
             (
                 DISTRIBUTION_KEYSPACE.to_string(),
                 set_id.to_bytes().to_vec().into(),
@@ -391,6 +392,11 @@ impl PublishOperation {
                     .into(),
             ),
         ];
+        // The publisher may coordinate ranges too; it finds catching-up members like any node.
+        if catch_up {
+            let key = set_id.to_bytes().to_vec().into();
+            writes.push((CATCH_UP_KEYSPACE.to_string(), key, Vec::new().into()));
+        }
         self.output = Some(Ok(revision));
         self.state = PublishState::Write;
         Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {

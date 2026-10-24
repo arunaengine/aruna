@@ -4,7 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE};
+use aruna_core::keyspaces::{
+    CATCH_UP_KEYSPACE, DISTRIBUTION_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE,
+};
 use aruna_core::structs::storage::distribution::parking::{Authority, publisher_authority};
 use aruna_core::structs::storage::distribution::{PublisherCutoff, SignedSnapshot, publisher_key};
 
@@ -211,17 +213,27 @@ async fn distribution_writes(
     let head = view.snapshot();
     let revision =
         postcard::to_allocvec(&head.revision()).map_err(|error| bootstrap(error.to_string()))?;
-    Ok(Some(vec![
-        (
-            DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
-            publisher_key(&head.root.publisher, set_id).into(),
-            revision.into(),
-        ),
-        reducer_state_entry(&state).map_err(|error| bootstrap(error.to_string()))?,
-        (
-            DISTRIBUTION_KEYSPACE.to_string(),
-            set_id.to_bytes().to_vec().into(),
-            bytes.into(),
-        ),
-    ]))
+    // Coordinators find the sets whose catching-up members they bootstrap through this row.
+    let catch_up = (!head.catching_up().is_empty()).then(|| {
+        let key = set_id.to_bytes().to_vec().into();
+        (CATCH_UP_KEYSPACE.to_string(), key, Value::from(Vec::new()))
+    });
+    Ok(Some(
+        vec![
+            (
+                DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
+                publisher_key(&head.root.publisher, set_id).into(),
+                revision.into(),
+            ),
+            reducer_state_entry(&state).map_err(|error| bootstrap(error.to_string()))?,
+            (
+                DISTRIBUTION_KEYSPACE.to_string(),
+                set_id.to_bytes().to_vec().into(),
+                bytes.into(),
+            ),
+        ]
+        .into_iter()
+        .chain(catch_up)
+        .collect(),
+    ))
 }
