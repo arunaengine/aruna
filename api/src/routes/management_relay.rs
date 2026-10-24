@@ -238,7 +238,8 @@ async fn relayed_response(route: &'static str, url: &str, response: reqwest::Res
         }
         Err(error) => {
             warn!(route, relay_target = %url, error = %error, "Management relay response failed");
-            ServerError::BadGateway.into_response()
+            // The management node already answered, so it may have applied the call.
+            ServerError::RelayFailed.into_response()
         }
     }
 }
