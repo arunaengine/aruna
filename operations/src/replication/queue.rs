@@ -19,6 +19,7 @@ use aruna_core::structs::execution::notification_watch::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::replication::{ArunaArn, ReplicationFailure};
 use aruna_core::structs::{
@@ -39,7 +40,7 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
-use super::members::{MemberTarget, bound_record, member_publication};
+use super::members::{MemberTarget, bound_record, member_jobs, member_publication};
 use super::parking::{PARKED_DUE, park_job};
 use super::plaintext::{consent_delete, consent_write, job_consent, plaintext_allowed};
 use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
@@ -125,6 +126,8 @@ struct BlobJobIdentity<'a> {
 pub struct LiveReplicationContinuation {
     pub relationship_after: Option<Vec<u8>>,
     pub relationships_complete: bool,
+    /// The publications to the members of a distributed bucket are queued.
+    pub members_done: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1876,6 +1879,15 @@ async fn process_live_obligations(
             })
             .or_insert(start);
     }
+    let mut records = HashMap::<String, Option<(DistributionBinding, DistributionSnapshot)>>::new();
+    for (_, obligation) in &obligations {
+        if !records.contains_key(&obligation.bucket) {
+            let record = bound_record(context, &obligation.bucket)
+                .await
+                .map_err(BlobQueueError::UnexpectedEvent)?;
+            records.insert(obligation.bucket.clone(), record);
+        }
+    }
     let mut relationship_cache = HashMap::<String, RelationshipPage>::new();
     let mut relationship_work = 0usize;
     for (bucket, start) in starts {
@@ -1910,7 +1922,14 @@ async fn process_live_obligations(
             result.has_more = true;
             continue;
         }
-        let write = write_live_jobs(&context.storage_handle, &obligation, relationships).await?;
+        let members = match records.get(&obligation.bucket) {
+            Some(Some((binding, snapshot))) if !cursor.members_done => {
+                member_jobs(binding, snapshot, &obligation, unix_timestamp_millis())
+            }
+            _ => Vec::new(),
+        };
+        let write =
+            write_live_jobs(&context.storage_handle, &obligation, relationships, members).await?;
         if !write.progressed {
             result.has_more = true;
             continue;
@@ -2130,6 +2149,7 @@ async fn write_live_jobs(
     storage: &StorageHandle,
     obligation: &LiveObligationRecord,
     relationships: Option<&RelationshipPage>,
+    members: Vec<BlobJobRecord>,
 ) -> Result<LiveRepairWrite, BlobQueueError> {
     if obligation
         .origin
@@ -2161,6 +2181,12 @@ async fn write_live_jobs(
         upstream_sources.push(source);
     }
     let mut cursor = obligation.continuation.clone().unwrap_or_default();
+    // Publications to set members are bounded by the member count and queued once.
+    let mut queued = 0;
+    if !cursor.members_done && !members.is_empty() {
+        queued = persist_live_jobs(storage, members, None).await?.queued;
+    }
+    cursor.members_done = true;
     let mut relationship_jobs = Vec::with_capacity(REPLICATION_JOB_LIMIT);
     if !cursor.relationships_complete {
         let Some(page) = relationships else {
@@ -2239,7 +2265,9 @@ async fn write_live_jobs(
         }
     }
     let continuation = (!cursor.relationships_complete).then_some(cursor);
-    persist_live_jobs(storage, relationship_jobs, continuation).await
+    let mut write = persist_live_jobs(storage, relationship_jobs, continuation).await?;
+    write.queued = write.queued.saturating_add(queued);
+    Ok(write)
 }
 
 async fn persist_live_jobs(
@@ -3618,6 +3646,7 @@ mod tests {
         let current = LiveReplicationContinuation {
             relationship_after: Some(vec![2]),
             relationships_complete: false,
+            members_done: false,
         };
         let older = LiveReplicationContinuation {
             relationship_after: Some(vec![1]),
@@ -4002,7 +4031,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            write_live_jobs(&storage, &obligation, Some(&relationships))
+            write_live_jobs(&storage, &obligation, Some(&relationships), Vec::new())
                 .await
                 .unwrap()
                 .queued,
@@ -4703,6 +4732,7 @@ mod tests {
         let observed = LiveReplicationContinuation {
             relationship_after: Some(vec![1]),
             relationships_complete: false,
+            members_done: false,
         };
 
         delete_live_obligation(&storage, key.clone(), Some(&observed))
@@ -4734,6 +4764,7 @@ mod tests {
         record.continuation = Some(LiveReplicationContinuation {
             relationship_after: Some(vec![2]),
             relationships_complete: false,
+            members_done: false,
         });
         super::write_live_obligation(&storage, &record)
             .await
@@ -4742,6 +4773,7 @@ mod tests {
         stale.continuation = Some(LiveReplicationContinuation {
             relationship_after: Some(vec![1]),
             relationships_complete: false,
+            members_done: false,
         });
 
         super::write_live_obligation(&storage, &stale)

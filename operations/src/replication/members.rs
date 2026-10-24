@@ -14,6 +14,9 @@ use aruna_core::structs::storage::distribution::{
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::protocol::ReplicationMode;
+use super::queue::{BlobJobRecord, LiveObligationRecord};
+use super::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -83,6 +86,45 @@ pub(crate) fn member_publication(
     Some((snapshot.publication(range, delivery), delivery.node_id))
 }
 
+/// The publications of one committed version to the members holding its key's range, while
+/// this member coordinates it. Delete markers are always delivered inside a set.
+pub(crate) fn member_jobs(
+    binding: &DistributionBinding,
+    snapshot: &DistributionSnapshot,
+    obligation: &LiveObligationRecord,
+    now_ms: u64,
+) -> Vec<BlobJobRecord> {
+    let admitted = snapshot
+        .member(binding.member_id)
+        .is_some_and(|member| member.incarnation == Some(binding.incarnation));
+    let deliveries = match snapshot.key_deliveries(binding.member_id, &obligation.key) {
+        Some((_, deliveries)) if admitted => deliveries,
+        _ => return Vec::new(),
+    };
+    deliveries
+        .into_iter()
+        .map(|delivery| {
+            let input = ReplicateScopeInput {
+                bucket: obligation.bucket.clone(),
+                target: ReplicateScopeTarget::Version {
+                    key: obligation.key.clone(),
+                    version_id: obligation.version_id,
+                },
+                target_node_id: delivery.node_id,
+                auth_context: obligation.auth_context.clone(),
+                replicate_delete_markers: true,
+                mode: ReplicationMode::Live,
+            };
+            BlobJobRecord::new(input, Some(obligation.delete_marker), now_ms).with_member(
+                MemberTarget {
+                    set_id: binding.set_id,
+                    member_id: delivery.member_id,
+                },
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +150,36 @@ mod tests {
         let mut replaced = coordinator.clone();
         replaced.incarnation += 1;
         assert!(member_publication(&replaced, &snapshot, "a", &target).is_none());
+    }
+
+    #[test]
+    fn fans_out_markers() {
+        use aruna_core::structs::identity::auth::AuthContext;
+        let (snapshot, _) = replicated(true, 1);
+        let realm_id = snapshot.statements[0].statement.realm_id;
+        let obligation = LiveObligationRecord::new(
+            snapshot.member(member(1)).unwrap().node_id,
+            AuthContext::anonymous(realm_id),
+            "spire".to_string(),
+            "a".to_string(),
+            Ulid::from_bytes([3; 16]),
+            true,
+        );
+        let jobs = member_jobs(&binding(&snapshot, 1, 5), &snapshot, &obligation, 9);
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.source_delete_marker, Some(true));
+        assert!(
+            job.input.replicate_delete_markers,
+            "markers ignore replicate_deletes"
+        );
+        assert_eq!(
+            job.distribution,
+            Some(MemberTarget {
+                set_id: snapshot.set_id(),
+                member_id: member(2),
+            })
+        );
+        assert!(member_jobs(&binding(&snapshot, 2, 5), &snapshot, &obligation, 9).is_empty());
     }
 }
