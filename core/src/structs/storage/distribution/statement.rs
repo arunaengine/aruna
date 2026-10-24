@@ -66,6 +66,8 @@ pub enum StatementKind {
     DeleteFenced { deletion: [u8; 32] },
     /// An automatic split by the range's coordinator.
     Split {
+        /// The revision number the coordinator decided on.
+        basis: u64,
         range_id: Ulid,
         epoch: u64,
         split_key: String,
@@ -74,6 +76,8 @@ pub enum StatementKind {
     },
     /// An automatic balancing transfer proposed by the range's coordinator.
     TransferPrepare {
+        /// The revision number the coordinator decided on.
+        basis: u64,
         transfer_id: Ulid,
         range_id: Ulid,
         to: Ulid,
@@ -94,9 +98,12 @@ impl StatementKind {
         }
     }
 
-    /// Automatic requests yield to a newer admin revision.
-    pub fn automatic(&self) -> bool {
-        matches!(self, Self::Split { .. } | Self::TransferPrepare { .. })
+    /// The revision an automatic request was decided on; it yields to a newer admin revision.
+    pub fn basis(&self) -> Option<u64> {
+        match self {
+            Self::Split { basis, .. } | Self::TransferPrepare { basis, .. } => Some(*basis),
+            _ => None,
+        }
     }
 }
 
@@ -110,9 +117,8 @@ pub struct Statement {
     pub statement_id: Ulid,
     pub member_id: Ulid,
     pub incarnation: u128,
-    /// The revision number of the intent: the create or join that added the member for an
-    /// admission, the revision a coordinator decided on for an automatic request.
-    pub intent: u64,
+    /// The digest of the create or join that added the member; it never names a head.
+    pub intent: [u8; 32],
     pub kind: StatementKind,
 }
 
@@ -189,7 +195,7 @@ mod tests {
             statement_id: Ulid::from_bytes([8; 16]),
             member_id: Ulid::from_bytes([9; 16]),
             incarnation: 10,
-            intent: 1,
+            intent: [1; 32],
             kind: StatementKind::Admit,
         };
         let signed = statement.clone().sign(&secret);

@@ -67,7 +67,7 @@ fn admitted(head: &DistributionSnapshot, signer: u8) -> DistributionSnapshot {
         statement_id: Ulid::from_parts(844, 1),
         member_id: Ulid::from_parts(843, 2),
         incarnation: 6,
-        intent: 1,
+        intent: head.config.members[1].intent,
         kind: StatementKind::Admit,
     }
     .sign(&secret(signer));

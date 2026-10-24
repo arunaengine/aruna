@@ -114,9 +114,9 @@ pub struct DistributionMember {
     pub strategy: DataStrategy,
     /// Overrides the bucket's range behaviour for this member.
     pub range_behaviour: Option<RangeBehaviour>,
-    /// The revision number of the create or join that added the member; its admission
-    /// answers this intent.
-    pub added_in: u64,
+    /// The digest of the create or join that added the member; its admission names exactly
+    /// this intent, whatever head it is published on.
+    pub intent: [u8; 32],
 }
 
 /// One key range `[lower, upper)`; `upper` `None` is the end of the key space.

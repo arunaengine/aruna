@@ -138,9 +138,9 @@ impl DistributionSnapshot {
             .config
             .members
             .iter()
-            .any(|member| member.added_in == 0 || member.added_in > self.number)
+            .any(|member| member.intent == [0; 32])
         {
-            return Err(malformed("a member names a revision after this one"));
+            return Err(malformed("a member names no intent"));
         }
         let mut ids = BTreeSet::new();
         for signed in &self.statements {
@@ -188,7 +188,7 @@ impl DistributionSnapshot {
             return Err(DistributionError::AdmissionOrigin(statement.member_id));
         }
         if matches!(statement.kind, StatementKind::Admit)
-            && (statement.intent != member.added_in
+            && (statement.intent != member.intent
                 || member
                     .incarnation
                     .is_some_and(|known| known != statement.incarnation))

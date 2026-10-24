@@ -21,6 +21,8 @@ pub enum TransferRole {
     Leave,
 }
 
+const INTENT_DOMAIN: &str = "aruna-distribution-intent-v1";
+
 /// Room the signature and envelope take next to an encoded snapshot.
 const SIGNED_OVERHEAD: usize = 128;
 
@@ -127,22 +129,36 @@ fn created(
     }
     validate_config(config)?;
     let fresh = config.members.iter().all(|member| {
-        member.state == MemberState::Created && member.incarnation.is_none() && member.added_in == 1
+        member.state == MemberState::Created
+            && member.incarnation.is_none()
+            && member.intent == [0; 32]
     });
     if !fresh {
         return Err(DistributionError::InvalidCreate);
+    }
+    let intent = create_intent(root, config);
+    let mut config = config.clone();
+    for member in &mut config.members {
+        member.intent = intent;
     }
     Ok(DistributionSnapshot {
         root: root.clone(),
         number: 1,
         previous: None,
         phase: SetPhase::Pending,
-        config: config.clone(),
+        config,
         lifecycle: Lifecycle::default(),
         statements: Vec::new(),
         tombstones: Vec::new(),
         admin_number: 1,
     })
+}
+
+/// The digest of a create request's content: the root and the configuration it creates.
+/// Two different creates never share it, so an admission cannot move between them.
+pub fn create_intent(root: &SetRoot, config: &DistributionConfig) -> [u8; 32] {
+    let bytes = postcard::to_allocvec(&(INTENT_DOMAIN, root, config)).unwrap_or_default();
+    *blake3::hash(&bytes).as_bytes()
 }
 
 fn accept(
@@ -192,7 +208,11 @@ fn embed(
     {
         return Err(DistributionError::Replayed(statement.statement_id));
     }
-    if statement.kind.automatic() && statement.intent < next.admin_number {
+    if statement
+        .kind
+        .basis()
+        .is_some_and(|basis| basis < next.admin_number)
+    {
         return Err(DistributionError::StaleRevision);
     }
     next.check_statement(realm_id, signed)?;

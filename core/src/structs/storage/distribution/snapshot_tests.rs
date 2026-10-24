@@ -3,7 +3,9 @@
 
 use super::*;
 use crate::structs::storage::distribution::presets::{replica_layout, shard_layout};
-use crate::structs::storage::distribution::{DistributionSettings, Statement};
+use crate::structs::storage::distribution::{
+    DistributionRequest, DistributionSettings, Statement, next_snapshot,
+};
 
 fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])
@@ -31,11 +33,8 @@ fn created() -> DistributionSnapshot {
         (member_id(2), secret(2).public()),
     ];
     let layout = replica_layout(root().set_id(), &nodes).unwrap();
-    DistributionSnapshot {
+    let create = DistributionRequest::Create {
         root: root(),
-        number: 1,
-        previous: None,
-        phase: SetPhase::Pending,
         config: DistributionConfig {
             bucket: "spire".to_string(),
             owner_group: root().owner_group,
@@ -44,11 +43,8 @@ fn created() -> DistributionSnapshot {
             ranges: layout.ranges,
             settings: DistributionSettings::default(),
         },
-        lifecycle: Lifecycle::default(),
-        statements: Vec::new(),
-        tombstones: Vec::new(),
-        admin_number: 1,
-    }
+    };
+    next_snapshot(realm(), None, &create).unwrap()
 }
 
 fn admission(member: u8, incarnation: u128, signer: u8) -> SignedStatement {
@@ -58,7 +54,7 @@ fn admission(member: u8, incarnation: u128, signer: u8) -> SignedStatement {
         statement_id: Ulid::from_bytes([member + 40; 16]),
         member_id: member_id(member),
         incarnation,
-        intent: 1,
+        intent: created().config.members[0].intent,
         kind: StatementKind::Admit,
     }
     .sign(&secret(signer))
@@ -114,7 +110,7 @@ fn statements_checked_inside() {
     forged.statement.incarnation = 7;
     assert!(admitted(forged, Some(7)).is_err());
     let mut later = admission(2, 5, 2);
-    later.statement.intent = 2;
+    later.statement.intent = [2; 32];
     let resigned = later.statement.clone().sign(&secret(2));
     assert!(admitted(resigned, Some(5)).is_err());
     let twice = signed(successor(&created(), |next| {

@@ -50,7 +50,7 @@ fn created() -> DistributionSnapshot {
     next_snapshot(realm(), None, &create).unwrap()
 }
 
-fn statement(member: u8, statement: u8, intent: u64, kind: StatementKind) -> Statement {
+fn statement(member: u8, statement: u8, intent: [u8; 32], kind: StatementKind) -> Statement {
     Statement {
         realm_id: realm(),
         set_id: root().set_id(),
@@ -63,7 +63,8 @@ fn statement(member: u8, statement: u8, intent: u64, kind: StatementKind) -> Sta
 }
 
 fn admit(member: u8, signer: u8) -> DistributionRequest {
-    let signed = statement(member, member + 40, 1, StatementKind::Admit).sign(&secret(signer));
+    let intent = created().config.members[0].intent;
+    let signed = statement(member, member + 40, intent, StatementKind::Admit).sign(&secret(signer));
     DistributionRequest::Statement(Box::new(signed))
 }
 
@@ -132,7 +133,7 @@ fn statements_are_checked() {
         next_snapshot(realm(), Some(&admitted), &admit(2, 2)),
         Err(DistributionError::Replayed(member_id(42)))
     );
-    let wrong_intent = statement(3, 43, 2, StatementKind::Admit).sign(&secret(3));
+    let wrong_intent = statement(3, 43, [2; 32], StatementKind::Admit).sign(&secret(3));
     let request = DistributionRequest::Statement(Box::new(wrong_intent));
     assert!(next_snapshot(realm(), Some(&admitted), &request).is_err());
 }
@@ -158,13 +159,14 @@ fn stale_automatic_dropped() {
     assert_eq!(head.admin_number, 2);
     let split = |intent| {
         let kind = StatementKind::Split {
+            basis: intent,
             range_id: head.config.ranges[0].range_id,
             epoch: 1,
             split_key: "m".to_string(),
             lower_id: Ulid::from_bytes([60; 16]),
             upper_id: Ulid::from_bytes([61; 16]),
         };
-        let signed = statement(1, 50, intent, kind).sign(&secret(1));
+        let signed = statement(1, 50, [3; 32], kind).sign(&secret(1));
         DistributionRequest::Statement(Box::new(signed))
     };
     assert_eq!(
@@ -179,4 +181,27 @@ fn stale_automatic_dropped() {
         next_snapshot(realm(), Some(&head), &DistributionRequest::DeleteCommit),
         Err(DistributionError::Unsupported("delete commit"))
     );
+}
+
+#[test]
+fn admission_binds_create() {
+    // Two creates of one set id are a fork; an admission for one never fits the other.
+    let mut other = config();
+    other.settings.public = true;
+    let fork = next_snapshot(
+        realm(),
+        None,
+        &DistributionRequest::Create {
+            root: root(),
+            config: other,
+        },
+    )
+    .unwrap();
+    assert_eq!(fork.number, created().number);
+    assert_ne!(
+        fork.config.members[0].intent,
+        created().config.members[0].intent
+    );
+    assert!(next_snapshot(realm(), Some(&fork), &admit(2, 2)).is_err());
+    assert!(next_snapshot(realm(), Some(&created()), &admit(2, 2)).is_ok());
 }

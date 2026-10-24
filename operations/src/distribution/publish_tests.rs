@@ -216,8 +216,9 @@ fn stale_automatic_dropped() {
         statement_id: Ulid::from_bytes([6; 16]),
         member_id: Ulid::from_bytes([1; 16]),
         incarnation: 1,
-        intent: 1,
+        intent: [1; 32],
         kind: StatementKind::Split {
+            basis: 1,
             range_id: head.config.ranges[0].range_id,
             epoch: 1,
             split_key: "m".to_string(),
