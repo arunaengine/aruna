@@ -1,21 +1,26 @@
 //! Resolves a distributed bucket's global version id on any realm node: candidate sets by hint,
-//! the key from a local version id index or one probe per set or range. Budgets are bounded;
-//! an exhausted budget or a silent range is "not resolvable now", never absence.
+//! the key from a local version id index or one probe per set or range. A bare content hash is
+//! resolved the same way through content indexes. Budgets are bounded; an exhausted budget or a
+//! silent range is "not resolvable now", never absence.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE};
-use aruna_core::structs::storage::distribution::inventory::{IndexEntry, Position, index_key};
+use aruna_core::keyspaces::{
+    CONTENT_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE,
+};
+use aruna_core::structs::storage::distribution::inventory::{
+    IndexEntry, Position, content_prefix, index_key,
+};
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionSnapshot, DistributionView, MemberState, MetadataCoverage, SetHint,
 };
 use tokio::time::Instant;
 use ulid::Ulid;
 
-use crate::distribution::version_key::VersionKeyOperation;
+use crate::distribution::version_key::{MemberAnswer, VersionKeyOperation};
 use crate::driver::{DriverContext, drive, drive_until};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -25,6 +30,8 @@ const MAX_SETS: usize = 4096;
 const MAX_CANDIDATES: usize = 4;
 /// At most this many members are asked for one id, over all candidate sets.
 pub const MAX_PROBES: usize = 16;
+/// At most this many versions of one content identity are read from one index or returned.
+pub const MAX_CONTENT_VERSIONS: usize = 16;
 /// How long resolving one id inside a longer request may take.
 pub const RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -113,12 +120,13 @@ pub fn probe_targets(snapshot: &DistributionSnapshot, local: NodeId) -> Vec<Node
     targets
 }
 
-/// The snapshots of the sets whose hint `version_id` carries, from this node's records.
-pub async fn candidate_sets(
+/// The snapshots of this node's records that `keep` accepts, at most `wanted` of them, and
+/// whether records were left unread because [`MAX_SETS`] were read.
+async fn scan_sets(
     context: &DriverContext,
-    version_id: Ulid,
-) -> Result<Vec<DistributionSnapshot>, String> {
-    let hint = SetHint::of_version(version_id);
+    keep: impl Fn(&DistributionSnapshot) -> bool,
+    wanted: usize,
+) -> Result<(Vec<DistributionSnapshot>, bool), String> {
     let mut found = Vec::new();
     let mut start = None;
     let mut seen = 0usize;
@@ -144,15 +152,26 @@ pub async fn candidate_sets(
                 continue;
             };
             let snapshot = view.snapshot();
-            if SetHint::of_set(snapshot.set_id()) == hint && found.len() < MAX_CANDIDATES {
+            if keep(snapshot) && found.len() < wanted {
                 found.push(snapshot.clone());
             }
         }
         match next {
             Some(next) if seen < MAX_SETS => start = Some(next),
-            _ => return Ok(found),
+            Some(_) => return Ok((found, true)),
+            None => return Ok((found, false)),
         }
     }
+}
+
+/// The snapshots of the sets whose hint `version_id` carries, from this node's records.
+pub async fn candidate_sets(
+    context: &DriverContext,
+    version_id: Ulid,
+) -> Result<Vec<DistributionSnapshot>, String> {
+    let hint = SetHint::of_version(version_id);
+    let keep = |snapshot: &DistributionSnapshot| SetHint::of_set(snapshot.set_id()) == hint;
+    Ok(scan_sets(context, keep, MAX_CANDIDATES).await?.0)
 }
 
 /// The key this node's version id index holds for `version_id` in `set_id`.
@@ -227,9 +246,9 @@ async fn ask_set(
         *probes += 1;
         let lookup = VersionKeyOperation::new(node_id, *net.realm_id(), set_id, version_id);
         match drive_until(lookup, context, deadline).await {
-            Ok(Some(key)) => return SetAnswer::Found { key, local: false },
-            Ok(None) => {}
-            Err(_) => complete = false,
+            Ok(MemberAnswer::Key(Some(key))) => return SetAnswer::Found { key, local: false },
+            Ok(MemberAnswer::Key(None)) => {}
+            Ok(MemberAnswer::Versions { .. }) | Err(_) => complete = false,
         }
     }
     match complete {
@@ -285,6 +304,149 @@ pub async fn version_holders(context: &DriverContext, version_id: Ulid) -> Optio
         GlobalResolution::Found(found) => Some(found),
         _ => None,
     }
+}
+
+/// The versions of one content identity this node's content index holds in `set_id`, at most
+/// `limit`, and whether more exist.
+pub async fn content_versions(
+    context: &DriverContext,
+    set_id: Ulid,
+    identity: &[u8; 32],
+    limit: usize,
+) -> Result<(Vec<(Ulid, String)>, bool), String> {
+    let iter = StorageEffect::Iter {
+        key_space: CONTENT_INDEX_KEYSPACE.to_string(),
+        prefix: Some(content_prefix(set_id, identity).into()),
+        start: None,
+        limit: limit.saturating_add(1),
+        txn_id: None,
+    };
+    let values = match context.storage_handle.send_storage_effect(iter).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+        other => return Err(format!("unexpected storage answer {other:?}")),
+    };
+    let more = values.len() > limit;
+    let mut versions = Vec::new();
+    for (row, _) in values.into_iter().take(limit) {
+        let Some(id) = row.len().checked_sub(16).and_then(|at| row.get(at..)) else {
+            continue;
+        };
+        let Ok(id) = <[u8; 16]>::try_from(id) else {
+            continue;
+        };
+        let version_id = Ulid::from_bytes(id);
+        if let Some(key) = indexed_key(context, set_id, version_id).await? {
+            versions.push((version_id, key));
+        }
+    }
+    Ok((versions, more))
+}
+
+/// The versions of a content identity across distributed buckets.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ContentResolution {
+    pub versions: Vec<ResolvedVersion>,
+    /// A set or range was not asked or did not answer, or a page was cut: more may exist.
+    pub incomplete: bool,
+}
+
+impl ContentResolution {
+    fn add(&mut self, snapshot: &DistributionSnapshot, found: Vec<(Ulid, String)>, local: bool) {
+        for (version_id, key) in found {
+            if self.versions.len() >= MAX_CONTENT_VERSIONS {
+                self.incomplete = true;
+                return;
+            }
+            if self
+                .versions
+                .iter()
+                .any(|known| known.version_id == version_id)
+            {
+                continue;
+            }
+            self.versions.push(ResolvedVersion {
+                set_id: snapshot.set_id(),
+                bucket: snapshot.config.bucket.clone(),
+                holders: range_holders(snapshot, &key),
+                key,
+                version_id,
+                local,
+            });
+        }
+    }
+}
+
+/// Whether this node's member of `snapshot` holds the records of every range.
+fn holds_every_range(snapshot: &DistributionSnapshot, local: NodeId) -> bool {
+    let member = snapshot
+        .config
+        .members
+        .iter()
+        .find(|member| member.node_id == local);
+    member.is_some_and(|member| {
+        snapshot.held_ranges(member.member_id).len() == snapshot.config.ranges.len()
+    })
+}
+
+/// Resolves a content identity within `deadline`: this node's content index for its own
+/// members, otherwise one `all` coverage member per set or the coordinator of every range.
+/// Distributed buckets do not announce their objects in the DHT; this is their lookup.
+pub async fn resolve_content(
+    context: &DriverContext,
+    identity: [u8; 32],
+    deadline: Instant,
+) -> ContentResolution {
+    let mut resolution = ContentResolution::default();
+    let (sets, truncated) = match scan_sets(context, |_| true, MAX_SETS).await {
+        Ok(found) => found,
+        Err(_) => {
+            resolution.incomplete = true;
+            return resolution;
+        }
+    };
+    resolution.incomplete = truncated;
+    let Some(net) = context.net_handle.as_ref() else {
+        resolution.incomplete |= !sets.is_empty();
+        return resolution;
+    };
+    let local = net.node_id();
+    let mut probes = 0usize;
+    for snapshot in &sets {
+        if resolution.versions.len() >= MAX_CONTENT_VERSIONS {
+            resolution.incomplete = true;
+            break;
+        }
+        let set_id = snapshot.set_id();
+        if bound_here(context, snapshot).await {
+            match content_versions(context, set_id, &identity, MAX_CONTENT_VERSIONS).await {
+                Ok((found, more)) => {
+                    resolution.incomplete |= more;
+                    resolution.add(snapshot, found, true);
+                }
+                Err(_) => resolution.incomplete = true,
+            }
+            if holds_every_range(snapshot, local) {
+                continue;
+            }
+        }
+        for node_id in probe_targets(snapshot, local) {
+            if probes >= MAX_PROBES || Instant::now() >= deadline {
+                resolution.incomplete = true;
+                return resolution;
+            }
+            probes += 1;
+            let lookup = VersionKeyOperation::content(node_id, *net.realm_id(), set_id, identity);
+            match drive_until(lookup, context, deadline).await {
+                Ok(MemberAnswer::Versions { versions, more }) => {
+                    resolution.incomplete |= more;
+                    resolution.add(snapshot, versions, false);
+                }
+                Ok(MemberAnswer::Key(_)) | Err(_) => resolution.incomplete = true,
+            }
+        }
+    }
+    resolution
 }
 
 #[cfg(test)]

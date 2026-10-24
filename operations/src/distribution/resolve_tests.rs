@@ -54,3 +54,25 @@ fn probes_one_full_member() {
         vec![secret(2).public()]
     );
 }
+
+#[tokio::test]
+async fn content_page_is_bounded() {
+    use super::content_versions;
+    use crate::distribution::test_store::{apply, context, install, open, range, write};
+    use ulid::Ulid;
+
+    let (_dir, handle) = open();
+    let set = Ulid::from_bytes([9; 16]);
+    install(&handle, set, &[range(1, "", None)]).await;
+    assert!(apply(&handle, write(set, "a", 3, 10)).await.unwrap());
+    let context = context(&handle);
+    let found = content_versions(&context, set, &[3; 32], 4).await.unwrap();
+    assert_eq!(
+        found,
+        (vec![(Ulid::from_bytes([3; 16]), "a".to_string())], false)
+    );
+    let cut = content_versions(&context, set, &[3; 32], 0).await.unwrap();
+    assert_eq!(cut, (Vec::new(), true), "a cut page says more exist");
+    let other = content_versions(&context, set, &[4; 32], 4).await.unwrap();
+    assert_eq!(other, (Vec::new(), false));
+}

@@ -523,6 +523,18 @@ pub enum VersionReplicationMessage {
     },
     /// The key the member's index holds, `None` when it holds no such version.
     VersionKeyResponse(Option<String>),
+    /// Asks a member for the versions of one content identity in a set by its content index.
+    /// Infrastructure peers only, like `VersionKeyRequest`.
+    ContentRequest {
+        realm_id: RealmId,
+        set_id: Ulid,
+        identity: [u8; 32],
+    },
+    /// Version ids and keys of the identity the member holds; `more` when the page was cut.
+    ContentResponse {
+        versions: Vec<(Ulid, String)>,
+        more: bool,
+    },
 }
 
 /// Read-only question a node asks a peer: do you hold this version, and on

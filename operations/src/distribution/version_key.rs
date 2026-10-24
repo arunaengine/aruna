@@ -1,5 +1,5 @@
 //! Asks one member of a distributed bucket which key a version id names, from its version id
-//! index. Read-only; the member answers infrastructure peers only.
+//! index, or which versions carry one content identity. Read-only; infrastructure peers only.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -35,14 +35,26 @@ enum KeyState {
     Error,
 }
 
-/// One lookup at `node_id`; the output is the key, or `None` when its index has no version.
+/// What a member answered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemberAnswer {
+    /// The key of the version, or `None` when its index has no such version.
+    Key(Option<String>),
+    /// Version ids and keys of a content identity; `more` when the member cut the page.
+    Versions {
+        versions: Vec<(Ulid, String)>,
+        more: bool,
+    },
+}
+
+/// One lookup at `node_id`.
 #[derive(Debug, PartialEq)]
 pub struct VersionKeyOperation {
     node_id: NodeId,
     message: VersionReplicationMessage,
     stream_id: Option<Ulid>,
     state: KeyState,
-    output: Option<Result<Option<String>, VersionKeyError>>,
+    output: Option<Result<MemberAnswer, VersionKeyError>>,
 }
 
 impl VersionKeyOperation {
@@ -60,6 +72,18 @@ impl VersionKeyOperation {
         }
     }
 
+    /// Asks `node_id` for the versions of `identity` in `set_id`.
+    pub fn content(node_id: NodeId, realm_id: RealmId, set_id: Ulid, identity: [u8; 32]) -> Self {
+        Self {
+            message: VersionReplicationMessage::ContentRequest {
+                realm_id,
+                set_id,
+                identity,
+            },
+            ..Self::new(node_id, realm_id, set_id, Ulid::nil())
+        }
+    }
+
     fn fail(&mut self, error: VersionKeyError) -> Effects {
         self.output = Some(Err(error));
         self.state = KeyState::Error;
@@ -71,7 +95,7 @@ impl VersionKeyOperation {
 }
 
 impl Operation for VersionKeyOperation {
-    type Output = Option<String>;
+    type Output = MemberAnswer;
     type Error = VersionKeyError;
 
     fn start(&mut self) -> Effects {
@@ -103,14 +127,23 @@ impl Operation for VersionKeyOperation {
             (KeyState::Read, Event::Blob(BlobEvent::MessageReceived { stream_id, payload }))
                 if Some(stream_id) == self.stream_id =>
             {
-                match VersionReplicationMessage::from_bytes(&payload) {
-                    Ok(VersionReplicationMessage::VersionKeyResponse(key)) => {
-                        self.output = Some(Ok(key));
-                        self.state = KeyState::Close;
-                        smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
-                    }
-                    _ => self.fail(VersionKeyError::Unexpected),
-                }
+                let answer = match (
+                    &self.message,
+                    VersionReplicationMessage::from_bytes(&payload),
+                ) {
+                    (
+                        VersionReplicationMessage::VersionKeyRequest { .. },
+                        Ok(VersionReplicationMessage::VersionKeyResponse(key)),
+                    ) => MemberAnswer::Key(key),
+                    (
+                        VersionReplicationMessage::ContentRequest { .. },
+                        Ok(VersionReplicationMessage::ContentResponse { versions, more }),
+                    ) => MemberAnswer::Versions { versions, more },
+                    _ => return self.fail(VersionKeyError::Unexpected),
+                };
+                self.output = Some(Ok(answer));
+                self.state = KeyState::Close;
+                smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
             }
             (KeyState::Close, Event::Blob(BlobEvent::ConnectionClosed { stream_id }))
                 if Some(stream_id) == self.stream_id =>
@@ -177,7 +210,10 @@ mod tests {
             .unwrap();
         let operation = answered(payload);
         assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(Some("a/b".to_string())));
+        assert_eq!(
+            operation.finalize(),
+            Ok(MemberAnswer::Key(Some("a/b".to_string())))
+        );
     }
 
     #[test]
@@ -188,6 +224,44 @@ mod tests {
         assert_eq!(
             answered(payload).finalize(),
             Err(VersionKeyError::Unexpected)
+        );
+    }
+
+    #[test]
+    fn content_needs_content_answer() {
+        let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let realm = RealmId::from_bytes([3; 32]);
+        let stream_id = Ulid::from_bytes([5; 16]);
+        let ask = |payload: Vec<u8>| {
+            let mut operation =
+                VersionKeyOperation::content(node, realm, Ulid::from_bytes([2; 16]), [7; 32]);
+            operation.start();
+            operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
+            operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+            operation.step(Event::Blob(BlobEvent::MessageReceived {
+                stream_id,
+                payload,
+            }));
+            operation.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+            operation.finalize()
+        };
+        let versions = vec![(Ulid::from_bytes([4; 16]), "a".to_string())];
+        let answer = VersionReplicationMessage::ContentResponse {
+            versions: versions.clone(),
+            more: false,
+        };
+        assert_eq!(
+            ask(answer.to_bytes().unwrap()),
+            Ok(MemberAnswer::Versions {
+                versions,
+                more: false
+            })
+        );
+        let key = VersionReplicationMessage::VersionKeyResponse(None);
+        assert_eq!(
+            ask(key.to_bytes().unwrap()),
+            Err(VersionKeyError::Unexpected),
+            "a key answer never stands for a content answer"
         );
     }
 

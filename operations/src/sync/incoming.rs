@@ -327,6 +327,35 @@ impl OperationsInboundHandler {
         close_failed_bao(blob_handle, stream_id).await;
     }
 
+    /// Answers which versions this member's content index holds for one identity.
+    async fn answer_content(
+        &self,
+        blob_handle: &aruna_blob::blob::BlobHandle,
+        stream_id: Ulid,
+        set_id: Ulid,
+        identity: [u8; 32],
+    ) {
+        use crate::distribution::resolve::{MAX_CONTENT_VERSIONS, content_versions};
+        let Ok((versions, more)) =
+            content_versions(&self.context, set_id, &identity, MAX_CONTENT_VERSIONS).await
+        else {
+            close_failed_bao(blob_handle, stream_id).await;
+            return;
+        };
+        let answer = VersionReplicationMessage::ContentResponse { versions, more };
+        let Ok(payload) = answer.to_bytes() else {
+            close_failed_bao(blob_handle, stream_id).await;
+            return;
+        };
+        let sent = blob_handle
+            .send_blob_effect(BlobEffect::SendMessage { stream_id, payload })
+            .await;
+        if let Event::Blob(BlobEvent::Error(error)) = sent {
+            debug!(error = ?error, "Failed to answer a content lookup");
+        }
+        close_failed_bao(blob_handle, stream_id).await;
+    }
+
     /// The bao plane input boundary: admission, bounded frame reads, and
     /// family-specific refusals all happen here or in the family handlers.
     async fn handle_bao_stream(&self, stream: BiStream, node_id: NodeId) {
@@ -452,6 +481,19 @@ impl OperationsInboundHandler {
                             return;
                         }
                         self.answer_version_key(&blob_handle, stream_id, set_id, version_id)
+                            .await;
+                    }
+                    Ok(VersionReplicationMessage::ContentRequest {
+                        realm_id: asked,
+                        set_id,
+                        identity,
+                    }) => {
+                        if admission != BaoAdmission::Infra || asked != realm_id {
+                            warn!(peer = %node_id, "Refusing a content lookup");
+                            close_failed_bao(&blob_handle, stream_id).await;
+                            return;
+                        }
+                        self.answer_content(&blob_handle, stream_id, set_id, identity)
                             .await;
                     }
                     _ => {
