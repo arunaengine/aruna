@@ -39,7 +39,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 
 use crate::tests::reducer::*;
-mod distribution;
 mod group;
 mod placement;
 mod realm_config;
