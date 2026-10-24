@@ -56,6 +56,10 @@ pub const DISTRIBUTION_KEYSPACE: &str = "distribution_records";
 pub const DISTRIBUTION_ACCEPT_KEYSPACE: &str = "distribution_accepted";
 /// The installed head revision of each set by publisher then set id, for removal cutoffs.
 pub const DISTRIBUTION_PUBLISHER_KEYSPACE: &str = "distribution_publishers";
+/// Snapshots whose publisher the realm config does not know yet, by publisher and set id.
+pub const DISTRIBUTION_PARKED_KEYSPACE: &str = "distribution_parked";
+/// The revision number of each parked snapshot, so the bound is counted without the bodies.
+pub const PARKED_INDEX_KEYSPACE: &str = "distribution_parked_index";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
@@ -476,6 +480,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DISTRIBUTION_KEYSPACE,
     DISTRIBUTION_ACCEPT_KEYSPACE,
     DISTRIBUTION_PUBLISHER_KEYSPACE,
+    DISTRIBUTION_PARKED_KEYSPACE,
+    PARKED_INDEX_KEYSPACE,
     DOCUMENT_CONFLICT_KEYSPACE,
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,

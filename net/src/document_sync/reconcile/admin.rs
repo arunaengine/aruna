@@ -27,8 +27,11 @@ pub(crate) async fn apply_admin_operation(
         (DocumentTarget::RealmAuthorization { .. }, AdminDocumentTarget::Realm { .. }) => {
             apply_realm_authorization(storage, document_target, event).await
         }
-        (DocumentTarget::RealmConfig { .. }, AdminDocumentTarget::RealmConfig { .. }) => {
-            apply_realm_config(storage, document_target, event).await
+        (DocumentTarget::RealmConfig { realm_id }, AdminDocumentTarget::RealmConfig { .. }) => {
+            let realm_id = *realm_id;
+            apply_realm_config(storage, document_target, event).await?;
+            // A membership change may give parked snapshots their publisher.
+            retry_parked(storage, realm_id).await
         }
         (DocumentTarget::RealmConfig { .. }, AdminDocumentTarget::Distribution { .. }) => {
             apply_distribution_operation(storage, document_target, event).await

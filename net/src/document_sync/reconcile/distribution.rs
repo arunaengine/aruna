@@ -49,10 +49,8 @@ pub(in crate::document_sync) async fn validate_distribution_authority(
         match publisher_authority(storage, *realm_id, snapshot).await? {
             Authority::Current => AdminEventValidation::Accepted,
             Authority::Ended(reason) => AdminEventValidation::Rejected(reason.to_string()),
-            Authority::Unknown => AdminEventValidation::Deferred {
-                dependency: Some(DocumentSyncDependency::RealmConfig(*realm_id)),
-                reason: "distribution publisher is not yet a known realm node".to_string(),
-            },
+            // Parked by the apply step, so the topic cursor moves on past a membership gap.
+            Authority::Unknown => AdminEventValidation::Accepted,
         },
     )
 }
@@ -139,11 +137,32 @@ pub(in crate::document_sync) async fn apply_distribution_operation(
             "distribution snapshot realm does not match its document".to_string(),
         ));
     }
-    let set_id = *set_id;
+    let (set_id, realm_id) = (*set_id, *realm_id);
+    let AdminDocumentOperation::DistributionPublished { snapshot } = &event.op else {
+        return Err(NetError::Bootstrap(
+            "distribution records change only through published snapshots".to_string(),
+        ));
+    };
+    match publisher_authority(storage, realm_id, snapshot).await? {
+        Authority::Current => install_snapshot(storage, &event, set_id).await,
+        Authority::Unknown => park_snapshot(storage, &event, snapshot).await,
+        Authority::Ended(reason) => {
+            warn!(%set_id, %reason, "Dropping a distribution snapshot without authority");
+            Ok(())
+        }
+    }
+}
+
+/// Installs a snapshot whose publisher may publish it, in one storage transaction.
+pub(in crate::document_sync) async fn install_snapshot(
+    storage: &StorageHandle,
+    event: &AdminDocumentEvent,
+    set_id: Ulid,
+) -> Result<()> {
     for _ in 0..APPLY_CONFLICT_ATTEMPTS {
         tokio::task::yield_now().await;
         let txn_id = start_storage_transaction(storage).await?;
-        let writes = match distribution_writes(storage, txn_id, &event, set_id).await {
+        let writes = match distribution_writes(storage, txn_id, event, set_id).await {
             Ok(Some(writes)) => writes,
             Ok(None) => return abort_txn(storage, txn_id).await,
             Err(error) => return Err(abort_error(storage, txn_id, error).await),

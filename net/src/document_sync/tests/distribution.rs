@@ -4,8 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, PARKED_INDEX_KEYSPACE};
 use aruna_core::structs::storage::distribution::presets::replica_layout;
+use aruna_core::structs::storage::distribution::publisher_key;
 use aruna_core::structs::storage::distribution::{
     DistributionConfig, DistributionRequest, DistributionSettings, DistributionSnapshot,
     DistributionView, MemberState, PublisherCutoff, SetRoot, SignedSnapshot, Statement,
@@ -146,6 +147,15 @@ async fn realm_nodes(storage: &StorageHandle) {
     .unwrap();
 }
 
+/// The revision number parked for the test set's publisher, if any.
+async fn parked(storage: &StorageHandle) -> Option<u64> {
+    let key = publisher_key(&node(PUBLISHER), root().set_id());
+    storage_read_from(storage, PARKED_INDEX_KEYSPACE.to_string(), key.into())
+        .await
+        .unwrap()
+        .map(|value| u64::from_be_bytes(<[u8; 8]>::try_from(value.as_ref()).unwrap()))
+}
+
 fn rejected(outcome: AdminEventValidation) -> bool {
     matches!(outcome, AdminEventValidation::Rejected(_))
 }
@@ -184,10 +194,12 @@ async fn admits_publisher_snapshots() {
 }
 
 #[tokio::test]
-async fn missing_config_defers() {
+async fn missing_config_parks() {
     let (_dir, storage) = test_storage();
     let outcome = receive(&storage, published(PUBLISHER, created(), PUBLISHER)).await;
-    assert!(matches!(outcome, AdminEventValidation::Deferred { .. }));
+    assert_eq!(outcome, AdminEventValidation::Accepted);
+    assert_eq!(stored(&storage).await, None);
+    assert_eq!(parked(&storage).await, Some(1));
 }
 
 #[tokio::test]
@@ -227,7 +239,8 @@ async fn membership_gaps_defer() {
     .await
     .unwrap();
     let early = receive(&storage, published(PUBLISHER, created(), PUBLISHER)).await;
-    assert!(matches!(early, AdminEventValidation::Deferred { .. }));
+    assert_eq!(early, AdminEventValidation::Accepted);
+    assert_eq!(stored(&storage).await, None);
 
     // After the publisher's removal, what it signed as a member stays relayable.
     let target = AdminDocumentTarget::RealmConfig { realm_id: realm() };
@@ -297,4 +310,140 @@ async fn federated_admin_published() {
     let mut forged = published(OTHER, created(), PUBLISHER);
     forged.actor.user_id = UserId::new(Ulid::from_parts(845, 1), RealmId::from_bytes([85; 32]));
     assert!(rejected(receive(&storage, forged).await));
+}
+
+#[tokio::test]
+async fn revocation_drops_parked() {
+    // A removal that lands while a snapshot waits ends the publisher's authority at its cutoff.
+    let (_dir, storage) = test_storage();
+    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    config.ensure_node(node(OTHER), RealmNodeKind::Management);
+    batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            DocumentTarget::RealmConfig { realm_id: realm() },
+            config.to_bytes(&actor(OTHER)).unwrap().into(),
+        )],
+    )
+    .await
+    .unwrap();
+    let later = admitted(&created(), MEMBER);
+    let outcome = receive(&storage, published(PUBLISHER, later, PUBLISHER)).await;
+    assert_eq!(outcome, AdminEventValidation::Accepted);
+    assert_eq!(parked(&storage).await, Some(2));
+
+    let removal = test_admin_event(
+        Ulid::from_parts(846, 1),
+        AdminDocumentTarget::RealmConfig { realm_id: realm() },
+        &actor(OTHER),
+        1,
+        AdminDocumentOperation::ConfigNodeRemoved {
+            node_id: node(PUBLISHER),
+            cutoffs: vec![PublisherCutoff {
+                set_id: root().set_id(),
+                revision: created().revision(),
+            }],
+        },
+    );
+    apply_admin_operation(
+        &storage,
+        DocumentTarget::RealmConfig { realm_id: realm() },
+        removal,
+    )
+    .await
+    .unwrap();
+    assert_eq!(parked(&storage).await, None);
+    assert_eq!(stored(&storage).await, None);
+    let first = receive(&storage, published(PUBLISHER, created(), PUBLISHER)).await;
+    assert_eq!(first, AdminEventValidation::Accepted);
+    assert_eq!(stored(&storage).await.unwrap().head.snapshot, created());
+}
+
+#[tokio::test]
+async fn parked_cursor_recovers() {
+    // Through the real batch and cursor: the cursor passes a snapshot whose publisher is not
+    // known yet, and the later membership update installs it.
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    const LOCAL: u8 = 44;
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(LOCAL).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm(),
+    )
+    .expect("document sync service opens");
+    let target = DocumentTarget::RealmConfig { realm_id: realm() };
+    let topic_id = target.sync_topic_id(realm(), &PlacementRef::NIL);
+    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    config.ensure_node(node(LOCAL), RealmNodeKind::Management);
+    batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            target.clone(),
+            config.to_bytes(&actor(LOCAL)).unwrap().into(),
+        )],
+    )
+    .await
+    .unwrap();
+
+    let snapshot = published(PUBLISHER, created(), PUBLISHER);
+    let signature = secret(PUBLISHER).sign(&snapshot.signing_bytes(&PlacementRef::NIL).unwrap());
+    let publish = |event: AdminDocumentEvent, origin_signature| {
+        service.publish_documents(
+            vec![DocumentSyncPublish::AdminOperation {
+                target: target.clone(),
+                event: Box::new(event),
+                placement: PlacementRef::NIL,
+                allow_genesis: true,
+                origin_signature,
+            }],
+            Vec::new(),
+        )
+    };
+    assert!(matches!(
+        publish(snapshot, Some(signature)).await,
+        DocumentNetEvent::DocumentsPublished { .. }
+    ));
+    reset_test_cursor(&service, topic_id).await;
+    service
+        .reconcile_document_topics([topic_id])
+        .await
+        .expect("reconcile runs");
+    let cursor = read_test_cursor(&storage, topic_id).await.expect("cursor");
+    let clock = service.node().storage().actor_clock(&topic_id).unwrap();
+    assert!(
+        cursor.dominates(&clock),
+        "the cursor moves past the parked snapshot"
+    );
+    assert_eq!(parked(&storage).await, Some(1));
+    assert_eq!(stored(&storage).await, None);
+
+    let ensure = test_admin_event(
+        Ulid::from_parts(847, 1),
+        AdminDocumentTarget::RealmConfig { realm_id: realm() },
+        &actor(LOCAL),
+        1,
+        AdminDocumentOperation::ConfigNodeEnsured {
+            node_id: node(PUBLISHER),
+            kind: RealmNodeKind::Server,
+        },
+    );
+    assert!(matches!(
+        publish(ensure, None).await,
+        DocumentNetEvent::DocumentsPublished { .. }
+    ));
+    // A local publication counts as applied here, so replay the topic as a receiver would.
+    reset_test_cursor(&service, topic_id).await;
+    service
+        .reconcile_document_topics([topic_id])
+        .await
+        .expect("reconcile runs");
+    assert_eq!(parked(&storage).await, None);
+    assert_eq!(stored(&storage).await.unwrap().head.snapshot, created());
+    service.shutdown().await;
 }
