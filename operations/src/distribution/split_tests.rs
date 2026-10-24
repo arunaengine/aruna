@@ -4,12 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::distribution::inventory::InventoryUpdate;
 use crate::distribution::rebuild::{RebuildConfig, RebuildOperation, RebuildOutcome};
 use crate::distribution::test_store::{
     account, apply, begin, commit, context, counters, exact, get, install, open, purge, range,
     stage, write,
 };
 use crate::driver::drive;
+use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_core::structs::storage::distribution::accounting::RangeCounters;
 use aruna_storage::storage::StorageHandle;
 
@@ -172,4 +174,21 @@ async fn refuses_bad_splits() {
         matches!(result, Err(SplitError::Refused(..))),
         "a rebuild is running"
     );
+}
+
+/// Both children keep the parent's epoch maximum through the handoff.
+#[tokio::test]
+async fn children_keep_epoch() {
+    let (_dir, handle) = open();
+    install(&handle, set(), &[range(1, "", None)]).await;
+    let mut change = write(set(), "a", 1, 1).change().clone();
+    change.added[0].epoch = OriginalEpoch(7);
+    assert!(apply(&handle, InventoryUpdate::new(change)).await.unwrap());
+    assert!(apply(&handle, purge(set(), "a", &[1])).await.unwrap());
+    drive(split_at("m"), &context(&handle)).await.unwrap();
+    assert_eq!(rebuild(&handle, id(2)).await, RebuildOutcome::Waiting);
+    assert_eq!(rebuild(&handle, id(3)).await, RebuildOutcome::Done);
+    for child in [id(2), id(3)] {
+        assert_eq!(charged(&handle, child).await.max_epoch, OriginalEpoch(7));
+    }
 }

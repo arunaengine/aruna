@@ -10,6 +10,7 @@ use crate::distribution::test_store::{
     write,
 };
 use crate::driver::drive;
+use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_storage::storage::StorageHandle;
 
 fn set() -> Ulid {
@@ -150,4 +151,18 @@ async fn walks_empty_and_uploads() {
     }
     assert_eq!(run(&handle, 2, 100).await, RebuildOutcome::Done);
     assert_eq!(generation(&handle, 3).await.open_uploads, 3);
+}
+
+/// A rebuild keeps the epoch maximum of versions that are gone, so the durable maximum never
+/// falls below an epoch the range has seen.
+#[tokio::test]
+async fn keeps_epoch_maximum() {
+    let (_dir, handle) = open();
+    install(&handle, set(), &[range(1, "", None)]).await;
+    let mut change = write(set(), "a", 1, 1).change().clone();
+    change.added[0].epoch = OriginalEpoch(7);
+    assert!(apply(&handle, InventoryUpdate::new(change)).await.unwrap());
+    assert!(apply(&handle, purge(set(), "a", &[1])).await.unwrap());
+    assert_eq!(run(&handle, 2, 100).await, RebuildOutcome::Done);
+    assert_eq!(generation(&handle, 2).await.max_epoch, OriginalEpoch(7));
 }

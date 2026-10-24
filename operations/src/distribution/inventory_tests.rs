@@ -242,6 +242,7 @@ async fn routes_split_states() {
     child.charge = Charge::Child {
         parent: id(5),
         sibling: id(6),
+        frozen: 1,
     };
     write_account(&handle, 1, &child).await;
     assert!(apply(&handle, put("a", 1, 1, 3)).await.unwrap());

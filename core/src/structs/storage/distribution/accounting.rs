@@ -179,9 +179,13 @@ impl Rebuild {
 pub enum Charge {
     /// The range's own generation row is its total.
     Active(u64),
-    /// A split child before the handoff: its parent's frozen row plus both pending rows are
-    /// charged, and the child's own deltas go to its pending row.
-    Child { parent: Ulid, sibling: Ulid },
+    /// A split child before the handoff: its parent's `frozen` generation row plus both
+    /// pending rows are charged, and the child's own deltas go to its pending row.
+    Child {
+        parent: Ulid,
+        sibling: Ulid,
+        frozen: u64,
+    },
     /// A split parent: its frozen `generation` row stays charged until the handoff.
     Retired {
         generation: u64,

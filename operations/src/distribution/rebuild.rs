@@ -90,6 +90,7 @@ enum State {
     ActivateRead,
     ActivateWrite,
     ActivateDelete,
+    ActivateCount,
     Commit,
     Abort,
     Done,
@@ -100,6 +101,7 @@ enum State {
 struct Plan {
     writes: Vec<(String, Key, Value)>,
     deletes: Vec<(String, Key)>,
+    counters: Vec<(Key, RangeCounters)>,
     account: Option<RangeAccount>,
     /// The outcome the commit finishes the run with; `None` continues the walk.
     finish: Option<RebuildOutcome>,
@@ -323,13 +325,25 @@ impl RebuildOperation {
 
     fn delete_plan(&mut self, txn_id: TxnId) -> Effects {
         if self.plan.deletes.is_empty() {
-            self.state = State::Commit;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+            return self.count_plan(txn_id);
         }
         self.state = State::ActivateDelete;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {
             deletes: std::mem::take(&mut self.plan.deletes),
             txn_id: Some(txn_id),
+        })]
+    }
+
+    fn count_plan(&mut self, txn_id: TxnId) -> Effects {
+        if self.plan.counters.is_empty() {
+            self.state = State::Commit;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
+        self.state = State::ActivateCount;
+        smallvec![Effect::Storage(StorageEffect::AddCounters {
+            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+            deltas: std::mem::take(&mut self.plan.counters),
+            txn_id,
         })]
     }
 
@@ -425,6 +439,7 @@ impl RebuildOperation {
                         self.plan = Plan {
                             writes: activation.writes,
                             deletes: activation.deletes,
+                            counters: activation.counters,
                             finish: Some(RebuildOutcome::Done),
                             ..Plan::default()
                         };
@@ -439,6 +454,9 @@ impl RebuildOperation {
             ) => Ok(self.delete_plan(self.txn_id.unwrap_or_default())),
             (State::ActivateDelete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 Ok(self.delete_plan(self.txn_id.unwrap_or_default()))
+            }
+            (State::ActivateCount, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                Ok(self.count_plan(self.txn_id.unwrap_or_default()))
             }
             (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
                 self.txn_id = None;

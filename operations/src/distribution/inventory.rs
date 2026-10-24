@@ -135,6 +135,10 @@ impl InventoryUpdate {
         self.phase == Phase::Done
     }
 
+    pub fn change(&self) -> &InventoryChange {
+        &self.change
+    }
+
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
         self.phase = Phase::Locate;
         let set_id = self.change.set_id;

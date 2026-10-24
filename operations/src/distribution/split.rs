@@ -137,6 +137,7 @@ impl SplitOperation {
             charge: Charge::Child {
                 parent: parent_id,
                 sibling,
+                frozen: generation,
             },
             rebuild: Some(Rebuild::new(1)),
         };
