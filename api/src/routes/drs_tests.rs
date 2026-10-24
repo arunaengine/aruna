@@ -548,6 +548,7 @@ async fn routed_uses_origin() {
             documents_held: None,
             load_permille: None,
             heartbeat_at_ms: 1_700_000_000_000,
+            download_slots: None,
         },
         updated_at_ms: 1_700_000_000_500,
         epoch: AdvertisementEpoch {

@@ -73,6 +73,8 @@ impl NetHandle {
                 inbound_admission: peers.inbound_admission,
                 watch_interest: handle_state.watch_interest,
                 heartbeats: Arc::default(),
+                download_gauge: Arc::default(),
+                avoided_holders: Default::default(),
                 notification_watch_metrics: NotificationWatchMetrics::default(),
                 notification_wakes: handle_state.notification_wakes,
                 dashboard_epoch: handle_state.dashboard_epoch,

@@ -12,6 +12,7 @@ pub mod compute;
 pub mod crate_merge;
 pub mod credential_encryption;
 pub mod document;
+pub mod download_slots;
 pub mod effects;
 pub mod egress;
 pub mod errors;

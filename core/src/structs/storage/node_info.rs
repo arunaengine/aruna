@@ -194,6 +194,8 @@ pub struct NodeUtilization {
     pub documents_held: Option<u64>,
     pub load_permille: Option<u32>,
     pub heartbeat_at_ms: u64,
+    /// DRS download slot use; live telemetry like the load.
+    pub download_slots: Option<crate::download_slots::DownloadSlots>,
 }
 
 #[cfg(test)]
@@ -233,6 +235,7 @@ mod tests {
                 documents_held: Some(7),
                 load_permille: Some(250),
                 heartbeat_at_ms: 1_700_000_000_000,
+                download_slots: None,
             },
             updated_at_ms: 1_700_000_000_500,
             epoch,

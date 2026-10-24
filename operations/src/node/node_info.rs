@@ -96,6 +96,7 @@ pub async fn seed_info_document(
             documents_held: held_documents(ctx, node_id, &config).await,
             load_permille: read_load_permille(),
             heartbeat_at_ms: now,
+            download_slots: None,
         },
         updated_at_ms: now,
         epoch,
@@ -459,6 +460,10 @@ pub async fn refresh_info_heartbeat(
         documents_held: held_documents(ctx, node_id, &config).await,
         load_permille: read_load_permille(),
         heartbeat_at_ms: now,
+        download_slots: ctx
+            .net_handle
+            .as_ref()
+            .map(|net| net.download_gauge().snapshot()),
     };
     revise_node_info(ctx, node_id, realm_id, |document| {
         document.executors = executors.clone();
@@ -517,6 +522,7 @@ fn durable_view(document: &NodeInfoDocument) -> NodeInfoDocument {
         documents_held: None,
         load_permille: None,
         heartbeat_at_ms: 0,
+        download_slots: None,
     };
     view.demand = ComputeDemandSnapshot::default();
     view.reservation = ComputeReservationSnapshot::default();
@@ -1943,6 +1949,7 @@ mod tests {
                     documents_held: None,
                     load_permille: None,
                     heartbeat_at_ms: 1,
+                    download_slots: None,
                 },
                 availability: Vec::new(),
                 reservation: ComputeReservationSnapshot::default(),

@@ -56,7 +56,6 @@ use utoipa_swagger_ui::SwaggerUi;
 pub const ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
 pub const ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
-pub(crate) const DOWNLOAD_SLOTS: usize = 256;
 
 /// Identity, realm trust roots, and the shared issuer-key cache. The `Arc`
 /// fields are the node's shared owners: cloning the state clones these handles
@@ -166,7 +165,8 @@ struct RequestLimits {
     rate_limits: Arc<crate::rate_limit::ApiRateLimits>,
     // Semaphore owners are moved into the state, never recreated per clone.
     rocrate_upload_slots: Arc<Semaphore>,
-    download_slots: Arc<Semaphore>,
+    /// Shared with the node's heartbeat, which reports the slot use.
+    download_slots: Arc<aruna_core::download_slots::DownloadGauge>,
 }
 
 /// Interface and portal runtime state, the process shutdown token, and the
@@ -312,6 +312,10 @@ impl ServerState {
             .unwrap_or_else(CredentialEncryptionKey::random);
         let assistant_client =
             crate::routes::assistant::egress::outbound_client(&node_capabilities);
+        let download_slots = driver_ctx
+            .net_handle
+            .as_ref()
+            .map_or_else(Default::default, |net| net.download_gauge().clone());
         let state = Self {
             git: None,
             driver_ctx,
@@ -332,7 +336,7 @@ impl ServerState {
                 trusted_proxies: Vec::new(),
                 rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
                 rocrate_upload_slots: Arc::new(Semaphore::new(ROCRATE_UPLOAD_SLOTS)),
-                download_slots: Arc::new(Semaphore::new(DOWNLOAD_SLOTS)),
+                download_slots,
             },
             interfaces: Interfaces {
                 interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
@@ -441,7 +445,7 @@ impl ServerState {
     }
 
     pub(crate) fn try_acquire_download(&self) -> Option<OwnedSemaphorePermit> {
-        self.limits.download_slots.clone().try_acquire_owned().ok()
+        self.limits.download_slots.try_acquire()
     }
 
     pub fn jobs_runtime(&self) -> Arc<JobsRuntime> {

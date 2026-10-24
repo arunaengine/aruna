@@ -123,6 +123,8 @@ struct NetInner {
     inbound_admission: streams::InboundAdmission,
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     heartbeats: Arc<heartbeat::HeartbeatTable>,
+    download_gauge: Arc<aruna_core::download_slots::DownloadGauge>,
+    avoided_holders: aruna_core::download_slots::AvoidList,
     notification_watch_metrics: NotificationWatchMetrics,
     notification_wakes: broadcast::Sender<UserId>,
     dashboard_epoch: Ulid,
@@ -537,6 +539,16 @@ impl NetHandle {
 
     pub fn held_heartbeats(&self) -> Vec<HeldHeartbeat> {
         self.inner.heartbeats.held()
+    }
+
+    /// This node's DRS download slots, which its heartbeat reports.
+    pub fn download_gauge(&self) -> &Arc<aruna_core::download_slots::DownloadGauge> {
+        &self.inner.download_gauge
+    }
+
+    /// Holders this node skips for a while after they failed.
+    pub fn avoided_holders(&self) -> &aruna_core::download_slots::AvoidList {
+        &self.inner.avoided_holders
     }
 
     /// Time since the last heartbeat of `node`, or since this node started without one.

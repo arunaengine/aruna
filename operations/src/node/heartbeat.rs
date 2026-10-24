@@ -48,7 +48,7 @@ pub fn fresh_heartbeats(net_handle: Option<&NetHandle>) -> BTreeMap<NodeId, Held
     held
 }
 
-/// Takes the load and executor availability of each document from the node's fresh heartbeat
+/// Takes the load, download slots and executor availability of each document from the node's fresh heartbeat
 /// when that names the document's advertisement, and clears them otherwise: unknown ranks worst.
 pub fn live_telemetry(
     fresh: &BTreeMap<NodeId, HeldHeartbeat>,
@@ -67,6 +67,8 @@ pub fn live_telemetry(
         let observed_at_ms = held.map_or(0, |held| now_ms.saturating_sub(held.age_ms));
         document.utilization.load_permille =
             held.and_then(|held| held.heartbeat.utilization.load_permille);
+        document.utilization.download_slots =
+            held.and_then(|held| held.heartbeat.utilization.download_slots);
         for executor in &mut document.executors {
             executor.availability = held
                 .and_then(|held| {
@@ -208,6 +210,7 @@ mod tests {
             documents_held: None,
             load_permille,
             heartbeat_at_ms: 0,
+            download_slots: None,
         }
     }
 
