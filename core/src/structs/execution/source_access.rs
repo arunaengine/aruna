@@ -257,6 +257,8 @@ pub enum SourceEntryKind {
 pub enum ListCursor {
     /// Provider key: the next page starts after it.
     After(String),
+    /// Provider key: the next page starts at it, so a key a full page deferred is read first.
+    At(String),
     /// Entries to skip, for a source whose provider cannot start after a key.
     Offset(u64),
 }

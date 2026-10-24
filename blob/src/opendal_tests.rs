@@ -1033,6 +1033,22 @@ async fn browse_seeks_successor() {
     assert_eq!(subtree_successor("d/a/"), "d/a0");
 }
 
+// A full page defers the successor probe after a directory to the next page, which starts at
+// the successor, so a page never exceeds its limit and the successor is not lost.
+#[tokio::test]
+async fn deferred_successor_probe() {
+    const KEYS: &[&str] = &["d/a/1", "d/a0", "d/b"];
+    let server = ListingServer::bind(KEYS).await;
+
+    let pages = all_pages(&server.operator(), "d/", list_request(1, false, false)).await;
+
+    assert_eq!(pages, [vec!["d/a"], vec!["d/a0"], vec!["d/b"], vec![]]);
+    let (_, cursor) = list_operator(&server.operator(), "d/", &list_request(1, false, false))
+        .await
+        .unwrap();
+    assert_eq!(cursor, Some(ListCursor::At("d/a0".to_string())));
+}
+
 // The probed lower key takes one entry of the page, so a page never exceeds its limit.
 #[tokio::test]
 async fn probe_counts_once() {

@@ -333,7 +333,7 @@ fn fallback_offset(request: &ListRequest, skip_limit: usize) -> Result<usize, St
     let offset = match &request.cursor {
         None => 0,
         Some(ListCursor::Offset(offset)) => usize::try_from(*offset).unwrap_or(usize::MAX),
-        Some(ListCursor::After(_)) => {
+        Some(ListCursor::After(_) | ListCursor::At(_)) => {
             return Err(StagingSourceError::InvalidListing(
                 "this source continues by offset, not by key".to_string(),
             ));
@@ -374,7 +374,7 @@ async fn list_operator(
         ));
     }
     let floor = match &request.cursor {
-        Some(ListCursor::After(key)) => Some(key.clone()),
+        Some(ListCursor::After(key) | ListCursor::At(key)) => Some(key.clone()),
         Some(ListCursor::Offset(_)) => {
             return Err(StagingSourceError::InvalidListing(
                 "this source continues by key, not by offset".to_string(),
@@ -384,8 +384,12 @@ async fn list_operator(
     };
     let limit = request.limit.clamp(1, PROVIDER_PAGE_LIMIT);
     let mut entries = Vec::with_capacity(limit);
-    if request.cursor.is_none()
-        && let Some(lower) = request.lower.as_deref()
+    let inclusive = match &request.cursor {
+        None => request.lower.as_deref(),
+        Some(ListCursor::At(key)) => Some(key.as_str()),
+        Some(_) => None,
+    };
+    if let Some(lower) = inclusive
         && let Some(entry) = probe_lower(operator, path, lower, request).await?
     {
         entries.push(entry);
@@ -454,8 +458,12 @@ async fn list_operator(
             if !request.files_only {
                 entries.push(directory_entry(&directory));
             }
-            // `start_after` skips the successor itself, so it is read on its own.
+            // `start_after` skips the successor itself, so it is read on its own; a full page
+            // leaves it to the next page, which starts at it.
             let successor = subtree_successor(&directory);
+            if consumed >= budget {
+                return Ok((entries, Some(ListCursor::At(successor))));
+            }
             if let Some(entry) = probe_lower(operator, path, &successor, request).await? {
                 entries.push(entry);
                 consumed += 1;

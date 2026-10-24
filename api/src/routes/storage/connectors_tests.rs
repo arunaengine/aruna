@@ -294,6 +294,7 @@ fn cursor_round_trips() {
     for cursor in [
         ListCursor::After("datasets/run 1/ä.txt".to_string()),
         ListCursor::Offset(500),
+        ListCursor::At("datasets/run 0".to_string()),
     ] {
         assert_eq!(decode_cursor(&encode_cursor(&cursor)).unwrap(), cursor);
     }
