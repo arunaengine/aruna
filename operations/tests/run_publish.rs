@@ -31,7 +31,7 @@ use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
-use topology::{TestResult, Topology};
+use topology::{TestResult, Topology, read_group_auth, wait_until};
 use ulid::Ulid;
 
 const REMOTE_BUCKET: &str = "lab-data";
@@ -196,7 +196,12 @@ async fn publishes_local_run() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
     let server = realm.node(0);
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    // A node lists a new group a little later, so a fetch can miss it; the device must hold it.
+    wait_until("the group on the device", device.node_id(), || async {
+        fetch_realm_documents(&device.context, FETCH_BUDGET).await
+            && matches!(read_group_auth(device, group_id).await, Ok(Some(_)))
+    })
+    .await?;
     create_bucket(&server.context, REMOTE_BUCKET, group_id, &realm).await?;
     create_bucket(&device.context, LOCAL_BUCKET, group_id, &realm).await?;
     let version_id = write_output(&realm, group_id).await?;
