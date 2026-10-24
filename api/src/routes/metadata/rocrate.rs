@@ -11,7 +11,7 @@ use crate::metadata::{
     ReplaceRoCrateRequest, RoCrateExportParams, SubmitExportRequest, SubmitExportResponse,
     commit_message, crate_entities, ensure_readable_files, forwarded_auth_token,
     load_document_record, local_write_record, map_api_error, map_export_response, map_export_view,
-    map_write_error, parse_document_id, serialize_jsonld_object,
+    map_write_error, parse_document_id, serialize_jsonld_object, with_global_ids,
 };
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
 use crate::routes::repository::links::{
@@ -527,7 +527,7 @@ pub async fn replace_metadata_rocrate(
         document_id,
         request.public,
         UpdateDocumentMutation::ReplaceRoCrate {
-            jsonld: serialize_jsonld_object(&request.rocrate)?,
+            jsonld: serialize_jsonld_object(&with_global_ids(&state, &request.rocrate).await?)?,
         },
         expected_revision,
         forwarded_auth_token(bearer_token)?,
@@ -637,7 +637,7 @@ pub async fn add_data_entity(
         document_id,
         None,
         UpdateDocumentMutation::UpsertDataEntity {
-            jsonld: serialize_jsonld_entity(&entity)?,
+            jsonld: serialize_jsonld_entity(&with_global_ids(&state, &entity).await?)?,
         },
         None,
         forwarded_auth_token(bearer_token)?,

@@ -215,6 +215,20 @@ fn format_timestamp_ms(timestamp_ms: u64) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
 }
 
+/// The crate or entity with objects of local distributed member buckets named by global id.
+pub(crate) async fn with_global_ids(state: &ServerState, value: &Value) -> ServerResult<Value> {
+    let mut value = value.clone();
+    aruna_operations::metadata::global_entries::normalize_entries(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        &mut value,
+    )
+    .await
+    .map_err(ServerError::InternalError)?;
+    Ok(value)
+}
+
 pub(crate) fn serialize_jsonld_object(value: &Value) -> ServerResult<String> {
     if !value.is_object() {
         return Err(ServerError::BadRequest);

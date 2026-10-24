@@ -13,6 +13,7 @@ pub mod delete_document;
 pub mod device_pull;
 pub mod forward;
 pub mod get_document;
+pub mod global_entries;
 pub(crate) mod handle;
 mod iri_index;
 pub mod list_documents;
