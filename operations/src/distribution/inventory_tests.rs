@@ -18,11 +18,13 @@ fn id(seed: u8) -> Ulid {
     Ulid::from_bytes([seed; 16])
 }
 
+/// Stored content of `size` bytes; its identity follows the size, so sizes tell contents apart.
 fn stored(size: u64) -> VersionEntry {
     VersionEntry {
         marker: false,
         size,
         referenced: false,
+        identity: Some([size.to_le_bytes()[0]; 32]),
     }
 }
 
@@ -119,6 +121,30 @@ async fn refuses_foreign_id() {
     assert_eq!(result, Err(InventoryError::Collision(id(1))));
 }
 
+/// The same id under the same key and epoch with other content is refused; an entry whose
+/// content is not known yet takes the known identity.
+#[tokio::test]
+async fn refuses_other_content() {
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
+    let result = apply(&handle, put("a", 1, 1, 11)).await;
+    assert_eq!(result, Err(InventoryError::Collision(id(1))));
+    let mut pending = put("a", 2, 2, 0);
+    if let HeadChange::Set(head) = &mut pending.change.head {
+        head.version.identity = None;
+    }
+    pending.change.added[0].entry.identity = None;
+    assert!(apply(&handle, pending).await.unwrap());
+    assert!(
+        apply(&handle, put("a", 2, 2, 0)).await.unwrap(),
+        "the hash becomes known"
+    );
+    let index = get(&handle, VERSION_INDEX_KEYSPACE, index_key(set(), id(2))).await;
+    let index = IndexEntry::from_bytes(&index.unwrap()).unwrap();
+    assert_eq!(index.version.identity, Some([0; 32]));
+}
+
 #[tokio::test]
 async fn purge_returns_to_zero() {
     let (_dir, handle) = open();
@@ -129,6 +155,7 @@ async fn purge_returns_to_zero() {
         marker: true,
         size: 0,
         referenced: false,
+        identity: None,
     };
     marker.added.push(AddedVersion {
         version_id: id(2),

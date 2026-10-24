@@ -56,7 +56,7 @@ use aruna_core::structs::storage::blob::{
     VersionKey, WriteOwner, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
-use aruna_core::structs::storage::distribution::inventory::VersionEntry;
+use aruna_core::structs::storage::distribution::inventory::{VersionEntry, content_identity};
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
@@ -349,8 +349,9 @@ pub struct IncomingVersionOperation {
     destination_bound: bool,
     /// The destination's binding, whose inventory the apply transaction maintains.
     destination_binding: Option<DistributionBinding>,
-    /// The head this apply installs, for the inventory.
+    /// The head this apply installs and the content of the written version, for the inventory.
     installed_head: Option<CurrentVersionPointer>,
+    written_identity: Option<[u8; 32]>,
     destination_inputs: GroupRoutingInputs,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
@@ -447,6 +448,7 @@ impl IncomingVersionOperation {
             pending_head: None,
             destination_binding: None,
             installed_head: None,
+            written_identity: None,
             head_transition_effects: VecDeque::new(),
             pending_version_effects: VecDeque::new(),
             release_id: None,
@@ -2007,6 +2009,7 @@ impl IncomingVersionOperation {
         };
 
         let version = version.with_epoch(self.original_epoch());
+        self.written_identity = content_identity(&version);
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),
@@ -2239,6 +2242,7 @@ impl IncomingVersionOperation {
                 marker,
                 size,
                 referenced: self.is_reference_item(),
+                identity: self.written_identity,
             },
         };
         let head = self.installed_head.is_some();

@@ -16,8 +16,8 @@ use aruna_core::structs::storage::distribution::accounting::{
     account_key, generation_key, pending_key, sample_count_key, sample_prefix, slot_key, slot_seek,
 };
 use aruna_core::structs::storage::distribution::inventory::{
-    Entry, HeadEntry, IndexEntry, Position, VersionEntry, head_position, index_key,
-    upload_position, version_position,
+    Entry, HeadEntry, IndexEntry, Position, VersionEntry, content_identity, head_position,
+    index_key, upload_position, version_position,
 };
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange, OriginalEpoch};
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -32,7 +32,7 @@ pub enum InventoryError {
     RangeMissing { set_id: Ulid, key: String },
     #[error("range {0} was split; retry against its children")]
     RangeRetired(Ulid),
-    #[error("version id {0} is already indexed under another key or epoch")]
+    #[error("version id {0} is already indexed with another key, epoch or content")]
     Collision(Ulid),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
@@ -44,8 +44,8 @@ pub enum InventoryError {
     UnexpectedEvent(Box<Event>),
 }
 
-/// One version written to the key. An indexed id of the same key and epoch is the same
-/// version: a replay changes nothing and a changed entry is replaced in place.
+/// One version written to the key. An indexed id of the same key, epoch and content is the
+/// same version: a replay changes nothing and a changed entry is replaced in place.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AddedVersion {
     pub version_id: Ulid,
@@ -316,7 +316,7 @@ impl InventoryUpdate {
         contributions: &mut Vec<(Walk, Vec<u8>, RangeCounters)>,
     ) -> Result<(), InventoryError> {
         let set_id = self.change.set_id;
-        for added in self.change.added.clone() {
+        for mut added in self.change.added.clone() {
             let mut position = version_position(
                 set_id,
                 &self.change.key,
@@ -324,33 +324,39 @@ impl InventoryUpdate {
                 added.generation,
                 added.version_id,
             );
-            let mut counters = RangeCounters::of_version(added.epoch, &added.entry);
+            let mut old = None;
             if let Some(value) = next() {
-                // The same version again keeps its first position; only its entry may change.
+                // The same version again keeps its first position; only its entry may change,
+                // and never to other content.
                 let existing = IndexEntry::from_bytes(&value)?;
                 let decoded = Position::decode(&existing.position)?;
                 let same =
                     matches!(decoded.entry, Entry::Version { epoch, .. } if epoch == added.epoch);
-                if !same || decoded.key != self.change.key {
+                if !same
+                    || decoded.key != self.change.key
+                    || !existing.version.same_content(&added.entry)
+                {
                     return Err(InventoryError::Collision(added.version_id));
                 }
+                added.entry.identity = added.entry.identity.or(existing.version.identity);
                 if existing.version == added.entry {
                     continue;
                 }
-                let old = RangeCounters::of_version(added.epoch, &existing.version);
-                counters = counters.merge(old.negate()?)?;
+                old = Some(RangeCounters::of_version(added.epoch, &existing.version));
                 position = existing.position;
+            }
+            let mut counters = RangeCounters::of_version(added.epoch, &added.entry);
+            if let Some(old) = old {
+                counters = counters.merge(old.negate()?)?;
             }
             let entry = IndexEntry {
                 position: position.clone(),
                 version: added.entry,
             };
             let index = index_key(set_id, added.version_id);
-            self.writes.push(row(
-                INVENTORY_KEYSPACE,
-                position.clone(),
-                added.entry.to_bytes()?,
-            ));
+            let value = added.entry.to_bytes()?;
+            self.writes
+                .push(row(INVENTORY_KEYSPACE, position.clone(), value));
             self.writes
                 .push(row(VERSION_INDEX_KEYSPACE, index, entry.to_bytes()?));
             contributions.push((Walk::Versions, position, counters));
@@ -530,6 +536,7 @@ pub fn entry_of(version: &BlobVersion, size: u64) -> VersionEntry {
         marker: version.is_deleted(),
         size,
         referenced: matches!(version.state, BlobVersionState::Reference { .. }),
+        identity: content_identity(version),
     }
 }
 

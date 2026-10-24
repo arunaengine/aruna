@@ -1570,6 +1570,9 @@ impl PutObjectOperation {
                 marker: false,
                 size: location.blob_size,
                 referenced: false,
+                identity: location
+                    .get_blake3()
+                    .and_then(|hash| <[u8; 32]>::try_from(hash).ok()),
             },
         });
         let head = self.head_pointer.is_some();

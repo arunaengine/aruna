@@ -963,6 +963,7 @@ impl DeleteObjectOperation {
                 marker: true,
                 size: 0,
                 referenced: false,
+                identity: None,
             },
         };
         version_written(self.binding.as_ref(), &self.input.key, added, true)

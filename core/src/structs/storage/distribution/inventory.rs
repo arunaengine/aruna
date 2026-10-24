@@ -8,6 +8,7 @@ use ulid::Ulid;
 
 use super::OriginalEpoch;
 use crate::errors::ConversionError;
+use crate::structs::storage::blob::{BlobVersion, BlobVersionState};
 
 /// Ends an escaped key; it sorts before every continuation of the key.
 const TERMINATOR: [u8; 2] = [0x00, 0x01];
@@ -164,13 +165,56 @@ impl Position {
     }
 }
 
-/// What a version row contributes to its range's counters.
+/// What a version row contributes to its range's counters, and its logical content.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VersionEntry {
     pub marker: bool,
     pub size: u64,
     /// The bytes are reached through an external reference, not stored here.
     pub referenced: bool,
+    /// The logical content identity from [`content_identity`]; `None` while it is unknown.
+    pub identity: Option<[u8; 32]>,
+}
+
+impl VersionEntry {
+    /// Two entries of one version id may differ only while one identity is unknown.
+    pub fn same_content(&self, other: &Self) -> bool {
+        match (self.identity, other.identity) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+    }
+}
+
+const IDENTITY_DOMAIN: &[u8] = b"aruna-reference-identity-v1";
+
+/// What one version holds, independent of where its bytes are: the BLAKE3 of stored bytes,
+/// or a digest of the observed source object of a reference. Markers and archives whose
+/// hash is not known yet have none.
+pub fn content_identity(version: &BlobVersion) -> Option<[u8; 32]> {
+    match &version.state {
+        BlobVersionState::Materialized { blob_hash, .. } => Some(*blob_hash),
+        BlobVersionState::Reference {
+            source,
+            cached_metadata,
+            ..
+        } => {
+            let descriptor = &source.descriptor;
+            let observed = (
+                &descriptor.kind,
+                &descriptor.source_path,
+                &descriptor.version_selector,
+                &cached_metadata.etag,
+                cached_metadata.content_length,
+            );
+            let bytes = postcard::to_allocvec(&observed).ok()?;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(IDENTITY_DOMAIN);
+            hasher.update(&bytes);
+            Some(*hasher.finalize().as_bytes())
+        }
+        BlobVersionState::Deleted | BlobVersionState::PendingContent { .. } => None,
+    }
 }
 
 /// A key's head row: the current version and what it contributes.

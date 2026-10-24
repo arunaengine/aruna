@@ -372,6 +372,7 @@ mod tests {
             marker,
             size,
             referenced,
+            identity: None,
         }
     }
 

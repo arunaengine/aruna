@@ -2050,6 +2050,11 @@ impl CompleteUploadOperation {
                 marker: false,
                 size: u64::try_from(size).unwrap_or_default(),
                 referenced: false,
+                identity: self
+                    .final_location
+                    .as_ref()
+                    .and_then(|location| location.get_blake3())
+                    .and_then(|hash| <[u8; 32]>::try_from(hash).ok()),
             },
         };
         let head = self.head_pointer.is_some();
