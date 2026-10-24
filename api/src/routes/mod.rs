@@ -14,6 +14,7 @@ use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 pub mod access;
 pub mod assistant;
 pub mod audit;
+pub mod database_types;
 pub mod device;
 pub mod drs;
 pub mod execution;
@@ -263,6 +264,10 @@ pub(crate) mod tests {
         ("GET", "/data/blobs/locations"),
         ("GET", "/data/buckets/{bucket}/distribution"),
         ("GET", "/data/buckets/{bucket}/links"),
+        (
+            "POST",
+            "/system/realm/databases/requests/{request_id}/approve",
+        ),
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),
