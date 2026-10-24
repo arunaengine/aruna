@@ -447,3 +447,45 @@ async fn parked_cursor_recovers() {
     assert_eq!(stored(&storage).await.unwrap().head.snapshot, created());
     service.shutdown().await;
 }
+
+#[tokio::test]
+async fn cutoff_is_exact() {
+    // After removal only the exact cutoff snapshot carries authority: older revisions and
+    // lower-number forks are refused, and receivers jump to the cutoff.
+    let (_dir, storage) = test_storage();
+    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    config.ensure_node(node(OTHER), RealmNodeKind::Server);
+    batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            DocumentTarget::RealmConfig { realm_id: realm() },
+            config.to_bytes(&actor(OTHER)).unwrap().into(),
+        )],
+    )
+    .await
+    .unwrap();
+    let cutoff = admitted(&created(), MEMBER);
+    let mut state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id: realm() });
+    let removed = AdminDocumentOperation::ConfigNodeRemoved {
+        node_id: node(PUBLISHER),
+        cutoffs: vec![PublisherCutoff {
+            set_id: root().set_id(),
+            revision: cutoff.revision(),
+        }],
+    };
+    state.apply_operation(&actor(OTHER), removed).unwrap();
+    batch_write_to(&storage, vec![reducer_state_entry(&state).unwrap()])
+        .await
+        .unwrap();
+    assert!(rejected(
+        receive(&storage, published(PUBLISHER, created(), PUBLISHER)).await
+    ));
+    let mut fork = created();
+    fork.config.settings.search_index = true;
+    assert!(rejected(
+        receive(&storage, published(PUBLISHER, fork, PUBLISHER)).await
+    ));
+    let exact = receive(&storage, published(PUBLISHER, cutoff.clone(), PUBLISHER)).await;
+    assert_eq!(exact, AdminEventValidation::Accepted);
+    assert_eq!(stored(&storage).await.unwrap().head.snapshot, cutoff);
+}

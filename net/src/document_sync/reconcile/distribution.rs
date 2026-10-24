@@ -30,8 +30,8 @@ pub(in crate::document_sync) fn validate_distribution_shape(
 }
 
 /// Committed revisions carry the publisher's acceptance, so no actor's current role is
-/// rechecked here. A publisher the config does not know yet defers; a removed one keeps
-/// authority only up to the cutoff its removal recorded for the set.
+/// rechecked here. A publisher the config does not know yet is parked; a removed one keeps
+/// authority only for the exact cutoff snapshot its removal recorded for the set.
 pub(in crate::document_sync) async fn validate_distribution_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
@@ -86,12 +86,10 @@ pub(in crate::document_sync) async fn publisher_authority(
     let within = cutoffs
         .iter()
         .find(|cutoff| cutoff.set_id == signed.snapshot.set_id())
-        .is_some_and(|cutoff| {
-            revision.number < cutoff.revision.number || revision == cutoff.revision
-        });
+        .is_some_and(|cutoff| revision == cutoff.revision);
     Ok(match within {
         true => Authority::Current,
-        false => Authority::Ended("snapshot is beyond the removed publisher's cutoff"),
+        false => Authority::Ended("snapshot is not the removed publisher's cutoff"),
     })
 }
 
