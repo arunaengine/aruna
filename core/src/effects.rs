@@ -134,9 +134,6 @@ pub enum BlobEffect {
         max_bytes: Option<u64>,
         deadline: Option<Instant>,
         blob: BackendStream<Result<Bytes, StreamError>>,
-        /// Reserves `max_bytes` from the shared spool budget until the spool is deleted;
-        /// its read stream deletes it when that stream ends or is dropped.
-        transient: bool,
     },
     /// Spools `blob` to an unnamed local temporary file and answers its hashes with a stream
     /// of `range` (all of it by default); the file is gone once that stream ends or drops.

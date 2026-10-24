@@ -43,7 +43,7 @@ pub(super) const READ_SLOTS: usize = 256;
 // Spools take their own pool because their input stream may issue nested
 // transfer and read effects; sharing a pool with those would deadlock.
 pub(super) const SPOOL_SLOTS: usize = 64;
-// Disk that transient spools may hold together, in MiB permits.
+// Disk that local spools may hold together, in MiB permits.
 pub(super) const SPOOL_BUDGET_MIB: usize = 32 * 1024;
 const QUEUE_WAIT_WARN: Duration = Duration::from_millis(100);
 const SLOW_LOCAL_EFFECT: Duration = Duration::from_secs(1);
@@ -628,14 +628,9 @@ impl BlobHandler {
             spool_dir: spool_dir.map(Arc::new),
             spool_files: Arc::new(Semaphore::new(super::local_spool::SPOOL_FILES)),
             spool_budget: Arc::new(Semaphore::new(SPOOL_BUDGET_MIB)),
-            transient_spools: Arc::default(),
-            live_spools: Arc::default(),
         };
         blob_handler.ensure_multipart_bucket().await?;
         blob_handler.probe_all_backends().await;
-        if let Err(error) = blob_handler.restore_charges().await {
-            tracing::warn!(%error, "transient spool charges were not restored");
-        }
         let status_handler = blob_handler.clone();
         let monitor_cancel = blob_handler.monitor_cancel.clone();
         let monitor_task = tokio::spawn(async move {
@@ -834,20 +829,10 @@ impl BlobHandler {
                 max_bytes,
                 deadline,
                 blob,
-                transient,
             } => {
-                // A transient spool gets a name of its own, so its charge names only it.
-                let name = match transient {
-                    true => format!("{name}-{}", Ulid::generate()),
-                    false => name,
-                };
                 let spool =
                     self.spool_hidden_blob(namespace, &name, created_by, max_bytes, deadline, blob);
-                if transient {
-                    Box::pin(self.spool_transient((namespace, &name), max_bytes, spool)).await
-                } else {
-                    Box::pin(spool).await
-                }
+                Box::pin(spool).await
             }
             BlobEffect::SpoolLocal {
                 size,
@@ -860,8 +845,7 @@ impl BlobHandler {
             }
             BlobEffect::DeleteHidden { key } => Box::pin(self.delete_hidden_blob(key)).await,
             BlobEffect::ListHidden { namespace, cursor } => {
-                let listed = Box::pin(self.list_hidden_blobs(namespace, cursor)).await;
-                self.hide_live(listed)
+                Box::pin(self.list_hidden_blobs(namespace, cursor)).await
             }
             BlobEffect::CheckGroupBackend { record, secret } => {
                 Box::pin(self.check_group_backend(record, secret)).await

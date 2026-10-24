@@ -20,7 +20,7 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE, PATHS_INDEX_KEYSPACE,
-    SPOOL_CHARGE_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::Status;
@@ -1189,7 +1189,6 @@ async fn hidden_bucket_registered() {
                 max_bytes: Some(0),
                 deadline: None,
                 blob: stream_from_bytes(b"x"),
-                transient: false,
             })
             .await,
         Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 0 }))
@@ -1370,7 +1369,6 @@ async fn hidden_spool_roundtrip() {
             max_bytes: Some(16),
             deadline: None,
             blob: stream_from_bytes(b"hidden"),
-            transient: false,
         })
         .await
     else {
@@ -1466,7 +1464,6 @@ async fn hidden_spool_limits() {
             max_bytes: None,
             deadline: None,
             blob: stream_from_bytes(b"seed"),
-            transient: false,
         })
         .await
     else {
@@ -1489,7 +1486,6 @@ async fn hidden_spool_limits() {
                 max_bytes: Some(3),
                 deadline: None,
                 blob: stream_from_bytes(b"four"),
-                transient: false,
             })
             .await,
         Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 3 }))
@@ -1507,58 +1503,85 @@ async fn hidden_spool_limits() {
     assert!(entries.is_empty());
 }
 
-// A transient spool holds spool budget until its read stream is dropped, which deletes it.
+fn local_spool(size: u64, range: Option<std::ops::Range<u64>>, bytes: &[u8]) -> BlobEffect {
+    BlobEffect::SpoolLocal {
+        size,
+        deadline: None,
+        range,
+        blob: stream_from_bytes(bytes),
+    }
+}
+
+// A local spool answers the hashes of every byte and streams only the range; its budget is held
+// until that stream ends.
 #[tokio::test]
-async fn transient_spool_cleanup() {
+async fn local_spool_range() {
     let context = setup_blob_handle(5).await;
-    let namespace = Ulid::from_bytes([12u8; 16]);
     let budget = context.blob_handle.handler.spool_budget.clone();
     let full = budget.available_permits();
-    let spool = |name: &str| BlobEffect::SpoolHidden {
-        namespace,
-        name: name.to_string(),
-        created_by: test_user_id(),
-        max_bytes: Some(4),
-        deadline: None,
-        blob: stream_from_bytes(b"four"),
-        transient: true,
-    };
-    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) =
-        context.blob_handle.send_blob_effect(spool("first")).await
-    else {
-        panic!("transient spool failed")
-    };
-    assert_eq!(budget.available_permits(), full - 1);
-
-    let Event::Blob(BlobEvent::HiddenRead { blob, .. }) = context
+    let Event::Blob(BlobEvent::LocalSpooled { hashes, size, blob }) = context
         .blob_handle
-        .send_blob_effect(BlobEffect::ReadHiddenRange {
-            location,
-            range: 0..2,
-        })
+        .send_blob_effect(local_spool(4, Some(1..3), b"four"))
         .await
     else {
-        panic!("transient read failed")
+        panic!("local spool failed")
     };
-    drop(blob);
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let event = context
+    assert_eq!(size, 4);
+    assert_eq!(
+        hashes.get(HASH_BLAKE3),
+        Some(&blake3::hash(b"four").as_bytes().to_vec())
+    );
+    assert_eq!(budget.available_permits(), full - 1);
+    let served: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    assert_eq!(served.concat(), b"ou");
+    assert_eq!(budget.available_permits(), full);
+}
+
+// A stream longer or shorter than announced is refused, and the refused spool frees its budget.
+#[tokio::test]
+async fn local_spool_length() {
+    let context = setup_blob_handle(5).await;
+    let budget = context.blob_handle.handler.spool_budget.clone();
+    let full = budget.available_permits();
+    for bytes in [&b"fours"[..], &b"for"[..]] {
+        assert!(matches!(
+            context
                 .blob_handle
-                .send_blob_effect(BlobEffect::ListHidden {
-                    namespace: Some(namespace),
-                    cursor: None,
-                })
-                .await;
-            match event {
-                Event::Blob(BlobEvent::HiddenListed { entries, .. }) if entries.is_empty() => break,
-                Event::Blob(BlobEvent::HiddenListed { .. }) => tokio::task::yield_now().await,
-                other => panic!("hidden list failed: {other:?}"),
-            }
+                .send_blob_effect(local_spool(4, None, bytes))
+                .await,
+            Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_)))
+        ));
+    }
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(local_spool(4, Some(2..5), b"four"))
+            .await,
+        Event::Blob(BlobEvent::Error(BlobError::ReadError(_)))
+    ));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while budget.available_permits() < full {
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("a dropped read must delete its transient spool");
+    .expect("a refused spool must free its budget");
+}
+
+// A dropped stream frees the budget; a full budget refuses at once, an oversized spool for good.
+#[tokio::test]
+async fn local_spool_budget() {
+    let context = setup_blob_handle(5).await;
+    let budget = context.blob_handle.handler.spool_budget.clone();
+    let full = budget.available_permits();
+    let Event::Blob(BlobEvent::LocalSpooled { blob, .. }) = context
+        .blob_handle
+        .send_blob_effect(local_spool(4, None, b"four"))
+        .await
+    else {
+        panic!("local spool failed")
+    };
+    drop(blob);
     assert_eq!(budget.available_permits(), full);
 
     let held = budget
@@ -1566,160 +1589,50 @@ async fn transient_spool_cleanup() {
         .try_acquire_many_owned(u32::try_from(full).unwrap())
         .unwrap();
     assert!(matches!(
-        context.blob_handle.send_blob_effect(spool("second")).await,
+        context
+            .blob_handle
+            .send_blob_effect(local_spool(4, None, b"four"))
+            .await,
         Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. }))
     ));
     drop(held);
-
-    // A spool larger than the whole budget is refused for good, not as contention.
     let limit = super::runtime::SPOOL_BUDGET_MIB as u64 * 1024 * 1024;
-    let oversized = BlobEffect::SpoolHidden {
-        namespace,
-        name: "oversized".to_string(),
-        created_by: test_user_id(),
-        max_bytes: Some(limit + 1),
-        deadline: None,
-        blob: stream_from_bytes(b"four"),
-        transient: true,
-    };
     assert_eq!(
-        context.blob_handle.send_blob_effect(oversized).await,
+        context
+            .blob_handle
+            .send_blob_effect(local_spool(limit + 1, None, b"four"))
+            .await,
         Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit }))
     );
 }
 
-// A spool being read is left out of hidden listings and cannot be deleted, so the sweep never
-// reclaims it; once the reader is gone the spool is deleted and its charge freed.
+// A node without a spool directory refuses to spool instead of falling back to another place.
 #[tokio::test]
-async fn live_spool_protected() {
-    let context = setup_blob_handle(5).await;
-    let namespace = Ulid::from_bytes([14u8; 16]);
-    let budget = context.blob_handle.handler.spool_budget.clone();
-    let full = budget.available_permits();
-    let list = || BlobEffect::ListHidden {
-        namespace: Some(namespace),
-        cursor: None,
-    };
-    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = context
-        .blob_handle
-        .send_blob_effect(BlobEffect::SpoolHidden {
-            namespace,
-            name: "live".to_string(),
-            created_by: test_user_id(),
-            max_bytes: Some(4),
-            deadline: None,
-            blob: stream_from_bytes(b"four"),
-            transient: true,
-        })
+async fn local_spool_unconfigured() {
+    let temp_dir = tempdir().unwrap();
+    let temp_root = temp_dir.path().to_str().unwrap().to_string();
+    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
         .await
-    else {
-        panic!("transient spool failed")
+        .unwrap();
+    let config = BackendConfig {
+        backend_type: Backend::FileSystem,
+        root: format!("{temp_root}/blobstore"),
+        service_config: HashMap::new(),
+        bucket_prefix: None,
+        max_bucket_size: None,
+        multipart_bucket: Some("uploaded-parts".to_string()),
+        timeouts: BlobTimeoutConfig::default(),
     };
-    let key = HiddenBlobKey::try_from(&location).unwrap();
-    let Event::Blob(BlobEvent::HiddenRead { blob, .. }) = context
-        .blob_handle
-        .send_blob_effect(BlobEffect::ReadHiddenRange {
-            location,
-            range: 0..4,
-        })
+    let blob_handle = BlobHandler::new(config, storage_handle, net_handle)
         .await
-    else {
-        panic!("transient read failed")
-    };
-
-    let Event::Blob(BlobEvent::HiddenListed { entries, .. }) =
-        context.blob_handle.send_blob_effect(list()).await
-    else {
-        panic!("hidden list failed")
-    };
-    assert!(entries.is_empty());
+        .unwrap();
     assert!(matches!(
-        context
-            .blob_handle
-            .send_blob_effect(BlobEffect::DeleteHidden { key })
+        blob_handle
+            .send_blob_effect(local_spool(4, None, b"four"))
             .await,
-        Event::Blob(BlobEvent::Error(BlobError::DeleteError(_)))
+        Event::Blob(BlobEvent::Error(BlobError::WriteError(_)))
     ));
-    assert_eq!(budget.available_permits(), full - 1);
-
-    drop(blob);
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while budget.available_permits() < full {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("a closed read must delete its spool");
-}
-
-// Spool charges outlive the process: a restart charges leftover spools again and drops
-// charges whose spools are gone, and a failed spool settles its own charge.
-#[tokio::test]
-async fn spool_charges_restored() {
-    let context = setup_blob_handle(5).await;
-    let handler = &context.blob_handle.handler;
-    let namespace = Ulid::from_bytes([13u8; 16]);
-    let full = handler.spool_budget.available_permits();
-    let spool = |name: &str, bytes: &[u8]| BlobEffect::SpoolHidden {
-        namespace,
-        name: name.to_string(),
-        created_by: test_user_id(),
-        max_bytes: Some(4),
-        deadline: None,
-        blob: stream_from_bytes(bytes),
-        transient: true,
-    };
-    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = context
-        .blob_handle
-        .send_blob_effect(spool("kept", b"four"))
-        .await
-    else {
-        panic!("transient spool failed")
-    };
-    let stale = StorageEffect::Write {
-        key_space: SPOOL_CHARGE_KEYSPACE.to_string(),
-        key: format!("_jobs/{namespace}/gone-{}", Ulid::nil())
-            .into_bytes()
-            .into(),
-        value: postcard::to_allocvec(&1u32).unwrap().into(),
-        txn_id: None,
-    };
-    context.storage_handle.send_storage_effect(stale).await;
-
-    // A restart starts without held permits.
-    handler.transient_spools.lock().unwrap().clear();
-    handler.restore_charges().await.unwrap();
-    assert_eq!(handler.spool_budget.available_permits(), full - 1);
-    assert_eq!(
-        keyspace_count(&context.storage_handle, SPOOL_CHARGE_KEYSPACE).await,
-        1
-    );
-
-    let key = HiddenBlobKey::try_from(&location).unwrap();
-    assert_eq!(
-        context
-            .blob_handle
-            .send_blob_effect(BlobEffect::DeleteHidden { key })
-            .await,
-        Event::Blob(BlobEvent::HiddenDeleted)
-    );
-    assert_eq!(handler.spool_budget.available_permits(), full);
-
-    assert!(matches!(
-        context
-            .blob_handle
-            .send_blob_effect(spool("failed", b"too long"))
-            .await,
-        Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 4 }))
-    ));
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while keyspace_count(&context.storage_handle, SPOOL_CHARGE_KEYSPACE).await > 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("a failed spool must settle its charge");
-    assert_eq!(handler.spool_budget.available_permits(), full);
 }
 
 #[tokio::test]
@@ -1767,7 +1680,6 @@ async fn sweeps_demoted_backend() {
             max_bytes: None,
             deadline: None,
             blob: stream_from_bytes(b"leftover"),
-            transient: false,
         })
         .await
     else {
@@ -1812,7 +1724,6 @@ async fn range_passes_writes() {
             max_bytes: None,
             deadline: None,
             blob: stream_from_bytes(b"source"),
-            transient: false,
         })
         .await
     else {
@@ -2838,7 +2749,6 @@ async fn cancelled_spool_releases() {
             max_bytes: None,
             deadline: None,
             blob: stream_from_bytes(b"partial"),
-            transient: false,
         })
         .await
     else {

@@ -253,8 +253,6 @@ pub const PURGE_FILES_KEYSPACE: &str = "s3_purge_files";
 pub const REPLICATION_JOB_KEYSPACE: &str = "blob_replication_jobs";
 pub const REPLICATION_OBLIGATION_KEYSPACE: &str = "blob_live_replication_obligations";
 pub const REFRESH_JOB_KEYSPACE: &str = "reference_metadata_refresh_jobs";
-/// MiB of the spool budget charged to transient hidden spools, by their path without its ULID.
-pub const SPOOL_CHARGE_KEYSPACE: &str = "blob_spool_charges";
 /// Due-time index of reference refresh jobs: big-endian due milliseconds, then the job key.
 pub const REFRESH_DUE_KEYSPACE: &str = "reference_metadata_refresh_due";
 pub const USAGE_STATS_KEYSPACE: &str = "usage_stats";
@@ -600,7 +598,6 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     REPLICATION_JOB_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE,
     REFRESH_JOB_KEYSPACE,
-    SPOOL_CHARGE_KEYSPACE,
     REFRESH_DUE_KEYSPACE,
     USAGE_STATS_KEYSPACE,
     NODE_STATS_KEYSPACE,

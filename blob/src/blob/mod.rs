@@ -11,7 +11,7 @@ use bao_tree::BlockSize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
@@ -31,7 +31,6 @@ mod registry;
 mod replication;
 mod runtime;
 mod source;
-mod spool;
 mod unlock;
 
 pub use group::{BackendClaim, GroupHold};
@@ -102,11 +101,8 @@ pub struct BlobHandler {
     spool_dir: Option<Arc<std::path::PathBuf>>,
     /// Open spool files, each held until its read stream ends.
     spool_files: Arc<Semaphore>,
-    /// Transient spool budget in MiB permits, and the permits held by spool charge.
+    /// Disk budget of local spools in MiB permits.
     spool_budget: Arc<Semaphore>,
-    transient_spools: Arc<StdMutex<HashMap<String, OwnedSemaphorePermit>>>,
-    /// Charges of transient spools being written or read, which the sweep must not reclaim.
-    live_spools: Arc<StdMutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Debug)]

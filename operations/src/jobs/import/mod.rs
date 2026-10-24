@@ -556,7 +556,6 @@ async fn spool_source(
             max_bytes: Some(limit),
             deadline: None,
             blob,
-            transient: false,
         })
         .await;
     match event {

@@ -1698,7 +1698,6 @@ mod tests {
                 blob: BackendStream::new(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
                     b"archive bytes".to_vec(),
                 ))),
-                transient: false,
             })
             .await
         else {

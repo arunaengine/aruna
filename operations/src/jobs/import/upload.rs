@@ -376,7 +376,6 @@ impl Operation for CreateRoCrateOperation {
             max_bytes: Some(self.max_bytes),
             deadline: self.deadline,
             blob,
-            transient: false,
         })]
     }
 

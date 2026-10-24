@@ -1528,7 +1528,6 @@ async fn upload_media(
             max_bytes: Some(size),
             deadline: None,
             blob,
-            transient: false,
         })
         .await
     else {
