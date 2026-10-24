@@ -1030,11 +1030,7 @@ impl ReplicateScopeOperation {
         let writer_auth_context = self.writer_auth_context.clone();
         let operation = match self.sync.clone() {
             Some(mut sync) => {
-                let Some(target_key) = map_sync_key(
-                    &request.key,
-                    sync.source_prefix.as_deref(),
-                    sync.target_prefix.as_deref(),
-                ) else {
+                let Some(target_key) = target_key(&sync, &request.key) else {
                     self.result.failed = self.result.failed.saturating_add(1);
                     return self.run_next_replication();
                 };
@@ -1070,6 +1066,19 @@ impl ReplicateScopeOperation {
                 },
             }),
         ))]
+    }
+}
+
+/// The key a version lands under at the target; a member of a set keeps the key exactly,
+/// leading slashes included.
+fn target_key(sync: &SyncTransferContext, key: &str) -> Option<String> {
+    match sync.distribution {
+        Some(_) => Some(key.to_string()),
+        None => map_sync_key(
+            key,
+            sync.source_prefix.as_deref(),
+            sync.target_prefix.as_deref(),
+        ),
     }
 }
 
@@ -4440,6 +4449,23 @@ mod tests {
         let mut expected = reference_source_binding();
         expected.connector_id = None;
         assert_eq!(source, expected);
+    }
+
+    #[test]
+    fn publication_keeps_key() {
+        let mut sync = reference_sync();
+        sync.target_prefix = None;
+        assert_eq!(target_key(&sync, "/a/b").as_deref(), Some("a/b"));
+        sync.distribution = Some(Publication {
+            set_id: Ulid::from_bytes([4; 16]),
+            range_id: Ulid::from_bytes([5; 16]),
+            revision: 3,
+            epoch: aruna_core::structs::storage::distribution::PublicationEpoch(2),
+            member_id: Ulid::from_bytes([6; 16]),
+            incarnation: 7,
+            bytes: true,
+        });
+        assert_eq!(target_key(&sync, "/a/b").as_deref(), Some("/a/b"));
     }
 
     #[test]
