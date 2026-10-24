@@ -13,7 +13,7 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, CACHE_ENTRY_KEYSPACE, DISTRIBUTION_KEYSPACE,
-    S3_BUCKET_KEYSPACE,
+    FILL_CLAIM_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_BLAKE3;
@@ -21,9 +21,10 @@ use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
-use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo};
+use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo, HiddenBlobKey};
 use aruna_core::structs::storage::distribution::on_use::{
-    Attachment, CacheEntry, PullPlan, attachment_key,
+    Attachment, CACHE_CAPACITY_BYTES, CacheEntry, FillClaim, KeptKind, PullPlan, attachment_key,
+    claim_key,
 };
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionView, MemberState, RangeBehaviour,
@@ -32,10 +33,12 @@ use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::types::{Key, KeySpace, Value};
 use bytes::Bytes;
+use tracing::warn;
 use ulid::Ulid;
 
+use super::keep::{ClaimFillOperation, Claimed, KeptCopy, PublishKeptOperation, Published};
 use crate::connectors::resolver::NATIVE_SET_ID;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive, now_ms};
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{
@@ -165,8 +168,14 @@ pub async fn pull_through(
             let whole = from_holders(context, &request, &member.holders, None).await?;
             spool_range(context, &request.held, whole, range).await?
         }
-        // Keeping follows with the fill of kept copies; until then the bytes stream.
-        PullPlan::FillFirst(_) | PullPlan::ServeAndFill(_) => {
+        PullPlan::FillFirst(kind) => match fill(context, &request, kind, &member.holders).await {
+            Some(location) => read_kept(context, location, range).await?,
+            None => from_holders(context, &request, &member.holders, range).await?,
+        },
+        PullPlan::ServeAndFill(kind) => {
+            let (background, filled) = (context.clone(), request.clone());
+            let holders = member.holders.clone();
+            tokio::spawn(async move { fill(&background, &filled, kind, &holders).await });
             from_holders(context, &request, &member.holders, range).await?
         }
     };
@@ -331,6 +340,156 @@ async fn spool_range(
             ..
         })) => Err(GetObjectError::SpoolBudgetExhausted),
         _ => Err(GetObjectError::HoldersUnavailable),
+    }
+}
+
+/// Reads `range` of a kept copy.
+async fn read_kept(
+    context: &DriverContext,
+    location: BackendLocation,
+    range: Option<Range<u64>>,
+) -> Result<Blob, GetObjectError> {
+    let blob_handle = context
+        .blob_handle
+        .as_ref()
+        .ok_or(GetObjectError::GetObjectFailed)?;
+    let read = match range {
+        Some(range) => BlobEffect::ReadRange { location, range },
+        None => BlobEffect::Read { location },
+    };
+    match blob_handle.send_blob_effect(read).await {
+        Event::Blob(BlobEvent::ReadFinished { blob, .. }) => Ok(blob),
+        _ => Err(GetObjectError::GetObjectFailed),
+    }
+}
+
+/// Keeps a verified copy of the whole version once: claims the fill, reads the version through
+/// a holder, checks its BLAKE3 and size, then publishes it. `None` when another fill runs or
+/// keeping failed; the read then streams instead.
+async fn fill(
+    context: &DriverContext,
+    request: &PullRequest,
+    kind: KeptKind,
+    holders: &[NodeId],
+) -> Option<BackendLocation> {
+    let held = &request.held;
+    let claim = claim_key(kind, held.set_id, held.version_id, held.blake3);
+    let claimed = FillClaim {
+        claim_id: Ulid::generate(),
+        claimed_at_ms: now_ms(),
+    };
+    match drive(ClaimFillOperation::new(claim.clone(), claimed), context).await {
+        Ok(Claimed::Claimed) => {}
+        Ok(Claimed::Busy) => return None,
+        Err(error) => {
+            warn!(%error, "A kept copy was not claimed");
+            return None;
+        }
+    }
+    let location = match write_copy(context, request, kind, holders).await {
+        Ok(location) => location,
+        Err(reason) => {
+            warn!(reason, set_id = %held.set_id, version_id = %held.version_id, "A kept copy was not filled");
+            release(context, claim).await;
+            return None;
+        }
+    };
+    let copy = KeptCopy {
+        kind,
+        set_id: held.set_id,
+        version_id: held.version_id,
+        blake3: held.blake3,
+        size: held.size,
+        location: location.clone(),
+        claim_key: claim.clone(),
+        capacity: CACHE_CAPACITY_BYTES,
+        order: Ulid::generate(),
+    };
+    match drive(PublishKeptOperation::new(copy), context).await {
+        Ok(Published::Kept { evicted }) => {
+            for evicted in evicted {
+                drop_copy(context, &evicted).await;
+            }
+            Some(location)
+        }
+        Ok(Published::Unkept) => {
+            drop_copy(context, &location).await;
+            None
+        }
+        Err(error) => {
+            warn!(%error, "A kept copy was not published");
+            drop_copy(context, &location).await;
+            release(context, claim).await;
+            None
+        }
+    }
+}
+
+/// Writes the whole version to a hidden copy and checks it against the record.
+async fn write_copy(
+    context: &DriverContext,
+    request: &PullRequest,
+    kind: KeptKind,
+    holders: &[NodeId],
+) -> Result<BackendLocation, String> {
+    let held = &request.held;
+    let blob_handle = context.blob_handle.as_ref().ok_or("no blob handle")?;
+    let whole = from_holders(context, request, holders, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let name = match kind {
+        KeptKind::Attachment => format!("{}-{}", held.set_id, held.version_id),
+        KeptKind::Cache => hex::encode(held.blake3),
+    };
+    let spool = BlobEffect::SpoolHidden {
+        namespace: kind.namespace(),
+        name,
+        created_by: request.auth.user_id,
+        max_bytes: Some(held.size),
+        deadline: None,
+        blob: whole,
+    };
+    match blob_handle.send_blob_effect(spool).await {
+        Event::Blob(BlobEvent::HiddenSpooled {
+            location,
+            blake3,
+            size,
+        }) if blake3 == held.blake3 && size == held.size => Ok(location),
+        Event::Blob(BlobEvent::HiddenSpooled { location, .. }) => {
+            drop_copy(context, &location).await;
+            Err("the copy does not match the version".to_string())
+        }
+        Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
+        _ => Err("unexpected answer to the copy write".to_string()),
+    }
+}
+
+async fn drop_copy(context: &DriverContext, location: &BackendLocation) {
+    let (Some(blob_handle), Ok(key)) = (
+        context.blob_handle.as_ref(),
+        HiddenBlobKey::try_from(location),
+    ) else {
+        return;
+    };
+    if let Event::Blob(BlobEvent::Error(error)) = blob_handle
+        .send_blob_effect(BlobEffect::DeleteHidden { key })
+        .await
+    {
+        warn!(%error, "A dropped kept copy is left to the hidden sweep");
+    }
+}
+
+/// Releases a fill claim, so the next read may fill again.
+async fn release(context: &DriverContext, claim: Vec<u8>) {
+    let delete = StorageEffect::Delete {
+        key_space: FILL_CLAIM_KEYSPACE.to_string(),
+        key: claim.into(),
+        txn_id: None,
+    };
+    if let Event::Storage(StorageEvent::Error { error }) =
+        context.storage_handle.send_storage_effect(delete).await
+    {
+        warn!(%error, "A fill claim stays until it goes stale");
     }
 }
 
