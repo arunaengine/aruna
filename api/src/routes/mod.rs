@@ -15,6 +15,7 @@ pub mod access;
 pub mod assistant;
 pub mod audit;
 pub mod database_types;
+pub mod databases;
 pub mod device;
 pub mod drs;
 pub mod execution;
@@ -67,6 +68,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::encryption::router())
         .merge(storage::abe::router())
         .merge(storage::bucket::keys::router())
+        .merge(databases::router())
         .merge(drs::router())
         .merge(staging::router())
         .merge(storage::deletion::router())
@@ -264,10 +266,15 @@ pub(crate) mod tests {
         ("GET", "/data/blobs/locations"),
         ("GET", "/data/buckets/{bucket}/distribution"),
         ("GET", "/data/buckets/{bucket}/links"),
+        ("GET", "/data/databases"),
+        ("POST", "/system/realm/databases"),
+        ("DELETE", "/system/realm/databases/{entry_id}"),
+        ("GET", "/system/realm/databases/requests"),
         (
             "POST",
             "/system/realm/databases/requests/{request_id}/approve",
         ),
+        ("DELETE", "/system/realm/databases/requests/{request_id}"),
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),
