@@ -12,6 +12,7 @@ use crate::types::GroupId;
 
 pub mod accounting;
 pub mod delegation;
+pub mod delivery;
 pub mod hint;
 pub mod inventory;
 pub mod parking;
@@ -22,6 +23,7 @@ pub mod snapshot;
 pub mod statement;
 pub mod validate;
 
+pub use delivery::{AdmissionError, Delivery, Publication};
 pub use hint::{HintIndex, SetHint};
 pub use request::{DistributionRequest, TransferRole, next_snapshot};
 pub use route::{RouteError, WriteRoute};
