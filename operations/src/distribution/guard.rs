@@ -293,6 +293,19 @@ pub async fn delegated_range(
     })
 }
 
+/// Whether this member answers listings of every key in `[lower, upper)` from its records.
+pub async fn lists_interval(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    lower: &str,
+    upper: Option<&str>,
+) -> Result<bool, GuardError> {
+    let view = bound_view(context, binding).await?;
+    Ok(view
+        .snapshot()
+        .lists_interval(binding.member_id, lower, upper))
+}
+
 /// The nodes that answer reads of `key`'s range from their own records, coordinator last.
 pub async fn record_holders(
     context: &DriverContext,

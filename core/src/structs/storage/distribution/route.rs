@@ -151,6 +151,32 @@ impl DistributionSnapshot {
         })
     }
 
+    /// The ranges a listing of every key under `prefix` walks, in key order.
+    pub fn listed_ranges(&self, prefix: &str) -> Vec<&KeyRange> {
+        (self.config.ranges.iter())
+            .filter(|range| reaches(range, prefix))
+            .collect()
+    }
+
+    /// Whether `member_id` answers listings of `range` from its own records: it keeps them
+    /// and is not catching up.
+    pub fn lists_locally(&self, member_id: Ulid, range: &KeyRange) -> bool {
+        self.member(member_id).is_some_and(|member| {
+            member.state == MemberState::Ready && keeps_records(range, member)
+        })
+    }
+
+    /// Whether `member_id` answers listings of every key in `[lower, upper)` itself.
+    pub fn lists_interval(&self, member_id: Ulid, lower: &str, upper: Option<&str>) -> bool {
+        (self.config.ranges.iter())
+            .filter(|range| {
+                let starts_before = upper.is_none_or(|upper| range.lower.as_str() < upper);
+                let ends_after = range.upper.as_deref().is_none_or(|end| lower < end);
+                starts_before && ends_after
+            })
+            .all(|range| self.lists_locally(member_id, range))
+    }
+
     /// The ready members that keep the records of `range`, its coordinator last, so reads of
     /// the range go to replicas and `all` coverage members first.
     pub fn record_holders(&self, range: &KeyRange) -> Vec<&DistributionMember> {

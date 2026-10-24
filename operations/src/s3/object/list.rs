@@ -138,6 +138,11 @@ pub struct ListBucketOperation {
     cursor_group: Option<String>,
     cursor_group_prefix: Option<Vec<u8>>,
     last_consumed_key: Option<Vec<u8>>,
+    /// The key range `[lower, upper)` a member lists for a merged listing.
+    bounds: Option<(String, Option<String>)>,
+    /// The inclusive first head key of the first round, at the lower bound.
+    first_key: Option<Vec<u8>>,
+    upper_key: Option<Vec<u8>>,
     output: Option<Result<ListBucketResult, ListBucketError>>,
 }
 
@@ -163,8 +168,37 @@ impl ListBucketOperation {
             cursor_group: None,
             cursor_group_prefix: None,
             last_consumed_key: None,
+            bounds: None,
+            first_key: None,
+            upper_key: None,
             output: None,
         }
+    }
+
+    /// Lists only keys in `[lower, upper)`, one range of a distributed bucket.
+    pub fn with_bounds(mut self, lower: String, upper: Option<String>) -> Self {
+        self.bounds = Some((lower, upper));
+        self
+    }
+
+    /// Starts at the lower bound when the cursor lies before it, and notes the upper bound.
+    fn apply_bounds(&mut self) -> Result<(), ListBucketError> {
+        let Some((lower, upper)) = self.bounds.clone() else {
+            return Ok(());
+        };
+        let first = BlobHeadKey::object_prefix(&self.input.bucket, &lower)?;
+        if self
+            .last_consumed_key
+            .as_ref()
+            .is_none_or(|cursor| *cursor < first)
+        {
+            self.last_consumed_key = None;
+            self.first_key = Some(first);
+        }
+        self.upper_key = upper
+            .map(|upper| BlobHeadKey::object_prefix(&self.input.bucket, &upper))
+            .transpose()?;
+        Ok(())
     }
 
     fn emit_error(&mut self, error: ListBucketError) -> Effects {
@@ -264,6 +298,9 @@ impl ListBucketOperation {
 
         self.scan_prefix = prefix;
         self.last_consumed_key = iter_start_key;
+        if let Err(error) = self.apply_bounds() {
+            return self.emit_error(error);
+        }
         self.issue_scan_round()
     }
 
@@ -303,10 +340,13 @@ impl ListBucketOperation {
             .and_then(prefix_upper_bound)
         {
             Some(seek) => Some(IterStart::At(seek.into())),
-            None => self
-                .last_consumed_key
-                .clone()
-                .map(|key| IterStart::After(key.into())),
+            None => match self.first_key.take() {
+                Some(first) => Some(IterStart::At(first.into())),
+                None => self
+                    .last_consumed_key
+                    .clone()
+                    .map(|key| IterStart::After(key.into())),
+            },
         };
 
         self.state = ListBucketState::ReadHeads;
@@ -406,6 +446,15 @@ impl ListBucketOperation {
         // Contents membership and prefix roll-up; keys in emitted groups skip.
         let mut candidates: Vec<(BlobHeadKey, Ulid, Vec<u8>)> = Vec::new();
         for (key, value) in values.into_iter() {
+            // Keys from the upper bound on belong to the next range.
+            if self
+                .upper_key
+                .as_deref()
+                .is_some_and(|upper| key.as_ref() >= upper)
+            {
+                self.round_exhausted = true;
+                break;
+            }
             if let Some(group_prefix) = self.cursor_group_prefix.as_deref()
                 && key.as_ref().starts_with(group_prefix)
             {

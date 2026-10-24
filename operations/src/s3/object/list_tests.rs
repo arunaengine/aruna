@@ -1255,3 +1255,41 @@ async fn pending_archives_listed() {
             if *found == location && *id == version_id
     ));
 }
+
+#[tokio::test]
+async fn bounds_limit_range() {
+    let (_temp_handle, storage_handle) = test_storage();
+    let driver_ctx = test_context(storage_handle.clone());
+    let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
+    seed_materialized_keys(&storage_handle, "bucket", &["a", "b", "c", "d"], created_by).await;
+    let bounded = |lower: &str, upper: Option<&str>, start_after: Option<&str>| {
+        ListBucketOperation::new(ListBucketInput {
+            bucket: "bucket".to_string(),
+            group_id: Ulid::generate(),
+            continuation_token: None,
+            max_keys: Some(100),
+            prefix: None,
+            delimiter: None,
+            start_after: start_after.map(str::to_string),
+        })
+        .with_bounds(lower.to_string(), upper.map(str::to_string))
+    };
+    let keys = |result: ListBucketResult| -> Vec<String> {
+        (result.objects.into_iter())
+            .map(|object| object.head.key)
+            .collect()
+    };
+    let inner = drive(bounded("b", Some("d"), None), &driver_ctx)
+        .await
+        .unwrap();
+    assert!(inner.continuation_token.is_none());
+    assert_eq!(keys(inner), vec!["b", "c"]);
+    let resumed = drive(bounded("b", Some("d"), Some("b")), &driver_ctx)
+        .await
+        .unwrap();
+    assert_eq!(keys(resumed), vec!["c"]);
+    let before = drive(bounded("b", None, Some("a")), &driver_ctx)
+        .await
+        .unwrap();
+    assert_eq!(keys(before), vec!["b", "c", "d"]);
+}
