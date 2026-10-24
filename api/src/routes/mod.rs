@@ -308,6 +308,7 @@ pub(crate) mod tests {
         ("GET", "/ga4gh/drs/v1/download"),
         ("GET", "/ga4gh/drs/v1/objects/{*object_id}"),
         ("GET", "/ga4gh/drs/v1/service-info"),
+        ("GET", "/resolve/{*id}"),
         ("GET", "/ga4gh/tes/v1/service-info"),
         ("GET", "/ga4gh/tes/v1/tasks"),
         ("GET", "/ga4gh/tes/v1/tasks/{id}"),
@@ -699,6 +700,7 @@ pub(crate) mod tests {
             "/ga4gh/drs/v1/objects/{object_id}",
             "/ga4gh/drs/v1/objects/{*object_id}",
         ),
+        ("/resolve/{id}", "/resolve/{*id}"),
         (
             "/ga4gh/tes/v1/tasks/{id}:cancel",
             "/ga4gh/tes/v1/tasks/{id}",

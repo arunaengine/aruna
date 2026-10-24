@@ -448,6 +448,7 @@ fn canonical_response_complete() {
         origin: None,
         holders: Vec::new(),
         pinned: None,
+        answered_by: None,
         source_metadata: Some(SourceMetadata {
             content_length: 42,
             content_type: Some("application/octet-stream".to_string()),
@@ -506,6 +507,7 @@ fn content_response_aliases() {
         origin: None,
         holders: Vec::new(),
         pinned: None,
+        answered_by: None,
         source_metadata: Some(SourceMetadata {
             content_length: 42,
             content_type: Some("application/octet-stream".to_string()),
@@ -599,6 +601,7 @@ async fn routed_uses_origin() {
         origin,
         holders: Vec::new(),
         pinned: None,
+        answered_by: None,
     };
     let response = build_object_response("https://local.example", &resolved);
     assert_eq!(response.access_methods.len(), 1);
@@ -679,6 +682,7 @@ fn pinned_holder_url() {
         origin: Some("https://answered.example".to_string()),
         holders: vec![test_node_id()],
         pinned: Some("https://holder.example".to_string()),
+        answered_by: None,
     };
     let response = build_object_response("https://local.example", &resolved);
     assert_eq!(
@@ -705,7 +709,7 @@ fn download_declares_statuses() {
         .expect("download operation")
         .responses
         .responses;
-    for status in ["404", "409", "503"] {
+    for status in ["307", "404", "409", "503"] {
         assert!(responses.contains_key(status), "missing {status}");
     }
 }

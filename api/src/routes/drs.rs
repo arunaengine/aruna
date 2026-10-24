@@ -12,12 +12,17 @@ use crate::server::state::{RestInterfaceRuntime, ServerState};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendLocation, object_permission_path};
+use aruna_core::structs::storage::distribution::ticket::{SignedTicket, TICKET_QUERY};
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
+use aruna_operations::auth::bearer_token::token_grant;
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::distribution::resolve::{GlobalResolution, resolve_version};
+use aruna_operations::distribution::ticket::{
+    RedeemError, TicketInput, issue_ticket, redeem_ticket,
+};
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::node::holder_choice::choose_holder;
 use aruna_operations::node::node_info::read_info_documents;
@@ -77,7 +82,7 @@ const BULK_PROBE_CONCURRENCY: usize = 8;
 pub struct DrsApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    routes_at(
+    let router = routes_at(
         OpenApiRouter::with_openapi(DrsApiDoc::openapi())
             .routes(routes!(get_service_info))
             .routes(routes!(post_objects))
@@ -85,7 +90,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         // Object ids carry `/`, so the runtime template is a catch-all.
         "/ga4gh/drs/v1/objects/{*object_id}",
         routes!(get_authorizations, get_object),
-    )
+    );
+    routes_at(router, "/resolve/{*id}", routes!(resolve_data))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -205,6 +211,11 @@ pub struct DrsBulkItem {
 #[derive(Debug, Deserialize)]
 pub struct DownloadQuery {
     object_id: String,
+    /// A pinned URL: serve here and never choose another holder.
+    #[serde(default)]
+    here: bool,
+    /// A download ticket of the node that redirected here.
+    ticket: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -248,6 +259,8 @@ struct ResolvedObject {
     holders: Vec<aruna_core::NodeId>,
     /// The base URL of the holder chosen to serve; its access URL is pinned there.
     pinned: Option<String>,
+    /// The node that answered for bytes that live elsewhere.
+    answered_by: Option<aruna_core::NodeId>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -650,69 +663,188 @@ fn download_error(error: GetObjectError) -> Response {
     path = "/ga4gh/drs/v1/download",
     tag = "drs",
     summary = "Download the bytes of a DRS object",
-    description = r#"Streams the bytes of a DRS object from the node that owns it.
+    description = r#"Streams the bytes of a DRS object, or redirects to the node that serves them.
 
 **Authentication**: optional, and it changes the result exactly as in the object lookup: an
-anonymous caller downloads only publicly readable objects.
+anonymous caller downloads only publicly readable objects. A `ticket` from the node that
+redirected here stands in for the caller's bearer token.
 
 **Behavior**
-- This is the URL advertised as the object's `https` access method; it streams the bytes itself and
-  never redirects, so a client follows no `Location` and needs no signed URL, only its own bearer
-  token.
-- Only the owning node serves bytes: an identifier that resolves at another node of the realm is
-  answered 501, because this node holds the metadata but not the object.
+- Every original download chooses who serves: for a distributed object two random holders with
+  a fresh heartbeat, the one with more free download slots wins, and this node counts when it
+  keeps the bytes; an ordinary object of another node is served by that node.
+- When another node serves, the answer is a temporary redirect (307, `Cache-Control: no-store`)
+  to its pinned download URL (`here=true`). For an authenticated caller the URL carries a
+  single-use download ticket valid for a few seconds, because browsers drop `Authorization`
+  on cross-origin redirects; the target checks the ticket, revocation and the caller's
+  permission on its own path. A caller whose token cannot be named in a ticket (an external
+  OIDC token) is served here when this node keeps the bytes, otherwise redirected without one.
+- A pinned URL serves here and never chooses again; a holder that cannot serve answers 503 and
+  the client retries the original URL.
 - The 200 carries the raw bytes and a `Content-Length` taken from the stored object; no content type
   is asserted and range requests are not supported.
 - Each transfer takes one node-wide download slot and one per-caller slot, keyed by user for an
   authenticated caller and by client address for an anonymous one; a slot that cannot be taken
-  refuses the download rather than queueing it.
+  refuses the download rather than queueing it. Heartbeats report the slot use.
 
 **Limits**
 - A transfer that stalls for 20 seconds, or that is still running after 30 minutes, is cut mid-body:
   the 200 has already been sent, so a client must treat a body shorter than `Content-Length` as a
   failed download and retry."#,
-    params(("object_id" = String, Query, description = "Aruna data W3ID, content-hash `ch` ARN, or versioned `s3` ARN locator, URL-encoded because these identifiers contain `:` and `/`")),
+    params(
+        ("object_id" = String, Query, description = "Aruna data W3ID (content hash, versioned `s3` ARN or global id), short global id `/{realm-id}/{version-id}`, content-hash `ch` ARN, or versioned `s3` ARN locator, URL-encoded because these identifiers contain `:` and `/`"),
+        ("here" = Option<bool>, Query, description = "Pinned URL: serve on this node and never redirect"),
+        ("ticket" = Option<String>, Query, description = "Download ticket of the redirecting node; single use, never logged")
+    ),
     responses(
         (status = 200, description = "Object bytes, streamed inline with a `Content-Length` header and no content type"),
+        (status = 307, description = "Another node serves the bytes; `Location` is its pinned download URL, with a download ticket for an authenticated caller, and the answer is never cached"),
         (status = 400, description = "The identifier is not one of the accepted forms, or its content hash, key encoding or version is malformed", body = DrsErrorPayload),
-        (status = 403, description = "An authenticated caller lacks READ; an anonymous caller gets 404 instead, so existence stays hidden", body = DrsErrorPayload),
-        (status = 404, description = "No such object on this node, an anonymous caller may not read it, or the recorded reference observation is no longer served by its source", body = DrsErrorPayload),
-        (status = 409, description = "Reference binding reached its automatic advance limit; retrying does not help until the reference is rebound by an explicit write", body = DrsErrorPayload),
-        (status = 501, description = "The identifier resolves to an object owned by another node, which alone serves its bytes; read the object first and download from the endpoint it names", body = DrsErrorPayload),
-        (status = 503, description = "Reference source is changing, or the owning node could not answer within the probe budget; retry. The same status is returned when the node's download capacity is exhausted, which is also retryable", body = DrsErrorPayload)
+        (status = 403, description = "An authenticated caller lacks READ, or the download ticket is refused; an anonymous caller gets 404 instead, so existence stays hidden", body = DrsErrorPayload),
+        (status = 404, description = "No such object, an anonymous caller may not read it, or the recorded reference observation is no longer served by its source", body = DrsErrorPayload),
+        (status = 409, description = "Reference binding reached its automatic advance limit, or more than one distributed bucket holds the version id", body = DrsErrorPayload),
+        (status = 503, description = "Reference source is changing, no holder could answer within the probe budget, this pinned holder cannot serve, or the node's download capacity is exhausted; retry", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
 pub async fn download_object(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
+    let caller = Caller {
+        auth,
+        bearer,
+        address: client_ip(state.trusted_proxies(), peer.ip(), &headers),
+    };
+    serve_download(&state, caller, &query.object_id, query.here, query.ticket).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResolveQuery {
+    #[serde(default)]
+    here: bool,
+    ticket: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/resolve/{id}",
+    tag = "drs",
+    summary = "Resolve an Aruna data w3id to its bytes",
+    description = r#"The node route the realm registry redirects `https://w3id.org/aruna/data/{id}` to.
+
+**Authentication**: optional, exactly as for `GET /ga4gh/drs/v1/download`.
+
+**Behavior**: `{id}` is the part after `https://w3id.org/aruna/data/`: a global id
+`{realm-id}/{version-id}`, a versioned `s3` node ARN or a content hash. The answer is the
+download of that identifier: the bytes, or a temporary redirect (307, `Cache-Control:
+no-store`) to the holder chosen to serve them. Bucket and prefix ids name no object (400)."#,
+    params(
+        ("id" = String, Path, description = "Identifier after the w3id data base; the whole remainder of the path"),
+        ("here" = Option<bool>, Query, description = "Pinned URL: serve on this node and never redirect"),
+        ("ticket" = Option<String>, Query, description = "Download ticket of the redirecting node; single use, never logged")
+    ),
+    responses(
+        (status = 200, description = "Object bytes, streamed inline with a `Content-Length` header"),
+        (status = 307, description = "Another node serves the bytes; `Location` is its pinned download URL"),
+        (status = 400, description = "The identifier is malformed or names no object", body = DrsErrorPayload),
+        (status = 403, description = "An authenticated caller lacks READ, or the download ticket is refused", body = DrsErrorPayload),
+        (status = 404, description = "No such object, or an anonymous caller may not read it", body = DrsErrorPayload),
+        (status = 409, description = "More than one distributed bucket holds the version id", body = DrsErrorPayload),
+        (status = 503, description = "No holder could answer now; retry", body = DrsErrorPayload)
+    ),
+    security((), ("bearer_auth" = []))
+)]
+pub async fn resolve_data(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ResolveQuery>,
+) -> Response {
+    let caller = Caller {
+        auth,
+        bearer,
+        address: client_ip(state.trusted_proxies(), peer.ip(), &headers),
+    };
+    let object_id = format!("{DATA_PREFIX}{id}");
+    serve_download(&state, caller, &object_id, query.here, query.ticket).await
+}
+
+/// Who asks for a download: the authenticated caller, its token and its address.
+struct Caller {
+    auth: Option<AuthContext>,
+    bearer: Option<crate::auth::ValidatedBearer>,
+    address: std::net::IpAddr,
+}
+
+/// Serves or redirects one download of `object_id`; `here` marks a pinned URL.
+async fn serve_download(
+    state: &Arc<ServerState>,
+    caller: Caller,
+    object_id: &str,
+    here: bool,
+    ticket: Option<String>,
+) -> Response {
+    let mut auth = caller.auth;
+    if auth.is_none()
+        && let Some(encoded) = ticket.as_deref()
+    {
+        match redeem(state, encoded, object_id).await {
+            Ok(redeemed) => auth = Some(redeemed),
+            Err(response) => return response,
+        }
+    }
     let anonymous = auth.is_none();
     let Ok(auth) = drs_auth(state.as_ref(), auth) else {
         return drs_error(StatusCode::NOT_FOUND, "DRS object not found");
     };
-    let resolved =
-        match resolve_object(state.as_ref(), &auth, &query.object_id, routed_deadline()).await {
-            Ok(ResolveOutcome::Found(resolved)) => resolved,
-            Ok(ResolveOutcome::Denied) => return drs_denied_error(anonymous).into_response(),
-            Ok(ResolveOutcome::NotFound) => {
-                return DrsError::not_found("DRS object not found").into_response();
-            }
-            Ok(ResolveOutcome::Unavailable) => return DrsError::unavailable().into_response(),
-            Err(error) => return error.into_response(),
+    let resolved = match resolve_object(state.as_ref(), &auth, object_id, routed_deadline()).await {
+        Ok(ResolveOutcome::Found(resolved)) => resolved,
+        Ok(ResolveOutcome::Denied) => return drs_denied_error(anonymous).into_response(),
+        Ok(ResolveOutcome::NotFound) => {
+            return DrsError::not_found("DRS object not found").into_response();
+        }
+        Ok(ResolveOutcome::Unavailable) => return DrsError::unavailable().into_response(),
+        Err(error) => return error.into_response(),
+    };
+    let token = crate::metadata::bearer_token_string(caller.bearer);
+    let grant = token.as_deref().and_then(|token| token_grant(token).ok());
+    // A caller no ticket can name is served here whenever the bytes are here.
+    let ticketable = anonymous || grant.is_some();
+    if !here && (ticketable || resolved.location.is_none()) {
+        let target = match chosen_holder(state.as_ref(), &resolved).await {
+            Some(node_id) => Some(node_id),
+            None if resolved.location.is_none() => resolved.answered_by,
+            None => None,
         };
+        if let Some(node_id) = target {
+            let ticket = grant.map(|grant| TicketInput {
+                target: node_id,
+                user_id: auth.user_id,
+                grant,
+                restrictions: auth.path_restrictions.clone(),
+                session: auth.session.clone(),
+                object_id: object_id.to_string(),
+            });
+            return holder_redirect(state.as_ref(), node_id, object_id, ticket).await;
+        }
+    }
     let Some(resolved_location) = resolved.location.clone() else {
         return drs_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "object bytes are served by the owning node",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node cannot serve the object now; retry the original URL",
         );
     };
 
     let key = if anonymous {
-        LocalKey::Ip(client_ip(state.trusted_proxies(), peer.ip(), &headers))
+        LocalKey::Ip(caller.address)
     } else {
         LocalKey::User(auth.user_id)
     };
@@ -760,6 +892,22 @@ pub async fn download_object(
     response
 }
 
+/// Redeems a download ticket for `object_id`; a refusal is the response to send.
+async fn redeem(
+    state: &Arc<ServerState>,
+    encoded: &str,
+    object_id: &str,
+) -> Result<AuthContext, Response> {
+    let refused = || drs_error(StatusCode::FORBIDDEN, "download ticket refused");
+    let signed = SignedTicket::decode(encoded).map_err(|_| refused())?;
+    let now = now_millis() / 1000;
+    match redeem_ticket(&state.get_ctx(), &signed, object_id, now).await {
+        Ok(auth) => Ok(auth),
+        Err(RedeemError::Unavailable) => Err(DrsError::unavailable().into_response()),
+        Err(_) => Err(refused()),
+    }
+}
+
 /// The node that serves a distributed object instead of this one, of two fresh holders the one
 /// with more free download slots; this node counts when it keeps the bytes. `None` serves here.
 async fn chosen_holder(
@@ -789,6 +937,42 @@ async fn pin_holder(state: &ServerState, resolved: &mut ResolvedObject) {
     {
         resolved.pinned = Some(origin);
     }
+}
+
+/// A temporary, uncached redirect to `node_id`'s pinned download URL, with a ticket when the
+/// caller is authenticated. The URL is never logged.
+async fn holder_redirect(
+    state: &ServerState,
+    node_id: aruna_core::NodeId,
+    object_id: &str,
+    ticket: Option<TicketInput>,
+) -> Response {
+    let Ok(Some(origin)) = owner_origin(state, node_id).await else {
+        return DrsError::unavailable().into_response();
+    };
+    let mut url = format!(
+        "{origin}/api/v1/ga4gh/drs/v1/download?object_id={}&here=true",
+        encode_component(object_id)
+    );
+    if let Some(input) = ticket {
+        let signed = issue_ticket(&state.get_ctx(), input, now_millis() / 1000);
+        let Some(encoded) = signed.and_then(|signed| signed.encode().ok()) else {
+            return DrsError::unavailable().into_response();
+        };
+        url.push_str(&format!("&{TICKET_QUERY}={encoded}"));
+    }
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+    let Ok(location) = http::HeaderValue::from_str(&url) else {
+        return DrsError::unavailable().into_response();
+    };
+    let headers = response.headers_mut();
+    headers.insert(http::header::LOCATION, location);
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 /// The datasets whose linked parts contain a local object; `None` when no metadata node
@@ -1098,6 +1282,7 @@ async fn resolve_at(
         origin: Some(origin),
         holders: Vec::new(),
         pinned: None,
+        answered_by: Some(node_id),
     }))
 }
 
@@ -1212,6 +1397,7 @@ async fn resolve_local(
         origin: None,
         holders: Vec::new(),
         pinned: None,
+        answered_by: None,
     }))
 }
 
@@ -1301,6 +1487,7 @@ async fn resolve_content_hash(
             origin: None,
             holders: Vec::new(),
             pinned: None,
+            answered_by: None,
         }));
     }
 
