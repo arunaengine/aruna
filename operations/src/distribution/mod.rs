@@ -9,6 +9,7 @@ use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement
 
 use crate::driver::DriverContext;
 
+pub mod admit;
 pub mod handoff;
 pub mod inventory;
 pub mod publish;

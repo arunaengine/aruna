@@ -324,6 +324,12 @@ impl CreateBucketOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(CreateBucketError::NoTransactionFound);
         };
+        // Every creation, a replicated one too, gets a fresh id for its delete trail.
+        let creation = ulid::Ulid::generate().to_bytes();
+        if let Some(binding) = self.bucket_info.distribution.as_mut() {
+            // A member binds this exact incarnation, so a later bucket of the name never passes.
+            binding.incarnation = u128::from_be_bytes(creation);
+        }
         let bytes = match self.bucket_info.to_bytes() {
             Ok(bytes) => bytes,
             Err(err) => return self.emit_error(err.into()),
@@ -331,8 +337,7 @@ impl CreateBucketOperation {
 
         self.state = CreateBucketState::CreateBucket;
         let key: aruna_core::types::Key = self.bucket.as_bytes().into();
-        // Every creation, a replicated one too, gets a fresh id for its delete trail.
-        let creation = ulid::Ulid::generate().to_bytes().to_vec();
+        let creation = creation.to_vec();
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes: vec![
                 (S3_BUCKET_KEYSPACE.to_string(), key.clone(), bytes.into()),
@@ -920,5 +925,53 @@ mod test {
         }
         assert_ne!(seen[0], seen[1]);
         assert_ne!(seen[0], 0);
+    }
+
+    #[tokio::test]
+    async fn member_binds_incarnation() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let binding = aruna_core::structs::storage::distribution::DistributionBinding {
+            set_id: Ulid::generate(),
+            member_id: Ulid::generate(),
+            incarnation: 0,
+            revision: Default::default(),
+        };
+        let bucket_info = BucketInfo {
+            group_id: Ulid::generate(),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: Some(binding),
+        };
+        let create = CreateBucketOperation::new("bucket-a".to_string(), bucket_info);
+        let created = drive(create, &driver_ctx).await.unwrap();
+        let read = StorageEffect::Read {
+            key_space: BUCKET_CREATION_KEYSPACE.to_string(),
+            key: b"bucket-a".to_vec().into(),
+            txn_id: None,
+        };
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+            driver_ctx.storage_handle.send_storage_effect(read).await
+        else {
+            panic!("expected the creation row")
+        };
+        let local = aruna_core::structs::storage::blob::incarnation(value.as_deref());
+        let bound = created.distribution.expect("binding kept").incarnation;
+        assert_eq!(bound, local);
+        assert_ne!(bound, 0);
     }
 }
