@@ -400,6 +400,8 @@ pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationMani
         version_generation: 0,
         logical_identity: None,
         distribution: None,
+        version_origin: None,
+        version_hop: None,
     }
 }
 
