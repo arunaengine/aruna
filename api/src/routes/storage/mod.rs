@@ -11,6 +11,7 @@ pub mod compression;
 pub mod connectors;
 pub mod deletion;
 pub mod discovery;
+pub mod distributed;
 pub mod encryption;
 pub mod group_backends;
 pub mod imports;

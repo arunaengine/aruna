@@ -72,6 +72,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::group_backends::router())
         .merge(storage::imports::router())
         .merge(storage::discovery::router())
+        .merge(storage::distributed::router())
         .merge(storage::organize::router())
         .merge(storage::routing::router())
         .merge(sync::router())
@@ -259,6 +260,7 @@ pub(crate) mod tests {
         ("GET", "/data/blobs/envelope"),
         ("GET", "/data/blobs/content"),
         ("GET", "/data/blobs/locations"),
+        ("GET", "/data/buckets/{bucket}/distribution"),
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),
@@ -334,6 +336,10 @@ pub(crate) mod tests {
             "/data/groups/{group_id}/storage/backends/{backend_id}/buckets/{bucket}",
         ),
         ("GET", "/data/groups/{group_id}/storage/buckets"),
+        (
+            "GET",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}",
+        ),
         ("GET", "/data/groups/{group_id}/storage/routing"),
         ("GET", "/data/groups/{group_id}/storage/imports"),
         ("GET", "/data/groups/{group_id}/storage/imports/{import_id}"),
@@ -455,6 +461,11 @@ pub(crate) mod tests {
         ("POST", "/access/groups"),
         ("POST", "/data/groups/{group_id}/connectors"),
         ("POST", "/data/groups/{group_id}/connectors/check"),
+        ("POST", "/data/groups/{group_id}/distributed-buckets"),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/admission",
+        ),
         (
             "POST",
             "/data/groups/{group_id}/connectors/{connector_id}/check",
