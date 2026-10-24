@@ -297,6 +297,12 @@ pub(crate) async fn rebuild_index(context: &DriverContext) -> Result<usize, Meta
         let references = metadata_handle
             .snapshot_iri_references(record.graph_iri.clone())
             .await?;
+        let links =
+            super::data_links::project_links(&record.graph_iri, record.last_event_id, &references);
+        let link_rows =
+            super::data_links::plan_link_rows(&context.storage_handle, record.document_id, &links)
+                .await?;
+        super::data_links::apply_rows(&context.storage_handle, link_rows).await?;
         let projected =
             project_iri_references(record.document_id, record.last_event_id, references);
         write_iri_references(&context.storage_handle, &projected).await?;

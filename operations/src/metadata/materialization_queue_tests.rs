@@ -1410,6 +1410,7 @@ async fn finish_keeps_newer() {
             document_job_key: Some(document_job_key(document_id, old_event_id).to_vec()),
             status: Some(materialization_success_status(&old_job, &old_event, None)),
             iri_index_writes: Vec::new(),
+            link_deletes: Vec::new(),
             raw_state_write: None,
             validation_write: None,
             sync: None,
@@ -1515,6 +1516,7 @@ async fn finish_not_regress() {
                     ByteView::from(stale_index_key.clone()),
                     ByteView::from(vec![1]),
                 )],
+                link_deletes: Vec::new(),
                 raw_state_write: Some((
                     RAW_REVISION_KEYSPACE.to_string(),
                     raw_state_key.clone(),
@@ -1940,6 +1942,7 @@ fn sync_dedupes_graphs() {
             document_job_key: None,
             status: None,
             iri_index_writes: Vec::new(),
+            link_deletes: Vec::new(),
             raw_state_write: None,
             validation_write: None,
             sync: Some(CompletedMaterializationSync {

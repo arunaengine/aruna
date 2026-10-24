@@ -316,7 +316,8 @@ async fn prune_deleted_index(
         return Ok(());
     }
     let keys = super::iri_index::document_iri_keys(&context.storage_handle, document_ids).await?;
-    super::iri_index::delete_keys(&context.storage_handle, keys).await
+    super::iri_index::delete_keys(&context.storage_handle, keys).await?;
+    Ok(super::data_links::delete_documents(&context.storage_handle, document_ids).await?)
 }
 
 fn group_prune_jobs(

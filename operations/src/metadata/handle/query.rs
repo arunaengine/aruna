@@ -339,16 +339,37 @@ pub(super) fn snapshot_iri_references(
         let Some(predicate) = quad.predicate.to_named_node() else {
             continue;
         };
-        let Some(Term::NamedNode(object)) = quad.object.to_term() else {
-            continue;
+        let object = match quad.object.to_term() {
+            Some(Term::NamedNode(object)) => object.as_str().to_string(),
+            // A literal `contentUrl` that names Aruna data is indexed like an IRI.
+            Some(Term::Literal(literal))
+                if CONTENT_URL_IRIS.contains(&predicate.as_str())
+                    && names_aruna_data(literal.value()) =>
+            {
+                literal.value().to_string()
+            }
+            _ => continue,
         };
-        references.push((
-            subject,
-            predicate.as_str().to_string(),
-            object.as_str().to_string(),
-        ));
+        references.push((subject, predicate.as_str().to_string(), object));
     }
     Ok(references)
+}
+
+const CONTENT_URL_IRIS: [&str; 2] = [
+    "http://schema.org/contentUrl",
+    "https://schema.org/contentUrl",
+];
+
+fn names_aruna_data(value: &str) -> bool {
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+    aruna_core::structs::storage::data_link::DataLink::parse(value).is_some()
+        || VersionedObjectArn::parse(value).is_ok()
+        || VersionedObjectArn::parse(
+            value
+                .strip_prefix(aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX)
+                .unwrap_or_default(),
+        )
+        .is_ok()
 }
 
 impl MetadataHandle {

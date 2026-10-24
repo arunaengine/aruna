@@ -8,6 +8,7 @@ pub(crate) mod builtin;
 pub mod checkpoint;
 pub mod contact;
 pub mod create_document;
+pub(crate) mod data_links;
 pub mod delete_document;
 pub mod device_pull;
 pub mod forward;

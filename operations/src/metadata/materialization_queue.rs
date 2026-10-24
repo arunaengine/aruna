@@ -101,6 +101,8 @@ struct CompletedMaterializationJob {
     document_job_key: Option<Vec<u8>>,
     status: Option<MaterializationStatusRecord>,
     iri_index_writes: Vec<(String, ByteView, ByteView)>,
+    /// Older data link rows of the document that this materialization replaces.
+    link_deletes: Vec<(String, ByteView)>,
     raw_state_write: Option<(String, ByteView, ByteView)>,
     validation_write: Option<(String, ByteView, ByteView)>,
     sync: Option<CompletedMaterializationSync>,
@@ -702,6 +704,7 @@ async fn plan_finish_chunk(
                     if should_write_final(current, &status) {
                         superseding.insert(status.document_id, status.event_id);
                         plan.writes.extend(job.iri_index_writes);
+                        plan.deletes.extend(job.link_deletes);
                         if let Some(raw_state_write) = job.raw_state_write {
                             plan.writes.push(raw_state_write);
                         }
@@ -1593,6 +1596,7 @@ async fn process_materialization_job(
                     document_job_key: Some(document_job_key),
                     status: None,
                     iri_index_writes: Vec::new(),
+                    link_deletes: Vec::new(),
                     raw_state_write: None,
                     validation_write: None,
                     sync: None,
@@ -1615,6 +1619,7 @@ async fn process_materialization_job(
                     document_job_key: Some(document_job_key),
                     status: None,
                     iri_index_writes: Vec::new(),
+                    link_deletes: Vec::new(),
                     raw_state_write: None,
                     validation_write: None,
                     sync: None,
@@ -1637,6 +1642,7 @@ async fn process_materialization_job(
                     true,
                 )),
                 iri_index_writes: Vec::new(),
+                link_deletes: Vec::new(),
                 raw_state_write: None,
                 validation_write: None,
                 sync: None,
@@ -1673,15 +1679,16 @@ async fn process_materialization_job(
                 // The next materialization of this document checks the window again.
                 warn!(document_id = %event.record.document_id, %error, "Metadata checkpoint failed");
             }
-            let iri_index_writes = match project_materialized_iris(context, &event).await {
-                Ok(writes) => writes,
-                Err(error) => {
-                    return Ok(ProcessedMaterializationJob::deferred(
-                        defer_materialization_job(&job_key, &job, &event, &error),
-                        craqle_elapsed,
-                    ));
-                }
-            };
+            let (iri_index_writes, link_deletes) =
+                match project_materialized_iris(context, &event).await {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        return Ok(ProcessedMaterializationJob::deferred(
+                            defer_materialization_job(&job_key, &job, &event, &error),
+                            craqle_elapsed,
+                        ));
+                    }
+                };
             Ok(ProcessedMaterializationJob::completed(
                 CompletedMaterializationJob {
                     job_key,
@@ -1692,6 +1699,7 @@ async fn process_materialization_job(
                         raw_revision.as_ref(),
                     )),
                     iri_index_writes,
+                    link_deletes,
                     raw_state_write: Some(materialized.raw_state_write),
                     validation_write: materialized.validation_write,
                     sync: Some(CompletedMaterializationSync {
@@ -1714,6 +1722,7 @@ async fn process_materialization_job(
                     true,
                 )),
                 iri_index_writes: Vec::new(),
+                link_deletes: Vec::new(),
                 raw_state_write: None,
                 validation_write: None,
                 sync: None,
@@ -2240,10 +2249,14 @@ async fn merge_batch_event(
     })
 }
 
+/// The IRI index and data link rows of one materialization, and the stale link rows it drops.
 async fn project_materialized_iris(
     context: &DriverContext,
     event: &MetadataEventRecord,
-) -> Result<Vec<(String, ByteView, ByteView)>, MetadataMaterializationError> {
+) -> Result<
+    (Vec<(String, ByteView, ByteView)>, Vec<(String, ByteView)>),
+    MetadataMaterializationError,
+> {
     let metadata_handle = context
         .metadata_handle
         .as_ref()
@@ -2251,12 +2264,23 @@ async fn project_materialized_iris(
     let references = metadata_handle
         .snapshot_iri_references(event.record.graph_iri.clone())
         .await?;
+    let links =
+        super::data_links::project_links(&event.record.graph_iri, event.event_id, &references);
+    let link_rows = super::data_links::plan_link_rows(
+        &context.storage_handle,
+        event.record.document_id,
+        &links,
+    )
+    .await
+    .map_err(|error| MetadataMaterializationError::UnexpectedEvent(error.to_string()))?;
     let records = super::iri_index::project_iri_references(
         event.record.document_id,
         event.event_id,
         references,
     );
-    super::iri_index::iri_write_entries(&records).map_err(MetadataMaterializationError::from)
+    let mut writes = super::iri_index::iri_write_entries(&records)?;
+    writes.extend(link_rows.writes);
+    Ok((writes, link_rows.deletes))
 }
 
 fn graph_materialization_effect(
