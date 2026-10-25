@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_only_https_targets() {
+    fn https_targets_only() {
         let url = |value: &str| url::Url::parse(value).unwrap();
         assert_eq!(
             resolve_target(&url("https://realm.example.org/api/v1"), "r/v"),

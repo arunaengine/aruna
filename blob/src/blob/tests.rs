@@ -1200,7 +1200,7 @@ async fn hidden_bucket_registered() {
 }
 
 #[tokio::test]
-async fn full_bucket_leaves_index() {
+async fn full_bucket_unselectable() {
     let context = setup_blob_handle(2).await;
     let write = |key: &str| BlobEffect::Write {
         resolved: ResolvedBackend::node_default(),

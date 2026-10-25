@@ -203,7 +203,7 @@ async fn missing_config_parks() {
 }
 
 #[tokio::test]
-async fn gap_recovers_by_snapshot() {
+async fn snapshot_fills_gap() {
     // A node that missed revisions installs the latest snapshot without replaying them.
     let (_dir, storage) = test_storage();
     realm_nodes(&storage).await;

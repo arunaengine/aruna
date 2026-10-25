@@ -75,7 +75,7 @@ async fn concurrent_deltas_merge() {
 
 /// A transaction that conflicts or aborts adds none of its deltas.
 #[tokio::test]
-async fn failed_txn_adds_nothing() {
+async fn failure_adds_nothing() {
     let dir = tempdir().unwrap();
     let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let loser = start_write_transaction(&handle).await;
