@@ -30,6 +30,7 @@ use crate::device::backlog::{
 };
 use crate::device::drain::DrainOutcome;
 use crate::driver::DriverContext;
+use crate::placement::process_placements::load_realm_config;
 
 use super::folders::FolderError;
 use super::pull::forward_pull;
@@ -44,6 +45,9 @@ pub const UPLOAD_DEFER_AFTER: Duration = Duration::from_secs(15);
 /// Delay between passes while uploads are still due.
 pub const UPLOAD_CONTINUE_AFTER: Duration = Duration::from_millis(250);
 
+/// Uploads forwarded at once. Each one holds a single realm pull and its polls.
+const UPLOADS_IN_FLIGHT: usize = 8;
+
 /// Forwards every due upload, oldest folder first.
 pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
     let Some(net_handle) = context.net_handle.as_ref() else {
@@ -51,6 +55,13 @@ pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
     };
     let realm_id = *net_handle.realm_id();
     let node_id = net_handle.node_id();
+    // A realm that limits a device's concurrent requests gets no more uploads at once.
+    let in_flight = load_realm_config(context, realm_id)
+        .await
+        .and_then(|config| config.quota.device_concurrent_pulls)
+        .map_or(UPLOADS_IN_FLIGHT, |limit| {
+            UPLOADS_IN_FLIGHT.min(limit as usize)
+        });
     let now = unix_timestamp_millis();
     drain_queue(
         now,
@@ -59,6 +70,7 @@ pub async fn drain_sync_outbox(context: &Arc<DriverContext>) -> DrainOutcome {
             realm_id,
             node_id,
         },
+        in_flight,
     )
     .await
 }
@@ -108,7 +120,7 @@ impl QueueDrain for UploadDrain<'_> {
         read_page(self.context, cursor).await
     }
 
-    async fn forward(&mut self, upload: SyncUpload) -> ForwardOutcome {
+    async fn forward(&self, upload: SyncUpload) -> ForwardOutcome {
         let Some(folder) = load_folder(self.context, upload.folder_id).await else {
             // The folder is unbound: this entry is nobody's work any more, and
             // leaving it would keep the drain awake for a folder that is gone.
