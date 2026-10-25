@@ -110,6 +110,8 @@ pub enum GetObjectState {
     StartAdvanceTransaction,
     /// Reads the bucket in the advance transaction; a distributed bucket never advances here.
     ReadBucketAdvance,
+    /// A distributed bucket's advance is dropped, then a refresh is queued for its coordinator.
+    AbortAdvance,
     ReadHeadAdvance,
     ReadAdvance,
     WriteSuccessor,
@@ -1346,7 +1348,7 @@ impl GetObjectOperation {
     }
 
     /// Source changes of a distributed bucket become successors only through the coordinated
-    /// refresh, so a read there fails instead of advancing the binding.
+    /// refresh, so a read there queues one durably and fails instead of advancing the binding.
     fn handle_advance_bucket(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.abort_with_error(GetObjectError::InvalidStateEvent {
@@ -1363,7 +1365,11 @@ impl GetObjectOperation {
             Err(err) => return self.abort_with_error(GetObjectError::ConversionError(err)),
         };
         if bucket.is_some_and(|bucket| bucket.distribution.is_some()) {
-            return self.abort_with_error(GetObjectError::ReferenceSourceChanged);
+            let Some(txn_id) = self.txn_id.take() else {
+                return self.queue_changed_refresh();
+            };
+            self.state = GetObjectState::AbortAdvance;
+            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
         }
         let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
             Ok(key) => key.into(),
@@ -1375,6 +1381,19 @@ impl GetObjectOperation {
             key,
             txn_id: self.txn_id,
         })]
+    }
+
+    fn advance_aborted(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(
+                StorageEvent::TransactionAborted { .. } | StorageEvent::Error { .. },
+            ) => self.queue_changed_refresh(),
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionAborted)",
+                received: other,
+            }),
+        }
     }
 
     fn handle_advance_head(&mut self, event: Event) -> Effects {
@@ -1968,6 +1987,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::HeadReferenceSource => self.reference_head_received(event),
             GetObjectState::StartAdvanceTransaction => self.handle_advance_started(event),
             GetObjectState::ReadBucketAdvance => self.handle_advance_bucket(event),
+            GetObjectState::AbortAdvance => self.advance_aborted(event),
             GetObjectState::ReadHeadAdvance => self.handle_advance_head(event),
             GetObjectState::ReadAdvance => self.handle_advance_version(event),
             GetObjectState::WriteSuccessor => self.handle_successor_written(event),

@@ -1478,7 +1478,7 @@ fn source_read(metadata: SourceMetadata) -> Event {
 }
 
 // A distributed bucket records source changes only through the coordinated refresh, so a
-// drifted read there fails and releases its transaction instead of advancing the binding.
+// drifted read there releases its transaction, queues a refresh and fails.
 #[test]
 fn bound_bucket_never_advances() {
     use aruna_core::structs::storage::blob::BucketInfo;
@@ -1513,6 +1513,12 @@ fn bound_bucket_never_advances() {
         effects.as_slice(),
         [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     );
+    let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
+    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    assert_eq!(operation.state, GetObjectState::QueueChangedRefresh);
+    operation.step(Event::SubOperation(SubOperationEvent::RefreshQueued {
+        result: Ok(()),
+    }));
     assert!(matches!(
         operation.finalize(),
         Err(GetObjectError::ReferenceSourceChanged)
