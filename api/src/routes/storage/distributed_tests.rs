@@ -1,3 +1,4 @@
+//! Tests the distributed bucket routes: request conversion, outage and degraded answers, refusals.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

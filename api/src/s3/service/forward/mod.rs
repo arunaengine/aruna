@@ -1,8 +1,9 @@
-//! Forwards an S3 write that reached a member of a distributed bucket to the coordinator of the
-//! key's range, with a request-bound delegation in place of the caller's signature (D33). An
-//! unreachable coordinator fails the write at once; nothing is queued.
+//! Forwards an S3 write on a distributed bucket member to the key range's coordinator, with a
+//! request-bound delegation in place of the caller's signature (D33).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// An unreachable coordinator fails the write at once; nothing is queued.
 
 pub(super) mod copy;
 pub(super) mod list;

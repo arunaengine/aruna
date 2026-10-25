@@ -1,6 +1,5 @@
-//! Lists a bucket's objects over REST. A distributed bucket is merged across its key ranges:
-//! each range is listed from this member's records or by a holder of the range through a
-//! relay with the caller's bearer token (D12), in key order and with a bounded fan-out.
+//! Lists a bucket's objects over REST; a distributed bucket is merged across its key ranges in
+//! key order, each range listed locally or by a holder through a bearer token relay (D12).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

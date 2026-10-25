@@ -1,8 +1,9 @@
-//! Copies into a distributed bucket across ranges and coordinators: a member that keeps the
-//! copy source streams it to the destination's coordinator as a forwarded write; otherwise the
-//! coordinator copies itself when it keeps the source's records (D33). Nothing is queued.
+//! Copies into a distributed bucket across ranges: a member keeping the source streams it to the
+//! destination's coordinator, else that coordinator copies from its own records (D33).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Nothing is queued.
 
 use std::collections::HashMap;
 use std::time::SystemTime;

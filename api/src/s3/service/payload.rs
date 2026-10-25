@@ -1,8 +1,9 @@
 //! Frames a forwarded body with a trailer the issuing node signs over its length and digest,
-//! and checks that trailer on the coordinator before the write can commit (D33). A body that
-//! was cut, extended or replaced fails the stream, so the write never commits.
+//! and checks that trailer on the coordinator before the write can commit (D33).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A body that was cut, extended or replaced fails the stream, so the write never commits.
 
 use std::pin::Pin;
 use std::sync::Arc;

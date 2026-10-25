@@ -1,8 +1,9 @@
-//! Lists the open multipart uploads of a distributed bucket across its key ranges: uploads live
-//! only on the coordinator of their key's range, so each range is listed from this member's
-//! upload inventory or by its coordinator, and the pages merge in key order with S3 markers.
+//! Lists a distributed bucket's open multipart uploads across its key ranges, merged in key
+//! order with S3 markers: each range from local upload inventory or by its coordinator.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Uploads live only on the coordinator of their key's range.
 
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::distribution::{

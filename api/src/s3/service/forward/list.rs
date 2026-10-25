@@ -1,6 +1,5 @@
-//! Lists a distributed bucket across its key ranges: each range under the prefix is listed
-//! from this member's records or by a holder of the range, in key order, and merged into one
-//! bounded page. Common prefixes that span a range bound appear once.
+//! Lists a distributed bucket across its key ranges into one bounded page in key order, each
+//! range from local records or by a holder; prefixes that span a range bound appear once.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

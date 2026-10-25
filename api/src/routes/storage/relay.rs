@@ -1,9 +1,9 @@
-//! Relays a REST write that reached a member of a distributed bucket to the coordinator of the
-//! key's range, and a read to a holder, with the caller's bearer token (D12). The target checks
-//! the token and the caller's permissions again on its own path; an unreachable coordinator
-//! fails the write.
+//! Relays a REST write on a distributed bucket member to the key range's coordinator, and a read
+//! to a holder, with the caller's bearer token (D12). An unreachable coordinator fails the write.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// The target checks the token and the caller's permissions again on its own path.
 
 use std::sync::LazyLock;
 use std::time::Duration;

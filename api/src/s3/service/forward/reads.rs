@@ -1,8 +1,9 @@
-//! Sends a GET or HEAD that reached a member keeping no records of the key's range to a holder
-//! of that range, chosen by free download slots, with a request-bound delegation (D33). The
-//! holder checks the caller on its own path; a holder that fails is skipped for a while.
+//! Sends a GET or HEAD for a key range this member keeps no records of to a holder, chosen by
+//! free download slots, with a request-bound delegation (D33).
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// The holder checks the caller on its own path; a holder that fails is skipped for a while.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
