@@ -290,6 +290,8 @@ mod tests {
             self.peak.fetch_max(now, Ordering::SeqCst);
             self.seen.lock().unwrap().push(entry.due_at_ms);
             self.gate.wait().await;
+            // The last to arrive must still count as running when the next forward starts.
+            tokio::task::yield_now().await;
             self.running.fetch_sub(1, Ordering::SeqCst);
             ForwardOutcome::Settled
         }
