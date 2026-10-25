@@ -697,6 +697,36 @@ fn pinned_holder_url() {
     );
 }
 
+#[test]
+fn local_holder_pinned() {
+    // A holder that chose itself pins its own URL, so the download never chooses again.
+    let blake3 = [0x22u8; 32];
+    let resolved = ResolvedObject {
+        bucket: "spire".to_string(),
+        key: "a.fa".to_string(),
+        group_id: Ulid::from_bytes([4u8; 16]),
+        version_id: Ulid::from_bytes([5u8; 16]),
+        canonical_w3id: "https://w3id.org/aruna/data/x".to_string(),
+        requested_id: "/realm/version".to_string(),
+        size: 42,
+        hashes: Default::default(),
+        source_metadata: None,
+        location: Some(materialized_location(blake3)),
+        origin: None,
+        holders: vec![test_node_id()],
+        pinned: None,
+        answered_by: None,
+    };
+    let response = build_object_response("https://local.example", &resolved);
+    assert_eq!(
+        response.access_methods[0].access_url.as_ref().unwrap().url,
+        format!(
+            "https://local.example/api/v1/ga4gh/drs/v1/download?object_id={}&here=true",
+            encode_component("/realm/version")
+        )
+    );
+}
+
 // Operators reading the spec must see the reference statuses the route can
 // actually return.
 #[test]

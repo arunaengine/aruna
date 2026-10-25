@@ -1088,6 +1088,8 @@ fn build_object_response(base_url: &str, resolved: &ResolvedObject) -> DrsObject
     // A chosen holder serves at its pinned URL; otherwise the node with the bytes serves.
     let origin = match (&resolved.pinned, &resolved.location) {
         (Some(pinned), _) => Some((pinned.as_str(), "&here=true")),
+        // This holder chose itself, so its URL is pinned here as well.
+        (None, Some(_)) if !resolved.holders.is_empty() => Some((base_url, "&here=true")),
         (None, Some(_)) => Some((base_url, "")),
         (None, None) => resolved.origin.as_deref().map(|origin| (origin, "")),
     };
