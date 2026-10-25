@@ -1,7 +1,7 @@
 arctrl==3.2.1
 argcomplete==3.7.2
 cachecontrol==0.14.4
-certifi==2026.7.22
+certifi==2026.10.19
 charset-normalizer==3.5.1
 coloredlogs==15.0.1
 cwl-upgrader==1.2.15
@@ -9,7 +9,7 @@ cwl-utils==0.44
 cwltool==3.2.20260720092025
 et-xmlfile==2.0.0
 fable-library==5.13.0
-filelock==4.0.1
+filelock==4.2.1
 humanfriendly==10.0
 idna==3.20
 lxml==6.1.3
