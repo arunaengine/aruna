@@ -1251,3 +1251,79 @@ async fn prefix_hides_keys() {
         .collect();
     assert_eq!(keys, vec!["imag"]);
 }
+
+mod distributed {
+    use super::{DataPathKind, DataPathsQuery, list_data_paths};
+    use crate::auth::ValidatedBearer;
+    use crate::mcp::data::{WriteObjectInput, store_text};
+    use crate::routes::storage::deletion::bucket_info;
+    use crate::tests::distributed::{
+        BUCKET, PEER, distribute, mock_peer, node_id, node_state, publish_api,
+    };
+    use aruna_core::structs::storage::blob::group_permission_path;
+    use axum::Extension;
+    use axum::Json;
+    use axum::extract::{Path, Query, State};
+    use axum::http::StatusCode;
+
+    /// Browsing a distributed bucket lists its own range here and the peer's range there.
+    #[tokio::test]
+    async fn browses_distributed_bucket() {
+        let node = node_state().await;
+        let info = bucket_info(&node.state, BUCKET).await.unwrap();
+        for key in ["a.md", "dir/b.md"] {
+            let input = WriteObjectInput {
+                bucket: BUCKET.to_string(),
+                key: key.to_string(),
+                text: "x".to_string(),
+                content_type: None,
+            };
+            store_text(&node.state, &node.owner, &info, input)
+                .await
+                .unwrap();
+        }
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+            "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+            "prefixes":[],"next_cursor":"more"}"#;
+        let peer = mock_peer(StatusCode::OK, answer).await;
+        publish_api(&node.state, node_id(PEER), &peer.url).await;
+        let state = &node.state;
+        let root = group_permission_path(state.get_realm_id(), node.group_id, state.get_node_id());
+
+        let (status, Json(paths)) = list_data_paths(
+            State(state.clone()),
+            Extension(Some(node.owner.clone())),
+            Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+            Path(node.group_id.to_string()),
+            Query(DataPathsQuery {
+                prefix: Some(format!("{root}/{BUCKET}")),
+                delimiter: Some("/".to_string()),
+                continuation_token: None,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        let entries: Vec<_> = (paths.entries.iter())
+            .map(|entry| {
+                (
+                    entry.permission_path.rsplit('/').next().unwrap(),
+                    entry.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("", DataPathKind::Folder),
+                ("a.md", DataPathKind::Object),
+                ("x.md", DataPathKind::Object),
+            ]
+        );
+        assert!(paths.entries[0].permission_path.ends_with("/dir/"));
+        assert_eq!(paths.continuation_token.as_deref(), Some("more"));
+    }
+}

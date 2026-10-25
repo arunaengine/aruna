@@ -465,3 +465,24 @@ fn requests_hide_secrets() {
         assert!(text.contains("token"), "{text}");
     }
 }
+
+#[test]
+fn pending_references_retry() {
+    // A connector whose references are still being checked can be replaced or deleted later.
+    assert!(matches!(
+        map_replace_error(ReplaceSourceError::ReferencesPending),
+        ServerError::ServiceUnavailableReason(_)
+    ));
+    assert!(matches!(
+        map_delete_error(DeleteSourceError::ReferencesPending),
+        ServerError::ServiceUnavailableReason(_)
+    ));
+    assert!(matches!(
+        map_replace_error(ReplaceSourceError::ReferencedObjectVersion),
+        ServerError::Conflict(_)
+    ));
+    assert!(matches!(
+        map_delete_error(DeleteSourceError::NotFound),
+        ServerError::NotFound
+    ));
+}
