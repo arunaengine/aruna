@@ -134,7 +134,7 @@ async fn searches_coordinated_ranges() {
 }
 
 #[tokio::test]
-async fn budget_bounds_denied_pages() {
+async fn denied_pages_bounded() {
     let ready = IndexState::Ready { generation: 1 };
     let test = distributed(ready, &["a/needle-1", "b/needle-2", "c/needle-3"]).await;
     let fixture = &test.fixture;
@@ -228,7 +228,7 @@ async fn ordinary_prefix_search() {
 }
 
 #[tokio::test]
-async fn realm_search_skips_distributed() {
+async fn realm_skips_distributed() {
     let ready = IndexState::Ready { generation: 1 };
     let test = distributed(ready, &["needle-spire"]).await;
     let fixture = &test.fixture;
