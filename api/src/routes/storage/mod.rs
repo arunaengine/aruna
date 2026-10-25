@@ -20,4 +20,5 @@ pub mod organize;
 pub mod relay;
 pub mod rename;
 pub mod routing;
+pub mod set_changes;
 pub mod text;

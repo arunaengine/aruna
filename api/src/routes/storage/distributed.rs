@@ -10,7 +10,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionSettings, MemberState, MetadataCoverage, RangeBehaviour, RouteError,
-    SetPhase,
+    SetPhase, TransferRole,
 };
 use aruna_operations::distribution::create::{
     CreateError, CreateInput, CreationReport, LayoutKind, admit_pending, create_set,
@@ -44,6 +44,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_distributed))
         .routes(routes!(retry_admission))
         .routes(routes!(get_bucket_distribution))
+        .merge(super::set_changes::router())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -197,9 +198,48 @@ pub struct DistributedResponse {
     pub ranges: Vec<RangeResponse>,
     /// The node glob grant that covers this bucket on every member node.
     pub recommended_grant: String,
+    /// Open transfers of ranges to another coordinator.
+    #[serde(default)]
+    pub transfers: Vec<TransferResponse>,
+    /// The deletion of the set, once it is prepared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion: Option<DeletionResponse>,
+    /// Ranges this node fenced as their former coordinator; it never writes them again at the
+    /// fenced epoch, and reconnecting does not clear the fence.
+    #[serde(default)]
+    pub fenced_ranges: Vec<String>,
+    /// This node applies no publication of the set anymore: it leaves or the set is deleted.
+    #[serde(default)]
+    pub publications_closed: bool,
 }
 
-fn strategy(value: StrategyName) -> DataStrategy {
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct TransferResponse {
+    pub transfer_id: String,
+    pub range_id: String,
+    /// The member that coordinated the range.
+    pub from: String,
+    /// The member that coordinates it once the transfer activates.
+    pub to: String,
+    /// The fresh epoch the new coordinator takes.
+    pub epoch: u64,
+    /// `replica` or `leave`: what the former coordinator keeps.
+    pub role: String,
+    /// The former coordinator fenced the range; writes to it fail until the activation.
+    pub fenced: bool,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct DeletionResponse {
+    /// Every coordinator fenced its ranges; members purge their buckets.
+    pub committed: bool,
+    pub fenced: Vec<String>,
+    /// Coordinators whose fence the commit still waits for.
+    pub waiting: Vec<String>,
+}
+
+pub(crate) fn strategy(value: StrategyName) -> DataStrategy {
     match value {
         StrategyName::Copy => DataStrategy::Copy,
         StrategyName::CopyOnUse => DataStrategy::CopyOnUse,
@@ -217,7 +257,7 @@ fn strategy_name(value: DataStrategy) -> StrategyName {
     }
 }
 
-fn node(value: &str) -> ServerResult<NodeId> {
+pub(crate) fn node(value: &str) -> ServerResult<NodeId> {
     value
         .parse()
         .map_err(|_| ServerError::BadRequestMessage(format!("`{value}` is not a node id")))
@@ -252,18 +292,7 @@ fn create_input(group_id: Ulid, request: CreateDistributedRequest) -> ServerResu
             replicas: request.replicas,
         },
     };
-    let settings = DistributionSettings {
-        refresh_secs: request.settings.refresh_secs,
-        range_behaviour: request.settings.range_behaviour.map(|value| match value {
-            BehaviourName::Passthrough => RangeBehaviour::Passthrough,
-            BehaviourName::FillFirst => RangeBehaviour::FillFirst,
-            BehaviourName::ServeAndFill => RangeBehaviour::ServeAndFill,
-        }),
-        search_index: request.settings.search_index,
-        public: request.settings.public,
-        split_objects: request.settings.split_objects,
-        split_bytes: request.settings.split_bytes,
-    };
+    let settings = settings_of(&request.settings);
     Ok(CreateInput {
         bucket: request.bucket,
         owner_group: group_id,
@@ -274,7 +303,26 @@ fn create_input(group_id: Ulid, request: CreateDistributedRequest) -> ServerResu
     })
 }
 
-fn admission_response(report: CreationReport) -> AdmissionResponse {
+pub(crate) fn behaviour(value: BehaviourName) -> RangeBehaviour {
+    match value {
+        BehaviourName::Passthrough => RangeBehaviour::Passthrough,
+        BehaviourName::FillFirst => RangeBehaviour::FillFirst,
+        BehaviourName::ServeAndFill => RangeBehaviour::ServeAndFill,
+    }
+}
+
+pub(crate) fn settings_of(request: &SettingsRequest) -> DistributionSettings {
+    DistributionSettings {
+        refresh_secs: request.refresh_secs,
+        range_behaviour: request.range_behaviour.map(behaviour),
+        search_index: request.search_index,
+        public: request.public,
+        split_objects: request.split_objects,
+        split_bytes: request.split_bytes,
+    }
+}
+
+pub(crate) fn admission_response(report: CreationReport) -> AdmissionResponse {
     AdmissionResponse {
         set_id: report.set_id.to_string(),
         active: report.active,
@@ -354,6 +402,30 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
         members,
         ranges,
         recommended_grant: status.recommended_grant,
+        transfers: (status.lifecycle.transfers.iter())
+            .map(|open| TransferResponse {
+                transfer_id: open.transfer_id.to_string(),
+                range_id: open.range_id.to_string(),
+                from: open.from.to_string(),
+                to: open.to.to_string(),
+                epoch: open.epoch,
+                role: match open.role {
+                    TransferRole::Replica => "replica".to_string(),
+                    TransferRole::Leave => "leave".to_string(),
+                },
+                fenced: open.fenced,
+                completed: open.completed,
+            })
+            .collect(),
+        deletion: status.lifecycle.deletion.map(|deletion| DeletionResponse {
+            committed: deletion.committed,
+            fenced: deletion.fenced.iter().map(ToString::to_string).collect(),
+            waiting: deletion.waiting.iter().map(ToString::to_string).collect(),
+        }),
+        fenced_ranges: (status.lifecycle.fenced_ranges.iter())
+            .map(ToString::to_string)
+            .collect(),
+        publications_closed: status.lifecycle.publications_closed,
     }
 }
 
@@ -553,7 +625,7 @@ pub async fn retry_admission(
 }
 
 /// The set's status, only when it belongs to `group_id`.
-async fn owned_status(
+pub(crate) async fn owned_status(
     state: &ServerState,
     group_id: Ulid,
     set_id: Ulid,

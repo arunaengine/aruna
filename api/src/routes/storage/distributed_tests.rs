@@ -3,7 +3,9 @@
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::distribution::DistributionRevision;
-use aruna_operations::distribution::status::{MemberStatus, RangeStatus};
+use aruna_operations::distribution::status::{
+    LifecycleStatus, MemberStatus, RangeStatus, TransferStatus,
+};
 
 use super::*;
 
@@ -117,7 +119,21 @@ fn degraded_names_coordinator() {
             degraded: Some(Reach::Unreachable { since_ms: Some(77) }),
         }],
         recommended_grant: "/r/g/9/data/*/spire/**".to_string(),
-        lifecycle: Default::default(),
+        lifecycle: LifecycleStatus {
+            transfers: vec![TransferStatus {
+                transfer_id: Ulid::from_bytes([4; 16]),
+                range_id: Ulid::from_bytes([3; 16]),
+                from: Ulid::from_bytes([2; 16]),
+                to: Ulid::from_bytes([5; 16]),
+                epoch: 2,
+                role: TransferRole::Leave,
+                fenced: true,
+                completed: false,
+            }],
+            deletion: None,
+            fenced_ranges: vec![Ulid::from_bytes([3; 16])],
+            publications_closed: false,
+        },
     };
     let response = status_response(status);
     assert!(response.configuration_changes_unavailable);
@@ -126,6 +142,13 @@ fn degraded_names_coordinator() {
     assert!(response.ranges[0].degraded);
     assert_eq!(response.ranges[0].unreachable_since_ms, Some(77));
     assert_eq!(response.ranges[0].coordinator_node, Some(node_text(2)));
+    assert_eq!(response.transfers[0].role, "leave");
+    assert!(response.transfers[0].fenced && !response.transfers[0].completed);
+    assert_eq!(
+        response.fenced_ranges,
+        vec![Ulid::from_bytes([3; 16]).to_string()]
+    );
+    assert!(response.deletion.is_none());
 }
 
 #[test]

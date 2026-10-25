@@ -651,6 +651,26 @@ pub(crate) mod tests {
         ),
         ("PUT", "/access/policies/group/{group_id}"),
         ("PUT", "/access/policies/realm"),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/members",
+        ),
+        (
+            "DELETE",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/members/{member_id}",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/transfers",
+        ),
+        (
+            "PUT",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/settings",
+        ),
+        (
+            "DELETE",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}",
+        ),
     ];
 
     /// Documented path to the runtime template that serves it. Catch-all ids
