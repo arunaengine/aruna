@@ -725,4 +725,8 @@ impl ArunaS3Service {
 }
 
 #[cfg(test)]
+pub(super) mod members;
+#[cfg(test)]
+mod members_tests;
+#[cfg(test)]
 mod tests;
