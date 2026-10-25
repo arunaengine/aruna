@@ -703,10 +703,10 @@ mod tests {
         // A bucket created for a member that was never admitted is still deleted with the set.
         let (snapshot, _) = crate::distribution::test_record::record(true);
         let mut member = snapshot.config.members[0].clone();
-        let set_id = snapshot.set_id();
+        let (set_id, member_id) = (snapshot.set_id(), member.member_id);
         let bound = |incarnation| DistributionBinding {
             set_id,
-            member_id: member.member_id,
+            member_id,
             incarnation,
             revision: snapshot.revision(),
         };
