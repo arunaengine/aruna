@@ -671,6 +671,9 @@ mod tests {
         };
         assert!(!watermark.reached_by(&older));
         let bytes = postcard::to_allocvec(&watermark).unwrap();
-        assert_eq!(postcard::from_bytes::<Watermark>(&bytes).unwrap(), watermark);
+        assert_eq!(
+            postcard::from_bytes::<Watermark>(&bytes).unwrap(),
+            watermark
+        );
     }
 }
