@@ -828,7 +828,7 @@ mod tests {
             aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
             true,
             path.clone(),
-            revision.clone(),
+            revision,
         );
         assert!(mapping.activate(user_id, revision));
         let record = MetadataRegistryRecord {
