@@ -111,7 +111,7 @@ fn hidden_survives_merge() {
 }
 
 #[test]
-fn hidden_page_moves_on() {
+fn hidden_page_continues() {
     // A node whose examined documents were all hidden still names where to continue.
     let hidden = LinkNodePage {
         hidden: true,
@@ -135,4 +135,27 @@ fn smallest_end_bounds() {
     let ids: Vec<_> = page.documents.iter().map(|doc| doc.document_id).collect();
     assert_eq!(ids, [Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16])]);
     assert_eq!(page.next_after, Some(Ulid::from_bytes([2; 16])));
+}
+
+#[test]
+fn preview_merges_nodes() {
+    use super::{SetPreviewPage, merge_previews};
+    // One document on two holders, and a node with unverified links: incomplete, merged once.
+    let first = SetPreviewPage {
+        page: node(vec![document(1, "a")]),
+        ..SetPreviewPage::default()
+    };
+    let second = SetPreviewPage {
+        page: node(vec![document(1, "b"), document(2, "a")]),
+        unverified: 1,
+        ..SetPreviewPage::default()
+    };
+    let preview = merge_previews([first, second], (2, 0), 10);
+    assert_eq!(preview.documents.len(), 2);
+    assert_eq!(preview.documents[0].links.len(), 2);
+    assert!(!preview.complete());
+    let settled = merge_previews([SetPreviewPage::default()], (1, 0), 10);
+    assert!(settled.complete());
+    let cut = merge_previews([SetPreviewPage::default()], (2, 1), 10);
+    assert!(!cut.complete());
 }

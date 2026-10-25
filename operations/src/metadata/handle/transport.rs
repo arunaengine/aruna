@@ -513,6 +513,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::DataLinkResults { .. } => "data_link_results",
         MetadataTransportMessage::BucketOwner { .. } => "bucket_owner",
         MetadataTransportMessage::BucketOwnerResult { .. } => "bucket_owner_result",
+        MetadataTransportMessage::SetPreview { .. } => "set_preview",
+        MetadataTransportMessage::SetPreviewResults { .. } => "set_preview_results",
     }
 }
 
@@ -655,6 +657,26 @@ impl MetadataHandle {
         .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::DataLinkResults { result } => result.map(|page| *page),
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    pub async fn request_set_preview(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<AuthToken>,
+        (set_id, limit): (Ulid, usize),
+    ) -> Result<crate::metadata::api::SetPreviewPage, MetadataReadError> {
+        let request = MetadataTransportMessage::SetPreview {
+            auth_token,
+            set_id,
+            limit,
+        };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::SetPreviewResults { result } => result.map(|page| *page),
             _ => Err(MetadataReadError::Unavailable),
         }
     }

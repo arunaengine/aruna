@@ -296,6 +296,130 @@ pub async fn set_preview_local(
     Ok(preview)
 }
 
+/// A set's deletion preview over every metadata node: each node's first page of the postings
+/// that name the set, merged by document id.
+#[derive(Clone, Debug, Default)]
+pub struct SetPreview {
+    pub documents: Vec<LinkDocument>,
+    /// A node holds more postings of the set than its first page.
+    pub more: bool,
+    pub hidden: bool,
+    pub nodes_queried: usize,
+    pub nodes_failed: usize,
+    pub unverified: usize,
+    pub pending_materializations: usize,
+    pub failed_materializations: usize,
+    pub truncated_documents: usize,
+}
+
+impl SetPreview {
+    /// Every node answered its whole set with nothing unsettled, unverified or truncated.
+    pub fn complete(&self) -> bool {
+        !self.more
+            && self.nodes_failed == 0
+            && self.unverified == 0
+            && self.pending_materializations == 0
+            && self.failed_materializations == 0
+            && self.truncated_documents == 0
+    }
+}
+
+/// Asks every metadata node for its first page of the documents that link `set_id`.
+pub async fn set_preview_distributed(
+    context: &DriverContext,
+    (realm_id, local_node_id): (RealmId, NodeId),
+    auth: Option<AuthContext>,
+    bearer_token: Option<String>,
+    (set_id, limit): (Ulid, usize),
+) -> Result<SetPreview, MetadataApiError> {
+    let handle = context
+        .metadata_handle
+        .clone()
+        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
+    let limit = limit.clamp(1, LINKS_MAX_LIMIT);
+    let local_call: MetadataNodeCall<SetPreviewPage> = metadata_node_call(
+        (context.clone(), auth, realm_id),
+        move |(context, auth, realm_id), _| async move {
+            set_preview_local(&context, realm_id, auth.as_ref(), set_id, None, limit)
+                .await
+                .map_err(crate::forward::transport::read_error)
+        },
+    );
+    let remote_call: MetadataNodeCall<SetPreviewPage> = metadata_node_call(
+        (handle, fanout_bearer(bearer_token.as_deref())),
+        move |(handle, auth_token), node_id| async move {
+            (handle.request_set_preview(node_id, auth_token, (set_id, limit))).await
+        },
+    );
+    let (parts, stats) = run_metadata_fanout(
+        context,
+        realm_id,
+        local_node_id,
+        MetadataFanoutScope::new(Some(ApiQueryMode::Distributed), None, true),
+        MetadataFanoutOperation::IdentifierLookup,
+        local_call,
+        remote_call,
+        record_preview_result,
+        map_read_error,
+    )
+    .await?;
+    let nodes = (
+        stats.nodes_queried,
+        stats.nodes_failed + usize::from(stats.discovery_failed),
+    );
+    Ok(merge_previews(
+        parts.into_iter().map(|(_, page)| page),
+        nodes,
+        limit,
+    ))
+}
+
+/// Merges node previews by document id, keeping the first `limit` documents.
+pub fn merge_previews(
+    pages: impl IntoIterator<Item = SetPreviewPage>,
+    (nodes_queried, nodes_failed): (usize, usize),
+    limit: usize,
+) -> SetPreview {
+    let mut preview = SetPreview {
+        nodes_queried,
+        nodes_failed,
+        ..SetPreview::default()
+    };
+    let mut merged = BTreeMap::<Ulid, LinkDocument>::new();
+    for node in pages {
+        preview.more |= node.next.is_some();
+        preview.hidden |= node.page.hidden;
+        preview.unverified += node.unverified;
+        preview.pending_materializations += node.page.pending_materializations;
+        preview.failed_materializations += node.page.failed_materializations;
+        preview.truncated_documents += node.page.truncated_documents;
+        for document in node.page.documents {
+            let entry = merged
+                .entry(document.document_id)
+                .or_insert_with(|| LinkDocument {
+                    links: Vec::new(),
+                    ..document.clone()
+                });
+            for link in document.links {
+                if !entry.links.contains(&link) {
+                    entry.links.push(link);
+                }
+            }
+        }
+    }
+    preview.more |= merged.len() > limit;
+    preview.documents = merged.into_values().take(limit).collect();
+    preview
+}
+
+fn record_preview_result(span: &Span, result: &Result<SetPreviewPage, MetadataReadError>) {
+    let outcome = match result {
+        Ok(_) => "ok",
+        Err(_) => "error",
+    };
+    span.record("result", outcome);
+}
+
 /// The version id of a set-version posting key: the 16 bytes before the document.
 fn version_of(key: &[u8]) -> Option<Ulid> {
     let end = key.len().checked_sub(16)?;

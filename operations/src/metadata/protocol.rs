@@ -584,6 +584,15 @@ pub enum MetadataTransportMessage {
     BucketOwnerResult {
         result: Result<aruna_core::types::GroupId, MetadataReadError>,
     },
+    /// One node's first page of the documents that link a set, for its deletion preview.
+    SetPreview {
+        auth_token: Option<AuthToken>,
+        set_id: Ulid,
+        limit: usize,
+    },
+    SetPreviewResults {
+        result: Result<Box<crate::metadata::api::SetPreviewPage>, MetadataReadError>,
+    },
 }
 
 /// One document as a holder serves it to a device.

@@ -1078,6 +1078,30 @@ impl MetadataHandle {
                 };
                 (MetadataTransportMessage::BucketOwnerResult { result }, None)
             }
+            MetadataTransportMessage::SetPreview {
+                auth_token,
+                set_id,
+                limit,
+            } => {
+                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                    Ok(auth) => match self.inner.net_handle.as_ref() {
+                        Some(net_handle) => crate::metadata::api::set_preview_local(
+                            context.as_ref(),
+                            *net_handle.realm_id(),
+                            auth.as_ref(),
+                            set_id,
+                            None,
+                            limit,
+                        )
+                        .await
+                        .map(Box::new)
+                        .map_err(crate::forward::transport::read_error),
+                        None => Err(MetadataReadError::Unavailable),
+                    },
+                    Err(error) => Err(error),
+                };
+                (MetadataTransportMessage::SetPreviewResults { result }, None)
+            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)

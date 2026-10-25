@@ -8,8 +8,8 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data_link::{DataLink, LinkScope};
 use aruna_operations::metadata::api::{
-    LINKS_MAX_LIMIT, LinkNodeRequest, LinkPage, LinkQuery, file_queries, links_distributed,
-    part_of, resolve_part,
+    LINKS_MAX_LIMIT, LinkDocument, LinkNodeRequest, LinkPage, LinkQuery, file_queries,
+    links_distributed, part_of, resolve_part,
 };
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -90,29 +90,31 @@ pub struct DataLinksResponse {
     pub truncated_documents: usize,
 }
 
+impl From<LinkDocument> for DataLinkDocument {
+    fn from(document: LinkDocument) -> Self {
+        Self {
+            document_id: document.document_id.to_string(),
+            group_id: document.group_id,
+            document_path: document.document_path,
+            graph_iri: document.graph_iri,
+            title: document.title,
+            links: document
+                .links
+                .into_iter()
+                .map(|link| DataLinkHit {
+                    id: link.id,
+                    part: link.part,
+                    subject_iris: link.subject_iris,
+                })
+                .collect(),
+        }
+    }
+}
+
 impl From<LinkPage> for DataLinksResponse {
     fn from(page: LinkPage) -> Self {
         Self {
-            documents: page
-                .documents
-                .into_iter()
-                .map(|document| DataLinkDocument {
-                    document_id: document.document_id.to_string(),
-                    group_id: document.group_id,
-                    document_path: document.document_path,
-                    graph_iri: document.graph_iri,
-                    title: document.title,
-                    links: document
-                        .links
-                        .into_iter()
-                        .map(|link| DataLinkHit {
-                            id: link.id,
-                            part: link.part,
-                            subject_iris: link.subject_iris,
-                        })
-                        .collect(),
-                })
-                .collect(),
+            documents: page.documents.into_iter().map(Into::into).collect(),
             next_after: page.next_after.map(|id| id.to_string()),
             complete: page.complete,
             hidden_references_exist: page.hidden,

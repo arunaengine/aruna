@@ -12,6 +12,7 @@ use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurg
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::jobs::service::submit_purge_job;
+use aruna_operations::metadata::api::set_preview_distributed;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use aruna_operations::s3::object::versions::{
@@ -29,8 +30,10 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{permission_granted, require_realm_auth};
+use crate::auth::{ValidatedBearer, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::metadata::{bearer_token_string, map_api_error};
+use crate::routes::metadata::links::DataLinkDocument;
 use crate::server::state::ServerState;
 
 const DEFAULT_PREFLIGHT_LIMIT: usize = 1_000;
@@ -39,6 +42,8 @@ const MAX_PREFLIGHT_LIMIT: usize = 1_000;
 const HIDDEN_PAGES: usize = 64;
 /// Versions one delete preview page passes over at most, hidden or filtered out ones included.
 const PAGE_VERSIONS: usize = 10_000;
+/// Datasets a distributed bucket's deletion preflight names at most.
+const PREVIEW_DATASETS: usize = 25;
 
 #[derive(OpenApi)]
 #[openapi()]
@@ -169,6 +174,10 @@ pub struct DeletionPreflightResponse {
     /// The Realm-complete backlink service is a separate dependency. Until it
     /// is available, this field explicitly refuses to imply "unreferenced".
     pub reference_coverage: ReferenceCoverageResponse,
+    /// For a whole distributed bucket: readable datasets that link it, its folders or its
+    /// files, at most 25.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_datasets: Vec<DataLinkDocument>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -207,7 +216,11 @@ separately whether the same caller may run the purge.
   numbers count that page rather than the scope, and `truncation` carries the resume markers.
 - Sync relationships a bucket delete would act on are listed, together with the ones that block it.
 - `reference_coverage` never implies that the scope is unreferenced: it reports how much of the
-  backlink question this node could answer at all."#,
+  backlink question this node could answer at all.
+- For a whole distributed bucket, every metadata node reports the datasets that link the bucket,
+  its folders or its verified files: `linked_datasets` names up to 25 readable ones, and
+  `reference_coverage.complete` is true only when every node answered all of them with nothing
+  unsettled or unverified. References by content hash alone carry no bucket and are excluded."#,
     request_body(
         content = DeletionPreflightRequest,
         description = "The scope to inspect plus an optional page bound and resume markers",
@@ -271,6 +284,7 @@ separately whether the same caller may run the purge.
 pub async fn deletion_preflight(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<DeletionPreflightRequest>,
 ) -> ServerResult<(StatusCode, Json<DeletionPreflightResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
@@ -352,6 +366,10 @@ pub async fn deletion_preflight(
     } else {
         Vec::new()
     };
+    let (reference_coverage, linked_datasets) = match (&info.distribution, scope.is_bucket()) {
+        (Some(binding), true) => set_coverage(&state, auth, bearer, binding.set_id).await?,
+        _ => (unevaluated_coverage(), Vec::new()),
+    };
 
     Ok((
         StatusCode::OK,
@@ -379,19 +397,62 @@ pub async fn deletion_preflight(
                 next_multipart_key,
                 next_multipart_marker: next_multipart_marker.map(|id| id.to_string()),
             },
-            reference_coverage: ReferenceCoverageResponse {
-                complete: false,
-                hidden_references_exist: None,
-                queried_nodes: 0,
-                failed_nodes: 0,
-                index_freshness: "not_evaluated".to_string(),
-                excluded: vec![
-                    "realm_backlink_fanout_unavailable".to_string(),
-                    "imported_relative_or_external_file_ids".to_string(),
-                ],
-            },
+            reference_coverage,
+            linked_datasets,
         }),
     ))
+}
+
+fn unevaluated_coverage() -> ReferenceCoverageResponse {
+    ReferenceCoverageResponse {
+        complete: false,
+        hidden_references_exist: None,
+        queried_nodes: 0,
+        failed_nodes: 0,
+        index_freshness: "not_evaluated".to_string(),
+        excluded: vec![
+            "realm_backlink_fanout_unavailable".to_string(),
+            "imported_relative_or_external_file_ids".to_string(),
+        ],
+    }
+}
+
+/// The datasets that link a distributed bucket, from the set's postings on every metadata
+/// node. References that name a file only by its content hash carry no set.
+async fn set_coverage(
+    state: &Arc<ServerState>,
+    auth: AuthContext,
+    bearer: Option<ValidatedBearer>,
+    set_id: Ulid,
+) -> ServerResult<(ReferenceCoverageResponse, Vec<DataLinkDocument>)> {
+    let preview = set_preview_distributed(
+        state.get_ctx().as_ref(),
+        (state.get_realm_id(), state.get_node_id()),
+        Some(auth),
+        bearer_token_string(bearer),
+        (set_id, PREVIEW_DATASETS),
+    )
+    .await
+    .map_err(map_api_error)?;
+    let freshness = match (
+        preview.pending_materializations,
+        preview.failed_materializations,
+    ) {
+        (0, 0) => "current",
+        (_, 0) => "pending",
+        (0, _) => "failed",
+        _ => "mixed",
+    };
+    let coverage = ReferenceCoverageResponse {
+        complete: preview.complete(),
+        hidden_references_exist: Some(preview.hidden),
+        queried_nodes: preview.nodes_queried as u32,
+        failed_nodes: preview.nodes_failed as u32,
+        index_freshness: freshness.to_string(),
+        excluded: vec!["hash_only_references".to_string()],
+    };
+    let datasets = preview.documents.into_iter().map(Into::into).collect();
+    Ok((coverage, datasets))
 }
 
 #[utoipa::path(

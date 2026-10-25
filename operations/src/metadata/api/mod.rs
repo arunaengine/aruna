@@ -131,8 +131,9 @@ pub use self::fanout::MetadataFanoutStats;
 pub(crate) use self::fanout::RealmNodeDiscovery;
 pub use self::links::{
     LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,
-    PART_OF_LIMIT, PartOf, PartTarget, SetPreviewPage, file_queries, links_distributed,
-    links_local, merge_pages, part_of, resolve_part, set_preview_local,
+    PART_OF_LIMIT, PartOf, PartTarget, SetPreview, SetPreviewPage, file_queries, links_distributed,
+    links_local, merge_pages, merge_previews, part_of, resolve_part, set_preview_distributed,
+    set_preview_local,
 };
 pub use self::list::{
     ListVisibleRequest, ListVisibleResult, ListedMetadataDocument, MetadataListOrder,
