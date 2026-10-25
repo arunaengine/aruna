@@ -1,8 +1,9 @@
-//! Rebuilds the node's usage counters by a paged walk over one storage snapshot. Pages add
-//! their counts to the rebuild rows while storage adds every later delta there too, so the
-//! rows are exact when the walk ends and replace the live counter rows.
+//! Rebuilds the node's usage counters by a paged walk over one storage snapshot.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Pages add their counts to the rebuild rows while storage adds every later delta there too,
+// so the rows are exact when the walk ends and replace the live counter rows.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;

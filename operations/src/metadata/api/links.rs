@@ -1,8 +1,10 @@
 //! Finds the datasets that link Aruna data: one identifier, or a file through its version, its
-//! content and the folders that contain its key. Every metadata node answers from its own
-//! postings within one budget; results merge by document id and say whether they are complete.
+//! content and the folders that contain its key.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Every metadata node answers from its own postings within one budget; results merge by
+// document id and say whether they are complete.
 
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, VersionKey};

@@ -1,8 +1,9 @@
 //! Chooses which holder serves a read or a download: of two random fresh candidates, the one
 //! with more free download slots wins and location links break ties (power of two choices).
-//! Holders that failed lately or report slot refusals are skipped.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Holders that failed lately or report slot refusals are skipped.
 
 use std::collections::BTreeMap;
 

@@ -1,8 +1,9 @@
 //! Lists how files get into a bucket, from configuration only: syncs that copy into it and
 //! storage folders registered into it. Outgoing syncs and member nodes are not sources.
-//! Nothing here reads the bucket's objects, so the cost never grows with the bucket.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Nothing here reads the bucket's objects, so the cost never grows with the bucket.
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};

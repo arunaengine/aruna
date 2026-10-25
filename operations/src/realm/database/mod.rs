@@ -1,8 +1,9 @@
 //! Serves the database list: marks, owner consent, removal and the reader-filtered listing.
-//! A mark needs the dataset to link the bucket root as a Dataset-typed `hasPart` already;
-//! the entry itself grants nothing, so every listing checks the caller's own permissions.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A mark needs the dataset to link the bucket root as a Dataset-typed `hasPart` already;
+// the entry itself grants nothing, so every listing checks the caller's own permissions.
 
 pub mod list;
 pub mod publish;

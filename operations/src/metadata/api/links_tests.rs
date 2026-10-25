@@ -1,3 +1,4 @@
+//! Tests merging data link pages from several nodes: cursors, completeness and hidden entries.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

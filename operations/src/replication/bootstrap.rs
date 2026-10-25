@@ -1,8 +1,9 @@
-//! Bootstraps a catching-up member from its coordinators: bounded pages over the ordered inventory
-//! with a durable cursor, each waiting for its jobs while live publications overlap the walk; a
-//! coordinator whose walks all ended states the catch-up to the record's publisher.
+//! Bootstraps a catching-up member from its coordinators: bounded pages over the ordered
+//! inventory with a durable cursor, each waiting for its jobs while live publications overlap.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A coordinator whose walks all ended states the catch-up to the record's publisher.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

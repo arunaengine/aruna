@@ -1,8 +1,9 @@
 //! Rewrites dataset entries that name an object of a local distributed member bucket by node
-//! ARN or `s3://` location to the object's global id before the dataset is saved. Entries of
-//! ordinary buckets and of other nodes stay as they are.
+//! ARN or `s3://` location to the object's global id before the dataset is saved.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Entries of ordinary buckets and of other nodes stay as they are.
 
 use std::collections::{BTreeMap, HashMap};
 

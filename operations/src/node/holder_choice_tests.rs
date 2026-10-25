@@ -1,3 +1,4 @@
+//! Tests holder choice: free download slots, skipped holders and location link ranking.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

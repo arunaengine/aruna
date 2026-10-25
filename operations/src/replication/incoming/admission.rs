@@ -1,8 +1,9 @@
 //! Admits a coordinator's publication into a member bucket of a distributed set: against the
-//! record this node holds before the negotiation, and again inside the apply transaction, so a
-//! record installed in between conflicts the apply or refuses it.
+//! record this node holds before the negotiation, and again inside the apply transaction.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// So a record installed in between conflicts the apply or refuses it.
 
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::storage::distribution::fence::LocalFence;

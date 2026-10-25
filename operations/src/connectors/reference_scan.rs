@@ -1,9 +1,10 @@
 //! Checks one bounded page of a connector's reference rows against their versions, shared by
-//! delete and replace. Stale rows of the page are pruned in the same transaction; when more rows
-//! follow, the rest is queued for background pruning and the caller is asked to retry.
-//! Each calling operation still owns that transaction and its final mutation.
+//! delete and replace. Stale rows of the page are pruned in the same transaction.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// When more rows follow, the rest is queued for background pruning and the caller retries.
+// Each calling operation still owns that transaction and its final mutation.
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;

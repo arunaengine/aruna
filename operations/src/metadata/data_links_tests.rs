@@ -1,3 +1,4 @@
+//! Tests data link projection and postings: parts, replacement, probes, budgets and retries.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

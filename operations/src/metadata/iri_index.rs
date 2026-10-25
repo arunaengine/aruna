@@ -1,8 +1,9 @@
 //! Builds and rebuilds the IRI reference index that maps referenced IRIs back to documents.
-//! Rows are keyed object first, so a backlink lookup is a seek, and each document keeps its
-//! own rows, so a materialization replaces exactly its own postings.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Rows are keyed object first, so a backlink lookup is a seek, and each document keeps its
+// own rows, so a materialization replaces exactly its own postings.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 

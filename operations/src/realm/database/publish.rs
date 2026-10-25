@@ -1,8 +1,10 @@
 //! Publishes one database list change through the realm config's admin document path on a
-//! management node: a mark or retarget with its owner consent, or a removal. Each credential
-//! the change depends on is checked first; nothing else in the realm config can change here.
+//! management node: a mark or retarget with its owner consent, or a removal.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Each credential the change depends on is checked first; nothing else in the realm config
+// can change here.
 
 use aruna_core::admin_documents::{AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};

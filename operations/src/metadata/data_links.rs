@@ -1,8 +1,9 @@
 //! Keeps the node-local data link postings of materialized documents: identifier first, so a
 //! lookup is a seek, and per document, so a materialization replaces exactly its own rows.
-//! Prefix lookups probe only the prefix lengths a bucket's postings use.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Prefix lookups probe only the prefix lengths a bucket's postings use.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Mutex;

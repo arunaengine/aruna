@@ -1,8 +1,10 @@
 //! Publishes a distributed bucket's versions from the coordinator of their range to the members
-//! that hold it. A queued job names only the member; what it publishes comes from the record
-//! this node holds when it sends, so an ended coordinatorship publishes nothing.
+//! that hold it.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A queued job names only the member; what it publishes comes from the record this node
+// holds when it sends, so an ended coordinatorship publishes nothing.
 
 use aruna_core::NodeId;
 use aruna_core::effects::IterStart;

@@ -1,8 +1,9 @@
-//! Chooses which holder serves a public document's RO-Crate when its w3id resolves, with the
-//! same choice as downloads: two random fresh holders, the one with more free download slots
-//! wins. The chosen holder serves its own copy and never chooses again.
+//! Chooses which holder serves a public document's RO-Crate when its w3id resolves, as for
+//! downloads: of two random fresh holders, the one with more free download slots wins.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// The chosen holder serves its own copy and never chooses again.
 
 use aruna_core::NodeId;
 use ulid::Ulid;
