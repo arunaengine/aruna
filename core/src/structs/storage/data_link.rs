@@ -27,6 +27,7 @@ const SET_TAG: u8 = 3;
 const NODE_TAG: u8 = 4;
 const SET_VERSION_TAG: u8 = 5;
 const UNVERIFIED_TAG: u8 = 6;
+const TRUNCATED_TAG: u8 = 7;
 
 /// One Aruna data identifier a document names.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -57,6 +58,8 @@ pub enum DataLink {
     },
     /// Derived, never parsed: a version link no local member could verify yet.
     Unverified { realm_id: RealmId, version_id: Ulid },
+    /// Derived, never parsed: the document names more links than one projection keeps.
+    Truncated,
 }
 
 /// The key all derived set-version postings of one set start with.
@@ -64,6 +67,11 @@ pub fn set_versions_key(set_id: Ulid) -> Vec<u8> {
     let mut key = vec![SET_VERSION_TAG];
     key.extend_from_slice(&set_id.to_bytes());
     key
+}
+
+/// The key the truncation marker of every truncated document starts with.
+pub fn truncated_key() -> Vec<u8> {
+    vec![TRUNCATED_TAG]
 }
 
 /// The key all unverified version postings start with.
@@ -194,7 +202,8 @@ impl DataLink {
             Self::Version { .. }
             | Self::Hash(_)
             | Self::SetVersion { .. }
-            | Self::Unverified { .. } => None,
+            | Self::Unverified { .. }
+            | Self::Truncated => None,
         }
     }
 
@@ -235,6 +244,7 @@ impl DataLink {
                 bucket,
                 prefix,
             } => format!("arn:aruna:{realm_id}:{node_id}:s3/{bucket}/{prefix}"),
+            Self::Truncated => String::new(),
         }
     }
 
@@ -271,6 +281,7 @@ impl DataLink {
                 key.extend_from_slice(&version_id.to_bytes());
                 key
             }
+            Self::Truncated => truncated_key(),
             Self::SetPrefix { .. } | Self::NodePrefix { .. } => {
                 let Some((scope, prefix)) = self.scope() else {
                     return Vec::new();

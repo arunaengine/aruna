@@ -109,3 +109,30 @@ fn hidden_survives_merge() {
     assert!(page.hidden);
     assert_eq!(page.documents.len(), 1);
 }
+
+#[test]
+fn hidden_page_moves_on() {
+    // A node whose examined documents were all hidden still names where to continue.
+    let hidden = LinkNodePage {
+        hidden: true,
+        next: Some(Ulid::from_bytes([5; 16])),
+        ..LinkNodePage::default()
+    };
+    let page = merge_pages([hidden], 10, 0);
+    assert!(page.documents.is_empty());
+    assert_eq!(page.next_after, Some(Ulid::from_bytes([5; 16])));
+    assert!(!page.complete);
+}
+
+#[test]
+fn smallest_end_bounds() {
+    // Documents past another node's end wait for the next page, so none is skipped there.
+    let short = LinkNodePage {
+        next: Some(Ulid::from_bytes([2; 16])),
+        ..node(vec![document(1, "a"), document(2, "a")])
+    };
+    let page = merge_pages([short, node(vec![document(3, "b")])], 10, 0);
+    let ids: Vec<_> = page.documents.iter().map(|doc| doc.document_id).collect();
+    assert_eq!(ids, [Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16])]);
+    assert_eq!(page.next_after, Some(Ulid::from_bytes([2; 16])));
+}

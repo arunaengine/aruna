@@ -86,6 +86,8 @@ pub struct DataLinksResponse {
     pub nodes_failed: usize,
     pub pending_materializations: usize,
     pub failed_materializations: usize,
+    /// Documents whose links were cut at 65,536 per document; any of them may match.
+    pub truncated_documents: usize,
 }
 
 impl From<LinkPage> for DataLinksResponse {
@@ -117,6 +119,7 @@ impl From<LinkPage> for DataLinksResponse {
             nodes_failed: page.nodes_failed,
             pending_materializations: page.pending_materializations,
             failed_materializations: page.failed_materializations,
+            truncated_documents: page.truncated_documents,
         }
     }
 }
@@ -140,7 +143,8 @@ fn example() -> serde_json::Value {
         "hidden_references_exist": false,
         "nodes_failed": 0,
         "pending_materializations": 0,
-        "failed_materializations": 0
+        "failed_materializations": 0,
+        "truncated_documents": 0
     })
 }
 
@@ -160,7 +164,8 @@ permission; unreadable matches only set `hidden_references_exist`.
   forms of one id find the same documents; literal `contentUrl` values count as well.
 - Every metadata node answers from its own link postings; documents merge by id.
 - `complete` is false when a node did not answer, a node's budget ended its walk, or a node has
-  queued or failed materializations whose links may be missing.
+  queued or failed materializations, or documents with more links than it keeps, whose links
+  may be missing.
 
 **Limits**
 - At most 100 documents per page; continue with `after`."#,

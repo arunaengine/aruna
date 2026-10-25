@@ -18,7 +18,8 @@ use super::{
     reference_document_title, run_metadata_fanout,
 };
 use crate::metadata::data_links::{
-    LinkBudget, key_prefixes, read_postings, set_postings, unsettled_documents, unverified_versions,
+    LinkBudget, key_prefixes, read_postings, set_postings, truncated_documents,
+    unsettled_documents, unverified_versions,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -69,14 +70,17 @@ pub struct LinkDocument {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkNodePage {
     pub documents: Vec<LinkDocument>,
-    /// More documents may follow the last one of this page.
-    pub more: bool,
+    /// Every matching document up to this id was examined, readable or not, and more may
+    /// follow it; `None` once nothing follows.
+    pub next: Option<Ulid>,
     /// The budget ran out before every queried identifier was read.
     pub cut: bool,
     /// A matching document exists that the caller may not read.
     pub hidden: bool,
     pub pending_materializations: usize,
     pub failed_materializations: usize,
+    /// Documents whose links were cut at the projection limit; any of them may match.
+    pub truncated_documents: usize,
 }
 
 /// The merged answer of every metadata node.
@@ -90,6 +94,7 @@ pub struct LinkPage {
     pub nodes_failed: usize,
     pub pending_materializations: usize,
     pub failed_materializations: usize,
+    pub truncated_documents: usize,
 }
 
 /// Answers a link lookup from this node's postings within one shared budget.
@@ -123,12 +128,20 @@ pub async fn links_local(
         }
     }
     let mut matches = BTreeMap::<Ulid, Vec<(DataLink, LinkPosting)>>::new();
+    // Each identifier is read up to its last returned document; beyond the smallest such end
+    // another identifier may still hold unread documents.
+    let mut end: Option<Ulid> = None;
     for link in links {
         let (postings, more) =
             read_postings(storage, &link.key(), request.after, limit, &mut budget)
                 .await
                 .map_err(internal)?;
-        page.more |= more;
+        if more {
+            match postings.last() {
+                Some((last, _)) => end = Some(end.map_or(*last, |end| end.min(*last))),
+                None => page.cut = true,
+            }
+        }
         for (document_id, posting) in postings {
             if request.parts_only && !posting.part {
                 continue;
@@ -140,16 +153,25 @@ pub async fn links_local(
         }
     }
     page.cut |= budget.exhausted();
-    if matches.len() > limit {
-        page.more = true;
+    if let Some((nth, _)) = matches.iter().nth(limit - 1)
+        && matches.len() > limit
+    {
+        end = Some(end.map_or(*nth, |end| end.min(*nth)));
     }
-    let documents: BTreeMap<_, _> = matches.into_iter().take(limit).collect();
+    page.next = end;
+    let documents: BTreeMap<_, _> = match end {
+        Some(end) => matches.into_iter().filter(|(id, _)| *id <= end).collect(),
+        None => matches,
+    };
     describe(context, realm_id, auth, documents, &mut page).await?;
     let (pending, failed) = unsettled_documents(storage, UNSETTLED_CAP)
         .await
         .map_err(internal)?;
     page.pending_materializations = pending;
     page.failed_materializations = failed;
+    page.truncated_documents = truncated_documents(storage, UNSETTLED_CAP)
+        .await
+        .map_err(internal)?;
     Ok(page)
 }
 
@@ -259,7 +281,6 @@ pub async fn set_preview_local(
         next,
         ..SetPreviewPage::default()
     };
-    preview.page.more = preview.next.is_some();
     describe(context, realm_id, auth, matches, &mut preview.page).await?;
     preview.unverified = unverified_versions(storage, UNSETTLED_CAP)
         .await
@@ -269,6 +290,9 @@ pub async fn set_preview_local(
         .map_err(internal)?;
     preview.page.pending_materializations = pending;
     preview.page.failed_materializations = failed;
+    preview.page.truncated_documents = truncated_documents(storage, UNSETTLED_CAP)
+        .await
+        .map_err(internal)?;
     Ok(preview)
 }
 
@@ -340,14 +364,18 @@ pub fn merge_pages(
         nodes_failed,
         ..LinkPage::default()
     };
-    let mut more = false;
+    // Every node examined everything up to its own end; together, up to the smallest one.
+    let mut end: Option<Ulid> = None;
     let mut cut = false;
     for node in pages {
-        more |= node.more;
+        if let Some(next) = node.next {
+            end = Some(end.map_or(next, |end| end.min(next)));
+        }
         cut |= node.cut;
         page.hidden |= node.hidden;
         page.pending_materializations += node.pending_materializations;
         page.failed_materializations += node.failed_materializations;
+        page.truncated_documents += node.truncated_documents;
         for document in node.documents {
             let entry = merged
                 .entry(document.document_id)
@@ -362,16 +390,21 @@ pub fn merge_pages(
             }
         }
     }
-    more |= merged.len() > limit;
+    if let Some(end) = end {
+        merged.retain(|id, _| *id <= end);
+    }
+    if merged.len() > limit {
+        end = merged.keys().nth(limit.saturating_sub(1)).copied();
+    }
     page.documents = merged.into_values().take(limit).collect();
-    page.next_after = more
-        .then(|| page.documents.last().map(|document| document.document_id))
-        .flatten();
-    page.complete = !more
+    // Hidden documents count as examined, so a page of only hidden ones still moves on.
+    page.next_after = end;
+    page.complete = end.is_none()
         && !cut
         && nodes_failed == 0
         && page.pending_materializations == 0
-        && page.failed_materializations == 0;
+        && page.failed_materializations == 0
+        && page.truncated_documents == 0;
     page
 }
 

@@ -270,3 +270,31 @@ async fn set_postings_page_both_ranges() {
     assert_eq!(end, None);
     assert_eq!(unverified_versions(&storage, 10).await.unwrap(), 1);
 }
+
+// A document over the link limit keeps a marker, so lookups never claim to be complete.
+#[tokio::test]
+async fn truncation_is_marked() {
+    let references: Vec<_> = (0..=MAX_DOCUMENT_LINKS)
+        .map(|index| triple(GRAPH, HAS_PART, &set_url(&format!("{index}/"))))
+        .collect();
+    let links = project_links(GRAPH, Ulid::nil(), &references);
+    assert!(links.contains_key(&DataLink::Truncated));
+    assert_eq!(links.len(), MAX_DOCUMENT_LINKS + 1);
+
+    let dir = tempdir().unwrap();
+    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let document = Ulid::from_bytes([1; 16]);
+    let marked = BTreeMap::from([(DataLink::Truncated, LinkPosting::default())]);
+    stored(
+        plan_link_rows(&storage, document, &marked).await.unwrap(),
+        &storage,
+    )
+    .await;
+    assert_eq!(truncated_documents(&storage, 10).await.unwrap(), 1);
+    // A later projection within the limit drops the marker with the document's other rows.
+    let rows = plan_link_rows(&storage, document, &BTreeMap::new())
+        .await
+        .unwrap();
+    stored(rows, &storage).await;
+    assert_eq!(truncated_documents(&storage, 10).await.unwrap(), 0);
+}

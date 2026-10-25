@@ -19,7 +19,7 @@ use aruna_core::structs::storage::data_link::{
     DataLink, LinkPosting, LinkScope, MAX_DOCUMENT_LINKS, MAX_LINK_SUBJECTS, document_key,
     posting_document, posting_key,
 };
-use aruna_core::structs::storage::data_link::{set_versions_key, unverified_key};
+use aruna_core::structs::storage::data_link::{set_versions_key, truncated_key, unverified_key};
 use aruna_core::structs::storage::distribution::inventory::index_key;
 use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
 use aruna_core::structs::storage::global_id::MAX_PREFIX_BYTES;
@@ -91,6 +91,12 @@ pub(crate) fn project_links(
                 graph_iri,
                 "Document names more data links than one projection keeps"
             );
+            // The marker posting makes every lookup on this node report itself incomplete.
+            let marker = LinkPosting {
+                cursor,
+                ..LinkPosting::default()
+            };
+            links.insert(DataLink::Truncated, marker);
             break;
         }
         let part = schema_term(predicate, "hasPart")
@@ -499,6 +505,16 @@ pub(crate) async fn unverified_versions(
     cap: usize,
 ) -> Result<usize, DataLinkError> {
     let prefix = ByteView::from(unverified_key());
+    let (rows, _) = iter_page(storage, DATA_LINK_KEYSPACE, Some(prefix), None, cap).await?;
+    Ok(rows.len())
+}
+
+/// Documents on this node whose links were cut at the projection limit, counted up to `cap`.
+pub(crate) async fn truncated_documents(
+    storage: &StorageHandle,
+    cap: usize,
+) -> Result<usize, DataLinkError> {
+    let prefix = ByteView::from(truncated_key());
     let (rows, _) = iter_page(storage, DATA_LINK_KEYSPACE, Some(prefix), None, cap).await?;
     Ok(rows.len())
 }
