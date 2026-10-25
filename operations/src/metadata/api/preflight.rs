@@ -14,13 +14,13 @@ use super::{
     REGISTRY_CANDIDATE_LIMIT, RealmConfigDocument, RealmId, RealmNodeDiscovery,
     ResolvePathsOperation, SearchCursor, SearchCursorError, SearchWatermark, Serialize,
     StorageEffect, StorageEvent, Ulid, Value, VersionKey, W3idIdentifier, bucket_permission_path,
-    can_read_record, deduplicate_fanout_nodes, drive, filter_live_records, forwarded_bearer,
-    load_pending_records, map_internal_error, map_read_error, metadata_node_call,
-    object_permission_path, paginate, record_preflight_node, resume_fetch_limit,
-    run_metadata_fanout, select_fanout_nodes, warn,
+    can_read_record, deduplicate_fanout_nodes, drive, forwarded_bearer, load_pending_records,
+    map_read_error, metadata_node_call, object_permission_path, paginate, record_preflight_node,
+    resume_fetch_limit, run_metadata_fanout, select_fanout_nodes, warn,
 };
 
-use super::read::ensure_permission;
+use super::read::{ensure_permission, load_live_record};
+use crate::metadata::data_links::LinkBudget;
 use crate::metadata::search_cursor::tie_order;
 use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 
@@ -409,38 +409,6 @@ pub(crate) async fn references_preflight_local(
     if auth.realm_id != realm_id {
         return Err(MetadataApiError::Forbidden);
     }
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    let registry = handle
-        .list_cached_records()
-        .await
-        .map_err(map_internal_error)?;
-    let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
-    let freshness =
-        crate::metadata::iri_index::iri_index_freshness(&context.storage_handle, registry.as_ref())
-            .await
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let pending_for_realm = load_pending_records(context, None, REGISTRY_CANDIDATE_LIMIT)
-        .await?
-        .into_values()
-        .flatten()
-        .any(|record| record.realm_id == realm_id);
-    let index_state = match (freshness.state, pending_for_realm) {
-        (crate::metadata::iri_index::IriFreshnessState::Current, false) => {
-            MetadataIndexState::Current
-        }
-        (crate::metadata::iri_index::IriFreshnessState::Current, true)
-        | (crate::metadata::iri_index::IriFreshnessState::Pending, _) => {
-            MetadataIndexState::Pending
-        }
-        (crate::metadata::iri_index::IriFreshnessState::Failed, false) => {
-            MetadataIndexState::Failed
-        }
-        (crate::metadata::iri_index::IriFreshnessState::Failed, true)
-        | (crate::metadata::iri_index::IriFreshnessState::Mixed, _) => MetadataIndexState::Mixed,
-    };
 
     let mut iri_targets = BTreeMap::<String, BTreeSet<String>>::new();
     let mut target_locations = BTreeMap::<String, (bool, bool)>::new();
@@ -481,51 +449,102 @@ pub(crate) async fn references_preflight_local(
         }
         target_locations.insert(target.content_w3id.clone(), (found, remaining));
     }
-    let object_iris = iri_targets.keys().cloned().collect::<BTreeSet<_>>();
-    let backlinks = crate::metadata::iri_index::lookup_backlinks_objects(
-        &context.storage_handle,
-        registry.as_ref(),
-        &object_iris,
-    )
-    .await
-    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let registry_by_id = registry
-        .iter()
-        .map(|record| (record.document_id, record))
-        .collect::<HashMap<_, _>>();
+    // Each object yields its first `limit + 1` visible documents or ends, which covers every
+    // reference of the page prefix; a lookup over the budget fails instead of scanning.
+    let mut budget = PREFLIGHT_BUDGET;
+    let mut records = HashMap::<Ulid, Option<MetadataRegistryRecord>>::new();
     let mut readable = HashMap::<Ulid, bool>::new();
     let mut hidden = BTreeSet::<String>::new();
     let mut visible = BTreeSet::<(String, Ulid)>::new();
-    for (iri, iri_backlinks) in backlinks {
-        let Some(content_w3ids) = iri_targets.get(&iri) else {
-            continue;
-        };
-        for backlink in iri_backlinks {
-            let Some(record) = registry_by_id.get(&backlink.document_id) else {
-                continue;
-            };
-            let allowed = match readable.get(&record.document_id) {
-                Some(allowed) => *allowed,
-                None => {
-                    let allowed = can_read_record(context, realm_id, Some(&auth), record).await?;
-                    readable.insert(record.document_id, allowed);
-                    allowed
-                }
-            };
-            for content_w3id in content_w3ids {
-                if !allowed {
-                    hidden.insert(content_w3id.clone());
+    for (iri, content_w3ids) in &iri_targets {
+        let mut after = None;
+        let mut found = 0usize;
+        loop {
+            let page = crate::metadata::iri_index::read_backlinks(
+                &context.storage_handle,
+                iri,
+                None,
+                after,
+                request.limit.saturating_add(1),
+                &mut budget,
+            )
+            .await
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+            for (document_id, postings) in page.documents {
+                let record = match records.get(&document_id) {
+                    Some(record) => record.clone(),
+                    None => {
+                        let record = match load_live_record(context, document_id).await {
+                            Ok(record) => Some(record),
+                            Err(MetadataApiError::NotFound) => None,
+                            Err(error) => return Err(error),
+                        };
+                        records.insert(document_id, record.clone());
+                        record
+                    }
+                };
+                let Some(record) = record else {
+                    continue;
+                };
+                if !postings
+                    .iter()
+                    .any(|posting| posting.document_cursor == record.last_event_id)
+                {
                     continue;
                 }
-                visible.insert((content_w3id.clone(), record.document_id));
+                let allowed = match readable.get(&document_id) {
+                    Some(allowed) => *allowed,
+                    None => {
+                        let allowed =
+                            can_read_record(context, realm_id, Some(&auth), &record).await?;
+                        readable.insert(document_id, allowed);
+                        allowed
+                    }
+                };
+                if !allowed {
+                    hidden.extend(content_w3ids.iter().cloned());
+                    continue;
+                }
+                found = found.saturating_add(1);
+                for content_w3id in content_w3ids {
+                    visible.insert((content_w3id.clone(), document_id));
+                }
+            }
+            match page.next {
+                Some(next) if found <= request.limit => after = Some(next),
+                _ => break,
             }
         }
     }
+    let returned: Vec<_> = records.values().flatten().cloned().collect();
+    let freshness =
+        crate::metadata::iri_index::iri_index_freshness(&context.storage_handle, &returned)
+            .await
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let pending_for_realm = load_pending_records(context, None, REGISTRY_CANDIDATE_LIMIT)
+        .await?
+        .into_values()
+        .flatten()
+        .any(|record| record.realm_id == realm_id);
+    let index_state = match (freshness.state, pending_for_realm) {
+        (crate::metadata::iri_index::IriFreshnessState::Current, false) => {
+            MetadataIndexState::Current
+        }
+        (crate::metadata::iri_index::IriFreshnessState::Current, true)
+        | (crate::metadata::iri_index::IriFreshnessState::Pending, _) => {
+            MetadataIndexState::Pending
+        }
+        (crate::metadata::iri_index::IriFreshnessState::Failed, false) => {
+            MetadataIndexState::Failed
+        }
+        (crate::metadata::iri_index::IriFreshnessState::Failed, true)
+        | (crate::metadata::iri_index::IriFreshnessState::Mixed, _) => MetadataIndexState::Mixed,
+    };
     let (selected, saturated) = visible_prefix(visible, request.limit);
     let mut titles = HashMap::<Ulid, String>::new();
     let mut visible_references = Vec::with_capacity(selected.len());
     for (content_w3id, document_id) in selected {
-        let Some(record) = registry_by_id.get(&document_id) else {
+        let Some(Some(record)) = records.get(&document_id) else {
             continue;
         };
         let title = match titles.get(&document_id) {
@@ -726,6 +745,11 @@ pub(crate) async fn discover_realm_nodes(
 }
 
 const MAX_TARGET_VERSIONS: usize = 128;
+/// Postings one node's preflight may read across all of its target IRIs.
+const PREFLIGHT_BUDGET: LinkBudget = LinkBudget {
+    seeks: 16_384,
+    rows: 262_144,
+};
 
 const PREFLIGHT_PAGE_SIZE: usize = 128;
 

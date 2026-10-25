@@ -1,4 +1,6 @@
 //! Builds and rebuilds the IRI reference index that maps referenced IRIs back to documents.
+//! Rows are keyed object first, so a backlink lookup is a seek, and each document keeps its
+//! own rows, so a materialization replaces exactly its own postings.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,11 +10,11 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, prefix_upper_bound};
 use aruna_core::metadata::{
     IriIndexRecord, MaterializationState, MaterializationStatusRecord, MetadataError,
 };
-use aruna_core::storage_entries::{iri_reference_entry, iri_reference_prefix};
+use aruna_core::storage_entries::{iri_object_prefix, iri_reference_entry, iri_reference_prefix};
 use aruna_core::structs::storage::data_link::document_key;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::StorageHandle;
@@ -22,7 +24,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use super::data_links::{DataLinkError, LinkRows, document_rows};
+use super::data_links::{DataLinkError, LinkBudget, LinkRows, document_rows, iter_page};
 use super::handle::REGISTRY_CANDIDATE_LIMIT;
 use super::queue_storage::{
     MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
@@ -47,6 +49,8 @@ pub(crate) enum MetadataIriError {
     DataLink(#[from] DataLinkError),
     #[error("unexpected metadata IRI reference index event: {0}")]
     UnexpectedEvent(String),
+    #[error("metadata IRI backlink lookup exceeded its budget")]
+    BudgetExhausted,
 }
 
 impl From<MetadataIriError> for MetadataError {
@@ -113,14 +117,166 @@ pub(crate) async fn plan_iri_rows(
     Ok(rows)
 }
 
+/// One page of the postings that name an object: every row of at most `limit` documents
+/// after the requested one, by document id. `next` is the last document when more may follow.
+#[derive(Debug, Default)]
+pub(crate) struct BacklinkPage {
+    pub documents: BTreeMap<Ulid, Vec<IriIndexRecord>>,
+    pub next: Option<Ulid>,
+}
+
+/// Reads one page of the postings that name `object_iri`. Without a predicate, each
+/// predicate group under the object is found by one seek and read from `after` on.
+pub(crate) async fn read_backlinks(
+    storage: &StorageHandle,
+    object_iri: &str,
+    predicate_iri: Option<&str>,
+    after: Option<Ulid>,
+    limit: usize,
+    budget: &mut LinkBudget,
+) -> Result<BacklinkPage, MetadataIriError> {
+    let limit = limit.max(1);
+    let mut documents = BTreeMap::<Ulid, Vec<IriIndexRecord>>::new();
+    let mut truncated = false;
+    let group = GroupRead {
+        object_iri,
+        predicate_iri,
+        after,
+        limit,
+    };
+    match predicate_iri {
+        Some(predicate) => {
+            let prefix = iri_reference_prefix(predicate, object_iri);
+            truncated = group.read(storage, prefix, budget, &mut documents).await?;
+        }
+        None => {
+            let object = iri_object_prefix(object_iri);
+            let mut start = IterStart::At(object.clone());
+            loop {
+                if !budget.take_seek() {
+                    return Err(MetadataIriError::BudgetExhausted);
+                }
+                let (values, _) = iter_page(
+                    storage,
+                    IRI_INDEX_KEYSPACE,
+                    Some(object.clone()),
+                    Some(start),
+                    1,
+                )
+                .await?;
+                let Some(prefix) = values.first().and_then(|(key, _)| key.get(..64)) else {
+                    break;
+                };
+                let next = prefix_upper_bound(prefix);
+                let prefix = ByteView::from(prefix.to_vec());
+                truncated |= group.read(storage, prefix, budget, &mut documents).await?;
+                let Some(next) = next else {
+                    break;
+                };
+                start = IterStart::At(ByteView::from(next));
+            }
+        }
+    }
+    let more = truncated || documents.len() > limit;
+    let documents: BTreeMap<_, _> = documents.into_iter().take(limit).collect();
+    let next = if more {
+        documents.keys().next_back().copied()
+    } else {
+        None
+    };
+    Ok(BacklinkPage { documents, next })
+}
+
+/// One object and predicate group of a backlink page.
+struct GroupRead<'a> {
+    object_iri: &'a str,
+    predicate_iri: Option<&'a str>,
+    after: Option<Ulid>,
+    limit: usize,
+}
+
+impl GroupRead<'_> {
+    /// Reads up to `limit + 1` rows of the group after the page start; `true` when more
+    /// rows may follow. Hash collisions are dropped by comparing the stored IRIs.
+    async fn read(
+        &self,
+        storage: &StorageHandle,
+        prefix: ByteView,
+        budget: &mut LinkBudget,
+        documents: &mut BTreeMap<Ulid, Vec<IriIndexRecord>>,
+    ) -> Result<bool, MetadataIriError> {
+        if !budget.take_seek() {
+            return Err(MetadataIriError::BudgetExhausted);
+        }
+        let start = self
+            .after
+            .map(|document_id| IterStart::After(ByteView::from(group_key(&prefix, document_id))));
+        let (values, next) = iter_page(
+            storage,
+            IRI_INDEX_KEYSPACE,
+            Some(prefix),
+            start,
+            self.limit.saturating_add(1),
+        )
+        .await?;
+        budget.rows = budget
+            .rows
+            .checked_sub(values.len())
+            .ok_or(MetadataIriError::BudgetExhausted)?;
+        for (_, value) in values {
+            let record =
+                postcard::from_bytes::<IriIndexRecord>(&value).map_err(ConversionError::from)?;
+            if record.object_iri != self.object_iri
+                || self
+                    .predicate_iri
+                    .is_some_and(|predicate| record.predicate_iri != predicate)
+            {
+                continue;
+            }
+            documents
+                .entry(record.document_id)
+                .or_default()
+                .push(record);
+        }
+        Ok(next.is_some())
+    }
+}
+
+fn group_key(prefix: &[u8], document_id: Ulid) -> Vec<u8> {
+    let mut key = prefix.to_vec();
+    key.extend_from_slice(&document_id.to_bytes());
+    key
+}
+
 pub(crate) async fn lookup_iri_references(
     storage: &StorageHandle,
     registry_records: &[MetadataRegistryRecord],
     predicate_iri: &str,
     object_iri: &str,
 ) -> Result<BTreeMap<Ulid, Vec<String>>, MetadataError> {
-    let prefix = iri_reference_prefix(predicate_iri, object_iri);
-    let records = scan_records(storage, Some(prefix)).await?;
+    // The registry holds at most this many documents, so more postings mean a broken index.
+    let mut budget = LinkBudget {
+        seeks: REGISTRY_CANDIDATE_LIMIT,
+        rows: REGISTRY_CANDIDATE_LIMIT.saturating_mul(2),
+    };
+    let mut records = Vec::new();
+    let mut after = None;
+    loop {
+        let page = read_backlinks(
+            storage,
+            object_iri,
+            Some(predicate_iri),
+            after,
+            INDEX_PAGE_SIZE,
+            &mut budget,
+        )
+        .await?;
+        records.extend(page.documents.into_values().flatten());
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
     let registry_records = super::api::filter_live_records(storage, registry_records)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
@@ -173,41 +329,8 @@ pub(crate) async fn lookup_iri_backlinks(
     ))
 }
 
-/// Backlinks to a bounded set of exact object IRIs. The predicate-less index
-/// scan is shared across all targets and stale document cursors are fenced.
-pub(crate) async fn lookup_backlinks_objects(
-    storage: &StorageHandle,
-    registry_records: &[MetadataRegistryRecord],
-    object_iris: &BTreeSet<String>,
-) -> Result<BTreeMap<String, Vec<IriBacklink>>, MetadataError> {
-    let records = scan_records(storage, None).await?;
-    let current_cursors = registry_records
-        .iter()
-        .map(|record| (record.document_id, record.last_event_id))
-        .collect::<HashMap<_, _>>();
-    let mut grouped = BTreeMap::<(String, Ulid, String), BTreeSet<String>>::new();
-    for record in records {
-        if !object_iris.contains(&record.object_iri)
-            || current_cursors.get(&record.document_id) != Some(&record.document_cursor)
-        {
-            continue;
-        }
-        grouped
-            .entry((record.object_iri, record.document_id, record.predicate_iri))
-            .or_default()
-            .extend(record.subject_iris);
-    }
-    let mut backlinks = BTreeMap::<String, Vec<IriBacklink>>::new();
-    for ((object_iri, document_id, predicate_iri), subject_iris) in grouped {
-        backlinks.entry(object_iri).or_default().push(IriBacklink {
-            document_id,
-            predicate_iri,
-            subject_iris: subject_iris.into_iter().collect(),
-        });
-    }
-    Ok(backlinks)
-}
-
+/// Materialization state of the given documents, one status read each; callers pass the
+/// documents a lookup returned, never the whole registry.
 pub(crate) async fn iri_index_freshness(
     storage: &StorageHandle,
     registry_records: &[MetadataRegistryRecord],

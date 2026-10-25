@@ -206,9 +206,8 @@ impl From<MetadataIriError> for MetadataMaterializationError {
             MetadataIriError::DataLink(DataLinkError::Storage(error)) => Self::Storage(error),
             MetadataIriError::DataLink(DataLinkError::Conversion(error)) => Self::Conversion(error),
             MetadataIriError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
-            error @ MetadataIriError::DataLink(DataLinkError::UnexpectedEvent(_)) => {
-                Self::UnexpectedEvent(error.to_string())
-            }
+            error @ (MetadataIriError::DataLink(DataLinkError::UnexpectedEvent(_))
+            | MetadataIriError::BudgetExhausted) => Self::UnexpectedEvent(error.to_string()),
         }
     }
 }
