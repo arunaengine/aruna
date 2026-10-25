@@ -15,7 +15,9 @@ mod payload;
 pub(crate) use forward::forwarded_digest;
 
 use crate::s3::auth::DelegatedRequest;
-use aruna_core::structs::storage::distribution::delegation::{Payload, body_digest};
+use aruna_core::structs::storage::distribution::delegation::{
+    COPY_CONTEXT_HEADER, Payload, body_digest,
+};
 use aruna_core::structs::storage::distribution::upload::UploadTag;
 mod multipart;
 mod object;
@@ -95,7 +97,7 @@ use aruna_operations::s3::multipart::create::{
     CreateMultipartInput as CMPI, CreateMultipartOperation,
 };
 use aruna_operations::s3::multipart::part_copy::{
-    PartCopyInput as UploadPartCopyData, upload_part_token,
+    PartCopyInput as UploadPartCopyData, keep_part_policies, upload_part_token,
 };
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput as UPI, UploadPartOperation};
 use aruna_operations::s3::multipart::parts::{ListPartsInput as LPI, ListPartsOperation};
@@ -1011,6 +1013,8 @@ impl S3 for ArunaS3Service {
             req.input.metadata.clone().unwrap_or_default(),
             req.input.content_type.as_deref(),
         );
+        // A forwarded copy keeps its source's placement refs and origin, as a local copy does.
+        let copied = forward::copy_context(&req.extensions, &req.headers)?;
         let routing = match bucket_info.as_ref() {
             Some(info) => bucket_snapshot(&self.state, info).await,
             None => routing_snapshot(&self.state, group_id, &replication_bucket).await,
@@ -1037,6 +1041,11 @@ impl S3 for ArunaS3Service {
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_metadata(metadata)
         .with_restrictions(replication_auth.path_restrictions.clone());
+        if let Some(copied) = copied {
+            operation = operation
+                .with_inherited_policies(copied.policies)
+                .with_version_origin(copied.origin);
+        }
         if let Some(gate) = gate {
             operation = operation.with_gate(gate);
         }
@@ -1443,6 +1452,13 @@ impl S3 for ArunaS3Service {
         let upload_id = self
             .upload_id(bucket_info, &req.input.key, &req.input.upload_id)
             .await?;
+        // A part copied on another member keeps its source's placement refs, as one copied here.
+        if let Some(copied) = forward::copy_context(&req.extensions, &req.headers)? {
+            let upload = (self.realm_id, upload_id);
+            keep_part_policies(&self.state, upload, &copied.policies)
+                .await
+                .map_err(IntoS3Error::into_s3_error)?;
+        }
         if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
             let composite = checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE;
             let check = payload::BodyCheck {
@@ -2019,11 +2035,15 @@ impl S3 for ArunaS3Service {
             full_object_checksums(&mut output, &result.info);
         }
 
-        Ok(if resolved_range.is_some() {
-            S3Response::with_status(output, http::StatusCode::PARTIAL_CONTENT)
-        } else {
-            S3Response::new(output)
-        })
+        let mut response = match resolved_range.is_some() {
+            true => S3Response::with_status(output, http::StatusCode::PARTIAL_CONTENT),
+            false => S3Response::new(output),
+        };
+        // A member copying this version through here keeps its placement refs.
+        if let Some(value) = forward::copy_policies(&req.extensions, &result.source_policies) {
+            (response.headers).insert(COPY_CONTEXT_HEADER, value);
+        }
+        Ok(response)
     }
 
     #[tracing::instrument(err, skip(self, req))]

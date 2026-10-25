@@ -176,6 +176,22 @@ pub async fn upload_part_token(
     })
 }
 
+/// Admits this node for the refs a part copied on another member carries and merges them into
+/// the upload before its bytes land, as a part copied here does.
+pub async fn keep_part_policies(
+    context: &DriverContext,
+    (realm_id, upload_id): (RealmId, Ulid),
+    policies: &[PlacementPolicyRef],
+) -> Result<(), PartCopyError> {
+    if policies.is_empty() {
+        return Ok(());
+    }
+    let upload = read_upload(context, upload_id).await?;
+    let refs = union_refs(&upload.placement_policies, policies).map_err(UploadPartError::from)?;
+    gate_part(context, realm_id, &refs, upload.group_id).await?;
+    store_source_policies(context, upload_id, policies).await
+}
+
 /// Evaluates this node against every ref the finished part carries. An
 /// ungoverned copy resolves nothing and performs no extra I/O.
 async fn gate_part(
@@ -283,11 +299,27 @@ async fn validate_destination_upload(
     context: &DriverContext,
     input: &PartCopyInput,
 ) -> Result<MultipartUpload, PartCopyError> {
+    let record = read_upload(context, input.upload_id).await?;
+    if record.bucket != input.dest_bucket || record.key != input.dest_key {
+        return Err(PartCopyError::UploadPart(
+            UploadPartError::UploadTargetMismatch,
+        ));
+    }
+    if record.status != MultipartUploadStatus::Open {
+        return Err(PartCopyError::UploadPart(UploadPartError::UploadNotOpen));
+    }
+    Ok(record)
+}
+
+async fn read_upload(
+    context: &DriverContext,
+    upload_id: Ulid,
+) -> Result<MultipartUpload, PartCopyError> {
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: UPLOAD_KEYSPACE.to_string(),
-            key: input.upload_id.to_bytes().to_vec().into(),
+            key: upload_id.to_bytes().to_vec().into(),
             txn_id: None,
         })
         .await;
@@ -307,16 +339,7 @@ async fn validate_destination_upload(
     let Some(value) = value else {
         return Err(PartCopyError::UploadPart(UploadPartError::NoSuchUpload));
     };
-    let record = MultipartUpload::from_bytes(value.as_ref()).map_err(UploadPartError::from)?;
-    if record.bucket != input.dest_bucket || record.key != input.dest_key {
-        return Err(PartCopyError::UploadPart(
-            UploadPartError::UploadTargetMismatch,
-        ));
-    }
-    if record.status != MultipartUploadStatus::Open {
-        return Err(PartCopyError::UploadPart(UploadPartError::UploadNotOpen));
-    }
-    Ok(record)
+    Ok(MultipartUpload::from_bytes(value.as_ref()).map_err(UploadPartError::from)?)
 }
 
 #[cfg(test)]
@@ -733,6 +756,56 @@ mod test {
             panic!("missing part read");
         };
         assert!(value.is_none(), "a refused part must write no bytes");
+    }
+
+    // A part copied on another member keeps its source's refs on the upload once this node is
+    // admitted for them, and is refused when it is not.
+    #[tokio::test]
+    async fn keeps_forwarded_policies() {
+        use aruna_core::structs::placement::policy::{
+            PlacementPolicy, PlacementSelector, VerifiedPolicy,
+        };
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let rule = |seed: u8, node| {
+            let selector = PlacementSelector {
+                node_id: Some(node),
+                location: None,
+                labels: Vec::new(),
+                executor_kind: None,
+            };
+            let policy = PlacementPolicy::new(
+                Ulid::from_bytes([seed; 16]),
+                "residency".to_string(),
+                vec![selector],
+            );
+            VerifiedPolicy::verify(policy.expect("policy is valid")).expect("policy verifies")
+        };
+        let here = rule(8, node_id);
+        let elsewhere = rule(9, iroh::SecretKey::from_bytes(&[9u8; 32]).public());
+        let (allowed, denied) = (here.policy_ref(), elsewhere.policy_ref());
+        let subject = subject(node_id, "eu-west");
+        seed_gate(&context, realm_id, user_id, subject, &[here, elsewhere]).await;
+        let upload_id = Ulid::generate();
+        seed_multipart_upload(&context, upload_id, "bucket", "dest.txt", group_id, user_id).await;
+
+        keep_part_policies(&context, (realm_id, upload_id), &[allowed])
+            .await
+            .unwrap();
+        let record = read_upload(&context, upload_id).await.unwrap();
+        assert_eq!(record.placement_policies, vec![allowed]);
+        let error = keep_part_policies(&context, (realm_id, upload_id), &[denied])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PartCopyError::UploadPart(UploadPartError::PolicyGateError(_))
+        ));
+        let missing = (realm_id, Ulid::generate());
+        assert_eq!(keep_part_policies(&context, missing, &[]).await, Ok(()));
     }
 
     async fn seed_governed_bucket(

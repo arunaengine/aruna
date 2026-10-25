@@ -15,6 +15,8 @@ use crate::NodeId;
 use crate::UserId;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::placement::policy::PlacementPolicyRef;
+use crate::structs::storage::origin::VersionOrigin;
 use crate::types::GroupId;
 
 /// The header a forwarded S3 request carries its delegation in.
@@ -245,6 +247,41 @@ pub fn request_digest(
     *hasher.finalize().as_bytes()
 }
 
+/// The header a forwarded copy carries what it keeps of its source in, bound by the request's
+/// digest; only a delegated request is read for it.
+pub const COPY_CONTEXT_HEADER: &str = "x-aruna-copy-context";
+
+/// What a copy that reaches its coordinator as a write keeps of its source, as a local copy
+/// would: the source's placement refs and the copy origin.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CopyContext {
+    pub policies: Vec<PlacementPolicyRef>,
+    pub origin: Option<VersionOrigin>,
+}
+
+impl CopyContext {
+    pub fn encode(&self) -> Result<String, DelegationError> {
+        let bytes = postcard::to_allocvec(self).map_err(|_| DelegationError::Encoding)?;
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    pub fn decode(value: &str) -> Result<Self, DelegationError> {
+        if value.len() > MAX_ENCODED {
+            return Err(DelegationError::Encoding);
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| DelegationError::Encoding)?;
+        let context: Self = postcard::from_bytes(&bytes).map_err(|_| DelegationError::Encoding)?;
+        // A copy names only the version it copied, within the origin's size budget.
+        match &context.origin {
+            None => Ok(context),
+            Some(origin @ VersionOrigin::Copy { .. }) if origin.bounded() => Ok(context),
+            Some(_) => Err(DelegationError::Encoding),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +313,39 @@ mod tests {
             issued_at: 100,
             valid_secs: 10,
         }
+    }
+
+    // A copy context survives its header; an origin that is no copy is refused.
+    #[test]
+    fn copy_context_bounded() {
+        use crate::structs::storage::global_id::GlobalId;
+        use crate::structs::storage::origin::OriginVersion;
+        let context = CopyContext {
+            policies: vec![PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([1; 16]),
+                digest: [2; 32],
+            }],
+            origin: Some(VersionOrigin::Copy {
+                from: OriginVersion::Global(GlobalId::Version {
+                    realm_id: RealmId::from_bytes([9; 32]),
+                    version_id: Ulid::from_bytes([3; 16]),
+                }),
+            }),
+        };
+        let encoded = context.encode().unwrap();
+        assert_eq!(CopyContext::decode(&encoded), Ok(context));
+        let upload = CopyContext {
+            policies: Vec::new(),
+            origin: Some(VersionOrigin::Upload {
+                node_id: secret(1).public(),
+                device: None,
+            }),
+        };
+        let encoded = upload.encode().unwrap();
+        assert_eq!(
+            CopyContext::decode(&encoded),
+            Err(DelegationError::Encoding)
+        );
     }
 
     #[test]

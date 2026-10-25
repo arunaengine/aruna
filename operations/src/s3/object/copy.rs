@@ -448,12 +448,23 @@ async fn copy_origin(
     let source = drive(GetBucketOperation::new(bucket.to_string()), context)
         .await
         .ok()?;
-    let from = match source.distribution {
-        Some(_) => OriginVersion::Global(GlobalId::Version {
+    let distributed = source.distribution.is_some();
+    source_origin((realm_id, node_id), (bucket, key), version_id, distributed)
+}
+
+/// The origin of a copy of `version_id`: its global id in a distributed bucket, else its ARN.
+pub fn source_origin(
+    (realm_id, node_id): (RealmId, NodeId),
+    (bucket, key): (&str, &str),
+    version_id: Ulid,
+    distributed: bool,
+) -> Option<VersionOrigin> {
+    let from = match distributed {
+        true => OriginVersion::Global(GlobalId::Version {
             realm_id,
             version_id,
         }),
-        None => OriginVersion::Node(
+        false => OriginVersion::Node(
             VersionedObjectArn::new(realm_id, node_id, bucket, key, version_id).ok()?,
         ),
     };

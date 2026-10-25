@@ -11,9 +11,12 @@ use std::time::SystemTime;
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{BucketInfo, CONTENT_TYPE_KEY, UserAccess};
+use aruna_core::structs::storage::distribution::delegation::{COPY_CONTEXT_HEADER, CopyContext};
 use aruna_core::structs::storage::distribution::{ReadRoute, RouteError};
+use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_operations::distribution::guard::{record_holders, route_read};
-use aruna_operations::s3::object::copy::{CopySourceConditions, read_copy_source};
+use aruna_operations::s3::object::copy::{CopySourceConditions, read_copy_source, source_origin};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use futures_util::TryStreamExt;
 use http::Method;
@@ -21,7 +24,7 @@ use s3s::dto::{
     CopyObjectOutput, CopyObjectResult, CopyPartResult, ETag, StreamingBlob, Timestamp,
     TimestampFormat, UploadPartCopyOutput,
 };
-use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
 
 use super::{Forward, ForwardBody, ForwardRequest, answer_text, header, xml_field};
 use crate::s3::error::{IntoS3Error, guard_error};
@@ -125,6 +128,28 @@ fn copy_headers(metadata: &HashMap<String, String>, length: u64) -> Vec<(String,
         }
     }
     headers
+}
+
+/// The header that carries what a streamed copy keeps of its source; none for a plain source.
+fn context_header(context: &CopyContext) -> S3Result<Option<(String, String)>> {
+    if *context == CopyContext::default() {
+        return Ok(None);
+    }
+    let encoded = (context.encode())
+        .map_err(|error| s3_error!(InternalError, "The copy context does not encode: {error}"))?;
+    Ok(Some((COPY_CONTEXT_HEADER.to_string(), encoded)))
+}
+
+/// The placement refs a holder answered a copy source read with.
+fn answered_policies(
+    response: &reqwest::Response,
+) -> S3Result<Vec<aruna_core::structs::placement::policy::PlacementPolicyRef>> {
+    match header(response, COPY_CONTEXT_HEADER) {
+        Some(value) => CopyContext::decode(&value)
+            .map(|context| context.policies)
+            .map_err(|_| s3_error!(ServiceUnavailable, "The holder named unreadable placement")),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn copied_at(text: Option<String>) -> Timestamp {
@@ -233,7 +258,22 @@ impl ArunaS3Service {
         let length = (header(&read, "content-length").and_then(|value| value.parse().ok()))
             .ok_or_else(|| s3s::s3_error!(ServiceUnavailable, "The holder named no length"))?;
         let metadata = metadata.unwrap_or_else(|| answered_metadata(&read));
-        let headers = copy_headers(&metadata, length);
+        // A relayed source is always a distributed version: its global id is the origin.
+        let origin = (version
+            .as_deref()
+            .and_then(|id| ulid::Ulid::from_string(id).ok()))
+        .map(|version_id| VersionOrigin::Copy {
+            from: OriginVersion::Global(GlobalId::Version {
+                realm_id: self.realm_id,
+                version_id,
+            }),
+        });
+        let context = CopyContext {
+            policies: answered_policies(&read)?,
+            origin,
+        };
+        let mut headers = copy_headers(&metadata, length);
+        headers.extend(context_header(&context)?);
         let body = StreamingBlob::wrap(read.bytes_stream().map_err(std::io::Error::other));
         self.send_copy(user, forward, target, (headers, body), version)
             .await
@@ -250,8 +290,13 @@ impl ArunaS3Service {
         let version = header(&read, "x-amz-version-id");
         let length = header(&read, "content-length")
             .ok_or_else(|| s3s::s3_error!(ServiceUnavailable, "The holder named no length"))?;
+        let context = CopyContext {
+            policies: answered_policies(&read)?,
+            origin: None,
+        };
         let body = StreamingBlob::wrap(read.bytes_stream().map_err(std::io::Error::other));
-        let headers = vec![("content-length".to_string(), length)];
+        let mut headers = vec![("content-length".to_string(), length)];
+        headers.extend(context_header(&context)?);
         self.send_part(user, forward, target, (headers, body), version)
             .await
     }
@@ -289,9 +334,19 @@ impl ArunaS3Service {
         metadata: Option<HashMap<String, String>>,
         token: Option<&aruna_operations::s3::object::get::TokenRead>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let (name, key_of) = (source.name.clone(), source.key.clone());
+        let distributed = source.bucket.distribution.is_some();
         let read = self.read_copy(source, token).await?;
         let version = read.resolved_version_id.or(read.version_id);
-        let headers = copy_headers(metadata.as_ref().unwrap_or(&read.metadata), read.info.size);
+        let mut headers = copy_headers(metadata.as_ref().unwrap_or(&read.metadata), read.info.size);
+        let context = CopyContext {
+            policies: read.source_policies.clone(),
+            origin: version.and_then(|id| {
+                let local = (self.realm_id, self.node_id);
+                source_origin(local, (&name, &key_of), id, distributed)
+            }),
+        };
+        headers.extend(context_header(&context)?);
         let body = StreamingBlob::wrap(read.blob);
         let version = version.map(|version| version.to_string());
         self.send_copy(user, forward, (bucket, key), (headers, body), version)
@@ -348,7 +403,12 @@ impl ArunaS3Service {
         let version = read.resolved_version_id.or(read.version_id);
         let length = (read.resolved_range.as_ref())
             .map_or(read.info.size, |range| range.range.end - range.range.start);
-        let headers = vec![("content-length".to_string(), length.to_string())];
+        let mut headers = vec![("content-length".to_string(), length.to_string())];
+        let context = CopyContext {
+            policies: read.source_policies.clone(),
+            origin: None,
+        };
+        headers.extend(context_header(&context)?);
         let body = StreamingBlob::wrap(read.blob);
         let version = version.map(|version| version.to_string());
         self.send_part(

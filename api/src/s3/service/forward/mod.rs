@@ -19,7 +19,8 @@ use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::distribution::delegation::{
-    DELEGATION_HEADER, Payload, TRAILER_BYTES, body_digest, request_digest,
+    COPY_CONTEXT_HEADER, CopyContext, DELEGATION_HEADER, Payload, TRAILER_BYTES, body_digest,
+    request_digest,
 };
 use aruna_core::structs::storage::distribution::upload::UploadTag;
 use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
@@ -177,11 +178,49 @@ pub(super) fn delegated_trailer(
     }
 }
 
+/// What a delegated write keeps of the source it copies; `None` for any other request.
+pub(super) fn copy_context(
+    extensions: &http::Extensions,
+    headers: &HeaderMap,
+) -> S3Result<Option<CopyContext>> {
+    if extensions.get::<DelegatedRequest>().is_none() {
+        return Ok(None);
+    }
+    let Some(value) = headers.get(COPY_CONTEXT_HEADER) else {
+        return Ok(None);
+    };
+    let value = value.to_str().ok();
+    match value.map(CopyContext::decode) {
+        Some(Ok(context)) => Ok(Some(context)),
+        _ => Err(s3_error!(
+            InvalidArgument,
+            "The copy context does not decode"
+        )),
+    }
+}
+
+/// The header a holder answers a delegated read with when the version carries placement refs.
+pub(super) fn copy_policies(
+    extensions: &http::Extensions,
+    policies: &[aruna_core::structs::placement::policy::PlacementPolicyRef],
+) -> Option<http::HeaderValue> {
+    extensions.get::<DelegatedRequest>()?;
+    if policies.is_empty() {
+        return None;
+    }
+    let context = CopyContext {
+        policies: policies.to_vec(),
+        origin: None,
+    };
+    http::HeaderValue::from_str(&context.encode().ok()?).ok()
+}
+
 /// Whether a header carries request semantics the delegation must bind; `accept` selects a
 /// folder index, which a forwarded read never asks for.
 fn semantic(name: &str) -> bool {
     DIGEST_HEADERS.contains(&name)
         || PASSED_HEADERS.contains(&name)
+        || name == COPY_CONTEXT_HEADER
         || name == "accept"
         || name.starts_with("x-amz-meta-")
         || name.starts_with("x-amz-checksum-")

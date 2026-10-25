@@ -145,3 +145,44 @@ fn consumed_headers_bound() {
     assert!(passed.contains(&("x-amz-acl".to_string(), "private".to_string())));
     assert!(passed.contains(&("x-amz-checksum-mode".to_string(), "ENABLED".to_string())));
 }
+
+// A forwarded copy's context is bound by the request digest and read only from a delegated
+// request; a client cannot pass one through a member.
+#[test]
+fn copy_context_bound() {
+    let context = CopyContext {
+        policies: vec![aruna_core::structs::placement::policy::PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([4; 16]),
+            digest: [5; 32],
+        }],
+        origin: None,
+    };
+    let encoded = context.encode().unwrap();
+    let copied = headers(&[(COPY_CONTEXT_HEADER, &encoded)]);
+    let plain = forwarded_digest(&Method::PUT, "spire", "a", None, &HeaderMap::new());
+    let bound = forwarded_digest(&Method::PUT, "spire", "a", None, &copied);
+    assert_ne!(
+        plain, bound,
+        "the copy context is part of the bound request"
+    );
+    let passed = passed_headers(&copied, None);
+    assert!(passed.iter().all(|(name, _)| name != COPY_CONTEXT_HEADER));
+    let mut extensions = http::Extensions::new();
+    assert_eq!(copy_context(&extensions, &copied).unwrap(), None);
+    assert_eq!(copy_policies(&extensions, &context.policies), None);
+    extensions.insert(DelegatedRequest {
+        issuer: forward().node_id,
+        nonce: [6; 16],
+        payload: Payload::Framed { checksum: None },
+    });
+    assert_eq!(
+        copy_context(&extensions, &copied).unwrap(),
+        Some(context.clone())
+    );
+    let answered = copy_policies(&extensions, &context.policies).unwrap();
+    let answered = CopyContext::decode(answered.to_str().unwrap()).unwrap();
+    assert_eq!(answered.policies, context.policies);
+    assert_eq!(copy_policies(&extensions, &[]), None);
+    let broken = headers(&[(COPY_CONTEXT_HEADER, "!")]);
+    assert!(copy_context(&extensions, &broken).is_err());
+}
