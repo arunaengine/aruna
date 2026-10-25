@@ -20,8 +20,8 @@ use aruna_core::keyspaces::{
     NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
     REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
-    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
-    UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
+    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -64,6 +64,7 @@ mod mappings;
 mod session_refs;
 mod sessions;
 mod sizes;
+mod staging;
 mod uploads;
 mod user_sessions;
 mod vault;
@@ -141,10 +142,13 @@ pub struct MigrateOutput {
     /// Login sessions from before a session named the linked login it came through.
     pub user_sessions_scanned: usize,
     pub user_sessions_rewritten: usize,
+    /// Finished staging checkpoints from before the directory queue; unfinished ones are
+    /// deleted, so their job walks its source again, and count as `staging_job_state` below.
+    pub staging_checkpoints_rewritten: usize,
     /// Rows rewritten by keyspace whose shape gained trailing fields with distributed buckets.
     pub relaid_rows: BTreeMap<&'static str, usize>,
-    /// Rows deleted by keyspace: refresh jobs and IRI index rows in a replaced key layout and
-    /// replication jobs moved to their new key.
+    /// Rows deleted by keyspace: refresh jobs and IRI index rows in a replaced key layout,
+    /// replication jobs moved to their new key and unfinished staging checkpoints.
     pub stale_rows_deleted: BTreeMap<&'static str, usize>,
 }
 
@@ -222,6 +226,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let replication_rows = db.keyspace(REPLICATION_JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
     let refresh_rows = db.keyspace(REFRESH_JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
     let iri_rows = db.keyspace(IRI_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let staging_rows = db.keyspace(STAGING_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -280,10 +285,12 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         &index_rows,
         ID_MAPPING_KEYSPACE,
     )?;
-    let jobs = jobs::job_rows(&db, &job_rows, JOB_KEYSPACE)?;
+    let identities = staging::identities(&db, &bucket_rows, &buckets.rows, S3_BUCKET_KEYSPACE)?;
+    let jobs = jobs::job_rows(&db, &job_rows, JOB_KEYSPACE, &identities)?;
     let dedup = jobs::dedup_rows(&db, &dedup_rows, &jobs.rows, DEDUP_INDEX_KEYSPACE)?;
     let kinds = jobs::checkpoint_kinds(&db, &job_rows, &jobs.rows, JOB_KEYSPACE)?;
     let checkpoints = jobs::checkpoint_rows(&db, &state_rows, &kinds, JOB_STATE_KEYSPACE)?;
+    let staged = staging::checkpoint_rows(&db, &staging_rows, STAGING_STATE_KEYSPACE)?;
     let mut relaid_rows = vec![
         padded::<CurrentVersionPointer>(&db, &head_rows, BLOB_HEAD_KEYSPACE, HEAD)?,
         padded::<PolicyMutationRecord>(&db, &mutation_rows, POLICY_MUTATION_KEYSPACE, HEAD)?,
@@ -306,7 +313,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     ));
     let announced = layouts::cleanup_rows(&db, &cleanup_rows)?.rows;
     relaid_rows.push((&cleanup_rows, BLOB_CLEANUP_KEYSPACE, announced));
-    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 3] = [
+    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 4] = [
         (
             &refresh_rows,
             REFRESH_JOB_KEYSPACE,
@@ -322,6 +329,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             REPLICATION_JOB_KEYSPACE,
             replication.removed,
         ),
+        (&staging_rows, STAGING_STATE_KEYSPACE, staged.restarted),
     ];
     let keys = node_secret(&db)?.map(|secret| {
         (
@@ -363,6 +371,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&job_rows, &jobs.rows),
         (&dedup_rows, &dedup.rows),
         (&state_rows, &checkpoints.rows),
+        (&staging_rows, &staged.rewrites.rows),
         (&owner_rows, &stale.owner_writes),
         (&cleanup_rows, &old_uploads.blob_deletes),
     ]
@@ -469,6 +478,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         info_cursors_deleted: info.cursors.len() + fanout_cursors,
         user_sessions_scanned: logins.scanned,
         user_sessions_rewritten: logins.rows.len(),
+        staging_checkpoints_rewritten: staged.rewrites.rows.len(),
         relaid_rows: counts(
             relaid_rows
                 .iter()
