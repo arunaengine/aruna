@@ -317,7 +317,8 @@ impl SetWork {
             !std::mem::replace(&mut fence.closed, true)
         })
         .await?;
-        if self.clear_set(context, true, budget).await? == Left::Waiting {
+        let clearing = (snapshot.config.bucket.as_str(), true, Some(binding));
+        if self.clear_set(context, clearing, budget).await? == Left::Waiting {
             return Ok(Left::Waiting);
         }
         unbind(context, &snapshot.config.bucket, binding, true).await?;
@@ -361,7 +362,7 @@ impl SetWork {
         let Some(binding) = local.binding.clone() else {
             // The member bucket is gone or replaced: nothing of the set is left here.
             return self
-                .clear_set(context, (&snapshot.config.bucket, true), budget)
+                .clear_set(context, (&snapshot.config.bucket, true, None), budget)
                 .await;
         };
         for range in &snapshot.config.ranges {
@@ -375,7 +376,7 @@ impl SetWork {
                 .bound_to(binding.clone());
         match drive(delete, context.as_ref()).await {
             Ok(()) | Err(crate::s3::bucket::delete::DeleteBucketError::NotFound) => {
-                self.clear_set(context, (&snapshot.config.bucket, true), budget)
+                self.clear_set(context, (&snapshot.config.bucket, true, None), budget)
                     .await
             }
             Err(error) => {
@@ -412,10 +413,11 @@ impl SetWork {
     async fn clear_set(
         &self,
         context: &DriverContext,
-        (bucket, keep_fence): (&str, bool),
+        (bucket, keep_fence, clearing): (&str, bool, Option<&DistributionBinding>),
         budget: &mut usize,
     ) -> Result<Left, String> {
-        match clear_set_rows(context, (self.set_id, bucket), keep_fence, budget).await? {
+        let rows = (self.set_id, bucket, clearing);
+        match clear_set_rows(context, rows, keep_fence, budget).await? {
             Purged::Done => Ok(Left::Settled),
             Purged::More => Ok(Left::Waiting),
         }
@@ -437,7 +439,7 @@ impl SetWork {
             unbind(context, &snapshot.config.bucket, binding, false).await?;
         }
         // The released bucket checks no fence; a later join of this node starts afresh.
-        self.clear_set(context, (&snapshot.config.bucket, false), budget)
+        self.clear_set(context, (&snapshot.config.bucket, false, None), budget)
             .await
     }
 
