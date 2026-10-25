@@ -56,6 +56,8 @@ const ACCESS_ID_HTTPS: &str = "https";
 /// Whole-request budget for the routed probes one call may need, however many
 /// identifiers it names.
 const DRS_ROUTED_TIMEOUT: Duration = Duration::from_secs(5);
+/// Holders of a distributed version asked in turn before it counts as unavailable.
+const MAX_HOLDER_TRIES: usize = 3;
 /// Identifiers one bulk request may name. Each foreign one costs a routed probe.
 const MAX_OBJECT_IDS: usize = 100;
 /// Routed probes of one bulk request that may be in flight at once.
@@ -691,7 +693,8 @@ redirected here stands in for the caller's bearer token.
   single-use download ticket valid for a few seconds, because browsers drop `Authorization`
   on cross-origin redirects; the target checks the ticket, revocation and the caller's
   permission on its own path. A caller whose token cannot be named in a ticket (an external
-  OIDC token) is served here when this node keeps the bytes, otherwise redirected without one.
+  OIDC token) is served here when this node keeps the bytes; otherwise the answer is 503 with the
+  pinned URL of the serving node, to request there with the same token.
 - A pinned URL serves here and never chooses again; a holder that cannot serve answers 503 and
   the client retries the original URL.
 - The 200 carries the raw bytes and a `Content-Length` taken from the stored object; no content type
@@ -716,7 +719,7 @@ redirected here stands in for the caller's bearer token.
         (status = 403, description = "An authenticated caller lacks READ, or the download ticket is refused; an anonymous caller gets 404 instead, so existence stays hidden", body = DrsErrorPayload),
         (status = 404, description = "No such object, an anonymous caller may not read it, or the recorded reference observation is no longer served by its source", body = DrsErrorPayload),
         (status = 409, description = "Reference binding reached its automatic advance limit, or more than one distributed bucket holds the version id", body = DrsErrorPayload),
-        (status = 503, description = "Reference source is changing, no holder could answer within the probe budget, this pinned holder cannot serve, or the node's download capacity is exhausted; retry", body = DrsErrorPayload)
+        (status = 503, description = "Reference source is changing, no holder could answer within the probe budget, this pinned holder cannot serve, the node's download capacity is exhausted, or a token no ticket can carry must be sent to the named holder; retry", body = DrsErrorPayload)
     ),
     security((), ("bearer_auth" = []))
 )]
@@ -778,7 +781,7 @@ pub async fn resolve_data(
     Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    uri: http::Uri,
     Query(query): Query<ResolveQuery>,
 ) -> Response {
     let caller = Caller {
@@ -786,8 +789,18 @@ pub async fn resolve_data(
         bearer,
         address: client_ip(state.trusted_proxies(), peer.ip(), &headers),
     };
+    // The raw path keeps an ARN key percent-encoded, as its canonical form requires.
+    let Some(id) = raw_id(&uri) else {
+        return DrsError::bad_request("the path names no identifier").into_response();
+    };
     let object_id = format!("{DATA_PREFIX}{id}");
     serve_download(&state, caller, &object_id, query.here, query.ticket).await
+}
+
+/// The still percent-encoded identifier after `/resolve/` of a request path.
+fn raw_id(uri: &http::Uri) -> Option<String> {
+    let (_, id) = uri.path().split_once("/resolve/")?;
+    Some(id.to_string())
 }
 
 /// Who asks for a download: the authenticated caller, its token and its address.
@@ -838,6 +851,9 @@ async fn serve_download(
             None => None,
         };
         if let Some(node_id) = target {
+            if !ticketable {
+                return holder_hint(state.as_ref(), node_id, object_id).await;
+            }
             let ticket = grant.map(|grant| TicketInput {
                 target: node_id,
                 user_id: auth.user_id,
@@ -952,6 +968,38 @@ async fn pin_holder(state: &ServerState, resolved: &mut ResolvedObject) {
     }
 }
 
+/// The pinned download URL of `object_id` on `node_id`.
+async fn pinned_url(
+    state: &ServerState,
+    node_id: aruna_core::NodeId,
+    object_id: &str,
+) -> Option<String> {
+    let origin = owner_origin(state, node_id).await.ok()??;
+    Some(format!(
+        "{origin}/api/v1/ga4gh/drs/v1/download?object_id={}&here=true",
+        encode_component(object_id)
+    ))
+}
+
+/// A redirect would drop a credential no ticket can carry, so the caller gets the holder's
+/// pinned URL to request with the same credential instead.
+async fn holder_hint(
+    state: &ServerState,
+    node_id: aruna_core::NodeId,
+    object_id: &str,
+) -> Response {
+    match pinned_url(state, node_id, object_id).await {
+        Some(url) => drs_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "node {node_id} serves this object; a redirect cannot carry this credential, \
+                 so request {url} with it"
+            ),
+        ),
+        None => DrsError::unavailable().into_response(),
+    }
+}
+
 /// A temporary, uncached redirect to `node_id`'s pinned download URL, with a ticket when the
 /// caller is authenticated. The URL is never logged.
 async fn holder_redirect(
@@ -960,13 +1008,9 @@ async fn holder_redirect(
     object_id: &str,
     ticket: Option<TicketInput>,
 ) -> Response {
-    let Ok(Some(origin)) = owner_origin(state, node_id).await else {
+    let Some(mut url) = pinned_url(state, node_id, object_id).await else {
         return DrsError::unavailable().into_response();
     };
-    let mut url = format!(
-        "{origin}/api/v1/ga4gh/drs/v1/download?object_id={}&here=true",
-        encode_component(object_id)
-    );
     if let Some(input) = ticket {
         let signed = issue_ticket(&state.get_ctx(), input, now_millis() / 1000);
         let Some(encoded) = signed.and_then(|signed| signed.encode().ok()) else {
@@ -1120,11 +1164,19 @@ async fn resolve_object(
 ) -> Result<ResolveOutcome, DrsError> {
     match parse_object_id(object_id)? {
         RequestedObjectId::CanonicalW3id(hash) => {
+            // A local copy the caller may not read leaves distributed copies to try.
             match resolve_content_hash(state, auth, object_id, None, &hash).await? {
-                ResolveOutcome::NotFound => {
-                    resolve_distributed_hash(state, auth, object_id, hash, deadline).await
+                ResolveOutcome::Found(object) => Ok(ResolveOutcome::Found(object)),
+                local => {
+                    let found = resolve_distributed_hash(state, auth, object_id, hash, deadline);
+                    Ok(match (found.await?, local) {
+                        (ResolveOutcome::NotFound, local) => local,
+                        (ResolveOutcome::Unavailable, ResolveOutcome::Denied) => {
+                            ResolveOutcome::Denied
+                        }
+                        (outcome, _) => outcome,
+                    })
                 }
-                outcome => Ok(outcome),
             }
         }
         RequestedObjectId::ContentHashArn {
@@ -1157,10 +1209,11 @@ async fn resolve_distributed_hash(
     let mut denied = false;
     for found in resolution.versions {
         let version_id = found.version_id;
-        match resolve_global(state, auth, requested_id, realm_id, version_id, deadline).await? {
-            ResolveOutcome::Found(object) => return Ok(ResolveOutcome::Found(object)),
-            ResolveOutcome::Denied => denied = true,
-            ResolveOutcome::NotFound | ResolveOutcome::Unavailable => {}
+        // One version that cannot be resolved does not end the search for the others.
+        match resolve_global(state, auth, requested_id, realm_id, version_id, deadline).await {
+            Ok(ResolveOutcome::Found(object)) => return Ok(ResolveOutcome::Found(object)),
+            Ok(ResolveOutcome::Denied) => denied = true,
+            Ok(ResolveOutcome::NotFound | ResolveOutcome::Unavailable) | Err(_) => {}
         }
     }
     Ok(match (denied, resolution.incomplete) {
@@ -1220,17 +1273,28 @@ async fn resolve_global(
         }
     }
     let local = state.get_node_id();
-    let remote: Vec<_> = found
+    let mut remote: Vec<_> = found
         .holders
         .iter()
         .copied()
         .filter(|node_id| *node_id != local)
         .collect();
-    let Some(holder) = choose_holder(&context, &remote, now_millis()).await else {
-        return Ok(ResolveOutcome::Unavailable);
-    };
-    let outcome = resolve_at(state, auth, requested_id, holder.node_id, &object, deadline).await?;
-    Ok(with_holders(outcome))
+    // A holder of the range may lack this version's bytes, so its miss proves no absence.
+    let mut outcome = ResolveOutcome::Unavailable;
+    for _ in 0..MAX_HOLDER_TRIES {
+        let Some(holder) = choose_holder(&context, &remote, now_millis()).await else {
+            break;
+        };
+        remote.retain(|node_id| *node_id != holder.node_id);
+        match resolve_at(state, auth, requested_id, holder.node_id, &object, deadline).await? {
+            ResolveOutcome::Found(object) => {
+                return Ok(with_holders(ResolveOutcome::Found(object)));
+            }
+            ResolveOutcome::Denied => outcome = ResolveOutcome::Denied,
+            ResolveOutcome::NotFound | ResolveOutcome::Unavailable => {}
+        }
+    }
+    Ok(outcome)
 }
 
 /// One exact object version a resolution names.

@@ -5,8 +5,8 @@
 use super::{
     DATA_PREFIX, DrsBulkBody, GetObjectError, MAX_OBJECT_IDS, RequestedObjectId, ResolveOutcome,
     ResolvedObject, build_object_response, download_error, drs_denied_error, encode_component,
-    get_authorizations, get_object, owner_origin, parse_object_id, post_objects, resolve_object,
-    routed_deadline,
+    get_authorizations, get_object, owner_origin, parse_object_id, post_objects, raw_id,
+    resolve_object, routed_deadline,
 };
 use crate::openapi::ApiDoc;
 use crate::server::state::ServerState;
@@ -734,4 +734,22 @@ fn openapi_has_drs() {
     );
     assert!(openapi.paths.paths.contains_key("/ga4gh/drs/v1/download"));
     let _ = DATA_PREFIX;
+}
+
+#[test]
+fn keeps_encoded_keys() {
+    let realm_id = RealmId::from_bytes([3; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let version = Ulid::from_bytes([7; 16]);
+    let arn = VersionedObjectArn::new(realm_id, node_id, "b", "a b", version).unwrap();
+    let w3id = arn.to_w3id();
+    let id = w3id.strip_prefix(DATA_PREFIX).unwrap();
+    // A decoded path would no longer be the canonical ARN and be refused.
+    let uri: http::Uri = format!("/resolve/{id}").parse().unwrap();
+    let raw = raw_id(&uri).unwrap();
+    assert_eq!(raw, id);
+    assert!(matches!(
+        parse_object_id(&format!("{DATA_PREFIX}{raw}")),
+        Ok(RequestedObjectId::VersionedObject(_))
+    ));
 }
