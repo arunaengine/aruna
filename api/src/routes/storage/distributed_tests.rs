@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::structs::storage::distribution::DistributionRevision;
+use aruna_core::structs::storage::distribution::{DistributionError, DistributionRevision};
 use aruna_operations::distribution::status::{
     DeletionStatus, LifecycleStatus, MemberStatus, RangeStatus, TransferStatus,
 };
@@ -234,4 +234,254 @@ fn partial_names_set() {
             .error
             .is_some_and(|error| error.contains("unavailable"))
     );
+}
+
+#[test]
+fn names_round_trip() {
+    for name in [
+        StrategyName::Copy,
+        StrategyName::CopyOnUse,
+        StrategyName::CacheOnUse,
+        StrategyName::Stream,
+    ] {
+        assert_eq!(strategy_name(strategy(name)), name);
+    }
+    assert_eq!(
+        behaviour(BehaviourName::Passthrough),
+        RangeBehaviour::Passthrough
+    );
+    assert_eq!(
+        behaviour(BehaviourName::ServeAndFill),
+        RangeBehaviour::ServeAndFill
+    );
+    let settings = settings_of(&SettingsRequest {
+        refresh_secs: Some(60),
+        range_behaviour: Some(BehaviourName::FillFirst),
+        search_index: true,
+        public: true,
+        split_objects: Some(10),
+        split_bytes: Some(20),
+    });
+    assert_eq!(settings.range_behaviour, Some(RangeBehaviour::FillFirst));
+    assert!(settings.search_index && settings.public);
+    assert_eq!(
+        (settings.split_objects, settings.split_bytes),
+        (Some(10), Some(20))
+    );
+    let states = [
+        MemberState::Created,
+        MemberState::Ready,
+        MemberState::Leaving,
+        MemberState::Failed,
+    ];
+    let names: Vec<_> = states.into_iter().map(state_name).collect();
+    assert_eq!(names, vec!["created", "ready", "leaving", "failed"]);
+}
+
+#[test]
+fn sharding_request_converts() {
+    let mut sharded = request(LayoutName::Sharding);
+    sharded.boundaries = vec!["m".to_string()];
+    sharded.replicas = 1;
+    let input = create_input(Ulid::nil(), sharded).unwrap();
+    assert!(matches!(
+        input.layout,
+        LayoutKind::Sharding { ref boundaries, replicas: 1 } if boundaries == &["m".to_string()]
+    ));
+    let mut edge = request(LayoutName::Replica);
+    edge.edges[0].node_id = "not-a-node".to_string();
+    assert!(matches!(
+        create_input(Ulid::nil(), edge),
+        Err(ServerError::BadRequestMessage(_))
+    ));
+}
+
+#[test]
+fn errors_map_to_status() {
+    let set_id = Ulid::from_bytes([1; 16]);
+    for retryable in [
+        GuardError::RecordMissing(set_id),
+        GuardError::Unreadable("broken".to_string()),
+        GuardError::Route(RouteError::Pending(set_id)),
+        GuardError::Route(RouteError::Moving(set_id)),
+        GuardError::Route(RouteError::StaleRange(set_id)),
+    ] {
+        assert!(matches!(
+            map_guard_error(retryable),
+            ServerError::ServiceUnavailableReason(_)
+        ));
+    }
+    for refused in [RouteError::Deleting(set_id), RouteError::NoRange(set_id)] {
+        assert!(matches!(
+            map_guard_error(GuardError::Route(refused)),
+            ServerError::Conflict(_)
+        ));
+    }
+    let conversion =
+        aruna_core::errors::ConversionError::from(postcard::Error::DeserializeUnexpectedEnd);
+    assert!(matches!(
+        map_guard_error(GuardError::Conversion(conversion)),
+        ServerError::InternalError(_)
+    ));
+    let cases = [
+        (CreateError::Invalid("bad".into()), "400"),
+        (
+            CreateError::Distribution(DistributionError::MemberCount),
+            "400",
+        ),
+        (CreateError::Publish(PublishRefusal::Unauthorized), "401"),
+        (CreateError::Publish(PublishRefusal::Replayed), "409"),
+        (CreateError::Conflicted, "409"),
+        (CreateError::Blocked("degraded".into()), "503"),
+    ];
+    for (error, status) in cases {
+        let mapped = match map_create_error(error) {
+            ServerError::BadRequestMessage(_) => "400",
+            ServerError::Unauthorized => "401",
+            ServerError::Conflict(_) => "409",
+            ServerError::ServiceUnavailableReason(_) => "503",
+            other => panic!("unexpected mapping {other:?}"),
+        };
+        assert_eq!(mapped, status);
+    }
+}
+
+#[test]
+fn report_lists_members() {
+    let node: NodeId = node_text(2).parse().unwrap();
+    let report = CreationReport {
+        set_id: Ulid::from_bytes([1; 16]),
+        active: true,
+        members: vec![aruna_operations::distribution::create::MemberOutcome {
+            member_id: Ulid::from_bytes([2; 16]),
+            node_id: node,
+            admitted: false,
+            error: Some("bucket exists".to_string()),
+        }],
+        error: None,
+    };
+    let response = admission_response(report);
+    assert!(response.active);
+    assert_eq!(response.members[0].node_id, node_text(2));
+    assert_eq!(response.members[0].error.as_deref(), Some("bucket exists"));
+}
+
+mod routes {
+    use super::*;
+    use crate::tests::distributed::{BUCKET, Node, distribute, node_state};
+
+    async fn status(
+        node: &Node,
+        auth: &AuthContext,
+        group_id: Ulid,
+        set_id: Ulid,
+    ) -> ServerResult<Json<DistributedResponse>> {
+        get_distributed(
+            State(node.state.clone()),
+            Extension(Some(auth.clone())),
+            Path((group_id, set_id)),
+        )
+        .await
+    }
+
+    async fn of_bucket(node: &Node, auth: &AuthContext) -> ServerResult<Json<DistributedResponse>> {
+        get_bucket_distribution(
+            State(node.state.clone()),
+            Extension(Some(auth.clone())),
+            Path(BUCKET.to_string()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn reads_set_status() {
+        let node = node_state().await;
+        // An ordinary bucket belongs to no distributed bucket.
+        assert!(matches!(
+            of_bucket(&node, &node.owner).await,
+            Err(ServerError::NotFound)
+        ));
+        let set_id = distribute(&node.state, node.group_id, BUCKET)
+            .await
+            .set_id();
+
+        let Json(response) = status(&node, &node.owner, node.group_id, set_id)
+            .await
+            .unwrap();
+        assert_eq!(response.bucket, BUCKET);
+        assert_eq!(response.phase, "active");
+        assert_eq!((response.members.len(), response.ranges.len()), (2, 2));
+        let Json(bound) = of_bucket(&node, &node.owner).await.unwrap();
+        assert_eq!(bound.set_id, set_id.to_string());
+
+        assert!(matches!(
+            status(&node, &node.stranger, node.group_id, set_id).await,
+            Err(ServerError::Forbidden)
+        ));
+        assert!(matches!(
+            of_bucket(&node, &node.stranger).await,
+            Err(ServerError::Forbidden)
+        ));
+        // A set is found only under its owner group.
+        assert!(matches!(
+            status(&node, &node.owner, Ulid::nil(), set_id).await,
+            Err(ServerError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn admission_retry_checks() {
+        let node = node_state().await;
+        let set_id = distribute(&node.state, node.group_id, BUCKET)
+            .await
+            .set_id();
+        let retry = |auth: &AuthContext, set_id: Ulid| {
+            retry_admission(
+                State(node.state.clone()),
+                Extension(Some(auth.clone())),
+                Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+                Path((node.group_id, set_id)),
+            )
+        };
+        assert!(matches!(
+            retry(&node.owner, Ulid::nil()).await,
+            Err(ServerError::NotFound)
+        ));
+        assert!(matches!(
+            retry(&node.stranger, set_id).await,
+            Err(ServerError::Forbidden)
+        ));
+        let Json(report) = retry(&node.owner, set_id).await.unwrap();
+        assert_eq!(report.set_id, set_id.to_string());
+        assert!(report.active);
+    }
+
+    #[tokio::test]
+    async fn creation_refused() {
+        let node = node_state().await;
+        let create = |auth: &AuthContext, request: CreateDistributedRequest| {
+            create_distributed(
+                State(node.state.clone()),
+                Extension(Some(auth.clone())),
+                Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+                Path(node.group_id),
+                Json(request),
+            )
+        };
+        assert!(matches!(
+            create(&node.stranger, request(LayoutName::Replica)).await,
+            Err(ServerError::Forbidden)
+        ));
+        let mut named = request(LayoutName::Replica);
+        named.bucket = "Not-Valid".to_string();
+        assert!(matches!(
+            create(&node.owner, named).await,
+            Err(ServerError::BadRequestMessage(_))
+        ));
+        // Members must be realm infrastructure nodes; these are not.
+        assert!(matches!(
+            create(&node.owner, request(LayoutName::Replica)).await,
+            Err(ServerError::BadRequestMessage(_))
+        ));
+    }
 }
