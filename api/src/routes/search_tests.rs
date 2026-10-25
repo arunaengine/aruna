@@ -962,6 +962,7 @@ fn search_maps_partiality() {
             discovery_failed: false,
         },
         omitted_partitions: 0,
+        incomplete_ranges: 0,
         complete: false,
     };
 

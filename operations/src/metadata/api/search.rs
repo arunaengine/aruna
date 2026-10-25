@@ -117,6 +117,9 @@ pub struct ObjectExecution {
     pub partitions: Vec<ObjectPartitionCoverage>,
     pub fanout_stats: MetadataFanoutStats,
     pub omitted_partitions: usize,
+    /// Distributed bucket ranges this page could not search: a missing or building index,
+    /// or in local mode a range another member coordinates.
+    pub incomplete_ranges: usize,
     pub complete: bool,
 }
 
@@ -609,6 +612,10 @@ pub(super) fn assemble_object_execution(
     partitions
         .sort_unstable_by(|left, right| left.node_id.as_bytes().cmp(right.node_id.as_bytes()));
 
+    let local = plan.mode == ObjectQueryMode::Local;
+    let incomplete_ranges = (parts.iter())
+        .map(|(_, page)| page.incomplete_ranges + if local { page.remote_ranges } else { 0 })
+        .sum::<usize>();
     let mut pages = parts.into_iter().collect::<HashMap<_, _>>();
     let mut hits = Vec::with_capacity(plan.limit);
     let mut remaining = plan.limit;
@@ -687,7 +694,7 @@ pub(super) fn assemble_object_execution(
     fanout_stats.failed_partitions = failed_partitions;
     fanout_stats.nodes_failed =
         fanout_stats.failed_partitions.len() + omitted_partitions + usize::from(discovery_failed);
-    let complete = fanout_stats.nodes_failed == 0;
+    let complete = fanout_stats.nodes_failed == 0 && incomplete_ranges == 0;
     Ok(ObjectExecution {
         hits,
         next_cursor,
@@ -695,6 +702,7 @@ pub(super) fn assemble_object_execution(
         partitions: coverage,
         fanout_stats,
         omitted_partitions,
+        incomplete_ranges,
         complete,
     })
 }
