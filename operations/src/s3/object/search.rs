@@ -622,18 +622,23 @@ mod tests {
     use tempfile::TempDir;
     use ulid::Ulid;
 
-    struct Fixture {
+    pub(super) struct Fixture {
         _directory: TempDir,
-        context: DriverContext,
-        realm_id: RealmId,
-        node_id: NodeId,
-        owner: UserId,
-        caller: UserId,
-        visible_group: GroupId,
+        pub(super) context: DriverContext,
+        pub(super) realm_id: RealmId,
+        pub(super) node_id: NodeId,
+        pub(super) owner: UserId,
+        pub(super) caller: UserId,
+        pub(super) visible_group: GroupId,
         hidden_group: GroupId,
     }
 
-    async fn write_value(context: &DriverContext, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
+    pub(super) async fn write_value(
+        context: &DriverContext,
+        keyspace: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -649,7 +654,7 @@ mod tests {
         ));
     }
 
-    async fn setup() -> Fixture {
+    pub(super) async fn setup() -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
@@ -766,7 +771,7 @@ mod tests {
         }
     }
 
-    async fn seed_materialized(
+    pub(super) async fn seed_materialized(
         fixture: &Fixture,
         bucket: &str,
         key: &str,
@@ -843,7 +848,7 @@ mod tests {
         .await;
     }
 
-    fn input(
+    pub(super) fn input(
         fixture: &Fixture,
         auth: AuthContext,
         query: &str,

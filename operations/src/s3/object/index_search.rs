@@ -255,3 +255,7 @@ async fn resolve_heads(
     let live = load_live(context, input, candidates, txn_id).await?;
     build_hits(context, input, live, txn_id).await
 }
+
+#[cfg(test)]
+#[path = "index_search_tests.rs"]
+mod tests;
