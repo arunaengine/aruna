@@ -1063,28 +1063,36 @@ mod tests {
     }
 
     /// Hands every storage effect to `storage`. The first write of a folder row in `held` waits
-    /// for `release` on its own thread, so the effects behind it still run.
+    /// for `release` on its own thread, so the effects behind it still run. `committed` gets the
+    /// error the commit of that write's transaction answered with.
     fn hold_write(
         storage: aruna_storage::StorageHandle,
         receivers: aruna_storage::storage::StorageReceivers,
         held: FolderState,
         reached: tokio::sync::oneshot::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
+        committed: tokio::sync::oneshot::Sender<Option<aruna_core::errors::StorageError>>,
     ) {
         fn forward(
             storage: &aruna_storage::StorageHandle,
             effect: aruna_core::effects::StorageEffect,
             response: aruna_storage::storage::ResponseSender,
-        ) {
+        ) -> Option<aruna_core::errors::StorageError> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
                 .expect("a proxy runtime");
-            if let aruna_core::events::Event::Storage(event) =
+            let aruna_core::events::Event::Storage(event) =
                 runtime.block_on(storage.send_storage_effect(effect))
-            {
-                response.send(event);
-            }
+            else {
+                return None;
+            };
+            let error = match &event {
+                aruna_core::events::StorageEvent::Error { error } => Some(error.clone()),
+                _ => None,
+            };
+            response.send(event);
+            error
         }
         let writes_held = move |effect: &aruna_core::effects::StorageEffect| match effect {
             aruna_core::effects::StorageEffect::BatchWrite { writes, .. } => {
@@ -1098,10 +1106,15 @@ mod tests {
         std::thread::spawn(move || {
             let _bulk = receivers.bulk;
             let mut gate = Some((reached, release));
+            let mut committed = Some(committed);
+            let mut held_txn = None;
             while let Ok((effect, response, ..)) = receivers.foreground.recv() {
                 if writes_held(&effect)
                     && let Some((reached, release)) = gate.take()
                 {
+                    if let aruna_core::effects::StorageEffect::BatchWrite { txn_id, .. } = &effect {
+                        held_txn = *txn_id;
+                    }
                     let storage = storage.clone();
                     std::thread::spawn(move || {
                         let _ = reached.send(());
@@ -1110,7 +1123,15 @@ mod tests {
                     });
                     continue;
                 }
-                forward(&storage, effect, response);
+                let commit = matches!(
+                    &effect,
+                    aruna_core::effects::StorageEffect::CommitTransaction { txn_id }
+                        if Some(*txn_id) == held_txn
+                );
+                let error = forward(&storage, effect, response);
+                if commit && let Some(committed) = committed.take() {
+                    let _ = committed.send(error);
+                }
             }
         });
     }
@@ -1131,12 +1152,14 @@ mod tests {
             let (storage, receivers) = aruna_storage::StorageHandle::new();
             let (reached, held) = tokio::sync::oneshot::channel();
             let (release, gate) = std::sync::mpsc::channel();
+            let (committed, commit) = tokio::sync::oneshot::channel();
             hold_write(
                 context.storage_handle.clone(),
                 receivers,
                 target.clone(),
                 reached,
                 gate,
+                committed,
             );
             let proxied = Arc::new(DriverContext {
                 storage_handle: storage,
@@ -1155,7 +1178,14 @@ mod tests {
             release.send(()).expect("the held write waits");
 
             let set = setter.await.expect("the setter task ends");
-            assert!(set.is_err(), "{target:?}: {set:?}");
+            assert_eq!(set, Err(FolderError::Unavailable), "{target:?}");
+            // Dropping the last proxied handle ends the proxy, so a commit that never came fails.
+            drop(proxied);
+            assert_eq!(
+                commit.await.expect("the setter commits its held write"),
+                Some(aruna_core::errors::StorageError::TransactionConflict),
+                "{target:?}"
+            );
             assert_eq!(
                 read_bound(&context, folder_id).await.map(|row| row.state),
                 Ok(FolderState::Deleting)
