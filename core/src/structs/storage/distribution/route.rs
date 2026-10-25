@@ -50,7 +50,7 @@ pub enum RouteError {
 /// Where a read is answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadRoute {
-    /// This member keeps the records; while it catches up, a miss proves nothing.
+    /// This member keeps the records; until it is ready, a miss proves nothing.
     Local { catching_up: bool },
     /// This member keeps no records of the range; its coordinator does.
     Holder { range_id: Ulid, node_id: NodeId },
@@ -99,7 +99,7 @@ impl DistributionSnapshot {
             .find(|range| !keeps_records(range, member))
         {
             None => Ok(ReadRoute::Local {
-                catching_up: member.state == MemberState::CatchingUp,
+                catching_up: member.state != MemberState::Ready,
             }),
             Some(range) => {
                 let coordinator = self
@@ -353,6 +353,14 @@ mod tests {
         assert!(
             matches!(lower, Ok(ReadRoute::Holder { .. })),
             "keys under l stay below m"
+        );
+        let mut created = head.clone();
+        created.config.members[0].state =
+            crate::structs::storage::distribution::MemberState::Created;
+        assert_eq!(
+            created.read_route(member(1), "a/b", false),
+            Ok(ReadRoute::Local { catching_up: true }),
+            "a created member has not received the range yet"
         );
     }
 
