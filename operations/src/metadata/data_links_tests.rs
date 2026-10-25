@@ -45,7 +45,7 @@ fn budget() -> LinkBudget {
 }
 
 #[test]
-fn root_dataset_parts_are_parts() {
+fn dataset_folder_part() {
     let folder = set_url("raw/");
     let references = vec![
         triple(GRAPH, HAS_PART, &folder),
@@ -66,7 +66,7 @@ fn root_dataset_parts_are_parts() {
 }
 
 #[test]
-fn untyped_part_is_mention() {
+fn untyped_part_mentions() {
     let folder = set_url("raw/");
     let links = project_links(GRAPH, Ulid::nil(), &[triple(GRAPH, HAS_PART, &folder)]);
     assert!(!links[&DataLink::parse(&folder).unwrap()].part);
@@ -138,7 +138,7 @@ async fn replaces_own_postings() {
 }
 
 #[tokio::test]
-async fn probes_only_used_lengths() {
+async fn probes_used_lengths() {
     let dir = tempdir().unwrap();
     let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     for (seed, prefix) in [(1u8, ""), (2, "raw/"), (3, "raw/2026/"), (4, "other/")] {
@@ -191,7 +191,7 @@ async fn budget_marks_incomplete() {
 }
 
 #[tokio::test]
-async fn deleted_documents_leave_nothing() {
+async fn deletion_leaves_nothing() {
     let dir = tempdir().unwrap();
     let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let document = Ulid::from_bytes([7; 16]);
@@ -223,7 +223,7 @@ async fn deleted_documents_leave_nothing() {
 }
 
 #[tokio::test]
-async fn set_postings_page_both_ranges() {
+async fn pages_both_ranges() {
     let dir = tempdir().unwrap();
     let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let set_id = Ulid::from_bytes([5; 16]);

@@ -17,7 +17,7 @@ fn fill(first: u64, second: u64) -> BTreeMap<NodeId, u64> {
 }
 
 #[test]
-fn over_full_node_moves_one_range() {
+fn moves_one_range() {
     let snapshot = over_full();
     let proposal = propose(&snapshot, secret(1).public(), &fill(900, 100)).unwrap();
     assert_eq!(proposal.to, member(2));
@@ -31,7 +31,7 @@ fn over_full_node_moves_one_range() {
 }
 
 #[test]
-fn balanced_or_busy_sets_stay() {
+fn balanced_sets_stay() {
     let snapshot = over_full();
     // Within the margin of the average nothing moves.
     assert_eq!(

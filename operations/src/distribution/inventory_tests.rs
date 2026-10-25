@@ -71,7 +71,7 @@ async fn write_account(handle: &StorageHandle, range_seed: u8, account: &RangeAc
 }
 
 #[tokio::test]
-async fn counts_versions_and_heads() {
+async fn counts_versions_heads() {
     let (_dir, handle) = open();
     single_range(&handle).await;
     assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
@@ -98,7 +98,7 @@ async fn counts_versions_and_heads() {
 }
 
 #[tokio::test]
-async fn reference_records_its_root() {
+async fn reference_records_root() {
     // A received reference leaves its source root for a later coordinator to check.
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::distribution::source_root::SourceRoot;
@@ -235,7 +235,7 @@ async fn refuses_other_content() {
 }
 
 #[tokio::test]
-async fn purge_returns_to_zero() {
+async fn purge_reaches_zero() {
     let (_dir, handle) = open();
     single_range(&handle).await;
     assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
@@ -300,7 +300,7 @@ async fn purge_returns_to_zero() {
 }
 
 #[tokio::test]
-async fn seeks_range_at_bounds() {
+async fn seeks_range_bounds() {
     let (_dir, handle) = open();
     install(
         &handle,
@@ -481,7 +481,7 @@ async fn write_sample(handle: &StorageHandle, row: Vec<u8>, txn_id: Option<TxnId
 /// A key that cannot enter a full sample never reads its largest entry in the transaction,
 /// so a concurrent sample change does not conflict with the write.
 #[tokio::test]
-async fn full_sample_no_conflict() {
+async fn sample_avoids_conflict() {
     let (_dir, handle) = open();
     single_range(&handle).await;
     fill_sample(&handle, 0).await;

@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn content_needs_content_answer() {
+    fn content_needs_answer() {
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let realm = RealmId::from_bytes([3; 32]);
         let stream_id = Ulid::from_bytes([5; 16]);

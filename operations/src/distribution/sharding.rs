@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn split_needs_both_sides() {
+    fn split_needs_sides() {
         assert_eq!(split_point(&keys(&["a"]), &range("", None)), None);
         assert_eq!(split_point(&[], &range("", None)), None);
         let sample = keys(&["m/1", "m/2", "n/1"]);

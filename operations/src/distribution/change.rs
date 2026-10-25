@@ -227,7 +227,7 @@ mod tests {
     use crate::distribution::test_record::{member, replicated};
 
     #[test]
-    fn refusal_names_eligible_members() {
+    fn refusal_names_eligible() {
         // Member 2 keeps a copy of member 1's range; member 1 itself cannot take it.
         let (snapshot, _) = replicated(true, 1);
         let range = &snapshot.config.ranges[0];

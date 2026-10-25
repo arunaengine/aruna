@@ -1480,7 +1480,7 @@ fn source_read(metadata: SourceMetadata) -> Event {
 // A distributed bucket records source changes only through the coordinated refresh, so a
 // drifted read there releases its transaction, queues a refresh and fails.
 #[test]
-fn bound_bucket_never_advances() {
+fn bound_never_advances() {
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::distribution::DistributionBinding;
     use aruna_core::structs::storage::format::Compression;
@@ -1904,7 +1904,7 @@ fn pinned_unknown_verified() {
 // Equal length and a second-rounded date call changed bytes the same, so a pin without a strong
 // ETag is checked against its digests even when the observation compares as the same.
 #[test]
-fn same_without_etag_verified() {
+fn same_still_verified() {
     let mut operation = drifted_operation();
     let mut stored = digested(9, 7);
     stored.etag = None;

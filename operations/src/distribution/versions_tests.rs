@@ -133,7 +133,7 @@ async fn newest_first_seeked() {
 }
 
 #[tokio::test]
-async fn markers_resume_inside_key() {
+async fn markers_resume_inside() {
     let (_dir, handle) = seeded().await;
     let first = list(&handle, input(2)).await;
     assert!(first.is_truncated);
@@ -188,7 +188,7 @@ async fn folders_grouped_once() {
 }
 
 #[tokio::test]
-async fn nil_marker_starts_at_key() {
+async fn nil_includes_key() {
     let (_dir, handle) = seeded().await;
     let start = InventoryVersionsInput {
         key_marker: Some("b".to_string()),

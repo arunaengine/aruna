@@ -901,7 +901,7 @@ mod pure_tests {
     }
 
     #[test]
-    fn target_keys_map_sources() {
+    fn keys_map_sources() {
         let walk = bounded(None);
         assert_eq!(source_key(&walk, "a"), Mapped::Before);
         assert_eq!(source_key(&walk, "copy/"), Mapped::Before);

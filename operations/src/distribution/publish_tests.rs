@@ -140,7 +140,7 @@ fn authorized(allowed: bool) -> Event {
 }
 
 #[test]
-fn head_and_outbox_atomic() {
+fn head_outbox_atomic() {
     let mut operation = operation(PUBLISHER, create());
     let effects = begin(&mut operation, [None, None, Some(config_value()), None]);
     assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));

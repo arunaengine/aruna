@@ -1244,7 +1244,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pulls_move_to_coordinator() {
+    async fn pulls_follow_coordinator() {
         use crate::distribution::test_record::{binding, record, secret, store_record};
         let fixture = policy_fixture(None).await;
         let (snapshot, bytes) = record(true);

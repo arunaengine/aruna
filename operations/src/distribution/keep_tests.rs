@@ -210,7 +210,7 @@ async fn refuses_unkeepable() {
 
 // A member fenced for a deletion keeps no new copy, so its purge leaves nothing behind.
 #[tokio::test]
-async fn fenced_member_keeps_nothing() {
+async fn fenced_keeps_nothing() {
     let (_dir, handle) = open();
     let fence = LocalFence {
         deletion: Some([4; 32]),

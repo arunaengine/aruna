@@ -53,7 +53,7 @@ fn replaced_bucket_refused() {
 }
 
 #[test]
-fn local_fence_refuses_writes() {
+fn fence_refuses_writes() {
     use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
     let (snapshot, bytes) = record(true);
     let own = binding(&snapshot, 1, 5);
@@ -137,7 +137,7 @@ fn completion_passes_grace() {
 }
 
 #[test]
-fn moved_keys_belong_elsewhere() {
+fn moved_keys_skipped() {
     // Jobs skip keys of another coordinator or a moving range, and retry a pending set.
     let (snapshot, bytes) = record(true);
     let own = binding(&snapshot, 1, 5);

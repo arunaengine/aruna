@@ -1963,7 +1963,7 @@ fn distributed_version_refused() {
 }
 
 #[test]
-fn purge_deletes_bound_versions_only() {
+fn purge_bound_only() {
     use aruna_core::structs::storage::format::Compression;
     let (snapshot, _) = crate::distribution::test_record::record(true);
     let bound = crate::distribution::test_record::binding(&snapshot, 1, 5);

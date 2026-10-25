@@ -2778,7 +2778,7 @@ mod decision_tests {
     }
 
     #[test]
-    fn planned_id_needs_hint() {
+    fn planned_needs_hint() {
         // A planned id in a distributed bucket must already carry the set hint.
         use aruna_core::structs::storage::distribution::hint::with_hint;
         use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};

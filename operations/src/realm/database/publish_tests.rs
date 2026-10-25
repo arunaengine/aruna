@@ -125,7 +125,7 @@ async fn mark_then_remove() {
 }
 
 #[tokio::test]
-async fn missing_entry_not_removed() {
+async fn removal_needs_entry() {
     let dir = tempdir().unwrap();
     let ctx = context(dir.path().to_str().unwrap());
     seed(&ctx, &actor()).await;
@@ -175,7 +175,7 @@ async fn stale_consent_refused() {
 }
 
 #[test]
-fn denied_check_is_terminal() {
+fn denied_check_terminal() {
     let mut operation = publish(DatabaseChange::Set {
         entry: entry(),
         consent: None,

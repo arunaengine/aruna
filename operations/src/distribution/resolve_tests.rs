@@ -39,7 +39,7 @@ fn holders_are_copies() {
 }
 
 #[test]
-fn probes_one_full_member() {
+fn probes_full_member() {
     let mut snapshot = ready_set();
     // Assigned coverage: the holders of each range are asked, never this node.
     assert_eq!(
@@ -76,7 +76,7 @@ fn probes_one_full_member() {
 }
 
 #[tokio::test]
-async fn content_page_is_bounded() {
+async fn content_page_bounded() {
     use super::content_versions;
     use crate::distribution::test_store::{apply, context, install, open, range, write};
     use ulid::Ulid;

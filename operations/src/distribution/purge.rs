@@ -638,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clearing_resumes_in_bounded_passes() {
+    async fn bounded_clearing_resumes() {
         // Each pass spends at most its pages; the next resumes at the cursor until the set is gone.
         let (_dir, handle) = open();
         let context = context(handle);

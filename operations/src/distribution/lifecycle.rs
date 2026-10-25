@@ -893,7 +893,7 @@ mod tests {
     use aruna_core::structs::storage::distribution::OriginalEpoch;
 
     #[test]
-    fn created_member_owns_its_bucket() {
+    fn unadmitted_bucket_deleted() {
         // A bucket created for a member that was never admitted is still deleted with the set.
         let (snapshot, _) = crate::distribution::test_record::record(true);
         let mut member = snapshot.config.members[0].clone();
@@ -1070,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_waits_for_every_count() {
+    fn completion_awaits_counts() {
         // The new coordinator completes only once its copy holds what the fenced range held.
         let fenced = RangeCounters {
             versions: 5,

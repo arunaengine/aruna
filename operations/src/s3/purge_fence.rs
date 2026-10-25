@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn fence_set_later_refuses_publication() {
+    fn late_fence_refuses() {
         // A write routed before its range was fenced fails in its publication transaction.
         let (snapshot, bytes) = record(true);
         let own = binding(&snapshot, 1, 5);
@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_write_reads_purge_fence_only() {
+    fn ordinary_reads_purge() {
         assert!(matches!(
             publication_read("bucket", None, None),
             Effect::Storage(StorageEffect::Read { .. })

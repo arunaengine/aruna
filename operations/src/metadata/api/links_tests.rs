@@ -27,7 +27,7 @@ fn node(documents: Vec<LinkDocument>) -> LinkNodePage {
 }
 
 #[test]
-fn holders_merge_by_document() {
+fn holders_merge_documents() {
     // Two holders of one document answer it once, with the links of both.
     let page = merge_pages(
         [
@@ -68,7 +68,7 @@ fn limit_sets_cursor() {
 }
 
 #[test]
-fn unsettled_or_failed_is_incomplete() {
+fn unsettled_stays_incomplete() {
     // A missing node, a cut budget or a pending materialization never reads as complete.
     let failed = merge_pages([node(vec![document(1, "a")])], 10, 1);
     assert!(!failed.complete);

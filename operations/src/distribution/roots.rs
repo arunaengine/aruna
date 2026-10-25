@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreadable_root_holds_completion() {
+    async fn unreadable_root_holds() {
         // Checked roots pass; a root no connector of the group reads stays unchecked.
         let (_dir, handle) = open();
         let context = context(&handle);

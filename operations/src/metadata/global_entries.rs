@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_local_forms_only() {
+    fn reads_local_only() {
         let realm = RealmId::from_bytes([1; 32]);
         let version = Ulid::from_bytes([2; 16]);
         let own = format!("arn:aruna:{realm}:{}:s3/lab/a.txt@{version}", node(3));
@@ -395,7 +395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bound_bucket_entries_get_global_ids() {
+    async fn bound_entries_globalized() {
         let dir = tempfile::tempdir().unwrap();
         let context = crate::driver::DriverContext {
             storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())

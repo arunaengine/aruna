@@ -97,7 +97,7 @@ async fn fixture() -> (tempfile::TempDir, StorageHandle) {
 }
 
 #[tokio::test]
-async fn pages_stay_in_range() {
+async fn pages_respect_range() {
     let (_dir, handle) = fixture().await;
     let first = list(&handle, input("", Some("m"), 2)).await;
     assert_eq!(listed(&first), [("a".into(), id(3)), ("a".into(), id(4))]);
@@ -129,7 +129,7 @@ async fn delimiter_groups_once() {
 }
 
 #[tokio::test]
-async fn nil_marker_includes_key() {
+async fn nil_includes_key() {
     let (_dir, handle) = fixture().await;
     let mut from = input("", None, 1);
     from.key_marker = Some("d/x".to_string());

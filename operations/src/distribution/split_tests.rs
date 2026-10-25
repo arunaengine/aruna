@@ -59,7 +59,7 @@ async fn charged(handle: &StorageHandle, range_id: Ulid) -> RangeCounters {
 }
 
 #[tokio::test]
-async fn charge_holds_until_handoff() {
+async fn charge_awaits_handoff() {
     let (_dir, handle) = open();
     install(&handle, set(), &[range(1, "", None)]).await;
     for (key, seed, size) in [("a", 1, 1), ("c", 2, 2), ("x", 3, 4)] {

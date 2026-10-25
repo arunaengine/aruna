@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn held_rows_count_once() {
+    fn rows_count_once() {
         let counters = |objects| RangeCounters {
             objects,
             ..RangeCounters::default()

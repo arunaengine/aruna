@@ -104,7 +104,7 @@ fn heartbeats_decide_reach() {
 }
 
 #[test]
-fn removed_publisher_stops_configuration() {
+fn removed_publisher_unavailable() {
     // Node 1 is reachable, but the realm config no longer lets it publish.
     let status = summarize(realm(), &view(), only(1), false);
     assert!(status.configuration_unavailable);

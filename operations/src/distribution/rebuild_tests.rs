@@ -138,7 +138,7 @@ async fn page_conflicts_writer() {
 
 /// An empty range reaches the end with its first page; open uploads are walked too.
 #[tokio::test]
-async fn walks_empty_and_uploads() {
+async fn walks_empty_uploads() {
     let (_dir, handle) = open();
     install(&handle, set(), &[range(1, "", None)]).await;
     assert_eq!(run(&handle, 2, 100).await, RebuildOutcome::Done);

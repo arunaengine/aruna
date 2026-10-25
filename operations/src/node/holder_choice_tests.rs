@@ -80,7 +80,7 @@ fn slots(active: u32, refused: u32) -> Option<DownloadSlots> {
 }
 
 #[test]
-fn more_free_slots_win() {
+fn free_slots_win() {
     // With exactly two candidates both are compared, whatever the shuffle order.
     for _ in 0..16 {
         assert_eq!(
@@ -96,7 +96,7 @@ fn more_free_slots_win() {
 }
 
 #[test]
-fn stale_or_refusing_skipped() {
+fn skips_unusable_holders() {
     let document = document(1);
     let fresh = held(1, 1_000, slots(6, 0));
     let chosen = candidate(&document, Some(&fresh), false, 0).unwrap();
