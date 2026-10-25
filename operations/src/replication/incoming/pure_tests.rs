@@ -4638,3 +4638,45 @@ fn mapped_refuses_replicas() {
         "A bucket stored 1:1 in a provider bucket cannot receive replicas yet.",
     );
 }
+
+// A member receiving a pulled marker of a distributed bucket keeps its receipt in the apply.
+#[test]
+fn keeps_pull_receipt() {
+    use aruna_core::keyspaces::SYNC_RECEIPT_KEYSPACE;
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::{ORIGIN_DEVICE_TAG, SYNC_VERSION_TAG, tagged_receipt};
+    let device = iroh::SecretKey::from_bytes(&[9; 32]).public();
+    let pulled = Ulid::from_bytes([2; 16]);
+    let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+    manifest.metadata = HashMap::from([
+        (SYNC_VERSION_TAG.to_string(), pulled.to_string()),
+        (ORIGIN_DEVICE_TAG.to_string(), device.to_string()),
+    ]);
+    let target = (manifest.bucket.clone(), manifest.key.clone());
+    let version_id = manifest.version_id;
+    let local = iroh::SecretKey::from_bytes(&[65; 32]).public();
+    let mut operation =
+        IncomingVersionOperation::new(trace_stream_id(), local, test_realm_id(), manifest);
+    assert_eq!(
+        operation.pull_receipt(),
+        None,
+        "an ordinary bucket keeps none"
+    );
+    operation.txn_id = Some(trace_txn_id());
+    operation.destination_binding = Some(DistributionBinding {
+        set_id: Ulid::from_bytes([3; 16]),
+        member_id: Ulid::from_bytes([4; 16]),
+        incarnation: 5,
+        revision: Default::default(),
+    });
+    let key = tagged_receipt((&target.0, &target.1), &operation.manifest.metadata, true);
+    assert_eq!(
+        operation.pull_receipt(),
+        Some(Effect::Storage(StorageEffect::Write {
+            key_space: SYNC_RECEIPT_KEYSPACE.to_string(),
+            key: key.unwrap().into(),
+            value: version_id.to_bytes().to_vec().into(),
+            txn_id: Some(trace_txn_id()),
+        }))
+    );
+}

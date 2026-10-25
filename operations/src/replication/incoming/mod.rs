@@ -41,7 +41,7 @@ use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE,
     OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, PENDING_CLAIM_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, SYNC_RECEIPT_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -76,6 +76,7 @@ use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::structs::tagged_receipt;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
@@ -2105,6 +2106,10 @@ impl IncomingVersionOperation {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),
         };
+        // A member keeps the receipt of a pulled version, so a later coordinator answers replays.
+        if let Some(receipt) = self.pull_receipt() {
+            self.pending_version_effects.push_back(receipt);
+        }
         // The envelope, its mappings and usage are published with the version they name.
         if let (Some(envelope), Some(received)) = (&self.envelope, &self.received_blob) {
             let rows = (
@@ -2317,6 +2322,20 @@ impl IncomingVersionOperation {
                 - i128::from(self.replaced_reference_bytes),
             ..Default::default()
         })
+    }
+
+    /// The receipt row of a device pull the received version of a distributed bucket records.
+    fn pull_receipt(&self) -> Option<Effect> {
+        self.destination_binding.as_ref()?;
+        let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
+        let target = (self.manifest.bucket.as_str(), self.manifest.key.as_str());
+        let key = tagged_receipt(target, &self.manifest.metadata, marker)?;
+        Some(Effect::Storage(StorageEffect::Write {
+            key_space: SYNC_RECEIPT_KEYSPACE.to_string(),
+            key: key.into(),
+            value: self.manifest.version_id.to_bytes().to_vec().into(),
+            txn_id: self.txn_id,
+        }))
     }
 
     /// The received version and, when this apply installs it, the head of a distributed bucket.

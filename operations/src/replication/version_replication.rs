@@ -229,6 +229,8 @@ enum ReplicationVersion {
     Deleted {
         created_at: SystemTime,
         created_by: aruna_core::user::id::UserId,
+        /// The marker's tags, such as the device version a sync delete came from.
+        metadata: HashMap<String, String>,
     },
 }
 
@@ -1995,6 +1997,7 @@ impl ReplicateObjectOperation {
             ReplicationVersion::Deleted {
                 created_at,
                 created_by,
+                metadata,
             } => Ok(ManifestVersionParts {
                 kind: ReplicationItemKind::DeleteMarker,
                 created_at,
@@ -2002,7 +2005,7 @@ impl ReplicateObjectOperation {
                 blob: None,
                 source: None,
                 reference: None,
-                metadata: HashMap::new(),
+                metadata,
             }),
             ReplicationVersion::Reference {
                 created_at,
@@ -2448,6 +2451,7 @@ impl ReplicateObjectOperation {
                 self.replication_version = Some(ReplicationVersion::Deleted {
                     created_at,
                     created_by,
+                    metadata,
                 });
                 self.read_current_lookup()
             }
@@ -4031,6 +4035,7 @@ mod tests {
         op.replication_version = Some(ReplicationVersion::Deleted {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
+            metadata: HashMap::new(),
         });
 
         op.build_manifest(Some(CurrentVersionPointer::new_with_generation(
@@ -4188,6 +4193,7 @@ mod tests {
         deleted.replication_version = Some(ReplicationVersion::Deleted {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
+            metadata: HashMap::new(),
         });
         assert_eq!(
             deleted.build_manifest(None),
@@ -4204,6 +4210,7 @@ mod tests {
         op.replication_version = Some(ReplicationVersion::Deleted {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
+            metadata: HashMap::new(),
         });
 
         op.build_manifest(None).unwrap();
@@ -4337,6 +4344,7 @@ mod tests {
         op.replication_version = Some(ReplicationVersion::Deleted {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
+            metadata: HashMap::new(),
         });
 
         op.build_manifest(None).unwrap();
@@ -4357,6 +4365,7 @@ mod tests {
         op.replication_version = Some(ReplicationVersion::Deleted {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
+            metadata: HashMap::new(),
         });
 
         op.build_manifest(None).unwrap();

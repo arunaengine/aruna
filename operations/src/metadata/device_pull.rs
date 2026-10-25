@@ -141,14 +141,21 @@ pub async fn accept_pull(
     auth_token: aruna_core::metadata::AuthToken,
     request: SyncPull,
 ) -> SyncPullStatus {
-    let admitted = match admit_pull(context, peer, auth_token, &request).await {
-        Ok(admitted) => admitted,
+    let auth = authorize_peer(context, peer, auth_token)
+        .await
+        .and_then(|auth| own_source(peer, &request).map(|()| auth));
+    let auth = match auth {
+        Ok(auth) => auth,
         Err(refusal) => return refused(peer, &request, refusal),
     };
-    // A replay of either kind answers with the version it already produced.
+    // A replay answers with the version it produced, even after its range moved away.
     if let Some(ack) = replayed(context, &request).await {
         return SyncPullStatus::Done(ack);
     }
+    let admitted = match admit_pull(context, auth, &request).await {
+        Ok(admitted) => admitted,
+        Err(refusal) => return refused(peer, &request, refusal),
+    };
     let (Some(metadata), Ok(key)) = (context.metadata_handle.as_ref(), receipt_of(&request)) else {
         return refused(peer, &request, SyncRefusal::Unavailable);
     };
@@ -217,15 +224,12 @@ fn own_source(peer: NodeId, request: &SyncPull) -> Result<(), SyncRefusal> {
     }
 }
 
-/// The owner, this node and the target bucket of a pull the owner may write.
+/// This node and the target bucket of a pull the authorized owner may write.
 async fn admit_pull(
     context: &Arc<DriverContext>,
-    peer: NodeId,
-    auth_token: aruna_core::metadata::AuthToken,
+    auth: AuthContext,
     request: &SyncPull,
 ) -> Result<(AuthContext, NodeId, BucketInfo), SyncRefusal> {
-    let auth = authorize_peer(context, peer, auth_token).await?;
-    own_source(peer, request)?;
     let node_id = local_node(context)?;
     let bucket = read_bucket(context, &request.target_bucket).await?;
     guard_target(context, &request.target_bucket).await?;
