@@ -529,21 +529,23 @@ pub async fn unbind_folder(
 }
 
 /// Removes a `Deleting` folder under its lock, after any pass in flight. The row goes last, so an
-/// interrupted cleanup resumes in the next pass. Answers the observations it tombstoned.
+/// interrupted cleanup resumes in the next pass.
 pub(crate) async fn finish_unbind(
     context: &Arc<DriverContext>,
     folder_id: Ulid,
     node_id: NodeId,
-) -> Result<usize, FolderError> {
+) -> Result<(), FolderError> {
     let _pass = super::folder_lock(folder_id).await;
     let folder = read_bound(context, folder_id).await?;
     if folder.state != FolderState::Deleting {
-        return Ok(0);
+        return Ok(());
     }
     for key_space in [SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNC_LOG_KEYSPACE] {
         clear_rows(context, key_space, folder_id).await?;
     }
-    let removed = match withdraw_offer(
+    // The offer keeps the bucket read-only for clients until the bucket is gone.
+    delete_local_bucket(context, &folder, node_id).await?;
+    match withdraw_offer(
         context,
         WithdrawOfferInput {
             bucket: folder.local_bucket.clone(),
@@ -554,13 +556,11 @@ pub(crate) async fn finish_unbind(
     )
     .await
     {
-        Ok(removed) => removed,
         // A resumed unbind finds the registration already withdrawn and
         // finishes the rest instead of failing on it.
-        Err(OfferedDirectoryError::NotOffered(_)) => 0,
+        Ok(_) | Err(OfferedDirectoryError::NotOffered(_)) => {}
         Err(error) => return Err(error.into()),
-    };
-    delete_local_bucket(context, &folder, node_id).await?;
+    }
     let Some(txn_id) = start_txn(context).await else {
         return Err(FolderError::Unavailable);
     };
@@ -575,7 +575,7 @@ pub(crate) async fn finish_unbind(
         abort_txn(context, txn_id).await;
         return Err(FolderError::Unavailable);
     }
-    Ok(removed)
+    Ok(())
 }
 
 /// Deletes the folder's device-local bucket and every version left in it. A bucket that is
@@ -948,6 +948,8 @@ pub async fn list_transfers(context: &Arc<DriverContext>) -> Result<Vec<SyncUplo
 mod tests {
     use super::*;
     use crate::tests::device::context;
+    use aruna_core::keyspaces::UPLOAD_KEYSPACE;
+    use aruna_core::structs::storage::multipart::MultipartUpload;
     use aruna_core::structs::{EntrySide, SyncedBytes};
 
     #[test]
@@ -1021,11 +1023,10 @@ mod tests {
             .expect("base encodes");
         assert!(super::super::repository::write_rows(&context, vec![row], None).await);
 
-        let removed = finish_unbind(&context, folder.folder_id, node())
+        finish_unbind(&context, folder.folder_id, node())
             .await
             .expect("a resumed unbind finishes");
 
-        assert_eq!(removed, 0);
         assert_eq!(
             read_bound(&context, folder.folder_id).await,
             Err(FolderError::NotFound)
@@ -1036,17 +1037,14 @@ mod tests {
         assert!(entries.is_empty());
     }
 
-    // A cleanup cut short after the offer was withdrawn still deletes the folder's bucket, also with
-    // an upload opened since. One cut short after the bucket delete finds it gone and finishes.
-    #[tokio::test]
-    async fn deletes_local_bucket() {
-        use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+    /// A deleting folder whose bucket offers one file, and an upload opened in that bucket.
+    async fn offered_folder(
+        context: &Arc<DriverContext>,
+    ) -> (tempfile::TempDir, SyncedFolder, MultipartUpload) {
         use crate::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
         use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
         use aruna_core::structs::storage::routing::RoutingSnapshot;
 
-        let fixture = crate::tests::staging::setup_driver_context().await;
-        let context = Arc::new(fixture.driver_context);
         let root = tempfile::tempdir().expect("root created");
         std::fs::write(root.path().join("note.txt"), b"note").expect("file written");
         let folder = SyncedFolder {
@@ -1061,14 +1059,7 @@ mod tests {
             node_id: node(),
             user_id: folder.created_by,
         };
-        offer_directory(&context, offer).await.expect("offered");
-        let withdrawal = WithdrawOfferInput {
-            bucket: folder.local_bucket.clone(),
-            realm_id: realm(),
-            node_id: node(),
-            user_id: folder.created_by,
-        };
-        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+        offer_directory(context, offer).await.expect("offered");
         let upload = CreateMultipartOperation::new(CreateMultipartInput {
             bucket: folder.local_bucket.clone(),
             key: "late.bin".to_string(),
@@ -1077,25 +1068,91 @@ mod tests {
             checksum_hint: None,
             routing: RoutingSnapshot::single(folder.group_id),
         });
-        drive(upload, &context).await.expect("upload opened");
+        let upload = drive(upload, context).await.expect("upload opened").record;
+        store_folder(context, &folder).await.expect("row stored");
+        (root, folder, upload)
+    }
+
+    async fn store_upload(context: &Arc<DriverContext>, upload: &MultipartUpload) {
+        let key = upload.upload_id.to_bytes().to_vec().into();
+        let value = upload.to_bytes().expect("upload encodes").into();
+        let row = (UPLOAD_KEYSPACE.to_string(), key, value);
+        assert!(super::super::repository::write_rows(context, vec![row], None).await);
+    }
+
+    async fn bucket_gone(context: &Arc<DriverContext>, bucket: &str) -> bool {
+        use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+        let bucket = GetBucketOperation::new(bucket.to_string());
+        matches!(drive(bucket, context).await, Err(GetBucketError::NotFound))
+    }
+
+    // A bucket left without its offer, with an upload in it, is still deleted. A cleanup cut short
+    // after the bucket delete finds it gone and finishes.
+    #[tokio::test]
+    async fn deletes_local_bucket() {
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = Arc::new(fixture.driver_context);
+        let (_root, folder, _) = offered_folder(&context).await;
+        let withdrawal = WithdrawOfferInput {
+            bucket: folder.local_bucket.clone(),
+            realm_id: realm(),
+            node_id: node(),
+            user_id: folder.created_by,
+        };
+        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
 
         for attempt in ["withdrawn offer", "deleted bucket"] {
             store_folder(&context, &folder).await.expect("row stored");
             assert_eq!(
                 finish_unbind(&context, folder.folder_id, node()).await,
-                Ok(0),
+                Ok(()),
                 "{attempt}"
             );
             assert_eq!(
                 read_bound(&context, folder.folder_id).await,
                 Err(FolderError::NotFound)
             );
-            let bucket = GetBucketOperation::new(folder.local_bucket.clone());
             assert!(
-                matches!(drive(bucket, &context).await, Err(GetBucketError::NotFound)),
+                bucket_gone(&context, &folder.local_bucket).await,
                 "{attempt}"
             );
         }
+    }
+
+    // A cleanup cut short midway, here by an upload being completed, leaves the bucket read-only
+    // for clients, so no upload can be opened before the next pass deletes it.
+    #[tokio::test]
+    async fn guards_interrupted_cleanup() {
+        use crate::staging::offered_directory::guard_bucket_write;
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = Arc::new(fixture.driver_context);
+        let (_root, folder, mut upload) = offered_folder(&context).await;
+        upload.status = MultipartUploadStatus::Completing;
+        upload.completing_since_ms = Some(crate::driver::now_ms());
+        store_upload(&context, &upload).await;
+
+        assert_eq!(
+            finish_unbind(&context, folder.folder_id, node()).await,
+            Err(FolderError::AbortUpload(
+                AbortUploadError::CompletionInProgress
+            ))
+        );
+        let bucket = folder.local_bucket.clone();
+        assert_eq!(
+            guard_bucket_write(&context, &bucket).await,
+            Err(OfferedDirectoryError::ReadOnly(bucket.clone()))
+        );
+
+        upload.status = MultipartUploadStatus::Open;
+        upload.completing_since_ms = None;
+        store_upload(&context, &upload).await;
+        assert_eq!(
+            finish_unbind(&context, folder.folder_id, node()).await,
+            Ok(())
+        );
+        assert!(bucket_gone(&context, &bucket).await);
+        assert_eq!(guard_bucket_write(&context, &bucket).await, Ok(()));
     }
 
     // A reconcile pass that started before the owner's change keeps it, and a
@@ -1206,7 +1263,7 @@ mod tests {
         assert!(super::super::repository::write_rows(&context, vec![row], None).await);
         drop(pass);
 
-        assert_eq!(unbind.await.expect("the unbind task ends"), Ok(0));
+        assert_eq!(unbind.await.expect("the unbind task ends"), Ok(()));
         let (entries, _) = list_entries(&context, folder.folder_id, None, None)
             .await
             .expect("the entries read");
