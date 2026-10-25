@@ -2476,10 +2476,12 @@ impl HolderFailures {
             BaoReadError::Refused(BaoReadRefusal::BucketLocked(bucket_id)) => {
                 self.locked = Some(bucket_id);
             }
+            // A member keeping only the record proves no absence: the bytes are elsewhere.
             BaoReadError::Refused(
                 BaoReadRefusal::BackendFailure
                 | BaoReadRefusal::RealmPeerDenied
-                | BaoReadRefusal::InvalidTarget,
+                | BaoReadRefusal::InvalidTarget
+                | BaoReadRefusal::HeldBy { .. },
             ) => self.unavailable = true,
             BaoReadError::GovernedUnavailable
             | BaoReadError::PolicyRequired { .. }

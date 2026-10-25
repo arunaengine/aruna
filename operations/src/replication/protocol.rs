@@ -313,6 +313,12 @@ pub enum BaoReadRefusal {
     BackendFailure,
     /// The copy is sealed with a key of this bucket that is locked on the serving node.
     BucketLocked(Ulid),
+    /// This node keeps only the record of the distributed version; `holder` keeps its bytes
+    /// and serves it as a version of set `set_id`.
+    HeldBy {
+        holder: NodeId,
+        set_id: Ulid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]

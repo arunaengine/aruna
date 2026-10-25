@@ -26,8 +26,8 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::replication::bao_read::{BaoReadOutput, managed_read};
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
+use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 use super::reconcile::Download;
 use super::repository::{action_entry, base_entry, base_key, read_value, write_rows};
@@ -416,7 +416,19 @@ pub(crate) async fn fetch_remote(
         known_refs: Vec::new(),
         range: None,
     };
-    match managed_read(context, folder.remote.node_id, request).await {
+    let mut answer = managed_read(context, folder.remote.node_id, request.clone()).await;
+    // A member keeping only the record of a distributed version names a holder of its bytes.
+    if let Err(BaoReadError::Refused(BaoReadRefusal::HeldBy { holder, set_id })) = answer {
+        let held = BaoReadRequest {
+            target: BaoReadTarget::Version {
+                set_id,
+                version_id: version,
+            },
+            ..request
+        };
+        answer = managed_read(context, holder, held).await;
+    }
+    match answer {
         Ok(BaoReadOutput::Stream { blob, .. }) => Ok(blob),
         Ok(BaoReadOutput::Metadata { .. }) => {
             Err("the remote version returned no bytes".to_string())

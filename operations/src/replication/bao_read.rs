@@ -30,8 +30,8 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, BucketInfo,
     HashIndex, ManagedCopyKey, VersionKey, object_permission_path,
 };
-use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::distribution::inventory::{IndexEntry, Position, index_key};
+use aruna_core::structs::storage::distribution::{DistributionView, MemberState};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
@@ -1235,7 +1235,14 @@ impl IncomingBaoOperation {
             .exact_target()
             .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
         self.state = IncomingBaoState::ReadKept;
-        let reads = kept_reads(&held);
+        let mut reads = kept_reads(&held);
+        // An exact read of a record without a copy here names a holder of its bytes instead.
+        if let BaoReadTarget::ExactVersion(_) = self.request.target {
+            reads.push((
+                DISTRIBUTION_KEYSPACE.to_string(),
+                held.set_id.to_bytes().into(),
+            ));
+        }
         self.kept = Some(held);
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
@@ -1247,12 +1254,19 @@ impl IncomingBaoOperation {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected(event);
         };
-        let location = self
-            .kept
-            .take()
-            .and_then(|held| kept_location(&held, &values));
-        let Some(location) = location else {
+        let Some(held) = self.kept.take() else {
             return self.send_refusal(BaoReadRefusal::NotFound);
+        };
+        let Some(location) = kept_location(&held, &values) else {
+            let record = values.get(2).and_then(|(_, value)| value.as_deref());
+            let holder = record.and_then(|record| self.byte_holder(record));
+            return self.send_refusal(match holder {
+                Some(holder) => BaoReadRefusal::HeldBy {
+                    holder,
+                    set_id: held.set_id,
+                },
+                None => BaoReadRefusal::NotFound,
+            });
         };
         // The copy's verified hash serves an external reference, whose record names none.
         let kept = location
@@ -1266,6 +1280,17 @@ impl IncomingBaoOperation {
             }
             _ => self.send_refusal(BaoReadRefusal::HashMismatch),
         }
+    }
+
+    /// A ready member other than this node that keeps the bytes of the exact target's range.
+    fn byte_holder(&self, record: &[u8]) -> Option<NodeId> {
+        let view = DistributionView::from_bytes(record).ok()?;
+        let snapshot = view.snapshot();
+        let range = snapshot.range_for(&self.exact_target()?.key)?;
+        (snapshot.byte_holders(range, None).into_iter())
+            .filter(|member| member.state == MemberState::Ready)
+            .map(|member| member.node_id)
+            .find(|node_id| *node_id != self.local_node)
     }
 
     /// Whether this node may answer out of its own observations at all: only a
@@ -2685,7 +2710,7 @@ mod pure_tests {
         }));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 2
+            [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 3
         ));
         let (location, _) = location_value(hash);
         let attached = Attachment {
@@ -2709,6 +2734,81 @@ mod pure_tests {
             VersionReplicationMessage::from_bytes(payload).unwrap(),
             VersionReplicationMessage::BaoReadAccepted { size: 42, blake3, .. } if blake3 == hash
         ));
+    }
+
+    // An exact read of a record kept without a copy names a member holding the range's bytes,
+    // so a device can read the version there.
+    #[test]
+    fn names_byte_holder() {
+        use aruna_core::structs::execution::source_access::SourceMetadata;
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_core::structs::execution::staging::{
+            PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+        };
+        let (snapshot, record) = crate::distribution::test_record::record(true);
+        let set_id = snapshot.set_id();
+        let (local_node, peer) = (node_from_seed(1), node_from_seed(2));
+        let hash = [4u8; 32];
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::ArunaNative,
+                public_config: HashMap::from([("set_id".to_string(), set_id.to_string())]),
+                source_path: "bucket/path/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+                namespace: None,
+            },
+            connector_id: None,
+        };
+        let observed = SourceMetadata {
+            content_length: 42,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let record_only = BlobVersion::reference(
+            source,
+            observed,
+            SystemTime::UNIX_EPOCH,
+            UserId::nil(test_realm()),
+            SystemTime::UNIX_EPOCH,
+        )
+        .with_identity(Some(hash));
+        let mut operation = IncomingBaoOperation::new(
+            peer,
+            local_node,
+            test_realm(),
+            Ulid::from(9u128),
+            read_request(local_node, hash),
+        )
+        .with_policy_paths(HashSet::from([read_path(local_node)]));
+        operation.start();
+        for value in [realm_value(peer), bucket_value()] {
+            operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: Vec::<u8>::new().into(),
+                value: Some(value),
+            }));
+        }
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(record_only.to_bytes().unwrap().into()),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Vec::new().into(), None),
+                (Vec::new().into(), None),
+                (Vec::new().into(), Some(record.into())),
+            ],
+        }));
+        let holder = crate::distribution::test_record::secret(2).public();
+        assert_eq!(
+            refusal_from(&effects),
+            BaoReadRefusal::HeldBy { holder, set_id }
+        );
     }
 
     // A holder serves its verified copy of an external reference by the copy's own BLAKE3: the
