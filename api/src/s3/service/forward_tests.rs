@@ -87,7 +87,7 @@ fn denial_hints_globs() {
 
 #[test]
 fn unreachable_names_range() {
-    let error = unreachable_error(&forward());
+    let error = unreachable_error(&forward(), "unreachable since its last heartbeat at 7 ms");
     assert_eq!(
         error.status_code(),
         Some(http::StatusCode::SERVICE_UNAVAILABLE)
@@ -95,6 +95,7 @@ fn unreachable_names_range() {
     let message = error.message().unwrap_or_default();
     assert!(message.contains("degraded"));
     assert!(message.contains(&forward().range_id.to_string()));
+    assert!(message.contains("since its last heartbeat at 7 ms"));
 }
 
 #[test]

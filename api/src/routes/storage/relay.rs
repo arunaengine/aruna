@@ -12,6 +12,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::WriteRoute;
 use aruna_operations::distribution::delegate::node_urls;
 use aruna_operations::distribution::guard::route_write;
+use aruna_operations::distribution::status::node_reach;
 use axum::http::{HeaderMap, StatusCode, header};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -69,9 +70,10 @@ pub(crate) async fn rest_target(
     }
 }
 
-fn unreachable(forward: &RestForward) -> ServerError {
+/// `reach` says since when this node has not heard from the coordinator.
+fn unreachable(forward: &RestForward, reach: &str) -> ServerError {
     ServerError::ServiceUnavailableReason(format!(
-        "range {} of distributed bucket {} is coordinated by node {}, which is unreachable; \
+        "range {} of distributed bucket {} is coordinated by node {}, which is {reach}; \
          the bucket is degraded and writes to this range fail until the coordinator returns",
         forward.range_id, forward.set_id, forward.node_id
     ))
@@ -116,7 +118,10 @@ pub(crate) async fn relay_json<T: DeserializeOwned>(
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let urls = node_urls(state.get_ctx().as_ref(), forward.node_id).await;
     let Some(base) = urls.and_then(|urls| urls.api) else {
-        return Err(unreachable(forward));
+        return Err(unreachable(
+            forward,
+            &node_reach(state.get_ctx().as_ref(), forward.node_id).hint(),
+        ));
     };
     let response = CLIENT
         .post(relay_url(&base, path))
@@ -134,7 +139,10 @@ pub(crate) async fn relay_json<T: DeserializeOwned>(
                 error = %error,
                 "A distributed bucket coordinator did not take a relayed write"
             );
-            return Err(unreachable(forward));
+            return Err(unreachable(
+                forward,
+                &node_reach(state.get_ctx().as_ref(), forward.node_id).hint(),
+            ));
         }
     };
     let status = response.status();
@@ -183,7 +191,8 @@ mod tests {
             coordinator_error(&forward(), StatusCode::FORBIDDEN, body),
             ServerError::Forbidden
         ));
-        let ServerError::ServiceUnavailableReason(message) = unreachable(&forward()) else {
+        let ServerError::ServiceUnavailableReason(message) = unreachable(&forward(), "unreachable")
+        else {
             panic!("an unreachable coordinator answers 503");
         };
         assert!(message.contains("degraded"));

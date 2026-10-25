@@ -19,6 +19,7 @@ use aruna_operations::distribution::delegate::{DelegationInput, issue_delegation
 use aruna_operations::distribution::guard::{
     GuardError, route_read, route_write, upload_route, upload_tag, upload_tags,
 };
+use aruna_operations::distribution::status::node_reach;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use bytes::Bytes;
 use http::{HeaderMap, Method};
@@ -265,11 +266,12 @@ pub(super) fn catch_up_miss(
     }
 }
 
-fn unreachable_error(forward: &Forward) -> S3Error {
+/// `reach` says since when this node has not heard from the coordinator.
+fn unreachable_error(forward: &Forward, reach: &str) -> S3Error {
     let mut error = S3Error::with_message(
         S3ErrorCode::Custom("CoordinatorUnreachable".into()),
         format!(
-            "Range {} of distributed bucket {} is coordinated by node {}, which is unreachable. \
+            "Range {} of distributed bucket {} is coordinated by node {}, which is {reach}. \
              The bucket is degraded and writes to this range fail until the coordinator returns.",
             forward.range_id, forward.set_id, forward.node_id
         ),
@@ -393,7 +395,10 @@ impl ArunaS3Service {
     ) -> S3Result<reqwest::Response> {
         let urls = node_urls(self.state.as_ref(), forward.node_id).await;
         let Some(base) = urls.and_then(|urls| urls.s3) else {
-            return Err(unreachable_error(forward));
+            return Err(unreachable_error(
+                forward,
+                &node_reach(self.state.as_ref(), forward.node_id).hint(),
+            ));
         };
         let (payload, extra) = match &request.body {
             ForwardBody::Empty => (Payload::Empty, 0),
@@ -478,7 +483,10 @@ impl ArunaS3Service {
                     error = %error,
                     "A distributed bucket coordinator did not take a forwarded write"
                 );
-                return Err(unreachable_error(forward));
+                return Err(unreachable_error(
+                    forward,
+                    &node_reach(self.state.as_ref(), forward.node_id).hint(),
+                ));
             }
         };
         let status = response.status();
