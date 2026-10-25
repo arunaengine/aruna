@@ -12,14 +12,16 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::federation::FederationSettings;
 use aruna_core::git::GitRecord;
 use aruna_core::keyspaces::{
-    APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
-    DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
-    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY,
+    APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BROKEN_VERSION_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE,
+    EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE,
+    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE,
+    IRI_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY,
     NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
-    SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
+    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
+    UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -29,15 +31,23 @@ use aruna_core::structs::execution::job::{
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::identity::database::DatabaseEntry;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
-use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo};
+use aruna_core::structs::placement::policy::attachment::{
+    BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyIntent, PolicyMutationRecord,
+};
+use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo, CurrentVersionPointer};
+use aruna_core::structs::storage::broken::BrokenVersion;
+use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
+use aruna_operations::replication::queue::LiveObligationRecord;
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
+use layouts::{CONNECTOR, HEAD, NODE_INFO, OBLIGATION, padded};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use session_refs::Layout;
@@ -49,6 +59,7 @@ mod buckets;
 mod git;
 mod info_topics;
 mod jobs;
+mod layouts;
 mod mappings;
 mod session_refs;
 mod sessions;
@@ -130,6 +141,20 @@ pub struct MigrateOutput {
     /// Login sessions from before a session named the linked login it came through.
     pub user_sessions_scanned: usize,
     pub user_sessions_rewritten: usize,
+    /// Rows rewritten by keyspace whose shape gained trailing fields with distributed buckets.
+    pub relaid_rows: BTreeMap<&'static str, usize>,
+    /// Rows deleted by keyspace: refresh jobs and IRI index rows in a replaced key layout and
+    /// replication jobs moved to their new key.
+    pub stale_rows_deleted: BTreeMap<&'static str, usize>,
+}
+
+/// Non-zero counts by keyspace; a keyspace listed twice adds up.
+fn counts(rows: impl Iterator<Item = (&'static str, usize)>) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    for (name, count) in rows.filter(|(_, count)| *count > 0) {
+        *counts.entry(name).or_default() += count;
+    }
+    counts
 }
 
 pub async fn migrate(database_path: String, sync_path: Option<String>) -> Result<(), CliError> {
@@ -184,6 +209,19 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let usage_rows = db.keyspace(QUARANTINE_USAGE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let login_rows = db.keyspace(USER_SESSION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let dedup_rows = db.keyspace(DEDUP_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let head_rows = db.keyspace(BLOB_HEAD_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let mutation_rows = db.keyspace(POLICY_MUTATION_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let intent_rows = db.keyspace(BULK_INTENT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let node_rows = db.keyspace(NODE_INFO_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let connector_rows = db.keyspace(SOURCE_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let obligation_rows = db.keyspace(
+        REPLICATION_OBLIGATION_KEYSPACE,
+        KeyspaceCreateOptions::default,
+    )?;
+    let broken_rows = db.keyspace(BROKEN_VERSION_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let replication_rows = db.keyspace(REPLICATION_JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let refresh_rows = db.keyspace(REFRESH_JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let iri_rows = db.keyspace(IRI_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -246,6 +284,45 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let dedup = jobs::dedup_rows(&db, &dedup_rows, &jobs.rows, DEDUP_INDEX_KEYSPACE)?;
     let kinds = jobs::checkpoint_kinds(&db, &job_rows, &jobs.rows, JOB_KEYSPACE)?;
     let checkpoints = jobs::checkpoint_rows(&db, &state_rows, &kinds, JOB_STATE_KEYSPACE)?;
+    let mut relaid_rows = vec![
+        padded::<CurrentVersionPointer>(&db, &head_rows, BLOB_HEAD_KEYSPACE, HEAD)?,
+        padded::<PolicyMutationRecord>(&db, &mutation_rows, POLICY_MUTATION_KEYSPACE, HEAD)?,
+        padded::<PolicyIntent>(&db, &intent_rows, BULK_INTENT_KEYSPACE, HEAD)?,
+        padded::<NodeInfoDocument>(&db, &node_rows, NODE_INFO_KEYSPACE, NODE_INFO)?,
+        padded::<SourceConnector>(&db, &connector_rows, SOURCE_INDEX_KEYSPACE, CONNECTOR)?,
+        padded::<LiveObligationRecord>(
+            &db,
+            &obligation_rows,
+            REPLICATION_OBLIGATION_KEYSPACE,
+            OBLIGATION,
+        )?,
+        padded::<BrokenVersion>(&db, &broken_rows, BROKEN_VERSION_KEYSPACE, versions::LAYOUT)?,
+    ];
+    let replication = layouts::replication_jobs(&db, &replication_rows, REPLICATION_JOB_KEYSPACE)?;
+    relaid_rows.push((
+        &replication_rows,
+        REPLICATION_JOB_KEYSPACE,
+        replication.rows,
+    ));
+    let announced = layouts::cleanup_rows(&db, &cleanup_rows)?.rows;
+    relaid_rows.push((&cleanup_rows, BLOB_CLEANUP_KEYSPACE, announced));
+    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 3] = [
+        (
+            &refresh_rows,
+            REFRESH_JOB_KEYSPACE,
+            layouts::old_refreshes(&db, &refresh_rows)?,
+        ),
+        (
+            &iri_rows,
+            IRI_INDEX_KEYSPACE,
+            layouts::old_iri_rows(&db, &iri_rows)?,
+        ),
+        (
+            &replication_rows,
+            REPLICATION_JOB_KEYSPACE,
+            replication.removed,
+        ),
+    ];
     let keys = node_secret(&db)?.map(|secret| {
         (
             CredentialEncryptionKey::derive(&secret),
@@ -296,7 +373,11 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             .map(|(keyspace, sealed)| (keyspace, &sealed.rows)),
     )
     .chain(moves.iter().map(|(_, moved)| (&vault_rows, &moved.rows)))
-    {
+    .chain(
+        relaid_rows
+            .iter()
+            .map(|(keyspace, _, rows)| (*keyspace, rows)),
+    ) {
         for (key, value) in rows {
             txn.insert(keyspace.clone(), key.clone(), value.clone());
         }
@@ -324,6 +405,11 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     for (keyspace, moved) in &moves {
         for key in &moved.removed {
             txn.remove(keyspace.clone(), key.clone());
+        }
+    }
+    for (keyspace, _, keys) in &stale_rows {
+        for key in keys {
+            txn.remove((*keyspace).clone(), key.clone());
         }
     }
     if let Some(usage) = &info.usage {
@@ -383,6 +469,12 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         info_cursors_deleted: info.cursors.len() + fanout_cursors,
         user_sessions_scanned: logins.scanned,
         user_sessions_rewritten: logins.rows.len(),
+        relaid_rows: counts(
+            relaid_rows
+                .iter()
+                .map(|(_, name, rows)| (*name, rows.len())),
+        ),
+        stale_rows_deleted: counts(stale_rows.iter().map(|(_, name, keys)| (*name, keys.len()))),
     })
 }
 
