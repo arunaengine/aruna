@@ -20,7 +20,7 @@ use ulid::Ulid;
 
 use super::ArunaS3Service;
 use super::forward::xml_field;
-use super::forward_list::{e_tag, elements, range_query, timestamp};
+use super::forward_list::{MAX_RANGES_PER_PAGE, e_tag, elements, range_query, timestamp};
 
 /// The entries one range answered for a version listing, raw positions included.
 #[derive(Default)]
@@ -210,11 +210,13 @@ impl ArunaS3Service {
             })
         });
         let mut first = true;
-        for range in ranges {
+        for (visited, range) in ranges.enumerate() {
             let remaining =
                 max_keys.saturating_sub(versions.len() + markers.len() + prefixes.len());
-            if remaining == 0 {
-                next = last.clone().map(|key| (key, None));
+            if remaining == 0 || visited == MAX_RANGES_PER_PAGE {
+                // Nothing listed yet: the nil version id starts the next page at this range.
+                let start = || (range.lower.clone(), Some(Ulid::nil().to_string()));
+                next = Some(last.clone().map_or_else(start, |key| (key, None)));
                 break;
             }
             let start = match first {

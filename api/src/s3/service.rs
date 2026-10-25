@@ -34,7 +34,7 @@ use aruna_core::structs::storage::format::Compression;
 
 use self::copy::{copy_object_response, copy_part_response, copy_source_conditions};
 use self::forward_copy::{CopyPath, CopySource};
-use self::forward_list::{decode_bound, encode_bound};
+use self::forward_list::{Resume, decode_bound, encode_bound};
 use self::listing::{
     ObjectListingPage, list_parts_output, list_uploads_output, marker_continuation_token,
     next_marker_for,
@@ -650,13 +650,14 @@ impl S3 for ArunaS3Service {
             .filter(|_| bounds.is_none());
         let requested_continuation_token = req.input.continuation_token.clone();
         let query = (req.input.prefix.as_deref(), req.input.delimiter.as_deref());
-        let continuation_token = match &merged {
-            Some(binding) => decode_bound(
-                binding.set_id,
-                query,
-                requested_continuation_token.as_deref(),
-            )?,
-            None => Self::decode_list_token(requested_continuation_token.as_deref())?,
+        let requested = requested_continuation_token.as_deref();
+        let (continuation_token, from) = match &merged {
+            Some(binding) => match decode_bound(binding.set_id, query, requested)? {
+                Some(Resume::After(token)) => (Some(token), None),
+                Some(Resume::From(key)) => (None, Some(key)),
+                None => (None, None),
+            },
+            None => (Self::decode_list_token(requested)?, None),
         };
         let max_keys = match req.input.max_keys {
             None => ListBucketOperation::DEFAULT_MAX_KEYS,
@@ -713,15 +714,17 @@ impl S3 for ArunaS3Service {
             delimiter: delimiter.clone(),
             start_after: start_after.clone(),
         };
-        let page = match &merged {
+        let (page, next_from) = match &merged {
             Some(binding) => {
                 let shape = (owner, url_encoded, scope.as_ref());
-                self.merged_objects(&user_access, binding, input, shape)
+                self.merged_objects(&user_access, binding, input, shape, (from, true))
                     .await?
             }
             None => {
-                self.run_object_listing(input, owner, url_encoded, scope.as_ref(), bounds)
-                    .await?
+                let page = self
+                    .run_object_listing(input, owner, url_encoded, scope.as_ref(), bounds)
+                    .await?;
+                (page, None)
             }
         };
 
@@ -734,7 +737,8 @@ impl S3 for ArunaS3Service {
         let next_continuation_token = match &merged {
             Some(binding) => {
                 let query = (prefix.as_deref(), delimiter.as_deref());
-                encode_bound(binding.set_id, query, result_token.as_ref())?
+                let resume = (result_token.map(Resume::After)).or(next_from.map(Resume::From));
+                encode_bound(binding.set_id, query, resume.as_ref())?
             }
             None => Self::encode_list_token(result_token.as_ref())?,
         };
@@ -844,10 +848,12 @@ impl S3 for ArunaS3Service {
             start_after,
         };
         let page = match &merged {
+            // A marker cannot name a range start, so a legacy listing visits every range.
             Some(binding) => {
                 let shape = (owner, url_encoded, scope.as_ref());
-                self.merged_objects(&user_access, binding, input, shape)
+                self.merged_objects(&user_access, binding, input, shape, (None, false))
                     .await?
+                    .0
             }
             None => {
                 self.run_object_listing(input, owner, url_encoded, scope.as_ref(), None)

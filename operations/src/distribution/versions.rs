@@ -156,6 +156,15 @@ impl InventoryVersionsOperation {
         }
         self.bounds();
         let marker = self.input.key_marker.clone().filter(|key| !key.is_empty());
+        // The nil version id marks a start at the marker key itself, where a merged page ends
+        // when it reached its range bound before any entry.
+        if let (Some(key), Some(true)) =
+            (&marker, self.input.version_id_marker.map(|id| id.is_nil()))
+        {
+            let start = bound_position(self.input.set_id, key);
+            self.resume(start, false);
+            return Ok(self.scan());
+        }
         if let (Some(_), Some(version_id)) = (&marker, self.input.version_id_marker) {
             self.state = State::ReadMarker;
             return Ok(smallvec![Effect::Storage(StorageEffect::Read {

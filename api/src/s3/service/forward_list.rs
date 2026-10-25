@@ -36,8 +36,19 @@ const TOKEN_DOMAIN: &[u8] = b"aruna-distributed-listing-v1";
 struct BoundToken {
     set_id: Ulid,
     query: [u8; 32],
-    position: ListContinuationToken,
+    position: Resume,
 }
+
+/// Where a merged listing continues: after a listed entry, or at the first key of a range when
+/// a page visited its bound number of ranges without an entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) enum Resume {
+    After(ListContinuationToken),
+    From(String),
+}
+
+/// Ranges one merged page visits at most, so its fan-out stays bounded.
+pub(super) const MAX_RANGES_PER_PAGE: usize = 64;
 
 fn query_digest(prefix: Option<&str>, delimiter: Option<&str>) -> [u8; 32] {
     let bytes = postcard::to_allocvec(&(prefix, delimiter)).unwrap_or_default();
@@ -51,7 +62,7 @@ fn query_digest(prefix: Option<&str>, delimiter: Option<&str>) -> [u8; 32] {
 pub(super) fn encode_bound(
     set_id: Ulid,
     (prefix, delimiter): (Option<&str>, Option<&str>),
-    position: Option<&ListContinuationToken>,
+    position: Option<&Resume>,
 ) -> S3Result<Option<String>> {
     position
         .map(|position| {
@@ -72,7 +83,7 @@ pub(super) fn decode_bound(
     set_id: Ulid,
     (prefix, delimiter): (Option<&str>, Option<&str>),
     token: Option<&str>,
-) -> S3Result<Option<ListContinuationToken>> {
+) -> S3Result<Option<Resume>> {
     let invalid = || s3_error!(InvalidArgument, "Invalid continuation token");
     token
         .map(|token| {
@@ -297,7 +308,8 @@ impl ArunaS3Service {
         binding: &DistributionBinding,
         input: ListBucketInput,
         (owner, url_encoded, scope): (Option<Owner>, bool, Option<&SubpathScope>),
-    ) -> S3Result<ObjectListingPage> {
+        (from, bounded): (Option<String>, bool),
+    ) -> S3Result<(ObjectListingPage, Option<String>)> {
         let snapshot = self.snapshot(binding).await?;
         let max = input
             .max_keys
@@ -323,21 +335,30 @@ impl ArunaS3Service {
         let mut last_key: Option<String> = None;
         let ranges = snapshot.listed_ranges(&prefix);
         let ranges = ranges.into_iter().filter(|range| {
-            resume.as_ref().is_none_or(|(key, _)| {
+            let after = resume.as_ref().is_none_or(|(key, _)| {
                 range
                     .upper
                     .as_deref()
                     .is_none_or(|upper| key.as_str() < upper)
-            })
+            });
+            after
+                && from
+                    .as_deref()
+                    .is_none_or(|from| range.lower.as_str() >= from)
         });
         let mut first = true;
-        for range in ranges {
+        for (visited, range) in ranges.enumerate() {
             let remaining =
                 max.saturating_sub(merged.contents.len() + merged.common_prefixes.len());
-            if remaining == 0 {
+            if remaining == 0 || (bounded && visited == MAX_RANGES_PER_PAGE) {
                 merged.continuation_token =
                     scoped_marker(&input.bucket, last_key.as_deref(), last_prefix.as_deref())?;
-                break;
+                // Nothing listed yet: the next page starts at this range.
+                let next = merged
+                    .continuation_token
+                    .is_none()
+                    .then(|| range.lower.clone());
+                return Ok((merged, next));
             }
             let part = match snapshot.lists_locally(binding.member_id, range) {
                 true => {
@@ -381,7 +402,7 @@ impl ArunaS3Service {
                 break;
             }
         }
-        Ok(merged)
+        Ok((merged, None))
     }
 }
 
@@ -397,9 +418,16 @@ mod tests {
             last_common_prefix: Some("a/".to_string()),
         };
         let query = (Some("a"), Some("/"));
-        let token = encode_bound(set, query, Some(&position)).unwrap();
+        let resume = Resume::After(position);
+        let token = encode_bound(set, query, Some(&resume)).unwrap();
         let back = decode_bound(set, query, token.as_deref()).unwrap();
-        assert_eq!(back, Some(position));
+        assert_eq!(back, Some(resume));
+        let from = Resume::From("m".to_string());
+        let token = encode_bound(set, query, Some(&from)).unwrap();
+        assert_eq!(
+            decode_bound(set, query, token.as_deref()).unwrap(),
+            Some(from)
+        );
         assert!(decode_bound(set, (Some("b"), Some("/")), token.as_deref()).is_err());
         let other = Ulid::from_bytes([2; 16]);
         assert!(decode_bound(other, query, token.as_deref()).is_err());

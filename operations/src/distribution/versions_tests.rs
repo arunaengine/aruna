@@ -186,3 +186,17 @@ async fn folders_grouped_once() {
     assert_eq!(result.common_prefixes, vec!["d/".to_string()]);
     assert_eq!(listed(&result), vec![("e".to_string(), id(6), true)]);
 }
+
+#[tokio::test]
+async fn nil_marker_starts_at_key() {
+    let (_dir, handle) = seeded().await;
+    let start = InventoryVersionsInput {
+        key_marker: Some("b".to_string()),
+        version_id_marker: Some(Ulid::nil()),
+        ..input(10)
+    };
+    assert_eq!(
+        listed(&list(&handle, start).await),
+        vec![("b".to_string(), id(3), true)]
+    );
+}
