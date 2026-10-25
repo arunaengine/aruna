@@ -660,3 +660,7 @@ impl Operation for RebuildStatsOperation {
         effects
     }
 }
+
+#[cfg(test)]
+#[path = "rebuild_tests.rs"]
+mod tests;
