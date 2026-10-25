@@ -90,6 +90,32 @@ fn needs_coordinator(
     }
 }
 
+/// Refuses a transfer to a member that cannot take the range, naming the members that can.
+fn eligible_target(
+    snapshot: &DistributionSnapshot,
+    range_id: Ulid,
+    to: Ulid,
+) -> Result<(), CreateError> {
+    let range = (snapshot.config.ranges.iter())
+        .find(|range| range.range_id == range_id)
+        .ok_or_else(|| CreateError::Invalid(format!("range {range_id} is not part of the set")))?;
+    let targets = snapshot.transfer_targets(range);
+    if targets.iter().any(|target| target.member_id == to) {
+        return Ok(());
+    }
+    let eligible = match targets.is_empty() {
+        true => "none; join a member with the copy strategy for this range first".to_string(),
+        false => (targets.iter())
+            .map(|m| format!("{} (node {})", m.member_id, m.node_id))
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    Err(CreateError::Invalid(format!(
+        "member {to} cannot take range {range_id}: only a ready copy replica of the range can \
+         become its coordinator; eligible members: {eligible}"
+    )))
+}
+
 /// Adds a member on `input.node_id`, then creates and admits its bucket there under the
 /// caller's bearer token. The member catches up from the coordinators before it is ready.
 pub async fn join_member(
@@ -156,6 +182,7 @@ pub async fn transfer_range(
     (range_id, to, role): (Ulid, Ulid, TransferRole),
 ) -> Result<DistributionRevision, CreateError> {
     let (local, snapshot) = head(context, set_id).await?;
+    eligible_target(&snapshot, range_id, to)?;
     needs_coordinator(context, &snapshot, range_id, "the transfer")?;
     let request = DistributionRequest::TransferPrepare {
         transfer_id: Ulid::generate(),
@@ -192,4 +219,36 @@ pub async fn delete_set(
         .collect();
     let request = DistributionRequest::DeletePrepare { members };
     send(context, (local, &snapshot), caller, request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distribution::test_record::{member, replicated};
+
+    #[test]
+    fn refusal_names_eligible_members() {
+        // Member 2 keeps a copy of member 1's range; member 1 itself cannot take it.
+        let (snapshot, _) = replicated(true, 1);
+        let range = &snapshot.config.ranges[0];
+        let (range_id, coordinator) = (range.range_id, range.coordinator);
+        let other = if coordinator == member(1) {
+            member(2)
+        } else {
+            member(1)
+        };
+        assert!(eligible_target(&snapshot, range_id, other).is_ok());
+        let Err(CreateError::Invalid(message)) = eligible_target(&snapshot, range_id, coordinator)
+        else {
+            panic!("a transfer to the coordinator itself is refused");
+        };
+        assert!(message.contains(&other.to_string()), "{message}");
+        let (bare, _) = replicated(true, 0);
+        let Err(CreateError::Invalid(message)) =
+            eligible_target(&bare, bare.config.ranges[0].range_id, other)
+        else {
+            panic!("a range without copies has no eligible member");
+        };
+        assert!(message.contains("none"), "{message}");
+    }
 }

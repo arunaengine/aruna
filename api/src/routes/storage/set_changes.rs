@@ -239,6 +239,7 @@ pub async fn leave_distributed(
 **Authentication**: realm bearer token with WRITE on the group's admin path; the publisher checks the forwarded token again.
 
 **Behavior**
+- Only a ready `copy` replica of the range can take it; a refusal names the eligible members.
 - The new coordinator takes a fresh epoch above every epoch of the set.
 - The current coordinator fences the range: writes to it fail with a retryable "range moving"
   until the transfer activates. Open uploads of the range are aborted.
@@ -262,7 +263,7 @@ pub async fn leave_distributed(
     ),
     responses(
         (status = 202, description = "The revision that opened the transfer", body = ChangeResponse),
-        (status = 400, description = "Invalid range or member", body = ErrorResponse),
+        (status = 400, description = "Unknown range, or the member is not a ready `copy` replica of it; the message names the eligible members", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),

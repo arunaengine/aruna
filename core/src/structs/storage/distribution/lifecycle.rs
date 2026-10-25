@@ -10,8 +10,8 @@ use ulid::Ulid;
 use super::membership::changeable;
 use super::snapshot::{Deletion, DistributionSnapshot, OpenTransfer, Tombstone};
 use super::{
-    DataStrategy, DistributionError, DistributionMember, MemberState, MetadataCoverage, SetPhase,
-    SignedStatement, Statement, StatementKind, TransferRole,
+    DataStrategy, DistributionError, DistributionMember, KeyRange, MemberState, MetadataCoverage,
+    SetPhase, SignedStatement, Statement, StatementKind, TransferRole,
 };
 use crate::structs::identity::realm::RealmId;
 
@@ -94,6 +94,15 @@ impl DistributionSnapshot {
         coordinators
     }
 
+    /// The members a transfer of `range` may go to: its ready `copy` replicas.
+    pub fn transfer_targets(&self, range: &KeyRange) -> Vec<&DistributionMember> {
+        (range.replicas.iter())
+            .filter(|replica| **replica != range.coordinator)
+            .filter_map(|replica| self.member(*replica))
+            .filter(|m| m.state == MemberState::Ready && m.strategy == DataStrategy::Copy)
+            .collect()
+    }
+
     fn statement_digest(&self, digest: &[u8; 32]) -> Option<&SignedStatement> {
         (self.statements.iter()).find(|signed| signed.statement.digest() == *digest)
     }
@@ -126,11 +135,9 @@ pub(super) fn prepare_transfer(
     if (open.iter()).any(|open| open.transfer_id == plan.transfer_id || open.to == plan.to) {
         return Err(refused("the member is already receiving a transfer"));
     }
-    let to = next
-        .member(plan.to)
+    next.member(plan.to)
         .ok_or(DistributionError::NoMember(plan.to))?;
-    let ready_copy = to.state == MemberState::Ready && to.strategy == DataStrategy::Copy;
-    if plan.to == range.coordinator || !ready_copy || !range.replicas.contains(&plan.to) {
+    if !(next.transfer_targets(range).iter()).any(|target| target.member_id == plan.to) {
         return Err(refused(
             "the new coordinator must be a ready copy replica of the range",
         ));

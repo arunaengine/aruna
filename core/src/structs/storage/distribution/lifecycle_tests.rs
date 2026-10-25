@@ -163,6 +163,28 @@ fn transfer_needs_ready_copy_replica() {
 }
 
 #[test]
+fn transfer_targets_are_ready_copies() {
+    // Only ready copy replicas other than the coordinator may take the range.
+    let mut head = active();
+    let ids = |head: &DistributionSnapshot| -> Vec<Ulid> {
+        let range = &head.config.ranges[0];
+        (head.transfer_targets(range).iter())
+            .map(|m| m.member_id)
+            .collect()
+    };
+    assert_eq!(ids(&head), vec![member_id(2), member_id(3)]);
+    head.config.members[2].state = MemberState::CatchingUp;
+    head.config.members[1].strategy = DataStrategy::CacheOnUse;
+    assert!(ids(&head).is_empty());
+    let refused = next_snapshot(
+        realm(),
+        Some(&head),
+        &prepare(&head, 3, TransferRole::Leave),
+    );
+    assert!(matches!(refused, Err(DistributionError::InvalidChange(_))));
+}
+
+#[test]
 fn transfer_binds_its_statements() {
     let head = active();
     let prepared = step(&head, &prepare(&head, 2, TransferRole::Leave));
