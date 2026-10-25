@@ -208,7 +208,12 @@ async fn deleted_documents_leave_nothing() {
     delete_documents(&storage, &BTreeSet::from([document]))
         .await
         .unwrap();
-    assert!(document_rows(&storage, document).await.unwrap().is_empty());
+    assert!(
+        document_rows(&storage, DOCUMENT_LINK_KEYSPACE, document)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let mut budget = budget();
     let key = DataLink::parse(&set_url("a/")).unwrap().key();
     let (postings, _) = read_postings(&storage, &key, None, 10, &mut budget)

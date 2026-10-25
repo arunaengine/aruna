@@ -3139,10 +3139,11 @@ mod tests {
         })
     }
     use super::{
-        MAX_SCOPE_VERSIONS, ReplicateObjectError, ReplicateObjectOperation, ReplicateObjectState,
-        ReplicateScopeError, ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeState,
-        ReplicateScopeTarget, ReplicationFailure, ReplicationVersion, SourceAuthorization,
-        SyncTransferContext,
+        MAX_SCOPE_VERSIONS, NATIVE_RELATIONSHIP_ID, NATIVE_SET_ID, Publication,
+        ReplicateObjectError, ReplicateObjectOperation, ReplicateObjectState, ReplicateScopeError,
+        ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeState, ReplicateScopeTarget,
+        ReplicationFailure, ReplicationVersion, SourceAuthorization, SyncTransferContext,
+        target_key,
     };
     use crate::driver::DriverContext;
     use crate::replication::protocol::{
