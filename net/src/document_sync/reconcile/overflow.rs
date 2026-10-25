@@ -94,6 +94,10 @@ impl DocumentSyncService {
             .topic_state(&topic_id)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?
         else {
+            // A topic that is gone takes its sweep rows along; the checkpoint goes last.
+            for prefix in [SCAN_PREFIX, FULL_PREFIX] {
+                self.storage_delete(topic_key(prefix, topic_id)).await?;
+            }
             return self.storage_delete(key).await;
         };
         let genesis = topic.genesis;
