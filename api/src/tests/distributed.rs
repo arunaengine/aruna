@@ -16,7 +16,7 @@ use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmId, RealmNode, RealmNodeKind,
 };
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
-use aruna_core::structs::storage::distribution::presets::shard_layout;
+use aruna_core::structs::storage::distribution::presets::{replica_layout, shard_layout};
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionConfig, DistributionRequest, DistributionSettings,
     DistributionSnapshot, DistributionView, SetRoot, SignedSnapshot, Statement, next_snapshot,
@@ -199,6 +199,8 @@ pub(crate) async fn write(state: &ServerState, key_space: &str, key: Vec<u8>, va
 enum Split {
     /// Two shards split at `m`: this node coordinates the lower one, the peer the upper one.
     Shards,
+    /// One range the peer coordinates, with a copy on this node.
+    PeerOnly,
 }
 
 /// The active record of `bucket`, published by this node.
@@ -213,6 +215,10 @@ fn record(state: &ServerState, owner_group: Ulid, bucket: &str, split: Split) ->
         Split::Shards => {
             let nodes = [(member(1), node_id(LOCAL)), (member(2), node_id(PEER))];
             shard_layout(root.set_id(), &nodes, &["m".to_string()], 0)
+        }
+        Split::PeerOnly => {
+            let nodes = [(member(2), node_id(PEER)), (member(1), node_id(LOCAL))];
+            replica_layout(root.set_id(), &nodes)
         }
     }
     .unwrap();
@@ -248,6 +254,15 @@ pub(crate) async fn distribute(
     bucket: &str,
 ) -> DistributionSnapshot {
     install(state, owner_group, bucket, Split::Shards).await
+}
+
+/// Makes `bucket` one range the peer coordinates, which this node keeps a copy of.
+pub(crate) async fn replicate(
+    state: &ServerState,
+    owner_group: Ulid,
+    bucket: &str,
+) -> DistributionSnapshot {
+    install(state, owner_group, bucket, Split::PeerOnly).await
 }
 
 /// Stores the record of `bucket` and binds the local bucket of that name to member 1.

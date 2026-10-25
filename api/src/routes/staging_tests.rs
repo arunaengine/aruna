@@ -817,3 +817,203 @@ async fn read_doc(
 
     value
 }
+
+mod distributed {
+    use super::super::*;
+    use crate::tests::distributed::{
+        BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
+        replicate,
+    };
+
+    fn bearer() -> Extension<Option<ValidatedBearer>> {
+        Extension(Some(ValidatedBearer::new_for_test("caller-token")))
+    }
+
+    fn connector() -> String {
+        ulid::Ulid::from_bytes([30; 16]).to_string()
+    }
+
+    fn target(node: &Node, key: &str) -> StageTargetRequest {
+        StageTargetRequest {
+            group_id: node.group_id.to_string(),
+            connector_id: connector(),
+            source_path: "data/a.bin".to_string(),
+            bucket: BUCKET.to_string(),
+            key: key.to_string(),
+        }
+    }
+
+    fn batch(node: &Node, items: &[&str], prefixes: &[&str]) -> StageBatchRequest {
+        StageBatchRequest {
+            group_id: node.group_id.to_string(),
+            node_id: None,
+            connector_id: connector(),
+            bucket: BUCKET.to_string(),
+            strategy: ApiStagingStrategy::Snapshot,
+            items: Some(
+                (items.iter())
+                    .map(|path| StageBatchItem {
+                        source_path: path.to_string(),
+                        target_key: path.to_string(),
+                    })
+                    .collect(),
+            ),
+            prefixes: Some(
+                (prefixes.iter())
+                    .map(|prefix| StageBatchPrefix {
+                        source_prefix: prefix.to_string(),
+                        target_prefix: "imported".to_string(),
+                    })
+                    .collect(),
+            ),
+            checksum_manifest: None,
+        }
+    }
+
+    async fn submit(
+        node: &Node,
+        request: StageBatchRequest,
+    ) -> ServerResult<(StatusCode, Json<SubmitStagingResponse>)> {
+        submit_staging(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            bearer(),
+            axum::http::HeaderMap::new(),
+            Json(request),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn stage_relays_write() {
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let answer =
+            r#"{"strategy":"snapshot","bucket":"routed","key":"z.bin","version_id":"v","size":3}"#;
+        let peer = mock_peer(StatusCode::CREATED, answer).await;
+        publish_api(&node.state, node_id(PEER), &peer.url).await;
+        let stage = |key: &str| {
+            stage_blob(
+                State(node.state.clone()),
+                Extension(Some(node.owner.clone())),
+                bearer(),
+                axum::http::HeaderMap::new(),
+                Json(StageRequest::Snapshot(target(&node, key))),
+            )
+        };
+
+        let (status, Json(staged)) = stage("z.bin").await.unwrap();
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            (staged.key.as_str(), staged.version_id.as_str()),
+            ("z.bin", "v")
+        );
+        assert_eq!(
+            peer.paths.lock().unwrap().clone(),
+            vec!["/api/v1/data/staging"]
+        );
+        // A key of this node's range is staged here, where the connector is unknown.
+        assert!(stage("a.bin").await.is_err());
+        assert_eq!(peer.paths.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_fans_out() {
+        let node = node_state().await;
+        replicate(&node.state, node.group_id, BUCKET).await;
+        let peer = mock_peer(StatusCode::ACCEPTED, r#"{"job_id":"j1"}"#).await;
+        publish_api(&node.state, node_id(PEER), &peer.url).await;
+
+        let (status, Json(submitted)) = submit(&node, batch(&node, &["data/a.bin"], &[]))
+            .await
+            .unwrap();
+
+        // This node coordinates no range, so the peer's job is the answer.
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(submitted.job_id, "j1");
+        let job = &submitted.coordinator_jobs[0];
+        assert_eq!(job.node_id, node_id(PEER).to_string());
+        assert_eq!(
+            (job.job_id.as_deref(), job.error.as_deref()),
+            (Some("j1"), None)
+        );
+        assert_eq!(
+            peer.paths.lock().unwrap().clone(),
+            vec!["/api/v1/data/staging/jobs"]
+        );
+
+        publish_api(&node.state, node_id(PEER), CLOSED_API).await;
+        let Err(ServerError::ServiceUnavailableReason(reason)) =
+            submit(&node, batch(&node, &["data/a.bin"], &[])).await
+        else {
+            panic!("a job no coordinator accepted answers 503");
+        };
+        assert!(reason.contains("no coordinator"));
+    }
+
+    #[tokio::test]
+    async fn submit_validates_input() {
+        let node = node_state().await;
+        let mut sync = batch(&node, &["data/a.bin"], &[]);
+        sync.strategy = ApiStagingStrategy::Sync;
+        assert!(matches!(
+            submit(&node, sync).await,
+            Err(ServerError::Unimplemented)
+        ));
+        let mut elsewhere = batch(&node, &["data/a.bin"], &[]);
+        elsewhere.node_id = Some(node_id(PEER).to_string());
+        assert!(matches!(
+            submit(&node, elsewhere).await,
+            Err(ServerError::BadRequestReason(_))
+        ));
+        assert!(matches!(
+            submit(&node, batch(&node, &[], &[])).await,
+            Err(ServerError::BadRequestReason(_))
+        ));
+        let mut manifest = batch(&node, &["data/a.bin"], &[]);
+        manifest.checksum_manifest = Some("../sums.txt".to_string());
+        assert!(submit(&node, manifest).await.is_err());
+        let mut foreign = batch(&node, &["data/a.bin"], &[]);
+        foreign.group_id = ulid::Ulid::nil().to_string();
+        assert!(submit(&node, foreign).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn batch_reports_errors() {
+        let node = node_state().await;
+        let run = |request: StageBatchRequest| {
+            stage_batch(
+                State(node.state.clone()),
+                Extension(Some(node.owner.clone())),
+                Json(request),
+            )
+        };
+        // A prefix that is no confined path and a prefix the unknown connector cannot list
+        // both come back as error results; nothing is staged.
+        let (status, Json(answer)) = run(batch(&node, &[], &["../escape", "data"]))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer.results.len(), 2);
+        assert!(
+            (answer.results.iter())
+                .all(|result| result.status == StageBatchStatus::Error && result.error.is_some())
+        );
+        let mut sync = batch(&node, &["data/a.bin"], &[]);
+        sync.strategy = ApiStagingStrategy::Sync;
+        assert!(matches!(run(sync).await, Err(ServerError::Unimplemented)));
+        let mut manifest = batch(&node, &["data/a.bin"], &[]);
+        manifest.checksum_manifest = Some("sums.txt".to_string());
+        assert!(matches!(
+            run(manifest).await,
+            Err(ServerError::BadRequestReason(_))
+        ));
+        let mut elsewhere = batch(&node, &["data/a.bin"], &[]);
+        elsewhere.node_id = Some(node_id(PEER).to_string());
+        assert!(matches!(
+            run(elsewhere).await,
+            Err(ServerError::BadRequestReason(_))
+        ));
+    }
+}
