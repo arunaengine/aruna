@@ -1769,8 +1769,6 @@ async fn put_version(
     drive(operation, &ctx.driver).await.map(|_| ())
 }
 
-/// Only a refusal of this one object fails it and lets the run go on; storage and other
-/// system errors end the run for a retry, so the checkpoint never passes an undecided object.
 /// Whether the key's range of a distributed bucket is another coordinator's, or moves there;
 /// that coordinator's run imports it.
 fn moved_away(error: &PutObjectError) -> bool {
@@ -1781,6 +1779,8 @@ fn moved_away(error: &PutObjectError) -> bool {
     }
 }
 
+/// Only a refusal of this one object fails it and lets the run go on; storage and other
+/// system errors end the run for a retry, so the checkpoint never passes an undecided object.
 fn put_failure(error: PutObjectError) -> ItemError {
     use PolicyGateError::{Denied, ForeignPolicy, Invalid, NoSubject, Required};
     match error {

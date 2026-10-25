@@ -697,8 +697,6 @@ fn given_away<'a>(
     given
 }
 
-/// Whether `binding` names the bucket of `member`: same set and member at its admitted
-/// incarnation. A member that never admitted owns the bucket it created, whatever incarnation.
 /// Whether `binding` names a former member of this node that a join replaced.
 fn replaced(
     snapshot: &DistributionSnapshot,
@@ -709,6 +707,8 @@ fn replaced(
         && snapshot.tombstoned(binding.member_id, binding.incarnation)
 }
 
+/// Whether `binding` names the bucket of `member`: same set and member at its admitted
+/// incarnation. A member that never admitted owns the bucket it created, whatever incarnation.
 fn owns(set_id: Ulid, member: &DistributionMember, binding: &DistributionBinding) -> bool {
     binding.set_id == set_id
         && binding.member_id == member.member_id

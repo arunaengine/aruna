@@ -2175,8 +2175,6 @@ fn slice_blob(
     BackendStream(Box::pin(sliced))
 }
 
-/// Reads the local copy; with a token, a locked or pending version is read with the object key
-/// that a grant of the credential opens.
 /// Reads a copy source like [`read_local`]; a record-only version of a distributed bucket is
 /// read through a holder of its range under the caller's authority.
 pub(crate) async fn read_source(
@@ -2208,6 +2206,8 @@ pub(crate) async fn read_source(
     }
 }
 
+/// Reads the local copy; with a token, a locked or pending version is read with the object key
+/// that a grant of the credential opens.
 pub(crate) async fn read_local(
     context: &DriverContext,
     input: GetObjectInput,

@@ -1484,9 +1484,6 @@ async fn reference_blob(
     ))
 }
 
-/// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes` from
-/// the realm quota config, mirroring the S3 surface's `resolve_quota_ceiling`.
-/// `None` means the group is unlimited.
 /// Starts the job on every other coordinator of a distributed bucket with the caller's bearer;
 /// reports whether this node coordinates a range itself.
 async fn coordinator_jobs(
@@ -1535,6 +1532,9 @@ async fn coordinator_jobs(
     Ok((coordinates, jobs))
 }
 
+/// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes` from
+/// the realm quota config, mirroring the S3 surface's `resolve_quota_ceiling`.
+/// `None` means the group is unlimited.
 async fn resolve_quota_ceiling(
     state: &ServerState,
     group_id: ulid::Ulid,

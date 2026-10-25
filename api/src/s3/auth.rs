@@ -675,8 +675,6 @@ fn map_offered_error(error: OfferedDirectoryError) -> s3s::S3Error {
 }
 
 impl AuthProvider {
-    /// Anonymous access permits only concrete object bytes granted to Everyone.
-    /// The bucket's group scopes the permission path.
     /// A write another member verified and forwarded: the delegation must come from a realm
     /// infrastructure node, match this exact request and be unused, and the user must hold
     /// the permission on this node's own path (D33).
@@ -818,6 +816,8 @@ impl AuthProvider {
         Ok(())
     }
 
+    /// Anonymous access permits only concrete object bytes granted to Everyone.
+    /// The bucket's group scopes the permission path.
     async fn check_anonymous(&self, cx: &mut S3AccessContext<'_>, action: Action) -> S3Result<()> {
         if !matches!(action, Action::Read) || !anonymous_read_allowed(cx.s3_op().name()) {
             return Err(s3_error!(
