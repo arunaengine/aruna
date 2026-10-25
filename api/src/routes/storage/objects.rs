@@ -420,7 +420,25 @@ async fn relayed_bounds(
         ObjectListQuery
     ),
     responses(
-        (status = 200, description = "One page of objects", body = ObjectListResponse),
+        (
+            status = 200,
+            description = "One page of objects",
+            body = ObjectListResponse,
+            example = json!({
+                "bucket": "research-raw",
+                "objects": [{
+                    "key": "runs/2026/sample.fastq.gz",
+                    "size": 1048576,
+                    "etag": "9b2cf535f27731c974343645a3985328",
+                    "last_modified": "2026-10-24T10:00:00+00:00",
+                    "content_type": "application/gzip",
+                    "referenced": false,
+                    "content_id": "https://w3id.org/aruna/data/af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+                }],
+                "prefixes": ["runs/2026/raw/"],
+                "next_cursor": "AAtydW5zLzIwMjYvAA"
+            })
+        ),
         (status = 400, description = "Invalid cursor or range bounds", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the bucket or the listed prefix", body = ErrorResponse),
