@@ -353,7 +353,8 @@ pub async fn settings_distributed(
 **Behavior**
 - Writes stop at once. Every coordinator fences its ranges; once all have, the deletion commits
   and every member purges its local bucket range by range, then deletes it.
-- A member bucket that was replaced in the meantime is left alone.
+- A member bucket that was replaced in the meantime is left alone. A member bucket that was
+  created but never admitted is deleted too.
 - Members that are offline purge when they return.
 - The answer is 202 once the deletion is recorded; its progress shows in the bucket status.
   An unreachable coordinator keeps the deletion waiting for its fence."#,

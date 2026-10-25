@@ -203,7 +203,7 @@ impl SetWork {
         Ok(left)
     }
 
-    /// The local bucket's binding, only while it is this member's admitted incarnation.
+    /// The local bucket's binding, only while it is this member's bucket.
     async fn binding(
         &self,
         context: &DriverContext,
@@ -214,11 +214,9 @@ impl SetWork {
         let Ok(info) = drive(bucket, context).await else {
             return Ok(None);
         };
-        Ok(info.distribution.filter(|binding| {
-            binding.set_id == self.set_id
-                && binding.member_id == member.member_id
-                && member.incarnation == Some(binding.incarnation)
-        }))
+        Ok(info
+            .distribution
+            .filter(|binding| owns(self.set_id, member, binding)))
     }
 
     /// Fences the whole set, states it as a coordinator, and purges once it is committed.
@@ -495,6 +493,14 @@ impl SetWork {
     }
 }
 
+/// Whether `binding` names the bucket of `member`: same set and member at its admitted
+/// incarnation. A member that never admitted owns the bucket it created, whatever incarnation.
+fn owns(set_id: Ulid, member: &DistributionMember, binding: &DistributionBinding) -> bool {
+    binding.set_id == set_id
+        && binding.member_id == member.member_id
+        && (member.incarnation).is_none_or(|admitted| admitted == binding.incarnation)
+}
+
 /// The active counters this node keeps for a range, while its account is not split or rebuilt.
 pub(super) async fn range_counters(
     context: &DriverContext,
@@ -648,6 +654,32 @@ async fn unbind(
 mod tests {
     use super::*;
     use aruna_core::structs::storage::distribution::OriginalEpoch;
+
+    #[test]
+    fn created_member_owns_its_bucket() {
+        // A bucket created for a member that was never admitted is still deleted with the set.
+        let (snapshot, _) = crate::distribution::test_record::record(true);
+        let mut member = snapshot.config.members[0].clone();
+        let set_id = snapshot.set_id();
+        let bound = |incarnation| DistributionBinding {
+            set_id,
+            member_id: member.member_id,
+            incarnation,
+            revision: snapshot.revision(),
+        };
+        assert!(owns(set_id, &member, &bound(5)));
+        assert!(
+            !owns(set_id, &member, &bound(6)),
+            "a replaced bucket is left alone"
+        );
+        member.incarnation = None;
+        assert!(owns(set_id, &member, &bound(6)));
+        let other = DistributionBinding {
+            member_id: Ulid::from_bytes([77; 16]),
+            ..bound(6)
+        };
+        assert!(!owns(set_id, &member, &other));
+    }
 
     #[test]
     fn completion_waits_for_every_count() {
