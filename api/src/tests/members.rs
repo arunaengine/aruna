@@ -85,6 +85,46 @@ pub(crate) struct Members {
 }
 
 impl Members {
+    /// Lets Everyone read the bucket on every member, by a node glob such as operators set.
+    pub async fn publish(&self) {
+        use aruna_core::structs::identity::auth::{Permission, Role};
+        use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+        use aruna_core::structs::storage::blob::bucket_permission_path;
+        let owner = self.user.user_identity;
+        let mut document =
+            GroupAuthorizationDocument::default_group_doc(owner, self.realm_id, self.group_id);
+        let first = self.nodes[0].node_id();
+        let path = bucket_permission_path(self.realm_id, self.group_id, first, BUCKET)
+            .replace(&first.to_string(), "*");
+        let role_id = Ulid::from_bytes([76; 16]);
+        let role = Role {
+            role_id,
+            name: "public".to_string(),
+            permissions: HashMap::from([
+                (path.clone(), Permission::READ),
+                (format!("{path}/**"), Permission::READ),
+            ]),
+            assigned_users: std::collections::HashSet::from([UserId::nil(self.realm_id)]),
+        };
+        document.roles.insert(role_id, role);
+        for node in &self.nodes {
+            let actor = Actor {
+                node_id: node.node_id(),
+                user_id: owner,
+                realm_id: self.realm_id,
+            };
+            let value = document.to_bytes(&actor).unwrap();
+            let key = aruna_core::keyspaces::AUTH_KEYSPACE;
+            write_doc(
+                &node.context,
+                key,
+                self.group_id.to_bytes().into(),
+                value.into(),
+            )
+            .await;
+        }
+    }
+
     /// The caller's credential as the node it is used on issued it.
     pub fn user_on(&self, node: usize) -> UserAccess {
         UserAccess {
@@ -174,7 +214,7 @@ fn info_document(node_id: NodeId, url: &str) -> NodeInfoDocument {
 /// Starts `count` members of one set split at `boundaries`, each range with `replicas` copies,
 /// every member admitted and the set active.
 pub(crate) async fn members(count: u8, boundaries: &[&str], replicas: usize) -> Members {
-    let realm_id = RealmId([70; 32]);
+    let realm_id = RealmId::from_bytes([3; 32]);
     let mut started = Vec::new();
     for seed in 0..count {
         started.push(start(realm_id, 71 + seed).await);

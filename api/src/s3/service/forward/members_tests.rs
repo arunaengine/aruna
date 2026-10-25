@@ -11,7 +11,7 @@ use s3s::{S3, S3Request};
 
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 
-use super::members::{BUCKET, Members, members};
+use crate::tests::members::{BUCKET, Members, members};
 
 /// A request the access hook admitted for `user` on `bucket`.
 fn request<T>(input: T, method: Method, user: UserAccess, bucket: BucketInfo) -> S3Request<T> {

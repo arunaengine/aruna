@@ -12,8 +12,8 @@ use http::{HeaderMap, Method};
 use s3s::dto::StreamingBlob;
 
 use super::forwarded_digest;
-use super::members::{BUCKET, Members, members};
 use crate::s3::service::payload::frame_body;
+use crate::tests::members::{BUCKET, Members, members};
 
 fn now() -> u64 {
     SystemTime::now()

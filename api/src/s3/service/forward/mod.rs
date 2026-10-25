@@ -727,8 +727,6 @@ impl ArunaS3Service {
 #[cfg(test)]
 mod delegated_tests;
 #[cfg(test)]
-pub(super) mod members;
-#[cfg(test)]
 mod members_tests;
 #[cfg(test)]
 mod tests;
