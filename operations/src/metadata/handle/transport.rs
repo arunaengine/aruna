@@ -686,9 +686,13 @@ impl MetadataHandle {
     pub async fn request_staging_spec(
         &self,
         node_id: NodeId,
+        transfer_id: Ulid,
         job_id: aruna_core::structs::execution::job::JobId,
-    ) -> Result<aruna_core::structs::execution::job::StagingJobSpec, MetadataReadError> {
-        let request = MetadataTransportMessage::StagingSpec { job_id };
+    ) -> Result<crate::distribution::imports::HandedImport, MetadataReadError> {
+        let request = MetadataTransportMessage::StagingSpec {
+            transfer_id,
+            job_id,
+        };
         match send_remote_request(&self.inner, &Span::current(), node_id, request)
             .await
             .map_err(|_| MetadataReadError::Unavailable)?

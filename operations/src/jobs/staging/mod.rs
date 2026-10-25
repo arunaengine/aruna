@@ -193,6 +193,56 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
     }
 }
 
+/// Where a job a range's new coordinator takes over goes on: the former job's position without
+/// its counters, errors or directory queue. A flat walk keeps its listing cursor; a manifest read
+/// or a directory walk, whose queue stays behind, starts its prefix again.
+pub(crate) fn handed_checkpoint(
+    spec: &StagingJobSpec,
+    at: &StagingJobCheckpoint,
+) -> StagingJobCheckpoint {
+    let mut next = initial_checkpoint(spec);
+    next.flat = at.flat;
+    next.items_done = at.items_done;
+    let queued = at.queue_head < at.queue_tail;
+    let open = at.walk.is_some() || at.manifest.is_some() || queued;
+    let flat_walk = at.flat == Some(true)
+        && at.manifest.is_none()
+        && !queued
+        && at
+            .walk
+            .as_ref()
+            .is_some_and(|walk| walk.queue_row.is_none());
+    match flat_walk {
+        true => {
+            next.prefixes_done = at.prefixes_done;
+            next.walk = at.walk.clone();
+        }
+        false => next.prefixes_done = at.prefixes_done.saturating_sub(u64::from(open)),
+    }
+    next
+}
+
+/// Stores the checkpoint a job submitted as `job_id` starts from, before it can run.
+pub(crate) async fn seed_checkpoint(
+    context: &crate::driver::DriverContext,
+    job_id: JobId,
+    checkpoint: &StagingJobCheckpoint,
+) -> Result<(), String> {
+    let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
+    let write = aruna_core::effects::StorageEffect::Write {
+        key_space: STAGING_STATE_KEYSPACE.to_string(),
+        key: staging_checkpoint_key(job_id),
+        value: ByteView::from(value),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(write).await {
+        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::WriteResult {
+            ..
+        }) => Ok(()),
+        other => Err(format!("staging checkpoint not seeded: {other:?}")),
+    }
+}
+
 pub(super) async fn stage_item(
     ctx: &JobContext,
     spec: &StagingJobSpec,
@@ -439,6 +489,46 @@ mod pure_tests {
             }],
             checksum_manifest: None,
         }
+    }
+
+    // A handed-over job keeps a flat walk's position and restarts a prefix whose directory
+    // queue stayed with the former coordinator; counters start at zero.
+    #[test]
+    fn handed_job_resumes() {
+        use aruna_core::structs::execution::job::StagingWalk;
+        let spec = test_spec();
+        let walk = StagingWalk {
+            source_path: "refseq/".to_string(),
+            target_prefix: String::new(),
+            cursor: None,
+            queue_row: None,
+            from: Some("refseq/k".to_string()),
+        };
+        let mut at = initial_checkpoint(&spec);
+        at.flat = Some(true);
+        at.items_done = 3;
+        at.prefixes_done = 1;
+        at.walk = Some(walk.clone());
+        at.items_succeeded = 40;
+        record_failure(&mut at, "a", "b", "denied".to_string());
+        let flat = handed_checkpoint(&spec, &at);
+        assert_eq!((flat.items_done, flat.prefixes_done), (3, 1));
+        assert_eq!(flat.walk, Some(walk.clone()));
+        assert_eq!((flat.items_succeeded, flat.items_failed), (0, 0));
+        assert!(flat.errors.is_empty());
+        let mut queued = at.clone();
+        queued.flat = Some(false);
+        queued.queue_tail = 2;
+        queued.walk = Some(StagingWalk {
+            queue_row: Some(0),
+            ..walk
+        });
+        let restarted = handed_checkpoint(&spec, &queued);
+        assert_eq!((restarted.prefixes_done, restarted.walk), (0, None));
+        assert_eq!((restarted.queue_head, restarted.queue_tail), (0, 0));
+        let mut finished = at;
+        finished.walk = None;
+        assert_eq!(handed_checkpoint(&spec, &finished).prefixes_done, 1);
     }
 
     #[test]

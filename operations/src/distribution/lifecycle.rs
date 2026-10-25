@@ -36,7 +36,7 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::create::submit;
-use super::imports::{keep_imports, open_imports};
+use super::imports::{fetch_imports, keep_resume, open_imports};
 use super::purge::{
     PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, has_uploads,
     purge_range, purge_rest, read,
@@ -466,6 +466,13 @@ impl SetWork {
             since_ms: unix_timestamp_millis(),
             uploads_open: true,
         };
+        // Where each open import stands is kept before the fence, for the new coordinator.
+        if self
+            .unfenced(context, range.range_id, open.transfer_id)
+            .await?
+        {
+            keep_resume(context, &snapshot.config.bucket, open.transfer_id).await?;
+        }
         // The byte copies the range has now; this node's copy goes only once it has them again.
         let copies = snapshot.byte_holders(range, None).len();
         let copies = u32::try_from(copies).unwrap_or(u32::MAX);
@@ -537,6 +544,20 @@ impl SetWork {
         Ok(Left::Waiting)
     }
 
+    /// Whether this node has not fenced `range_id` for `transfer_id` yet.
+    async fn unfenced(
+        &self,
+        context: &DriverContext,
+        range_id: Ulid,
+        transfer_id: Ulid,
+    ) -> Result<bool, String> {
+        let key = LocalFence::key(self.set_id);
+        let stored = read(context, DISTRIBUTION_FENCE_KEYSPACE, key).await?;
+        let fence = LocalFence::decode(stored.as_deref()).map_err(|error| error.to_string())?;
+        let fenced = fence.range(range_id);
+        Ok(fenced.is_none_or(|fenced| fenced.transfer_id != transfer_id))
+    }
+
     /// The new coordinator's side: complete once its copy reached the fenced watermark and
     /// every source root it holds references of is checked.
     async fn take_over(
@@ -579,15 +600,18 @@ impl SetWork {
         if !roots_checked(context, self.set_id, group_id, open.transfer_id).await? {
             return Ok(Left::Waiting);
         }
-        // The former coordinator's open imports are kept to run once this node coordinates.
+        // The former coordinator's open imports are fetched now, while it still holds them,
+        // and run once this node coordinates.
         if let Some(imports) = imports {
             let jobs: Vec<JobId> = postcard::from_bytes(&imports).map_err(|e| e.to_string())?;
-            let range = (self.set_id, open.range_id);
+            let range = (self.set_id, open.range_id, open.transfer_id);
             let from = (snapshot.config.members.iter()).find(|m| m.member_id == open.from);
             let Some(from) = from.map(|member| member.node_id) else {
                 return Ok(Left::Waiting);
             };
-            keep_imports(context, range, from, &jobs).await?;
+            if !fetch_imports(context, range, from, &jobs).await? {
+                return Ok(Left::Waiting);
+            }
         }
         let kind = StatementKind::TransferComplete {
             transfer_id: open.transfer_id,

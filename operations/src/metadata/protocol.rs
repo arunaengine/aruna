@@ -593,12 +593,13 @@ pub enum MetadataTransportMessage {
     SetPreviewResults {
         result: Result<Box<crate::metadata::api::SetPreviewPage>, MetadataReadError>,
     },
-    /// The spec of a staging job the former coordinator of a range hands over.
+    /// A staging job the former coordinator of a range hands over in transfer `transfer_id`.
     StagingSpec {
+        transfer_id: Ulid,
         job_id: aruna_core::structs::execution::job::JobId,
     },
     StagingSpecResult {
-        result: Result<Box<aruna_core::structs::execution::job::StagingJobSpec>, MetadataReadError>,
+        result: Result<Box<crate::distribution::imports::HandedImport>, MetadataReadError>,
     },
 }
 
