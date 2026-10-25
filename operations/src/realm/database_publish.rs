@@ -245,8 +245,8 @@ impl PublishDatabaseOperation {
             .unwrap_or_else(|| AdminDocumentState::new(target));
         let operation = self.operation(&state, &document)?;
         let admin_event = state.apply_operation(&self.config.actor, operation)?;
+        validate_databases(&state.database_entries())?;
         document.databases = state.materialized_databases();
-        validate_databases(&document.databases)?;
 
         let stale = stale_conflict_deletes(previous.as_ref(), Some(&state));
         let document_target = self.document_target();
