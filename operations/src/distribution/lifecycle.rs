@@ -486,7 +486,7 @@ impl SetWork {
         }
         // Every source root of what it applied must be readable here before it takes over.
         let group_id = snapshot.config.owner_group;
-        if !roots_checked(context, self.set_id, group_id).await? {
+        if !roots_checked(context, self.set_id, group_id, open.transfer_id).await? {
             return Ok(Left::Waiting);
         }
         let kind = StatementKind::TransferComplete {

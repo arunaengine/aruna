@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::errors::ConversionError;
+use crate::repository::invenio::{REFERENCE_FILE, REFERENCE_RECORD};
 use crate::structs::execution::source_connector::SourceConnectorKind;
 use crate::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
@@ -18,6 +19,8 @@ use crate::structs::execution::staging::{
 const ROOT_DOMAIN: &[u8] = b"aruna-source-root-v1";
 /// Follows a root's row key in the row that marks the root checked.
 const CHECKED_TAG: u8 = 0x01;
+/// Public configuration that names one object rather than its source, kept out of the root.
+const OBJECT_KEYS: [&str; 2] = [REFERENCE_RECORD, REFERENCE_FILE];
 
 /// One source root: the connector kind, its public configuration and the login namespace.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -41,6 +44,8 @@ impl SourceRoot {
 pub struct RootEntry {
     pub root: SourceRoot,
     pub probe_path: String,
+    /// The object's own configuration the probe needs, such as an Invenio record and file.
+    pub probe_config: BTreeMap<String, String>,
 }
 
 impl RootEntry {
@@ -54,13 +59,17 @@ impl RootEntry {
             return None;
         }
         let config = descriptor.public_config.iter();
+        let (object, public_config): (BTreeMap<_, _>, _) = config
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .partition(|(key, _)| OBJECT_KEYS.contains(&key.as_str()));
         Some(Self {
             root: SourceRoot {
                 kind: descriptor.kind,
-                public_config: config.map(|(k, v)| (k.clone(), v.clone())).collect(),
+                public_config,
                 namespace: descriptor.namespace.clone(),
             },
             probe_path: descriptor.source_path.clone(),
+            probe_config: object,
         })
     }
 
@@ -72,7 +81,10 @@ impl RootEntry {
             strategy: StagingStrategy::Reference,
             descriptor: PortableSourceDescriptor {
                 kind: root.kind,
-                public_config: root.public_config.clone().into_iter().collect(),
+                public_config: (root.public_config.iter())
+                    .chain(&self.probe_config)
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
                 source_path: self.probe_path.clone(),
                 version_selector: None,
                 capabilities: Vec::new(),
@@ -155,6 +167,26 @@ mod tests {
         assert_eq!(probe.descriptor.source_path, "a/1.fa");
         let encoded = first.to_bytes().unwrap();
         assert_eq!(RootEntry::from_bytes(&encoded).unwrap(), first);
+    }
+
+    #[test]
+    fn records_share_root() {
+        // Invenio references of one endpoint share a root; the probe still names its file.
+        let mut first = source(SourceConnectorKind::Invenio, "content");
+        let config = &mut first.descriptor.public_config;
+        config.insert(REFERENCE_RECORD.to_string(), "1".to_string());
+        config.insert(REFERENCE_FILE.to_string(), "a.fa".to_string());
+        let mut second = first.clone();
+        let config = &mut second.descriptor.public_config;
+        config.insert(REFERENCE_RECORD.to_string(), "2".to_string());
+        let (first, second) = (
+            RootEntry::of(&first).unwrap(),
+            RootEntry::of(&second).unwrap(),
+        );
+        assert_eq!(first.root.digest().unwrap(), second.root.digest().unwrap());
+        let probe = second.probe().descriptor.public_config;
+        assert_eq!(probe.get(REFERENCE_RECORD).map(String::as_str), Some("2"));
+        assert_eq!(probe.get("bucket").map(String::as_str), Some("bakrep-1"));
     }
 
     #[test]

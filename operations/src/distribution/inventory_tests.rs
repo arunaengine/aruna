@@ -111,6 +111,7 @@ async fn reference_records_its_root() {
             namespace: None,
         },
         probe_path: "a.fa".to_string(),
+        probe_config: BTreeMap::new(),
     };
     let mut update = put("a", 1, 1, 10);
     update.change.root = Some(entry.clone());
