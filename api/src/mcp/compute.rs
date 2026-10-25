@@ -551,6 +551,8 @@ impl McpServer {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("run_script", &input)?;
         let plan = plan_script(input)?;
+        let bearer = request_bearer(&parts);
+        let relay = (&parts.headers, bearer.as_ref());
         write_text(
             self,
             &auth,
@@ -566,6 +568,7 @@ impl McpServer {
                 content_type: Some(plan.script_type),
             },
             extras.clone(),
+            relay,
         )
         .await?;
         if let Some((key, text)) = plan.dependency {
@@ -585,6 +588,7 @@ impl McpServer {
                     content_type: Some("application/json".to_string()),
                 },
                 extras.clone(),
+                relay,
             )
             .await?;
         }
@@ -962,7 +966,7 @@ async fn accepted_payload(
     )))
 }
 
-fn request_bearer(parts: &http::request::Parts) -> Option<crate::auth::ValidatedBearer> {
+pub(super) fn request_bearer(parts: &http::request::Parts) -> Option<crate::auth::ValidatedBearer> {
     parts
         .extensions
         .get::<Option<crate::auth::ValidatedBearer>>()

@@ -1208,7 +1208,9 @@ operation.
 - A materialized object needs a verified local copy of its bytes on a destination the new references
   admit: without one the outcome is `blocked` with a reason and nothing was written, and compliant
   bytes have to be staged and registered first.
-- A reference-only head mints a successor and registers no copy."#,
+- A reference-only head mints a successor and registers no copy.
+- In a distributed bucket the coordinator of the key's range mints the successor: another member
+  relays the request there with the caller's bearer token."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
     request_body(content = ObjectPlacementRequest, example = json!({
         "key": "raw/sample.fastq",
@@ -1246,6 +1248,8 @@ operation.
 pub async fn mint_object_placement(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
     Path(bucket): Path<String>,
     Json(request): Json<ObjectPlacementRequest>,
 ) -> ServerResult<Json<ObjectPlacementResponse>> {
@@ -1253,6 +1257,19 @@ pub async fn mint_object_placement(
     ensure_placement_writer(&state, &auth, &bucket).await?;
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
+    // In a distributed bucket the coordinator of the key's range mints the successor.
+    let forward = crate::routes::storage::relay::rest_target(&state, &info, &request.key, &headers);
+    if let Some(forward) = forward.await? {
+        let path = format!("/data/buckets/{bucket}/placement/objects");
+        let relayed = crate::routes::storage::relay::relay_json(
+            &state,
+            &forward,
+            &path,
+            bearer.as_ref(),
+            &request,
+        );
+        return Ok(Json(relayed.await?.1));
+    }
     let subject = local_subject(&state, auth.realm_id).await?;
     let mutation_id =
         Ulid::from_string(&request.mutation_id).map_err(|_| ServerError::BadRequest)?;

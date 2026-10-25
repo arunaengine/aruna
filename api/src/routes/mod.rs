@@ -73,6 +73,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::imports::router())
         .merge(storage::discovery::router())
         .merge(storage::distributed::router())
+        .merge(storage::text::router())
         .merge(storage::organize::router())
         .merge(storage::routing::router())
         .merge(sync::router())
@@ -440,6 +441,7 @@ pub(crate) mod tests {
         ("POST", "/data/sync/quarantine/{record_id}/acknowledge"),
         ("POST", "/data/blobs/replicate"),
         ("POST", "/data/buckets/{bucket}/placement/objects"),
+        ("POST", "/data/buckets/{bucket}/objects/text"),
         ("POST", "/data/buckets/{bucket}/placement/runs"),
         ("POST", "/data/sync/relationships"),
         ("POST", "/data/sync/relationships/{id}/run"),

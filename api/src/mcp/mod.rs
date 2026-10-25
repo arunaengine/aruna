@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 mod compute;
 mod context;
-mod data;
+pub(crate) mod data;
 mod metadata;
 mod prompts;
 mod resources;

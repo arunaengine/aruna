@@ -97,18 +97,22 @@ fn get_error_categories() {
 #[test]
 fn put_error_categories() {
     assert_eq!(
-        body(map_put_error(PutObjectError::MissingBody))["code"],
+        body(server_error(put_server_error(PutObjectError::MissingBody)))["code"],
         "Bad request"
     );
     assert_eq!(
-        body(map_put_error(PutObjectError::QuotaExceeded {
-            limit: 10,
-            usage: 20
-        }))["code"],
+        body(server_error(put_server_error(
+            PutObjectError::QuotaExceeded {
+                limit: 10,
+                usage: 20
+            }
+        )))["code"],
         "Conflict"
     );
     assert_eq!(
-        body(map_put_error(PutObjectError::PutObjectFailed))["code"],
+        body(server_error(put_server_error(
+            PutObjectError::PutObjectFailed
+        )))["code"],
         "Internal error"
     );
 }

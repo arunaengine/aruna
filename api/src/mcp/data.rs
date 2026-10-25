@@ -2,11 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::compute::request_bearer;
 use super::context::member_groups;
 use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     request_auth, server_error, tool_extras,
 };
+use crate::routes::storage::relay::{relay_json, rest_target};
+use crate::server::state::ServerState;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -40,6 +43,7 @@ use rmcp::model::CallToolResult;
 use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// Upper bound on one aggregation's scan, so a huge bucket answers partially
@@ -250,7 +254,7 @@ pub struct WriteObjectInput {
     pub content_type: Option<String>,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct WriteObjectOutput {
     pub bucket: String,
     pub key: String,
@@ -690,7 +694,9 @@ impl McpServer {
     ) -> Result<Json<WriteObjectOutput>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("write_object", &input)?;
-        Ok(Json(write_text(self, &auth, input, extras).await?))
+        let bearer = request_bearer(&parts);
+        let relay = (&parts.headers, bearer.as_ref());
+        Ok(Json(write_text(self, &auth, input, extras, relay).await?))
     }
 
     #[tool(
@@ -966,6 +972,7 @@ pub(crate) async fn write_text(
     auth: &AuthContext,
     input: WriteObjectInput,
     extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    (headers, bearer): (&http::HeaderMap, Option<&crate::auth::ValidatedBearer>),
 ) -> Result<WriteObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
     let size = input.text.len();
@@ -996,35 +1003,71 @@ pub(crate) async fn write_text(
     )
     .await
     .map_err(|error| object_error(error, "write"))?;
+    // In a distributed bucket the coordinator of the key's range writes it.
+    let forward = rest_target(&server.state, &bucket_info, &input.key, headers)
+        .await
+        .map_err(server_error)?;
+    if let Some(forward) = forward {
+        let path = format!("/data/buckets/{}/objects/text", input.bucket);
+        let body = TextObjectRequest {
+            key: input.key,
+            text: input.text,
+            content_type: input.content_type,
+        };
+        let (_, answer) = relay_json(&server.state, &forward, &path, bearer, &body)
+            .await
+            .map_err(server_error)?;
+        return Ok(answer);
+    }
+    store_text(&server.state, auth, &bucket_info, input)
+        .await
+        .map_err(server_error)
+}
+
+/// The body of a relayed text write.
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct TextObjectRequest {
+    pub key: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+/// Stores a checked text write on this node as one new version of its key.
+pub(crate) async fn store_text(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+    bucket_info: &BucketInfo,
+    input: WriteObjectInput,
+) -> Result<WriteObjectOutput, crate::error::ServerError> {
+    use crate::error::ServerError;
+    let internal = |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string());
+    let size = input.text.len();
     let content_type = input
         .content_type
         .clone()
         .unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
     let realm = drive(
-        GetConfigOperation::new(server.state.get_realm_id()),
-        &server.state.get_ctx(),
+        GetConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(|error| internal(&error))?;
     let quota_ceiling = realm.quota.effective_group_ceiling(&bucket_info.group_id);
-    let routing = bucket_snapshot(&server.state.get_ctx(), &bucket_info)
+    let routing = bucket_snapshot(&state.get_ctx(), bucket_info)
         .await
-        .map_err(internal_error)?;
-    let gate = gate_context(
-        &server.state.get_ctx(),
-        server.state.get_realm_id(),
-        now_ms(),
-    )
-    .await
-    .map_err(internal_error)?;
+        .map_err(|error| internal(&error))?;
+    let gate = gate_context(&state.get_ctx(), state.get_realm_id(), now_ms())
+        .await
+        .map_err(|error| internal(&error))?;
     let body = BackendStream::new(stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(
         input.text.into_bytes(),
     ))]));
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: auth.user_id,
         group_id: bucket_info.group_id,
-        realm_id: server.state.get_realm_id(),
-        node_id: server.state.get_node_id(),
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
         request: PutObjectInput {
             bucket: input.bucket.clone(),
             key: input.key.clone(),
@@ -1039,7 +1082,7 @@ pub(crate) async fn write_text(
         quota_ceiling,
         routing,
     })
-    .with_rocrate_limits(server.state.rocrate_limits().clone())
+    .with_rocrate_limits(state.rocrate_limits().clone())
     .with_metadata(HashMap::from([(
         CONTENT_TYPE_KEY.to_string(),
         content_type.clone(),
@@ -1048,13 +1091,13 @@ pub(crate) async fn write_text(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
-    let result = drive(operation, &server.state.get_ctx())
+    let result = drive(operation, &state.get_ctx())
         .await
-        .map_err(map_put_error)?;
+        .map_err(put_server_error)?;
     complete_put(
-        &server.state.get_ctx(),
-        server.state.get_realm_id(),
-        server.state.get_node_id(),
+        &state.get_ctx(),
+        state.get_realm_id(),
+        state.get_node_id(),
         auth.clone(),
         bucket_info.group_id,
         input.bucket.clone(),
@@ -1248,45 +1291,56 @@ fn map_head_error(error: HeadObjectError) -> CallToolResult {
     }
 }
 
-fn map_put_error(error: PutObjectError) -> CallToolResult {
+fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
+    use crate::error::ServerError;
     match error {
         error @ (PutObjectError::MissingBody
         | PutObjectError::IncompleteBody
         | PutObjectError::MissingExpectedChecksum(_)
         | PutObjectError::ChecksumMismatch(_)
-        | PutObjectError::Unmapped) => bad_request(error),
-        error @ PutObjectError::QuotaExceeded { .. } => {
-            server_error(crate::error::ServerError::Conflict(error.to_string()))
-        }
-        PutObjectError::StorageError(error) => internal_error(error),
-        PutObjectError::InvalidOperationState => internal_error("invalid object write state"),
-        PutObjectError::NoTransactionFound => internal_error("object write transaction is missing"),
-        PutObjectError::MissingOutput => internal_error("object write output is missing"),
-        PutObjectError::MissingHash(hash) => {
-            internal_error(format!("object hash is missing: {hash}"))
-        }
-        PutObjectError::WriteFailed(error) => internal_error(error),
-        PutObjectError::BlobWriteFailed(error) => internal_error(error),
-        PutObjectError::InvalidPreassignedVersion => internal_error("invalid object version"),
-        PutObjectError::ObjectExists => internal_error("object already exists"),
-        PutObjectError::ConversionError(error) => internal_error(error),
-        PutObjectError::UsageUpdateError(error) => internal_error(error),
-        PutObjectError::QuotaGateError(error) => internal_error(error),
-        PutObjectError::RoutingFailed(error) => internal_error(error),
-        PutObjectError::BackendFenceError(error) => internal_error(error),
-        PutObjectError::ManagedCopyError(error) => internal_error(error),
-        PutObjectError::PolicyError(error) => internal_error(error),
-        PutObjectError::PolicyGate(error) => internal_error(error),
-        PutObjectError::PurgeFence(error) => internal_error(error),
+        | PutObjectError::Unmapped) => ServerError::BadRequestReason(error.to_string()),
+        error @ PutObjectError::QuotaExceeded { .. } => ServerError::Conflict(error.to_string()),
         PutObjectError::Distribution(error) => {
-            server_error(crate::routes::storage::distributed::map_guard_error(error))
+            crate::routes::storage::distributed::map_guard_error(error)
         }
-        PutObjectError::PutObjectFailed => internal_error("object write failed"),
-        error @ (PutObjectError::HeadChanged
+        PutObjectError::InvalidOperationState => {
+            ServerError::InternalError("invalid object write state".to_string())
+        }
+        PutObjectError::NoTransactionFound => {
+            ServerError::InternalError("object write transaction is missing".to_string())
+        }
+        PutObjectError::MissingOutput => {
+            ServerError::InternalError("object write output is missing".to_string())
+        }
+        PutObjectError::MissingHash(hash) => {
+            ServerError::InternalError(format!("object hash is missing: {hash}"))
+        }
+        PutObjectError::InvalidPreassignedVersion => {
+            ServerError::InternalError("invalid object version".to_string())
+        }
+        PutObjectError::ObjectExists => {
+            ServerError::InternalError("object already exists".to_string())
+        }
+        PutObjectError::PutObjectFailed => {
+            ServerError::InternalError("object write failed".to_string())
+        }
+        error @ (PutObjectError::StorageError(_)
+        | PutObjectError::WriteFailed(_)
+        | PutObjectError::BlobWriteFailed(_)
+        | PutObjectError::ConversionError(_)
+        | PutObjectError::UsageUpdateError(_)
+        | PutObjectError::QuotaGateError(_)
+        | PutObjectError::RoutingFailed(_)
+        | PutObjectError::BackendFenceError(_)
+        | PutObjectError::ManagedCopyError(_)
+        | PutObjectError::PolicyError(_)
+        | PutObjectError::PolicyGate(_)
+        | PutObjectError::PurgeFence(_)
+        | PutObjectError::HeadChanged
         | PutObjectError::ImportRemoved
         | PutObjectError::VersionExists
         | PutObjectError::HistoryDeleted
-        | PutObjectError::FenceTaken) => internal_error(error),
+        | PutObjectError::FenceTaken) => ServerError::InternalError(error.to_string()),
     }
 }
 
