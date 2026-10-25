@@ -441,27 +441,10 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
         TestContextSetup::Single {
             max_bucket_size,
             timeouts,
-        } => {
-            let blob_root = format!("{temp_root}/blobstore");
-            std::fs::create_dir_all(&blob_root).unwrap();
-            let mut backends = std::collections::BTreeMap::new();
-            backends.insert(
-                BackendRef::DEFAULT_NODE_NAME.to_string(),
-                Arc::new(NodeBackend::new(
-                    BackendConfig {
-                        backend_type: Backend::FileSystem,
-                        root: blob_root,
-                        service_config: HashMap::new(),
-                        bucket_prefix: Some("aruna-test-".to_string()),
-                        max_bucket_size: Some(*max_bucket_size),
-                        multipart_bucket: Some("uploaded-parts".to_string()),
-                        timeouts: *timeouts,
-                    },
-                    None,
-                )),
-            );
-            (backends, EgressPolicy::strict())
-        }
+        } => (
+            single_backend(&temp_root, *max_bucket_size, *timeouts),
+            EgressPolicy::strict(),
+        ),
         TestContextSetup::TwoFilesystem | TestContextSetup::S3Mixed(_) => {
             let mut backends = std::collections::BTreeMap::new();
             backends.insert(
@@ -509,6 +492,33 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
         blob_handle,
         storage_handle,
     }
+}
+
+/// The one filesystem backend of a `Single` test context, below `temp_root`.
+fn single_backend(
+    temp_root: &str,
+    max_bucket_size: u64,
+    timeouts: BlobTimeoutConfig,
+) -> std::collections::BTreeMap<String, Arc<NodeBackend>> {
+    let blob_root = format!("{temp_root}/blobstore");
+    std::fs::create_dir_all(&blob_root).unwrap();
+    let mut backends = std::collections::BTreeMap::new();
+    backends.insert(
+        BackendRef::DEFAULT_NODE_NAME.to_string(),
+        Arc::new(NodeBackend::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                root: blob_root,
+                service_config: HashMap::new(),
+                bucket_prefix: Some("aruna-test-".to_string()),
+                max_bucket_size: Some(max_bucket_size),
+                multipart_bucket: Some("uploaded-parts".to_string()),
+                timeouts,
+            },
+            None,
+        )),
+    );
+    backends
 }
 
 async fn setup_blob_handle(max_bucket_size: u64) -> TestContext {
@@ -1231,6 +1241,59 @@ async fn full_bucket_unselectable() {
         0,
         "a full bucket leaves the free index in the reserving transaction"
     );
+}
+
+#[tokio::test]
+async fn backfills_free_index() {
+    // A bucket with room but no free index row, as from before the index, gains its row when
+    // the handler starts, so the next write fills it instead of opening a new bucket.
+    let context = setup_blob_handle(5).await;
+    let mut key = BackendRef::node_default().key_bytes();
+    key.push(0);
+    key.extend_from_slice(b"aruna-test-old");
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: BUCKET_STATS_DB.to_string(),
+            key: key.into(),
+            value: 1u64.to_le_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    let root = context._temp_dir.path().to_str().unwrap();
+    let backends = single_backend(root, 5, BlobTimeoutConfig::default());
+    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+    let storage = context.storage_handle.clone();
+    let net = NetHandle::new(NetConfig::default(), storage.clone())
+        .await
+        .unwrap();
+    let restarted =
+        BlobHandler::with_registry(registry, storage, net, EgressPolicy::strict(), None)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        keyspace_count(&context.storage_handle, BUCKET_FREE_INDEX).await,
+        1
+    );
+    let Event::Blob(BlobEvent::WriteFinished { location }) = restarted
+        .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
+            bucket: "bucket-a".to_string(),
+            key: "one.bin".to_string(),
+            created_by: test_user_id(),
+            blob: stream_from_bytes(b"one"),
+            size: None,
+        })
+        .await
+    else {
+        panic!("write failed")
+    };
+    assert_eq!(location.storage_bucket, "aruna-test-old");
 }
 
 #[tokio::test]

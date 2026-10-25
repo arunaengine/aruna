@@ -630,6 +630,9 @@ impl BlobHandler {
             spool_budget: Arc::new(Semaphore::new(SPOOL_BUDGET_MIB)),
         };
         blob_handler.ensure_multipart_bucket().await?;
+        if let Err(error) = blob_handler.backfill_free_index().await {
+            tracing::warn!(%error, "Could not add provider buckets to the free index");
+        }
         blob_handler.probe_all_backends().await;
         let status_handler = blob_handler.clone();
         let monitor_cancel = blob_handler.monitor_cancel.clone();

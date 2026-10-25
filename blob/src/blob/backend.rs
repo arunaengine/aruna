@@ -39,6 +39,8 @@ const STATS_BACKOFF_CAP: Duration = Duration::from_millis(50);
 // happens when another writer filled the bucket we picked.
 const BUCKET_RESERVE_ROUNDS: usize = 8;
 const ACTIVE_RESERVATION_LIMIT: usize = 4096;
+/// Bucket stats rows one page of the free index backfill reads.
+const BACKFILL_PAGE: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoadUpdate {
@@ -752,6 +754,79 @@ impl BlobHandler {
                 "unexpected storage event while writing bucket stats".to_string(),
             )),
         }
+    }
+
+    /// Adds the free index row of every provider bucket below its limit, as buckets from
+    /// before the index or from under a lower limit. Runs at startup before any write, so it
+    /// needs no transaction; rewriting an existing row changes nothing.
+    pub(super) async fn backfill_free_index(&self) -> Result<(), BlobError> {
+        for (name, entry) in self.registry.entries() {
+            if entry.config.max_bucket_size.is_none() || fixed_bucket(&entry.config)?.is_some() {
+                continue;
+            }
+            let backend = BackendRef::Node(name.clone());
+            let name_at = stats_prefix(&backend, None).len();
+            let prefix = stats_prefix(&backend, entry.config.bucket_prefix.as_deref());
+            let mut start = None;
+            loop {
+                let event = self
+                    .storage
+                    .send_effect(Effect::Storage(StorageEffect::Iter {
+                        key_space: BUCKET_STATS_DB.to_string(),
+                        prefix: Some(prefix.clone().into()),
+                        start: start.take().map(IterStart::After),
+                        limit: BACKFILL_PAGE,
+                        txn_id: None,
+                    }))
+                    .await;
+                let Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) = event
+                else {
+                    return Err(BlobError::ReadError(
+                        "unexpected storage event while reading bucket stats".to_string(),
+                    ));
+                };
+                let mut writes = Vec::new();
+                for (key, value) in &values {
+                    let bucket = key.as_ref().get(name_at..).unwrap_or_default().to_vec();
+                    let bucket = String::from_utf8(bucket).map_err(ConversionError::from)?;
+                    let load = value.as_ref().try_into().map_err(ConversionError::from)?;
+                    let load = u64::from_le_bytes(load);
+                    if self
+                        .indexed_limit(&backend, &bucket)
+                        .is_some_and(|limit| load < limit)
+                    {
+                        let key = free_key(&backend, load, &bucket).into();
+                        writes.push((
+                            BUCKET_FREE_INDEX.to_string(),
+                            key,
+                            ByteView::from(Vec::new()),
+                        ));
+                    }
+                }
+                if !writes.is_empty() {
+                    let event = self
+                        .storage
+                        .send_effect(Effect::Storage(StorageEffect::BatchWrite {
+                            writes,
+                            txn_id: None,
+                        }))
+                        .await;
+                    if !matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
+                        return Err(BlobError::WriteError(
+                            "failed to write the bucket free index".to_string(),
+                        ));
+                    }
+                }
+                match next_start_after {
+                    Some(key) => start = Some(key),
+                    None => break,
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn stats_managed(&self, backend: &BackendRef, bucket: &str) -> bool {
