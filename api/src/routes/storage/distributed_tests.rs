@@ -117,6 +117,7 @@ fn degraded_names_coordinator() {
             degraded: Some(Reach::Unreachable { since_ms: Some(77) }),
         }],
         recommended_grant: "/r/g/9/data/*/spire/**".to_string(),
+        lifecycle: Default::default(),
     };
     let response = status_response(status);
     assert!(response.configuration_changes_unavailable);

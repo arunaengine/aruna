@@ -10,6 +10,7 @@ use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement
 use crate::driver::DriverContext;
 
 pub mod admit;
+pub mod change;
 pub mod create;
 pub mod delegate;
 pub mod forward;

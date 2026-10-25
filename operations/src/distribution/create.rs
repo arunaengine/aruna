@@ -67,6 +67,9 @@ pub enum CreateError {
     Conflicted,
     #[error(transparent)]
     Status(#[from] StatusError),
+    /// An operation that needs an unreachable coordinator waits until it is reachable again.
+    #[error("{0}")]
+    Blocked(String),
 }
 
 /// One member after an admission attempt.
@@ -281,17 +284,29 @@ pub(crate) async fn submit(
 /// Activation is an admin request: the publisher checks the caller's group admin WRITE again.
 async fn activate(
     context: &Arc<DriverContext>,
-    (publisher, local): (NodeId, NodeId),
+    nodes: (NodeId, NodeId),
     set_id: Ulid,
     auth: &AuthContext,
     bearer: Option<AuthToken>,
 ) -> Result<(), PublishRefusal> {
-    let request_id = Ulid::generate();
     let request = DistributionRequest::Activate;
+    send_admin(context, nodes, set_id, (auth, bearer), request)
+        .await
+        .map(|_| ())
+}
+
+/// Sends an admin request to the set's publisher: accepted here when this node publishes,
+/// otherwise forwarded with the caller's bearer token, which the publisher checks again.
+pub(crate) async fn send_admin(
+    context: &Arc<DriverContext>,
+    (publisher, local): (NodeId, NodeId),
+    set_id: Ulid,
+    (auth, bearer): (&AuthContext, Option<AuthToken>),
+    request: DistributionRequest,
+) -> Result<DistributionRevision, PublishRefusal> {
+    let request_id = Ulid::generate();
     if publisher == local {
-        return publish_local(context, set_id, request_id, request, Some(auth.clone()))
-            .await
-            .map(|_| ());
+        return publish_local(context, set_id, request_id, request, Some(auth.clone())).await;
     }
     let auth_token = bearer.ok_or(PublishRefusal::Unauthorized)?;
     let message = MetadataTransportMessage::ForwardDistributionRequest {
@@ -300,9 +315,7 @@ async fn activate(
         request_id,
         request: Box::new(request),
     };
-    publish_remote(context, publisher, message)
-        .await
-        .map(|_| ())
+    publish_remote(context, publisher, message).await
 }
 
 /// Sends one request to the set's publisher; an unreachable publisher means configuration

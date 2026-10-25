@@ -385,6 +385,7 @@ pub(crate) fn map_create_error(error: CreateError) -> ServerError {
         CreateError::UnknownSet(_) => ServerError::NotFound,
         CreateError::Conflicted => ServerError::Conflict(error.to_string()),
         CreateError::Status(error) => ServerError::InternalError(error.to_string()),
+        CreateError::Blocked(message) => ServerError::ServiceUnavailableReason(message),
     }
 }
 

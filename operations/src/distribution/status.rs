@@ -11,10 +11,12 @@ use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+use aruna_core::keyspaces::{DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionRevision, DistributionView, MemberState, MetadataCoverage, SetPhase,
+    DataStrategy, DistributionRevision, DistributionSnapshot, DistributionView, MemberState,
+    MetadataCoverage, SetPhase, TransferRole,
 };
 use aruna_core::types::GroupId;
 use thiserror::Error;
@@ -87,6 +89,41 @@ pub struct DistributionStatus {
     /// The grant that covers the bucket on every member node, so reads that pull from another
     /// member pass that member's own check.
     pub recommended_grant: String,
+    pub lifecycle: LifecycleStatus,
+}
+
+/// Open transfers and deletion from the record, and this node's own fences.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LifecycleStatus {
+    pub transfers: Vec<TransferStatus>,
+    pub deletion: Option<DeletionStatus>,
+    /// Ranges this node fenced as their former coordinator; it never writes them again at the
+    /// fenced epoch, whatever reconnects.
+    pub fenced_ranges: Vec<Ulid>,
+    /// This node applies no incoming publication of the set: it leaves or the set is deleted.
+    pub publications_closed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferStatus {
+    pub transfer_id: Ulid,
+    pub range_id: Ulid,
+    pub from: Ulid,
+    pub to: Ulid,
+    /// The fresh epoch the new coordinator takes.
+    pub epoch: u64,
+    pub role: TransferRole,
+    /// The former coordinator fenced the range; writes to it fail until the activation.
+    pub fenced: bool,
+    pub completed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeletionStatus {
+    pub committed: bool,
+    pub fenced: Vec<Ulid>,
+    /// Coordinators that have not fenced their ranges yet; the commit waits for them.
+    pub waiting: Vec<Ulid>,
 }
 
 /// Builds the status from a record; `reach` tells which nodes this node hears from and
@@ -150,6 +187,39 @@ pub fn summarize(
         degraded: ranges.iter().any(|range| range.degraded.is_some()),
         members,
         ranges,
+        lifecycle: lifecycle(snapshot),
+    }
+}
+
+/// The record's open transfers and deletion; this node's fences are added by the reader.
+fn lifecycle(snapshot: &DistributionSnapshot) -> LifecycleStatus {
+    let transfers = (snapshot.lifecycle.transfers.iter())
+        .map(|open| TransferStatus {
+            transfer_id: open.transfer_id,
+            range_id: open.range_id,
+            from: open.from,
+            to: open.to,
+            epoch: open.epoch,
+            role: open.role,
+            fenced: open.fenced.is_some(),
+            completed: open.completed.is_some(),
+        })
+        .collect();
+    let deletion = snapshot
+        .lifecycle
+        .deletion
+        .as_ref()
+        .map(|deletion| DeletionStatus {
+            committed: deletion.committed,
+            fenced: deletion.fenced.clone(),
+            waiting: (snapshot.coordinators().into_iter())
+                .filter(|coordinator| !deletion.fenced.contains(coordinator))
+                .collect(),
+        });
+    LifecycleStatus {
+        transfers,
+        deletion,
+        ..LifecycleStatus::default()
     }
 }
 
@@ -168,6 +238,31 @@ pub fn heartbeat_reach(
         },
         None => Reach::Unreachable { since_ms: None },
     }
+}
+
+impl Reach {
+    /// The hint an unreachable node adds to a refusal: since when this node has not heard it.
+    pub fn hint(&self) -> String {
+        match self {
+            Self::Reachable => "reachable".to_string(),
+            Self::Unreachable { since_ms: Some(ms) } => {
+                format!("unreachable since its last heartbeat at {ms} ms Unix time")
+            }
+            Self::Unreachable { since_ms: None } => {
+                "unreachable; no heartbeat arrived since this node started".to_string()
+            }
+        }
+    }
+}
+
+/// Whether this node hears from `node_id` now, from its heartbeats.
+pub fn node_reach(context: &DriverContext, node_id: NodeId) -> Reach {
+    let net = context.net_handle.as_ref();
+    let heard = held_heartbeats(net)
+        .into_iter()
+        .map(|(node_id, held)| (node_id, (held.age_ms, held.received_at_ms)))
+        .collect();
+    heartbeat_reach(net.map(|net| net.node_id()), heard)(node_id)
 }
 
 /// This node's record of the set, if it holds one.
@@ -210,7 +305,20 @@ pub async fn read_status(
         .await
         .and_then(|config| config.sync_eligible_nodes().ok())
         .is_some_and(|nodes| nodes.contains(&publisher));
-    Ok(Some(summarize(realm_id, &view, reach, eligible)))
+    let mut status = summarize(realm_id, &view, reach, eligible);
+    let read = StorageEffect::Read {
+        key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+        key: LocalFence::key(set_id).into(),
+        txn_id: None,
+    };
+    if let Event::Storage(StorageEvent::ReadResult { value, .. }) =
+        context.storage_handle.send_storage_effect(read).await
+    {
+        let fence = LocalFence::decode(value.as_deref())?;
+        status.lifecycle.fenced_ranges = fence.ranges.iter().map(|f| f.range_id).collect();
+        status.lifecycle.publications_closed = !fence.receiving();
+    }
+    Ok(Some(status))
 }
 
 #[cfg(test)]
