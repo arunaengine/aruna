@@ -1911,6 +1911,8 @@ mod pure_tests {
         )
         .expect("the gate starts");
         mint.step(read(None), Some(txn_id))
+            .expect("no usage rebuild runs");
+        mint.step(read(None), Some(txn_id))
             .expect("the gate reads its own realm config");
         mint.step(read(None), Some(txn_id))
             .expect("the group holds no counters yet");
