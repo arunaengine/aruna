@@ -98,6 +98,7 @@ fn source_url_joins_public_parts() {
         ]),
         source_path: "/genomes/a.gbff".to_string(),
         version_selector: None,
+        namespace: None,
         capabilities: Vec::new(),
         origin_node_id: None,
     };
