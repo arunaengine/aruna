@@ -59,6 +59,11 @@ fn quota_exceeded_error(limit: u64, usage: u64) -> S3Error {
     error
 }
 
+/// A write for a group with a quota while this node rebuilds its usage counters: retryable.
+fn usage_rebuilding_error() -> S3Error {
+    s3_error!(SlowDown, "Usage counters are being rebuilt; retry later")
+}
+
 /// Response header that tells a locked bucket apart from other `AccessDenied` refusals.
 pub(crate) const LOCKED_HEADER: &str = "x-aruna-bucket-locked";
 
@@ -413,6 +418,7 @@ impl IntoS3Error for PutObjectError {
                 missing_checksum_error(algorithm, "PutObject")
             }
             PutObjectError::QuotaExceeded { limit, usage } => quota_exceeded_error(limit, usage),
+            PutObjectError::UsageRebuilding => usage_rebuilding_error(),
             PutObjectError::RoutingFailed(RoutingError::BackendFull(backend)) => {
                 backend_full_error(&backend.to_string())
             }
@@ -540,6 +546,7 @@ impl IntoS3Error for CompleteUploadError {
             CompleteUploadError::QuotaExceeded { limit, usage } => {
                 quota_exceeded_error(limit, usage)
             }
+            CompleteUploadError::UsageRebuilding => usage_rebuilding_error(),
             CompleteUploadError::PolicyGate(ref error) => {
                 policy_gate_error(error, "CompleteMultipartUpload")
             }

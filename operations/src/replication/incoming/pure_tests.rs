@@ -1734,6 +1734,11 @@ fn quota_excess_rejects() {
         [Effect::Storage(StorageEffect::Read { txn_id: read_txn_id, .. })]
             if *read_txn_id == Some(txn_id)
     ));
+    // No usage rebuild marker.
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0u8; 4].into(),
+        value: None,
+    }));
     op.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![0u8; 4].into(),
         value: Some(config_bytes.into()),

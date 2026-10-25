@@ -26,11 +26,11 @@ use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::{
     BucketCounters, BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, GLOBAL_SHARD_COUNT,
     NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY,
-    USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX, UsageCounterError, UsageCounters, UsageDelta,
-    dirty_group_id, dirty_group_key, global_group_key, global_shard_index, global_shard_key,
-    global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key, usage_bucket_key,
-    usage_global_key, usage_group_id, usage_group_key, usage_group_prefix, usage_node_id,
-    usage_snapshot_key, usage_summary_key,
+    USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX, USAGE_REBUILD_KEY, UsageCounterError, UsageCounters,
+    UsageDelta, dirty_group_id, dirty_group_key, global_group_key, global_shard_index,
+    global_shard_key, global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key,
+    usage_bucket_key, usage_global_key, usage_group_id, usage_group_key, usage_group_prefix,
+    usage_node_id, usage_snapshot_key, usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -403,6 +403,7 @@ impl UsageCounterUpdate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum QuotaGatePhase {
     Pending,
+    ReadMarker,
     ReadRealmConfig,
     ReadLocal,
     ScanRemote,
@@ -420,6 +421,7 @@ pub enum QuotaGateError {
 /// Embeddable read side of the hard per-group quota gate: sums the group's
 /// realm-wide `logical_bytes` inside the caller's write transaction, so a concurrent
 /// same-group write conflicts on the group key. `ceiling` already folds in grace.
+/// While a usage rebuild runs, the local counters are incomplete and every write is refused.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,
@@ -430,6 +432,7 @@ pub struct QuotaGate {
     realm_id: Option<RealmId>,
     active_node_ids: Option<HashSet<NodeId>>,
     usage: u64,
+    rebuilding: bool,
     phase: QuotaGatePhase,
 }
 
@@ -451,6 +454,7 @@ impl QuotaGate {
             realm_id: None,
             active_node_ids: None,
             usage: 0,
+            rebuilding: false,
             phase: QuotaGatePhase::Pending,
         }
     }
@@ -468,7 +472,14 @@ impl QuotaGate {
         }
     }
 
+    /// Reads the rebuild marker first, inside the write transaction, so a rebuild that begins
+    /// or finishes meanwhile makes the write conflict and retry.
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
+        self.phase = QuotaGatePhase::ReadMarker;
+        smallvec![rebuild_marker_read(Some(txn_id))]
+    }
+
+    fn read_config_effect(&mut self, txn_id: TxnId) -> Effects {
         if let Some(realm_id) = self.realm_id {
             self.phase = QuotaGatePhase::ReadRealmConfig;
             return smallvec![Effect::Storage(StorageEffect::Read {
@@ -503,6 +514,17 @@ impl QuotaGate {
     /// `Ok(None)` once the group's realm-wide usage has been summed.
     pub fn step(&mut self, event: Event, txn_id: TxnId) -> Result<Option<Effects>, QuotaGateError> {
         match (&self.phase, event) {
+            (
+                QuotaGatePhase::ReadMarker,
+                Event::Storage(StorageEvent::ReadResult { value, .. }),
+            ) => {
+                if value.is_some() {
+                    self.rebuilding = true;
+                    self.phase = QuotaGatePhase::Done;
+                    return Ok(None);
+                }
+                Ok(Some(self.read_config_effect(txn_id)))
+            }
             (
                 QuotaGatePhase::ReadRealmConfig,
                 Event::Storage(StorageEvent::ReadResult { value, .. }),
@@ -566,13 +588,42 @@ impl QuotaGate {
     }
 
     /// True when committing the pending write would push the group's realm-wide
-    /// `logical_bytes` past the ceiling. At-ceiling passes; one byte over fails.
+    /// `logical_bytes` past the ceiling, or while usage is being rebuilt. At-ceiling passes.
     pub fn is_exceeded(&self) -> bool {
-        self.projected_usage() > self.ceiling
+        self.rebuilding || self.projected_usage() > self.ceiling
+    }
+
+    /// True when the write is refused because usage counters are being rebuilt.
+    pub fn is_rebuilding(&self) -> bool {
+        self.rebuilding
     }
 
     pub fn ceiling(&self) -> u64 {
         self.ceiling
+    }
+}
+
+/// Reads the usage rebuild marker; a present row means the local counters are incomplete.
+pub fn rebuild_marker_read(txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: USAGE_STATS_KEYSPACE.to_string(),
+        key: Key::from(USAGE_REBUILD_KEY.to_vec()),
+        txn_id,
+    })
+}
+
+/// False while a usage rebuild runs: local usage counters must not count as free capacity
+/// and do not yet back quota decisions.
+pub async fn usage_complete(context: &DriverContext) -> Result<bool, StorageError> {
+    let Effect::Storage(read) = rebuild_marker_read(None) else {
+        return Err(StorageError::InvalidEffect);
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_none()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error),
+        other => Err(StorageError::ReadError(format!(
+            "unexpected answer {other:?}"
+        ))),
     }
 }
 

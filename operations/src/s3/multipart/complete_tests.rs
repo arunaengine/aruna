@@ -2095,6 +2095,10 @@ fn ceiling_covers_promotion() {
         }));
         assert!(matches!(operation.state, CompleteUploadState::EnforceQuota));
         operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"rebuild".to_vec().into(),
+            value: None,
+        }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
             key: b"realm".to_vec().into(),
             value: None,
         }));

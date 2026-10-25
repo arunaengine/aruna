@@ -228,6 +228,8 @@ pub enum PutObjectError {
     HistoryDeleted,
     #[error("a guarded row changed before the version committed")]
     FenceTaken,
+    #[error("usage counters are being rebuilt; retry later")]
+    UsageRebuilding,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1693,7 +1695,10 @@ impl PutObjectOperation {
         match gate.step(event, txn_id) {
             Ok(Some(effects)) => effects,
             Ok(None) => {
-                if gate.is_exceeded() {
+                if gate.is_rebuilding() {
+                    self.cleanup.set_error(PutObjectError::UsageRebuilding);
+                    self.reject_over_quota()
+                } else if gate.is_exceeded() {
                     self.cleanup.set_error(PutObjectError::QuotaExceeded {
                         limit: gate.ceiling(),
                         usage: gate.projected_usage(),

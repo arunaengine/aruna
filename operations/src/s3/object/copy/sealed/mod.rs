@@ -88,6 +88,8 @@ pub enum SealedCopyError {
     InvalidState,
     #[error("operation did not finish")]
     NotFinished,
+    #[error("usage counters are being rebuilt; retry later")]
+    UsageRebuilding,
 }
 
 /// One same-bucket copy of a sealed version, described by what HEAD returned for it.
@@ -775,6 +777,9 @@ impl SealedCopyOperation {
         let gate = self.quota.as_mut().ok_or(SealedCopyError::InvalidState)?;
         if let Some(effects) = gate.step(event, txn_id)? {
             return Ok(effects);
+        }
+        if gate.is_rebuilding() {
+            return Err(SealedCopyError::UsageRebuilding);
         }
         if gate.is_exceeded() {
             let (limit, usage) = (gate.ceiling(), gate.projected_usage());

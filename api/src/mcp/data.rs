@@ -1300,6 +1300,9 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
         | PutObjectError::ChecksumMismatch(_)
         | PutObjectError::Unmapped) => ServerError::BadRequestReason(error.to_string()),
         error @ PutObjectError::QuotaExceeded { .. } => ServerError::Conflict(error.to_string()),
+        error @ PutObjectError::UsageRebuilding => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
         PutObjectError::Distribution(error) => {
             crate::routes::storage::distributed::map_guard_error(error)
         }

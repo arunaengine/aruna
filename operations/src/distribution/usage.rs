@@ -17,6 +17,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::node::usage_stats::usage_complete;
 use crate::replication::members::bound_record;
 
 #[derive(Debug, Error, PartialEq)]
@@ -39,7 +40,8 @@ pub struct RangeUsage {
     pub ranges: usize,
     /// Ranges whose records this member holds and whose counters were summed.
     pub counted: usize,
-    /// Every range is held here and its counters are exact (active, not rebuilding).
+    /// Every range is held here and its counters are exact (active, not rebuilding, and no
+    /// node-wide usage rebuild is running).
     pub complete: bool,
 }
 
@@ -134,6 +136,8 @@ pub async fn range_usage(
         .collect();
     let counters = sum_rows(&batch_read(context, reads).await?)?;
     let ranges = snapshot.config.ranges.len();
+    // A node-wide usage rebuild also leaves range counters unconfirmed.
+    exact &= usage_complete(context).await?;
     Ok(Some(RangeUsage {
         counters,
         ranges,

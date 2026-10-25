@@ -8,6 +8,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
 use aruna_operations::distribution::usage::{RangeUsage, range_usage};
+use aruna_operations::node::usage_stats::usage_complete;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -41,7 +42,8 @@ pub struct BucketUsageResponse {
     pub logical_bytes: u64,
     /// Bytes reachable only through external references.
     pub referenced_bytes: u64,
-    /// False for a distributed bucket while a range is not held here or is being rebuilt.
+    /// False for a distributed bucket while a range is not held here or is being rebuilt, and
+    /// for any bucket while this node rebuilds its usage counters.
     pub complete: bool,
     /// Ranges of a distributed bucket; absent for an ordinary bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,7 +54,7 @@ pub struct BucketUsageResponse {
 }
 
 impl BucketUsageResponse {
-    fn new(bucket: String, counters: BucketCounters) -> Self {
+    fn new(bucket: String, counters: BucketCounters, complete: bool) -> Self {
         Self {
             bucket,
             objects: counters.objects,
@@ -61,7 +63,7 @@ impl BucketUsageResponse {
             open_multipart_uploads: counters.open_uploads,
             logical_bytes: counters.logical_bytes,
             referenced_bytes: counters.referenced_bytes,
-            complete: true,
+            complete,
             ranges: None,
             ranges_counted: None,
         }
@@ -108,7 +110,8 @@ objects.
   one read per range. `ranges` and `ranges_counted` say how many ranges the set has and how many
   were summed; `complete` is false while a range is held elsewhere or its counters are being
   rebuilt.
-- `complete` is always true for an ordinary bucket."#,
+- For an ordinary bucket `complete` is false only while this node rebuilds its usage counters
+  after a restart that found them missing or a rebuild interrupted; the numbers are then low."#,
     params(
         ("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")
     ),
@@ -158,7 +161,10 @@ pub async fn get_bucket_usage(
         Some(usage) => Ok(Json(BucketUsageResponse::of_ranges(bucket, usage))),
         None => {
             let counters = bucket_counters(&state, &bucket).await?;
-            Ok(Json(BucketUsageResponse::new(bucket, counters)))
+            let complete = usage_complete(&state.get_ctx())
+                .await
+                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+            Ok(Json(BucketUsageResponse::new(bucket, counters, complete)))
         }
     }
 }

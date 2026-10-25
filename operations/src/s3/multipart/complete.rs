@@ -241,6 +241,8 @@ pub enum CompleteUploadError {
     NotFinished,
     #[error(transparent)]
     BucketKey(#[from] BucketKeyError),
+    #[error("usage counters are being rebuilt; retry later")]
+    UsageRebuilding,
 }
 
 impl From<UploadTargetError> for CompleteUploadError {
@@ -2226,7 +2228,9 @@ impl CompleteUploadOperation {
         match gate.step(event, txn_id) {
             Ok(Some(effects)) => effects,
             Ok(None) => {
-                if gate.is_exceeded() {
+                if gate.is_rebuilding() {
+                    self.schedule_error(CompleteUploadError::UsageRebuilding)
+                } else if gate.is_exceeded() {
                     let limit = gate.ceiling();
                     let usage = gate.projected_usage();
                     // schedule_error resets the upload back to Open and cleans up

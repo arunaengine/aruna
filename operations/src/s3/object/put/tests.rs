@@ -2613,6 +2613,8 @@ mod sealed {
                     value: None,
                 })
             };
+            // The rebuild marker, the realm config and the local counter are absent.
+            op.step(empty());
             op.step(empty());
             op.step(empty());
             effects = op.step(Event::Storage(StorageEvent::IterResult {
@@ -2636,6 +2638,52 @@ mod sealed {
         assert!(refused(quota_charge(0, 3)));
         assert!(!refused(quota_charge(0, 2)));
         assert!(!refused(quota_charge(1, 1)));
+    }
+
+    /// While usage is rebuilt a write for a group with a quota is refused as retryable; a
+    /// group without a quota never reads the marker and books its usage.
+    #[test]
+    fn rebuild_refuses_quota() {
+        use aruna_core::structs::storage::usage::USAGE_REBUILD_KEY;
+        for ceiling in [Some(u64::MAX), None] {
+            let mut op = operation();
+            op.config.quota_ceiling = ceiling;
+            let mut location = test_location(op.config.user_id);
+            location.blob_size = 1;
+            location.hashes.insert(
+                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                vec![5; 32],
+            );
+            op.txn_id = Some(Ulid::generate());
+            op.output = Some(Ok(location));
+            op.state = PutObjectState::WriteReplicationObligation;
+            let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+                key: b"obligation".to_vec().into(),
+            }));
+            if ceiling.is_none() {
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::AddUsage { .. })]
+                ));
+                continue;
+            }
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Read { key, .. })] if key.as_ref() == USAGE_REBUILD_KEY
+            ));
+            let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+                key: USAGE_REBUILD_KEY.to_vec().into(),
+                value: Some(Vec::new().into()),
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            ));
+            assert_eq!(
+                op.cleanup.take_error(),
+                Some(PutObjectError::UsageRebuilding)
+            );
+        }
     }
 }
 
