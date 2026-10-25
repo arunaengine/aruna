@@ -1180,3 +1180,79 @@ pub(crate) mod received {
         );
     }
 }
+
+#[test]
+fn distributed_learns_identity() {
+    // A promoted version of a distributed bucket gains its identity in the version, its head
+    // and the inventory, where holders find it by content.
+    let mut operation = hashed_operation();
+    reread(&mut operation);
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(Vec::new()),
+    }));
+    let version = VersionKey::new("bucket", "key", Ulid::from_bytes([6; 16]));
+    let owner = CopyOwner::new(ArchiveKey::of(&sealed()), version.clone());
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: vec![(Key::from(owner.key().unwrap()), Value::from(Vec::new()))],
+        next_start_after: None,
+    }));
+    let pending = BlobVersion::pending(
+        ArchiveKey::of(&sealed()),
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+        None,
+    );
+    let row = Key::from(version.to_bytes().unwrap());
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(row, Some(Value::from(pending.to_bytes().unwrap())))],
+    }));
+    let info = BucketInfo {
+        group_id: Ulid::from_bytes([8; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Default::default(),
+        distribution: Some(
+            aruna_core::structs::storage::distribution::DistributionBinding {
+                set_id: Ulid::from_bytes([7; 16]),
+                member_id: Ulid::from_bytes([5; 16]),
+                incarnation: 1,
+                revision: Default::default(),
+            },
+        ),
+    };
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(
+            Key::from(b"bucket".to_vec()),
+            Some(Value::from(info.to_bytes().unwrap())),
+        )],
+    }));
+    let effects = operation.step(no_registrations());
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("one batch promotes the page")
+    };
+    let promoted = BlobVersion::from_bytes(&writes[0].2).unwrap();
+    assert_eq!(promoted.identity, Some(BLAKE3));
+    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    }));
+    let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+        panic!("the head of the promoted version is read")
+    };
+    assert_eq!(reads[0].0, BLOB_HEAD_KEYSPACE);
+    let head = CurrentVersionPointer::new_with_generation(version.version_id, 1);
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(reads[0].1.clone(), Some(head.to_bytes().unwrap().into()))],
+    }));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
+                if key_space == aruna_core::keyspaces::RANGE_INDEX_KEYSPACE
+        ),
+        "the inventory update starts: {effects:?}"
+    );
+}
