@@ -1160,4 +1160,157 @@ mod tests {
                 .all(|code| *code == S3ErrorCode::Custom("PlacementUnavailable".into()))
         );
     }
+
+    // Every refusal of a distributed bucket keeps a stable code, and only one a retry may
+    // clear is a 503: a wrong or moving coordinator, a missing record, a range just split.
+    #[test]
+    fn distributed_codes_stable() {
+        use aruna_operations::s3::multipart::create::CreateMultipartError;
+        let set_id = ulid::Ulid::from_bytes([5; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[6; 32]).public();
+        let retry = Some(http::StatusCode::SERVICE_UNAVAILABLE);
+        let conflict = Some(http::StatusCode::CONFLICT);
+        let guards = [
+            (
+                GuardError::NotCoordinator {
+                    set_id,
+                    range_id: set_id,
+                    node_id,
+                },
+                "WrongCoordinator",
+                retry,
+            ),
+            (
+                GuardError::RecordMissing(set_id),
+                "DistributedBucketUnavailable",
+                retry,
+            ),
+            (
+                GuardError::Unreadable("down".to_string()),
+                "DistributedBucketUnavailable",
+                retry,
+            ),
+            (
+                RouteError::Pending(set_id).into(),
+                "DistributedBucketUnavailable",
+                retry,
+            ),
+            (
+                RouteError::Moving(set_id).into(),
+                "DistributedBucketUnavailable",
+                retry,
+            ),
+            (
+                RouteError::StaleRange(set_id).into(),
+                "DistributedBucketUnavailable",
+                retry,
+            ),
+            (
+                RouteError::Deleting(set_id).into(),
+                "InvalidBucketState",
+                conflict,
+            ),
+            (
+                RouteError::NotMember(set_id).into(),
+                "InvalidBucketState",
+                conflict,
+            ),
+            (
+                RouteError::NoRange(set_id).into(),
+                "InvalidBucketState",
+                conflict,
+            ),
+            (GuardError::Unbound(set_id), "InvalidBucketState", conflict),
+        ];
+        for (guard, code, status) in guards {
+            let error = guard_error(&guard);
+            assert_eq!(*error.code(), S3ErrorCode::Custom(code.into()), "{guard}");
+            assert_eq!(error.status_code(), status, "{guard}");
+            assert_eq!(error.message(), Some(guard.to_string().as_str()));
+        }
+        let fenced = PurgeFenceError::Distribution(GuardError::RecordMissing(set_id));
+        let errors = [
+            PutObjectError::PurgeFence(fenced).into_s3_error(),
+            CreateMultipartError::Distribution(GuardError::Unbound(set_id)).into_s3_error(),
+            CompleteUploadError::Distribution(GuardError::Unbound(set_id)).into_s3_error(),
+            CopyObjectError::Reference(MaterializeReferenceError::Distribution(
+                GuardError::Unbound(set_id),
+            ))
+            .into_s3_error(),
+        ];
+        let codes: Vec<_> = errors.iter().map(|error| error.code().clone()).collect();
+        assert_eq!(
+            codes[0],
+            S3ErrorCode::Custom("DistributedBucketUnavailable".into())
+        );
+        assert!(
+            codes[1..]
+                .iter()
+                .all(|code| *code == S3ErrorCode::Custom("InvalidBucketState".into()))
+        );
+        let rebuilding = PutObjectError::UsageRebuilding.into_s3_error();
+        assert_eq!(*rebuilding.code(), S3ErrorCode::SlowDown);
+        let rebuilding = CompleteUploadError::UsageRebuilding.into_s3_error();
+        assert_eq!(*rebuilding.code(), S3ErrorCode::SlowDown);
+    }
+
+    // An inventory refusal is a retryable range state; any other usage fault is accounting.
+    #[test]
+    fn inventory_refusals_retry() {
+        let set_id = ulid::Ulid::from_bytes([7; 16]);
+        let retryable = [
+            InventoryError::RangeMissing {
+                set_id,
+                key: "a".to_string(),
+            },
+            InventoryError::RangeRetired(set_id),
+            InventoryError::Collision(set_id),
+            InventoryError::Storage(StorageError::TransactionConflict),
+        ];
+        for inventory in retryable {
+            let error = usage_update_error(&UsageUpdateError::Inventory(inventory));
+            let code = S3ErrorCode::Custom("DistributedBucketUnavailable".into());
+            assert_eq!(*error.code(), code);
+            assert_eq!(
+                error.status_code(),
+                Some(http::StatusCode::SERVICE_UNAVAILABLE)
+            );
+        }
+        let accounting = S3ErrorCode::Custom("UsageAccountingFailed".into());
+        let other = UsageUpdateError::Inventory(InventoryError::Storage(StorageError::KeyNotFound));
+        assert_eq!(*usage_update_error(&other).code(), accounting);
+        let event = UsageUpdateError::UnexpectedEvent(aruna_core::events::Event::Search());
+        assert_eq!(*usage_update_error(&event).code(), accounting);
+        let deleted = DeleteObjectError::UsageUpdateError(UsageUpdateError::Inventory(
+            InventoryError::Collision(set_id),
+        ));
+        assert_eq!(
+            deleted.into_s3_error().status_code(),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        let copied = CopyObjectError::Reference(MaterializeReferenceError::Usage(
+            UsageUpdateError::Inventory(InventoryError::RangeRetired(set_id)),
+        ));
+        assert_eq!(
+            copied.into_s3_error().status_code(),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    // Reads that cannot be served now say so: a too large reference is unsupported, a full
+    // spool asks to slow down.
+    #[test]
+    fn reference_reads_mapped() {
+        let large = GetObjectError::ReferenceTooLarge { limit: 1 }.into_s3_error();
+        assert_eq!(*large.code(), S3ErrorCode::NotImplemented);
+        let spool = GetObjectError::SpoolBudgetExhausted.into_s3_error();
+        assert_eq!(*spool.code(), S3ErrorCode::SlowDown);
+        let delete = DeleteObjectError::Distribution(GuardError::RecordMissing(
+            ulid::Ulid::from_bytes([8; 16]),
+        ));
+        assert_eq!(
+            delete.into_s3_error().status_code(),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
 }
