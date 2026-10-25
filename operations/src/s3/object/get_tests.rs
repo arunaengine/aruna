@@ -2718,7 +2718,15 @@ fn held_version_pulls() {
     let Err(GetObjectError::HeldElsewhere(held)) = operation.finalize() else {
         panic!("expected a read through holders")
     };
-    assert_eq!((held.set_id, held.blake3, held.size), (set_id, [3; 32], 4));
+    assert_eq!(
+        (held.set_id, held.identity, held.size),
+        (set_id, [3; 32], 4)
+    );
+    assert_eq!(
+        held.blake3,
+        Some([3; 32]),
+        "a native record names its bytes"
+    );
 }
 
 // A member serves its kept copy of an external reference without asking the source.
@@ -2796,4 +2804,47 @@ fn kept_reference_served() {
             if key_space == aruna_core::keyspaces::OBJECT_METADATA_KEYSPACE
     ));
     assert_eq!(operation.state, GetObjectState::ReadMultipartSummary);
+}
+
+// An external reference whose source fails reads through holders by its identity, without
+// claiming that the identity digest is the BLAKE3 of its bytes.
+#[test]
+fn failed_source_identity() {
+    use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
+    let mut operation = distributed_operation();
+    let version = BlobVersion::reference(
+        reference_source(),
+        observation(4),
+        SystemTime::UNIX_EPOCH,
+        UserId::local(Ulid::from_parts(1, 1), RealmId([0u8; 32])),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_identity(Some([6; 32]));
+    operation.read_version(Ulid::from_parts(4, 4), version, false);
+    let bucket = aruna_core::structs::storage::blob::BucketInfo {
+        group_id: Ulid::from_parts(5, 5),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: aruna_core::structs::storage::format::Compression::Off,
+        distribution: Some(DistributionBinding {
+            set_id: Ulid::from_parts(7, 7),
+            member_id: Ulid::from_parts(8, 8),
+            incarnation: 5,
+            revision: DistributionRevision::default(),
+        }),
+    };
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: Vec::<u8>::new().into(),
+        value: Some(bucket.to_bytes().unwrap().into()),
+    }));
+    operation.source_failed(GetObjectError::GetObjectFailed);
+    let Err(GetObjectError::HeldElsewhere(held)) = operation.finalize() else {
+        panic!("expected a read through holders")
+    };
+    assert_eq!((held.identity, held.blake3), ([6; 32], None));
+    assert!(!held.info().hashes.contains_key("blake3"));
 }

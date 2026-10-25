@@ -16,7 +16,8 @@ fn held(size: u64) -> HeldElsewhere {
     HeldElsewhere {
         set_id: Ulid::from_bytes([1; 16]),
         version_id: Ulid::from_bytes([2; 16]),
-        blake3: [3; 32],
+        identity: [3; 32],
+        blake3: Some([3; 32]),
         size,
         metadata: HashMap::new(),
         version_created_at: None,
@@ -109,6 +110,35 @@ fn kept_copy_matches() {
     assert_eq!(
         kept_location(&held, &[row(None), row(Some(foreign.to_bytes().unwrap()))]),
         None
+    );
+}
+
+// An external reference names no BLAKE3, so its kept copy serves by identity and size alone.
+#[test]
+fn kept_external_matches() {
+    let external = HeldElsewhere {
+        blake3: None,
+        ..held(9)
+    };
+    let entry = CacheEntry {
+        key: external.identity,
+        blake3: [4; 32],
+        location: location(9),
+        size: 9,
+        order: Ulid::nil(),
+    };
+    let row = |value: Option<Vec<u8>>| (Key::from(Vec::new()), value.map(Value::from));
+    let values = [row(None), row(Some(entry.to_bytes().unwrap()))];
+    assert_eq!(kept_location(&external, &values), Some(location(9)));
+    let short = HeldElsewhere {
+        size: 8,
+        ..external.clone()
+    };
+    assert_eq!(kept_location(&short, &values), None);
+    assert!(!external.info().hashes.contains_key(HASH_BLAKE3));
+    assert_eq!(
+        kept_reads(&external)[1].1.to_vec(),
+        external.identity.to_vec()
     );
 }
 

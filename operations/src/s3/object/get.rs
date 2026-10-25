@@ -652,13 +652,14 @@ impl GetObjectOperation {
                 cached_metadata,
                 ..
             } if HeldElsewhere::of(&source, version.identity).is_some() => {
-                let Some((set_id, blake3)) = HeldElsewhere::of(&source, version.identity) else {
+                let Some((set_id, identity)) = HeldElsewhere::of(&source, version.identity) else {
                     return self.emit_error(GetObjectError::GetObjectFailed);
                 };
                 let held = HeldElsewhere {
                     set_id,
                     version_id,
-                    blake3,
+                    identity,
+                    blake3: Some(identity),
                     size: cached_metadata.content_length,
                     metadata: version.metadata,
                     version_created_at: Some(version.created_at),
@@ -784,10 +785,11 @@ impl GetObjectOperation {
     fn source_failed(&mut self, error: GetObjectError) -> Effects {
         let held = (self.source_set.zip(self.source_identity))
             .zip(self.resolved_version_id.zip(self.reference_cached.as_ref()))
-            .map(|((set_id, blake3), (version_id, cached))| HeldElsewhere {
+            .map(|((set_id, identity), (version_id, cached))| HeldElsewhere {
                 set_id,
                 version_id,
-                blake3,
+                identity,
+                blake3: None,
                 size: cached.content_length,
                 metadata: self.metadata.clone(),
                 version_created_at: None,

@@ -260,7 +260,8 @@ pub enum BaoReadTarget {
     ExactVersion(VersionedObjectArn),
     Blake3([u8; 32]),
     /// One version of a distributed bucket by its logical identity: the holder finds it in its
-    /// own member bucket, and the request's `expected_blake3` names its content.
+    /// own member bucket. `expected_blake3` names its content, unless an external reference's
+    /// record names none; the holder's verified copy then binds the stream.
     Version {
         set_id: Ulid,
         version_id: Ulid,

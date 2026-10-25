@@ -109,7 +109,11 @@ pub fn pinned_blob(location: &BackendLocation, blob: Blob) -> Blob {
 pub struct HeldElsewhere {
     pub set_id: Ulid,
     pub version_id: Ulid,
-    pub blake3: [u8; 32],
+    /// The logical identity the set fixed; a cache entry is keyed by it.
+    pub identity: [u8; 32],
+    /// The BLAKE3 of the bytes when the record names it. An external reference names none: its
+    /// identity digests the source observation, so the serving copy's verified hash binds.
+    pub blake3: Option<[u8; 32]>,
     pub size: u64,
     pub metadata: HashMap<String, String>,
     pub version_created_at: Option<SystemTime>,
@@ -136,7 +140,9 @@ impl HeldElsewhere {
             version_created_at: self.version_created_at,
             etag: None,
             checksum_type: MultipartChecksumType::FullObject,
-            hashes: HashMap::from([(HASH_BLAKE3.to_string(), self.blake3.to_vec())]),
+            hashes: (self.blake3.iter())
+                .map(|blake3| (HASH_BLAKE3.to_string(), blake3.to_vec()))
+                .collect(),
             composite_hashes: HashMap::new(),
             part_count: None,
         }
@@ -152,7 +158,7 @@ pub fn record_only(source: &VersionSourceBinding) -> bool {
 
 /// The reads of the copies this member may keep of `held`: its attachment, its cache entry.
 pub fn kept_reads(held: &HeldElsewhere) -> Vec<(KeySpace, Key)> {
-    kept_source_reads(held.set_id, held.version_id, held.blake3)
+    kept_source_reads(held.set_id, held.version_id, held.identity)
 }
 
 /// The reads of a version's kept copies, by set and version id, and by logical identity.
@@ -189,13 +195,14 @@ pub fn kept_source_location(values: &[(Key, Option<Value>)], size: u64) -> Optio
     })
 }
 
-/// The kept copy a read uses: one whose BLAKE3 and size are the version's.
+/// The kept copy a read uses: one of the version's size whose BLAKE3 is the version's, or for
+/// an external reference the one it was verified as.
 pub fn kept_location(
     held: &HeldElsewhere,
     values: &[(Key, Option<Value>)],
 ) -> Option<BackendLocation> {
     let fits = |location: &BackendLocation, blake3: [u8; 32]| {
-        blake3 == held.blake3 && location.blob_size == held.size
+        held.blake3.unwrap_or(blake3) == blake3 && location.blob_size == held.size
     };
     let attached = values
         .first()
@@ -414,7 +421,7 @@ async fn from_holders(
                 set_id: held.set_id,
                 version_id: held.version_id,
             },
-            expected_blake3: Some(held.blake3),
+            expected_blake3: held.blake3,
             metadata_only: false,
             destination: None,
             known_refs: Vec::new(),
@@ -454,7 +461,9 @@ async fn spool_range(
     };
     match blob_handle.send_blob_effect(spool).await {
         Event::Blob(BlobEvent::LocalSpooled { hashes, blob, .. })
-            if hashes.get(HASH_BLAKE3).map(Vec::as_slice) == Some(held.blake3.as_slice()) =>
+            if held.blake3.is_none_or(|blake3| {
+                hashes.get(HASH_BLAKE3).map(Vec::as_slice) == Some(blake3.as_slice())
+            }) =>
         {
             Ok(blob)
         }
@@ -506,7 +515,7 @@ async fn fill(
         return None;
     }
     let holders = &member.holders;
-    let claim = claim_key(kind, held.set_id, held.version_id, held.blake3);
+    let claim = claim_key(kind, held.set_id, held.version_id, held.identity);
     let claimed = FillClaim {
         claim_id: Ulid::generate(),
         claimed_at_ms: now_ms(),
@@ -519,8 +528,8 @@ async fn fill(
             return None;
         }
     }
-    let location = match write_copy(context, request, kind, holders).await {
-        Ok(location) => location,
+    let (location, blake3) = match write_copy(context, request, kind, holders).await {
+        Ok(written) => written,
         Err(reason) => {
             warn!(reason, set_id = %held.set_id, version_id = %held.version_id, "A kept copy was not filled");
             release(context, claim).await;
@@ -531,8 +540,8 @@ async fn fill(
         kind,
         set_id: held.set_id,
         version_id: held.version_id,
-        identity: held.blake3,
-        blake3: held.blake3,
+        identity: held.identity,
+        blake3,
         size: held.size,
         location: location.clone(),
         claim_key: claim.clone(),
@@ -560,13 +569,14 @@ async fn fill(
     }
 }
 
-/// Writes the whole version to a hidden copy and checks it against the record.
+/// Writes the whole version to a hidden copy, checks it against the record and returns it with
+/// its BLAKE3.
 async fn write_copy(
     context: &DriverContext,
     request: &PullRequest,
     kind: KeptKind,
     holders: &[NodeId],
-) -> Result<BackendLocation, String> {
+) -> Result<(BackendLocation, [u8; 32]), String> {
     let held = &request.held;
     let blob_handle = context.blob_handle.as_ref().ok_or("no blob handle")?;
     let whole = from_holders(context, request, holders, None)
@@ -574,7 +584,7 @@ async fn write_copy(
         .map_err(|error| error.to_string())?;
     let name = match kind {
         KeptKind::Attachment => format!("{}-{}", held.set_id, held.version_id),
-        KeptKind::Cache => hex::encode(held.blake3),
+        KeptKind::Cache => hex::encode(held.identity),
     };
     let spool = BlobEffect::SpoolHidden {
         namespace: kind.namespace(),
@@ -589,7 +599,9 @@ async fn write_copy(
             location,
             blake3,
             size,
-        }) if blake3 == held.blake3 && size == held.size => Ok(location),
+        }) if held.blake3.unwrap_or(blake3) == blake3 && size == held.size => {
+            Ok((location, blake3))
+        }
         Event::Blob(BlobEvent::HiddenSpooled { location, .. }) => {
             drop_copy(context, &location).await;
             Err("the copy does not match the version".to_string())
