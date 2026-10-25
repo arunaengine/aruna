@@ -767,6 +767,7 @@ pub async fn submit_staging(
         validate_source_path(name)?;
     }
 
+    crate::routes::storage::relay::relayed_set(&bucket_info, &headers)?;
     // A distributed bucket imports by range: every coordinator runs a job for its own keys.
     let fan_out =
         (bucket_info.distribution.as_ref()).filter(|_| !headers.contains_key(RELAY_HOP_HEADER));

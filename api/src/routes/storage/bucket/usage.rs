@@ -326,6 +326,7 @@ pub async fn get_bucket_usage(
             "held is only accepted from another member".into(),
         ));
     }
+    crate::routes::storage::relay::relayed_set(&info, &headers)?;
     let ranges = held_ranges(&state.get_ctx(), &bucket).await;
     match ranges.map_err(|error| ServerError::InternalError(error.to_string()))? {
         Some((_, _, ranges)) if held => {

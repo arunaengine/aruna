@@ -28,6 +28,10 @@ use crate::server::state::ServerState;
 
 const API_PREFIX: &str = "/api/v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The distributed bucket a relayed request is meant for; its target refuses another bucket.
+pub(crate) const RELAY_SET_HEADER: &str = "x-aruna-relay-set";
+/// Bytes of a node's answer read at most; a longer answer fails instead of filling memory.
+pub(crate) const MAX_ANSWER_BYTES: usize = 16 * 1024 * 1024;
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -44,6 +48,36 @@ pub(crate) struct RestForward {
     pub node_id: NodeId,
 }
 
+/// Refuses a relayed request when the local bucket of the name is not the member of the
+/// distributed bucket the relaying node meant, for example after it was deleted and recreated.
+pub(crate) fn relayed_set(bucket: &BucketInfo, headers: &HeaderMap) -> ServerResult<()> {
+    let named = headers.get(RELAY_SET_HEADER).map(|value| value.to_str());
+    let bound = bucket.distribution.as_ref().map(|binding| binding.set_id);
+    let relayed = headers.contains_key(RELAY_HOP_HEADER);
+    match (named, bound) {
+        (None, None) => Ok(()),
+        (None, Some(_)) if !relayed => Ok(()),
+        (Some(Ok(named)), Some(set_id)) if named == set_id.to_string() => Ok(()),
+        _ => Err(ServerError::Conflict(
+            "the bucket of this name is not the member of the distributed bucket the \
+             relaying node named"
+                .into(),
+        )),
+    }
+}
+
+/// The body of a node's answer, at most [`MAX_ANSWER_BYTES`]; a broken body is an error.
+pub(crate) async fn capped_body(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if body.len() + chunk.len() > MAX_ANSWER_BYTES {
+            return Err(format!("the answer exceeds {MAX_ANSWER_BYTES} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// The coordinator a REST write to `key` goes to, or `None` when this node writes it. A request
 /// another node already relayed is never relayed again.
 pub(crate) async fn rest_target(
@@ -52,6 +86,7 @@ pub(crate) async fn rest_target(
     key: &str,
     headers: &HeaderMap,
 ) -> ServerResult<Option<RestForward>> {
+    relayed_set(bucket, headers)?;
     let Some(binding) = bucket.distribution.as_ref() else {
         return Ok(None);
     };
@@ -100,7 +135,7 @@ fn coordinator_error(forward: &RestForward, status: StatusCode, body: &str) -> S
 }
 
 /// The url of `path` on a node's published api base, which may already carry the nest.
-fn relay_url(base: &str, path: &str) -> String {
+pub(crate) fn relay_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     match base.ends_with(API_PREFIX) {
         true => format!("{base}{path}"),
@@ -128,6 +163,7 @@ pub(crate) async fn relay_json<T: DeserializeOwned>(
         .post(relay_url(&base, path))
         .header(header::AUTHORIZATION, format!("Bearer {}", bearer.as_str()))
         .header(RELAY_HOP_HEADER, state.get_node_id().to_string())
+        .header(RELAY_SET_HEADER, forward.set_id.to_string())
         .json(body)
         .send()
         .await;
@@ -155,7 +191,17 @@ async fn answer<T: DeserializeOwned>(
     response: reqwest::Response,
 ) -> ServerResult<(StatusCode, T)> {
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = match capped_body(response).await {
+        Ok(body) => body,
+        Err(_) if !status.is_success() => Vec::new(),
+        Err(error) => {
+            return Err(ServerError::BadGatewayReason(format!(
+                "node {} answered incompletely: {error}",
+                forward.node_id
+            )));
+        }
+    };
+    let body = String::from_utf8_lossy(&body);
     if !status.is_success() {
         return Err(coordinator_error(forward, status, &body));
     }
@@ -182,6 +228,7 @@ pub(crate) async fn relay_get<T: DeserializeOwned>(
         .get(relay_url(&base, path))
         .header(header::AUTHORIZATION, format!("Bearer {}", bearer.as_str()))
         .header(RELAY_HOP_HEADER, state.get_node_id().to_string())
+        .header(RELAY_SET_HEADER, forward.set_id.to_string())
         .send()
         .await;
     match response {
@@ -208,6 +255,51 @@ mod tests {
             range_id: Ulid::from_bytes([2; 16]),
             node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
         }
+    }
+
+    #[tokio::test]
+    async fn answers_are_capped() {
+        let answer = |body: Vec<u8>| reqwest::Response::from(http::Response::new(body));
+        assert_eq!(capped_body(answer(b"{}".to_vec())).await.unwrap(), b"{}");
+        let oversized = vec![b'x'; MAX_ANSWER_BYTES + 1];
+        assert!(capped_body(answer(oversized)).await.is_err());
+    }
+
+    #[test]
+    fn relays_name_set() {
+        let set_id = Ulid::from_bytes([1; 16]);
+        use aruna_core::structs::storage::distribution::{
+            DistributionBinding, DistributionRevision,
+        };
+        let bucket = |distribution| BucketInfo {
+            group_id: Ulid::from_bytes([3; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution,
+        };
+        let member = bucket(Some(DistributionBinding {
+            set_id,
+            member_id: Ulid::from_bytes([2; 16]),
+            incarnation: 5,
+            revision: DistributionRevision {
+                number: 1,
+                digest: [0; 32],
+            },
+        }));
+        let mut relayed = HeaderMap::new();
+        relayed.insert(RELAY_HOP_HEADER, "node".parse().unwrap());
+        // A relay that names no set, or another one, reaches no member bucket.
+        assert!(relayed_set(&member, &relayed).is_err());
+        relayed.insert(RELAY_SET_HEADER, set_id.to_string().parse().unwrap());
+        assert!(relayed_set(&member, &relayed).is_ok());
+        // A recreated ordinary bucket of the name refuses the relay meant for the set.
+        assert!(relayed_set(&bucket(None), &relayed).is_err());
+        assert!(relayed_set(&member, &HeaderMap::new()).is_ok());
     }
 
     #[test]
