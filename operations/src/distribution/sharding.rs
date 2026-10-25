@@ -120,6 +120,43 @@ async fn maintain_accounts(context: &Arc<DriverContext>) -> Duration {
     }
 }
 
+/// Begins a counter rebuild of every active range account without one, a page at a time, so
+/// range counters are confirmed again after a node-wide usage rebuild started. The range
+/// maintenance runs the rebuilds; until they activate, the counters report incomplete.
+pub async fn begin_range_rebuilds(context: &DriverContext) -> Result<usize, String> {
+    let mut start = None;
+    let mut begun = 0usize;
+    loop {
+        let (rows, more) = accounts(context, start.take()).await?;
+        for (key, value) in rows {
+            start = Some(key.clone());
+            let Some((set_id, range_id, account)) = decode(&key, &value) else {
+                continue;
+            };
+            if account.rebuild.is_some() || !matches!(account.charge, Charge::Active(_)) {
+                continue;
+            }
+            // No page budget: the run only records the new generation's rebuild.
+            let config = RebuildConfig {
+                set_id,
+                range_id,
+                page_rows: WALK_ROWS,
+                page_bytes: WALK_BYTES,
+                max_pages: 0,
+            };
+            match drive(RebuildOperation::new(config), context).await {
+                Ok(_) => begun += 1,
+                Err(error) => {
+                    warn!(%set_id, %range_id, %error, "A range counter rebuild did not begin")
+                }
+            }
+        }
+        if !more {
+            return Ok(begun);
+        }
+    }
+}
+
 fn decode(key: &[u8], value: &[u8]) -> Option<(Ulid, Ulid, RangeAccount)> {
     let set_id = Ulid::from_bytes(key.get(..16)?.try_into().ok()?);
     let range_id = Ulid::from_bytes(key.get(16..32)?.try_into().ok()?);
@@ -381,8 +418,14 @@ pub(crate) fn split_point(keys: &[String], range: &KeyRange) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_point;
+    use super::{begin_range_rebuilds, split_point};
+    use crate::distribution::rebuild::{RebuildConfig, RebuildOperation, RebuildOutcome};
+    use crate::distribution::test_store::{
+        account, apply, context, counters, exact, install, open, write,
+    };
+    use crate::driver::drive;
     use aruna_core::structs::storage::distribution::KeyRange;
+    use aruna_core::structs::storage::distribution::accounting::{Charge, generation_key};
     use ulid::Ulid;
 
     fn range(lower: &str, upper: Option<&str>) -> KeyRange {
@@ -414,6 +457,41 @@ mod tests {
             Some("b/x/2"),
             "a folder at the lower bound leaves the left child empty"
         );
+    }
+
+    #[tokio::test]
+    async fn rebuilds_begin_once() {
+        let (_dir, handle) = open();
+        let set = Ulid::from_bytes([6; 16]);
+        install(
+            &handle,
+            set,
+            &[super::super::test_store::range(1, "", None)],
+        )
+        .await;
+        assert!(apply(&handle, write(set, "a", 1, 5)).await.unwrap());
+        let context = context(&handle);
+        assert_eq!(begin_range_rebuilds(&context).await.unwrap(), 1);
+        let range_id = Ulid::from_bytes([1; 16]);
+        let begun = account(&handle, set, range_id).await.unwrap();
+        assert!(begun.rebuild.is_some() && !begun.is_complete());
+        // A running rebuild is left alone.
+        assert_eq!(begin_range_rebuilds(&context).await.unwrap(), 0);
+        let config = RebuildConfig {
+            set_id: set,
+            range_id,
+            page_rows: 8,
+            page_bytes: 1 << 20,
+            max_pages: 100,
+        };
+        let outcome = drive(RebuildOperation::new(config), &context).await;
+        assert_eq!(outcome.unwrap(), RebuildOutcome::Done);
+        let done = account(&handle, set, range_id).await.unwrap();
+        let Charge::Active(generation) = done.charge else {
+            panic!("the range stays active");
+        };
+        let row = counters(&handle, generation_key(set, range_id, generation)).await;
+        assert_eq!(row, exact(1, 5));
     }
 
     #[test]
