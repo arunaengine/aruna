@@ -245,7 +245,8 @@ pub async fn leave_distributed(
   until the transfer activates. Open uploads of the range are aborted.
 - The new coordinator completes once its copy holds everything up to the fence; then it
   writes the range and the former coordinator forwards to it.
-- With role `leave` the former coordinator removes its copy once the new one is ready.
+- With role `leave` the former coordinator removes its copy once the new one and every
+  other listed replica of the range are ready.
 - The answer is 202 once the transfer is open; its progress shows in the bucket status.
 - While the current coordinator is unreachable the transfer is refused with 503."#,
     params(

@@ -103,6 +103,12 @@ impl DistributionSnapshot {
             .collect()
     }
 
+    /// Whether the coordinator and every replica the record lists for `range` are ready.
+    pub fn range_ready(&self, range: &KeyRange) -> bool {
+        let ready = |id: &Ulid| (self.member(*id)).is_some_and(|m| m.state == MemberState::Ready);
+        ready(&range.coordinator) && range.replicas.iter().all(ready)
+    }
+
     fn statement_digest(&self, digest: &[u8; 32]) -> Option<&SignedStatement> {
         (self.statements.iter()).find(|signed| signed.statement.digest() == *digest)
     }

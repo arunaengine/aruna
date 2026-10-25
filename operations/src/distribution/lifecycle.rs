@@ -6,11 +6,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StatementSignEvent, StorageEvent};
 use aruna_core::keyspaces::{
     DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_LIFECYCLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
@@ -49,6 +49,8 @@ const PURGE_PAGES: usize = 32;
 /// How soon the next pass comes while lifecycle work waits.
 pub const LIFECYCLE_POLL: Duration = Duration::from_secs(5);
 const FENCE_ATTEMPTS: usize = 4;
+/// The set marker after which the next pass continues; a restart begins at the first set.
+static MARKER_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 /// What a range held when its former coordinator fenced it; the new coordinator completes
 /// once its own counters of the range reach it.
@@ -138,17 +140,30 @@ fn marker(key: &[u8]) -> (String, Key) {
     )
 }
 
+/// Reads the next batch of sets after the last one looked at, so sets that keep waiting never
+/// starve later ones; a short batch makes the next pass start over.
 async fn scan_markers(context: &DriverContext) -> Result<Vec<Vec<u8>>, String> {
+    let after = MARKER_CURSOR
+        .lock()
+        .map(|cursor| cursor.clone())
+        .unwrap_or(None);
     let iter = StorageEffect::Iter {
         key_space: DISTRIBUTION_LIFECYCLE_KEYSPACE.to_string(),
         prefix: None,
-        start: None,
+        start: after.map(|key| IterStart::After(key.into())),
         limit: SET_BATCH,
         txn_id: None,
     };
     match context.storage_handle.send_storage_effect(iter).await {
         Event::Storage(StorageEvent::IterResult { values, .. }) => {
-            Ok(values.into_iter().map(|(key, _)| key.to_vec()).collect())
+            let keys: Vec<Vec<u8>> = values.into_iter().map(|(key, _)| key.to_vec()).collect();
+            let next = (keys.len() == SET_BATCH)
+                .then(|| keys.last().cloned())
+                .flatten();
+            if let Ok(mut cursor) = MARKER_CURSOR.lock() {
+                *cursor = next;
+            }
+            Ok(keys)
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected scan answer {other:?}")),
@@ -417,7 +432,7 @@ impl SetWork {
     }
 
     /// Purges a range this node fenced for a transfer once the record no longer has it hold
-    /// the range at all and the new coordinator is ready.
+    /// the range at all and the range's coordinator and every listed replica are ready.
     async fn reclaim(
         &self,
         context: &Arc<DriverContext>,
@@ -443,20 +458,17 @@ impl SetWork {
             else {
                 continue;
             };
+            if held.iter().any(|r| r.range_id == range.range_id) {
+                continue;
+            }
             let moving = snapshot
                 .lifecycle
                 .transfers
                 .iter()
                 .any(|t| t.range_id == range.range_id);
-            let ready = snapshot
-                .member(range.coordinator)
-                .is_some_and(|coordinator| coordinator.state == MemberState::Ready);
-            let kept = held.iter().any(|r| r.range_id == range.range_id);
-            if moving || kept || !ready {
-                left = left.and(match moving {
-                    true => Left::Waiting,
-                    false => Left::Settled,
-                });
+            // The copies stay until the range keeps every listed replica without this node.
+            if moving || !snapshot.range_ready(range) {
+                left = Left::Waiting;
                 continue;
             }
             let target = self.target(snapshot, &binding, range);

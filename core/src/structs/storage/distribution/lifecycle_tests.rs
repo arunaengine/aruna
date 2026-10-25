@@ -185,6 +185,22 @@ fn transfer_targets_are_ready_copies() {
 }
 
 #[test]
+fn range_ready_needs_every_replica() {
+    // A former coordinator reclaims only while the range keeps all its listed copies.
+    let mut head = active();
+    let range = head.config.ranges[0].clone();
+    assert!(head.range_ready(&range));
+    head.config.members[2].state = MemberState::CatchingUp;
+    assert!(!head.range_ready(&range));
+    head.config.members[2].state = MemberState::Ready;
+    head.config.members[0].state = MemberState::Leaving;
+    assert!(
+        !head.range_ready(&range),
+        "the coordinator must be ready too"
+    );
+}
+
+#[test]
 fn transfer_binds_its_statements() {
     let head = active();
     let prepared = step(&head, &prepare(&head, 2, TransferRole::Leave));
