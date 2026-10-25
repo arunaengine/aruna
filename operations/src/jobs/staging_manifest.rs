@@ -16,7 +16,8 @@ use futures_util::TryStreamExt;
 
 use super::executor::JobContext;
 use super::staging_walk::{
-    PageFailure, canonical_walker_path, commit_rows, record_failure, source_permission_path,
+    PageFailure, canonical_walker_path, clear_rows, commit_rows, record_failure,
+    source_permission_path,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
@@ -55,8 +56,7 @@ pub(super) async fn read_manifest_chunk(
     .map_err(|error| PageFailure::Retry(error.to_string()))?;
     if !allowed {
         let message = "checksum manifest read denied".to_string();
-        record_failure(&mut next, &manifest.source_path, "", message);
-        return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
+        return fail_manifest(ctx, checkpoint, next, &manifest, message).await;
     }
     let observation = match manifest.observation.clone() {
         Some(observation) => observation,
@@ -102,13 +102,11 @@ pub(super) async fn read_manifest_chunk(
         Ok(read) if read.metadata.compare(&observation) != ObservationMatch::Changed => read,
         Ok(_) | Err(ReadSourceError::Staging(StagingSourceError::ConditionFailed)) => {
             let message = "the checksum manifest changed while it was read".to_string();
-            record_failure(&mut next, &manifest.source_path, "", message);
-            return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
+            return fail_manifest(ctx, checkpoint, next, &manifest, message).await;
         }
         Err(error) if lasting_read(&error) => {
             let message = format!("checksum manifest read failed: {error}");
-            record_failure(&mut next, &manifest.source_path, "", message);
-            return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
+            return fail_manifest(ctx, checkpoint, next, &manifest, message).await;
         }
         Err(error) => return Err(PageFailure::Retry(error.to_string())),
     };
@@ -126,14 +124,10 @@ pub(super) async fn read_manifest_chunk(
         (false, Some(newline)) => newline + 1,
         (false, None) => {
             let message = format!("a checksum manifest line exceeds {MANIFEST_CHUNK} bytes");
-            record_failure(&mut next, &manifest.source_path, "", message);
-            return commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await;
+            return fail_manifest(ctx, checkpoint, next, &manifest, message).await;
         }
     };
-    let directory = manifest
-        .source_path
-        .rsplit_once('/')
-        .map_or("", |(directory, _)| directory);
+    let directory = manifest_directory(&manifest);
     let mut writes = Vec::new();
     for line in String::from_utf8_lossy(&bytes[..used]).lines() {
         let Some((algorithm, digest, path)) = parse_manifest_line(line) else {
@@ -165,8 +159,34 @@ pub(super) async fn read_manifest_chunk(
     commit_rows(ctx, checkpoint, next, writes, Vec::new()).await
 }
 
+fn manifest_directory(manifest: &ManifestRead) -> &str {
+    (manifest.source_path.rsplit_once('/')).map_or("", |(directory, _)| directory)
+}
+
+/// Skips a manifest that cannot be read to its end. Digests its earlier chunks stored are
+/// deleted first, so no file of the prefix is bound to part of a manifest.
+async fn fail_manifest(
+    ctx: &JobContext,
+    checkpoint: &mut StagingJobCheckpoint,
+    mut next: StagingJobCheckpoint,
+    manifest: &ManifestRead,
+    message: String,
+) -> Result<(), PageFailure> {
+    if manifest.offset > 0 {
+        let prefix = match manifest_directory(manifest) {
+            "" => manifest_key(ctx.job_id, ""),
+            directory => manifest_key(ctx.job_id, &format!("{directory}/")),
+        };
+        clear_rows(ctx, STAGING_MANIFEST_KEYSPACE, prefix)
+            .await
+            .map_err(PageFailure::Retry)?;
+    }
+    record_failure(&mut next, &manifest.source_path, "", message);
+    commit_rows(ctx, checkpoint, next, Vec::new(), Vec::new()).await
+}
+
 /// Errors that stay on a retry: the manifest is then skipped instead of retried.
-fn lasting_head(error: &HeadSourceError) -> bool {
+pub(super) fn lasting_head(error: &HeadSourceError) -> bool {
     match error {
         HeadSourceError::Resolve(error) => lasting_resolution(error),
         HeadSourceError::Staging(error) => lasting_source(error),
@@ -183,7 +203,7 @@ fn lasting_read(error: &ReadSourceError) -> bool {
 }
 
 /// A missing or unusable connector stays; storage failures such as a timeout pass.
-fn lasting_resolution(error: &SourceResolutionError) -> bool {
+pub(super) fn lasting_resolution(error: &SourceResolutionError) -> bool {
     match error {
         SourceResolutionError::StorageError(_) | SourceResolutionError::ResolveFailed => false,
         SourceResolutionError::ConversionError(_)
@@ -193,7 +213,7 @@ fn lasting_resolution(error: &SourceResolutionError) -> bool {
     }
 }
 
-fn lasting_source(error: &StagingSourceError) -> bool {
+pub(super) fn lasting_source(error: &StagingSourceError) -> bool {
     matches!(
         error,
         StagingSourceError::NotFound
@@ -402,6 +422,23 @@ mod tests {
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
         };
         let mut checkpoint = checkpoint();
+        // Digests an earlier chunk stored, and one of another folder's manifest.
+        let digest = postcard::to_allocvec(&(ChecksumAlgorithm::Md5, vec![1u8; 16])).unwrap();
+        let writes = ["data/a.txt", "other/b.txt"]
+            .map(|path| {
+                let key = manifest_key(job_id, path);
+                (
+                    STAGING_MANIFEST_KEYSPACE.to_string(),
+                    key,
+                    ByteView::from(digest.clone()),
+                )
+            })
+            .to_vec();
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        ctx.driver.storage_handle.send_storage_effect(write).await;
 
         if let Err(PageFailure::Retry(message) | PageFailure::Permanent(message)) =
             read_manifest_chunk(&ctx, &spec, &mut checkpoint).await
@@ -412,5 +449,11 @@ mod tests {
         assert_eq!(checkpoint.manifest, None);
         assert_eq!(checkpoint.items_failed, 1);
         assert_eq!(checkpoint.errors[0].error, "checksum manifest read denied");
+        // The skipped manifest leaves no partial digests behind.
+        let digests = manifest_digests(&ctx, &["data/a.txt", "other/b.txt"])
+            .await
+            .unwrap();
+        assert_eq!(digests[0], None);
+        assert!(digests[1].is_some());
     }
 }

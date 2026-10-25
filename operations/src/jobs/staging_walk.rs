@@ -30,7 +30,9 @@ use super::executor::{JobContext, JobRunOutcome};
 use super::staging::{
     ItemFailure, moved_away, persist_rows, pinned_bucket, queue_key, stage_item, sync_progress,
 };
-use super::staging_manifest::{ManifestDigest, manifest_digests};
+use super::staging_manifest::{
+    ManifestDigest, lasting_head, lasting_resolution, lasting_source, manifest_digests,
+};
 use super::store::{batch_delete, iter_prefix_page, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::distribution::guard::{GuardError, authority_reads, authority_rows, write_target};
@@ -109,15 +111,20 @@ pub(super) async fn start_walk(
 /// until the next run and do not change the outcome.
 pub(super) async fn clear_queue(ctx: &JobContext) {
     for key_space in [STAGING_QUEUE_KEYSPACE, STAGING_MANIFEST_KEYSPACE] {
-        if let Err(error) = clear_rows(ctx, key_space).await {
+        let prefix = ByteView::from(ctx.job_id.to_bytes().to_vec());
+        if let Err(error) = clear_rows(ctx, key_space, prefix).await {
             warn!(job_id = %ctx.job_id, error = %error, "Staging job row cleanup failed");
         }
     }
 }
 
-async fn clear_rows(ctx: &JobContext, key_space: &str) -> Result<(), String> {
+/// Deletes every row of `key_space` under `prefix`, page by page.
+pub(super) async fn clear_rows(
+    ctx: &JobContext,
+    key_space: &str,
+    prefix: ByteView,
+) -> Result<(), String> {
     let storage = &ctx.driver.storage_handle;
-    let prefix = ByteView::from(ctx.job_id.to_bytes().to_vec());
     loop {
         let (rows, _) = iter_prefix_page(
             storage,
@@ -374,16 +381,15 @@ async fn list_page(
 /// A source that refuses the path skips it; any other listing error retries the page, so one
 /// transient failure never abandons the rest of a large walk.
 fn list_failure(error: ListStagingError) -> ItemFailure {
-    match error {
-        ListStagingError::Resolve(_)
-        | ListStagingError::Staging(
-            StagingSourceError::NotFound
-            | StagingSourceError::AccessDenied
-            | StagingSourceError::UnsupportedKind(_)
-            | StagingSourceError::InvalidListing(_)
-            | StagingSourceError::EgressDenied(_),
-        ) => ItemFailure::Stage(error.to_string()),
-        error => ItemFailure::System(error.to_string()),
+    let lasting = match &error {
+        ListStagingError::Resolve(error) => lasting_resolution(error),
+        ListStagingError::Staging(StagingSourceError::InvalidListing(_)) => true,
+        ListStagingError::Staging(error) => lasting_source(error),
+        _ => false,
+    };
+    match lasting {
+        true => ItemFailure::Stage(error.to_string()),
+        false => ItemFailure::System(error.to_string()),
     }
 }
 
@@ -711,7 +717,11 @@ async fn head_observation(
     )
     .await
     .map(|result| result.metadata)
-    .map_err(|error| ItemFailure::Stage(error.to_string()))
+    .map_err(|error| match lasting_head(&error) {
+        true => ItemFailure::Stage(error.to_string()),
+        // A transient failure replays the page instead of failing the file for good.
+        false => ItemFailure::System(error.to_string()),
+    })
 }
 
 /// READ on the source file and WRITE on the destination key, as the submitting user.
@@ -858,6 +868,27 @@ mod pure_tests {
             queue_row: None,
             from: from.map(str::to_string),
         }
+    }
+
+    // Transient listing failures retry the page; only a refusing source skips its path.
+    #[test]
+    fn transient_listing_retries() {
+        use aruna_core::errors::SourceResolutionError;
+        let retried =
+            |error: ListStagingError| matches!(list_failure(error), ItemFailure::System(_));
+        let storage =
+            SourceResolutionError::StorageError(aruna_core::errors::StorageError::CommitFailed);
+        assert!(retried(ListStagingError::Resolve(storage)));
+        assert!(retried(ListStagingError::Resolve(
+            SourceResolutionError::ResolveFailed
+        )));
+        assert!(retried(
+            StagingSourceError::ListError("reset".into()).into()
+        ));
+        assert!(!retried(ListStagingError::Resolve(
+            SourceResolutionError::NotFound
+        )));
+        assert!(!retried(StagingSourceError::AccessDenied.into()));
     }
 
     #[test]
