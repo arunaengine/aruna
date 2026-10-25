@@ -71,7 +71,9 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
             writes.first().map(|(key_space, _, _)| key_space.as_str())
         }
         StorageEffect::AddUsage { key_space, .. }
-        | StorageEffect::AddCounters { key_space, .. } => Some(key_space),
+        | StorageEffect::AddCounters { key_space, .. }
+        | StorageEffect::BeginUsageRebuild { key_space }
+        | StorageEffect::FinishUsageRebuild { key_space } => Some(key_space),
         StorageEffect::BatchDelete { deletes, .. } => {
             deletes.first().map(|(key_space, _)| key_space.as_str())
         }
@@ -165,6 +167,8 @@ pub struct FjallStorage {
     pub(super) txn_usage: HashMap<Ulid, Vec<(String, ByteView, CounterChange)>>,
     /// Open write transactions that wrote or deleted realm config rows.
     pub(super) config_txns: HashSet<Ulid>,
+    /// Keyspaces whose committed usage deltas also go to their rebuild rows.
+    pub(super) usage_shadow: HashSet<String>,
 }
 
 impl FjallStorage {
@@ -276,6 +280,8 @@ impl FjallStorage {
             | StorageEffect::VaultDelete { .. } => StorageEvent::Error {
                 error: StorageError::InvalidEffect,
             },
+            StorageEffect::BeginUsageRebuild { key_space } => self.begin_usage_rebuild(key_space),
+            StorageEffect::FinishUsageRebuild { key_space } => self.finish_usage_rebuild(key_space),
         };
         match config_txn {
             Some(Some(txn_id)) if self.txns.contains_key(&txn_id) => {

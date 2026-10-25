@@ -7,6 +7,7 @@ mod lifecycle;
 mod metrics;
 mod owner;
 mod persistence;
+mod rebuild;
 mod records;
 mod sealing;
 mod shutdown;
@@ -21,6 +22,8 @@ mod tests_counters;
 mod tests_persistence;
 #[cfg(test)]
 mod tests_range;
+#[cfg(test)]
+mod tests_rebuild;
 mod transactions;
 mod vault;
 mod worker;

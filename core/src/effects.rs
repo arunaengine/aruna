@@ -647,6 +647,18 @@ pub enum StorageEffect {
         entry: VaultEntry,
         txn_id: Option<TxnId>,
     },
+    /// Between two commits: clears old rebuild rows, writes the rebuild marker and from now on
+    /// adds each committed usage delta to its rebuild row too. Answers `TransactionStarted`
+    /// with a read snapshot taken at that point.
+    BeginUsageRebuild {
+        key_space: KeySpace,
+    },
+    /// In one commit: every live counter row becomes its rebuild row (or is deleted without
+    /// one), rebuild rows and the marker go. Answers `BatchWriteResult`; fails unless this
+    /// running storage began the rebuild.
+    FinishUsageRebuild {
+        key_space: KeySpace,
+    },
 }
 
 /// Dispatch lane for a storage effect. Foreground is always served before Bulk,

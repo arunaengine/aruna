@@ -161,6 +161,10 @@ pub(super) fn record_effect_fields(span: &Span, effect: &StorageEffect) {
             }
         }
         StorageEffect::SyncAll => {}
+        StorageEffect::BeginUsageRebuild { key_space }
+        | StorageEffect::FinishUsageRebuild { key_space } => {
+            span.record("key_space", field::display(key_space));
+        }
     }
 }
 
@@ -184,6 +188,8 @@ pub(super) fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
         StorageEffect::VaultWrite { .. } => "vault_write",
         StorageEffect::VaultRead { .. } => "vault_read",
         StorageEffect::VaultDelete { .. } => "vault_delete",
+        StorageEffect::BeginUsageRebuild { .. } => "begin_usage_rebuild",
+        StorageEffect::FinishUsageRebuild { .. } => "finish_usage_rebuild",
     }
 }
 

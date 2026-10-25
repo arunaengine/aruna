@@ -107,6 +107,7 @@ impl FjallStorage {
             txn_deletes: HashMap::new(),
             txn_usage: HashMap::new(),
             config_txns: HashSet::new(),
+            usage_shadow: HashSet::new(),
         }
     }
 }

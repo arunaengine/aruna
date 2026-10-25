@@ -25,6 +25,10 @@ pub const DIRTY_GLOBAL_KEY: &[u8] = b"dirty/global";
 pub const DIRTY_GROUP_PREFIX: &[u8] = b"dirty/group/";
 pub const SUMMARY_GLOBAL_KEY: &[u8] = b"summary/global";
 pub const SUMMARY_GROUP_PREFIX: &[u8] = b"summary/group/";
+/// Marker row of a running usage rebuild; while it exists the live counters are incomplete.
+pub const USAGE_REBUILD_KEY: &[u8] = b"rebuild";
+/// Prefix of the signed rows a usage rebuild fills before they replace the live counter rows.
+pub const USAGE_SHADOW_PREFIX: &[u8] = b"shadow/";
 
 /// A single node's usage total distributed over the sync layer. Single writer
 /// per key (each node writes only its own snapshots), so ingest is last-write-wins.
@@ -159,6 +163,11 @@ pub fn usage_bucket_key(bucket: &str) -> Vec<u8> {
     [USAGE_BUCKET_PREFIX.as_bytes(), bucket.as_bytes()].concat()
 }
 
+/// The rebuild row of the live counter row `key`.
+pub fn usage_shadow_key(key: &[u8]) -> Vec<u8> {
+    [USAGE_SHADOW_PREFIX, key].concat()
+}
+
 pub fn usage_group_key(group_id: GroupId) -> Vec<u8> {
     let mut key = Vec::with_capacity(6 + 16);
     key.extend_from_slice(b"group/");
@@ -249,7 +258,7 @@ impl UsageCounters {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageDelta {
     pub buckets: i128,
     pub objects: i128,
@@ -339,7 +348,7 @@ impl BucketCounters {
 }
 
 /// A change of [`BucketCounters`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BucketDelta {
     pub objects: i128,
     pub versions: i128,
@@ -372,6 +381,57 @@ impl From<UsageDelta> for BucketDelta {
             ..Default::default()
         }
     }
+}
+
+/// A rebuild row under [`USAGE_SHADOW_PREFIX`]: signed sums of the walked snapshot and of every
+/// delta committed after the rebuild began, so a removal walked later never clamps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ShadowCounters {
+    Usage(UsageDelta),
+    Bucket(BucketDelta),
+}
+
+impl ShadowCounters {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// Adds two rows of one kind; `None` when the kinds differ.
+    pub fn merge(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Usage(left), Self::Usage(right)) => Some(Self::Usage(left.merge(right))),
+            (Self::Bucket(left), Self::Bucket(right)) => Some(Self::Bucket(left.merge(right))),
+            _ => None,
+        }
+    }
+
+    /// The live row this rebuild row becomes; a negative sum is clamped and reported.
+    pub fn live_row(&self) -> Result<(Vec<u8>, Vec<CounterShortfall>), ShadowRowError> {
+        Ok(match self {
+            Self::Usage(delta) => {
+                let mut counters = UsageCounters::default();
+                let shortfalls = counters.apply(delta)?;
+                (counters.to_bytes()?, shortfalls)
+            }
+            Self::Bucket(delta) => {
+                let mut counters = BucketCounters::default();
+                let shortfalls = counters.apply(delta)?;
+                (counters.to_bytes()?, shortfalls)
+            }
+        })
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum ShadowRowError {
+    #[error(transparent)]
+    Counter(#[from] UsageCounterError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]

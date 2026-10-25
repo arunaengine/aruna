@@ -7,7 +7,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use aruna_core::structs::storage::distribution::accounting::{CounterOverflow, RangeCounters};
 use aruna_core::structs::storage::usage::{
-    BucketCounters, BucketDelta, CounterShortfall, UsageCounters, UsageDelta,
+    BucketCounters, BucketDelta, CounterShortfall, USAGE_SHADOW_PREFIX, UsageCounters, UsageDelta,
 };
 use byteview::ByteView;
 use fjall::Readable;
@@ -15,6 +15,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::compaction::{DELETE_THRESHOLD, compactable};
+
+use super::rebuild::shadow_row;
 
 use super::{CleanupEntry, CleanupKind, FjallStorage, MAX_TRANSACTION_CLEANUP, Txn};
 
@@ -28,7 +30,7 @@ pub(super) enum CounterChange {
 
 impl CounterChange {
     /// Folds two changes of one row; rows of one key always hold the same kind.
-    fn merge(self, other: Self) -> Result<Self, StorageError> {
+    pub(super) fn merge(self, other: Self) -> Result<Self, StorageError> {
         let overflow = |error: CounterOverflow| StorageError::WriteError(error.to_string());
         Ok(match (self, other) {
             (Self::Usage(left), Self::Usage(right)) => Self::Usage(left.merge(right)),
@@ -123,9 +125,10 @@ impl FjallStorage {
         txn_id: Ulid,
         txn: &mut fjall::OptimisticWriteTx,
     ) -> Result<(), StorageError> {
-        let Some(pending) = self.txn_usage.remove(&txn_id) else {
+        let Some(mut pending) = self.txn_usage.remove(&txn_id) else {
             return Ok(());
         };
+        self.shadow_changes(&mut pending)?;
         let snapshot = self.store.db.read_tx();
         let failed = |error: &dyn std::fmt::Display| StorageError::WriteError(error.to_string());
         for (key_space, key, change) in pending {
@@ -135,6 +138,11 @@ impl FjallStorage {
                 .map_err(|error| StorageError::ReadError(error.to_string()))?;
             let stored = stored.as_deref();
             let (value, shortfalls) = match change {
+                CounterChange::Usage(_) | CounterChange::Bucket(_)
+                    if key.as_ref().starts_with(USAGE_SHADOW_PREFIX) =>
+                {
+                    (shadow_row(stored, change)?, Vec::new())
+                }
                 CounterChange::Usage(delta) => {
                     let counters = stored.map(UsageCounters::from_bytes).transpose();
                     let mut counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
@@ -392,7 +400,7 @@ impl FjallStorage {
     }
 }
 
-fn warn_clamped(key: &[u8], shortfalls: Vec<CounterShortfall>) {
+pub(super) fn warn_clamped(key: &[u8], shortfalls: Vec<CounterShortfall>) {
     for shortfall in shortfalls {
         warn!(
             event = "storage.usage.clamped",
