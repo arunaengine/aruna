@@ -6,7 +6,7 @@ use aruna_core::effects::IterStart;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use aruna_core::structs::storage::usage::{
-    ShadowCounters, USAGE_REBUILD_KEY, USAGE_SHADOW_PREFIX, usage_shadow_key,
+    ShadowCounters, USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY, USAGE_SHADOW_PREFIX, usage_shadow_key,
 };
 use byteview::ByteView;
 use fjall::Readable;
@@ -155,6 +155,9 @@ impl FjallStorage {
             let (values, next) =
                 iterate_page(&snapshot, &keyspace, None, start.as_ref(), REBUILD_PAGE)?;
             for (key, value) in values {
+                if key.as_ref() == USAGE_COMPLETE_KEY {
+                    continue;
+                }
                 if key.as_ref() == USAGE_REBUILD_KEY {
                     tx.remove(keyspace.clone(), key);
                 } else if let Some(live) = key.as_ref().strip_prefix(USAGE_SHADOW_PREFIX) {
@@ -183,6 +186,8 @@ impl FjallStorage {
                 None => break,
             }
         }
+        let complete = ByteView::from(USAGE_COMPLETE_KEY);
+        tx.insert(keyspace, complete, ByteView::from(&[][..]));
         self.commit_buffered(tx)?;
         self.persist_journal()?;
         Ok(entries)

@@ -29,6 +29,9 @@ pub const SUMMARY_GROUP_PREFIX: &[u8] = b"summary/group/";
 pub const USAGE_REBUILD_KEY: &[u8] = b"rebuild";
 /// Prefix of the signed rows a usage rebuild fills before they replace the live counter rows.
 pub const USAGE_SHADOW_PREFIX: &[u8] = b"shadow/";
+/// Marker row of live counters a rebuild once completed: every later delta applies to them,
+/// so quota decisions keep using them while another rebuild runs.
+pub const USAGE_COMPLETE_KEY: &[u8] = b"complete";
 
 /// A single node's usage total distributed over the sync layer. Single writer
 /// per key (each node writes only its own snapshots), so ingest is last-write-wins.

@@ -611,7 +611,9 @@ async fn ensure_usage_counters(
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-    use aruna_core::structs::storage::usage::{USAGE_REBUILD_KEY, global_shard_keys};
+    use aruna_core::structs::storage::usage::{
+        USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY, global_shard_keys,
+    };
 
     let mut probe_keys = global_shard_keys();
     probe_keys.push(USAGE_REBUILD_KEY.to_vec());
@@ -637,10 +639,20 @@ async fn ensure_usage_counters(
                 .into());
             }
             let (marker, shards) = values.split_last().ok_or("usage counter probe is empty")?;
-            if marker.1.is_some()
-                || shards.iter().any(|(_, value)| value.is_none())
-                || bucket_rows_missing(driver_ctx).await?
-            {
+            let shards_missing = shards.iter().any(|(_, value)| value.is_none());
+            if marker.1.is_some() || shards_missing || bucket_rows_missing(driver_ctx).await? {
+                // Missing group rows leave no complete counters for quota decisions.
+                if shards_missing {
+                    let forget = StorageEffect::Delete {
+                        key_space: USAGE_STATS_KEYSPACE.to_string(),
+                        key: USAGE_COMPLETE_KEY.to_vec().into(),
+                        txn_id: None,
+                    };
+                    let event = driver_ctx.storage_handle.send_storage_effect(forget).await;
+                    if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
+                        return Err(format!("usage completion marker kept: {event:?}").into());
+                    }
+                }
                 let mark = StorageEffect::Write {
                     key_space: USAGE_STATS_KEYSPACE.to_string(),
                     key: USAGE_REBUILD_KEY.to_vec().into(),

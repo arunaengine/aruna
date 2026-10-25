@@ -2646,7 +2646,7 @@ mod sealed {
     /// group without a quota never reads the marker and books its usage.
     #[test]
     fn rebuild_refuses_quota() {
-        use aruna_core::structs::storage::usage::USAGE_REBUILD_KEY;
+        use aruna_core::structs::storage::usage::{USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY};
         for ceiling in [Some(u64::MAX), None] {
             let mut op = operation();
             op.config.quota_ceiling = ceiling;
@@ -2676,6 +2676,15 @@ mod sealed {
             let effects = op.step(Event::Storage(StorageEvent::ReadResult {
                 key: USAGE_REBUILD_KEY.to_vec().into(),
                 value: Some(Vec::new().into()),
+            }));
+            // No earlier rebuild completed the counters, so nothing backs the quota.
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Read { key, .. })] if key.as_ref() == USAGE_COMPLETE_KEY
+            ));
+            let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+                key: USAGE_COMPLETE_KEY.to_vec().into(),
+                value: None,
             }));
             assert!(matches!(
                 effects.as_slice(),

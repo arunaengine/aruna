@@ -15,11 +15,12 @@ use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::usage::{
     BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
-    SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX,
-    USAGE_REBUILD_KEY, UsageCounterError, UsageCounters, UsageDelta, dirty_group_id,
-    dirty_group_key, global_group_key, global_shard_key, global_shard_keys, shard_for_archive,
-    shard_for_hash, usage_backend_key, usage_bucket_key, usage_global_key, usage_group_id,
-    usage_group_key, usage_group_prefix, usage_node_id, usage_snapshot_key, usage_summary_key,
+    SUMMARY_GROUP_PREFIX, USAGE_COMPLETE_KEY, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX,
+    USAGE_GROUP_PREFIX, USAGE_REBUILD_KEY, UsageCounterError, UsageCounters, UsageDelta,
+    dirty_group_id, dirty_group_key, global_group_key, global_shard_key, global_shard_keys,
+    shard_for_archive, shard_for_hash, usage_backend_key, usage_bucket_key, usage_global_key,
+    usage_group_id, usage_group_key, usage_group_prefix, usage_node_id, usage_snapshot_key,
+    usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -396,6 +397,8 @@ impl UsageCounterUpdate {
 enum QuotaGatePhase {
     Pending,
     ReadMarker,
+    /// While a rebuild runs, whether complete counters exist from an earlier one.
+    ReadComplete,
     ReadRealmConfig,
     ReadLocal,
     ScanRemote,
@@ -410,10 +413,9 @@ pub enum QuotaGateError {
     UnexpectedEvent(Event),
 }
 
-/// Embeddable read side of the hard per-group quota gate: sums the group's
-/// realm-wide `logical_bytes` inside the caller's write transaction, so a concurrent
-/// same-group write conflicts on the group key. `ceiling` already folds in grace.
-/// While a usage rebuild runs, the local counters are incomplete and every write is refused.
+/// Embeddable read side of the per-group quota gate: sums the realm-wide `logical_bytes` in the
+/// caller's write transaction, so same-group writes conflict; `ceiling` folds in grace. A rebuild
+/// without complete counters from an earlier one refuses every write.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,
@@ -511,6 +513,21 @@ impl QuotaGate {
                 Event::Storage(StorageEvent::ReadResult { value, .. }),
             ) => {
                 if value.is_some() {
+                    // A rebuild runs: the last complete counters plus their deltas still hold.
+                    self.phase = QuotaGatePhase::ReadComplete;
+                    return Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
+                        key_space: USAGE_STATS_KEYSPACE.to_string(),
+                        key: Key::from(USAGE_COMPLETE_KEY.to_vec()),
+                        txn_id: Some(txn_id),
+                    })]));
+                }
+                Ok(Some(self.read_config_effect(txn_id)))
+            }
+            (
+                QuotaGatePhase::ReadComplete,
+                Event::Storage(StorageEvent::ReadResult { value, .. }),
+            ) => {
+                if value.is_none() {
                     self.rebuilding = true;
                     self.phase = QuotaGatePhase::Done;
                     return Ok(None);
@@ -580,7 +597,8 @@ impl QuotaGate {
     }
 
     /// True when committing the pending write would push the group's realm-wide
-    /// `logical_bytes` past the ceiling, or while usage is being rebuilt. At-ceiling passes.
+    /// `logical_bytes` past the ceiling, or while usage is being rebuilt without complete
+    /// counters from an earlier rebuild. At-ceiling passes.
     pub fn is_exceeded(&self) -> bool {
         self.rebuilding || self.projected_usage() > self.ceiling
     }
@@ -1503,6 +1521,39 @@ mod tests {
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    // A rebuild refuses quota writes only while no earlier rebuild completed the counters.
+    #[test]
+    fn rebuild_keeps_counters() {
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let txn_id = Ulid::from_bytes([1; 16]);
+        let marker = |value: Option<Vec<u8>>| {
+            Event::Storage(StorageEvent::ReadResult {
+                key: Key::from(b"marker".to_vec()),
+                value: value.map(Into::into),
+            })
+        };
+        let mut fresh = QuotaGate::new(10, 1, Ulid::from_bytes([2; 16]), node_id);
+        fresh.start(txn_id);
+        assert!(
+            fresh
+                .step(marker(Some(Vec::new())), txn_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(fresh.step(marker(None), txn_id).unwrap(), None);
+        assert!(fresh.is_rebuilding() && fresh.is_exceeded());
+
+        let mut complete = QuotaGate::new(10, 1, Ulid::from_bytes([2; 16]), node_id);
+        complete.start(txn_id);
+        complete.step(marker(Some(Vec::new())), txn_id).unwrap();
+        let next = complete.step(marker(Some(Vec::new())), txn_id).unwrap();
+        assert!(matches!(
+            next.as_deref(),
+            Some([Effect::Storage(StorageEffect::Read { key, .. })]) if key.as_ref() != USAGE_COMPLETE_KEY
+        ));
+        assert!(!complete.is_rebuilding());
+    }
 
     fn test_ctx(root: &str) -> DriverContext {
         DriverContext {

@@ -7,8 +7,8 @@ use super::{FjallStorage, StorageHandle};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::storage::usage::{
-    BucketCounters, BucketDelta, ShadowCounters, USAGE_REBUILD_KEY, UsageCounters, UsageDelta,
-    usage_shadow_key,
+    BucketCounters, BucketDelta, ShadowCounters, USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY,
+    UsageCounters, UsageDelta, usage_shadow_key,
 };
 use aruna_core::types::TxnId;
 use byteview::ByteView;
@@ -174,6 +174,18 @@ async fn finish_replaces_rows() {
         ..UsageCounters::default()
     };
     assert_eq!(counters(read(&handle, GROUP, None).await), Some(six));
+    // The finished rows count as complete, also while a later rebuild runs.
+    assert!(read(&handle, USAGE_COMPLETE_KEY, None).await.is_some());
+    let again = begin(&handle).await;
+    handle
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id: again })
+        .await;
+    assert!(read(&handle, USAGE_COMPLETE_KEY, None).await.is_some());
+    assert!(matches!(
+        finish(&handle).await,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+    assert!(read(&handle, USAGE_COMPLETE_KEY, None).await.is_some());
 }
 
 /// A begin clears rebuild rows a crashed rebuild left; a finish without a begin in this
