@@ -38,6 +38,8 @@ const ROUND_PREFIX: &[u8] = b"refresh_round/";
 
 /// The record after which the next pass continues; a restart begins again at the start.
 static CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// The set and range after which the set's next pass goes on, so later ranges get pages too.
+static RANGE_CURSOR: Mutex<Option<(Ulid, Ulid)>> = Mutex::new(None);
 
 /// One range's refresh round on this coordinator.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -103,10 +105,17 @@ pub(crate) async fn refresh_ranges(context: &DriverContext) -> Result<bool, Stri
             continue;
         };
         let now_ms = unix_timestamp_millis();
-        for range in coordinated(context, &binding).await? {
-            // A pass that runs out of pages comes back to this set first.
+        let after = (RANGE_CURSOR.lock().ok().and_then(|cursor| *cursor))
+            .filter(|(set_id, _)| *set_id == binding.set_id)
+            .map(|(_, range_id)| range_id);
+        let mut last = None;
+        for range in after_range(coordinated(context, &binding).await?, after) {
+            // A pass that runs out of pages comes back to this set, after its last paged range.
             if pages >= PAGES_PER_PASS {
                 resume(done);
+                if let (Ok(mut cursor), Some(range_id)) = (RANGE_CURSOR.lock(), last) {
+                    *cursor = Some((binding.set_id, range_id));
+                }
                 return Ok(true);
             }
             let key = round_key(binding.set_id, range.range_id);
@@ -120,12 +129,22 @@ pub(crate) async fn refresh_ranges(context: &DriverContext) -> Result<bool, Stri
             };
             let walked = walk_page(context, (bucket, &range), round, realm_id).await?;
             pages += 1;
+            last = Some(range.range_id);
             busy |= !walked.finished;
             write_round(context, key, &walked).await?;
         }
         done = Some(record_key.to_vec());
     }
     Ok(busy)
+}
+
+/// The ranges in the order a pass visits them: those after `after` first, then the rest.
+fn after_range(mut ranges: Vec<KeyRange>, after: Option<Ulid>) -> Vec<KeyRange> {
+    let position = after.and_then(|after| ranges.iter().position(|r| r.range_id == after));
+    if let Some(position) = position {
+        ranges.rotate_left(position + 1);
+    }
+    ranges
 }
 
 /// The ranges this member coordinates now; a range it fenced for a transfer is left out.
@@ -293,6 +312,33 @@ async fn page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A pass that ran out of pages goes on after its last paged range, then wraps around.
+    #[test]
+    fn passes_resume_ranges() {
+        let range = |seed: u8| KeyRange {
+            range_id: Ulid::from_bytes([seed; 16]),
+            lower: String::new(),
+            upper: None,
+            lineage: None,
+            coordinator: Ulid::nil(),
+            epoch: 1,
+            replicas: Vec::new(),
+        };
+        let ids = |ranges: Vec<KeyRange>| -> Vec<u8> {
+            ranges.iter().map(|r| r.range_id.to_bytes()[0]).collect()
+        };
+        let all = vec![range(1), range(2), range(3)];
+        assert_eq!(ids(after_range(all.clone(), None)), [1, 2, 3]);
+        let after = Some(Ulid::from_bytes([2; 16]));
+        assert_eq!(ids(after_range(all.clone(), after)), [3, 1, 2]);
+        let gone = Some(Ulid::from_bytes([9; 16]));
+        assert_eq!(
+            ids(after_range(all, gone)),
+            [1, 2, 3],
+            "a gone range starts over"
+        );
+    }
 
     // A running round goes on; a finished one waits for the interval, then starts over.
     #[test]
