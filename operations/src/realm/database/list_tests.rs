@@ -81,7 +81,7 @@ async fn unlinked_stays_unlinked() {
 #[tokio::test]
 async fn approval_rechecks_owner() {
     // A request taken for one group is not approved once the bucket names another owner.
-    use crate::realm::databases::approve_request;
+    use crate::realm::database::approve_request;
     let (_dir, handle) = open();
     let context = context(&handle);
     let (snapshot, bytes) = record(true);

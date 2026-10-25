@@ -417,5 +417,5 @@ impl Operation for PublishDatabaseOperation {
 }
 
 #[cfg(test)]
-#[path = "database_publish_tests.rs"]
+#[path = "publish_tests.rs"]
 mod tests;

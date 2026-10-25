@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::realm::database_list::{Caller, DatabaseServiceError, list_databases};
-use aruna_operations::realm::database_publish::PublishDatabaseError;
-use aruna_operations::realm::databases::{
+use aruna_operations::realm::database::list::{Caller, DatabaseServiceError, list_databases};
+use aruna_operations::realm::database::publish::PublishDatabaseError;
+use aruna_operations::realm::database::{
     MarkInput, MarkOutcome, approve_request, list_requests, mark_database, reject_request,
     remove_database,
 };

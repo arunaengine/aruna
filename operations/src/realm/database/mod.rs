@@ -4,6 +4,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod list;
+pub mod publish;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
@@ -21,10 +24,10 @@ use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 
-use super::database_list::{Caller, DatabaseServiceError, allowed, read};
+use self::list::{Caller, DatabaseServiceError, allowed, read};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::forwarded_bearer;
-use crate::realm::database_publish::{
+use crate::realm::database::publish::{
     DatabaseChange, PublishDatabaseConfig, PublishDatabaseOperation,
 };
 use crate::realm::get_config::GetConfigOperation;
@@ -175,8 +178,8 @@ async fn require_link(
     caller: &Caller,
     entry: &DatabaseEntry,
 ) -> Result<(), DatabaseServiceError> {
-    match super::database_list::dataset_links(context, realm_id, node_id, caller, entry).await? {
-        Some(super::database_list::LinkedDataset::Linked { .. }) => Ok(()),
+    match list::dataset_links(context, realm_id, node_id, caller, entry).await? {
+        Some(list::LinkedDataset::Linked { .. }) => Ok(()),
         Some(_) => Err(DatabaseServiceError::NotLinked(entry.dataset_id)),
         None => Err(DatabaseServiceError::Unavailable(
             "not every metadata node answered; the dataset link cannot be confirmed".to_string(),
@@ -368,7 +371,7 @@ async fn register_version(
     realm_id: RealmId,
     entry_id: Ulid,
 ) -> Result<Option<AdminDocumentDot>, DatabaseServiceError> {
-    let state = super::database_list::config_state(context, realm_id).await?;
+    let state = list::config_state(context, realm_id).await?;
     Ok(state.and_then(|state| state.database_version(entry_id)))
 }
 

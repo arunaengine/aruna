@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::identity::database::{DatabaseEntry, DatabaseRequest, DatabaseTarget};
-use aruna_operations::realm::database_list::{DatabaseListing, DatabaseState};
+use aruna_operations::realm::database::list::{DatabaseListing, DatabaseState};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};

@@ -25,7 +25,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::metadata::api::{LinkNodeRequest, LinkQuery, links_distributed};
-use crate::realm::database_publish::PublishDatabaseError;
+use crate::realm::database::publish::PublishDatabaseError;
 use crate::realm::get_config::GetConfigOperation;
 
 /// Pages of linking datasets read to find one dataset, at most.
@@ -377,5 +377,5 @@ fn entry_bucket(entry: &DatabaseEntry) -> String {
 }
 
 #[cfg(test)]
-#[path = "database_list_tests.rs"]
+#[path = "list_tests.rs"]
 mod tests;

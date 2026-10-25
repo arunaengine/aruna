@@ -61,6 +61,7 @@ SMALL_DOMAINS = {
     "operations/src/jobs/store": "coherent ownership scope",
     "operations/src/metadata/forward": "grouped shared-prefix domain",
     "operations/src/metadata/profile": "grouped shared-prefix domain",
+    "operations/src/realm/database": "grouped shared-prefix domain",
     "operations/src/replication/incoming": "grouped shared-prefix domain",
     "operations/src/s3": "coherent ownership scope",
     "operations/src/s3/bucket/rotate": "grouped shared-prefix domain",
