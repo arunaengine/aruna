@@ -89,3 +89,19 @@ fn deletion_fence_closes_set() {
     assert_eq!(LocalFence::decode(Some(&encoded)).unwrap(), local);
     assert_eq!(LocalFence::decode(None).unwrap(), LocalFence::default());
 }
+
+#[test]
+fn clear_cursor_sorts_first() {
+    // The clear cursor of a set sorts before its range purge cursors, so a walk after it skips it.
+    let set_id = Ulid::from_bytes([3; 16]);
+    let clear = ClearCursor::key(set_id);
+    let purge = PurgeCursor::key(set_id, Ulid::from_bytes([0; 16]));
+    assert!(clear < purge && purge.starts_with(&clear));
+    let cursor = ClearCursor {
+        step: 2,
+        after: Some(vec![1]),
+    };
+    let encoded = cursor.to_bytes().unwrap();
+    assert_eq!(ClearCursor::decode(Some(&encoded)).unwrap(), cursor);
+    assert_eq!(ClearCursor::decode(None).unwrap(), ClearCursor::default());
+}

@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::accounting::account_key;
-use aruna_core::structs::storage::distribution::fence::PurgeCursor;
+use aruna_core::structs::storage::distribution::fence::{ClearCursor, PurgeCursor};
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, Position, VersionEntry, index_key, range_interval,
 };
@@ -191,60 +191,97 @@ pub async fn purge_rest(context: &DriverContext, target: &PurgeTarget) -> Result
     Ok(())
 }
 
-/// Deletes what this node keeps of a set besides its bucket: inventory, accounting, bootstrap
-/// cursors, purge cursors and copy-on-use attachments with their bytes. The fence row stays
-/// with `keep_fence`, so nothing writes into a deleted set again.
+/// The keyspaces a set's local rows are cleared from, in step order after the attachments.
+const CLEARED: [&str; 9] = [
+    INVENTORY_KEYSPACE,
+    UPLOAD_INVENTORY_KEYSPACE,
+    VERSION_INDEX_KEYSPACE,
+    RANGE_INDEX_KEYSPACE,
+    RANGE_ACCOUNT_KEYSPACE,
+    RANGE_COUNTER_KEYSPACE,
+    KEY_SAMPLE_KEYSPACE,
+    BOOTSTRAP_KEYSPACE,
+    DISTRIBUTION_PURGE_KEYSPACE,
+];
+
+/// Deletes what this node keeps of a set besides its bucket: copy-on-use attachments with
+/// their bytes, inventory, accounting, bootstrap and purge cursors, at most `pages` pages per
+/// call from a durable cursor. The fence row stays with `keep_fence`, so nothing writes into a
+/// deleted set again.
 pub async fn clear_set_rows(
     context: &DriverContext,
     set_id: Ulid,
     keep_fence: bool,
-) -> Result<(), String> {
+    pages: &mut usize,
+) -> Result<Purged, String> {
+    let key = ClearCursor::key(set_id);
+    let stored = read(context, DISTRIBUTION_PURGE_KEYSPACE, key.clone()).await?;
+    let mut cursor = ClearCursor::decode(stored.as_deref()).map_err(|e| e.to_string())?;
     let prefix = set_id.to_bytes().to_vec();
-    loop {
-        let iter = StorageEffect::Iter {
-            key_space: ATTACHMENT_KEYSPACE.to_string(),
-            prefix: Some(prefix.clone().into()),
-            start: None,
-            limit: PAGE_ROWS,
-            txn_id: None,
-        };
-        let rows = match context.storage_handle.send_storage_effect(iter).await {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected scan answer {other:?}")),
-        };
-        if rows.is_empty() {
-            break;
+    while usize::from(cursor.step) <= CLEARED.len() {
+        if *pages == 0 {
+            return Ok(Purged::More);
         }
-        for (key, value) in rows {
-            if let Ok(attachment) = Attachment::from_bytes(&value) {
+        *pages -= 1;
+        let space = match cursor.step {
+            0 => ATTACHMENT_KEYSPACE,
+            step => CLEARED[usize::from(step) - 1],
+        };
+        // The cursor row itself sorts first among the purge cursors and is skipped.
+        let start = match (cursor.after.clone(), space == DISTRIBUTION_PURGE_KEYSPACE) {
+            (Some(after), _) => Some(after),
+            (None, true) => Some(key.clone()),
+            (None, false) => None,
+        };
+        let rows = clear_page(context, space, &prefix, start).await?;
+        match rows.last() {
+            None => (cursor.step, cursor.after) = (cursor.step + 1, None),
+            Some((last, _)) => cursor.after = Some(last.to_vec()),
+        }
+        let mut deletes = Vec::with_capacity(rows.len());
+        for (row, value) in rows {
+            if space == ATTACHMENT_KEYSPACE
+                && let Ok(attachment) = Attachment::from_bytes(&value)
+            {
                 drop_copy(context, &attachment.location).await;
             }
-            batch_delete(context, vec![(ATTACHMENT_KEYSPACE.to_string(), key)]).await?;
+            deletes.push((space.to_string(), row));
         }
+        batch_delete(context, deletes).await?;
+        let value = cursor.to_bytes().map_err(|error| error.to_string())?;
+        write(context, DISTRIBUTION_PURGE_KEYSPACE, key.clone(), value).await?;
     }
-    let spaces = [
-        INVENTORY_KEYSPACE,
-        UPLOAD_INVENTORY_KEYSPACE,
-        VERSION_INDEX_KEYSPACE,
-        RANGE_INDEX_KEYSPACE,
-        RANGE_ACCOUNT_KEYSPACE,
-        RANGE_COUNTER_KEYSPACE,
-        KEY_SAMPLE_KEYSPACE,
-        BOOTSTRAP_KEYSPACE,
-        DISTRIBUTION_PURGE_KEYSPACE,
-    ];
-    for key_space in spaces {
-        clear_prefix(context, key_space, prefix.clone()).await?;
-    }
+    let mut deletes = vec![(DISTRIBUTION_PURGE_KEYSPACE.to_string(), key.into())];
     if !keep_fence {
-        batch_delete(
-            context,
-            vec![(DISTRIBUTION_FENCE_KEYSPACE.to_string(), prefix.into())],
-        )
-        .await?;
+        deletes.push((DISTRIBUTION_FENCE_KEYSPACE.to_string(), prefix.into()));
     }
-    Ok(())
+    batch_delete(context, deletes).await?;
+    Ok(Purged::Done)
+}
+
+/// One page of a set's rows in `key_space`, after `start` when given.
+async fn clear_page(
+    context: &DriverContext,
+    key_space: &str,
+    prefix: &[u8],
+    start: Option<Vec<u8>>,
+) -> Result<Vec<(Key, Value)>, String> {
+    let limit = match key_space == ATTACHMENT_KEYSPACE {
+        true => PAGE_ROWS,
+        false => PAGE_ROWS * 16,
+    };
+    let iter = StorageEffect::Iter {
+        key_space: key_space.to_string(),
+        prefix: Some(prefix.to_vec().into()),
+        start: start.map(|key| IterStart::After(key.into())),
+        limit,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(iter).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected scan answer {other:?}")),
+    }
 }
 
 async fn abort_uploads(
@@ -517,5 +554,88 @@ pub(super) async fn batch_delete(
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected delete answer {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distribution::test_store::open;
+
+    fn context(storage_handle: aruna_storage::storage::StorageHandle) -> DriverContext {
+        DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    fn row(set_id: Ulid, seed: u8) -> Vec<u8> {
+        let mut key = set_id.to_bytes().to_vec();
+        key.push(seed);
+        key
+    }
+
+    #[tokio::test]
+    async fn clearing_resumes_in_bounded_passes() {
+        // Each pass spends at most its pages; the next resumes at the cursor until the set is gone.
+        let (_dir, handle) = open();
+        let context = context(handle);
+        let (set_id, other) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
+        for seed in 0..4 {
+            for id in [set_id, other] {
+                write(&context, INVENTORY_KEYSPACE, row(id, seed), vec![seed])
+                    .await
+                    .unwrap();
+            }
+        }
+        let range_cursor = PurgeCursor::key(set_id, Ulid::from_bytes([3; 16]));
+        write(
+            &context,
+            DISTRIBUTION_PURGE_KEYSPACE,
+            range_cursor.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let fence = set_id.to_bytes().to_vec();
+        write(&context, DISTRIBUTION_FENCE_KEYSPACE, fence.clone(), vec![])
+            .await
+            .unwrap();
+        let mut passes = 0;
+        loop {
+            passes += 1;
+            let mut pages = 1;
+            let cleared = clear_set_rows(&context, set_id, true, &mut pages).await;
+            if cleared.unwrap() == Purged::Done {
+                break;
+            }
+            assert_eq!(pages, 0, "a waiting pass spent its whole budget");
+            assert!(passes < 32, "clearing must finish");
+        }
+        assert!(
+            passes > CLEARED.len(),
+            "every keyspace takes at least one page"
+        );
+        for seed in 0..4 {
+            let gone = read(&context, INVENTORY_KEYSPACE, row(set_id, seed)).await;
+            assert_eq!(gone.unwrap(), None);
+            let kept = read(&context, INVENTORY_KEYSPACE, row(other, seed)).await;
+            assert!(kept.unwrap().is_some(), "another set's rows stay");
+        }
+        let purged = read(&context, DISTRIBUTION_PURGE_KEYSPACE, range_cursor).await;
+        assert_eq!(purged.unwrap(), None);
+        let cursor = read(
+            &context,
+            DISTRIBUTION_PURGE_KEYSPACE,
+            ClearCursor::key(set_id),
+        )
+        .await;
+        assert_eq!(cursor.unwrap(), None, "a finished clear leaves no cursor");
+        let kept = read(&context, DISTRIBUTION_FENCE_KEYSPACE, fence).await;
+        assert!(kept.unwrap().is_some(), "a deleted set keeps its fence");
     }
 }

@@ -118,6 +118,29 @@ impl PurgeCursor {
     }
 }
 
+/// Where clearing what a node keeps of a set continues: the keyspace step and the last key
+/// it deleted there. It sorts before the set's purge cursors, which share its prefix.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClearCursor {
+    pub step: u8,
+    pub after: Option<Vec<u8>>,
+}
+
+impl ClearCursor {
+    /// The cursor key: the set id alone.
+    pub fn key(set_id: Ulid) -> Vec<u8> {
+        set_id.to_bytes().to_vec()
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn decode(value: Option<&[u8]>) -> Result<Self, ConversionError> {
+        value.map_or_else(|| Ok(Self::default()), |v| Ok(postcard::from_bytes(v)?))
+    }
+}
+
 #[cfg(test)]
 #[path = "fence_tests.rs"]
 mod tests;

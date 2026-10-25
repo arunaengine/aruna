@@ -203,7 +203,7 @@ impl SetWork {
         }
         let mut left = Left::Settled;
         if member.state == MemberState::Leaving {
-            left = left.and(self.leave(context, snapshot, &local).await?);
+            left = left.and(self.leave(context, snapshot, &local, budget).await?);
         }
         for open in &snapshot.lifecycle.transfers {
             if open.from == member.member_id {
@@ -269,7 +269,7 @@ impl SetWork {
         }
         let Some(binding) = local.binding.clone() else {
             // The member bucket is gone or replaced: nothing of the set is left here.
-            return self.clear_set(context, true).await;
+            return self.clear_set(context, true, budget).await;
         };
         for range in &snapshot.config.ranges {
             let target = self.target(snapshot, &binding, range);
@@ -282,7 +282,7 @@ impl SetWork {
                 .bound_to(binding.clone());
         match drive(delete, context.as_ref()).await {
             Ok(()) | Err(crate::s3::bucket::delete::DeleteBucketError::NotFound) => {
-                self.clear_set(context, true).await
+                self.clear_set(context, true, budget).await
             }
             Err(error) => {
                 // Versions the inventory did not name block the delete; their walk follows.
@@ -314,10 +314,17 @@ impl SetWork {
     }
 
     /// Deletes what this node keeps of the set besides its bucket: inventory, accounting,
-    /// bootstrap, purge cursors and kept copies, in bounded batches.
-    async fn clear_set(&self, context: &DriverContext, keep_fence: bool) -> Result<Left, String> {
-        clear_set_rows(context, self.set_id, keep_fence).await?;
-        Ok(Left::Settled)
+    /// bootstrap, purge cursors and kept copies, a bounded number of pages per pass.
+    async fn clear_set(
+        &self,
+        context: &DriverContext,
+        keep_fence: bool,
+        budget: &mut usize,
+    ) -> Result<Left, String> {
+        match clear_set_rows(context, self.set_id, keep_fence, budget).await? {
+            Purged::Done => Ok(Left::Settled),
+            Purged::More => Ok(Left::Waiting),
+        }
     }
 
     /// A leaving member refuses publications, then releases its bucket as an ordinary one.
@@ -326,6 +333,7 @@ impl SetWork {
         context: &DriverContext,
         snapshot: &DistributionSnapshot,
         local: &Local<'_>,
+        budget: &mut usize,
     ) -> Result<Left, String> {
         if let Some(binding) = &local.binding {
             update_fence(context, self.set_id, |fence| {
@@ -335,7 +343,7 @@ impl SetWork {
             unbind(context, &snapshot.config.bucket, binding).await?;
         }
         // The released bucket checks no fence; a later join of this node starts afresh.
-        self.clear_set(context, false).await
+        self.clear_set(context, false, budget).await
     }
 
     /// The former coordinator's side: fence the range, abort its uploads, state the fence.
