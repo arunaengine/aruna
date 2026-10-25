@@ -314,11 +314,11 @@ impl SetWork {
         snapshot: &DistributionSnapshot,
         local: &Local<'_>,
     ) -> Result<Left, String> {
-        update_fence(context, self.set_id, |fence| {
-            !std::mem::replace(&mut fence.closed, true)
-        })
-        .await?;
         if let Some(binding) = &local.binding {
+            update_fence(context, self.set_id, |fence| {
+                !std::mem::replace(&mut fence.closed, true)
+            })
+            .await?;
             unbind(context, &snapshot.config.bucket, binding).await?;
         }
         // The released bucket checks no fence; a later join of this node starts afresh.
