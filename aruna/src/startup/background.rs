@@ -7,6 +7,7 @@ use std::sync::Arc;
 use aruna_api::monitoring::Readiness;
 use aruna_core::document::DocumentTarget;
 use aruna_core::shutdown::Shutdown;
+use aruna_operations::distribution::index_feed::spawn_index_feed;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::drain::restore_drain_timer;
 use aruna_operations::jobs::lifecycle::restore_lifecycle_timers;
@@ -52,6 +53,7 @@ pub(crate) enum StartupPhase {
     SweepSessions,
     DrainGitMerges,
     RecoverChild,
+    FeedIndexes,
 }
 
 /// The order the node starts its durable background work. Readiness requires
@@ -69,6 +71,7 @@ pub(crate) const STARTUP_PHASES: &[StartupPhase] = &[
     StartupPhase::SweepSessions,
     StartupPhase::DrainGitMerges,
     StartupPhase::RecoverChild,
+    StartupPhase::FeedIndexes,
 ];
 
 /// What the ordered background start did, in the same required-versus-optional
@@ -207,6 +210,7 @@ pub(crate) async fn start(
                         .await;
                 });
             }
+            StartupPhase::FeedIndexes => spawn_index_feed(driver_ctx.clone(), &shutdown),
         }
     }
     if completed_all_phases {
@@ -442,7 +446,7 @@ mod tests {
 mod pure_tests {
     use super::*;
 
-    const ALL_PHASES: [StartupPhase; 11] = [
+    const ALL_PHASES: [StartupPhase; 12] = [
         StartupPhase::Ready,
         StartupPhase::CorePublication,
         StartupPhase::RecoverStaleJobs,
@@ -454,6 +458,7 @@ mod pure_tests {
         StartupPhase::SweepSessions,
         StartupPhase::DrainGitMerges,
         StartupPhase::RecoverChild,
+        StartupPhase::FeedIndexes,
     ];
 
     // The executed order is the tested order: readiness before recovery, the
