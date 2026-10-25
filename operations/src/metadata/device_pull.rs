@@ -37,6 +37,7 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 
 /// Pulls this node is running, by receipt key. The registry lives as long as the process, so a
 /// restart forgets a running pull and the device asks for it again.
@@ -224,8 +225,21 @@ async fn admit_pull(
     own_source(peer, request)?;
     let node_id = local_node(context)?;
     let bucket = read_bucket(context, &request.target_bucket).await?;
+    guard_target(context, &request.target_bucket).await?;
     ensure_write(context, &auth, node_id, &bucket, request).await?;
     Ok((auth, node_id, bucket))
+}
+
+/// A pull writes like a client, so a bucket that is read-only for clients refuses it too.
+async fn guard_target(context: &DriverContext, bucket: &str) -> Result<(), SyncRefusal> {
+    match guard_bucket_write(context, bucket).await {
+        Ok(()) => Ok(()),
+        Err(OfferedDirectoryError::ReadOnly(_)) => Err(SyncRefusal::Forbidden),
+        Err(error) => {
+            debug!(error = %error, bucket = %bucket, "A sync pull could not check its target bucket");
+            Err(SyncRefusal::Unavailable)
+        }
+    }
 }
 
 /// Commits one admitted pull, counting the bytes that arrive into `bytes_done`.
@@ -944,6 +958,81 @@ mod tests {
             stored,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
+    }
+
+    // A pull into an offered folder bucket is refused, and so is one into the bucket of a folder
+    // being unbound after its offer is gone. The cleanup on this node still deletes the bucket.
+    #[tokio::test]
+    async fn guards_folder_pull() {
+        use crate::device::sync::folders::{finish_unbind, folder_bucket, store_folder};
+        use crate::staging::offered_directory::{
+            OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
+        };
+        use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = Arc::new(fixture.driver_context);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), b"note").unwrap();
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let folder_id = Ulid::generate();
+        let bucket = folder_bucket(folder_id);
+        let offer = OfferDirectoryInput {
+            bucket: bucket.clone(),
+            root: root.path().to_string_lossy().to_string(),
+            group_id: Ulid::generate(),
+            realm_id,
+            node_id,
+            user_id,
+        };
+        offer_directory(&context, offer.clone()).await.unwrap();
+        assert_eq!(
+            guard_target(&context, &bucket).await,
+            Err(SyncRefusal::Forbidden)
+        );
+
+        let folder = SyncedFolder {
+            folder_id,
+            root: offer.root.clone(),
+            local_bucket: bucket.clone(),
+            group_id: offer.group_id,
+            remote: RemoteBinding {
+                node_id,
+                bucket: "lab".to_string(),
+                prefix: String::new(),
+            },
+            mode: FolderMode::TwoWay,
+            propagate_deletes: true,
+            state: FolderState::Deleting,
+            created_by: user_id,
+            created_at_ms: 1,
+            last_reconcile_ms: None,
+            last_error: None,
+            last_error_ms: None,
+            observed_files: 0,
+            list_cursor: None,
+        };
+        store_folder(&context, &folder).await.unwrap();
+        let withdrawal = WithdrawOfferInput {
+            bucket: bucket.clone(),
+            realm_id,
+            node_id,
+            user_id,
+        };
+        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+        assert_eq!(
+            guard_target(&context, &bucket).await,
+            Err(SyncRefusal::Forbidden)
+        );
+
+        assert_eq!(finish_unbind(&context, folder_id, node_id).await, Ok(()));
+        assert!(matches!(
+            read_bucket(&context, &bucket).await,
+            Err(SyncRefusal::NotFound)
+        ));
+        assert_eq!(guard_target(&context, &bucket).await, Ok(()));
     }
 
     #[tokio::test]
