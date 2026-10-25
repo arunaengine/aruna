@@ -95,6 +95,19 @@ fn admits_coordinator() {
 }
 
 #[test]
+fn refuses_future_epoch() {
+    // A version above the publication epoch would outrank every later coordinator's writes.
+    let (mut manifest, record, bucket) = published();
+    let published = manifest.distribution.as_ref().unwrap().epoch.0;
+    manifest.original_epoch = aruna_core::structs::storage::distribution::OriginalEpoch(published);
+    let operation = admit(receiver(manifest.clone(), 1), &bucket, record.clone());
+    assert_eq!(operation.state, IncomingVersionState::ReadExistingVersion);
+    manifest.original_epoch.0 += 1;
+    let operation = admit(receiver(manifest, 1), &bucket, record);
+    assert!(rejected(&operation));
+}
+
+#[test]
 fn refuses_other_sender() {
     let (manifest, record, bucket) = published();
     let operation = admit(receiver(manifest, 3), &bucket, record);

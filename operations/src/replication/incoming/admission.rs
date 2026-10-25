@@ -60,6 +60,15 @@ impl IncomingVersionOperation {
         let key = &self.manifest.key;
         view.snapshot()
             .admit(binding, self.publisher_node_id, key, publication)?;
+        // A version never claims an epoch above the authority it was published under.
+        let (epoch, published) = (self.manifest.original_epoch.0, publication.epoch.0);
+        if epoch > published {
+            let error = AdmissionError::FutureEpoch {
+                epoch,
+                publication: published,
+            };
+            return Err(error.into());
+        }
         // A leaving or deleted member fences its own bucket before the record says so.
         let fence = LocalFence::decode(fence.as_deref())?;
         if !fence.receiving() {

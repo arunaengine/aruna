@@ -61,6 +61,8 @@ pub enum AdmissionError {
     Fenced,
     #[error("distributed bucket {0} is being deleted")]
     Deleting(Ulid),
+    #[error("a version of epoch {epoch} is above the publication epoch {publication}")]
+    FutureEpoch { epoch: u64, publication: u64 },
 }
 
 impl AdmissionError {

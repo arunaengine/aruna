@@ -79,6 +79,12 @@ impl Watermark {
             && counters.delete_markers >= self.delete_markers
             && counters.max_epoch.0 >= self.max_epoch
     }
+
+    /// Whether every version of the range is older than `epoch`, so the new coordinator's
+    /// writes at `epoch` outrank them.
+    pub fn below(&self, epoch: u64) -> bool {
+        self.max_epoch < epoch
+    }
 }
 
 /// What one set left to do on this node.
@@ -462,10 +468,15 @@ impl SetWork {
             return Ok(Left::Waiting);
         };
         let wanted: Watermark = postcard::from_bytes(&bytes).map_err(|error| error.to_string())?;
-        let reached = range_counters(context, self.set_id, open.range_id)
-            .await?
-            .is_some_and(|counters| wanted.reached_by(&counters));
-        if !reached || local.binding.is_none() {
+        let Some(counters) = range_counters(context, self.set_id, open.range_id).await? else {
+            return Ok(Left::Waiting);
+        };
+        if !wanted.reached_by(&counters) || local.binding.is_none() {
+            return Ok(Left::Waiting);
+        }
+        // A holder's version at the new epoch or above would outrank the new coordinator.
+        if !wanted.below(open.epoch) || !Watermark::of(&counters).below(open.epoch) {
+            warn!(set_id = %self.set_id, transfer_id = %open.transfer_id, "A transfer epoch is not above its range's versions");
             return Ok(Left::Waiting);
         }
         // Every source root of what it applied must be readable here before it takes over.
@@ -883,6 +894,7 @@ mod tests {
             ..fenced
         };
         assert!(!watermark.reached_by(&older));
+        assert!(watermark.below(4) && !watermark.below(3));
         let bytes = postcard::to_allocvec(&watermark).unwrap();
         assert_eq!(
             postcard::from_bytes::<Watermark>(&bytes).unwrap(),
