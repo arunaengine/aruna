@@ -12,16 +12,17 @@ use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, BOOTSTRAP_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE,
-    DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_PURGE_KEYSPACE, INVENTORY_KEYSPACE,
-    KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE,
-    SOURCE_ROOT_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
+    CONTENT_INDEX_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_PURGE_KEYSPACE,
+    INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
+    RANGE_INDEX_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE, SOURCE_ROOT_KEYSPACE,
+    UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::accounting::account_key;
 use aruna_core::structs::storage::distribution::fence::{ClearCursor, PurgeCursor};
 use aruna_core::structs::storage::distribution::inventory::{
-    Entry, Position, VersionEntry, index_key, range_interval,
+    Entry, Position, VersionEntry, content_key, head_position, index_key, range_interval,
 };
 use aruna_core::structs::storage::distribution::on_use::{
     Attachment, CACHE_TOTALS_KEY, CacheEntry, CacheTotals, attachment_key,
@@ -29,6 +30,7 @@ use aruna_core::structs::storage::distribution::on_use::{
 use aruna_core::types::{GroupId, Key, Value};
 use ulid::Ulid;
 
+use super::feed_store::split_key;
 use super::pull::drop_copy;
 use crate::driver::{DriverContext, drive, now_ms};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -198,7 +200,7 @@ pub async fn purge_rest(context: &DriverContext, target: &PurgeTarget) -> Result
 }
 
 /// The keyspaces a set's local rows are cleared from, in step order after the attachments.
-const CLEARED: [&str; 10] = [
+const CLEARED: [&str; 13] = [
     INVENTORY_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE,
     VERSION_INDEX_KEYSPACE,
@@ -208,13 +210,16 @@ const CLEARED: [&str; 10] = [
     KEY_SAMPLE_KEYSPACE,
     BOOTSTRAP_KEYSPACE,
     SOURCE_ROOT_KEYSPACE,
+    CONTENT_INDEX_KEYSPACE,
+    SEARCH_FEED_KEYSPACE,
+    SEARCH_INDEX_KEYSPACE,
     DISTRIBUTION_PURGE_KEYSPACE,
 ];
 
 /// Deletes what this node keeps of a set besides its bucket: copy-on-use attachments with
-/// their bytes, inventory, accounting, bootstrap and purge cursors, at most `pages` pages per
-/// call from a durable cursor. The fence row stays with `keep_fence`, so nothing writes into a
-/// deleted set again.
+/// their bytes, inventory, accounting, search indexes, bootstrap and purge cursors, at most
+/// `pages` pages per call from a durable cursor. The fence row stays with `keep_fence`, so
+/// nothing writes into a deleted set again.
 pub async fn clear_set_rows(
     context: &DriverContext,
     set_id: Ulid,
@@ -251,6 +256,10 @@ pub async fn clear_set_rows(
                 && let Ok(attachment) = Attachment::from_bytes(&value)
             {
                 drop_copy(context, &attachment.location).await;
+            }
+            if space == SEARCH_INDEX_KEYSPACE {
+                let (_, range_id) = split_key(&row).map_err(|error| error.to_string())?;
+                drop_index(context, set_id, range_id).await?;
             }
             deletes.push((space.to_string(), row));
         }
@@ -327,12 +336,18 @@ async fn purge_keys(
     let mut deletes = Vec::with_capacity(rows.len() * 2);
     for (row, value) in rows {
         let position = Position::decode(&row).map_err(|error| error.to_string())?;
+        if let Entry::Head = position.entry {
+            let feed = head_position(set_id, &position.key).into();
+            deletes.push((SEARCH_FEED_KEYSPACE.to_string(), feed));
+        }
         if let Entry::Version { version_id, .. } = position.entry {
             delete_version(context, target, &position.key, version_id).await?;
             drop_attachment(context, set_id, version_id).await?;
             let entry = VersionEntry::from_bytes(&value).map_err(|error| error.to_string())?;
             if let Some(identity) = entry.identity {
                 drop_cached(context, identity).await?;
+                let content = content_key(set_id, &identity, version_id).into();
+                deletes.push((CONTENT_INDEX_KEYSPACE.to_string(), content));
             }
             let index = index_key(set_id, version_id).into();
             deletes.push((VERSION_INDEX_KEYSPACE.to_string(), index));
@@ -460,8 +475,8 @@ async fn drop_cached(context: &DriverContext, identity: [u8; 32]) -> Result<(), 
     Ok(())
 }
 
-/// Deletes the accounting rows this node keeps for the range: its account, counters and
-/// key sample, in bounded batches.
+/// Deletes the accounting rows this node keeps for the range: its account, counters, key
+/// sample and search index, in bounded batches.
 async fn clear_range_rows(
     context: &DriverContext,
     set_id: Ulid,
@@ -472,10 +487,20 @@ async fn clear_range_rows(
         RANGE_COUNTER_KEYSPACE,
         KEY_SAMPLE_KEYSPACE,
         RANGE_ACCOUNT_KEYSPACE,
+        SEARCH_INDEX_KEYSPACE,
     ] {
         clear_prefix(context, key_space, prefix.clone()).await?;
     }
-    Ok(())
+    drop_index(context, set_id, range_id).await
+}
+
+/// Removes every generation of the range's search index from disk.
+async fn drop_index(context: &DriverContext, set_id: Ulid, range_id: Ulid) -> Result<(), String> {
+    let Some(metadata) = &context.metadata_handle else {
+        return Ok(());
+    };
+    (metadata.range_indexes().prune(set_id, range_id, None).await)
+        .map_err(|error| error.to_string())
 }
 
 /// Deletes every row under `prefix` in bounded batches.
@@ -644,5 +669,29 @@ mod tests {
         assert_eq!(cursor.unwrap(), None, "a finished clear leaves no cursor");
         let kept = read(&context, DISTRIBUTION_FENCE_KEYSPACE, fence).await;
         assert!(kept.unwrap().is_some(), "a deleted set keeps its fence");
+    }
+
+    #[tokio::test]
+    async fn clears_search_rows() {
+        // Content index, search feed and search index rows leave with the set.
+        let (_dir, handle) = open();
+        let context = context(handle);
+        let set_id = Ulid::from_bytes([1; 16]);
+        let key = account_key(set_id, Ulid::from_bytes([3; 16]));
+        let spaces = [
+            CONTENT_INDEX_KEYSPACE,
+            SEARCH_FEED_KEYSPACE,
+            SEARCH_INDEX_KEYSPACE,
+        ];
+        for space in spaces {
+            write(&context, space, key.clone(), vec![1]).await.unwrap();
+        }
+        let mut pages = usize::MAX;
+        let cleared = clear_set_rows(&context, set_id, false, &mut pages).await;
+        assert_eq!(cleared.unwrap(), Purged::Done);
+        for space in spaces {
+            let gone = read(&context, space, key.clone()).await.unwrap();
+            assert_eq!(gone, None, "{space} keeps no row of a cleared set");
+        }
     }
 }
