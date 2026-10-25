@@ -34,6 +34,7 @@ pub struct DataLinksParams {
     pub parts_only: bool,
     /// The `next_after` of the previous page.
     pub after: Option<Ulid>,
+    /// Documents per page, 1 to 100 (default 25).
     pub limit: Option<usize>,
 }
 
@@ -45,9 +46,12 @@ pub struct BucketLinksParams {
     pub version_id: Option<Ulid>,
     /// A folder (`raw/2026/`) or the bucket root (empty): datasets that link exactly it.
     pub prefix: Option<String>,
+    /// Only linked parts: with `key`, the file's derived `isPartOf`.
     #[serde(default)]
     pub parts_only: bool,
+    /// The `next_after` of the previous page.
     pub after: Option<Ulid>,
+    /// Documents per page, 1 to 100 (default 25).
     pub limit: Option<usize>,
 }
 
@@ -307,6 +311,7 @@ async fn run(
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PartOfParams {
+    /// Object key in the bucket.
     pub key: String,
 }
 

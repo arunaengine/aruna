@@ -516,7 +516,7 @@ pub(crate) async fn set_postings(
     let mut last = None;
     for range in [scope.key(), set_versions_key(set_id)] {
         if rows.len() >= limit {
-            break;
+            return Ok((rows, last));
         }
         let start = match &after {
             Some(after) if after.starts_with(&range) => {
@@ -543,7 +543,9 @@ pub(crate) async fn set_postings(
             return Ok((rows, last));
         }
     }
-    Ok((rows, None))
+    // A full page names its last key even at the end; the page after it is empty.
+    let next = (rows.len() >= limit).then_some(last).flatten();
+    Ok((rows, next))
 }
 
 /// Queued and parked materializations on this node, each counted up to `cap`: postings of

@@ -117,6 +117,7 @@ pub struct DatabaseListResponse {
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct DatabaseListParams {
+    /// The `next_after` of the previous page.
     pub after: Option<Ulid>,
     /// Entries per page, 1 to 100 (default 25).
     pub limit: Option<usize>,

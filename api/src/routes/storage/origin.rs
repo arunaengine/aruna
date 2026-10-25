@@ -40,6 +40,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct OriginParams {
+    /// Object key in the bucket.
     pub key: String,
     /// The version; the current version when absent.
     pub version_id: Option<Ulid>,
