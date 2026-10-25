@@ -852,6 +852,45 @@ mod tests {
         let _ = server.await;
     }
 
+    /// A chain of directory indexes, `depth` deep, with `file` in the top index when given.
+    fn chain(depth: usize, file: Option<&str>) -> Vec<(&'static str, &'static str, String)> {
+        (0..=depth)
+            .map(|level| {
+                let path: &'static str = format!("/{}", "d/".repeat(level)).leak();
+                let mut rows = "<a href=\"d/\">d/</a>     19-Jul-2026 10:00       -\n".to_string();
+                if let Some(file) = file.filter(|_| level == 0) {
+                    rows.push_str(&format!(
+                        "<a href=\"{file}\">{file}</a>     19-Jul-2026 10:00       5\n"
+                    ));
+                }
+                (path, "text/html", index_page(path, &rows))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn bounds_index_fetches() {
+        // Without one entry after the fetch budget the walk fails: no page could move on.
+        let (server, endpoint) = spawn_index_server(chain(MAX_INDEX_FETCHES, None)).await;
+        let config = HashMap::from([("endpoint".to_string(), endpoint)]);
+        let walked = list_http_autoindex(&test_guard(), &config, "", 0, 10, true, true).await;
+        assert!(matches!(walked, Err(StagingSourceError::InvalidListing(_))));
+        server.abort();
+        let _ = server.await;
+
+        // With an entry the walk stops at the budget and reports more.
+        let (server, endpoint) = spawn_index_server(chain(MAX_INDEX_FETCHES, Some("a.txt"))).await;
+        let config = HashMap::from([("endpoint".to_string(), endpoint)]);
+        let (entries, truncated) =
+            list_http_autoindex(&test_guard(), &config, "", 0, 10, true, true)
+                .await
+                .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(truncated);
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn lists_autoindex_recursively() {
         let root_rows = concat!(
