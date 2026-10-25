@@ -5,7 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::structs::storage::distribution::DistributionRevision;
 use aruna_operations::distribution::status::{
-    LifecycleStatus, MemberStatus, RangeStatus, TransferStatus,
+    DeletionStatus, LifecycleStatus, MemberStatus, RangeStatus, TransferStatus,
 };
 
 use super::*;
@@ -150,6 +150,55 @@ fn degraded_names_coordinator() {
         vec![Ulid::from_bytes([3; 16]).to_string()]
     );
     assert!(response.deletion.is_none());
+}
+
+#[test]
+fn deletion_names_phase() {
+    // A deleted set reports the deletion step, never `active`, in step with `deletion`.
+    let (first, second) = (Ulid::from_bytes([2; 16]), Ulid::from_bytes([3; 16]));
+    let status = |deletion: Option<DeletionStatus>| DistributionStatus {
+        set_id: Ulid::from_bytes([1; 16]),
+        bucket: "spire".to_string(),
+        owner_group: Ulid::from_bytes([9; 16]),
+        publisher: node_text(2).parse().unwrap(),
+        revision: DistributionRevision {
+            number: 7,
+            digest: [0; 32],
+        },
+        phase: SetPhase::Active,
+        serving: true,
+        conflicted: false,
+        configuration_unavailable: false,
+        degraded: false,
+        members: Vec::new(),
+        ranges: Vec::new(),
+        recommended_grant: "/r/g/9/data/*/spire/**".to_string(),
+        lifecycle: LifecycleStatus {
+            transfers: Vec::new(),
+            deletion,
+            fenced_ranges: Vec::new(),
+            publications_closed: true,
+        },
+    };
+    let deletion = |committed, fenced: Vec<Ulid>, waiting: Vec<Ulid>| DeletionStatus {
+        committed,
+        fenced,
+        waiting,
+    };
+    let phase = |deletion| status_response(status(deletion)).phase;
+    assert_eq!(phase(None), "active");
+    assert_eq!(
+        phase(Some(deletion(false, vec![first], vec![second]))),
+        "deletion_prepared"
+    );
+    assert_eq!(
+        phase(Some(deletion(false, vec![first, second], Vec::new()))),
+        "deletion_fenced"
+    );
+    assert_eq!(
+        phase(Some(deletion(true, vec![first, second], Vec::new()))),
+        "deletion_committed"
+    );
 }
 
 #[test]

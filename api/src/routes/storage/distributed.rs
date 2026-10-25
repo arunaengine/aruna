@@ -17,7 +17,9 @@ use aruna_operations::distribution::create::{
 };
 use aruna_operations::distribution::forward::PublishRefusal;
 use aruna_operations::distribution::guard::GuardError;
-use aruna_operations::distribution::status::{DistributionStatus, Reach, read_status};
+use aruna_operations::distribution::status::{
+    DeletionStatus, DistributionStatus, Reach, read_status,
+};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -184,7 +186,8 @@ pub struct DistributedResponse {
     /// The node that alone signs configuration changes.
     pub publisher: String,
     pub revision: u64,
-    /// `pending` or `active`.
+    /// `pending` or `active`; with a recorded deletion `deletion_prepared`, then
+    /// `deletion_fenced` once every coordinator fenced, then `deletion_committed`.
     pub phase: String,
     /// Active, and every coordinator is ready.
     pub serving: bool,
@@ -350,6 +353,17 @@ fn state_name(state: MemberState) -> &'static str {
     }
 }
 
+/// The set's phase; a recorded deletion names its step instead, as `deletion` reports it.
+fn phase_name(phase: SetPhase, deletion: Option<&DeletionStatus>) -> &'static str {
+    match (deletion, phase) {
+        (Some(deletion), _) if deletion.committed => "deletion_committed",
+        (Some(deletion), _) if deletion.waiting.is_empty() => "deletion_fenced",
+        (Some(_), _) => "deletion_prepared",
+        (None, SetPhase::Pending) => "pending",
+        (None, SetPhase::Active) => "active",
+    }
+}
+
 pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse {
     let members = status
         .members
@@ -391,10 +405,7 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
         group_id: status.owner_group.to_string(),
         publisher: status.publisher.to_string(),
         revision: status.revision.number,
-        phase: match status.phase {
-            SetPhase::Pending => "pending".to_string(),
-            SetPhase::Active => "active".to_string(),
-        },
+        phase: phase_name(status.phase, status.lifecycle.deletion.as_ref()).to_string(),
         serving: status.serving,
         conflicted: status.conflicted,
         configuration_changes_unavailable: status.configuration_unavailable,
