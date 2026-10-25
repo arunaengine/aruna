@@ -23,6 +23,7 @@ use aruna_core::structs::storage::backend_import::{BackendImport, ProviderCleanu
 use aruna_core::structs::storage::blob::{
     BlobCleanupWork, BlobHeadKey, BucketInfo, VersionKey, incarnation,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRecord};
 use aruna_core::structs::storage::group_backend::{BUCKET_DELETING, BUCKET_STATE, GroupStorage};
 use aruna_core::structs::storage::multipart::MultipartUpload;
@@ -103,6 +104,8 @@ pub struct DeleteBucketOperation {
     key_deletes: Vec<(String, Key)>,
     /// Rules that link this bucket whole to a provider bucket; they go with it.
     links: Vec<BackendImport>,
+    /// A set deletion deletes only the member bucket of this binding.
+    member: Option<DistributionBinding>,
     output: Option<Result<(), DeleteBucketError>>,
 }
 
@@ -123,8 +126,26 @@ impl DeleteBucketOperation {
             key_spaces: Vec::new(),
             key_deletes: Vec::new(),
             links: Vec::new(),
+            member: None,
             output: None,
         }
+    }
+
+    /// Deletes the bucket only while it carries `binding`'s set, member and incarnation, read
+    /// in the delete transaction; another bucket of the name answers `NotFound`.
+    pub fn bound_to(mut self, binding: DistributionBinding) -> Self {
+        self.member = Some(binding);
+        self
+    }
+
+    fn member_matches(&self, info: &BucketInfo) -> bool {
+        let Some(member) = self.member.as_ref() else {
+            return true;
+        };
+        info.distribution.as_ref().is_some_and(|binding| {
+            (binding.set_id, binding.member_id, binding.incarnation)
+                == (member.set_id, member.member_id, member.incarnation)
+        })
     }
 
     fn emit_error(&mut self, error: DeleteBucketError) -> Effects {
@@ -176,6 +197,9 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::NotFound);
         };
         match BucketInfo::from_bytes(value.as_ref()) {
+            Ok(info) if !self.member_matches(&info) => {
+                return self.emit_error(DeleteBucketError::NotFound);
+            }
             Ok(info) => {
                 self.group_id = Some(info.group_id);
                 self.incarnation = incarnation(creation.as_deref());

@@ -235,6 +235,9 @@ pub struct DeleteObjectOperation {
     /// The marker's head and version epoch, for the inventory.
     marker_head: Option<CurrentVersionPointer>,
     marker_epoch: OriginalEpoch,
+    /// The member binding a set deletion or range reclaim purges under; only then may a
+    /// version of a distributed bucket be deleted.
+    purge: Option<DistributionBinding>,
 }
 
 impl DeleteObjectOperation {
@@ -274,7 +277,15 @@ impl DeleteObjectOperation {
             binding: None,
             marker_head: None,
             marker_epoch: OriginalEpoch::default(),
+            purge: None,
         }
+    }
+
+    /// Lets a purge delete a version of the member bucket bound by `binding`; the bucket is
+    /// read in the delete transaction and must still carry that set, member and incarnation.
+    pub fn purging(mut self, binding: DistributionBinding) -> Self {
+        self.purge = Some(binding);
+        self
     }
 
     /// Writes the delete marker only while `version_id` is the head, read in its transaction.
@@ -451,14 +462,22 @@ impl DeleteObjectOperation {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
-        let bound = match value
+        let binding = match value
             .map(|value| BucketInfo::from_bytes(value.as_ref()))
             .transpose()
         {
-            Ok(bucket) => bucket.is_some_and(|bucket| bucket.distribution.is_some()),
+            Ok(bucket) => bucket.and_then(|bucket| bucket.distribution),
             Err(error) => return self.emit_error(error.into()),
         };
-        match (bound, self.input.version_id) {
+        let purged = match (&binding, &self.purge) {
+            (Some(bound), Some(purge)) => same_member(bound, purge),
+            _ => false,
+        };
+        if self.purge.is_some() && !purged {
+            // The member bucket the purge was for is gone or replaced; nothing is deleted.
+            return self.emit_error(DeleteObjectError::NoSuchVersion);
+        }
+        match (binding.is_some() && !purged, self.input.version_id) {
             (true, _) => self.emit_error(DeleteObjectError::DistributedVersion),
             (false, Some(version_id)) => self.read_target_version(version_id),
             (false, None) => self.emit_error(DeleteObjectError::InvalidOperationState),
@@ -1362,6 +1381,12 @@ impl Operation for DeleteObjectOperation {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             })
     }
+}
+
+/// Whether two bindings name the same member bucket: set, member and incarnation.
+fn same_member(left: &DistributionBinding, right: &DistributionBinding) -> bool {
+    (left.set_id, left.member_id, left.incarnation)
+        == (right.set_id, right.member_id, right.incarnation)
 }
 
 #[cfg(test)]

@@ -1897,3 +1897,44 @@ fn distributed_version_refused() {
         Err(DeleteObjectError::DistributedVersion)
     );
 }
+
+#[test]
+fn purge_deletes_bound_versions_only() {
+    use aruna_core::structs::storage::format::Compression;
+    let (snapshot, _) = crate::distribution::test_record::record(true);
+    let bound = crate::distribution::test_record::binding(&snapshot, 1, 5);
+    let info = BucketInfo {
+        group_id: Ulid::from_bytes([2u8; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: test_user_id(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(bound.clone()),
+    };
+    let run = |purge: DistributionBinding| {
+        let mut operation = audit_op(Some(Ulid::from_bytes([3u8; 16]))).purging(purge);
+        operation.state = DeleteObjectState::StartTransaction;
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([4u8; 16]),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(info.to_bytes().unwrap().into()),
+        }));
+        (operation, effects)
+    };
+    // The purge of the bound member deletes the version like in an ordinary bucket.
+    let (operation, effects) = run(bound.clone());
+    assert_eq!(operation.state, DeleteObjectState::ReadTargetVersion);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BLOB_VERSIONS_KEYSPACE
+    ));
+    // A purge recorded for an earlier incarnation of the name deletes nothing.
+    let replaced = crate::distribution::test_record::binding(&snapshot, 1, 6);
+    let (operation, _) = run(replaced);
+    assert_eq!(operation.finalize(), Err(DeleteObjectError::NoSuchVersion));
+}

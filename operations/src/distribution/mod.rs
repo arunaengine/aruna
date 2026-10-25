@@ -19,6 +19,7 @@ pub mod inventory;
 pub mod keep;
 pub mod publish;
 pub mod pull;
+pub mod purge;
 pub mod rebuild;
 pub mod refill;
 pub mod sharding;

@@ -90,6 +90,34 @@ impl LocalFence {
     }
 }
 
+/// Where the streaming purge of one range of a member bucket continues.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PurgeCursor {
+    /// Every open upload of the range was aborted.
+    pub uploads_done: bool,
+    /// The last position of the current inventory walk that was purged, inclusive.
+    pub after: Option<Vec<u8>>,
+    /// The range holds nothing of the set anymore.
+    pub done: bool,
+}
+
+impl PurgeCursor {
+    /// The cursor key: set id, then range id.
+    pub fn key(set_id: Ulid, range_id: Ulid) -> Vec<u8> {
+        let mut key = set_id.to_bytes().to_vec();
+        key.extend_from_slice(&range_id.to_bytes());
+        key
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn decode(value: Option<&[u8]>) -> Result<Self, ConversionError> {
+        value.map_or_else(|| Ok(Self::default()), |v| Ok(postcard::from_bytes(v)?))
+    }
+}
+
 #[cfg(test)]
 #[path = "fence_tests.rs"]
 mod tests;
