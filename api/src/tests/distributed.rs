@@ -6,12 +6,14 @@ use crate::server::state::ServerState;
 use crate::tests::assistant::spawn_mock;
 use crate::tests::routes::{seed_group_docs, seed_realm_auth, test_state, write_doc};
 use aruna_blob::blob::BlobHandler;
+use aruna_core::download_slots::DownloadSlots;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::heartbeat::NodeHeartbeat;
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, NODE_INFO_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, TokenClaims};
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmId, RealmNode, RealmNodeKind,
 };
@@ -201,6 +203,8 @@ enum Split {
     Shards,
     /// One range the peer coordinates, with a copy on this node.
     PeerOnly,
+    /// One range this node coordinates, with a copy on the peer.
+    LocalOnly,
 }
 
 /// The active record of `bucket`, published by this node.
@@ -218,6 +222,10 @@ fn record(state: &ServerState, owner_group: Ulid, bucket: &str, split: Split) ->
         }
         Split::PeerOnly => {
             let nodes = [(member(2), node_id(PEER)), (member(1), node_id(LOCAL))];
+            replica_layout(root.set_id(), &nodes)
+        }
+        Split::LocalOnly => {
+            let nodes = [(member(1), node_id(LOCAL)), (member(2), node_id(PEER))];
             replica_layout(root.set_id(), &nodes)
         }
     }
@@ -263,6 +271,15 @@ pub(crate) async fn replicate(
     bucket: &str,
 ) -> DistributionSnapshot {
     install(state, owner_group, bucket, Split::PeerOnly).await
+}
+
+/// Makes `bucket` one range this node coordinates, which the peer keeps a copy of.
+pub(crate) async fn mirror(
+    state: &ServerState,
+    owner_group: Ulid,
+    bucket: &str,
+) -> DistributionSnapshot {
+    install(state, owner_group, bucket, Split::LocalOnly).await
 }
 
 /// Stores the record of `bucket` and binds the local bucket of that name to member 1.
@@ -383,3 +400,62 @@ pub(crate) async fn mock_peer(status: StatusCode, body: &str) -> MockPeer {
 
 /// An api url nothing can connect to: port 0 is never a listening port.
 pub(crate) const CLOSED_API: &str = "http://127.0.0.1:0";
+
+/// Makes the peer a realm peer with a fresh heartbeat and free download slots, so it can be
+/// chosen to serve downloads.
+pub(crate) async fn peer_heartbeat(state: &ServerState) {
+    let net = state.get_ctx().net_handle.clone().unwrap();
+    net.reload_realm_peers().await.unwrap();
+    let now = aruna_core::time::unix_timestamp_millis();
+    let heartbeat = NodeHeartbeat {
+        realm_id: state.get_realm_id(),
+        epoch: AdvertisementEpoch {
+            membership_generation: 1,
+            publisher_generation: 1,
+            observed_at_ms: now,
+        },
+        sequence: 1,
+        utilization: NodeUtilization {
+            storage_bytes_used: 0,
+            documents_held: None,
+            load_permille: None,
+            heartbeat_at_ms: now,
+            download_slots: Some(DownloadSlots {
+                active: 0,
+                max: 8,
+                refused: 0,
+            }),
+            storage_capacity_bytes: None,
+        },
+        availability: Vec::new(),
+        reservation: Default::default(),
+        demand: Default::default(),
+    };
+    assert!(net.record_heartbeat(node_id(PEER), heartbeat));
+}
+
+/// A bearer token of `auth`'s user whose claims parse; nothing in these tests checks its
+/// signature.
+pub(crate) fn unsigned_token(auth: &AuthContext) -> String {
+    use base64::Engine;
+    let now = aruna_core::time::unix_timestamp_secs();
+    let claims = TokenClaims {
+        sub: auth.user_id.to_string(),
+        iss: auth.realm_id.to_base64(),
+        iat: now,
+        exp: now + 3600,
+        jti: Ulid::from_bytes([40; 16]).to_string(),
+        sid: None,
+        session_kind: None,
+        restrictions: None,
+        issuer_pubkey: None,
+        delegation_signature: None,
+        name: None,
+        via: None,
+        auth_time: None,
+    };
+    let encode = |json: String| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+    let header = encode(r#"{"alg":"EdDSA","typ":"JWT"}"#.to_string());
+    let payload = encode(serde_json::to_string(&claims).unwrap());
+    format!("{header}.{payload}.c2lnbmF0dXJl")
+}

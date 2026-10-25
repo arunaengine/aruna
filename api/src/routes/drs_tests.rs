@@ -784,3 +784,188 @@ fn keeps_encoded_keys() {
         Ok(RequestedObjectId::VersionedObject(_))
     ));
 }
+
+mod global {
+    use super::super::*;
+    use crate::auth::ValidatedBearer;
+    use crate::mcp::data::{WriteObjectInput, store_text};
+    use crate::routes::storage::deletion::bucket_info;
+    use crate::tests::distributed::{
+        BUCKET, Node, PEER, distribute, mirror, node_id, node_state, peer_heartbeat, publish_api,
+        unsigned_token,
+    };
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::global_id::GlobalId;
+    use axum::body::to_bytes;
+
+    const PEER_API: &str = "https://peer.example";
+
+    /// Stores `a.md` in the bucket and returns its global id.
+    async fn stored(node: &Node) -> String {
+        let info = bucket_info(&node.state, BUCKET).await.unwrap();
+        let input = WriteObjectInput {
+            bucket: BUCKET.to_string(),
+            key: "a.md".to_string(),
+            text: "bytes".to_string(),
+            content_type: None,
+        };
+        let output = store_text(&node.state, &node.owner, &info, input)
+            .await
+            .unwrap();
+        let version_id = output.version_id.parse().unwrap();
+        GlobalId::Version {
+            realm_id: node.state.get_realm_id(),
+            version_id,
+        }
+        .to_url()
+    }
+
+    async fn resolve(
+        node: &Node,
+        (auth, bearer): (Option<&AuthContext>, Option<&str>),
+        id: &str,
+        (here, ticket): (bool, Option<String>),
+    ) -> Response {
+        let path = id.strip_prefix(DATA_PREFIX).unwrap();
+        resolve_data(
+            State(node.state.clone()),
+            Extension(auth.cloned()),
+            Extension(bearer.map(ValidatedBearer::new_for_test)),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            format!("/api/v1/resolve/{path}").parse().unwrap(),
+            Query(ResolveQuery { here, ticket }),
+        )
+        .await
+    }
+
+    async fn body(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn object(node: &Node, id: &str) -> serde_json::Value {
+        let response = get_object(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            Path(id.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_str(&body(response).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn serves_global_version() {
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let owner = Some(&node.owner);
+
+        let served = resolve(&node, (owner, None), &id, (false, None)).await;
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(served.headers()[http::header::CONTENT_LENGTH], "5");
+        assert_eq!(body(served).await, "bytes");
+        assert_eq!(object(&node, &id).await["size"], 5);
+
+        let anonymous = resolve(&node, (None, None), &id, (false, None)).await;
+        assert_eq!(anonymous.status(), StatusCode::NOT_FOUND);
+        let stranger = resolve(&node, (Some(&node.stranger), None), &id, (false, None)).await;
+        assert_eq!(stranger.status(), StatusCode::FORBIDDEN);
+        let version_id = id.rsplit('/').next().unwrap().parse().unwrap();
+        let foreign = GlobalId::Version {
+            realm_id: RealmId([9; 32]),
+            version_id,
+        };
+        let elsewhere = resolve(&node, (owner, None), &foreign.to_url(), (false, None)).await;
+        assert_eq!(elsewhere.status(), StatusCode::NOT_FOUND);
+        let unnamed = resolve_data(
+            State(node.state.clone()),
+            Extension(None),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            "/api/v1/objects".parse().unwrap(),
+            Query(ResolveQuery {
+                here: false,
+                ticket: None,
+            }),
+        )
+        .await;
+        assert_eq!(unnamed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn redirects_to_holder() {
+        let node = node_state().await;
+        mirror(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        publish_api(&node.state, node_id(PEER), PEER_API).await;
+        peer_heartbeat(&node.state).await;
+        let owner = Some(&node.owner);
+        let token = unsigned_token(&node.owner);
+
+        // A caller whose token a ticket can name is sent to the chosen holder.
+        let redirect = resolve(&node, (owner, Some(&token)), &id, (false, None)).await;
+        assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        let headers = redirect.headers();
+        assert_eq!(headers[http::header::CACHE_CONTROL], "no-store");
+        let location = headers[http::header::LOCATION].to_str().unwrap();
+        let pinned = format!("{PEER_API}/api/v1/ga4gh/drs/v1/download?object_id=");
+        assert!(location.starts_with(&pinned));
+        assert!(location.contains("&here=true&ticket="));
+
+        // A credential no ticket can carry is served here, where the bytes are.
+        let opaque = resolve(&node, (owner, Some("opaque")), &id, (false, None)).await;
+        assert_eq!(opaque.status(), StatusCode::OK);
+
+        // A pinned url is served here.
+        let here = resolve(&node, (owner, Some(&token)), &id, (true, None)).await;
+        assert_eq!(here.status(), StatusCode::OK);
+
+        let access = object(&node, &id).await["access_methods"][0]["access_url"]["url"].clone();
+        assert!(access.as_str().unwrap().starts_with(PEER_API));
+        let bulk = post_objects(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            Json(DrsBulkBody {
+                object_ids: vec![id.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(bulk.status(), StatusCode::OK);
+        assert!(body(bulk).await.contains(PEER_API));
+    }
+
+    #[tokio::test]
+    async fn refuses_foreign_tickets() {
+        let node = node_state().await;
+        mirror(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let garbage = resolve(
+            &node,
+            (None, None),
+            &id,
+            (false, Some("not-a-ticket".into())),
+        );
+        assert_eq!(garbage.await.status(), StatusCode::FORBIDDEN);
+
+        // The ticket of a redirect names the peer; this node refuses to redeem it.
+        publish_api(&node.state, node_id(PEER), PEER_API).await;
+        peer_heartbeat(&node.state).await;
+        let token = unsigned_token(&node.owner);
+        let redirect = resolve(&node, (Some(&node.owner), Some(&token)), &id, (false, None)).await;
+        let location = redirect.headers()[http::header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let ticket = location.split("&ticket=").nth(1).unwrap().to_string();
+        let foreign = resolve(&node, (None, None), &id, (false, Some(ticket))).await;
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    }
+}
