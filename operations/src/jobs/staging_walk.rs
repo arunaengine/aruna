@@ -75,6 +75,7 @@ pub(super) async fn start_walk(
                     target_prefix: directory.target_prefix,
                     cursor: None,
                     queue_row: Some(checkpoint.queue_head),
+                    from: None,
                 });
             }
             None => checkpoint.queue_head += 1,
@@ -92,6 +93,7 @@ pub(super) async fn start_walk(
         target_prefix: prefix.target_prefix.clone(),
         cursor: None,
         queue_row: None,
+        from: None,
     });
     // The prefix's manifest is read before its first page, so every page can look it up.
     checkpoint.manifest = spec.checksum_manifest.as_ref().map(|name| ManifestRead {
@@ -197,7 +199,19 @@ pub(super) async fn walk_page(
     let mut next = checkpoint.clone();
     let mut writes = Vec::new();
     let mut deletes = Vec::new();
-    let mut page = match list_page(ctx, spec, &walk, flat).await {
+    // A flat walk into a distributed bucket lists only the key ranges this node coordinates.
+    let segment = match (flat, walk.queue_row) {
+        (true, None) => match segment_of(ctx, spec, &walk).await? {
+            Bounds::Whole => None,
+            Bounds::Segment(segment) => Some(segment),
+            Bounds::Done => {
+                next.walk = None;
+                return commit_rows(ctx, checkpoint, next, writes, deletes).await;
+            }
+        },
+        _ => None,
+    };
+    let mut page = match list_page(ctx, spec, &walk, (flat, segment.as_ref())).await {
         Ok(page) => Some(page),
         Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
             record_failure(&mut next, &walk.source_path, &walk.target_prefix, message);
@@ -220,7 +234,14 @@ pub(super) async fn walk_page(
             })
         }
         None => {
-            next.walk = None;
+            // The next coordinated range continues where this one ends.
+            next.walk = (segment.as_ref())
+                .and_then(|segment| segment.upper.clone())
+                .map(|upper| StagingWalk {
+                    cursor: None,
+                    from: Some(upper),
+                    ..walk.clone()
+                });
             if let Some(row) = walk.queue_row {
                 deletes.push((
                     STAGING_QUEUE_KEYSPACE.to_string(),
@@ -311,7 +332,7 @@ async fn list_page(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     walk: &StagingWalk,
-    flat: bool,
+    (flat, segment): (bool, Option<&Segment>),
 ) -> Result<ListStagingResult, ItemFailure> {
     let allowed = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -337,10 +358,11 @@ async fn list_page(
             source_path: walk.source_path.clone(),
             request: ListRequest {
                 cursor: walk.cursor.clone(),
+                lower: segment.and_then(|segment| segment.lower.clone()),
+                stop: segment.and_then(|segment| segment.stop.clone()),
                 limit,
                 recursive: flat,
                 files_only: flat,
-                ..Default::default()
             },
         }),
         &ctx.driver,
@@ -391,6 +413,115 @@ pub(super) async fn coordinated(
             Err(error) => Err(error.to_string()),
         })
         .collect()
+}
+
+/// Where a target key falls among the source keys of a flat walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Mapped {
+    /// Before every target key of the walk.
+    Before,
+    /// The source key that maps to it.
+    At(String),
+    /// After every target key of the walk.
+    After,
+}
+
+/// The source key of a flat walk that target key `key` stands for: target keys are the walk's
+/// target prefix plus the path below its source path, so the mapping keeps key order.
+fn source_key(walk: &StagingWalk, key: &str) -> Mapped {
+    let target = walk.target_prefix.trim_matches('/');
+    let target = match target.is_empty() {
+        true => String::new(),
+        false => format!("{target}/"),
+    };
+    let relative = match key.strip_prefix(target.as_str()) {
+        Some(relative) if !relative.is_empty() => relative,
+        Some(_) => return Mapped::Before,
+        None if key < target.as_str() => return Mapped::Before,
+        None => return Mapped::After,
+    };
+    let base = walk.source_path.trim_matches('/');
+    Mapped::At(match base.is_empty() {
+        true => relative.to_string(),
+        false => format!("{base}/{relative}"),
+    })
+}
+
+/// The source keys of one coordinated key range: listed from `lower`, ending before `stop`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Segment {
+    lower: Option<String>,
+    stop: Option<String>,
+    /// The range's exclusive upper target key, where the next range starts.
+    upper: Option<String>,
+}
+
+/// What a flat walk lists next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Bounds {
+    /// The whole prefix: the destination is an ordinary bucket.
+    Whole,
+    Segment(Segment),
+    /// No coordinated range of the walk's prefix is left.
+    Done,
+}
+
+/// The first coordinated range at or after `from` that holds target keys of the walk.
+fn next_segment(
+    walk: &StagingWalk,
+    ranges: impl IntoIterator<Item = (String, Option<String>)>,
+) -> Bounds {
+    let from = walk.from.clone().unwrap_or_default();
+    for (lower, upper) in ranges {
+        if upper.as_deref().is_some_and(|upper| upper <= from.as_str()) {
+            continue;
+        }
+        let stop = match upper.as_deref().map(|upper| source_key(walk, upper)) {
+            Some(Mapped::Before) => continue,
+            Some(Mapped::At(stop)) => Some(stop),
+            Some(Mapped::After) | None => None,
+        };
+        let lower = match source_key(walk, lower.max(from.clone()).as_str()) {
+            Mapped::Before => None,
+            Mapped::At(lower) => Some(lower),
+            Mapped::After => return Bounds::Done,
+        };
+        return Bounds::Segment(Segment { lower, stop, upper });
+    }
+    Bounds::Done
+}
+
+/// The bounds of the walk's next listing in a distributed destination.
+async fn segment_of(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    walk: &StagingWalk,
+) -> Result<Bounds, PageFailure> {
+    let bucket = match pinned_bucket(ctx, spec).await {
+        Ok(bucket) => bucket,
+        Err(ItemFailure::System(message)) => return Err(PageFailure::Retry(message)),
+        Err(
+            ItemFailure::Denied(message)
+            | ItemFailure::Stage(message)
+            | ItemFailure::Lasting(message),
+        ) => return Err(PageFailure::Permanent(message)),
+    };
+    let Some(binding) = bucket.distribution.as_ref() else {
+        return Ok(Bounds::Whole);
+    };
+    let view = bound_view(&ctx.driver, binding)
+        .await
+        .map_err(|error| PageFailure::Retry(error.to_string()))?;
+    let snapshot = view.snapshot();
+    let coordinated = (snapshot.config.ranges.iter())
+        .filter(|range| {
+            matches!(
+                snapshot.write_route(binding.member_id, &range.lower),
+                Ok(WriteRoute::Local { .. })
+            )
+        })
+        .map(|range| (range.lower.clone(), range.upper.clone()));
+    Ok(next_segment(walk, coordinated))
 }
 
 /// The files of a page this node imports.
@@ -708,12 +839,66 @@ pub(super) fn source_permission_path(spec: &StagingJobSpec, source_path: &str) -
 mod pure_tests {
     use super::*;
 
+    fn bounded(from: Option<&str>) -> StagingWalk {
+        StagingWalk {
+            source_path: "src/".to_string(),
+            target_prefix: "copy".to_string(),
+            cursor: None,
+            queue_row: None,
+            from: from.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn target_keys_map_sources() {
+        let walk = bounded(None);
+        assert_eq!(source_key(&walk, "a"), Mapped::Before);
+        assert_eq!(source_key(&walk, "copy/"), Mapped::Before);
+        assert_eq!(
+            source_key(&walk, "copy/x/1"),
+            Mapped::At("src/x/1".to_string())
+        );
+        assert_eq!(source_key(&walk, "d"), Mapped::After);
+    }
+
+    #[test]
+    fn segments_follow_ranges() {
+        let ranges = || {
+            vec![
+                (String::new(), Some("copy/g".to_string())),
+                ("copy/p".to_string(), Some("e".to_string())),
+            ]
+        };
+        let first = Segment {
+            lower: None,
+            stop: Some("src/g".to_string()),
+            upper: Some("copy/g".to_string()),
+        };
+        assert_eq!(
+            next_segment(&bounded(None), ranges()),
+            Bounds::Segment(first)
+        );
+        // The next walk starts at the end of the first range and skips to the second.
+        let second = Segment {
+            lower: Some("src/p".to_string()),
+            stop: None,
+            upper: Some("e".to_string()),
+        };
+        let after = next_segment(&bounded(Some("copy/g")), ranges());
+        assert_eq!(after, Bounds::Segment(second));
+        assert_eq!(next_segment(&bounded(Some("e")), ranges()), Bounds::Done);
+        // A range wholly before the prefix is skipped.
+        let early = vec![(String::new(), Some("b".to_string()))];
+        assert_eq!(next_segment(&bounded(None), early), Bounds::Done);
+    }
+
     fn walk(source_path: &str) -> StagingWalk {
         StagingWalk {
             source_path: source_path.to_string(),
             target_prefix: "copy".to_string(),
             cursor: None,
             queue_row: None,
+            from: None,
         }
     }
 

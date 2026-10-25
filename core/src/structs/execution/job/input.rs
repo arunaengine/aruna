@@ -269,6 +269,9 @@ pub struct StagingWalk {
     pub cursor: Option<crate::structs::execution::source_access::ListCursor>,
     /// The queue row this directory came from, deleted with the walk's last page.
     pub queue_row: Option<u64>,
+    /// In a distributed destination, the target key from which the walk lists the key ranges
+    /// this node coordinates, one range after another; `None` starts at the first.
+    pub from: Option<String>,
 }
 
 /// A checksum manifest being read in bounded chunks before its prefix is walked.
