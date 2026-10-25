@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn range_path_names_bounds() {
+    fn path_names_bounds() {
         let request = ListRequest {
             bucket: "b".to_string(),
             prefix: Some("a b/".to_string()),
@@ -574,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn group_resumes_past_it() {
+    fn resumes_past_group() {
         let token = resume_token("bucket", "d/x", Some("d/")).unwrap();
         assert_eq!(token.last_common_prefix.as_deref(), Some("d/"));
         let head = BlobHeadKey::from_bytes(&token.last_key).unwrap();

@@ -388,7 +388,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn held_rows_round_trip() {
+    fn held_rows_decode() {
         let counters = RangeCounters {
             objects: 3,
             logical_bytes: -7,

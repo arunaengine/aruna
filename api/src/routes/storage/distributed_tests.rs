@@ -170,7 +170,7 @@ fn guard_refusals_map() {
 }
 
 #[test]
-fn partial_creation_names_set() {
+fn partial_names_set() {
     let report = CreationReport {
         set_id: Ulid::from_bytes([1; 16]),
         active: false,

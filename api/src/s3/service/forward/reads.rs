@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn read_request_binds_range() {
+    fn request_binds_range() {
         let mut headers = HeaderMap::new();
         headers.insert("range", "bytes=0-2".parse().unwrap());
         headers.insert("authorization", "AWS4-HMAC-SHA256 secret".parse().unwrap());
