@@ -11,9 +11,9 @@ use super::{
     REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect, StorageEvent,
     StorageHandle, StorageReadError, TxnId, Ulid, check_policy_limit, document_lifecycle_key,
     drive, graph_lifecycle_key, load_document_record, load_group_records, load_pending_records,
-    load_realm_config, map_internal_error, map_query_error, merge_pending_records,
-    parse_registry_read, query_fingerprint, read_document_registry, record_materialized_read,
-    reference_document_title, replica_query_nodes, resolve_graph_reference, warn,
+    load_realm_config, map_query_error, merge_pending_records, parse_registry_read,
+    query_fingerprint, read_document_registry, record_materialized_read, reference_document_title,
+    replica_query_nodes, resolve_graph_reference, warn,
 };
 
 use super::distributed::run_query_distributed;
@@ -201,8 +201,9 @@ pub async fn references_metadata(
         .clamp(1, REFERENCES_MAX_LIMIT);
 
     if request.resolve {
-        let registry = live_registry(context).await?;
-        let entry = resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?;
+        let registry = graph_record(context, &request.iri).await?;
+        let entry =
+            resolve_graph_reference(context, realm_id, &request, registry.as_slice()).await?;
         return Ok(MetadataReferencesExecution {
             references: entry.into_iter().collect(),
             next_after: None,
@@ -252,9 +253,9 @@ pub async fn references_metadata(
     }
 
     if references.is_empty() && request.after.is_none() && page.next.is_none() {
-        let registry = live_registry(context).await?;
+        let registry = graph_record(context, &request.iri).await?;
         if let Some(entry) =
-            resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?
+            resolve_graph_reference(context, realm_id, &request, registry.as_slice()).await?
         {
             references.push(entry);
         }
@@ -266,18 +267,20 @@ pub async fn references_metadata(
     })
 }
 
-async fn live_registry(
+/// The live record whose graph IRI is `iri`, by one point read of the document it names; never
+/// a walk over the registry.
+async fn graph_record(
     context: &DriverContext,
-) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    let registry = handle
-        .list_cached_records()
-        .await
-        .map_err(map_internal_error)?;
-    filter_live_records(&context.storage_handle, registry.as_ref()).await
+    iri: &str,
+) -> Result<Option<MetadataRegistryRecord>, MetadataApiError> {
+    let Some(document_id) = MetadataRegistryRecord::graph_document(iri) else {
+        return Ok(None);
+    };
+    match load_live_record(context, document_id).await {
+        Ok(record) => Ok((record.graph_iri == iri).then_some(record)),
+        Err(MetadataApiError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) async fn filter_live_records(

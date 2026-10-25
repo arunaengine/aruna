@@ -218,9 +218,5 @@ fn map_read_error(error: MetadataReadError) -> MetadataApiError {
     }
 }
 
-fn map_internal_error(error: MetadataError) -> MetadataApiError {
-    MetadataApiError::Internal(error.to_string())
-}
-
 #[cfg(test)]
 mod tests;
