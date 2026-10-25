@@ -3024,3 +3024,84 @@ async fn kind_conflict_withholds() {
         .is_some()
     );
 }
+
+#[tokio::test]
+async fn database_waits_group() {
+    // Without the owning group's roles yet, a database mark waits instead of being refused.
+    use aruna_core::structs::identity::database::{DatabaseEntry, DatabaseTarget};
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([61; 32]);
+    let group_id = Ulid::from_parts(1_640, 1);
+    let actor = test_actor(
+        12,
+        UserId::local(Ulid::from_parts(1_641, 1), realm_id),
+        realm_id,
+    );
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(actor.node_id, RealmNodeKind::Management);
+    let realm_auth = RealmAuthorizationDocument {
+        realm_id,
+        roles: HashMap::new(),
+        operation_restrictions: Default::default(),
+    };
+    batch_write_to(
+        &storage,
+        vec![
+            target_write_entry(
+                DocumentTarget::RealmConfig { realm_id },
+                config.to_bytes(&actor).expect("config serializes").into(),
+            ),
+            target_write_entry(
+                DocumentTarget::RealmAuthorization { realm_id },
+                realm_auth.to_bytes(&actor).expect("auth serializes").into(),
+            ),
+        ],
+    )
+    .await
+    .expect("realm state writes");
+    let entry = DatabaseEntry {
+        entry_id: Ulid::from_parts(1_642, 1),
+        dataset_id: Ulid::from_parts(1_643, 1),
+        target: DatabaseTarget::Distributed {
+            set_id: Ulid::from_parts(1_644, 1),
+        },
+        owner_group: group_id,
+    };
+    let event = test_admin_event(
+        Ulid::from_parts(1_645, 1),
+        AdminDocumentTarget::RealmConfig { realm_id },
+        &actor,
+        1,
+        AdminDocumentOperation::DatabaseSet {
+            entry,
+            predecessor: None,
+            consent: None,
+        },
+    );
+    let target = DocumentTarget::RealmConfig { realm_id };
+    let placement = admin_test_placement();
+    let topic = target.sync_topic_id(realm_id, &placement);
+    let validation = validate_admin_event(
+        &storage,
+        topic,
+        ::irokle::actor_id_for(topic, node_to_peer(&actor.node_id)),
+        &target,
+        &event,
+        realm_id,
+        &placement,
+        &sign_as_origin(&event, &placement),
+        &mut ConfigValidationCache::default(),
+    )
+    .await
+    .expect("validation runs");
+    assert!(
+        matches!(
+            validation,
+            AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::GroupAuthorization(id)),
+                ..
+            } if id == group_id
+        ),
+        "{validation:?}"
+    );
+}

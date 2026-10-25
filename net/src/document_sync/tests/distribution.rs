@@ -749,3 +749,44 @@ async fn overflow_keeps_forks() {
     assert!(view.conflicted(), "the replayed pair keeps the fork");
     service.shutdown().await;
 }
+
+#[tokio::test]
+async fn database_owner_checked() {
+    // A database entry of a distributed bucket must name the group the set fixed.
+    use aruna_core::structs::identity::database::{DatabaseEntry, DatabaseTarget};
+    let (_dir, storage) = test_storage();
+    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    config.ensure_node(node(PUBLISHER), RealmNodeKind::Server);
+    config.ensure_node(node(OTHER), RealmNodeKind::Management);
+    let row = target_write_entry(
+        DocumentTarget::RealmConfig { realm_id: realm() },
+        config.to_bytes(&actor(OTHER)).unwrap().into(),
+    );
+    batch_write_to(&storage, vec![row]).await.unwrap();
+    let outcome = receive(&storage, published(PUBLISHER, created(), PUBLISHER)).await;
+    assert_eq!(outcome, AdminEventValidation::Accepted);
+    let entry = DatabaseEntry {
+        entry_id: Ulid::from_parts(849, 1),
+        dataset_id: Ulid::from_parts(849, 2),
+        target: DatabaseTarget::Distributed {
+            set_id: root().set_id(),
+        },
+        owner_group: Ulid::from_parts(849, 3),
+    };
+    let event = test_admin_event(
+        Ulid::from_parts(849, 4),
+        AdminDocumentTarget::RealmConfig { realm_id: realm() },
+        &actor(OTHER),
+        1,
+        AdminDocumentOperation::DatabaseSet {
+            entry,
+            predecessor: None,
+            consent: None,
+        },
+    );
+    let outcome = receive(&storage, event).await;
+    assert!(
+        matches!(&outcome, AdminEventValidation::Rejected(reason) if reason.contains("owner group")),
+        "{outcome:?}"
+    );
+}

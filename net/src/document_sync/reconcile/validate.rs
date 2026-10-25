@@ -924,6 +924,13 @@ async fn validate_database_actors(
         ),
         _ => return Ok(AdminEventValidation::Accepted),
     };
+    if let AdminDocumentOperation::DatabaseSet { entry, .. } = &event.op
+        && !owner_matches(storage, entry).await?
+    {
+        return Ok(AdminEventValidation::Rejected(
+            "the entry names another owner group than its distributed bucket".to_string(),
+        ));
+    }
     let realm_id = event.actor.realm_id;
     let Some(realm_auth) = read_realm_authorization(storage, realm_id).await? else {
         return Ok(AdminEventValidation::Deferred {
@@ -968,6 +975,12 @@ async fn validate_database_actors(
         }
         _ => curator || owner(event.actor.user_id),
     };
+    if let Some(group_id) = group.filter(|_| !allowed && group_auth.is_none()) {
+        return Ok(AdminEventValidation::Deferred {
+            dependency: Some(DocumentSyncDependency::GroupAuthorization(group_id)),
+            reason: "the owning group's authorization state is unavailable".to_string(),
+        });
+    }
     Ok(if allowed {
         AdminEventValidation::Accepted
     } else {
@@ -975,6 +988,25 @@ async fn validate_database_actors(
             "actor or consent approver lacks current database authority".to_string(),
         )
     })
+}
+
+/// Whether a distributed bucket's entry names the set's owner group; a set fixes its group,
+/// and a set this node does not hold yet passes.
+async fn owner_matches(
+    storage: &StorageHandle,
+    entry: &aruna_core::structs::identity::database::DatabaseEntry,
+) -> Result<bool> {
+    use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+    use aruna_core::structs::identity::database::DatabaseTarget;
+    use aruna_core::structs::storage::distribution::DistributionView;
+    let DatabaseTarget::Distributed { set_id } = &entry.target else {
+        return Ok(true);
+    };
+    let key = set_id.to_bytes().to_vec().into();
+    let view = storage_read_from(storage, DISTRIBUTION_KEYSPACE.to_string(), key).await?;
+    Ok(view
+        .and_then(|bytes| DistributionView::from_bytes(&bytes).ok())
+        .is_none_or(|view| view.snapshot().root.owner_group == entry.owner_group))
 }
 
 pub(in crate::document_sync) fn has_write_permission<'a>(
