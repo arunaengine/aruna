@@ -5,7 +5,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::Duration;
 
+use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -17,6 +20,7 @@ use aruna_core::keyspaces::{
     prefix_upper_bound,
 };
 use aruna_core::operation::Operation;
+use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
@@ -26,14 +30,50 @@ use aruna_core::structs::storage::usage::{UsageCounterError, UsageCounters};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 
+use crate::driver::{DriverContext, drive};
 use crate::node::rebuild_counts::{Joined, RebuildCounts, is_pithos, named_size, usable};
+use crate::node::usage_stats::publish_refresh_snapshots;
 
 /// Rows read per walk page; every page commits before the next one is read.
 const PAGE_LIMIT: usize = 256;
 /// Copies of one hash read per page when a version's own location row is unusable.
 const COPY_LIMIT: usize = 16;
+/// Pause before a failed background rebuild starts again from a new snapshot.
+const RETRY_PAUSE: Duration = Duration::from_secs(30);
+
+/// Rebuilds the usage counters in the background until one rebuild finishes, then publishes
+/// full usage snapshots. Startup does not wait; until then quota-limited writes are refused.
+pub fn spawn_usage_rebuild(
+    context: Arc<DriverContext>,
+    realm_id: RealmId,
+    node_id: NodeId,
+    shutdown: &Shutdown,
+) {
+    let token = shutdown.token();
+    shutdown.spawn(async move {
+        loop {
+            let rebuild = drive(RebuildStatsOperation::new().with_realm(realm_id), &context);
+            let result = tokio::select! {
+                _ = token.cancelled() => return,
+                result = rebuild => result,
+            };
+            match result {
+                Ok(_) => break,
+                Err(error) => warn!(error = %error, "Usage counter rebuild failed; retrying"),
+            }
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(RETRY_PAUSE) => {}
+            }
+        }
+        info!("Usage counters rebuilt");
+        if let Err(error) = publish_refresh_snapshots(&context, node_id, realm_id, true).await {
+            warn!(error = %error, "Usage snapshots were not published after the rebuild");
+        }
+    });
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RebuildStatsState {

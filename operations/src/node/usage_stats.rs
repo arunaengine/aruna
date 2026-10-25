@@ -37,7 +37,9 @@ use crate::driver::{DriverContext, drive};
 use crate::storage_read::scan_all;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
-pub use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
+pub use crate::node::usage_rebuild::{
+    RebuildStatsError, RebuildStatsOperation, RebuildStatsState, spawn_usage_rebuild,
+};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
