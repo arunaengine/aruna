@@ -9,4 +9,5 @@ pub mod node_info;
 mod rebuild_counts;
 pub mod startup;
 pub mod status;
+mod usage_rebuild;
 pub mod usage_stats;

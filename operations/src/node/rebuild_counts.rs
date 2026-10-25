@@ -28,7 +28,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::abe::copies::copy_version;
-use crate::node::usage_stats::{RebuildStatsError, StoredDelta};
+use crate::node::usage_rebuild::RebuildStatsError;
+use crate::node::usage_stats::StoredDelta;
 
 /// Point reads of one page by keyspace and key; `None` for an absent row.
 pub(crate) type Joined = HashMap<(&'static str, Vec<u8>), Option<Value>>;
