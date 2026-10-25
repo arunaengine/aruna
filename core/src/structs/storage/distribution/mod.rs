@@ -25,6 +25,7 @@ pub mod presets;
 pub mod request;
 pub mod route;
 pub mod snapshot;
+pub mod source_root;
 pub mod split;
 pub mod statement;
 pub mod upload;

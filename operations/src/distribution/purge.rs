@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, BOOTSTRAP_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE,
     DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_PURGE_KEYSPACE, INVENTORY_KEYSPACE,
     KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE,
-    UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
+    SOURCE_ROOT_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::DistributionBinding;
@@ -198,7 +198,7 @@ pub async fn purge_rest(context: &DriverContext, target: &PurgeTarget) -> Result
 }
 
 /// The keyspaces a set's local rows are cleared from, in step order after the attachments.
-const CLEARED: [&str; 9] = [
+const CLEARED: [&str; 10] = [
     INVENTORY_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE,
     VERSION_INDEX_KEYSPACE,
@@ -207,6 +207,7 @@ const CLEARED: [&str; 9] = [
     RANGE_COUNTER_KEYSPACE,
     KEY_SAMPLE_KEYSPACE,
     BOOTSTRAP_KEYSPACE,
+    SOURCE_ROOT_KEYSPACE,
     DISTRIBUTION_PURGE_KEYSPACE,
 ];
 

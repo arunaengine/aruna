@@ -57,6 +57,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::distribution::inventory::{VersionEntry, logical_identity};
+use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::distribution::{
     AdmissionError, DistributionBinding, OriginalEpoch,
 };
@@ -2300,12 +2301,18 @@ impl IncomingVersionOperation {
             },
         };
         let head = self.installed_head.is_some();
-        version_written(
+        let mut change = version_written(
             self.destination_binding.as_ref(),
             &self.manifest.key,
             added,
             head,
-        )
+        )?;
+        // A reference carries its source root, which a member taking over the range checks.
+        let source = self.manifest.source.as_ref();
+        change.root = source
+            .filter(|_| self.is_reference_item())
+            .and_then(RootEntry::of);
+        Some(change)
     }
 
     fn start_commit_quota(&mut self) -> Effects {

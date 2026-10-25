@@ -98,6 +98,29 @@ async fn counts_versions_and_heads() {
 }
 
 #[tokio::test]
+async fn reference_records_its_root() {
+    // A received reference leaves its source root for a later coordinator to check.
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::storage::distribution::source_root::SourceRoot;
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    let entry = RootEntry {
+        root: SourceRoot {
+            kind: SourceConnectorKind::S3,
+            public_config: BTreeMap::from([("bucket".to_string(), "bakrep".to_string())]),
+            namespace: None,
+        },
+        probe_path: "a.fa".to_string(),
+    };
+    let mut update = put("a", 1, 1, 10);
+    update.change.root = Some(entry.clone());
+    assert!(apply(&handle, update).await.unwrap());
+    let key = root_key(set(), &entry.root.digest().unwrap());
+    let stored = get(&handle, SOURCE_ROOT_KEYSPACE, key).await.unwrap();
+    assert_eq!(RootEntry::from_bytes(&stored).unwrap(), entry);
+}
+
+#[tokio::test]
 async fn replay_changes_nothing() {
     let (_dir, handle) = open();
     single_range(&handle).await;

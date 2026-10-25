@@ -10,7 +10,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
-    RANGE_INDEX_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
+    RANGE_INDEX_KEYSPACE, SOURCE_ROOT_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::accounting::{
@@ -21,6 +21,7 @@ use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, IndexEntry, Position, VersionEntry, head_position, index_key,
     logical_identity, upload_position, version_position,
 };
+use aruna_core::structs::storage::distribution::source_root::{RootEntry, root_key};
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange, OriginalEpoch};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
@@ -74,6 +75,8 @@ pub struct InventoryChange {
     pub head: HeadChange,
     /// A multipart upload opened (`true`) or closed (`false`).
     pub upload: Option<(Ulid, bool)>,
+    /// The source root of a received external reference, which a new coordinator checks.
+    pub root: Option<RootEntry>,
 }
 
 impl InventoryChange {
@@ -85,6 +88,7 @@ impl InventoryChange {
             removed: Vec::new(),
             head: HeadChange::Keep,
             upload: None,
+            root: None,
         }
     }
 }
@@ -347,6 +351,12 @@ impl InventoryUpdate {
             }
         }
         self.plan_versions(&mut next, &mut contributions)?;
+        if let Some(entry) = &self.change.root {
+            // A blind write: replays and other versions of the root rewrite the same row.
+            let key = root_key(self.change.set_id, &entry.root.digest()?);
+            self.writes
+                .push(row(SOURCE_ROOT_KEYSPACE, key, entry.to_bytes()?));
+        }
         self.plan_head(head, &mut contributions)?;
         self.plan_sample(range_id, had_head, sample.is_some());
         let routed = route(self.change.set_id, range_id, &account, contributions)?;
