@@ -137,6 +137,7 @@ fn input(entries: Vec<PageEntry>) -> PageImportInput {
         writes: Vec::new(),
         deletes: Vec::new(),
         now: SystemTime::UNIX_EPOCH + Duration::from_secs(2_000),
+        database: None,
     }
 }
 
@@ -327,6 +328,26 @@ fn page_registers_atomically() {
     );
     assert_eq!(result.checkpoint.items_current, 2);
     assert_eq!(result.checkpoint.items_succeeded, 2);
+}
+
+// The database entry the bucket is listed under is fixed in the origin when it is minted.
+#[test]
+fn origin_keeps_database() {
+    use aruna_core::structs::storage::blob::BlobVersion;
+    use aruna_core::structs::storage::origin::VersionOrigin;
+    let database = Some(Ulid::from_bytes([8; 16]));
+    let mut operation = PageImportOperation::new(PageImportInput {
+        database,
+        ..input(vec![entry("a")])
+    });
+
+    let writes = run_to_writes(&mut operation, vec![None], None);
+
+    let (_, _, value) = (writes.iter())
+        .find(|(space, ..)| space == BLOB_VERSIONS_KEYSPACE)
+        .unwrap();
+    let version = BlobVersion::from_bytes(value).unwrap();
+    assert_eq!(version.origin, Some(VersionOrigin::Source { database }));
 }
 
 #[test]

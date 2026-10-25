@@ -81,6 +81,8 @@ pub struct PageImportInput {
     pub writes: Vec<(KeySpace, Key, Value)>,
     pub deletes: Vec<(KeySpace, Key)>,
     pub now: SystemTime,
+    /// The bucket's database list entry at registration, kept in every version's origin.
+    pub database: Option<Ulid>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -437,7 +439,9 @@ fn register_rows(
         input.user_id,
         input.now,
     )
-    .with_origin(Some(VersionOrigin::Source { database: None }))
+    .with_origin(Some(VersionOrigin::Source {
+        database: input.database,
+    }))
     .with_policies(guards.policies.clone())?;
     let version_key = VersionKey::new(&input.bucket, &entry.target_key, version_id);
     let pointer = CurrentVersionPointer::next_for(head, version_id)?;

@@ -112,3 +112,30 @@ fn source_url_joins_public_parts() {
     };
     assert_eq!(public_source_url(&device), None);
 }
+
+// Only a source read without credentials may be named in a dataset.
+#[test]
+fn signed_source_unpublished() {
+    use crate::structs::execution::source_connector::SourceConnectorKind;
+    use std::collections::HashMap;
+    let mut descriptor = PortableSourceDescriptor {
+        kind: SourceConnectorKind::S3,
+        public_config: HashMap::from([
+            ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ("bucket".to_string(), "lab".to_string()),
+        ]),
+        source_path: "a.txt".to_string(),
+        version_selector: None,
+        namespace: None,
+        capabilities: Vec::new(),
+        origin_node_id: None,
+    };
+    assert!(!publishable(&descriptor));
+    (descriptor.public_config).insert("skip_signature".to_string(), "true".to_string());
+    assert!(publishable(&descriptor));
+    descriptor.namespace = Some("login".to_string());
+    assert!(!publishable(&descriptor));
+    descriptor.namespace = None;
+    descriptor.kind = SourceConnectorKind::Http;
+    assert!(!publishable(&descriptor));
+}

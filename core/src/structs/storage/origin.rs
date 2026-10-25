@@ -122,6 +122,19 @@ pub fn project(
     projection
 }
 
+/// Whether a dataset may name the source: only a source anyone can read without credentials,
+/// an S3 bucket read unsigned. Other kinds may hold credentials the descriptor does not show.
+pub fn publishable(descriptor: &PortableSourceDescriptor) -> bool {
+    use crate::structs::execution::source_connector::SourceConnectorKind;
+    descriptor.kind == SourceConnectorKind::S3
+        && descriptor.namespace.is_none()
+        && descriptor
+            .public_config
+            .get("skip_signature")
+            .map(String::as_str)
+            == Some("true")
+}
+
 /// The public URL of an external source object, from the descriptor's public settings:
 /// endpoint, bucket and root, then the path. Device folders and Aruna sources have none.
 pub fn public_source_url(descriptor: &PortableSourceDescriptor) -> Option<String> {

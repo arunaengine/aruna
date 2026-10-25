@@ -37,6 +37,7 @@ use super::store::{batch_delete, iter_prefix_page, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::distribution::guard::{GuardError, authority_reads, authority_rows, write_target};
 use crate::driver::drive;
+use crate::s3::object::origin::database_entry;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
@@ -601,6 +602,13 @@ async fn import_page(
             Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
         }
     }
+    let database = database_entry(
+        &ctx.driver,
+        (spec.auth_context.realm_id, spec.node_id),
+        &spec.bucket,
+        (bucket.distribution.as_ref()).map(|binding| binding.set_id),
+    )
+    .await;
     let result = drive(
         PageImportOperation::new(PageImportInput {
             job_id: ctx.job_id,
@@ -619,6 +627,7 @@ async fn import_page(
             writes: rows.writes,
             deletes: rows.deletes,
             now: SystemTime::now(),
+            database,
         }),
         &ctx.driver,
     )

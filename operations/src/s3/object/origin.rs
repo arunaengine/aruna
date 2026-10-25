@@ -17,7 +17,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
-    OriginProjection, SyncHop, VersionOrigin, project, public_source_url,
+    OriginProjection, SyncHop, VersionOrigin, project, public_source_url, publishable,
 };
 use aruna_core::{NodeId, UserId};
 use thiserror::Error;
@@ -64,7 +64,7 @@ pub struct OriginView {
 /// Reads the origin of `version_id`, or of the current version, of a local bucket's key.
 pub async fn read_origin(
     context: &DriverContext,
-    (realm_id, node_id): (RealmId, NodeId),
+    (realm_id, _): (RealmId, NodeId),
     bucket: &str,
     key: &str,
     version_id: Option<Ulid>,
@@ -101,31 +101,45 @@ pub async fn read_origin(
         realm_id,
         version_id,
     });
-    let mut view = view(version_id, global, version);
-    // A source origin names the bucket's database entry when the bucket is listed.
-    if let Some(VersionOrigin::Source { database }) = view.origin.as_mut()
-        && database.is_none()
-        && let Ok(config) = drive(GetConfigOperation::new(realm_id), context).await
-    {
-        *database = config
-            .databases
-            .iter()
-            .find(|entry| match &entry.target {
-                DatabaseTarget::Distributed { set_id } => info
-                    .distribution
-                    .as_ref()
-                    .is_some_and(|binding| binding.set_id == *set_id),
-                DatabaseTarget::Ordinary {
-                    node_id: entry_node,
-                    bucket: name,
-                } => *entry_node == node_id && name == bucket,
-            })
-            .map(|entry| entry.entry_id);
-    }
-    Ok(view)
+    Ok(view(version_id, global, version))
+}
+
+/// The database list entry a bucket is listed under now: its set's entry, or this node's entry
+/// of its name. A source origin records it when the version is minted; none when unreadable.
+pub async fn database_entry(
+    context: &DriverContext,
+    (realm_id, node_id): (RealmId, NodeId),
+    bucket: &str,
+    set_id: Option<Ulid>,
+) -> Option<Ulid> {
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .ok()?;
+    let entry = config.databases.iter().find(|entry| match &entry.target {
+        DatabaseTarget::Distributed { set_id: listed } => set_id == Some(*listed),
+        DatabaseTarget::Ordinary {
+            node_id: entry_node,
+            bucket: name,
+        } => set_id.is_none() && *entry_node == node_id && name == bucket,
+    });
+    entry.map(|entry| entry.entry_id)
 }
 
 fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> OriginView {
+    let descriptor = match &version.state {
+        BlobVersionState::Reference { source, .. }
+        | BlobVersionState::Materialized {
+            source: Some(source),
+            ..
+        }
+        | BlobVersionState::PendingContent {
+            source: Some(source),
+            ..
+        } => Some(&source.descriptor),
+        _ => None,
+    };
+    // File readers see the source location; datasets only a source anyone may read.
+    let published = descriptor.is_some_and(publishable);
     let source = match &version.state {
         BlobVersionState::Reference {
             source,
@@ -159,7 +173,7 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
     let projection = project(
         version.origin.as_ref(),
         version.hop.as_ref(),
-        source.as_ref().and_then(|source| source.url.clone()),
+        (source.as_ref().filter(|_| published)).and_then(|source| source.url.clone()),
     );
     OriginView {
         version_id,
