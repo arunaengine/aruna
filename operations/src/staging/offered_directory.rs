@@ -718,7 +718,7 @@ async fn read_offered(
         .map_err(OfferedDirectoryError::Conversion)
 }
 
-async fn read_bucket(
+pub(crate) async fn read_bucket(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<Option<BucketInfo>, OfferedDirectoryError> {

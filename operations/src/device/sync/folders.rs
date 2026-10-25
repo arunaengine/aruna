@@ -35,7 +35,7 @@ use crate::s3::object::versions::{
     ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
 use crate::staging::offered_directory::{
-    OfferedDirectoryError, WithdrawOfferInput, check_root, withdraw_offer,
+    OfferedDirectoryError, WithdrawOfferInput, check_root, read_bucket, withdraw_offer,
 };
 
 use super::repository::{
@@ -586,6 +586,10 @@ async fn delete_local_bucket(
     node_id: NodeId,
 ) -> Result<(), FolderError> {
     let bucket = &folder.local_bucket;
+    // Checked first, so the routine missing bucket is not logged as a failed delete.
+    if read_bucket(context, bucket).await?.is_none() {
+        return Ok(());
+    }
     abort_uploads(context, bucket).await?;
     loop {
         let listing = ListVersionsOperation::new(ListVersionsInput {
