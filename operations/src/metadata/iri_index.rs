@@ -555,30 +555,52 @@ async fn read_materialization_status(
 
 #[cfg(test)]
 mod tests {
+    use super::super::data_links::apply_rows;
     use super::*;
-    use aruna_core::storage_entries::iri_reference_key;
+    use aruna_core::storage_entries::{iri_reference_key, materialization_status_entry};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_storage::FjallStorage;
 
-    fn index_key(document_id: Ulid, cursor: Ulid) -> ByteView {
-        iri_reference_key("p", "o", document_id, cursor)
+    const OBJECT: &str = "https://example.test/object";
+
+    fn record(document_id: Ulid, cursor: Ulid, predicate: &str, object: &str) -> IriIndexRecord {
+        IriIndexRecord {
+            document_id,
+            document_cursor: cursor,
+            predicate_iri: predicate.to_string(),
+            object_iri: object.to_string(),
+            subject_iris: vec!["https://example.test/root".to_string()],
+        }
     }
 
-    async fn write_index_row(storage: &StorageHandle, document_id: Ulid, cursor: Ulid) {
+    async fn write_document(
+        storage: &StorageHandle,
+        document_id: Ulid,
+        records: &[IriIndexRecord],
+    ) {
+        let rows = plan_iri_rows(storage, document_id, records).await.unwrap();
+        apply_rows(storage, rows).await.unwrap();
+    }
+
+    async fn row_exists(storage: &StorageHandle, key_space: &str, key: Vec<u8>) -> bool {
         match storage
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes: vec![(
-                    IRI_INDEX_KEYSPACE.to_string(),
-                    index_key(document_id, cursor),
-                    ByteView::from(vec![1u8]),
-                )],
+            .send_storage_effect(StorageEffect::Read {
+                key_space: key_space.to_string(),
+                key: ByteView::from(key),
                 txn_id: None,
             })
             .await
         {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            other => panic!("unexpected write event: {other:?}"),
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
+            other => panic!("unexpected read event: {other:?}"),
+        }
+    }
+
+    fn open_budget() -> LinkBudget {
+        LinkBudget {
+            seeks: 64,
+            rows: 1024,
         }
     }
 
@@ -689,60 +711,139 @@ mod tests {
         );
     }
 
-    #[test]
-    fn backlinks_by_predicate() {
-        // Object match and cursor fence hold across predicates; a predicate
-        // filter narrows the grouped backlinks.
-        let document_id = Ulid::from_parts(1, 1);
-        let cursor = Ulid::from_parts(2, 1);
-        let object = "https://example.test/object";
-        let records = vec![
-            IriIndexRecord {
-                document_id,
-                document_cursor: cursor,
-                predicate_iri: "https://example.test/license".to_string(),
-                object_iri: object.to_string(),
-                subject_iris: vec!["https://example.test/root".to_string()],
-            },
-            IriIndexRecord {
-                document_id,
-                document_cursor: cursor,
-                predicate_iri: "https://example.test/based-on".to_string(),
-                object_iri: object.to_string(),
-                subject_iris: vec!["https://example.test/root".to_string()],
-            },
-            IriIndexRecord {
-                document_id,
-                document_cursor: Ulid::from_parts(2, 0),
-                predicate_iri: "https://example.test/license".to_string(),
-                object_iri: object.to_string(),
-                subject_iris: vec!["https://example.test/stale".to_string()],
-            },
-            IriIndexRecord {
-                document_id,
-                document_cursor: cursor,
-                predicate_iri: "https://example.test/license".to_string(),
-                object_iri: "https://example.test/other".to_string(),
-                subject_iris: vec!["https://example.test/miss".to_string()],
-            },
-        ];
-        let registry_records = vec![registry_record(document_id, cursor)];
+    #[tokio::test]
+    async fn replaces_old_postings() {
+        // A new revision deletes the rows it does not write again, with their document rows.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let doc = Ulid::from_parts(5, 1);
+        let first = Ulid::from_parts(1, 1);
+        let second = Ulid::from_parts(2, 1);
+        write_document(
+            &storage,
+            doc,
+            &[record(doc, first, "p", "o1"), record(doc, first, "p", "o2")],
+        )
+        .await;
+        write_document(&storage, doc, &[record(doc, second, "p", "o2")]).await;
 
-        let all = collect_iri_backlinks(records.clone(), &registry_records, object, None);
-        assert_eq!(all.len(), 2);
+        let dropped = iri_reference_key("p", "o1", doc).to_vec();
+        let kept = iri_reference_key("p", "o2", doc).to_vec();
+        assert!(!row_exists(&storage, IRI_INDEX_KEYSPACE, dropped.clone()).await);
+        assert!(!row_exists(&storage, DOCUMENT_IRI_KEYSPACE, document_key(doc, &dropped)).await);
+        assert!(row_exists(&storage, DOCUMENT_IRI_KEYSPACE, document_key(doc, &kept)).await);
+        let page = read_backlinks(&storage, "o2", None, None, 10, &mut open_budget())
+            .await
+            .unwrap();
+        assert_eq!(page.documents[&doc][0].document_cursor, second);
+    }
 
-        let filtered = collect_iri_backlinks(
-            records,
-            &registry_records,
-            object,
-            Some("https://example.test/license"),
-        );
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].predicate_iri, "https://example.test/license");
-        assert_eq!(
-            filtered[0].subject_iris,
-            vec!["https://example.test/root".to_string()]
-        );
+    #[tokio::test]
+    async fn reads_object_prefix() {
+        // More than a registry's worth of rows under other objects: a predicate-less lookup
+        // still costs a few seeks and only the object's own rows.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let cursor = Ulid::from_parts(1, 1);
+        let noise: Vec<_> = (0..1100u64)
+            .map(|index| {
+                let doc = Ulid::from_parts(100, index.into());
+                record(
+                    doc,
+                    cursor,
+                    "p",
+                    &format!("https://example.test/other/{index}"),
+                )
+            })
+            .collect();
+        let rows = LinkRows {
+            writes: noise
+                .iter()
+                .map(|record| iri_reference_entry(record).unwrap())
+                .collect(),
+            deletes: Vec::new(),
+        };
+        apply_rows(&storage, rows).await.unwrap();
+        let doc = Ulid::from_parts(7, 1);
+        write_document(
+            &storage,
+            doc,
+            &[
+                record(doc, cursor, "p1", OBJECT),
+                record(doc, cursor, "p2", OBJECT),
+            ],
+        )
+        .await;
+
+        let mut budget = LinkBudget { seeks: 5, rows: 4 };
+        let page = read_backlinks(&storage, OBJECT, None, None, 10, &mut budget)
+            .await
+            .unwrap();
+
+        assert_eq!(page.documents.len(), 1);
+        assert_eq!(page.documents[&doc].len(), 2);
+        assert_eq!(page.next, None);
+        assert_eq!(budget.rows, 2);
+    }
+
+    #[tokio::test]
+    async fn pages_after_document() {
+        // Documents come in id order across predicates; `next` continues after the last one.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let cursor = Ulid::from_parts(1, 1);
+        let docs: Vec<_> = (1..=5u128)
+            .map(|index| Ulid::from_parts(9, index))
+            .collect();
+        for (index, doc) in docs.iter().enumerate() {
+            let predicate = if index % 2 == 0 { "p1" } else { "p2" };
+            let mut records = vec![record(*doc, cursor, predicate, OBJECT)];
+            if index == 2 {
+                records.push(record(*doc, cursor, "p2", OBJECT));
+            }
+            write_document(&storage, *doc, &records).await;
+        }
+
+        let mut budget = open_budget();
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let page = read_backlinks(&storage, OBJECT, None, after, 2, &mut budget)
+                .await
+                .unwrap();
+            assert!(page.documents.len() <= 2);
+            seen.extend(page.documents.keys().copied());
+            if let Some(both) = page.documents.get(&docs[2]) {
+                assert_eq!(both.len(), 2);
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, docs);
+
+        let filtered = read_backlinks(&storage, OBJECT, Some("p2"), None, 10, &mut budget)
+            .await
+            .unwrap();
+        let ids: Vec<_> = filtered.documents.keys().copied().collect();
+        assert_eq!(ids, vec![docs[1], docs[2], docs[3]]);
+    }
+
+    #[tokio::test]
+    async fn budget_ends_lookup() {
+        // An exhausted budget fails the lookup instead of returning a partial page.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let doc = Ulid::from_parts(3, 1);
+        let cursor = Ulid::from_parts(1, 1);
+        write_document(&storage, doc, &[record(doc, cursor, "p", OBJECT)]).await;
+
+        let mut budget = LinkBudget { seeks: 1, rows: 8 };
+        let error = read_backlinks(&storage, OBJECT, None, None, 10, &mut budget)
+            .await
+            .expect_err("two seeks are needed");
+        assert!(matches!(error, MetadataIriError::BudgetExhausted));
     }
 
     #[tokio::test]
@@ -751,75 +852,143 @@ mod tests {
         // the document, while storage failures must never spend that budget.
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        write_index_row(&storage, Ulid::from_parts(1, 1), Ulid::from_parts(2, 1)).await;
+        let key = iri_reference_key("p", OBJECT, Ulid::from_parts(1, 1));
+        let rows = LinkRows {
+            writes: vec![(
+                IRI_INDEX_KEYSPACE.to_string(),
+                key,
+                ByteView::from(vec![1u8]),
+            )],
+            deletes: Vec::new(),
+        };
+        apply_rows(&storage, rows).await.unwrap();
 
-        let error = scan_records(&storage, None)
+        let error = read_backlinks(&storage, OBJECT, None, None, 10, &mut open_budget())
             .await
             .expect_err("malformed row fails to decode");
         assert!(matches!(error, MetadataIriError::Conversion(_)));
     }
 
     #[tokio::test]
-    async fn keeps_raced_cursor() {
-        // A cursor a concurrent materialization advanced past the reprojected one
-        // survives cleanup; only genuinely older rows are dropped.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let doc = Ulid::from_parts(5, 1);
-        let ancient = Ulid::from_parts(1, 1);
-        let reprojected_cursor = Ulid::from_parts(2, 1);
-        let raced = Ulid::from_parts(3, 1);
-        for cursor in [ancient, reprojected_cursor, raced] {
-            write_index_row(&storage, doc, cursor).await;
-        }
-        let reprojected = HashMap::from([(doc, reprojected_cursor)]);
-        let registered = HashMap::from([(doc, raced)]);
-
-        let stale = stale_rebuild_keys(&storage, &reprojected, &registered)
-            .await
-            .unwrap();
-        let keys: Vec<ByteView> = stale.into_iter().map(|(_, key)| key).collect();
-        assert_eq!(keys, vec![index_key(doc, ancient)]);
-    }
-
-    #[tokio::test]
-    async fn prunes_deleted_docs() {
-        // A document gone from the registry has all its rows marked stale.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let live = Ulid::from_parts(1, 1);
-        let gone = Ulid::from_parts(2, 1);
-        let cursor = Ulid::from_parts(3, 1);
-        write_index_row(&storage, live, cursor).await;
-        write_index_row(&storage, gone, cursor).await;
-        let reprojected = HashMap::from([(live, cursor)]);
-        let registered = HashMap::from([(live, cursor)]);
-
-        let stale = stale_rebuild_keys(&storage, &reprojected, &registered)
-            .await
-            .unwrap();
-        let keys: Vec<ByteView> = stale.into_iter().map(|(_, key)| key).collect();
-        assert_eq!(keys, vec![index_key(gone, cursor)]);
-    }
-
-    #[tokio::test]
     async fn deletes_document_rows() {
-        // The deletion path collects every cursor's rows for the given documents.
+        // The deletion path reads only the deleted document's own rows.
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let deleted = Ulid::from_parts(1, 1);
         let kept = Ulid::from_parts(2, 1);
-        let first = Ulid::from_parts(1, 1);
-        let second = Ulid::from_parts(2, 1);
-        write_index_row(&storage, deleted, first).await;
-        write_index_row(&storage, deleted, second).await;
-        write_index_row(&storage, kept, first).await;
-        let targets = BTreeSet::from([deleted]);
+        let cursor = Ulid::from_parts(1, 1);
+        write_document(
+            &storage,
+            deleted,
+            &[
+                record(deleted, cursor, "p", "o1"),
+                record(deleted, cursor, "p", "o2"),
+            ],
+        )
+        .await;
+        write_document(&storage, kept, &[record(kept, cursor, "p", "o1")]).await;
 
-        let keys = document_iri_keys(&storage, &targets).await.unwrap();
-        let keys: Vec<ByteView> = keys.into_iter().map(|(_, key)| key).collect();
-        assert!(keys.contains(&index_key(deleted, first)));
-        assert!(keys.contains(&index_key(deleted, second)));
-        assert!(!keys.contains(&index_key(kept, first)));
+        let keys = document_iri_keys(&storage, &BTreeSet::from([deleted]))
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 4);
+        delete_keys(&storage, keys).await.unwrap();
+
+        let page = read_backlinks(&storage, "o1", None, None, 10, &mut open_budget())
+            .await
+            .unwrap();
+        let ids: Vec<_> = page.documents.keys().copied().collect();
+        assert_eq!(ids, vec![kept]);
+        let kept_key = iri_reference_key("p", "o1", kept).to_vec();
+        assert!(
+            row_exists(
+                &storage,
+                DOCUMENT_IRI_KEYSPACE,
+                document_key(kept, &kept_key)
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn freshness_of_documents() {
+        // Only the documents passed in count; a pending one elsewhere does not.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let cursor = Ulid::from_parts(1, 1);
+        let current = registry_record(Ulid::from_parts(4, 1), cursor);
+        let pending = registry_record(Ulid::from_parts(4, 2), cursor);
+        let status = |record: &MetadataRegistryRecord, state| MaterializationStatusRecord {
+            document_id: record.document_id,
+            event_id: cursor,
+            graph_iri: record.graph_iri.clone(),
+            context_digest: None,
+            dataset_digest: None,
+            state,
+            attempts: 0,
+            failures: 0,
+            last_error: None,
+            updated_at_ms: 5,
+        };
+        let rows = LinkRows {
+            writes: vec![
+                materialization_status_entry(&status(&current, MaterializationState::Materialized))
+                    .unwrap(),
+                materialization_status_entry(&status(&pending, MaterializationState::Pending))
+                    .unwrap(),
+            ],
+            deletes: Vec::new(),
+        };
+        apply_rows(&storage, rows).await.unwrap();
+
+        let returned = iri_index_freshness(&storage, std::slice::from_ref(&current))
+            .await
+            .unwrap();
+        assert_eq!(returned.state, IriFreshnessState::Current);
+        assert_eq!(returned.oldest_status_updated, Some(5));
+        let both = iri_index_freshness(&storage, &[current, pending])
+            .await
+            .unwrap();
+        assert_eq!(both.state, IriFreshnessState::Mixed);
+    }
+
+    #[tokio::test]
+    async fn rebuild_skips_newer() {
+        // A rebuild commits a document's rows only while its status still names the event.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let cursor = Ulid::from_parts(1, 1);
+        let record_at = registry_record(Ulid::from_parts(6, 1), cursor);
+        let doc = record_at.document_id;
+        let rows = plan_iri_rows(&storage, doc, &[record(doc, cursor, "p", OBJECT)])
+            .await
+            .unwrap();
+
+        assert!(!replace_rows(&storage, &record_at, rows).await.unwrap());
+        let key = iri_reference_key("p", OBJECT, doc).to_vec();
+        assert!(!row_exists(&storage, IRI_INDEX_KEYSPACE, key.clone()).await);
+
+        let status = MaterializationStatusRecord {
+            document_id: doc,
+            event_id: cursor,
+            graph_iri: record_at.graph_iri.clone(),
+            context_digest: None,
+            dataset_digest: None,
+            state: MaterializationState::Materialized,
+            attempts: 0,
+            failures: 0,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        let status_rows = LinkRows {
+            writes: vec![materialization_status_entry(&status).unwrap()],
+            deletes: Vec::new(),
+        };
+        apply_rows(&storage, status_rows).await.unwrap();
+        let rows = plan_iri_rows(&storage, doc, &[record(doc, cursor, "p", OBJECT)])
+            .await
+            .unwrap();
+        assert!(replace_rows(&storage, &record_at, rows).await.unwrap());
+        assert!(row_exists(&storage, IRI_INDEX_KEYSPACE, key).await);
     }
 }
