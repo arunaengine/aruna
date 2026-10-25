@@ -28,7 +28,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,
     ensure_confined_path, object_permission_path,
 };
-use aruna_core::structs::storage::data_identity::{DataIdentity, content_id};
+use aruna_core::structs::storage::data::identity::{DataIdentity, content_id};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };

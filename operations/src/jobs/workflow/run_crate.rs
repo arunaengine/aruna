@@ -17,7 +17,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::key_content_type;
-use aruna_core::structs::storage::data_identity::{
+use aruna_core::structs::storage::data::identity::{
     DataEntity, ObjectLocation, normalized_id, parse_hash,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -974,7 +974,7 @@ mod pure_tests {
                 .find(|entity| entity["contentUrl"] == url)
                 .expect("entity")
         };
-        let content = aruna_core::structs::storage::data_identity::content_id([9; 32]);
+        let content = aruna_core::structs::storage::data::identity::content_id([9; 32]);
         let input = by_url("s3://src/in.txt");
         assert_eq!(input["@id"], content);
         assert_eq!(input["contentSize"], "3");

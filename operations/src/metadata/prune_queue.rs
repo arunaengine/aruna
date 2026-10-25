@@ -953,7 +953,7 @@ mod tests {
             record.document_id,
         );
         let document_row =
-            aruna_core::structs::storage::data_link::document_key(record.document_id, &index_key);
+            aruna_core::structs::storage::data::link::document_key(record.document_id, &index_key);
         write_entries(
             &storage,
             vec![

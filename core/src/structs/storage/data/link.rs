@@ -134,7 +134,7 @@ impl DataLink {
         let arn = ArunaArn::parse(value).ok()?;
         match arn.resource_type {
             ArunaArnType::ContentHash => {
-                crate::structs::storage::data_identity::parse_hash(&arn.path).map(Self::Hash)
+                crate::structs::storage::data::identity::parse_hash(&arn.path).map(Self::Hash)
             }
             ArunaArnType::S3 => {
                 let bucket = arn.bucket()?.to_string();
@@ -382,5 +382,5 @@ pub fn document_key(document_id: Ulid, posting_key: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-#[path = "data_link_tests.rs"]
+#[path = "link_tests.rs"]
 mod tests;

@@ -35,7 +35,7 @@ use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_SHA256};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_core::structs::storage::data_identity::{DataIdentity, text_values};
+use aruna_core::structs::storage::data::identity::{DataIdentity, text_values};
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;

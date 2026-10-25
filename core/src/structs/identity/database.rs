@@ -12,7 +12,7 @@ use crate::UserId;
 use crate::admin_documents::AdminDocumentDot;
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
-use crate::structs::storage::data_link::{DataLink, MAX_BUCKET_BYTES};
+use crate::structs::storage::data::link::{DataLink, MAX_BUCKET_BYTES};
 use crate::types::GroupId;
 
 /// At most this many database entries per realm.

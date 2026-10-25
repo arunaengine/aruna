@@ -16,7 +16,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::storage::data_identity::{CONTENT_URL, ObjectLocation, text_values};
+use aruna_core::structs::storage::data::identity::{CONTENT_URL, ObjectLocation, text_values};
 use aruna_core::structs::storage::distribution::inventory::{IndexEntry, Position, index_key};
 use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
 use aruna_core::structs::storage::global_id::GlobalId;

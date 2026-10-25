@@ -6,9 +6,9 @@
 
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, VersionKey};
-use aruna_core::structs::storage::data_link::{DataLink, LinkScope};
+use aruna_core::structs::storage::data::link::{DataLink, LinkScope};
 
-use aruna_core::structs::storage::data_link::LinkPosting;
+use aruna_core::structs::storage::data::link::LinkPosting;
 
 use super::{
     ApiQueryMode, AuthContext, BTreeMap, BlobVersion, Deserialize, DriverContext, Event,

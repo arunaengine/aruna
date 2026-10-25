@@ -9,7 +9,7 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_core::structs::storage::data_identity::{DataIdentity, text_values};
+use aruna_core::structs::storage::data::identity::{DataIdentity, text_values};
 use aruna_core::types::GroupId;
 use serde_json::Value as JsonValue;
 

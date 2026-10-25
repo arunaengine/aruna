@@ -18,11 +18,11 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::data_link::{
+use aruna_core::structs::storage::data::link::{
     DataLink, LinkPosting, LinkScope, MAX_DOCUMENT_LINKS, MAX_LINK_SUBJECTS, document_key,
     posting_document, posting_key,
 };
-use aruna_core::structs::storage::data_link::{set_versions_key, truncated_key, unverified_key};
+use aruna_core::structs::storage::data::link::{set_versions_key, truncated_key, unverified_key};
 use aruna_core::structs::storage::distribution::inventory::index_key;
 use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
 use aruna_core::structs::storage::global_id::MAX_PREFIX_BYTES;

@@ -17,7 +17,7 @@ use aruna_core::metadata::{
     IriIndexRecord, MaterializationState, MaterializationStatusRecord, MetadataError,
 };
 use aruna_core::storage_entries::{iri_object_prefix, iri_reference_entry, iri_reference_prefix};
-use aruna_core::structs::storage::data_link::document_key;
+use aruna_core::structs::storage::data::link::document_key;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;

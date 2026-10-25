@@ -46,6 +46,7 @@ SMALL_DOMAINS = {
     "core/src/structs/identity": "identity record scope; hoisting recreates identity_*",
     "core/src/structs/identity/user": "grouped shared-prefix domain",
     "core/src/structs/placement/policy": "grouped shared-prefix domain",
+    "core/src/structs/storage/data": "grouped shared-prefix domain",
     "core/src/structured_id": "grouped shared-prefix domain",
     "core/src/user": "grouped shared-prefix domain",
     "operations/src/assistant": "coherent ownership scope",

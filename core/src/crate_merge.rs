@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::repo_layout::{CRATE_FILE, data_path, root_id};
-use crate::structs::storage::data_identity::{
+use crate::structs::storage::data::identity::{
     CONTENT_URL, LOCAL_PATH, LOCAL_PATH_IRI, ObjectLocation, text_values,
 };
 use crate::structs::storage::dataset_location::DatasetLocation;
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn matches_stored_entities() {
-        let id = crate::structs::storage::data_identity::content_id([1; 32]);
+        let id = crate::structs::storage::data::identity::content_id([1; 32]);
         let file = json!({"@id": id, "@type": "File", "name": "a.csv",
             "contentUrl": "s3://lab/doc/data/a.csv", "localPath": "data/a.csv"});
         let live = crate_with(json!([{"@id": id}]), vec![file]);

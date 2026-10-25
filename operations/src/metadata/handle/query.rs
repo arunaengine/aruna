@@ -362,7 +362,7 @@ const CONTENT_URL_IRIS: [&str; 2] = [
 
 fn names_aruna_data(value: &str) -> bool {
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    aruna_core::structs::storage::data_link::DataLink::parse(value).is_some()
+    aruna_core::structs::storage::data::link::DataLink::parse(value).is_some()
         || VersionedObjectArn::parse(value).is_ok()
         || VersionedObjectArn::parse(
             value

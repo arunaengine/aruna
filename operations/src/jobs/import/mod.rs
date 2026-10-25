@@ -41,7 +41,7 @@ use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdenti
 use aruna_core::structs::storage::blob::{
     BackendLocation, BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, object_permission_path,
 };
-use aruna_core::structs::storage::data_identity::{ObjectLocation, normalized_id};
+use aruna_core::structs::storage::data::identity::{ObjectLocation, normalized_id};
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;

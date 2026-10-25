@@ -1626,7 +1626,7 @@ async fn supersedes_prior_rows() {
             .to_vec()
     };
     let document_row = |object: &str| {
-        aruna_core::structs::storage::data_link::document_key(document_id, &key_of(object))
+        aruna_core::structs::storage::data::link::document_key(document_id, &key_of(object))
     };
     assert!(
         !storage_key_exists(&storage, IRI_INDEX_KEYSPACE, key_of("o1")).await,

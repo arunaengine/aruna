@@ -17,7 +17,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
-use aruna_core::structs::storage::data_identity::content_id;
+use aruna_core::structs::storage::data::identity::content_id;
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::complete_put;

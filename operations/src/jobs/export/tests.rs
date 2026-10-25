@@ -25,7 +25,7 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
 };
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef, BlobLocationKey};
-use aruna_core::structs::storage::data_identity::{ObjectLocation, normalized_id};
+use aruna_core::structs::storage::data::identity::{ObjectLocation, normalized_id};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
 use std::collections::HashMap;
