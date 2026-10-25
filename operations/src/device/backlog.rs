@@ -163,10 +163,11 @@ pub(crate) async fn arm_timer(task_handle: &TaskHandle, task_key: TaskKey, failu
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use aruna_core::types::Key;
+    use tokio::sync::Barrier;
 
     use super::{ForwardOutcome, QueueDrain, RetryView, drain_queue};
     use crate::device::drain::DrainOutcome;
@@ -264,5 +265,57 @@ mod tests {
     async fn settles_without_recheck() {
         let queue = FakeQueue::new(vec![Some(vec![entry(0, false)])], Arc::default());
         assert_eq!(drain_queue(0, queue, 1).await, DrainOutcome::Idle);
+    }
+
+    /// Entries wait at a barrier as wide as the limit, so the limit is reached and never passed.
+    struct GateQueue {
+        pages: Vec<Vec<Entry>>,
+        gate: Arc<Barrier>,
+        running: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        seen: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl QueueDrain for GateQueue {
+        type Entry = Entry;
+
+        async fn read(&mut self, _cursor: Option<Key>) -> Option<(Vec<Entry>, Option<Key>)> {
+            let entries = self.pages.remove(0);
+            let next = (!self.pages.is_empty()).then(|| Key::from(vec![1]));
+            Some((entries, next))
+        }
+
+        async fn forward(&self, entry: Entry) -> ForwardOutcome {
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            self.seen.lock().unwrap().push(entry.due_at_ms);
+            self.gate.wait().await;
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            ForwardOutcome::Settled
+        }
+    }
+
+    #[tokio::test]
+    async fn bounds_in_flight() {
+        let (running, peak, seen) = (Arc::default(), Arc::default(), Arc::default());
+        let queue = GateQueue {
+            pages: vec![
+                (0..3).map(|id| entry(id, false)).collect(),
+                (3..6)
+                    .map(|id| entry(id, false))
+                    .chain([entry(5_000, false)])
+                    .collect(),
+            ],
+            gate: Arc::new(Barrier::new(3)),
+            running: Arc::clone(&running),
+            peak: Arc::clone(&peak),
+            seen: Arc::clone(&seen),
+        };
+        assert_eq!(drain_queue(1_000, queue, 3).await, DrainOutcome::Idle);
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..6).collect::<Vec<_>>());
     }
 }
