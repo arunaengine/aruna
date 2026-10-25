@@ -107,3 +107,148 @@ async fn get_error(members: &Members, on: usize, key: &str) -> s3s::S3Error {
         Err(error) => error,
     }
 }
+
+// A HEAD through a member keeping no records of the range is the holder's answer.
+#[tokio::test]
+async fn head_through_holder() {
+    let members = members(3, &["h", "p"], 0).await;
+    let version = put(&members, 1, "q/far", b"held").await;
+    let node = &members.nodes[0];
+    let input = s3s::dto::HeadObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "q/far".to_string(),
+        ..Default::default()
+    };
+    let head = request(input, Method::HEAD, members.user_on(0), node.bucket().await);
+    let output = node.service.head_object(head).await.unwrap().output;
+    assert_eq!(output.content_length, Some(4));
+    assert_eq!(output.version_id.as_deref(), Some(version.as_str()));
+}
+
+// A delete of a key another member coordinates sets its marker there, and a bulk delete
+// keeps local keys and exact versions here while each foreign key goes to its coordinator.
+#[tokio::test]
+async fn deletes_reach_coordinators() {
+    use s3s::dto::DeleteObjectInput;
+    let members = members(3, &["h", "p"], 0).await;
+    for key in ["a/near", "k/one", "k/two", "q/far"] {
+        put(&members, 0, key, b"doomed").await;
+    }
+    let node = &members.nodes[0];
+    let input = DeleteObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "k/one".to_string(),
+        ..Default::default()
+    };
+    let delete = request(
+        input,
+        Method::DELETE,
+        members.user_on(0),
+        node.bucket().await,
+    );
+    let output = node.service.delete_object(delete).await.unwrap().output;
+    assert_eq!(output.delete_marker, Some(true));
+    assert!(output.version_id.is_some());
+    let gone = get_error(&members, 1, "k/one").await;
+    assert_eq!(*gone.code(), s3s::S3ErrorCode::NoSuchKey);
+
+    let entries = ["a/near", "k/two", "q/far", "k/pinned"].map(|key| BulkDeleteEntry {
+        key: key.to_string(),
+        version_id: (key == "k/pinned").then(ulid::Ulid::nil),
+    });
+    let info = node.bucket().await;
+    let target = (BUCKET, Some(&info));
+    let (local, deleted, errors) = (node.service)
+        .forward_deletes(
+            &Extensions::new(),
+            target,
+            &members.user_on(0),
+            entries.into(),
+        )
+        .await;
+    // A key this node coordinates, and any exact version, stays for the local bulk delete.
+    let local: Vec<&str> = local.iter().map(|entry| entry.key.as_str()).collect();
+    assert_eq!(local, ["a/near", "k/pinned"]);
+    let deleted: Vec<String> = deleted.into_iter().filter_map(|entry| entry.key).collect();
+    assert_eq!(deleted, ["k/two", "q/far"]);
+    assert!(errors.is_empty());
+    for (on, key) in [(1, "k/two"), (2, "q/far")] {
+        let gone = get_error(&members, on, key).await;
+        assert_eq!(*gone.code(), s3s::S3ErrorCode::NoSuchKey, "{key}");
+    }
+}
+
+// An unreachable coordinator fails the write at once with the degraded-range hint, and a
+// bulk delete reports the key it could not forward instead of dropping it.
+#[tokio::test]
+async fn unreachable_coordinator_fails() {
+    let mut members = members(3, &["h", "p"], 0).await;
+    members.nodes[1].stop().await;
+    let node = &members.nodes[0];
+    let input = PutObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "k/lost".to_string(),
+        content_length: Some(4),
+        body: Some(StreamingBlob::from(bytes::Bytes::from_static(b"lost"))),
+        ..Default::default()
+    };
+    let put = request(input, Method::PUT, members.user_on(0), node.bucket().await);
+    let error = node.service.put_object(put).await.unwrap_err();
+    let code = s3s::S3ErrorCode::Custom("CoordinatorUnreachable".into());
+    assert_eq!(*error.code(), code);
+    assert_eq!(
+        error.status_code(),
+        Some(http::StatusCode::SERVICE_UNAVAILABLE)
+    );
+    let coordinator = members.nodes[1].node_id().to_string();
+    assert!(
+        error
+            .message()
+            .is_some_and(|text| text.contains(&coordinator))
+    );
+
+    let entries = vec![BulkDeleteEntry {
+        key: "k/lost".to_string(),
+        version_id: None,
+    }];
+    let info = node.bucket().await;
+    let target = (BUCKET, Some(&info));
+    let (_, deleted, errors) = (node.service)
+        .forward_deletes(&Extensions::new(), target, &members.user_on(0), entries)
+        .await;
+    assert!(deleted.is_empty());
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].key.as_deref(), Some("k/lost"));
+    assert_eq!(errors[0].code.as_deref(), Some("CoordinatorUnreachable"));
+}
+
+// Every member checks the caller on its own node path: a grant for this node only is
+// refused by the coordinator, and the answer says that node globs fix it.
+#[tokio::test]
+async fn node_grant_refused() {
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+    use aruna_core::structs::storage::blob::bucket_permission_path;
+    let members = members(3, &["h", "p"], 0).await;
+    let node = &members.nodes[0];
+    let mut user = members.user_on(0);
+    let root = bucket_permission_path(members.realm_id, members.group_id, node.node_id(), BUCKET);
+    user.path_restrictions = Some(vec![PathRestriction {
+        pattern: format!("{root}/**"),
+        permission: Permission::WRITE,
+    }]);
+    let input = PutObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "k/denied".to_string(),
+        content_length: Some(1),
+        body: Some(StreamingBlob::from(bytes::Bytes::from_static(b"x"))),
+        ..Default::default()
+    };
+    let put = request(input, Method::PUT, user, node.bucket().await);
+    let error = node.service.put_object(put).await.unwrap_err();
+    assert_eq!(error.status_code(), Some(http::StatusCode::FORBIDDEN));
+    assert!(
+        error
+            .message()
+            .is_some_and(|text| text.contains("node glob"))
+    );
+}
