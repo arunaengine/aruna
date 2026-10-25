@@ -29,9 +29,12 @@ use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
 use bao_tree::{BaoTree, ByteRanges};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
+use lru::LruCache;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::sync::{LazyLock, Mutex as StdMutex};
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -39,6 +42,41 @@ use ulid::Ulid;
 pub(super) type ServeTarget = (BackendLocation, [u8; 32], Option<Range<u64>>);
 
 use super::BAO_BLOCK_SIZE;
+
+/// Outboards kept for reuse; with [`OUTBOARD_BYTES`] at most 64 MiB of memory.
+const OUTBOARD_ENTRIES: usize = 256;
+/// Largest outboard kept, the one of an object of about 256 GiB.
+const OUTBOARD_BYTES: usize = 256 * 1024;
+
+type OutboardCache = LruCache<([u8; 32], u64), Bytes>;
+
+/// Outboards of served objects by BLAKE3 and size, so the reads of one object hash all of its
+/// bytes once instead of per ranged read. Stored objects never change, so entries stay valid.
+static OUTBOARDS: LazyLock<StdMutex<OutboardCache>> = LazyLock::new(|| {
+    let entries = NonZeroUsize::new(OUTBOARD_ENTRIES).unwrap_or(NonZeroUsize::MIN);
+    StdMutex::new(LruCache::new(entries))
+});
+
+fn kept_outboard(blake3: [u8; 32], size: u64) -> Option<PreOrderOutboard<BytesMut>> {
+    let mut outboards = OUTBOARDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let data = outboards.get(&(blake3, size))?;
+    Some(PreOrderOutboard {
+        tree: BaoTree::new(size, BAO_BLOCK_SIZE),
+        root: blake3.into(),
+        data: BytesMut::from(&data[..]),
+    })
+}
+
+fn keep_outboard(blake3: [u8; 32], size: u64, data: &BytesMut) {
+    if data.len() <= OUTBOARD_BYTES {
+        let mut outboards = OUTBOARDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        outboards.put((blake3, size), Bytes::copy_from_slice(data));
+    }
+}
 
 impl BlobHandler {
     /// Persists durable evidence that a stored copy failed verification (§8.2)
@@ -140,9 +178,18 @@ impl BlobHandler {
                 "bao read range is outside the object".to_string(),
             ));
         }
+        // The encoder still checks every served chunk against a reused outboard.
+        if let Some(mut outboard) = kept_outboard(expected_blake3, size) {
+            return self
+                .stream_encoding(stream_id, reader, &mut outboard, range)
+                .await;
+        }
         let mut outboard =
             match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
-                Ok(outboard) if outboard.root.as_bytes() == &expected_blake3 => outboard,
+                Ok(outboard) if outboard.root.as_bytes() == &expected_blake3 => {
+                    keep_outboard(expected_blake3, size, &outboard.data);
+                    outboard
+                }
                 Ok(_) => {
                     self.quarantine_corrupt_blob(
                         expected_blake3,
@@ -818,6 +865,25 @@ mod tests {
             path: path.to_string(),
             version: None,
         }
+    }
+
+    #[tokio::test]
+    async fn outboards_reused() {
+        use super::{BAO_BLOCK_SIZE, keep_outboard, kept_outboard};
+        use bao_tree::io::fsm::CreateOutboard;
+        use bao_tree::io::outboard::PreOrderOutboard;
+        let bytes = vec![7u8; 3000];
+        let blake3 = *blake3::hash(&bytes).as_bytes();
+        let mut reader = bytes::Bytes::from(bytes.clone());
+        let created = PreOrderOutboard::<bytes::BytesMut>::create(&mut reader, BAO_BLOCK_SIZE)
+            .await
+            .unwrap();
+        assert!(kept_outboard(blake3, 3000).is_none());
+        keep_outboard(blake3, 3000, &created.data);
+        let kept = kept_outboard(blake3, 3000).unwrap();
+        assert_eq!((kept.root, kept.data), (created.root, created.data));
+        // Another size is another object, never served the outboard of the first.
+        assert!(kept_outboard(blake3, 2999).is_none());
     }
 
     async fn fingerprint_of(path: &Path) -> String {
