@@ -135,7 +135,14 @@ async fn serves_once() {
     let signed =
         delegation(&members, (0, 1), &get("k/held"), &accept()).sign(&members.nodes[0].secret);
     let value = signed.encode().unwrap();
-    let (status, body) = send(&members, 1, (Method::GET, "k/held"), &[value.clone()], None).await;
+    let (status, body) = send(
+        &members,
+        1,
+        (Method::GET, "k/held"),
+        std::slice::from_ref(&value),
+        None,
+    )
+    .await;
     assert_eq!((status, body.as_str()), (http::StatusCode::OK, "held"));
     let (status, body) = send(&members, 1, (Method::GET, "k/held"), &[value], None).await;
     assert_eq!(status, http::StatusCode::FORBIDDEN);
