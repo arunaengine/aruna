@@ -485,6 +485,10 @@ pub const DISTRIBUTION_PURGE_KEYSPACE: &str = "distribution_purge";
 pub const SOURCE_ROOT_KEYSPACE: &str = "distribution_source_roots";
 /// IRI index postings by document first, so a materialization replaces exactly its own rows.
 pub const DOCUMENT_IRI_KEYSPACE: &str = "metadata_document_iris";
+/// Head changes of distributed buckets waiting for the range search indexes, by head position.
+pub const SEARCH_FEED_KEYSPACE: &str = "distribution_search_feed";
+/// The search index state of each range on this member, by set id and range id.
+pub const SEARCH_INDEX_KEYSPACE: &str = "distribution_search_indexes";
 
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
@@ -744,6 +748,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     BUCKET_FREE_INDEX,
     CONTENT_INDEX_KEYSPACE,
     DOCUMENT_IRI_KEYSPACE,
+    SEARCH_FEED_KEYSPACE,
+    SEARCH_INDEX_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

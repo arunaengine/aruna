@@ -10,8 +10,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     CONTENT_INDEX_KEYSPACE, INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
-    RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE, SOURCE_ROOT_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE,
-    VERSION_INDEX_KEYSPACE,
+    RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE, SEARCH_FEED_KEYSPACE, SOURCE_ROOT_KEYSPACE,
+    UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::accounting::{
@@ -22,6 +22,7 @@ use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, IndexEntry, Position, VersionEntry, content_key, head_position, index_key,
     logical_identity, upload_position, version_position,
 };
+use aruna_core::structs::storage::distribution::search::feed_value;
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, root_key};
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange, OriginalEpoch};
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -470,6 +471,10 @@ impl InventoryUpdate {
             return Ok(());
         }
         let position = head_position(self.change.set_id, &self.change.key);
+        // The search feed row carries the new head to the range's index in this transaction.
+        let feed = feed_value(new.as_ref())?;
+        self.writes
+            .push(row(SEARCH_FEED_KEYSPACE, position.clone(), feed));
         match new {
             Some(head) => {
                 self.writes

@@ -609,3 +609,36 @@ async fn sees_staged_entry() {
         i128::from(SAMPLE_SIZE)
     );
 }
+
+#[tokio::test]
+async fn feeds_head_changes() {
+    use aruna_core::structs::storage::distribution::search::decode_feed;
+
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    let feed = || get(&handle, SEARCH_FEED_KEYSPACE, head_position(set(), "a"));
+    assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
+    let row = feed().await.expect("a new head is fed");
+    assert_eq!(decode_feed(&row).unwrap().unwrap().version_id, id(1));
+
+    let delete = handle
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: SEARCH_FEED_KEYSPACE.to_string(),
+            key: head_position(set(), "a").into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        delete,
+        Event::Storage(StorageEvent::DeleteResult { .. })
+    ));
+    assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
+    assert!(feed().await.is_none(), "a replayed head feeds nothing");
+
+    let mut purge = InventoryChange::new(set(), "a");
+    purge.removed = vec![id(1)];
+    purge.head = HeadChange::Remove;
+    assert!(apply(&handle, InventoryUpdate::new(purge)).await.unwrap());
+    let row = feed().await.expect("a removed head is fed");
+    assert_eq!(decode_feed(&row).unwrap(), None);
+}

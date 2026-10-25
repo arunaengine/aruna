@@ -24,6 +24,7 @@ pub mod parking;
 pub mod presets;
 pub mod request;
 pub mod route;
+pub mod search;
 pub mod snapshot;
 pub mod source_root;
 pub mod split;
