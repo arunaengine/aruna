@@ -402,6 +402,7 @@ pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationMani
         distribution: None,
         version_origin: None,
         version_hop: None,
+        sync_source: None,
     }
 }
 
@@ -1527,6 +1528,33 @@ fn changed_reference_updates() {
             ReplicationNegotiationResult::NeedVersionOnly
         )
     ));
+}
+
+// A sync destination's hop names the sender's bucket and key, never its own.
+#[test]
+fn hop_names_source() {
+    use aruna_core::structs::storage::origin::OriginVersion;
+    let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+    let relationship_id = Ulid::from_parts(22, 22);
+    manifest.origin = Some(SyncOrigin {
+        relationship_id,
+        hop_count: 1,
+    });
+    manifest.sync_source = Some(("source-bucket".to_string(), "raw/a.txt".to_string()));
+    let publisher = iroh::SecretKey::from_bytes(&[75; 32]).public();
+    let op = IncomingVersionOperation::new(
+        Ulid::from_parts(23, 23),
+        publisher,
+        test_realm_id(),
+        manifest,
+    );
+
+    let hop = op.hop().unwrap();
+    assert_eq!(hop.relationship_id, relationship_id);
+    let OriginVersion::Node(arn) = hop.from else {
+        panic!("an ordinary source is named by its node ARN")
+    };
+    assert_eq!((arn.bucket.as_str(), arn.key.as_str()), ("source-bucket", "raw/a.txt"));
 }
 
 #[test]

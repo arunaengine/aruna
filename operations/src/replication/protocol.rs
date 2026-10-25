@@ -84,6 +84,8 @@ pub struct VersionReplicationManifest {
     pub version_origin: Option<aruna_core::structs::storage::origin::VersionOrigin>,
     /// The sync hop the sender's version carries; a sync destination records its own.
     pub version_hop: Option<aruna_core::structs::storage::origin::SyncHop>,
+    /// The sender's own bucket and key of a sync delivery, which the destination's hop names.
+    pub sync_source: Option<(String, String)>,
 }
 
 impl VersionReplicationManifest {
@@ -103,6 +105,10 @@ impl VersionReplicationManifest {
         }
         check_text(&mut budget, &self.bucket, MAX_VALUE_BYTES)?;
         check_text(&mut budget, &self.key, MAX_VALUE_BYTES)?;
+        if let Some((bucket, key)) = &self.sync_source {
+            check_text(&mut budget, bucket, MAX_VALUE_BYTES)?;
+            check_text(&mut budget, key, MAX_VALUE_BYTES)?;
+        }
         if self
             .version_origin
             .as_ref()
@@ -773,6 +779,7 @@ mod pure_tests {
             distribution: None,
             version_origin: None,
             version_hop: None,
+            sync_source: None,
         }
     }
 

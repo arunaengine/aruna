@@ -1559,6 +1559,7 @@ mod tests {
             distribution: None,
             version_origin: None,
             version_hop: None,
+            sync_source: None,
         };
 
         assert_eq!(
@@ -2061,6 +2062,7 @@ mod tests {
             distribution: None,
             version_origin: None,
             version_hop: None,
+            sync_source: None,
         });
         let summary = VersionReplicationMessage::LocationSummaryRequest(LocationSummaryRequest {
             realm_id: RealmId::from_bytes([8u8; 32]),

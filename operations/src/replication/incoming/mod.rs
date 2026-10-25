@@ -1015,8 +1015,8 @@ impl IncomingVersionOperation {
         }
     }
 
-    /// A sync destination records the hop from the sender's exact version; member replication
-    /// keeps the hop the version already carries.
+    /// A sync destination records the hop from the sender's exact version, named by the
+    /// sender's own coordinates; member replication keeps the hop the version carries.
     fn hop(&self) -> Option<SyncHop> {
         let Some(sync) = &self.manifest.origin else {
             return self.manifest.version_hop.clone();
@@ -1027,12 +1027,13 @@ impl IncomingVersionOperation {
                 version_id: self.manifest.version_id,
             })
         } else {
+            let (bucket, key) = self.manifest.sync_source.as_ref()?;
             OriginVersion::Node(
                 VersionedObjectArn::new(
                     self.local_realm_id,
                     self.publisher_node_id,
-                    &self.manifest.bucket,
-                    &self.manifest.key,
+                    bucket,
+                    key,
                     self.manifest.version_id,
                 )
                 .ok()?,

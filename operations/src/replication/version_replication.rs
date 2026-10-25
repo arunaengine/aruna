@@ -2147,6 +2147,8 @@ impl ReplicateObjectOperation {
                 .and_then(|sync| sync.distribution.clone()),
             version_origin: self.version_origin.clone(),
             version_hop: self.version_hop.clone(),
+            sync_source: (self.sync.as_ref())
+                .map(|_| (self.request.bucket.clone(), self.request.key.clone())),
         });
         if let Some(manifest) = self.manifest.as_ref() {
             debug!(
