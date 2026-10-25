@@ -440,6 +440,25 @@ pub async fn delegated_range(
     })
 }
 
+/// Resolves the range a forwarded read names to the key's range, whose records this ready
+/// member must keep; an ancestor id from before a split resolves to its descendant.
+pub async fn delegated_read(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    range_id: Ulid,
+    key: &str,
+) -> Result<(), GuardError> {
+    let view = bound_view(context, binding).await?;
+    let snapshot = view.snapshot();
+    let range = snapshot.resolve(range_id, key)?;
+    match (snapshot.record_holders(range).iter())
+        .any(|member| member.member_id == binding.member_id)
+    {
+        true => Ok(()),
+        false => Err(GuardError::Route(RouteError::StaleRange(range.range_id))),
+    }
+}
+
 /// Whether this member answers listings of every key in `[lower, upper)` from its records.
 pub async fn lists_interval(
     context: &DriverContext,

@@ -203,3 +203,30 @@ async fn uploads_follow_authority() {
         Err(GuardError::Route(RouteError::StaleRange(upper)))
     );
 }
+
+#[tokio::test]
+async fn replicas_take_reads() {
+    use crate::distribution::test_record::{replicated, store_record};
+    use crate::distribution::test_store::{context, open};
+    let (_dir, handle) = open();
+    let context = context(&handle);
+    let (snapshot, bytes) = replicated(true, 1);
+    store_record(&handle, snapshot.set_id(), bytes).await;
+    let replica = binding(&snapshot, 2, 5);
+    let lower = snapshot.config.ranges[0].range_id;
+    assert_eq!(delegated_read(&context, &replica, lower, "a").await, Ok(()));
+    assert!(matches!(
+        delegated_range(&context, &replica, lower, "a").await,
+        Err(GuardError::NotCoordinator { .. })
+    ));
+    let (_dir, handle) = open();
+    let context = crate::distribution::test_store::context(&handle);
+    let (snapshot, bytes) = record(true);
+    store_record(&handle, snapshot.set_id(), bytes).await;
+    let stranger = binding(&snapshot, 2, 5);
+    let lower = snapshot.config.ranges[0].range_id;
+    assert_eq!(
+        delegated_read(&context, &stranger, lower, "a").await,
+        Err(GuardError::Route(RouteError::StaleRange(lower)))
+    );
+}
