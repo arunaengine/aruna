@@ -34,6 +34,7 @@ use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportM
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::search::{SearchBucketsInput, search_local_buckets};
 use crate::s3::object::search::{SearchObjectsInput, search_local_objects};
+use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
@@ -114,6 +115,14 @@ impl MetadataHandle {
             .await;
         }
 
+        // A read-only bucket refuses a mirror like a denied write, before any bucket is created.
+        match guard_bucket_write(context.as_ref(), local_bucket).await {
+            Ok(()) => {}
+            Err(OfferedDirectoryError::ReadOnly(_)) => {
+                return MetadataTransportMessage::Reject("access_denied".to_string());
+            }
+            Err(_) => return MetadataTransportMessage::Reject("mirror_internal".to_string()),
+        }
         let (group_id, create_bucket) = match drive(
             GetBucketOperation::new(local_bucket.to_string()),
             context.as_ref(),
