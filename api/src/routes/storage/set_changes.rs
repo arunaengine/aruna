@@ -22,8 +22,8 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::distributed::{
-    AdmissionResponse, BehaviourName, SettingsRequest, StrategyName, admission_response, behaviour,
-    map_create_error, node, owned_status, settings_of, strategy,
+    AdmissionResponse, BehaviourName, SettingsRequest, StrategyName, admission_example,
+    admission_response, behaviour, map_create_error, node, owned_status, settings_of, strategy,
 };
 use super::routing::ensure_group_admin;
 use crate::auth::{ValidatedBearer, require_realm_auth};
@@ -89,6 +89,10 @@ pub struct ChangeResponse {
     pub revision: u64,
 }
 
+fn change_example() -> serde_json::Value {
+    serde_json::json!({ "set_id": "01JMPRT0123456789ABCDEFGHJ", "revision": 5 })
+}
+
 fn id(value: &str) -> ServerResult<Ulid> {
     value
         .parse()
@@ -149,7 +153,7 @@ async fn admin(
         })
     ),
     responses(
-        (status = 201, description = "The member's admission", body = AdmissionResponse),
+        (status = 201, description = "The member's admission", body = AdmissionResponse, example = admission_example),
         (status = 400, description = "Invalid node, range or coverage", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
@@ -206,7 +210,7 @@ pub async fn join_distributed(
         ("member_id" = String, Path, description = "Member id")
     ),
     responses(
-        (status = 200, description = "The revision that took the change", body = ChangeResponse),
+        (status = 200, description = "The revision that took the change", body = ChangeResponse, example = change_example),
         (status = 400, description = "The member still coordinates a range", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
@@ -265,7 +269,7 @@ pub async fn leave_distributed(
         })
     ),
     responses(
-        (status = 202, description = "The revision that opened the transfer", body = ChangeResponse),
+        (status = 202, description = "The revision that opened the transfer", body = ChangeResponse, example = change_example),
         (status = 400, description = "Unknown range, or the member is not a ready `copy` replica of it; the message names the eligible members", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
@@ -319,7 +323,7 @@ pub async fn transfer_distributed(
         example = json!({ "refresh_secs": 3600, "public": true, "split_objects": 250000 })
     ),
     responses(
-        (status = 200, description = "The revision that took the change", body = ChangeResponse),
+        (status = 200, description = "The revision that took the change", body = ChangeResponse, example = change_example),
         (status = 400, description = "Invalid settings", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
@@ -366,7 +370,7 @@ pub async fn settings_distributed(
         ("set_id" = String, Path, description = "Distributed bucket set id")
     ),
     responses(
-        (status = 202, description = "The revision that recorded the deletion", body = ChangeResponse),
+        (status = 202, description = "The revision that recorded the deletion", body = ChangeResponse, example = change_example),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),

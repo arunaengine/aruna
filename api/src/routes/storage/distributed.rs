@@ -496,7 +496,7 @@ fn status_example() -> serde_json::Value {
     serde_json::from_str(STATUS_EXAMPLE).unwrap_or_default()
 }
 
-fn admission_example() -> serde_json::Value {
+pub(super) fn admission_example() -> serde_json::Value {
     json!({
         "set_id": "01JMPRT0123456789ABCDEFGHJ",
         "active": false,

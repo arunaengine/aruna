@@ -48,9 +48,22 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
   request there with the caller's bearer token, and the coordinator checks the caller again on its
   own path. An unreachable coordinator fails the write at once."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
-    request_body(content = TextObjectRequest),
+    request_body(
+        content = TextObjectRequest,
+        example = json!({
+            "key": "notes/summary.md",
+            "text": "# Summary\n",
+            "content_type": "text/markdown"
+        })
+    ),
     responses(
-        (status = 200, description = "The stored version", body = WriteObjectOutput),
+        (status = 200, description = "The stored version", body = WriteObjectOutput, example = json!({
+            "bucket": "project-data",
+            "key": "notes/summary.md",
+            "version_id": "01JMPRT0123456789ABCDEFGHJ",
+            "size": 10,
+            "content_type": "text/markdown"
+        })),
         (status = 400, description = "The key is not a valid object key", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the object's path, or the bucket is a read-only offered directory", body = ErrorResponse),
