@@ -145,7 +145,11 @@ impl RefreshHoldersOperation {
         }
     }
 
-    fn owners_read(&mut self, values: Vec<(Key, aruna_core::types::Value)>) -> Effects {
+    fn owners_read(&mut self, values: Vec<(Key, aruna_core::types::Value)>, more: bool) -> Effects {
+        // Owners beyond the probe are unknown, so the hash stays announced.
+        if more {
+            return self.decide();
+        }
         let mut buckets: Vec<String> = values
             .iter()
             .filter_map(|(key, _)| HashIndex::from_bytes(key.as_ref()).ok())
@@ -274,7 +278,10 @@ impl Operation for RefreshHoldersOperation {
                 other => self.unexpected("blob location page", other),
             },
             RefreshState::ReadOwners => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => self.owners_read(values),
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => self.owners_read(values, next_start_after.is_some()),
                 other => self.unexpected("hash owner rows", other),
             },
             RefreshState::ReadBuckets => match event {
@@ -638,6 +645,24 @@ mod pure_tests {
         }));
         assert!(finish.is_empty());
         assert_eq!(operation.finalize(), Ok(1));
+    }
+
+    // Owners past the probe may be ordinary buckets, so a truncated probe keeps the hash.
+    #[test]
+    fn truncated_owners_announce() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let mut operation = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
+        operation.distributed.insert("shared".to_string(), true);
+        operation.pending.push_back(DhtKeyId::from_bytes([4; 32]));
+        operation.next_effect();
+        let publish = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(owner_row("shared", 4), Vec::<u8>::new().into())],
+            next_start_after: Some(owner_row("shared", 4)),
+        }));
+        assert!(matches!(
+            publish.as_slice(),
+            [Effect::Net(NetEffect::Dht(DhtEffect::Put { .. }))]
+        ));
     }
 
     #[test]
