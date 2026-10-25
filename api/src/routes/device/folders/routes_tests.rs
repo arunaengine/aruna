@@ -1,8 +1,10 @@
-//! Tests the synced folder routes for owner checks, binding, pausing, entries and actions.
+//! Tests the synced folder routes and the bucket route for owner checks, binding, pausing,
+//! entries and actions.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::routes::device::buckets::{CreateBucketRequest, create_device_bucket};
 use crate::routes::device::dto::FolderStateName;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -11,6 +13,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
+use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
 use aruna_operations::device::sync::repository::{action_entry, base_entry, folder_entry};
 use aruna_operations::driver::DriverContext;
@@ -56,19 +59,25 @@ async fn seed_row(state: &ServerState, row: (String, Key, Value)) {
 async fn setup_with(capabilities: NodeCapabilities) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+    };
+    serve(dir, context, capabilities).await
+}
+
+/// Serves `context` as the owner's device, with a realm config that names it.
+async fn serve(dir: TempDir, context: DriverContext, capabilities: NodeCapabilities) -> Fixture {
     let realm_id = realm_id();
     let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
     let owner = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
     let state = Arc::new(
         ServerState::new(
-            Arc::new(DriverContext {
-                storage_handle: storage,
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: Some(TaskHandle::new()),
-                compute_handle: None,
-            }),
+            Arc::new(context),
             realm_id,
             node_id,
             capabilities,
@@ -104,6 +113,62 @@ async fn setup_with(capabilities: NodeCapabilities) -> Fixture {
 
 async fn setup() -> Fixture {
     setup_with(NodeCapabilities::user_node(realm_id()).unwrap()).await
+}
+
+/// Sends every timer key the scheduler fires, so a wake is awaited instead of slept on.
+struct Fired(tokio::sync::mpsc::UnboundedSender<TaskKey>);
+
+#[async_trait::async_trait]
+impl aruna_tasks::InboundTaskHandler for Fired {
+    async fn handle_timer(&self, key: TaskKey) {
+        let _ = self.0.send(key);
+    }
+}
+
+/// A device that reads local directories and reports the timers it fires. No pass runs.
+async fn local_setup() -> (Fixture, tokio::sync::mpsc::UnboundedReceiver<TaskKey>) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let storage = FjallStorage::open(&path).unwrap();
+    let net = aruna_net::NetHandle::new(
+        aruna_net::NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            realm_id: realm_id(),
+            discovery_method: aruna_net::DiscoveryMethod::None,
+            relay_method: aruna_net::RelayMethod::None,
+            ..aruna_net::NetConfig::default()
+        },
+        storage.clone(),
+    )
+    .await
+    .unwrap();
+    let backend = aruna_core::structs::storage::blob::BackendConfig {
+        backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
+        root: format!("{path}/blobs"),
+        service_config: std::collections::HashMap::new(),
+        bucket_prefix: Some("aruna-".to_string()),
+        max_bucket_size: Some(1_000_000),
+        multipart_bucket: Some("multipart".to_string()),
+        timeouts: Default::default(),
+    };
+    let blob = aruna_blob::blob::BlobHandler::new(backend, storage.clone(), net)
+        .await
+        .unwrap();
+    let (sender, fired) = tokio::sync::mpsc::unbounded_channel();
+    let task_handle = TaskHandle::new();
+    task_handle
+        .set_inbound_handler(Arc::new(Fired(sender)))
+        .await;
+    let context = DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: Some(blob),
+        metadata_handle: None,
+        task_handle: Some(task_handle),
+        compute_handle: None,
+    };
+    let capabilities = NodeCapabilities::user_node(realm_id()).unwrap();
+    (serve(dir, context, capabilities).await, fired)
 }
 
 fn owner_auth(fixture: &Fixture) -> AuthContext {
@@ -337,7 +402,14 @@ async fn unbinds_folder() {
     .await
     .unwrap();
     assert_eq!(unbound.folder_id, id.to_string());
-    assert_eq!(unbound.removed, 0);
+    let Json(deleting) = get_synced_folder(
+        State(fixture.state.clone()),
+        Extension(Some(owner_auth(&fixture))),
+        Path(id.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(deleting.state, FolderStateName::Deleting);
 }
 
 #[tokio::test]
@@ -438,6 +510,50 @@ async fn pause_resume() {
     assert_eq!(refused.status_code(), StatusCode::NOT_FOUND);
 }
 
+/// A folder still binding shows as `binding` and cannot be paused or resumed past its bucket.
+#[tokio::test]
+async fn refuses_binding_pause() {
+    let fixture = setup().await;
+    let id = Ulid::from_bytes([32u8; 16]);
+    let binding = FolderState::Binding {
+        create_bucket: true,
+    };
+    seed_row(
+        &fixture.state,
+        folder_entry(&sample_folder(id, &fixture, "/data", binding)).unwrap(),
+    )
+    .await;
+    let Json(view) = get_synced_folder(
+        State(fixture.state.clone()),
+        Extension(Some(owner_auth(&fixture))),
+        Path(id.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(view.state, FolderStateName::Binding);
+    for paused in [true, false] {
+        let call = match paused {
+            true => {
+                pause_folder(
+                    State(fixture.state.clone()),
+                    Extension(Some(owner_auth(&fixture))),
+                    Path(id.to_string()),
+                )
+                .await
+            }
+            false => {
+                resume_folder(
+                    State(fixture.state.clone()),
+                    Extension(Some(owner_auth(&fixture))),
+                    Path(id.to_string()),
+                )
+                .await
+            }
+        };
+        assert_eq!(call.unwrap_err().status_code(), StatusCode::CONFLICT);
+    }
+}
+
 #[tokio::test]
 async fn sync_needs_active() {
     let fixture = setup().await;
@@ -473,6 +589,147 @@ async fn sync_needs_active() {
     .await
     .unwrap_err();
     assert_eq!(paused.status_code(), StatusCode::CONFLICT);
+}
+
+/// "Sync now" answers with the folder as it stands and leaves the pass to the timer it wakes.
+#[tokio::test]
+async fn sync_skips_scan() {
+    let (fixture, mut fired) = local_setup().await;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("note.txt"), b"local").unwrap();
+    let id = Ulid::from_bytes([29u8; 16]);
+    let folder = sample_folder(
+        id,
+        &fixture,
+        root.path().to_str().unwrap(),
+        FolderState::Active,
+    );
+    seed_row(&fixture.state, folder_entry(&folder).unwrap()).await;
+
+    let Json(view) = sync_folder(
+        State(fixture.state.clone()),
+        Extension(Some(owner_auth(&fixture))),
+        Path(id.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(view.counters.observed, 0);
+    let offers =
+        aruna_operations::staging::offered_directory::list_offers(&fixture.state.get_ctx())
+            .await
+            .unwrap();
+    assert!(offers.is_empty(), "the request must not walk the folder");
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        while let Some(key) = fired.recv().await {
+            if key == TaskKey::ReconcileSyncedFolders {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(woken, Ok(true), "the folder pass must be woken");
+}
+
+/// A root that is gone, or runs through a file, is the owner's input error on bind and sync now.
+#[tokio::test]
+async fn refuses_missing_root() {
+    let (fixture, _fired) = local_setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("note.txt"), b"local").unwrap();
+    let unusable = |error: &ServerError| {
+        matches!(error, ServerError::BadRequestReason(reason)
+            if reason.starts_with("the directory is unusable"))
+    };
+    for (index, root) in [dir.path().join("missing"), dir.path().join("note.txt/sub")]
+        .iter()
+        .enumerate()
+    {
+        let root = root.to_string_lossy().to_string();
+        let bind = bind_synced_folder(
+            State(fixture.state.clone()),
+            Extension(Some(owner_auth(&fixture))),
+            Json(BindFolderRequest {
+                root: root.clone(),
+                group_id: Ulid::from_bytes([10u8; 16]).to_string(),
+                remote_node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public().to_string(),
+                remote_bucket: "lab".to_string(),
+                create_bucket: true,
+                remote_prefix: String::new(),
+                mode: None,
+                propagate_deletes: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(unusable(&bind), "bind of {root}: {bind:?}");
+
+        let id = Ulid::from_bytes([30 + index as u8; 16]);
+        let folder = sample_folder(id, &fixture, &root, FolderState::Active);
+        seed_row(&fixture.state, folder_entry(&folder).unwrap()).await;
+        let sync = sync_folder(
+            State(fixture.state.clone()),
+            Extension(Some(owner_auth(&fixture))),
+            Path(id.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(unusable(&sync), "sync of {root}: {sync:?}");
+    }
+}
+
+/// The bucket route admits only the owner and refuses bad input, this computer and nodes outside
+/// the realm before it forwards anything.
+#[tokio::test]
+async fn bucket_bad_input() {
+    let fixture = setup().await;
+    let group = Ulid::from_bytes([10u8; 16]).to_string();
+    let outsider = iroh::SecretKey::from_bytes(&[5u8; 32]).public().to_string();
+    let own = fixture.state.get_node_id().to_string();
+    let create = |auth: AuthContext, name: &str, group: &str, node: &str| {
+        create_device_bucket(
+            State(fixture.state.clone()),
+            Extension(Some(auth)),
+            Json(CreateBucketRequest {
+                name: name.to_string(),
+                group_id: group.to_string(),
+                node_id: node.to_string(),
+            }),
+        )
+    };
+    let stranger = AuthContext {
+        user_id: UserId::local(Ulid::from_bytes([1u8; 16]), fixture.realm_id),
+        ..owner_auth(&fixture)
+    };
+    let foreign = create(stranger, "lab-data", &group, &outsider)
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.status_code(), StatusCode::FORBIDDEN);
+
+    for (name, group, node) in [
+        ("Lab_Data", group.as_str(), outsider.as_str()),
+        ("lab-data", "nope", outsider.as_str()),
+        ("lab-data", group.as_str(), "not-a-node"),
+    ] {
+        let bad = create(owner_auth(&fixture), name, group, node)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            bad.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{name} {group} {node}"
+        );
+    }
+    for node in [&own, &outsider] {
+        let refused = create(owner_auth(&fixture), "lab-data", &group, node)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            refused.to_string(),
+            format!("node {node} is not a realm server")
+        );
+    }
 }
 
 #[tokio::test]

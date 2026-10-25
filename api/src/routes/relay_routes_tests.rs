@@ -213,6 +213,36 @@ async fn keeps_api_prefix() {
     handle.abort();
 }
 
+/// A reply cut off after the management node answered may already be applied: `relay_failed`.
+#[tokio::test]
+async fn truncated_reply_failed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "the relay closed before its request ended");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let reply = b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\npartial";
+        stream.write_all(reply).await.unwrap();
+    });
+    let fixture = setup(vec![format!("http://{address}")]).await;
+    let response = relay_app(fixture.state.clone())
+        .oneshot(token_request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: crate::error::ErrorResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body.code.as_deref(), Some("relay_failed"));
+    handle.await.unwrap();
+}
+
 #[tokio::test]
 async fn no_management_target() {
     // A resolved realm config with no reachable management node answers 503.

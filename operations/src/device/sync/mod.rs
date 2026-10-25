@@ -90,14 +90,32 @@ impl ReconcileFolderError {
 
 /// Reconciles every active folder once.
 pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
-    if context.net_handle.is_none() {
+    let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
         return DrainOutcome::Deferred;
-    }
+    };
     let Ok(folders) = list_folders(context).await else {
         return DrainOutcome::Deferred;
     };
     let mut work = false;
     for folder in folders {
+        // An unbind finishes here, also after a cancelled call or a restart.
+        if folder.state == FolderState::Deleting {
+            if let Err(error) = folders::finish_unbind(context, folder.folder_id, node_id).await {
+                warn!(folder = %folder.folder_id, reason = %error, "Could not finish the unbind");
+            }
+            continue;
+        }
+        // A bind cut short by a lost reply, a failed write or a restart finishes here.
+        if matches!(folder.state, FolderState::Binding { .. }) {
+            let folder_id = folder.folder_id;
+            match folders::finish_binding(context, folder).await {
+                Ok(_) => work = true,
+                Err(error) => {
+                    warn!(folder = %folder_id, reason = %error, "Could not finish the folder binding")
+                }
+            }
+            continue;
+        }
         if folder.state != FolderState::Active {
             continue;
         }
@@ -114,12 +132,28 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
     }
 }
 
+static FOLDER_LOCKS: std::sync::LazyLock<[tokio::sync::Mutex<()>; 64]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(|_| tokio::sync::Mutex::new(())));
+
+/// Held by a folder's pass for its whole run, so an unbind waits for a pass in flight.
+pub(crate) async fn folder_lock(folder_id: ulid::Ulid) -> tokio::sync::MutexGuard<'static, ()> {
+    FOLDER_LOCKS[usize::from(folder_id.to_bytes()[15]) % 64]
+        .lock()
+        .await
+}
+
 /// Reconciles one folder: observe the directory, list the realm heads, decide
 /// every entry, then write what the decisions allow.
 pub async fn reconcile_folder(
     context: &Arc<DriverContext>,
     folder: &SyncedFolder,
 ) -> Result<ReconcilePlan, ReconcileFolderError> {
+    let _pass = folder_lock(folder.folder_id).await;
+    // A folder unbound or paused since the pass listed it is left alone.
+    let current = folders::read_bound(context, folder.folder_id).await;
+    if !matches!(current, Ok(current) if current.state == FolderState::Active) {
+        return Ok(ReconcilePlan::default());
+    }
     let mut stored = folder.clone();
     let result: Result<_, ReconcileFolderError> = async {
         let net_handle = context

@@ -1,4 +1,4 @@
-//! Binds, lists and unbinds the realm folders this device keeps in sync.
+//! Binds, lists and unbinds the realm folders this device keeps in sync, and creates realm buckets.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,25 +11,36 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::multipart::MultipartUploadStatus;
 use aruna_core::structs::{
     EntryState, FolderMode, FolderState, RemoteBinding, SyncActionRecord, SyncBase, SyncPageLimit,
     SyncRefusal, SyncedFolder,
 };
+use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{GroupId, Key};
+use aruna_core::types::{GroupId, Key, TxnId};
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::get_config::GetConfigOperation;
+use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
+use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
+use crate::s3::multipart::uploads::{ListUploadsError, ListUploadsInput, ListUploadsOperation};
+use crate::s3::object::delete::DeleteObjectError;
+use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use crate::s3::object::versions::{
+    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
+};
 use crate::staging::offered_directory::{
-    OfferDirectoryInput, OfferedDirectoryError, WithdrawOfferInput, offer_directory, withdraw_offer,
+    OfferedDirectoryError, WithdrawOfferInput, check_root, read_bucket, withdraw_offer,
 };
 
 use super::repository::{
     MAX_SYNCED_FOLDERS, SyncUpload, abort_txn, commit_txn, delete_rows, folder_entry, folder_key,
-    key_path, read_value, scan_folder, scan_folders, scan_page, start_txn, write_rows,
+    key_path, read_value, scan_folder, scan_folders, scan_page, start_txn, sync_all, write_rows,
 };
 use super::{ReconcileFolderError, request_versions};
 
@@ -44,7 +55,16 @@ pub struct BindFolderInput {
     pub mode: FolderMode,
     pub propagate_deletes: bool,
     pub realm_id: RealmId,
+    pub user_id: UserId,
+}
+
+/// A bucket the owner creates on a realm node without binding a folder to it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmBucketInput {
+    pub bucket: String,
+    pub group_id: GroupId,
     pub node_id: NodeId,
+    pub realm_id: RealmId,
     pub user_id: UserId,
 }
 
@@ -70,10 +90,24 @@ pub enum FolderError {
     RemoteBucketConflict { bucket: String, reason: String },
     #[error("node {node} is unreachable: {reason}")]
     RemoteUnreachable { node: NodeId, reason: String },
+    #[error("the bucket \"{bucket}\" already exists on node {node}")]
+    BucketExists { node: NodeId, bucket: String },
+    #[error("the folder is still being bound")]
+    StillBinding,
     #[error(transparent)]
     Offer(#[from] OfferedDirectoryError),
     #[error("a download-only folder never propagates deletions")]
     DownloadOnly,
+    #[error(transparent)]
+    ListVersions(#[from] ListVersionsError),
+    #[error(transparent)]
+    DeleteObject(#[from] DeleteObjectError),
+    #[error(transparent)]
+    DeleteBucket(#[from] DeleteBucketError),
+    #[error(transparent)]
+    ListUploads(#[from] ListUploadsError),
+    #[error(transparent)]
+    AbortUpload(#[from] AbortUploadError),
 }
 
 /// How much of a folder still needs attention. Every counter is derived from
@@ -88,116 +122,309 @@ pub struct FolderCounters {
     pub errors: usize,
 }
 
-/// Binds one directory to a realm bucket prefix and takes the first
-/// observation of it. The bucket becomes this device's read-only view of the
-/// directory, exactly as an offered directory is.
+/// Binds one directory to a realm bucket prefix and answers before the directory is walked:
+/// the first reconcile pass, woken here, observes and publishes it in the background.
 pub async fn bind_folder(
     context: &Arc<DriverContext>,
     input: BindFolderInput,
 ) -> Result<SyncedFolder, FolderError> {
-    let bound = list_folders(context).await?;
+    check_root(context, &input.root).await?;
+    ensure_realm_node(context, input.realm_id, input.remote.node_id).await?;
+    let folder = SyncedFolder {
+        folder_id: input.folder_id,
+        root: input.root,
+        local_bucket: folder_bucket(input.folder_id),
+        group_id: input.group_id,
+        remote: input.remote,
+        mode: input.mode,
+        propagate_deletes: input.propagate_deletes,
+        state: FolderState::Binding {
+            create_bucket: input.create_bucket,
+        },
+        created_by: input.user_id,
+        created_at_ms: unix_timestamp_millis(),
+        last_reconcile_ms: None,
+        last_error: None,
+        last_error_ms: None,
+        observed_files: 0,
+        list_cursor: None,
+    };
+    reserve_binding(context, &folder).await?;
+    // Detached, so a dropped request still records the outcome; a crash leaves it to the next pass.
+    let context = context.clone();
+    tokio::spawn(async move { finish_binding(&context, folder).await })
+        .await
+        .map_err(|_| FolderError::Unavailable)?
+}
+
+/// Admits `folder` and records it in one transaction. Its scan conflicts with any concurrent
+/// reservation, so a retried request cannot bind the same root twice.
+async fn reserve_binding(
+    context: &Arc<DriverContext>,
+    folder: &SyncedFolder,
+) -> Result<(), FolderError> {
+    let txn_id = start_txn(context).await.ok_or(FolderError::Unavailable)?;
+    let admitted = match scan_bound(context, Some(txn_id)).await {
+        Ok(bound) => admit(&bound, folder),
+        Err(error) => Err(error),
+    };
+    let written = match admitted {
+        Ok(()) => match folder_entry(folder) {
+            Ok(row) => match write_rows(context, vec![row], Some(txn_id)).await {
+                true => Ok(()),
+                false => Err(FolderError::Unavailable),
+            },
+            Err(_) => Err(FolderError::Unavailable),
+        },
+        Err(error) => Err(error),
+    };
+    if let Err(error) = written {
+        abort_txn(context, txn_id).await;
+        return Err(error);
+    }
+    match commit_txn(context, txn_id).await {
+        true => Ok(()),
+        false => Err(FolderError::Unavailable),
+    }
+}
+
+/// The count, overlap and bucket checks a new folder must pass against the bound ones.
+fn admit(bound: &[SyncedFolder], folder: &SyncedFolder) -> Result<(), FolderError> {
     if bound.len() >= MAX_SYNCED_FOLDERS {
         return Err(FolderError::TooManyFolders(MAX_SYNCED_FOLDERS));
     }
     if let Some(existing) = bound
         .iter()
-        .find(|folder| overlaps(&folder.root, &input.root))
+        .find(|bound| overlaps(&bound.root, &folder.root))
     {
         return Err(FolderError::RootOverlaps(existing.root.clone()));
     }
-    let local_bucket = folder_bucket(input.folder_id);
     if bound
         .iter()
-        .any(|folder| folder.local_bucket == local_bucket)
+        .any(|bound| bound.local_bucket == folder.local_bucket)
     {
-        return Err(FolderError::BucketBound(local_bucket));
+        return Err(FolderError::BucketBound(folder.local_bucket.clone()));
     }
-    let config = drive(GetConfigOperation::new(input.realm_id), context)
+    Ok(())
+}
+
+/// Confirms the realm bucket of a binding in progress and records the outcome: an accepted
+/// remote activates the folder, a refusal drops the binding, and a failure without an answer
+/// keeps it for the next folder pass. Creating again is safe: the node accepts its own bucket.
+pub(crate) async fn finish_binding(
+    context: &Arc<DriverContext>,
+    folder: SyncedFolder,
+) -> Result<SyncedFolder, FolderError> {
+    let _pass = super::folder_lock(folder.folder_id).await;
+    // The caller's copy may be stale: a binding unbound or finished since is left alone.
+    let folder = read_bound(context, folder.folder_id).await?;
+    let FolderState::Binding { create_bucket } = folder.state else {
+        return Ok(folder);
+    };
+    let auth = AuthContext {
+        user_id: folder.created_by,
+        realm_id: folder.created_by.realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let remote = match create_bucket {
+        // The binding must be on disk before the realm node may create a bucket for it.
+        true if !sync_all(context).await => Err(FolderError::Unavailable),
+        true => forward_create(context, auth, &folder.remote, folder.group_id).await,
+        false => request_versions(
+            context,
+            folder.remote.node_id,
+            auth,
+            folder.remote.bucket.clone(),
+            folder.remote.prefix.clone(),
+            None,
+            SyncPageLimit::new(1),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| map_remote_error(error, &folder.remote)),
+    };
+    let binding = |current: &SyncedFolder| matches!(current.state, FolderState::Binding { .. });
+    match remote {
+        Ok(()) => {
+            let active = update_folder(context, folder.folder_id, |current| {
+                match binding(&current) {
+                    true => Ok(SyncedFolder {
+                        state: FolderState::Active,
+                        last_error: None,
+                        last_error_ms: None,
+                        ..current
+                    }),
+                    false => Ok(current),
+                }
+            })
+            .await?;
+            crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
+            Ok(active)
+        }
+        Err(
+            error @ (FolderError::RemoteBucketMissing { .. }
+            | FolderError::RemoteForbidden { .. }
+            | FolderError::RemoteBucketConflict { .. }),
+        ) => {
+            drop_binding(context, folder.folder_id).await;
+            Err(error)
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            let noted = update_folder(context, folder.folder_id, |current| {
+                match binding(&current) {
+                    true => Ok(SyncedFolder {
+                        last_error: Some(reason),
+                        last_error_ms: Some(unix_timestamp_millis()),
+                        ..current
+                    }),
+                    false => Ok(current),
+                }
+            })
+            .await;
+            if let Err(note_error) = noted {
+                warn!(folder = %folder.folder_id, reason = %note_error, "Could not note the binding error");
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Removes a binding the realm refused, unless it changed meanwhile.
+async fn drop_binding(context: &Arc<DriverContext>, folder_id: Ulid) {
+    let Some(txn_id) = start_txn(context).await else {
+        return;
+    };
+    let key = folder_key(folder_id);
+    let binding = read_value(context, SYNCED_FOLDER_KEYSPACE, key.clone(), Some(txn_id))
+        .await
+        .and_then(|bytes| SyncedFolder::from_bytes(&bytes).ok())
+        .is_some_and(|folder| matches!(folder.state, FolderState::Binding { .. }));
+    let row = vec![(SYNCED_FOLDER_KEYSPACE.to_string(), key)];
+    match binding && delete_rows(context, row, Some(txn_id)).await {
+        true if commit_txn(context, txn_id).await => {}
+        true => warn!(folder = %folder_id, "Could not drop the refused binding"),
+        false => abort_txn(context, txn_id).await,
+    }
+}
+
+/// Refuses a node that cannot hold realm buckets, such as this computer.
+async fn ensure_realm_node(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    node_id: NodeId,
+) -> Result<(), FolderError> {
+    let config = drive(GetConfigOperation::new(realm_id), context)
         .await
         .map_err(|_| FolderError::Unavailable)?;
     let eligible = config
         .sync_eligible_nodes()
         .map_err(|_| FolderError::Unavailable)?;
-    if !eligible.contains(&input.remote.node_id) {
-        return Err(FolderError::NotRealmNode(input.remote.node_id));
+    match eligible.contains(&node_id) {
+        true => Ok(()),
+        false => Err(FolderError::NotRealmNode(node_id)),
     }
+}
+
+/// Creates the remote bucket through the node plane. The realm node accepts a bucket of the
+/// same group that already exists.
+async fn forward_create(
+    context: &Arc<DriverContext>,
+    auth: AuthContext,
+    remote: &RemoteBinding,
+    group_id: GroupId,
+) -> Result<(), FolderError> {
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(FolderError::Unavailable)?;
+    let creation = metadata
+        .request_forwarded_write(
+            remote.node_id,
+            MetadataTransportMessage::ForwardCreateBucket {
+                auth_token: aruna_core::metadata::AuthToken::internal(auth),
+                bucket: remote.bucket.clone(),
+                group_id,
+            },
+        )
+        .await
+        .map_err(|error| ReconcileFolderError::Unreachable(error.to_string()));
+    let creation = match creation {
+        Ok(MetadataTransportMessage::ForwardedBucketCreated { result }) => {
+            result.map_err(ReconcileFolderError::Refused)
+        }
+        Ok(other) => Err(ReconcileFolderError::Unreachable(format!(
+            "unexpected metadata response: {}",
+            crate::metadata::transport_message_kind(&other)
+        ))),
+        Err(error) => Err(error),
+    };
+    creation.map_err(|error| map_remote_error(error, remote))
+}
+
+/// Creates a bucket on a realm node for the owner without binding a folder to it. A bucket of
+/// that name the node already holds, in any group, is refused, never adopted.
+pub async fn create_realm_bucket(
+    context: &Arc<DriverContext>,
+    input: RealmBucketInput,
+) -> Result<(), FolderError> {
+    ensure_realm_node(context, input.realm_id, input.node_id).await?;
     let auth = AuthContext {
         user_id: input.user_id,
         realm_id: input.realm_id,
         path_restrictions: None,
         session: None,
     };
-    if input.create_bucket {
-        let metadata = context
-            .metadata_handle
-            .as_ref()
-            .ok_or(FolderError::Unavailable)?;
-        let creation = metadata
-            .request_forwarded_write(
-                input.remote.node_id,
-                MetadataTransportMessage::ForwardCreateBucket {
-                    auth_token: aruna_core::metadata::AuthToken::internal(auth.clone()),
-                    bucket: input.remote.bucket.clone(),
-                    group_id: input.group_id,
-                },
-            )
-            .await
-            .map_err(|error| ReconcileFolderError::Unreachable(error.to_string()));
-        let creation = match creation {
-            Ok(MetadataTransportMessage::ForwardedBucketCreated { result }) => {
-                result.map_err(ReconcileFolderError::Refused)
-            }
-            Ok(other) => Err(ReconcileFolderError::Unreachable(format!(
-                "unexpected metadata response: {}",
-                crate::metadata::transport_message_kind(&other)
-            ))),
-            Err(error) => Err(error),
-        };
-        creation.map_err(|error| map_remote_error(error, &input.remote))?;
-    }
-    request_versions(
-        context,
-        input.remote.node_id,
-        auth,
-        input.remote.bucket.clone(),
-        input.remote.prefix.clone(),
-        None,
-        SyncPageLimit::new(1),
-    )
-    .await
-    .map_err(|error| map_remote_error(error, &input.remote))?;
-    let sweep = offer_directory(
-        context,
-        OfferDirectoryInput {
-            bucket: local_bucket.clone(),
-            root: input.root.clone(),
-            group_id: input.group_id,
-            realm_id: input.realm_id,
-            node_id: input.node_id,
-            user_id: input.user_id,
-        },
-    )
-    .await?;
-
-    let folder = SyncedFolder {
-        folder_id: input.folder_id,
-        root: input.root,
-        local_bucket,
-        group_id: input.group_id,
-        remote: input.remote,
-        mode: input.mode,
-        propagate_deletes: input.propagate_deletes,
-        state: FolderState::Active,
-        created_by: input.user_id,
-        created_at_ms: unix_timestamp_millis(),
-        last_reconcile_ms: None,
-        last_error: None,
-        last_error_ms: None,
-        observed_files: sweep.files as u64,
-        list_cursor: None,
+    let remote = RemoteBinding {
+        node_id: input.node_id,
+        bucket: input.bucket,
+        prefix: String::new(),
     };
-    store_folder(context, &folder).await?;
-    Ok(folder)
+    let metadata = context
+        .metadata_handle
+        .as_ref()
+        .ok_or(FolderError::Unavailable)?;
+    // The node decides existence inside its create transaction, so concurrent creates cannot
+    // both succeed.
+    let reply = metadata
+        .request_forwarded_write(
+            remote.node_id,
+            MetadataTransportMessage::ForwardNewBucket {
+                auth_token: aruna_core::metadata::AuthToken::internal(auth),
+                bucket: remote.bucket.clone(),
+                group_id: input.group_id,
+            },
+        )
+        .await
+        .map_err(|error| ReconcileFolderError::Unreachable(error.to_string()));
+    let created = match reply {
+        Ok(MetadataTransportMessage::ForwardedNewBucket { result }) => {
+            result.map_err(ReconcileFolderError::Refused)
+        }
+        Ok(other) => Err(ReconcileFolderError::Unreachable(format!(
+            "unexpected metadata response: {}",
+            crate::metadata::transport_message_kind(&other)
+        ))),
+        Err(error) => Err(error),
+    };
+    match created.map_err(|error| map_remote_error(error, &remote))? {
+        true => Ok(()),
+        false => Err(FolderError::BucketExists {
+            node: remote.node_id,
+            bucket: remote.bucket,
+        }),
+    }
+}
+
+/// Wakes the background pass for a folder whose root is still a usable directory.
+pub async fn request_sync(
+    context: &Arc<DriverContext>,
+    folder: &SyncedFolder,
+) -> Result<(), FolderError> {
+    check_root(context, &folder.root).await?;
+    crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
+    Ok(())
 }
 
 fn map_remote_error(error: ReconcileFolderError, remote: &RemoteBinding) -> FolderError {
@@ -237,6 +464,12 @@ pub fn folder_bucket(folder_id: Ulid) -> String {
     format!("folder-{}", folder_id.to_string().to_lowercase())
 }
 
+/// The folder whose device-local bucket `bucket` is, if it is one.
+pub(crate) fn bucket_folder(bucket: &str) -> Option<Ulid> {
+    let folder_id = Ulid::from_string(bucket.strip_prefix("folder-")?).ok()?;
+    (folder_bucket(folder_id) == bucket).then_some(folder_id)
+}
+
 /// Whether two roots are the same directory or one contains the other. The
 /// comparison is textual: a folder is bound by the path the owner gave.
 fn overlaps(left: &str, right: &str) -> bool {
@@ -248,10 +481,17 @@ fn overlaps(left: &str, right: &str) -> bool {
 }
 
 pub async fn list_folders(context: &Arc<DriverContext>) -> Result<Vec<SyncedFolder>, FolderError> {
+    scan_bound(context, None).await
+}
+
+async fn scan_bound(
+    context: &Arc<DriverContext>,
+    txn_id: Option<TxnId>,
+) -> Result<Vec<SyncedFolder>, FolderError> {
     let mut folders = Vec::new();
     let mut cursor: Option<Key> = None;
     loop {
-        let (values, next) = scan_page(context, scan_folders(cursor, None))
+        let (values, next) = scan_page(context, scan_folders(cursor, txn_id))
             .await
             .ok_or(FolderError::Unavailable)?;
         folders.extend(
@@ -276,47 +516,57 @@ pub async fn read_bound(
         .ok_or(FolderError::NotFound)
 }
 
-/// Stops syncing one folder; the owner's filesystem is untouched.
-///
-/// Marked `Deleting` first and removed last, so a crash mid-way leaves work the next call resumes.
+/// Stops syncing one folder; the owner's filesystem is untouched. The folder is marked
+/// `Deleting` and the folder pass, woken here, removes it, also after a cancelled call or a restart.
 pub async fn unbind_folder(
     context: &Arc<DriverContext>,
     folder_id: Ulid,
-    realm_id: RealmId,
+) -> Result<(), FolderError> {
+    // One transaction, so a pause or resume that read the folder earlier cannot write over it.
+    update_folder(context, folder_id, |current| {
+        Ok(SyncedFolder {
+            state: FolderState::Deleting,
+            ..current
+        })
+    })
+    .await?;
+    crate::device::sync_status::arm(context, TaskKey::ReconcileSyncedFolders).await;
+    Ok(())
+}
+
+/// Removes a `Deleting` folder under its lock, after any pass in flight. The row goes last, so an
+/// interrupted cleanup resumes in the next pass.
+pub(crate) async fn finish_unbind(
+    context: &Arc<DriverContext>,
+    folder_id: Ulid,
     node_id: NodeId,
-    user_id: UserId,
-) -> Result<usize, FolderError> {
+) -> Result<(), FolderError> {
+    let _pass = super::folder_lock(folder_id).await;
     let folder = read_bound(context, folder_id).await?;
     if folder.state != FolderState::Deleting {
-        store_folder(
-            context,
-            &SyncedFolder {
-                state: FolderState::Deleting,
-                ..folder.clone()
-            },
-        )
-        .await?;
+        return Ok(());
     }
     for key_space in [SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNC_LOG_KEYSPACE] {
-        clear_rows(context, key_space, folder_id).await?;
+        clear_rows(context, key_space, folder_id, CLEANUP_LIMIT).await?;
     }
-    let removed = match withdraw_offer(
+    // The offer keeps the bucket read-only for clients until the bucket is gone.
+    delete_local_bucket(context, &folder, node_id, CLEANUP_LIMIT).await?;
+    match withdraw_offer(
         context,
         WithdrawOfferInput {
-            bucket: folder.local_bucket,
-            realm_id,
+            bucket: folder.local_bucket.clone(),
+            realm_id: folder.created_by.realm_id,
             node_id,
-            user_id,
+            user_id: folder.created_by,
         },
     )
     .await
     {
-        Ok(removed) => removed,
         // A resumed unbind finds the registration already withdrawn and
         // finishes the rest instead of failing on it.
-        Err(OfferedDirectoryError::NotOffered(_)) => 0,
+        Ok(_) | Err(OfferedDirectoryError::NotOffered(_)) => {}
         Err(error) => return Err(error.into()),
-    };
+    }
     let Some(txn_id) = start_txn(context).await else {
         return Err(FolderError::Unavailable);
     };
@@ -331,15 +581,133 @@ pub async fn unbind_folder(
         abort_txn(context, txn_id).await;
         return Err(FolderError::Unavailable);
     }
-    Ok(removed)
+    Ok(())
 }
 
-/// Deletes every row one folder owns in a keyspace, page by page.
+/// Rows, uploads and versions one cleanup pass removes at most, so writes that keep arriving
+/// cannot hold the folder lock. Anything left fails this pass, and the next pass goes on.
+const CLEANUP_LIMIT: usize = 16_000;
+
+/// Deletes the folder's device-local bucket and every version left in it, removing at most
+/// `limit` uploads and `limit` versions. A bucket that is already gone, or was never created,
+/// counts as deleted.
+async fn delete_local_bucket(
+    context: &DriverContext,
+    folder: &SyncedFolder,
+    node_id: NodeId,
+    limit: usize,
+) -> Result<(), FolderError> {
+    let bucket = &folder.local_bucket;
+    // Checked first, so the routine missing bucket is not logged as a failed delete.
+    if read_bucket(context, bucket).await?.is_none() {
+        return Ok(());
+    }
+    abort_uploads(context, bucket, limit).await?;
+    let mut left = limit;
+    while left > 0 {
+        let listing = ListVersionsOperation::new(ListVersionsInput {
+            bucket: bucket.clone(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: Some(left.min(ListVersionsOperation::DEFAULT_MAX_KEYS)),
+        });
+        let page = drive(listing, context).await?;
+        if page.items.is_empty() {
+            break;
+        }
+        left = left.saturating_sub(page.items.len());
+        let entries = page
+            .items
+            .into_iter()
+            .map(|item| match item {
+                ListVersionsItem::Version {
+                    key, version_id, ..
+                }
+                | ListVersionsItem::DeleteMarker {
+                    key, version_id, ..
+                } => BulkDeleteEntry {
+                    key,
+                    version_id: Some(version_id),
+                },
+            })
+            .collect();
+        let input = BulkDeleteInput {
+            bucket: bucket.clone(),
+            entries,
+            group_id: folder.group_id,
+            realm_id: folder.created_by.realm_id,
+            node_id,
+            deleted_by: folder.created_by,
+            restrictions: None,
+        };
+        for outcome in delete_objects(context, input).await {
+            match outcome.result {
+                Ok(_) | Err(DeleteObjectError::NoSuchVersion) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    match drive(DeleteBucketOperation::new(bucket.clone()), context).await {
+        Ok(()) | Err(DeleteBucketError::NotFound) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Aborts up to `limit` multipart uploads left in `bucket`, page by page. An upload still being
+/// completed fails this pass, so the next pass retries once it is done or its lease is stale.
+async fn abort_uploads(
+    context: &DriverContext,
+    bucket: &str,
+    limit: usize,
+) -> Result<(), FolderError> {
+    let mut left = limit;
+    while left > 0 {
+        let listing = ListUploadsOperation::new(ListUploadsInput {
+            bucket: bucket.to_string(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            upload_id_marker: None,
+            max_uploads: left.min(ListUploadsOperation::DEFAULT_MAX_UPLOADS),
+        })
+        .including_in_progress()
+        .complete_scan();
+        let page = drive(listing, context).await?;
+        if page.uploads.is_empty() {
+            return Ok(());
+        }
+        left = left.saturating_sub(page.uploads.len());
+        for upload in page.uploads {
+            let resume = upload.status == MultipartUploadStatus::Aborting;
+            let mut abort = AbortUploadOperation::new(AbortUploadInput {
+                bucket: upload.bucket,
+                key: upload.key,
+                upload_id: upload.upload_id,
+                now_ms: crate::driver::now_ms(),
+            });
+            if resume {
+                abort = abort.resuming_abort();
+            }
+            match drive(abort, context).await {
+                Ok(()) | Err(AbortUploadError::NoSuchUpload) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deletes up to `limit` rows one folder owns in a keyspace, page by page. Rows left over fail
+/// this pass, so the folder row and its offer stay for the next pass.
 async fn clear_rows(
     context: &Arc<DriverContext>,
     key_space: &str,
     folder_id: Ulid,
+    limit: usize,
 ) -> Result<(), FolderError> {
+    let mut left = limit;
     loop {
         let (values, _) = scan_page(context, scan_folder(key_space, folder_id, None, None))
             .await
@@ -347,10 +715,15 @@ async fn clear_rows(
         if values.is_empty() {
             return Ok(());
         }
-        let deletes = values
+        if left == 0 {
+            return Err(FolderError::Unavailable);
+        }
+        let deletes: Vec<_> = values
             .into_iter()
+            .take(left)
             .map(|(key, _)| (key_space.to_string(), key))
             .collect();
+        left -= deletes.len();
         if !delete_rows(context, deletes, None).await {
             return Err(FolderError::Unavailable);
         }
@@ -362,14 +735,14 @@ pub async fn set_folder_state(
     folder_id: Ulid,
     state: FolderState,
 ) -> Result<SyncedFolder, FolderError> {
-    let current = read_bound(context, folder_id).await?;
-    // A folder whose cleanup is running is on its way out, not resumable.
-    if current.state == FolderState::Deleting {
-        return Err(FolderError::NotFound);
-    }
-    let folder = SyncedFolder { state, ..current };
-    store_folder(context, &folder).await?;
-    Ok(folder)
+    update_folder(context, folder_id, |current| match current.state {
+        // A folder whose cleanup is running is on its way out, not resumable.
+        FolderState::Deleting => Err(FolderError::NotFound),
+        // Pausing or resuming must not skip the realm bucket a binding still has to confirm.
+        FolderState::Binding { .. } => Err(FolderError::StillBinding),
+        _ => Ok(SyncedFolder { state, ..current }),
+    })
+    .await
 }
 
 /// Turns the propagation of local deletions on or off for one folder.
@@ -443,6 +816,7 @@ async fn update_folder(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn store_folder(
     context: &Arc<DriverContext>,
     folder: &SyncedFolder,
@@ -603,6 +977,8 @@ pub async fn list_transfers(context: &Arc<DriverContext>) -> Result<Vec<SyncUplo
 mod tests {
     use super::*;
     use crate::tests::device::context;
+    use aruna_core::keyspaces::UPLOAD_KEYSPACE;
+    use aruna_core::structs::storage::multipart::MultipartUpload;
     use aruna_core::structs::{EntrySide, SyncedBytes};
 
     #[test]
@@ -676,17 +1052,10 @@ mod tests {
             .expect("base encodes");
         assert!(super::super::repository::write_rows(&context, vec![row], None).await);
 
-        let removed = unbind_folder(
-            &context,
-            folder.folder_id,
-            realm(),
-            node(),
-            folder.created_by,
-        )
-        .await
-        .expect("a resumed unbind finishes");
+        finish_unbind(&context, folder.folder_id, node())
+            .await
+            .expect("a resumed unbind finishes");
 
-        assert_eq!(removed, 0);
         assert_eq!(
             read_bound(&context, folder.folder_id).await,
             Err(FolderError::NotFound)
@@ -695,6 +1064,286 @@ mod tests {
             .await
             .expect("the entries read");
         assert!(entries.is_empty());
+    }
+
+    // Rows that keep arriving cannot hold the folder lock: a pass stops at its limit, and the
+    // next pass deletes the rest.
+    #[tokio::test]
+    async fn limits_row_cleanup() {
+        use super::super::repository::{base_entry, write_rows};
+
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let folder_id = Ulid::generate();
+        let rows = ["a.txt", "b.txt"]
+            .map(|relative| base_entry(folder_id, relative, &base_row()).expect("base encodes"));
+        assert!(write_rows(&context, rows.to_vec(), None).await);
+
+        assert_eq!(
+            clear_rows(&context, SYNC_BASE_KEYSPACE, folder_id, 1).await,
+            Err(FolderError::Unavailable)
+        );
+        let (entries, _) = list_entries(&context, folder_id, None, None)
+            .await
+            .expect("the entries read");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            clear_rows(&context, SYNC_BASE_KEYSPACE, folder_id, 1).await,
+            Ok(())
+        );
+        let (entries, _) = list_entries(&context, folder_id, None, None)
+            .await
+            .expect("the entries read");
+        assert!(entries.is_empty());
+    }
+
+    // An owner action on a folder whose cleanup is running writes no audit row for it to remove.
+    #[tokio::test]
+    async fn actions_refuse_deleting() {
+        use super::super::actions::{ActionError, ApplyActionInput, apply_action};
+        use aruna_core::structs::{ActionKind, ActionScope};
+
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let folder = SyncedFolder {
+            folder_id: Ulid::generate(),
+            ..bound_folder(FolderState::Deleting)
+        };
+        store_folder(&context, &folder).await.expect("row stored");
+        let input = ApplyActionInput {
+            folder_id: folder.folder_id,
+            kind: ActionKind::KeepLocal,
+            scope: ActionScope::AllPending,
+            expected: None,
+            actor: folder.created_by,
+        };
+
+        assert!(matches!(
+            apply_action(&context, input).await,
+            Err(ActionError::Folder(FolderError::NotFound))
+        ));
+        let (actions, _) = list_actions(&context, folder.folder_id, None)
+            .await
+            .expect("the log reads");
+        assert!(actions.is_empty());
+    }
+
+    /// A deleting folder whose bucket offers one file, and an upload opened in that bucket.
+    async fn offered_folder(
+        context: &Arc<DriverContext>,
+    ) -> (tempfile::TempDir, SyncedFolder, MultipartUpload) {
+        use crate::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+        use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+        use aruna_core::structs::storage::routing::RoutingSnapshot;
+
+        let root = tempfile::tempdir().expect("root created");
+        std::fs::write(root.path().join("note.txt"), b"note").expect("file written");
+        let folder_id = Ulid::generate();
+        let folder = SyncedFolder {
+            folder_id,
+            root: root.path().to_string_lossy().to_string(),
+            local_bucket: folder_bucket(folder_id),
+            ..bound_folder(FolderState::Deleting)
+        };
+        let offer = OfferDirectoryInput {
+            bucket: folder.local_bucket.clone(),
+            root: folder.root.clone(),
+            group_id: folder.group_id,
+            realm_id: realm(),
+            node_id: node(),
+            user_id: folder.created_by,
+        };
+        offer_directory(context, offer).await.expect("offered");
+        let upload = CreateMultipartOperation::new(CreateMultipartInput {
+            bucket: folder.local_bucket.clone(),
+            key: "late.bin".to_string(),
+            group_id: folder.group_id,
+            created_by: folder.created_by,
+            checksum_hint: None,
+            routing: RoutingSnapshot::single(folder.group_id),
+        });
+        let upload = drive(upload, context).await.expect("upload opened").record;
+        store_folder(context, &folder).await.expect("row stored");
+        (root, folder, upload)
+    }
+
+    async fn store_upload(context: &Arc<DriverContext>, upload: &MultipartUpload) {
+        let key = upload.upload_id.to_bytes().to_vec().into();
+        let value = upload.to_bytes().expect("upload encodes").into();
+        let row = (UPLOAD_KEYSPACE.to_string(), key, value);
+        assert!(super::super::repository::write_rows(context, vec![row], None).await);
+    }
+
+    async fn bucket_gone(context: &Arc<DriverContext>, bucket: &str) -> bool {
+        use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+        let bucket = GetBucketOperation::new(bucket.to_string());
+        matches!(drive(bucket, context).await, Err(GetBucketError::NotFound))
+    }
+
+    // A bucket left without its offer, with an upload in it, is still deleted. A cleanup cut short
+    // after the bucket delete finds it gone and finishes.
+    #[tokio::test]
+    async fn deletes_local_bucket() {
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = Arc::new(fixture.driver_context);
+        let (_root, folder, _) = offered_folder(&context).await;
+        let withdrawal = WithdrawOfferInput {
+            bucket: folder.local_bucket.clone(),
+            realm_id: realm(),
+            node_id: node(),
+            user_id: folder.created_by,
+        };
+        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+
+        for attempt in ["withdrawn offer", "deleted bucket"] {
+            store_folder(&context, &folder).await.expect("row stored");
+            assert_eq!(
+                finish_unbind(&context, folder.folder_id, node()).await,
+                Ok(()),
+                "{attempt}"
+            );
+            assert_eq!(
+                read_bound(&context, folder.folder_id).await,
+                Err(FolderError::NotFound)
+            );
+            assert!(
+                bucket_gone(&context, &folder.local_bucket).await,
+                "{attempt}"
+            );
+        }
+    }
+
+    // A pass stops at its limit, so writes that keep arriving cannot hold the folder lock. The
+    // leftover upload and version fail the bucket delete, and the next pass deletes the bucket.
+    #[tokio::test]
+    async fn limits_cleanup_pass() {
+        use crate::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+        use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+        use aruna_core::structs::storage::routing::RoutingSnapshot;
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = Arc::new(fixture.driver_context);
+        let (_root, folder, _) = offered_folder(&context).await;
+        let second = CreateMultipartOperation::new(CreateMultipartInput {
+            bucket: folder.local_bucket.clone(),
+            key: "later.bin".to_string(),
+            group_id: folder.group_id,
+            created_by: folder.created_by,
+            checksum_hint: None,
+            routing: RoutingSnapshot::single(folder.group_id),
+        });
+        drive(second, &context).await.expect("second upload opened");
+        std::fs::write(std::path::Path::new(&folder.root).join("more.txt"), b"more")
+            .expect("file written");
+        let offer = OfferDirectoryInput {
+            bucket: folder.local_bucket.clone(),
+            root: folder.root.clone(),
+            group_id: folder.group_id,
+            realm_id: realm(),
+            node_id: node(),
+            user_id: folder.created_by,
+        };
+        offer_directory(&context, offer)
+            .await
+            .expect("offer refreshed");
+
+        assert!(matches!(
+            delete_local_bucket(&context, &folder, node(), 1).await,
+            Err(FolderError::DeleteBucket(DeleteBucketError::NotEmpty))
+        ));
+        assert!(!bucket_gone(&context, &folder.local_bucket).await);
+        let uploads = ListUploadsOperation::new(ListUploadsInput {
+            bucket: folder.local_bucket.clone(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            upload_id_marker: None,
+            max_uploads: ListUploadsOperation::DEFAULT_MAX_UPLOADS,
+        })
+        .including_in_progress();
+        let uploads = drive(uploads, &context).await.expect("uploads listed");
+        assert_eq!(uploads.uploads.len(), 1);
+        let versions = ListVersionsOperation::new(ListVersionsInput {
+            bucket: folder.local_bucket.clone(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: None,
+        });
+        let versions = drive(versions, &context).await.expect("versions listed");
+        assert_eq!(versions.items.len(), 1);
+        assert_eq!(
+            delete_local_bucket(&context, &folder, node(), 1).await,
+            Ok(())
+        );
+        assert!(bucket_gone(&context, &folder.local_bucket).await);
+    }
+
+    // A deleting folder's bucket without an offer, as after a crash before the offer was stored,
+    // is read-only for clients, and the cleanup still deletes it.
+    #[tokio::test]
+    async fn guards_unoffered_bucket() {
+        use crate::staging::offered_directory::guard_bucket_write;
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = Arc::new(fixture.driver_context);
+        let (_root, folder, _) = offered_folder(&context).await;
+        let bucket = folder.local_bucket.clone();
+        let withdrawal = WithdrawOfferInput {
+            bucket: bucket.clone(),
+            realm_id: realm(),
+            node_id: node(),
+            user_id: folder.created_by,
+        };
+        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+
+        assert_eq!(
+            guard_bucket_write(&context, &bucket).await,
+            Err(OfferedDirectoryError::ReadOnly(bucket.clone()))
+        );
+        assert_eq!(
+            finish_unbind(&context, folder.folder_id, node()).await,
+            Ok(())
+        );
+        assert!(bucket_gone(&context, &bucket).await);
+        assert_eq!(guard_bucket_write(&context, &bucket).await, Ok(()));
+    }
+
+    // A cleanup cut short midway, here by an upload being completed, leaves the bucket read-only
+    // for clients, so no upload can be opened before the next pass deletes it.
+    #[tokio::test]
+    async fn guards_interrupted_cleanup() {
+        use crate::staging::offered_directory::guard_bucket_write;
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = Arc::new(fixture.driver_context);
+        let (_root, folder, mut upload) = offered_folder(&context).await;
+        upload.status = MultipartUploadStatus::Completing;
+        upload.completing_since_ms = Some(crate::driver::now_ms());
+        store_upload(&context, &upload).await;
+
+        assert_eq!(
+            finish_unbind(&context, folder.folder_id, node()).await,
+            Err(FolderError::AbortUpload(
+                AbortUploadError::CompletionInProgress
+            ))
+        );
+        let bucket = folder.local_bucket.clone();
+        assert_eq!(
+            guard_bucket_write(&context, &bucket).await,
+            Err(OfferedDirectoryError::ReadOnly(bucket.clone()))
+        );
+
+        upload.status = MultipartUploadStatus::Open;
+        upload.completing_since_ms = None;
+        store_upload(&context, &upload).await;
+        assert_eq!(
+            finish_unbind(&context, folder.folder_id, node()).await,
+            Ok(())
+        );
+        assert!(bucket_gone(&context, &bucket).await);
+        assert_eq!(guard_bucket_write(&context, &bucket).await, Ok(()));
     }
 
     // A reconcile pass that started before the owner's change keeps it, and a
@@ -779,6 +1428,231 @@ mod tests {
         assert_eq!(
             set_folder_state(&context, folder.folder_id, FolderState::Active).await,
             Err(FolderError::NotFound)
+        );
+    }
+
+    // The removal of an unbound folder waits for the pass in flight on it, so rows that pass still
+    // writes are cleared too instead of outliving the folder.
+    #[tokio::test]
+    async fn unbind_awaits_pass() {
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let folder = bound_folder(FolderState::Active);
+        store_folder(&context, &folder).await.expect("row stored");
+
+        unbind_folder(&context, folder.folder_id)
+            .await
+            .expect("the folder is marked");
+        let pass = super::super::folder_lock(folder.folder_id).await;
+        let unbind = tokio::spawn({
+            let context = context.clone();
+            let folder_id = folder.folder_id;
+            async move { finish_unbind(&context, folder_id, node()).await }
+        });
+        let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())
+            .expect("base encodes");
+        assert!(super::super::repository::write_rows(&context, vec![row], None).await);
+        drop(pass);
+
+        assert_eq!(unbind.await.expect("the unbind task ends"), Ok(()));
+        let (entries, _) = list_entries(&context, folder.folder_id, None, None)
+            .await
+            .expect("the entries read");
+        assert!(entries.is_empty());
+        assert_eq!(
+            read_bound(&context, folder.folder_id).await,
+            Err(FolderError::NotFound)
+        );
+    }
+
+    // A pass that listed a binding before its unbind must not ask the realm node for a bucket once
+    // the folder is deleting or gone. This context reaches no realm node, so a request would fail.
+    #[tokio::test]
+    async fn skips_unbound_binding() {
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let listed = bound_folder(FolderState::Binding {
+            create_bucket: true,
+        });
+        let deleting = SyncedFolder {
+            state: FolderState::Deleting,
+            ..listed.clone()
+        };
+        store_folder(&context, &deleting).await.expect("row stored");
+        assert_eq!(finish_binding(&context, listed.clone()).await, Ok(deleting));
+
+        let row = vec![(
+            SYNCED_FOLDER_KEYSPACE.to_string(),
+            folder_key(listed.folder_id),
+        )];
+        assert!(delete_rows(&context, row, None).await);
+        assert_eq!(
+            finish_binding(&context, listed).await,
+            Err(FolderError::NotFound)
+        );
+    }
+
+    /// Hands every storage effect to `storage`. The first write of a folder row in `held` waits
+    /// for `release` on its own thread, so the effects behind it still run. `committed` gets the
+    /// error the commit of that write's transaction answered with.
+    fn hold_write(
+        storage: aruna_storage::StorageHandle,
+        receivers: aruna_storage::storage::StorageReceivers,
+        held: FolderState,
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        committed: tokio::sync::oneshot::Sender<Option<aruna_core::errors::StorageError>>,
+    ) {
+        fn forward(
+            storage: &aruna_storage::StorageHandle,
+            effect: aruna_core::effects::StorageEffect,
+            response: aruna_storage::storage::ResponseSender,
+        ) -> Option<aruna_core::errors::StorageError> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("a proxy runtime");
+            let aruna_core::events::Event::Storage(event) =
+                runtime.block_on(storage.send_storage_effect(effect))
+            else {
+                return None;
+            };
+            let error = match &event {
+                aruna_core::events::StorageEvent::Error { error } => Some(error.clone()),
+                _ => None,
+            };
+            response.send(event);
+            error
+        }
+        let writes_held = move |effect: &aruna_core::effects::StorageEffect| match effect {
+            aruna_core::effects::StorageEffect::BatchWrite { writes, .. } => {
+                writes.iter().any(|(key_space, _, value)| {
+                    key_space == SYNCED_FOLDER_KEYSPACE
+                        && SyncedFolder::from_bytes(value).is_ok_and(|row| row.state == held)
+                })
+            }
+            _ => false,
+        };
+        std::thread::spawn(move || {
+            let _bulk = receivers.bulk;
+            let mut gate = Some((reached, release));
+            let mut committed = Some(committed);
+            let mut held_txn = None;
+            while let Ok((effect, response, ..)) = receivers.foreground.recv() {
+                if writes_held(&effect)
+                    && let Some((reached, release)) = gate.take()
+                {
+                    if let aruna_core::effects::StorageEffect::BatchWrite { txn_id, .. } = &effect {
+                        held_txn = *txn_id;
+                    }
+                    let storage = storage.clone();
+                    std::thread::spawn(move || {
+                        let _ = reached.send(());
+                        let _ = release.recv();
+                        forward(&storage, effect, response);
+                    });
+                    continue;
+                }
+                let commit = matches!(
+                    &effect,
+                    aruna_core::effects::StorageEffect::CommitTransaction { txn_id }
+                        if Some(*txn_id) == held_txn
+                );
+                let error = forward(&storage, effect, response);
+                if commit && let Some(committed) = committed.take() {
+                    let _ = committed.send(error);
+                }
+            }
+        });
+    }
+
+    // A pause or resume that read the folder before an acknowledged unbind must not write over
+    // `Deleting`. The test plays the storage worker and holds the setter's write until then.
+    #[tokio::test]
+    async fn unbind_outlasts_pause() {
+        for (start, target) in [
+            (FolderState::Active, FolderState::Paused),
+            (FolderState::Paused, FolderState::Active),
+        ] {
+            let (_dir, context) = context().await;
+            let context = Arc::new(context);
+            let folder = bound_folder(start);
+            let folder_id = folder.folder_id;
+            store_folder(&context, &folder).await.expect("row stored");
+            let (storage, receivers) = aruna_storage::StorageHandle::new();
+            let (reached, held) = tokio::sync::oneshot::channel();
+            let (release, gate) = std::sync::mpsc::channel();
+            let (committed, commit) = tokio::sync::oneshot::channel();
+            hold_write(
+                context.storage_handle.clone(),
+                receivers,
+                target.clone(),
+                reached,
+                gate,
+                committed,
+            );
+            let proxied = Arc::new(DriverContext {
+                storage_handle: storage,
+                ..(*context).clone()
+            });
+
+            let setter = tokio::spawn({
+                let proxied = proxied.clone();
+                let target = target.clone();
+                async move { set_folder_state(&proxied, folder_id, target).await }
+            });
+            held.await.expect("the setter reaches its write");
+            unbind_folder(&proxied, folder_id)
+                .await
+                .expect("the unbind is acknowledged");
+            release.send(()).expect("the held write waits");
+
+            let set = setter.await.expect("the setter task ends");
+            assert_eq!(set, Err(FolderError::Unavailable), "{target:?}");
+            // Dropping the last proxied handle ends the proxy, so a commit that never came fails.
+            drop(proxied);
+            assert_eq!(
+                commit.await.expect("the setter commits its held write"),
+                Some(aruna_core::errors::StorageError::TransactionConflict),
+                "{target:?}"
+            );
+            assert_eq!(
+                read_bound(&context, folder_id).await.map(|row| row.state),
+                Ok(FolderState::Deleting)
+            );
+        }
+    }
+
+    // Two reservations of one root race in storage; the transaction lets exactly one through,
+    // and a binding cannot be paused past its realm bucket.
+    #[tokio::test]
+    async fn reserves_one_root() {
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let binding = FolderState::Binding {
+            create_bucket: true,
+        };
+        let first = bound_folder(binding.clone());
+        let second = SyncedFolder {
+            folder_id: Ulid::from_bytes([6u8; 16]),
+            local_bucket: "folder-y".to_string(),
+            ..bound_folder(binding)
+        };
+
+        let (left, right) = tokio::join!(
+            reserve_binding(&context, &first),
+            reserve_binding(&context, &second)
+        );
+        assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        let bound = list_folders(&context).await.expect("the folders list");
+        assert_eq!(bound.len(), 1);
+        assert_eq!(
+            reserve_binding(&context, &first).await,
+            Err(FolderError::RootOverlaps(first.root.clone()))
+        );
+        assert_eq!(
+            set_folder_state(&context, bound[0].folder_id, FolderState::Paused).await,
+            Err(FolderError::StillBinding)
         );
     }
 }

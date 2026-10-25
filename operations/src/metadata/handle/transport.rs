@@ -491,6 +491,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedBucketCreated { .. } => "forwarded_bucket_created",
         MetadataTransportMessage::ForwardCheckBucket { .. } => "forward_check_bucket",
         MetadataTransportMessage::ForwardedBucketChecked { .. } => "forwarded_bucket_checked",
+        MetadataTransportMessage::ForwardNewBucket { .. } => "forward_new_bucket",
+        MetadataTransportMessage::ForwardedNewBucket { .. } => "forwarded_new_bucket",
         MetadataTransportMessage::FetchRealmDocuments { .. } => "fetch_realm_documents",
         MetadataTransportMessage::FetchedRealmDocuments { .. } => "fetched_realm_documents",
         MetadataTransportMessage::FetchGraphState { .. } => "fetch_graph_state",

@@ -267,6 +267,17 @@ pub(crate) async fn commit_txn(context: &Arc<crate::driver::DriverContext>, txn_
     )
 }
 
+/// Whether storage confirmed that every committed transaction is on disk.
+pub(crate) async fn sync_all(context: &Arc<crate::driver::DriverContext>) -> bool {
+    matches!(
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::SyncAll)
+            .await,
+        Event::Storage(StorageEvent::SyncAllFinished)
+    )
+}
+
 pub(crate) async fn abort_txn(context: &Arc<crate::driver::DriverContext>, txn_id: TxnId) {
     context
         .storage_handle

@@ -12,7 +12,9 @@ use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect}
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
+};
 use aruna_core::structs::execution::offered_directory::{
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };
@@ -29,6 +31,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::structs::{FolderState, SyncedFolder};
 use aruna_core::types::{GroupId, Key, TxnId};
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -134,16 +137,33 @@ pub enum OfferedDirectoryError {
     Usage(#[from] UsageUpdateError),
 }
 
-/// Refuses a write addressed to an offered bucket. Called on the write path so
-/// the read-only rule lives with the registration, not in a transport handler.
+/// Refuses a write addressed to an offered bucket or to the bucket of a folder being unbound.
+/// Called on the write path so the read-only rule lives with the registration, not in a handler.
 pub async fn guard_bucket_write(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<(), OfferedDirectoryError> {
-    match read_offered(context, bucket, None).await? {
-        Some(_) => Err(OfferedDirectoryError::ReadOnly(bucket.to_string())),
-        None => Ok(()),
+    if read_offered(context, bucket, None).await?.is_some()
+        || folder_deleting(context, bucket).await?
+    {
+        return Err(OfferedDirectoryError::ReadOnly(bucket.to_string()));
     }
+    Ok(())
+}
+
+/// Whether `bucket` belongs to a synced folder marked `Deleting`, offered or not.
+async fn folder_deleting(
+    context: &DriverContext,
+    bucket: &str,
+) -> Result<bool, OfferedDirectoryError> {
+    let Some(folder_id) = crate::device::sync::folders::bucket_folder(bucket) else {
+        return Ok(false);
+    };
+    let key = folder_id.to_bytes();
+    let Some(value) = read(context, SYNCED_FOLDER_KEYSPACE, &key, None).await? else {
+        return Ok(false);
+    };
+    Ok(SyncedFolder::from_bytes(&value)?.state == FolderState::Deleting)
 }
 
 /// Registers `root` as a read-only bucket and mints one reference version per
@@ -335,7 +355,10 @@ fn local_access(root: &str, path: &str) -> ResolvedSourceAccess {
     }
 }
 
-async fn check_root(context: &DriverContext, root: &str) -> Result<(), OfferedDirectoryError> {
+pub(crate) async fn check_root(
+    context: &DriverContext,
+    root: &str,
+) -> Result<(), OfferedDirectoryError> {
     let event = send_source_effect(
         context,
         StagingSourceEffect::Check {
@@ -715,7 +738,7 @@ async fn read_offered(
         .map_err(OfferedDirectoryError::Conversion)
 }
 
-async fn read_bucket(
+pub(crate) async fn read_bucket(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<Option<BucketInfo>, OfferedDirectoryError> {

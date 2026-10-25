@@ -55,6 +55,7 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/access/onboarding/bootstrap"),
     ("POST", "/access/onboarding/secrets"),
     ("POST", "/access/sessions"),
+    ("POST", "/access/users/register"),
     ("PUT", "/access/policies/realm"),
     ("PUT", "/access/users/{id}/status"),
     ("PUT", "/compute/config"),
@@ -237,7 +238,8 @@ async fn relayed_response(route: &'static str, url: &str, response: reqwest::Res
         }
         Err(error) => {
             warn!(route, relay_target = %url, error = %error, "Management relay response failed");
-            ServerError::BadGateway.into_response()
+            // The management node already answered, so it may have applied the call.
+            ServerError::RelayFailed.into_response()
         }
     }
 }

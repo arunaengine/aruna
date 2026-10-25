@@ -43,6 +43,8 @@ pub enum FolderStateName {
     /// The owner unbound it and the cleanup is still running.
     Deleting,
     Error,
+    /// Recorded, but the realm node has not confirmed the bucket yet; a folder pass finishes it.
+    Binding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -314,6 +316,7 @@ pub fn folder_view(folder: SyncedFolder, counters: FolderCounters) -> SyncedFold
         FolderState::Paused => (FolderStateName::Paused, None),
         FolderState::Deleting => (FolderStateName::Deleting, None),
         FolderState::Error { reason } => (FolderStateName::Error, Some(reason)),
+        FolderState::Binding { .. } => (FolderStateName::Binding, None),
     };
     SyncedFolderView {
         folder_id: folder.folder_id.to_string(),

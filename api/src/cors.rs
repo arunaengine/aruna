@@ -30,8 +30,8 @@ pub(crate) const S3_PREFLIGHT_VARY: &[HeaderName] = &[
 /// on the platform webview.
 pub const DESKTOP_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
 
-/// Cross-origin origins shared by REST and S3; empty denies S3 and `*` allows all.
-/// REST also permits desktop origins because bearer tokens, not cookies, authorize requests.
+/// Cross-origin origins shared by REST and S3; `*` allows all.
+/// Both also admit desktop origins, as tokens and signed keys, not cookies, authorize requests.
 /// Operators can disable the desktop exception with `DESKTOP_CORS=off`.
 #[derive(Clone, Debug)]
 pub struct CorsConfig {
@@ -74,8 +74,7 @@ impl CorsConfig {
         self
     }
 
-    /// Whether any origin is configured. The desktop admission is REST-only and
-    /// deliberately does not enable the S3 interface.
+    /// Whether any origin is configured, not counting the desktop origins.
     pub fn is_enabled(&self) -> bool {
         self.allow_any || !self.allowed_origins.is_empty()
     }
@@ -87,9 +86,9 @@ impl CorsConfig {
         origin
             .to_str()
             .map(|origin| {
-                self.allowed_origins
-                    .iter()
-                    .any(|allowed| allowed == origin.trim_end_matches('/'))
+                let origin = origin.trim_end_matches('/');
+                self.allowed_origins.iter().any(|allowed| allowed == origin)
+                    || (self.allow_desktop && DESKTOP_ORIGINS.contains(&origin))
             })
             .unwrap_or(false)
     }
@@ -383,15 +382,36 @@ mod tests {
     }
 
     #[test]
-    fn s3_denies_desktop() {
-        // The desktop admission covers the bearer-only REST API, not S3.
-        let config = CorsConfig::new(vec!["http://portal.test".to_string()]);
-        let origin = HeaderValue::from_static("tauri://localhost");
-        assert!(!config.allows(&origin));
-        assert!(config.s3_preflight_headers(&origin, None).is_none());
-        let mut headers = HeaderMap::new();
-        config.apply_s3_headers(Some(&origin), &mut headers);
-        assert!(headers.is_empty());
+    fn s3_admits_desktop() {
+        for config in [
+            CorsConfig::new(vec!["http://portal.test".to_string()]),
+            CorsConfig::default(),
+        ] {
+            for name in DESKTOP_ORIGINS {
+                let origin = HeaderValue::from_static(name);
+                assert!(config.allows(&origin));
+                let headers = config.s3_preflight_headers(&origin, None).unwrap();
+                assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], name);
+                let mut headers = HeaderMap::new();
+                config.apply_s3_headers(Some(&origin), &mut headers);
+                assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], name);
+            }
+            assert!(!config.allows(&HeaderValue::from_static("http://evil.test")));
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_off_denied() {
+        let config = CorsConfig::default().with_desktop(false);
+        for name in DESKTOP_ORIGINS {
+            let origin = HeaderValue::from_static(name);
+            assert!(!config.allows(&origin));
+            assert!(config.s3_preflight_headers(&origin, None).is_none());
+            let mut headers = HeaderMap::new();
+            config.apply_s3_headers(Some(&origin), &mut headers);
+            assert!(headers.is_empty());
+            assert!(rest_allow_origin(&config, name).await.is_none());
+        }
     }
 
     #[test]

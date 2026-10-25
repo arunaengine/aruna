@@ -531,6 +531,17 @@ pub enum MetadataTransportMessage {
         auth_token: AuthToken,
         pull: Box<SyncPull>,
     },
+    /// Creates a bucket only if the node holds none of that name, in any group. Appended last
+    /// to keep discriminants stable; answered by `ForwardedNewBucket`.
+    ForwardNewBucket {
+        auth_token: AuthToken,
+        bucket: String,
+        group_id: GroupId,
+    },
+    /// `Ok(false)`: the node already held a bucket of that name and created nothing.
+    ForwardedNewBucket {
+        result: Result<bool, SyncRefusal>,
+    },
 }
 
 /// One document as a holder serves it to a device.

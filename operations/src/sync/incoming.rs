@@ -35,6 +35,7 @@ use crate::replication::protocol::{
     BaoReadRequest, LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use crate::sync::document_outbox::{
     new_identified_record, schedule_drain_effect, write_outbox_effect,
 };
@@ -561,6 +562,13 @@ async fn manifest_policy(
     local_node: NodeId,
     manifest: &VersionReplicationManifest,
 ) -> Result<(Option<String>, Option<String>), String> {
+    // Denied like a missing policy, so the sender stops and no destination is created. An unbound
+    // folder stays `Deleting` until its row is gone, so checking before the create suffices.
+    match guard_bucket_write(context, &manifest.bucket).await {
+        Ok(()) => {}
+        Err(OfferedDirectoryError::ReadOnly(_)) => return Ok((None, None)),
+        Err(error) => return Err(error.to_string()),
+    }
     let group_id = match drive(GetBucketOperation::new(manifest.bucket.clone()), context).await {
         Ok(info) => info.group_id,
         Err(GetBucketError::NotFound) => manifest.group_id,
@@ -1502,6 +1510,65 @@ mod tests {
         manifest.writer_auth_context = Some(manifest.auth_context.clone());
         assert_eq!(
             manifest_policy(&context, realm_id, node_id, &manifest)
+                .await
+                .unwrap(),
+            (None, None)
+        );
+    }
+
+    // A replica into an offered bucket, delete markers included, is denied, so the sender stops.
+    #[tokio::test]
+    async fn denies_offered_bucket() {
+        use crate::device::sync::folders::folder_bucket;
+        use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = &fixture.driver_context;
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), b"note").unwrap();
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let bucket = folder_bucket(Ulid::generate());
+        let offer = OfferDirectoryInput {
+            bucket: bucket.clone(),
+            root: root.path().to_string_lossy().to_string(),
+            group_id: Ulid::generate(),
+            realm_id,
+            node_id,
+            user_id,
+        };
+        offer_directory(context, offer).await.unwrap();
+        let manifest = VersionReplicationManifest {
+            bucket,
+            key: "note.txt".to_string(),
+            version_id: Ulid::generate(),
+            group_id: Ulid::generate(),
+            kind: ReplicationItemKind::DeleteMarker,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user_id,
+            current_version: true,
+            current_version_generation: Some(2),
+            auth_context: AuthContext::anonymous(realm_id),
+            blob: None,
+            source: None,
+            multipart: None,
+            reference_intent: false,
+            origin: None,
+            upstream_sources: Vec::new(),
+            writer_auth_context: None,
+            reference_metadata: None,
+            metadata: HashMap::new(),
+            reference_advance: Some(ReferenceAdvance {
+                generation: 2,
+                predecessor: Ulid::generate(),
+            }),
+            reference_advance_count: Some(0),
+            placement_policies: Vec::new(),
+        };
+
+        assert_eq!(
+            manifest_policy(context, realm_id, node_id, &manifest)
                 .await
                 .unwrap(),
             (None, None)

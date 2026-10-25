@@ -21,16 +21,16 @@ use aruna_core::errors::StagingSourceError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
-    ActionKind, ActionOutcome, ActionScope, FolderMode, FolderState, RemoteBinding, SyncRefusal,
+    ActionKind, ActionOutcome, ActionScope, FolderMode, FolderState, RemoteBinding,
 };
 use aruna_core::types::Key;
-use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{
     ActionError, ApplyActionInput, ExpectedEntry, apply_action,
 };
 use aruna_operations::device::sync::folders::{
     BindFolderInput, FolderError, bind_folder, folder_counters, list_actions, list_entries,
-    list_folders, read_bound, read_entry, set_folder_state, set_propagate_deletes, unbind_folder,
+    list_folders, read_bound, read_entry, request_sync, set_folder_state, set_propagate_deletes,
+    unbind_folder,
 };
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 
@@ -84,8 +84,6 @@ pub struct BindFolderRequest {
 #[derive(Debug, serde::Serialize, Deserialize, ToSchema)]
 pub struct UnboundFolder {
     pub folder_id: String,
-    /// Objects the device tombstoned in its own observation bucket.
-    pub removed: usize,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -198,27 +196,20 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
             ServerError::BadRequestReason(error.to_string())
         }
         FolderError::RemoteForbidden { .. } => ServerError::Forbidden,
-        FolderError::DownloadOnly => ServerError::Conflict(error.to_string()),
+        FolderError::DownloadOnly | FolderError::StillBinding => {
+            ServerError::Conflict(error.to_string())
+        }
         FolderError::RemoteUnreachable { .. } => ServerError::BadGatewayReason(error.to_string()),
+        FolderError::BucketExists { .. } => {
+            ServerError::Refused(StatusCode::CONFLICT, "bucket_exists", error.to_string())
+        }
         FolderError::Unavailable => ServerError::ServiceUnavailableReason(error.to_string()),
         FolderError::Offer(offer) => map_offer_error(offer),
-    }
-}
-
-fn map_reconcile_error(error: ReconcileFolderError, remote: &RemoteBinding) -> ServerError {
-    let reason = error.describe(remote);
-    match error {
-        ReconcileFolderError::Sweep(error) => map_offer_error(error),
-        ReconcileFolderError::Refused(SyncRefusal::NotFound) => {
-            ServerError::BadRequestReason(reason)
-        }
-        ReconcileFolderError::Refused(SyncRefusal::Unauthorized | SyncRefusal::Forbidden) => {
-            ServerError::Forbidden
-        }
-        ReconcileFolderError::Unreachable(_) => ServerError::BadGatewayReason(reason),
-        ReconcileFolderError::Refused(_)
-        | ReconcileFolderError::Decide(_)
-        | ReconcileFolderError::Unavailable => ServerError::ServiceUnavailableReason(reason),
+        FolderError::ListVersions(_)
+        | FolderError::DeleteObject(_)
+        | FolderError::DeleteBucket(_)
+        | FolderError::ListUploads(_)
+        | FolderError::AbortUpload(_) => ServerError::InternalError(error.to_string()),
     }
 }
 
@@ -281,9 +272,19 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
 **Behavior**
 - The device-local bucket is derived from the folder id, so the owner never names it and it cannot
   collide with a bucket they already use.
-- `create_bucket` creates a missing remote bucket through the node plane before the listing probe.
-- The directory is walked once and every file becomes one read-only object of that bucket; no byte
-  is copied into this node's blob store.
+- `create_bucket` creates a missing remote bucket through the node plane. Without it, a listing
+  probe checks that the remote bucket exists and the owner may read it.
+- The folder is recorded in state `binding` before the realm node is asked, so a retried call for
+  the same root answers 409. Of two concurrent calls only one is recorded; the other answers 409 or
+  a retryable 503. The folder turns `active` once the realm node confirms the bucket; a refusal
+  removes it again.
+- If the realm node does not answer, the call fails with 502 or 503 but the folder stays `binding`
+  and the next folder pass finishes it, also after a restart, so a bucket the node created never
+  stays behind without a folder. Unbinding the folder stops that.
+- The answer comes before the directory is walked. The first sync pass starts at once in the
+  background: every file becomes one read-only object of that bucket, and no byte is copied into
+  this node's blob store. `GET /device/folders/{folder_id}` and `GET /device/transfers` show its
+  progress.
 - `two_way` syncs both directions; `upload_only` never writes to disk; `download_only` never
   publishes: local edits and deletions stay local, and `propagate_deletes` is always false.
 - Local data always wins locally: a file is replaced automatically only while its fingerprint and
@@ -294,7 +295,9 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
   `propagate_deletes` is set.
 
 **Limits**
-- A device binds at most 64 folders, and a folder holds at most 100000 files.
+- A device binds at most 64 folders.
+- A folder holds at most 100000 files. A larger folder is bound, but its sync passes stop with this
+  limit in `last_error`.
 - Roots must not nest."#,
     request_body(
         content = BindFolderRequest,
@@ -311,7 +314,7 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
         })
     ),
     responses(
-        (status = 201, description = "The folder is bound and its first observation is registered", body = SyncedFolderView,
+        (status = 201, description = "The folder is bound and its first sync pass runs in the background", body = SyncedFolderView,
             example = json!({
                 "folder_id": "01JFOLDER0123456789ABCDEFG",
                 "root": "/home/ada/data",
@@ -326,24 +329,23 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
                 "propagate_deletes": true,
                 "state": "active",
                 "counters": {
-                    "observed": 131,
-                    "in_sync": 128,
-                    "uploading": 2,
-                    "conflicts": 1,
+                    "observed": 0,
+                    "in_sync": 0,
+                    "uploading": 0,
+                    "conflicts": 0,
                     "pending_replacements": 0,
                     "remote_deleted": 0,
                     "errors": 0
                 },
-                "last_reconcile_ms": 1775748191000_i64,
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "Malformed ids, an unusable directory, a non-realm target, or a missing remote bucket", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not this device's owner, or the remote bucket refuses the owner", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 409, description = "The root overlaps a bound folder, or the bucket belongs to another group", body = ErrorResponse),
+        (status = 409, description = "The root overlaps a bound folder, also one still binding, or the bucket belongs to another group", body = ErrorResponse),
         (status = 502, description = "The remote realm node is unreachable", body = ErrorResponse),
-        (status = 503, description = "The device sync service or realm configuration is unavailable", body = ErrorResponse)
+        (status = 503, description = "The device sync service or realm configuration is unavailable, or the folder list changed while this bind was recorded; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -380,7 +382,6 @@ async fn bind_synced_folder(
             propagate_deletes: mode != FolderMode::DownloadOnly
                 && request.propagate_deletes.unwrap_or(true),
             realm_id: state.get_realm_id(),
-            node_id: state.get_node_id(),
             user_id: auth.user_id,
         },
     )
@@ -595,20 +596,22 @@ async fn update_synced_folder(
 for. Nothing outside this device is decided here, so the owner binding is the whole authority.
 
 **Behavior**
+- The answer comes at once: the folder turns `deleting` and the folder pass, started right away,
+  removes it after any pass still running on it. A removal cut short, also by a restart, resumes in
+  the next pass.
 - The binding, its merge bases, its queued uploads and its audit log are removed from this device.
-- The device's own observation bucket is emptied with delete markers; the realm objects the folder
-  published stay.
+- The device's own observation bucket is deleted; the realm objects the folder published stay.
 - The files on disk, including any conflicted copies and anything in the folder's trash, are left
   exactly as they are."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
-        (status = 200, description = "The folder is unbound", body = UnboundFolder,
-            example = json!({"folder_id": "01JFOLDER0123456789ABCDEFG", "removed": 128})),
+        (status = 200, description = "The folder is marked `deleting` and is removed in the background", body = UnboundFolder,
+            example = json!({"folder_id": "01JFOLDER0123456789ABCDEFG"})),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        (status = 503, description = "The realm configuration has not reached this device yet, or a concurrent change to the folder caused a storage conflict; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -617,25 +620,13 @@ async fn unbind_synced_folder(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<UnboundFolder>> {
-    let auth = require_owner(&state, auth).await?;
+    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
-    let context = state.get_ctx();
-    // An unknown folder answers 404 before anything is torn down.
-    read_bound(&context, folder_id)
+    unbind_folder(&state.get_ctx(), folder_id)
         .await
         .map_err(map_folder_error)?;
-    let removed = unbind_folder(
-        &context,
-        folder_id,
-        state.get_realm_id(),
-        state.get_node_id(),
-        auth.user_id,
-    )
-    .await
-    .map_err(map_folder_error)?;
     Ok(Json(UnboundFolder {
         folder_id: folder_id.to_string(),
-        removed,
     }))
 }
 
@@ -683,7 +674,8 @@ for.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        (status = 409, description = "The folder is still being bound", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet, or a concurrent change to the folder caused a storage conflict; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -741,7 +733,8 @@ for."#,
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        (status = 409, description = "The folder is still being bound", body = ErrorResponse),
+        (status = 503, description = "The realm configuration has not reached this device yet, or a concurrent change to the folder caused a storage conflict; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -762,18 +755,21 @@ async fn resume_folder(
     post,
     path = "/device/folders/{folder_id}/sync",
     tag = "device",
-    summary = "Reconcile one folder now",
-    description = r#"Runs one reconciliation of the folder without waiting for the timer.
+    summary = "Start a sync pass now",
+    description = r#"Starts the next sync pass at once instead of waiting for the timer.
 
 **Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
 for.
 
 **Behavior**
+- The answer comes at once with the folder's current status; the pass runs in the background.
+  `GET /device/folders/{folder_id}` and `GET /device/transfers` show its progress, and a failed
+  pass sets `last_error`.
 - The pass observes the directory and the realm heads and applies only what the sync may apply on
   its own; everything else waits for an explicit action."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),
     responses(
-        (status = 200, description = "The folder was reconciled", body = SyncedFolderView,
+        (status = 200, description = "The pass started; the folder as it stands now", body = SyncedFolderView,
             example = json!({
                 "folder_id": "01JFOLDER0123456789ABCDEFG",
                 "root": "/home/ada/data",
@@ -799,13 +795,12 @@ for.
                 "last_reconcile_ms": 1775748191000_i64,
                 "created_at_ms": 1775748000000_i64
             })),
-        (status = 400, description = "Malformed folder id, an unusable local directory, or a missing remote bucket", body = ErrorResponse),
+        (status = 400, description = "Malformed folder id, or the local directory is missing or unusable", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not this device's owner, or the remote bucket refuses the owner", body = ErrorResponse),
+        (status = 403, description = "The caller is not this device's owner", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is paused", body = ErrorResponse),
-        (status = 502, description = "The remote realm node is unreachable", body = ErrorResponse),
-        (status = 503, description = "The folder could not be reconciled right now", body = ErrorResponse)
+        (status = 503, description = "This node cannot read local directories or its store is unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -825,10 +820,7 @@ async fn sync_folder(
             "the folder is not active".to_string(),
         ));
     }
-    aruna_operations::device::sync::reconcile_folder(&context, &folder)
-        .await
-        .map_err(|error| map_reconcile_error(error, &folder.remote))?;
-    let folder = read_bound(&context, folder_id)
+    request_sync(&context, &folder)
         .await
         .map_err(map_folder_error)?;
     Ok(Json(folder_detail(&state, folder).await?))
