@@ -6,11 +6,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, prefix_upper_bound};
+use aruna_core::keyspaces::{
+    DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, METADATA_INDEX_KEYSPACE, prefix_upper_bound,
+};
 use aruna_core::metadata::{
     IriIndexRecord, MaterializationState, MaterializationStatusRecord, MetadataError,
 };
@@ -30,7 +32,9 @@ use super::queue_storage::{
     MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
     start_write_transaction,
 };
-use super::repository::{StorageReadError, parse_status_read, read_status_effect};
+use super::repository::{
+    StorageReadError, parse_registry_iter, parse_status_read, read_status_effect,
+};
 
 const INDEX_PAGE_SIZE: usize = 128;
 const INDEX_BATCH_SIZE: usize = 128;
@@ -351,15 +355,42 @@ fn status_current(status: &MaterializationStatusRecord, record: &MetadataRegistr
         && status.state == MaterializationState::Materialized
 }
 
-/// Re-projects each live materialized document on its own and replaces its postings.
+/// Re-projects each live materialized document on its own and replaces its postings, walking
+/// the registry a page at a time so its size never bounds the rebuild.
 pub(crate) async fn rebuild_index(context: &DriverContext) -> Result<usize, MetadataError> {
+    let storage = &context.storage_handle;
+    let mut written = 0usize;
+    let mut start_after = None;
+    loop {
+        let page = storage
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: METADATA_INDEX_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.take().map(IterStart::After),
+                limit: INDEX_PAGE_SIZE,
+                txn_id: None,
+            }))
+            .await;
+        let (records, next) = parse_registry_iter(page).map_err(status_error)?;
+        written = written.saturating_add(rebuild_page(context, &records).await?);
+        match next {
+            Some(next) => start_after = Some(next),
+            None => return Ok(written),
+        }
+    }
+}
+
+/// Rebuilds the postings of one registry page's live materialized documents.
+async fn rebuild_page(
+    context: &DriverContext,
+    records: &[MetadataRegistryRecord],
+) -> Result<usize, MetadataError> {
     let metadata_handle = context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataError::HandleMissing)?;
     let storage = &context.storage_handle;
-    let registry_records = metadata_handle.list_cached_records().await?;
-    let registry_records = super::api::filter_live_records(storage, registry_records.as_ref())
+    let registry_records = super::api::filter_live_records(storage, records)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     let mut written = 0usize;
