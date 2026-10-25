@@ -305,3 +305,117 @@ async fn framed_body_checked() {
     let (status, _) = send(&members, 1, (Method::GET, "k/forged"), &[value], None).await;
     assert_eq!(status, http::StatusCode::NOT_FOUND);
 }
+
+/// Sends `body` framed by node 0 to node 1 as `operation` on `key` with `query`, carrying
+/// `checksum` as the client's trailing CRC32 when given.
+async fn framed_send(
+    members: &Members,
+    (operation, key, query): (&str, &str, Option<&str>),
+    body: &'static [u8],
+    checksum: Option<String>,
+) -> http::StatusCode {
+    use aruna_core::structs::storage::distribution::delegation::TRAILER_BYTES;
+    let issuer = &members.nodes[0];
+    let request = Delegated {
+        method: Method::PUT,
+        operation,
+        key,
+        payload: Payload::Framed {
+            checksum: checksum.as_ref().map(|_| "CRC32".to_string()),
+        },
+    };
+    let mut headers = accept();
+    let length = body.len() + TRAILER_BYTES;
+    headers.insert("content-length", length.to_string().parse().unwrap());
+    let mut delegation = delegation(members, (0, 1), &request, &headers);
+    delegation.request_digest = forwarded_digest(&Method::PUT, BUCKET, key, query, &headers);
+    let signed = delegation.sign(&issuer.secret);
+    let value: Option<crate::s3::service::payload::ChecksumValue> =
+        checksum.map(|checksum| std::sync::Arc::new(move || Some(checksum.clone())) as _);
+    let blob = StreamingBlob::from(bytes::Bytes::from_static(body));
+    let framed = frame_body(blob, issuer.context.clone(), signed.delegation.nonce, value);
+    use futures_util::TryStreamExt;
+    let bytes: Vec<u8> = (framed.try_collect::<Vec<bytes::Bytes>>().await.unwrap()).concat();
+    let mut url = format!("{}/{BUCKET}/{key}", members.nodes[1].url);
+    if let Some(query) = query {
+        url = format!("{url}?{query}");
+    }
+    let response = reqwest::Client::new()
+        .put(url)
+        .headers(headers)
+        .header(DELEGATION_HEADER, signed.encode().unwrap())
+        .body(bytes)
+        .send()
+        .await
+        .unwrap();
+    response.status()
+}
+
+fn crc32(body: &[u8]) -> String {
+    use base64::Engine;
+    let mut sums = aruna_blob::hash::Hasher::new();
+    sums.update(body);
+    let crc = sums.to_map()[aruna_core::structs::checksum::HASH_CRC32].clone();
+    base64::engine::general_purpose::STANDARD.encode(crc)
+}
+
+// The client's trailing checksum travels in the issuer's signed trailer: the coordinator
+// stores the object or part only when it matches the bytes it received.
+#[tokio::test]
+async fn trailer_checksum_checked() {
+    use s3s::dto::CreateMultipartUploadInput;
+    let members = members(3, &["h", "p"], 0).await;
+    let good = crc32(b"summed");
+    let put = ("PutObject", "k/sum", None);
+    assert!(
+        framed_send(&members, put, b"summed", Some(good.clone()))
+            .await
+            .is_success()
+    );
+    let put = ("PutObject", "k/badsum", None);
+    let wrong = Some("AAAAAA==".to_string());
+    assert!(
+        !framed_send(&members, put, b"summed", wrong.clone())
+            .await
+            .is_success()
+    );
+
+    let node = &members.nodes[1];
+    let input = CreateMultipartUploadInput {
+        bucket: BUCKET.to_string(),
+        key: "k/parts".to_string(),
+        ..Default::default()
+    };
+    let mut extensions = http::Extensions::new();
+    extensions.insert(members.user_on(1));
+    extensions.insert(node.bucket().await);
+    extensions.insert(aruna_operations::auth::request_policy::PolicyRequestExtras::rest());
+    let create = s3s::S3Request {
+        input,
+        method: Method::POST,
+        uri: http::Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let created = s3s::S3::create_multipart_upload(&node.service, create).await;
+    let upload_id = created.unwrap().output.upload_id.unwrap();
+    let encoded: String = url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
+    let query = format!("partNumber=1&uploadId={encoded}");
+    let part = ("UploadPart", "k/parts", Some(query.as_str()));
+    assert!(
+        framed_send(&members, part, b"summed", Some(good))
+            .await
+            .is_success()
+    );
+    let query = format!("partNumber=2&uploadId={encoded}");
+    let part = ("UploadPart", "k/parts", Some(query.as_str()));
+    assert!(
+        !framed_send(&members, part, b"summed", wrong)
+            .await
+            .is_success()
+    );
+}
