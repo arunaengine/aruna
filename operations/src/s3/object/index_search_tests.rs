@@ -241,4 +241,8 @@ async fn realm_skips_distributed() {
     realm.as_of = SystemTime::now();
     let page = search_local_objects(&fixture.context, realm).await.unwrap();
     assert_eq!(keys(&page), ["needle-visible"]);
+    assert_eq!(
+        page.incomplete_ranges, 1,
+        "the skipped bucket is not covered"
+    );
 }

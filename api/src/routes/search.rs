@@ -458,7 +458,12 @@ restrictions and request policies before it can be returned.
   that bound returns a cursor even without hits. Substring queries match whole name parts of
   the key, split at `/`, `.`, `-`, `_` and other separators. `coverage.incomplete_ranges` counts
   ranges whose index is missing or still being built (and, in `local` mode, ranges another
-  member coordinates); they are never scanned, and `complete` is false while any remain."#,
+  member coordinates); they are never scanned, and `complete` is false while any remain.
+  `distributed_strict` answers 503 while any remain.
+- A search without `bucket` skips distributed buckets, which only their key indexes cover;
+  each skipped bucket counts in `coverage.incomplete_ranges`.
+- A cursor that continues after keys the caller may not see carries them sealed; a restart of
+  the node that sealed it makes such a cursor invalid."#,
     params(
         ("q" = String, Query, description = "Case-sensitive key substring or prefix; trimmed, minimum 2 characters"),
         ("bucket" = Option<String>, Query, description = "Optional exact bucket name"),

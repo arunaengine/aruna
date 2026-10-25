@@ -385,7 +385,7 @@ fn search_assembly_order() {
         target_nodes: None,
         fingerprint: [7u8; 32],
     };
-    let partitions = ObjectSearchPartitions {
+    let partitions = || ObjectSearchPartitions {
         as_of: SystemTime::UNIX_EPOCH,
         partitions: vec![
             ObjectPartitionState {
@@ -428,20 +428,39 @@ fn search_assembly_order() {
         incomplete_ranges: 0,
         remote_ranges: 0,
     };
+    let stats = || MetadataFanoutStats {
+        nodes_queried: 2,
+        nodes_failed: 0,
+        failed_partitions: Vec::new(),
+        discovery_failed: false,
+    };
+    // A strict search fails rather than answer with a range nobody searched.
+    let strict = ObjectSearchPlan {
+        mode: ObjectQueryMode::DistributedStrict,
+        auth: plan.auth.clone(),
+        query: plan.query.clone(),
+        ..plan
+    };
+    let unsearched = SearchNodePage {
+        incomplete_ranges: 1,
+        ..page(second, None)
+    };
+    let parts = vec![(first, page(first, Some("a"))), (second, unsearched)];
+    let refused = assemble_object_execution(&test.context, &strict, partitions(), parts, stats());
+    assert!(matches!(refused, Err(MetadataApiError::ServiceUnavailable)));
+    let plan = ObjectSearchPlan {
+        mode: ObjectQueryMode::DistributedBestEffort,
+        ..strict
+    };
     let execution = assemble_object_execution(
         &test.context,
         &plan,
-        partitions,
+        partitions(),
         vec![
             (first, page(first, Some("a"))),
             (second, page(second, None)),
         ],
-        MetadataFanoutStats {
-            nodes_queried: 2,
-            nodes_failed: 0,
-            failed_partitions: Vec::new(),
-            discovery_failed: false,
-        },
+        stats(),
     )
     .expect("exhausted partitions assemble without a net handle");
 

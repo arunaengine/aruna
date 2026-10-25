@@ -94,7 +94,8 @@ pub struct SearchNodePage {
     pub next_start_after: Option<Vec<u8>>,
     pub observed_at: SystemTime,
     /// Ranges of a distributed bucket this node coordinates whose index is missing or still
-    /// being built; the page does not cover their keys.
+    /// being built, and distributed buckets a realm-wide scan skipped; the page does not
+    /// cover their keys.
     #[serde(default)]
     pub incomplete_ranges: usize,
     /// Ranges of a distributed bucket another member coordinates; their keys come from
@@ -189,23 +190,29 @@ pub async fn search_local_objects(
                     .get(limit - 1)
                     .map(|candidate| candidate.cursor_key.clone());
                 visible.truncate(limit);
-                return Ok(node_page(visible, next_start_after));
+                return Ok(node_page(visible, next_start_after, &distributed));
             }
         }
 
         match batch.next_start {
             Some(next) => start = Some(next),
-            None => return Ok(node_page(visible, None)),
+            None => return Ok(node_page(visible, None, &distributed)),
         }
     }
 }
 
-fn node_page(hits: Vec<SearchNodeHit>, next_start_after: Option<Vec<u8>>) -> SearchNodePage {
+/// A page of a scan; the distributed buckets it skipped count as unsearched, since only their
+/// range indexes cover them.
+fn node_page(
+    hits: Vec<SearchNodeHit>,
+    next_start_after: Option<Vec<u8>>,
+    distributed: &HashMap<String, bool>,
+) -> SearchNodePage {
     SearchNodePage {
         hits,
         next_start_after,
         observed_at: SystemTime::now(),
-        incomplete_ranges: 0,
+        incomplete_ranges: distributed.values().filter(|bound| **bound).count(),
         remote_ranges: 0,
     }
 }

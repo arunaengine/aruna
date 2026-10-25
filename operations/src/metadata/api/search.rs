@@ -618,6 +618,10 @@ pub(super) fn assemble_object_execution(
     let incomplete_ranges = (parts.iter())
         .map(|(_, page)| page.incomplete_ranges + if local { page.remote_ranges } else { 0 })
         .sum::<usize>();
+    // Strict mode answers complete pages only: an unsearched range fails the request.
+    if plan.mode == ObjectQueryMode::DistributedStrict && incomplete_ranges > 0 {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
     let mut pages = parts.into_iter().collect::<HashMap<_, _>>();
     let mut hits = Vec::with_capacity(plan.limit);
     let mut remaining = plan.limit;
