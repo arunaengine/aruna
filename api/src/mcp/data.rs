@@ -84,7 +84,7 @@ pub struct ListObjectsInput {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct ObjectOutput {
     pub key: String,
     pub size: Option<u64>,
@@ -389,8 +389,8 @@ impl McpServer {
         )
         .await
         .map_err(|error| object_error(error, "read"))?;
-        let cursor = input.cursor.as_deref().map(decode_cursor).transpose()?;
         let limit = input.limit.unwrap_or(100).clamp(1, 200);
+        let cursor = input.cursor.as_deref().map(decode_cursor).transpose()?;
         let result = drive(
             ListBucketOperation::new(ListBucketInput {
                 bucket: input.bucket.clone(),
@@ -405,45 +405,7 @@ impl McpServer {
         )
         .await
         .map_err(internal_error)?;
-        let objects = result
-            .objects
-            .into_iter()
-            .map(|object| {
-                let size = entry_size(&object);
-                let etag = object
-                    .location
-                    .as_ref()
-                    .and_then(|location| location.hashes.get(HASH_MD5))
-                    .map(hex::encode)
-                    .or_else(|| {
-                        object
-                            .source_metadata
-                            .as_ref()
-                            .and_then(|metadata| metadata.etag.clone())
-                    });
-                let content_type = object
-                    .source_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.content_type.clone());
-                let content_id = object
-                    .location
-                    .as_ref()
-                    .and_then(|location| location.hashes.get(HASH_BLAKE3))
-                    .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
-                    .map(content_id);
-                let last_modified = entry_time(&object)
-                    .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
-                ObjectOutput {
-                    key: object.head.key,
-                    size,
-                    etag,
-                    last_modified,
-                    content_type,
-                    referenced: object.referenced,
-                    content_id,
-                }
-            })
-            .collect();
+        let objects = result.objects.iter().map(object_output).collect();
         let next_cursor = result
             .continuation_token
             .as_ref()
@@ -750,6 +712,43 @@ impl McpServer {
         )
         .await
         .map_err(map_bucket_error)
+    }
+}
+
+/// One listed object as the listing tools and the REST object listing show it.
+pub(crate) fn object_output(object: &ListedObject) -> ObjectOutput {
+    let size = entry_size(object);
+    let etag = object
+        .location
+        .as_ref()
+        .and_then(|location| location.hashes.get(HASH_MD5))
+        .map(hex::encode)
+        .or_else(|| {
+            object
+                .source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.etag.clone())
+        });
+    let content_type = object
+        .source_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.content_type.clone());
+    let content_id = object
+        .location
+        .as_ref()
+        .and_then(|location| location.hashes.get(HASH_BLAKE3))
+        .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
+        .map(content_id);
+    let last_modified =
+        entry_time(object).map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+    ObjectOutput {
+        key: object.head.key.clone(),
+        size,
+        etag,
+        last_modified,
+        content_type,
+        referenced: object.referenced,
+        content_id,
     }
 }
 
