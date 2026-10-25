@@ -425,6 +425,8 @@ fn search_assembly_order() {
             .unwrap_or_default(),
         next_start_after: None,
         observed_at: SystemTime::UNIX_EPOCH,
+        incomplete_ranges: 0,
+        remote_ranges: 0,
     };
     let execution = assemble_object_execution(
         &test.context,
