@@ -28,7 +28,7 @@ use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::node::usage_stats::{UsageCounterUpdate, UsageUpdateError};
+use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::replication::protocol::ReferenceAdvance;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::object::get::MAX_AUTO_ADVANCES;
@@ -258,7 +258,9 @@ impl MintSuccessorOperation {
         };
         let key = &refresh.key;
         let inventory = version_written(bucket.distribution.as_ref(), key, added, true);
-        let usage = UsageCounterUpdate::for_group(bucket.group_id, delta);
+        // The successor is one more version row of the bucket, booked like any other write.
+        let usage = UsageCounterUpdate::for_group(bucket.group_id, delta)
+            .in_bucket(&refresh.bucket, RowChange::AddedVersion);
         self.usage = Some(usage.with_inventory(inventory));
         Ok(Some(writes))
     }
@@ -476,6 +478,36 @@ mod tests {
             operation.finalize(),
             Err(MintError::Purge(PurgeFenceError::Suspended))
         );
+    }
+
+    // A successor is booked on its bucket's row as well as on its group.
+    #[test]
+    fn successor_books_bucket() {
+        let version_id = Ulid::from_bytes([2; 16]);
+        let mut operation = mint(version_id);
+        operation.start();
+        let head = CurrentVersionPointer::new(version_id);
+        let values = vec![
+            (
+                Key::from(b"head".to_vec()),
+                Some(head.to_bytes().unwrap().into()),
+            ),
+            (
+                Key::from(b"bucket".to_vec()),
+                Some(bucket().to_bytes().unwrap().into()),
+            ),
+            (Key::from(b"fence".to_vec()), None),
+        ];
+        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+
+        let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice() else {
+            panic!("expected the usage update, got {effects:?}");
+        };
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].1.versions, 1);
     }
 
     // A refreshed version that is no longer the head gets no successor.
