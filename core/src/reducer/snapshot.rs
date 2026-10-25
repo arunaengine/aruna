@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::structs::storage::distribution::snapshot::{Installed, install};
+use crate::structs::storage::distribution::snapshot::{Installed, forked, install};
 use crate::structs::storage::distribution::{DistributionError, DistributionView, SignedSnapshot};
 
 const VIEW_PATH: &str = "distribution.view";
@@ -53,6 +53,46 @@ impl AdminDocumentState {
             }
             Installed::Unchanged => Ok(AdminApplyStatus::Duplicate),
         }
+    }
+
+    /// Keeps a parked fork as equivocation evidence, also when a newer head was installed
+    /// meanwhile: two snapshots that fork prove the publisher equivocated, whatever came after.
+    pub fn keep_equivocation(
+        &mut self,
+        head: &AdminDocumentEvent,
+        conflict: &AdminDocumentEvent,
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
+        let (
+            AdminDocumentOperation::DistributionPublished { snapshot: first },
+            AdminDocumentOperation::DistributionPublished { snapshot: second },
+            AdminDocumentTarget::Distribution { realm_id, .. },
+        ) = (&head.op, &conflict.op, &self.target)
+        else {
+            return Err(AdminDocumentError::UnsupportedTarget);
+        };
+        let Some(mut view) = self.distribution_view() else {
+            return Ok(AdminApplyStatus::Duplicate);
+        };
+        for (event, signed) in [(head, first), (conflict, second)] {
+            if event.origin_node_id != signed.snapshot.root.publisher {
+                return Err(DistributionError::NotPublisher.into());
+            }
+            if signed.snapshot.root != view.head.snapshot.root {
+                return Err(DistributionError::ForeignSet(signed.snapshot.set_id()).into());
+            }
+            signed.verify(*realm_id)?;
+        }
+        if view.conflicted() || !forked(&first.snapshot, &second.snapshot) {
+            return Ok(AdminApplyStatus::Duplicate);
+        }
+        view.conflict = Some((**second).clone());
+        let value = hex::encode(view.to_bytes().map_err(|_| DistributionError::TooLarge)?);
+        let version = AdminAttributeVersion {
+            value: Some(value),
+            dot: conflict.dot(),
+        };
+        self.user_subject_ids.insert(VIEW_PATH.to_string(), version);
+        Ok(AdminApplyStatus::Applied)
     }
 
     /// The highest valid snapshot of a distribution target and any equivocation evidence.

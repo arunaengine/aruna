@@ -109,15 +109,44 @@ pub(in crate::document_sync) async fn retry_parked(
                 warn!(%set_id, %reason, "Dropping a parked distribution snapshot");
             }
             RetryDecision::Install(events) => {
-                // A conflict installs after its head, so the view keeps the equivocation.
-                for event in &events {
-                    install_snapshot(storage, event, set_id).await?;
-                }
+                // Head and conflict install together, so the view keeps the equivocation.
+                install_events(storage, &events, set_id).await?;
             }
         }
         unpark(storage, key).await?;
     }
     Ok(())
+}
+
+/// Retries the parked entry of a snapshot's publisher and set, if any, before a snapshot of
+/// that set installs; evidence that may install goes in first, the rest keeps waiting.
+pub(in crate::document_sync) async fn drain_parked(
+    storage: &StorageHandle,
+    membership: &Membership,
+    signed: &SignedSnapshot,
+) -> Result<()> {
+    let snapshot = &signed.snapshot;
+    let key: ByteView = publisher_key(&snapshot.root.publisher, snapshot.set_id()).into();
+    let entry = storage_read_from(
+        storage,
+        DISTRIBUTION_PARKED_KEYSPACE.to_string(),
+        key.clone(),
+    )
+    .await?
+    .and_then(|bytes| postcard::from_bytes::<ParkedEntry>(&bytes).ok());
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    match retry(&entry, |signed| membership.authority(signed)) {
+        RetryDecision::Wait => return Ok(()),
+        RetryDecision::Drop(reason) => {
+            warn!(set_id = %snapshot.set_id(), %reason, "Dropping a parked distribution snapshot");
+        }
+        RetryDecision::Install(events) => {
+            install_events(storage, &events, snapshot.set_id()).await?;
+        }
+    }
+    unpark(storage, key).await
 }
 
 /// The parked entry of one key and the number of parked keys, read in the transaction.

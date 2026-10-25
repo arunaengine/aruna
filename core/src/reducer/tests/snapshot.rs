@@ -157,6 +157,36 @@ fn equivocation_stops_changes() {
 }
 
 #[test]
+fn parked_fork_survives_newer_head() {
+    // Forks at revision 2 waited while revision 4 installed; the pair still proves equivocation.
+    let mut state = AdminDocumentState::new(target());
+    let first = created();
+    let second = settings(&first, true);
+    let mut fork = settings(&first, true);
+    fork.config.settings.search_index = true;
+    let fourth = settings(&settings(&second, false), true);
+    state.apply(&published(1, 1, fourth, 1)).unwrap();
+    let (head, conflict) = (published(2, 1, second.clone(), 1), published(3, 1, fork, 1));
+    assert_eq!(state.apply(&head), Ok(AdminApplyStatus::Duplicate));
+    assert_eq!(state.apply(&conflict), Ok(AdminApplyStatus::Duplicate));
+    assert_eq!(
+        state.keep_equivocation(&head, &conflict),
+        Ok(AdminApplyStatus::Applied)
+    );
+    let view = state.distribution_view().unwrap();
+    assert!(view.conflicted());
+    assert_eq!(view.snapshot().number, 4);
+    // Two snapshots that do not fork are no evidence.
+    let mut fresh = AdminDocumentState::new(target());
+    fresh.apply(&published(1, 1, second.clone(), 1)).unwrap();
+    let same = published(4, 1, second, 1);
+    assert_eq!(
+        fresh.keep_equivocation(&same, &same),
+        Ok(AdminApplyStatus::Duplicate)
+    );
+}
+
+#[test]
 fn fences_survive_installs() {
     // Installing a snapshot never clears a fence a newer installed snapshot holds.
     use crate::structs::storage::distribution::snapshot::Deletion;

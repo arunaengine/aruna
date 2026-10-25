@@ -350,6 +350,21 @@ impl DistributionView {
     }
 }
 
+/// Whether two snapshots of one set prove publisher equivocation: different snapshots of one
+/// number, or a successor that names another predecessor.
+pub fn forked(head: &DistributionSnapshot, next: &DistributionSnapshot) -> bool {
+    let head_digest = head.digest();
+    match next.number.cmp(&head.number) {
+        std::cmp::Ordering::Equal => next.digest() != head_digest,
+        std::cmp::Ordering::Greater => {
+            next.number == head.number + 1 && next.previous != Some(head_digest)
+        }
+        std::cmp::Ordering::Less => {
+            next.number + 1 == head.number && head.previous != Some(next.digest())
+        }
+    }
+}
+
 /// Keeps the highest snapshot; older and equal ones are ignored, a different one of the same
 /// number, or a successor that names another predecessor, marks the set conflicted with no
 /// winner. `incoming` must already be verified.
@@ -371,17 +386,7 @@ pub fn install(
     if view.conflicted() {
         return Ok(Installed::Unchanged);
     }
-    let head_digest = head.digest();
-    let forked = match next.number.cmp(&head.number) {
-        std::cmp::Ordering::Equal => next.digest() != head_digest,
-        std::cmp::Ordering::Greater => {
-            next.number == head.number + 1 && next.previous != Some(head_digest)
-        }
-        std::cmp::Ordering::Less => {
-            next.number + 1 == head.number && head.previous != Some(next.digest())
-        }
-    };
-    if forked {
+    if forked(head, next) {
         return Ok(Installed::Changed(Box::new(DistributionView {
             head: view.head.clone(),
             conflict: Some(incoming),

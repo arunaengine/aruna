@@ -134,13 +134,15 @@ pub(in crate::document_sync) async fn apply_distribution_operation(
             "distribution records change only through published snapshots".to_string(),
         ));
     };
-    match Membership::read(storage, realm_id)
-        .await?
-        .authority(snapshot)
-    {
-        Authority::Current => install_snapshot(storage, &event, set_id)
-            .await
-            .map(|()| Handled::Done),
+    let membership = Membership::read(storage, realm_id).await?;
+    match membership.authority(snapshot) {
+        Authority::Current => {
+            // Parked evidence of the same set installs first, so a newer head cannot hide it.
+            drain_parked(storage, &membership, snapshot).await?;
+            install_snapshot(storage, &event, set_id)
+                .await
+                .map(|()| Handled::Done)
+        }
         Authority::Unknown => park_snapshot(storage, &event, snapshot).await,
         Authority::Ended(reason) => {
             warn!(%set_id, %reason, "Dropping a distribution snapshot without authority");
@@ -155,10 +157,20 @@ pub(in crate::document_sync) async fn install_snapshot(
     event: &AdminDocumentEvent,
     set_id: Ulid,
 ) -> Result<()> {
+    install_events(storage, std::slice::from_ref(event), set_id).await
+}
+
+/// Installs snapshots of one set in one storage transaction; a parked head with its conflict
+/// installs as a pair that keeps the equivocation even behind a newer head.
+pub(in crate::document_sync) async fn install_events(
+    storage: &StorageHandle,
+    events: &[AdminDocumentEvent],
+    set_id: Ulid,
+) -> Result<()> {
     for _ in 0..APPLY_CONFLICT_ATTEMPTS {
         tokio::task::yield_now().await;
         let txn_id = start_storage_transaction(storage).await?;
-        let writes = match distribution_writes(storage, txn_id, event, set_id).await {
+        let writes = match distribution_writes(storage, txn_id, events, set_id).await {
             Ok(Some(writes)) => writes,
             Ok(None) => return abort_txn(storage, txn_id).await,
             Err(error) => return Err(abort_error(storage, txn_id, error).await),
@@ -183,10 +195,13 @@ pub(in crate::document_sync) async fn install_snapshot(
 async fn distribution_writes(
     storage: &StorageHandle,
     txn_id: TxnId,
-    event: &AdminDocumentEvent,
+    events: &[AdminDocumentEvent],
     set_id: Ulid,
 ) -> Result<Option<Vec<(String, ByteView, Value)>>> {
     let bootstrap = |error: String| NetError::Bootstrap(error);
+    let Some(event) = events.first() else {
+        return Ok(None);
+    };
     let mut state = transaction_read(
         storage,
         DOCUMENT_STATE_KEYSPACE.to_string(),
@@ -198,11 +213,19 @@ async fn distribution_writes(
     .transpose()
     .map_err(|error| bootstrap(error.to_string()))?
     .unwrap_or_else(|| AdminDocumentState::new(event.target.clone()));
-    if state
-        .apply(event)
-        .map_err(|error| bootstrap(error.to_string()))?
-        != AdminApplyStatus::Applied
-    {
+    let mut applied = false;
+    for event in events {
+        let status = state
+            .apply(event)
+            .map_err(|error| bootstrap(error.to_string()))?;
+        applied |= status == AdminApplyStatus::Applied;
+    }
+    if let [head, conflict] = events {
+        let status = (state.keep_equivocation(head, conflict))
+            .map_err(|error| bootstrap(error.to_string()))?;
+        applied |= status == AdminApplyStatus::Applied;
+    }
+    if !applied {
         return Ok(None);
     }
     let Some(view) = state.distribution_view() else {
