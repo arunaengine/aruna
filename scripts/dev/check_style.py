@@ -70,6 +70,7 @@ SMALL_DOMAINS = {
     "operations/src/s3/policy": "coherent ownership scope",
     "operations/src/session": "coherent ownership scope",
     "operations/src/shard": "coherent ownership scope",
+    "operations/src/staging/page": "grouped shared-prefix domain",
     "operations/src/tasks": "coherent ownership scope",
     "operations/src/users/service_account": "grouped shared-prefix domain",
     "operations/src/users/vault": "grouped shared-prefix domain",

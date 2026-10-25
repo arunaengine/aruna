@@ -5,7 +5,7 @@
 use super::*;
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::staging::descriptor::build_source_binding;
-use crate::staging::page_rows::{GUARD_READS, MAX_PAGE_ENTRIES};
+use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES};
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
@@ -638,7 +638,7 @@ fn guards_carry_hint() {
         (Key::from(b"head".to_vec()), None),
     ];
     let input = input(vec![entry("a")]);
-    let guards = crate::staging::page_rows::check_guards(&input, values).unwrap();
+    let guards = crate::staging::page::rows::check_guards(&input, values).unwrap();
     assert_eq!(
         guards.set_hint,
         Some(SetHint::of_set(Ulid::from_bytes([5u8; 16])))

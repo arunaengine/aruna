@@ -7,7 +7,7 @@ use crate::connectors::resolver::secret_fingerprint;
 use crate::distribution::guard::{authority_read, authority_rows, write_epoch};
 use crate::node::usage_stats::{UsageCounterUpdate, schedule_snapshot_publish};
 use crate::replication::queue::schedule_blob_drain;
-use crate::staging::page_rows::{
+use crate::staging::page::rows::{
     MAX_PAGE_ENTRIES, PageGuards, check_guards, guard_reads, page_rows, version_reads,
 };
 use aruna_core::effects::{Effect, StorageEffect};
@@ -18,7 +18,7 @@ use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 
-pub use crate::staging::page_rows::{
+pub use crate::staging::page::rows::{
     PageEntry, PageImportError, PageImportInput, PageImportResult, PageImportState,
 };
 
@@ -329,5 +329,5 @@ impl Operation for PageImportOperation {
 }
 
 #[cfg(test)]
-#[path = "page_tests.rs"]
+#[path = "tests.rs"]
 mod tests;
