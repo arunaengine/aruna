@@ -40,7 +40,7 @@ pub(crate) async fn apply_bucket_create(
             note_refusal(peer, &bucket, &result);
             MetadataTransportMessage::ForwardedBucketCreated { result }
         }
-        MetadataTransportMessage::ForwardCreateNewBucket {
+        MetadataTransportMessage::ForwardNewBucket {
             auth_token,
             bucket,
             group_id,

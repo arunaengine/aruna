@@ -533,7 +533,7 @@ pub enum MetadataTransportMessage {
     },
     /// Creates a bucket only if the node holds none of that name, in any group. Appended last
     /// to keep discriminants stable; answered by `ForwardedNewBucket`.
-    ForwardCreateNewBucket {
+    ForwardNewBucket {
         auth_token: AuthToken,
         bucket: String,
         group_id: GroupId,

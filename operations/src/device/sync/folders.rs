@@ -371,7 +371,7 @@ pub async fn create_realm_bucket(
     let reply = metadata
         .request_forwarded_write(
             remote.node_id,
-            MetadataTransportMessage::ForwardCreateNewBucket {
+            MetadataTransportMessage::ForwardNewBucket {
                 auth_token: aruna_core::metadata::AuthToken::internal(auth),
                 bucket: remote.bucket.clone(),
                 group_id: input.group_id,
