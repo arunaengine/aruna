@@ -10,7 +10,7 @@ use ulid::Ulid;
 
 use super::{
     DataStrategy, DistributionConfig, KeyRange, MAX_BOUND_BYTES, MAX_MEMBERS, MAX_RANGES,
-    MetadataCoverage,
+    MemberState, MetadataCoverage,
 };
 
 const MAX_BUCKET_BYTES: usize = 63;
@@ -86,6 +86,20 @@ pub enum DistributionError {
     NotPublisher,
     #[error("a split threshold must be at least one")]
     InvalidSplit,
+    #[error("the distributed bucket is being deleted")]
+    Deleting,
+    #[error("the distribution change is refused: {0}")]
+    InvalidChange(&'static str),
+    #[error("member {0} still coordinates a range; transfer its ranges first")]
+    CoordinatorMember(Ulid),
+    #[error("range {0} has an open transfer")]
+    TransferOpen(Ulid),
+    #[error("transfer {0} is not open")]
+    NoTransfer(Ulid),
+    #[error("no deletion of the distributed bucket is prepared")]
+    NoDeletion,
+    #[error("coordinator {0} has not fenced its ranges for the deletion yet")]
+    NotFenced(Ulid),
 }
 
 /// Checks the shape of a configuration; record-level checks add the encoded size.
@@ -125,8 +139,11 @@ pub fn validate_config(config: &DistributionConfig) -> Result<(), DistributionEr
         }
         active.extend(named);
     }
+    // A leaving member holds no range on purpose.
     if let Some(idle) = config.members.iter().find(|member| {
-        member.coverage == MetadataCoverage::Assigned && !active.contains(&member.member_id)
+        member.coverage == MetadataCoverage::Assigned
+            && member.state != MemberState::Leaving
+            && !active.contains(&member.member_id)
     }) {
         return Err(DistributionError::IdleMember(idle.member_id));
     }

@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::membership::{changeable, join, leave};
 use super::snapshot::{DistributionSnapshot, Lifecycle};
 use super::split::apply_split;
 use super::validate::validate_config;
@@ -41,8 +42,10 @@ pub enum DistributionRequest {
     ChangeSettings {
         settings: DistributionSettings,
     },
+    /// A created member, as a replica of the named ranges.
     Join {
         member: DistributionMember,
+        ranges: Vec<Ulid>,
     },
     Leave {
         member_id: Ulid,
@@ -179,11 +182,14 @@ fn accept(
             if next.phase != SetPhase::Pending {
                 return Err(DistributionError::NotPending);
             }
+            if let Some(member_id) = next.unadmitted() {
+                return Err(DistributionError::MissingAdmission(member_id));
+            }
             next.phase = SetPhase::Active;
-            // Snapshot validation names the first coordinator or replica not yet admitted.
             Ok(())
         }
         DistributionRequest::ChangeSettings { settings } => {
+            changeable(next)?;
             if settings.refresh_secs == Some(0) {
                 return Err(DistributionError::InvalidRefresh);
             }
@@ -194,9 +200,9 @@ fn accept(
             Ok(())
         }
         DistributionRequest::Create { .. } => Err(DistributionError::SetMismatch(next.set_id())),
-        DistributionRequest::Join { .. }
-        | DistributionRequest::Leave { .. }
-        | DistributionRequest::TransferPrepare { .. }
+        DistributionRequest::Join { member, ranges } => join(next, member, ranges),
+        DistributionRequest::Leave { member_id } => leave(next, *member_id),
+        DistributionRequest::TransferPrepare { .. }
         | DistributionRequest::TransferActivate { .. }
         | DistributionRequest::DeletePrepare { .. }
         | DistributionRequest::DeleteCommit => Err(DistributionError::Unsupported(request.name())),
@@ -228,21 +234,21 @@ fn embed(
     next.check_statement(realm_id, signed)?;
     match &statement.kind {
         StatementKind::Admit => {
-            // After activation only a member that serves no range may still admit itself.
+            // After activation only a joined member, or one that serves no range, admits itself.
             let late = next.phase != SetPhase::Pending;
             let serves = next.config.ranges.iter().any(|range| {
                 range.coordinator == statement.member_id
                     || range.replicas.contains(&statement.member_id)
             });
-            if late && serves {
-                return Err(DistributionError::NotPending);
-            }
             let member = next
                 .config
                 .members
                 .iter_mut()
                 .find(|member| member.member_id == statement.member_id)
                 .ok_or(DistributionError::NoMember(statement.member_id))?;
+            if late && serves && member.state != MemberState::Created {
+                return Err(DistributionError::NotPending);
+            }
             // A pending set holds nothing yet; a later member catches up first.
             member.incarnation = Some(statement.incarnation);
             member.state = match late {

@@ -156,21 +156,35 @@ impl DistributionSnapshot {
         for member in &self.config.members {
             self.check_admission(member)?;
         }
+        // An active set's coordinators are admitted; a replica only once it joined and admitted.
         if self.phase == SetPhase::Active {
-            let missing = self
-                .config
-                .ranges
-                .iter()
+            let missing = (self.config.ranges.iter())
                 .flat_map(|range| std::iter::once(&range.coordinator).chain(&range.replicas))
                 .find(|member_id| {
-                    self.member(**member_id)
-                        .is_none_or(|member| member.incarnation.is_none())
+                    self.member(**member_id).is_none_or(|member| {
+                        member.incarnation.is_none() && member.state != MemberState::Created
+                    })
                 });
-            if let Some(member_id) = missing {
+            let unadmitted = (self.config.ranges.iter()).find(|range| {
+                self.member(range.coordinator)
+                    .is_none_or(|member| member.incarnation.is_none())
+            });
+            if let Some(member_id) = missing.or(unadmitted.map(|range| &range.coordinator)) {
                 return Err(DistributionError::MissingAdmission(*member_id));
             }
         }
         Ok(())
+    }
+
+    /// The first coordinator or replica that has not admitted itself, if any.
+    pub fn unadmitted(&self) -> Option<Ulid> {
+        (self.config.ranges.iter())
+            .flat_map(|range| std::iter::once(&range.coordinator).chain(&range.replicas))
+            .find(|member_id| {
+                self.member(**member_id)
+                    .is_none_or(|member| member.incarnation.is_none())
+            })
+            .copied()
     }
 
     /// An admitted member needs its own signed admission for its incarnation; a member that
