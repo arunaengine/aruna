@@ -207,7 +207,9 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
         FolderError::Offer(offer) => map_offer_error(offer),
         FolderError::ListVersions(_)
         | FolderError::DeleteObject(_)
-        | FolderError::DeleteBucket(_) => ServerError::InternalError(error.to_string()),
+        | FolderError::DeleteBucket(_)
+        | FolderError::ListUploads(_)
+        | FolderError::AbortUpload(_) => ServerError::InternalError(error.to_string()),
     }
 }
 

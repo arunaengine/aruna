@@ -11,6 +11,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::multipart::MultipartUploadStatus;
 use aruna_core::structs::{
     EntryState, FolderMode, FolderState, RemoteBinding, SyncActionRecord, SyncBase, SyncPageLimit,
     SyncRefusal, SyncedFolder,
@@ -26,6 +27,8 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
+use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
+use crate::s3::multipart::uploads::{ListUploadsError, ListUploadsInput, ListUploadsOperation};
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
 use crate::s3::object::versions::{
@@ -101,6 +104,10 @@ pub enum FolderError {
     DeleteObject(#[from] DeleteObjectError),
     #[error(transparent)]
     DeleteBucket(#[from] DeleteBucketError),
+    #[error(transparent)]
+    ListUploads(#[from] ListUploadsError),
+    #[error(transparent)]
+    AbortUpload(#[from] AbortUploadError),
 }
 
 /// How much of a folder still needs attention. Every counter is derived from
@@ -579,6 +586,7 @@ async fn delete_local_bucket(
     node_id: NodeId,
 ) -> Result<(), FolderError> {
     let bucket = &folder.local_bucket;
+    abort_uploads(context, bucket).await?;
     loop {
         let listing = ListVersionsOperation::new(ListVersionsInput {
             bucket: bucket.clone(),
@@ -626,6 +634,43 @@ async fn delete_local_bucket(
     match drive(DeleteBucketOperation::new(bucket.clone()), context).await {
         Ok(()) | Err(DeleteBucketError::NotFound) => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Aborts every multipart upload left in `bucket`, page by page. An upload still being completed
+/// fails this pass, so the next pass retries once it is done or its lease is stale.
+async fn abort_uploads(context: &DriverContext, bucket: &str) -> Result<(), FolderError> {
+    loop {
+        let listing = ListUploadsOperation::new(ListUploadsInput {
+            bucket: bucket.to_string(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            upload_id_marker: None,
+            max_uploads: ListUploadsOperation::DEFAULT_MAX_UPLOADS,
+        })
+        .including_in_progress()
+        .complete_scan();
+        let page = drive(listing, context).await?;
+        if page.uploads.is_empty() {
+            return Ok(());
+        }
+        for upload in page.uploads {
+            let resume = upload.status == MultipartUploadStatus::Aborting;
+            let mut abort = AbortUploadOperation::new(AbortUploadInput {
+                bucket: upload.bucket,
+                key: upload.key,
+                upload_id: upload.upload_id,
+                now_ms: crate::driver::now_ms(),
+            });
+            if resume {
+                abort = abort.resuming_abort();
+            }
+            match drive(abort, context).await {
+                Ok(()) | Err(AbortUploadError::NoSuchUpload) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 }
 
@@ -987,12 +1032,14 @@ mod tests {
         assert!(entries.is_empty());
     }
 
-    // A cleanup cut short after the offer was withdrawn still deletes the folder's bucket. One cut
-    // short after the bucket delete finds it gone and finishes.
+    // A cleanup cut short after the offer was withdrawn still deletes the folder's bucket, also with
+    // an upload opened since. One cut short after the bucket delete finds it gone and finishes.
     #[tokio::test]
     async fn deletes_local_bucket() {
         use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+        use crate::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
         use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+        use aruna_core::structs::storage::routing::RoutingSnapshot;
 
         let fixture = crate::tests::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
@@ -1018,6 +1065,15 @@ mod tests {
             user_id: folder.created_by,
         };
         assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+        let upload = CreateMultipartOperation::new(CreateMultipartInput {
+            bucket: folder.local_bucket.clone(),
+            key: "late.bin".to_string(),
+            group_id: folder.group_id,
+            created_by: folder.created_by,
+            checksum_hint: None,
+            routing: RoutingSnapshot::single(folder.group_id),
+        });
+        drive(upload, &context).await.expect("upload opened");
 
         for attempt in ["withdrawn offer", "deleted bucket"] {
             store_folder(&context, &folder).await.expect("row stored");
