@@ -9,12 +9,16 @@ use aruna_core::structs::SyncMode;
 use aruna_core::structs::execution::source_access::{DigestOrigin, DigestScope};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
+use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, VersionOrigin,
 };
+use aruna_operations::distribution::guard::route_read;
+use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
 use aruna_operations::s3::object::origin::{OriginError, OriginView, read_origin};
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -23,9 +27,12 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::deletion::bucket_info;
+use crate::routes::storage::distributed::map_guard_error;
+use crate::routes::storage::relay::{RestForward, relay_get};
 use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
@@ -214,7 +221,8 @@ it is bound to, and the statements a dataset may add about it.
   in place.
 
 **Limits**
-- One version per call; one point read."#,
+- One version per call; one point read. A member of a distributed bucket that holds no copy
+  of the key's range relays the call to a holder with the caller's token."#,
     params(
         ("bucket" = String, Path, description = "Bucket name on this node"),
         OriginParams
@@ -232,13 +240,16 @@ it is bound to, and the statements a dataset may add about it.
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
-        (status = 404, description = "Bucket or version not found on this node", body = ErrorResponse)
+        (status = 404, description = "Bucket or version not found", body = ErrorResponse),
+        (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_origin(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: HeaderMap,
     Path(bucket): Path<String>,
     Query(params): Query<OriginParams>,
 ) -> ServerResult<Json<OriginResponse>> {
@@ -252,6 +263,33 @@ pub async fn get_origin(
         &params.key,
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
+    // A member that holds no copy of the key's range asks a holder, which checks again.
+    if let Some(binding) = info.distribution.as_ref()
+        && !headers.contains_key(RELAY_HOP_HEADER)
+    {
+        let context = state.get_ctx();
+        let route = route_read(context.as_ref(), binding, &params.key, false).await;
+        if let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? {
+            let mut holders = key_holders(context.as_ref(), binding.set_id, &params.key).await;
+            holders.retain(|holder| *holder != state.get_node_id());
+            holders.push(node_id);
+            let path = origin_path(&bucket, &params);
+            for node_id in holders {
+                let forward = RestForward {
+                    set_id: binding.set_id,
+                    range_id,
+                    node_id,
+                };
+                if let Some(answer) = relay_get(&state, &forward, &path, bearer.as_ref()).await? {
+                    return Ok(Json(answer));
+                }
+            }
+            return Err(ServerError::ServiceUnavailableReason(format!(
+                "no holder of range {range_id} of distributed bucket {} answered",
+                binding.set_id
+            )));
+        }
+    }
     let view = read_origin(
         state.get_ctx().as_ref(),
         (state.get_realm_id(), state.get_node_id()),
@@ -265,6 +303,17 @@ pub async fn get_origin(
         OriginError::Storage(reason) => ServerError::InternalError(reason),
     })?;
     Ok(Json(view.into()))
+}
+
+/// The origin route of one file version, for a holder.
+fn origin_path(bucket: &str, params: &OriginParams) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("key", &params.key);
+    if let Some(version_id) = params.version_id {
+        query.append_pair("version_id", &version_id.to_string());
+    }
+    let bucket: String = url::form_urlencoded::byte_serialize(bucket.as_bytes()).collect();
+    format!("/data/buckets/{bucket}/objects/origin?{}", query.finish())
 }
 
 /// One way files get into the bucket.
@@ -378,4 +427,26 @@ pub async fn get_sources(
             .collect(),
         complete,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A relayed origin read names the same key and version on the holder.
+    #[test]
+    fn relay_path_kept() {
+        let params = OriginParams {
+            key: "raw/a b.txt".to_string(),
+            version_id: Some(Ulid::from_bytes([1; 16])),
+        };
+        let path = origin_path("lab", &params);
+        assert_eq!(
+            path,
+            format!(
+                "/data/buckets/lab/objects/origin?key=raw%2Fa+b.txt&version_id={}",
+                Ulid::from_bytes([1; 16])
+            )
+        );
+    }
 }
