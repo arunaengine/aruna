@@ -613,10 +613,9 @@ pub enum StorageEffect {
         limit: usize,
         txn_id: Option<TxnId>,
     },
-    /// Reads the rows from `start` to `end` in key order, at most `limit` rows and, after the
-    /// first row, at most `max_bytes` of keys and values. In a write transaction only this
-    /// interval joins the read set. Answers `IterResult`; `next_start_after` names the last
-    /// returned key while the interval holds more rows.
+    /// Reads rows from `start` to `end` in key order: at most `limit` rows and, after the first,
+    /// at most `max_bytes` of keys and values. Only this interval joins a transaction's read set.
+    /// Answers `IterResult`; `next_start_after` names the last returned key while rows remain.
     IterRange {
         key_space: KeySpace,
         start: IterStart,

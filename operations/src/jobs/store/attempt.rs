@@ -28,10 +28,9 @@ pub async fn read_attempt_control(
         .transpose()
 }
 
-/// Write-ahead one VersionId per output destination in the attempt-control
-/// transaction that already fences this physical execution. It commits before
-/// any output write, so a replayed capture reuses the reserved identities.
-/// `hints` holds the set hints of distributed destination buckets by node and bucket.
+/// Write-ahead one VersionId per output destination in the attempt-control transaction that
+/// fences this physical execution; it commits before any output write, so a replayed capture
+/// reuses the reserved identities. `hints` maps distributed destinations to their set hints.
 pub async fn reserve_output_commits(
     storage: &StorageHandle,
     job_id: JobId,

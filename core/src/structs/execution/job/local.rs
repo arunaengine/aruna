@@ -54,10 +54,9 @@ impl AttemptControl {
         Ok(postcard::from_bytes(bytes)?)
     }
 
-    /// Reserve one VersionId per destination this execution has not committed
-    /// yet, keeping every existing reservation so a replayed capture reuses it
-    /// instead of creating a second version. `mint` sees the destination, so a distributed
-    /// bucket's id carries its set hint. Reports whether anything was added.
+    /// Reserve one VersionId per destination not committed yet, keeping every reservation so a
+    /// replayed capture reuses it instead of creating a second version. `mint` sees the
+    /// destination, so a distributed bucket's id carries its set hint. Reports any addition.
     pub fn reserve_outputs<F>(
         &mut self,
         destinations: &[(crate::NodeId, String, String)],
