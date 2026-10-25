@@ -4,9 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::admin_documents::{AdminDocumentDot, AdminDocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+use aruna_core::keyspaces::{
+    DATABASE_UNLINKED_KEYSPACE, DISTRIBUTION_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+};
+use aruna_core::reducer::AdminDocumentState;
+use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::database::{DatabaseEntry, DatabaseTarget, database_admin_path};
 use aruna_core::structs::identity::realm::RealmId;
@@ -95,6 +100,55 @@ pub(crate) async fn read(
         }
         other => Err(DatabaseServiceError::Internal(format!("{other:?}"))),
     }
+}
+
+/// The realm config's reducer state, which names the register version of every entry.
+pub(crate) async fn config_state(
+    context: &DriverContext,
+    realm_id: RealmId,
+) -> Result<Option<AdminDocumentState>, DatabaseServiceError> {
+    let key = reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id });
+    let Some(value) = read(context, DOCUMENT_STATE_KEYSPACE, key.to_vec()).await? else {
+        return Ok(None);
+    };
+    aruna_core::reducer::decode_reducer_state(&value)
+        .map(Some)
+        .map_err(|error| DatabaseServiceError::Internal(error.to_string()))
+}
+
+/// How the dataset stands for `entry` at register `version`: once seen unlinked, the entry stays
+/// unlinked until a fresh mark writes a new version, even if the dataset links the bucket again.
+async fn version_links(
+    context: &DriverContext,
+    (realm_id, node_id): (RealmId, NodeId),
+    caller: &Caller,
+    entry: &DatabaseEntry,
+    version: Option<AdminDocumentDot>,
+) -> Result<Option<LinkedDataset>, DatabaseServiceError> {
+    let key = entry.entry_id.to_bytes().to_vec();
+    let seen = postcard::to_allocvec(&version)
+        .map_err(|error| DatabaseServiceError::Internal(error.to_string()))?;
+    let stored = read(context, DATABASE_UNLINKED_KEYSPACE, key.clone()).await?;
+    if stored.as_ref() == Some(&seen) {
+        return Ok(Some(LinkedDataset::Unlinked));
+    }
+    let links = dataset_links(context, realm_id, node_id, caller, entry).await?;
+    if links == Some(LinkedDataset::Unlinked) {
+        let write = StorageEffect::Write {
+            key_space: DATABASE_UNLINKED_KEYSPACE.to_string(),
+            key: key.into(),
+            value: seen.into(),
+            txn_id: None,
+        };
+        match context.storage_handle.send_storage_effect(write).await {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(DatabaseServiceError::Unavailable(error.to_string()));
+            }
+            other => return Err(DatabaseServiceError::Internal(format!("{other:?}"))),
+        }
+    }
+    Ok(links)
 }
 
 /// Whether the dataset's live root names the target bucket as a linked part, as the caller
@@ -250,6 +304,7 @@ pub async fn list_databases(
         .map_err(|error| DatabaseServiceError::Unavailable(error.to_string()))?;
     let mut entries = config.databases;
     entries.sort_by_key(|entry| entry.entry_id);
+    let versions = config_state(context, realm_id).await?;
     let limit = limit.clamp(1, 100);
     let mut listed = Vec::new();
     let mut last = None;
@@ -267,20 +322,21 @@ pub async fn list_databases(
             None if curator_view => entry_bucket(&entry),
             None => continue,
         };
-        let (state, details) =
-            match dataset_links(context, realm_id, node_id, caller, &entry).await? {
-                Some(LinkedDataset::Linked {
-                    title,
-                    graph_iri,
-                    document_path,
-                }) => (
-                    DatabaseState::Active,
-                    Some((title, graph_iri, document_path)),
-                ),
-                None => (DatabaseState::Unavailable, None),
-                Some(LinkedDataset::Hidden) => (DatabaseState::DatasetHidden, None),
-                Some(LinkedDataset::Unlinked) => (DatabaseState::Unlinked, None),
-            };
+        let version = (versions.as_ref()).and_then(|state| state.database_version(entry.entry_id));
+        let place = (realm_id, node_id);
+        let (state, details) = match version_links(context, place, caller, &entry, version).await? {
+            Some(LinkedDataset::Linked {
+                title,
+                graph_iri,
+                document_path,
+            }) => (
+                DatabaseState::Active,
+                Some((title, graph_iri, document_path)),
+            ),
+            None => (DatabaseState::Unavailable, None),
+            Some(LinkedDataset::Hidden) => (DatabaseState::DatasetHidden, None),
+            Some(LinkedDataset::Unlinked) => (DatabaseState::Unlinked, None),
+        };
         if !curator_view
             && matches!(
                 state,
@@ -319,3 +375,7 @@ fn entry_bucket(entry: &DatabaseEntry) -> String {
         DatabaseTarget::Distributed { .. } => String::new(),
     }
 }
+
+#[cfg(test)]
+#[path = "database_list_tests.rs"]
+mod tests;

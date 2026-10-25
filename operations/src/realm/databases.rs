@@ -7,13 +7,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
-use aruna_core::admin_documents::{AdminDocumentDot, AdminDocumentTarget};
+use aruna_core::admin_documents::AdminDocumentDot;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    DATABASE_REQUEST_KEYSPACE, DISTRIBUTION_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
-};
-use aruna_core::storage_entries::reducer_state_key;
+use aruna_core::keyspaces::{DATABASE_REQUEST_KEYSPACE, DISTRIBUTION_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::database::{
     ConsentClaim, DatabaseConsent, DatabaseEntry, DatabaseRequest, DatabaseTarget,
@@ -137,16 +134,7 @@ pub async fn mark_database(
     entry
         .validate()
         .map_err(|error| DatabaseServiceError::BadRequest(error.to_string()))?;
-    match super::database_list::dataset_links(context, realm_id, node_id, caller, &entry).await? {
-        Some(super::database_list::LinkedDataset::Linked { .. }) => {}
-        Some(_) => return Err(DatabaseServiceError::NotLinked(entry.dataset_id)),
-        None => {
-            return Err(DatabaseServiceError::Unavailable(
-                "not every metadata node answered; the dataset link cannot be confirmed"
-                    .to_string(),
-            ));
-        }
-    }
+    require_link(context, realm_id, node_id, caller, &entry).await?;
     let owner_path = owner_admin_path(realm_id, owner_group);
     if allowed(context, realm_id, auth, &owner_path, Permission::WRITE).await? {
         let actor = Actor {
@@ -179,8 +167,26 @@ pub async fn mark_database(
     Ok(MarkOutcome::Pending(request))
 }
 
+/// Refuses an entry whose dataset does not link the bucket root now.
+async fn require_link(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    caller: &Caller,
+    entry: &DatabaseEntry,
+) -> Result<(), DatabaseServiceError> {
+    match super::database_list::dataset_links(context, realm_id, node_id, caller, entry).await? {
+        Some(super::database_list::LinkedDataset::Linked { .. }) => Ok(()),
+        Some(_) => Err(DatabaseServiceError::NotLinked(entry.dataset_id)),
+        None => Err(DatabaseServiceError::Unavailable(
+            "not every metadata node answered; the dataset link cannot be confirmed".to_string(),
+        )),
+    }
+}
+
 /// An admin of the owning group approves a pending request: this node signs the consent for
-/// the approver's own authenticated request and publishes the curator's mark with it.
+/// the approver's own authenticated request and publishes the curator's mark with it. The
+/// bucket's owner and the dataset link are checked again, since both may have changed.
 pub async fn approve_request(
     context: &DriverContext,
     realm_id: RealmId,
@@ -194,6 +200,13 @@ pub async fn approve_request(
     if !allowed(context, realm_id, auth, &owner_path, Permission::WRITE).await? {
         return Err(DatabaseServiceError::Forbidden);
     }
+    let owner = bucket_owner(context, node_id, caller, &request.entry.target).await?;
+    if owner != request.entry.owner_group {
+        return Err(DatabaseServiceError::BadRequest(format!(
+            "the bucket now belongs to group {owner}; mark it again"
+        )));
+    }
+    require_link(context, realm_id, node_id, caller, &request.entry).await?;
     let net = context
         .net_handle
         .as_ref()
@@ -355,13 +368,8 @@ async fn register_version(
     realm_id: RealmId,
     entry_id: Ulid,
 ) -> Result<Option<AdminDocumentDot>, DatabaseServiceError> {
-    let key = reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id });
-    let Some(value) = read(context, DOCUMENT_STATE_KEYSPACE, key.to_vec()).await? else {
-        return Ok(None);
-    };
-    let state = aruna_core::reducer::decode_reducer_state(&value)
-        .map_err(|error| DatabaseServiceError::Internal(error.to_string()))?;
-    Ok(state.database_version(entry_id))
+    let state = super::database_list::config_state(context, realm_id).await?;
+    Ok(state.and_then(|state| state.database_version(entry_id)))
 }
 
 async fn read_request(

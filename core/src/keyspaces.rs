@@ -489,6 +489,8 @@ pub const DOCUMENT_IRI_KEYSPACE: &str = "metadata_document_iris";
 pub const SEARCH_FEED_KEYSPACE: &str = "distribution_search_feed";
 /// The search index state of each range on this member, by set id and range id.
 pub const SEARCH_INDEX_KEYSPACE: &str = "distribution_search_indexes";
+/// The register version of each database entry this node saw unlinked, by entry id.
+pub const DATABASE_UNLINKED_KEYSPACE: &str = "database_unlinked";
 
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
@@ -750,6 +752,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DOCUMENT_IRI_KEYSPACE,
     SEARCH_FEED_KEYSPACE,
     SEARCH_INDEX_KEYSPACE,
+    DATABASE_UNLINKED_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,
