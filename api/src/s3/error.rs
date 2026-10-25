@@ -421,6 +421,9 @@ impl IntoS3Error for PutObjectError {
             PutObjectError::PolicyGate(ref error) => policy_gate_error(error, "PutObject"),
             PutObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
             PutObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            PutObjectError::PurgeFence(PurgeFenceError::Distribution(ref error)) => {
+                guard_error(error)
+            }
             PutObjectError::UsageUpdateError(ref error) => usage_update_error(error),
             PutObjectError::Distribution(ref error) => guard_error(error),
             PutObjectError::BlobWriteFailed(BlobError::PathTaken) => path_taken_error(),
@@ -542,6 +545,9 @@ impl IntoS3Error for CompleteUploadError {
             }
             CompleteUploadError::ManagedCopyError(ref error) => managed_copy_error(error),
             CompleteUploadError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            CompleteUploadError::PurgeFence(PurgeFenceError::Distribution(ref error)) => {
+                guard_error(error)
+            }
             CompleteUploadError::Distribution(ref error) => guard_error(error),
             CompleteUploadError::UsageUpdateError(ref error) => usage_update_error(error),
             CompleteUploadError::BlobError(BlobError::KeyTooLong) => long_key_error(),

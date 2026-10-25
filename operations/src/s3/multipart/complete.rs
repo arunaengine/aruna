@@ -8,7 +8,7 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
-use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, InventoryUpdate, stamp_head, stamp_version, version_written,
 };
@@ -25,7 +25,9 @@ use crate::replication::queue::build_live_obligation;
 use crate::s3::multipart::create::storage_current;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::purge_fence::{
+    PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,
+};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
 use aruna_blob::hash::{Hasher, combine_crcs};
 use aruna_core::UserId;
@@ -338,6 +340,8 @@ pub struct CompleteUploadOperation {
     /// The head the finalize installs and the epoch of its version, for the inventory.
     head_pointer: Option<CurrentVersionPointer>,
     version_epoch: OriginalEpoch,
+    /// The coordinator authority the completion was routed under; finalize rechecks it.
+    authority: Option<WriteAuthority>,
     /// The close-only inventory update of a completion that adopts a registered version.
     close: Option<InventoryUpdate>,
     /// The reset that returns the record to `Open` has already been taken, so
@@ -420,6 +424,7 @@ impl CompleteUploadOperation {
             binding: None,
             head_pointer: None,
             version_epoch: OriginalEpoch::default(),
+            authority: None,
             close: None,
             reset_done: false,
             compose_share: None,
@@ -1117,9 +1122,10 @@ impl CompleteUploadOperation {
         let Some(binding) = self.binding.as_ref() else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
-        match record_epoch(binding, &self.input.key, event) {
-            Ok(epoch) => {
-                self.version_epoch = epoch;
+        match record_authority(binding, &self.input.key, event) {
+            Ok(authority) => {
+                self.version_epoch = authority.epoch;
+                self.authority = Some(authority);
                 self.compose_upload()
             }
             Err(error) => self.schedule_error(error.into()),
@@ -1286,11 +1292,13 @@ impl CompleteUploadOperation {
         self.txn_id = Some(txn_id);
         (self.dedup, self.dedup_checked) = (None, false);
         self.state = CompleteUploadState::CheckPurgeFinalize;
-        smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
+        let authority = self.authority.as_ref();
+        smallvec![publication_read(&self.input.bucket, authority, self.txn_id)]
     }
 
     fn finalize_fence_checked(&mut self, event: Event) -> Effects {
-        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
+        let (bucket, key) = (&self.input.bucket, &self.input.key);
+        if let Err(error) = check_publication(event, bucket, key, self.authority.as_ref()) {
             return self.schedule_error(error.into());
         }
         // The version snapshots the default this transaction observes, not one

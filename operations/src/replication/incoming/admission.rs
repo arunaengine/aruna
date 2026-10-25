@@ -4,18 +4,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
-use aruna_core::structs::storage::distribution::DistributionView;
+use aruna_core::structs::storage::distribution::fence::LocalFence;
+use aruna_core::structs::storage::distribution::{AdmissionError, DistributionView};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
+
+use crate::distribution::guard::{authority_read, authority_rows};
 
 use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState};
 
 impl IncomingVersionOperation {
-    /// Reads this node's record of the destination's set; `recheck` reads it in the apply
-    /// transaction.
+    /// Reads this node's record and fence row of the destination's set; `recheck` reads them
+    /// in the apply transaction, so a member fence set meanwhile conflicts the apply.
     pub(super) fn read_publication_record(&mut self, recheck: bool) -> Effects {
         let Some(binding) = self.destination_binding.as_ref() else {
             return match recheck {
@@ -23,7 +24,7 @@ impl IncomingVersionOperation {
                 false => self.reject_negotiation(IncomingVersionError::ForeignPublication),
             };
         };
-        let key = binding.set_id.to_bytes().to_vec().into();
+        let set_id = binding.set_id;
         let txn_id = match recheck {
             true => self.txn_id,
             false => None,
@@ -32,22 +33,20 @@ impl IncomingVersionOperation {
             true => IncomingVersionState::RecheckPublication,
             false => IncomingVersionState::ReadPublicationRecord,
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: DISTRIBUTION_KEYSPACE.to_string(),
-            key,
-            txn_id,
-        })]
+        smallvec![authority_read(set_id, txn_id)]
     }
 
     /// Whether the record admits this publication from the authenticated peer.
     fn admission(&self, event: Event) -> Result<(), IncomingVersionError> {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        if !matches!(event, Event::Storage(StorageEvent::BatchReadResult { .. })) {
             return Err(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
+                expected: "Event::Storage(StorageEvent::BatchReadResult)",
                 received: event,
             });
-        };
+        }
+        let (value, fence) =
+            authority_rows(event).map_err(|_| IncomingVersionError::RecordMissing)?;
         let (Some(binding), Some(publication)) = (
             self.destination_binding.as_ref(),
             self.manifest.distribution.as_ref(),
@@ -61,6 +60,11 @@ impl IncomingVersionOperation {
         let key = &self.manifest.key;
         view.snapshot()
             .admit(binding, self.publisher_node_id, key, publication)?;
+        // A leaving or deleted member fences its own bucket before the record says so.
+        let fence = LocalFence::decode(fence.as_deref())?;
+        if !fence.receiving() {
+            return Err(AdmissionError::Fenced.into());
+        }
         Ok(())
     }
 

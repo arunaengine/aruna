@@ -9,7 +9,7 @@ use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_eff
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
 };
-use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
@@ -21,7 +21,7 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::purge_fence::{PurgeFenceError, check_publication, publication_read};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -163,6 +163,8 @@ pub struct SealedCopyOperation {
     binding: Option<DistributionBinding>,
     /// The coordinator epoch the copy's version carries in a distributed bucket.
     epoch: aruna_core::structs::storage::distribution::OriginalEpoch,
+    /// The coordinator authority the copy was routed under; its transaction rechecks it.
+    authority: Option<WriteAuthority>,
     head: Option<CurrentVersionPointer>,
     was_live: bool,
     /// Offered directory bytes the replaced head stops charging.
@@ -194,6 +196,7 @@ impl SealedCopyOperation {
             existing: None,
             binding: None,
             epoch: Default::default(),
+            authority: None,
             head: None,
             was_live: false,
             released_bytes: 0,
@@ -289,7 +292,9 @@ impl SealedCopyOperation {
 
     fn record_checked(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
         let binding = self.binding.as_ref().ok_or(SealedCopyError::InvalidState)?;
-        self.epoch = record_epoch(binding, &self.input.dest_key, event)?;
+        let authority = record_authority(binding, &self.input.dest_key, event)?;
+        self.epoch = authority.epoch;
+        self.authority = Some(authority);
         self.read_abe_rows()
     }
 
@@ -786,7 +791,12 @@ impl SealedCopyOperation {
             (Step::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
                 self.txn_id = Some(txn_id);
                 self.step = Step::Fence;
-                Ok(smallvec![write_fence_read(&self.input.bucket, self.txn_id)])
+                let authority = self.authority.as_ref();
+                Ok(smallvec![publication_read(
+                    &self.input.bucket,
+                    authority,
+                    self.txn_id
+                )])
             }
             (Step::ReadBucket, event) => self.bucket_read(event),
             (Step::Gate, event) => self.gate_step(event),
@@ -795,7 +805,8 @@ impl SealedCopyOperation {
             (Step::ReadEnvelope, event) => self.envelope_read(event),
             (Step::CreateEnvelope, event) => self.envelope_created(event),
             (Step::Fence, event) => {
-                check_write_fence(event, &self.input.bucket, &self.input.dest_key)?;
+                let (bucket, key) = (&self.input.bucket, &self.input.dest_key);
+                check_publication(event, bucket, key, self.authority.as_ref())?;
                 self.step = Step::Drift;
                 Ok(smallvec![drift_reads(&self.input.bucket, self.txn_id)])
             }

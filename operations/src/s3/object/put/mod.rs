@@ -11,7 +11,7 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
-use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
 use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, version_written};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
@@ -24,7 +24,9 @@ use crate::placement::policy::{
 };
 use crate::replication::dht_registration::dht_registration_effect;
 use crate::replication::queue::build_live_obligation;
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::purge_fence::{
+    PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,
+};
 use crate::s3::row_fence::{FenceError, RowFence};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
 use aruna_core::UserId;
@@ -349,6 +351,8 @@ pub struct PutObjectOperation {
     pub(super) set_hint: Option<SetHint>,
     /// The bucket's distribution binding, whose inventory the version transaction maintains.
     binding: Option<DistributionBinding>,
+    /// The coordinator authority the write was routed under; the version transaction rechecks it.
+    authority: Option<WriteAuthority>,
     /// The head this write installs and the epoch of its version, for the inventory.
     head_pointer: Option<CurrentVersionPointer>,
     version_epoch: OriginalEpoch,
@@ -413,6 +417,7 @@ impl PutObjectOperation {
             row_fence: None,
             set_hint: None,
             binding: None,
+            authority: None,
             head_pointer: None,
             version_epoch: OriginalEpoch::default(),
         }
@@ -736,9 +741,10 @@ impl PutObjectOperation {
         let Some(binding) = self.binding.as_ref() else {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
-        match record_epoch(binding, &self.config.request.key, event) {
-            Ok(epoch) => {
-                self.version_epoch = epoch;
+        match record_authority(binding, &self.config.request.key, event) {
+            Ok(authority) => {
+                self.version_epoch = authority.epoch;
+                self.authority = Some(authority);
                 self.read_write_fence()
             }
             Err(error) => self.emit_error(error.into()),
@@ -974,16 +980,25 @@ impl PutObjectOperation {
         if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
             self.txn_id = Some(txn_id);
             self.state = PutObjectState::CheckPurgeFence;
-            smallvec![write_fence_read(&self.config.request.bucket, self.txn_id)]
+            let authority = self.authority.as_ref();
+            smallvec![publication_read(
+                &self.config.request.bucket,
+                authority,
+                self.txn_id
+            )]
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
     }
 
     fn fence_checked(&mut self, event: Event) -> Effects {
-        if let Err(error) =
-            check_write_fence(event, &self.config.request.bucket, &self.config.request.key)
-        {
+        let request = &self.config.request;
+        if let Err(error) = check_publication(
+            event,
+            &request.bucket,
+            &request.key,
+            self.authority.as_ref(),
+        ) {
             return self.cleanup_failed_write(error.into());
         }
         // Read unconditionally: the version snapshots the default this

@@ -765,7 +765,8 @@ fn fence_error(error: PurgeFenceError) -> JobError {
         PurgeFenceError::Suspended
         | PurgeFenceError::Busy
         | PurgeFenceError::Storage(_)
-        | PurgeFenceError::Unexpected(_) => JobError::retryable(error.to_string()),
+        | PurgeFenceError::Unexpected(_)
+        | PurgeFenceError::Distribution(_) => JobError::retryable(error.to_string()),
     }
 }
 

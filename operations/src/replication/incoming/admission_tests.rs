@@ -7,9 +7,10 @@ use super::pure_tests::{
     bucket_read, load_routing, make_bucket_info, make_manifest, test_realm_id,
 };
 use super::*;
-use crate::distribution::test_record::{binding, member, replicated, secret};
+use crate::distribution::test_record::{authority_rows, binding, member, replicated, secret};
 use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
 use aruna_core::structs::storage::distribution::Publication;
+use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::structs::storage::routing::GroupRoutingInputs;
 
@@ -47,23 +48,43 @@ fn rejected(operation: &IncomingVersionOperation) -> bool {
 
 /// Runs the negotiation up to the record read and answers it with `record`.
 fn admit(
+    operation: IncomingVersionOperation,
+    bucket: &BucketInfo,
+    record: Vec<u8>,
+) -> IncomingVersionOperation {
+    admit_fenced(operation, bucket, record, None)
+}
+
+/// Like [`admit`], with this member's fence row.
+fn admit_fenced(
     mut operation: IncomingVersionOperation,
     bucket: &BucketInfo,
     record: Vec<u8>,
+    fence: Option<Vec<u8>>,
 ) -> IncomingVersionOperation {
     operation.start();
     operation.step(bucket_read(Some(bucket.to_bytes().unwrap().into())));
     let effects = load_routing(&mut operation, GroupRoutingInputs::default());
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, txn_id: None, .. })]
-            if key_space == DISTRIBUTION_KEYSPACE
+        [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: None })]
+            if reads[0].0 == DISTRIBUTION_KEYSPACE
     ));
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::new().into(),
-        value: Some(record.into()),
-    }));
+    operation.step(authority_rows(Some(record), fence));
     operation
+}
+
+#[test]
+fn refuses_closed_member() {
+    // A member that fenced its bucket for leaving refuses even its coordinator's publication.
+    let (manifest, record, bucket) = published();
+    let closed = LocalFence {
+        closed: true,
+        ..LocalFence::default()
+    };
+    let fence = Some(closed.to_bytes().unwrap());
+    let operation = admit_fenced(receiver(manifest, 1), &bucket, record, fence);
+    assert!(rejected(&operation));
 }
 
 #[test]
