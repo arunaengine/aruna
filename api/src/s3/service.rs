@@ -13,6 +13,7 @@ mod forward_copy;
 mod forward_list;
 mod forward_parts;
 mod forward_reads;
+mod forward_uploads;
 mod forward_versions;
 mod listing;
 mod payload;
@@ -2315,7 +2316,7 @@ impl S3 for ArunaS3Service {
             "Received LIST MULTIPART UPLOADS Request"
         );
 
-        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
@@ -2324,6 +2325,9 @@ impl S3 for ArunaS3Service {
         let delimiter = req.input.delimiter.clone();
         let key_marker = req.input.key_marker.clone();
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let bounds = self
+            .delegated_listing(&req.extensions, bucket_info.as_ref(), req.uri.query())
+            .await?;
         // A distributed bucket shows tagged upload ids; the marker names the stored one.
         let requested_upload_marker = req.input.upload_id_marker.as_deref().map(|marker| {
             UploadTag::parse(marker)
@@ -2338,6 +2342,20 @@ impl S3 for ArunaS3Service {
                 .map_err(|_| s3_error!(InvalidArgument, "max-uploads must be non-negative"))?
                 .min(ListUploadsOperation::DEFAULT_MAX_UPLOADS),
         };
+        // A distributed bucket's uploads live on the coordinator of each key's range.
+        if let Some(binding) = (bucket_info.as_ref()).and_then(|info| info.distribution.clone()) {
+            let shape = (upload_id_marker, max_uploads);
+            return match bounds {
+                Some(bounds) => self.range_uploads(&binding, req.input, bounds, shape).await,
+                None => {
+                    let group_id =
+                        (bucket_info.as_ref()).map_or(user_access.group_id, |info| info.group_id);
+                    let shape = (group_id, upload_id_marker, max_uploads);
+                    self.merged_uploads(&user_access, &binding, req.input, shape)
+                        .await
+                }
+            };
+        }
 
         let result = drive(
             ListUploadsOperation::new(LMUI {
