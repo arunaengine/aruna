@@ -284,7 +284,9 @@ async fn member_of(
             })
         })
     };
-    let copies: Vec<&Ulid> = ready(&[DataStrategy::Copy]).collect();
+    let copies: Vec<&Ulid> = (ready(&[DataStrategy::Copy]))
+        .filter(|replica| **replica != member.member_id)
+        .collect();
     let replicas = copies.len();
     // Members that keep copies on use may serve one; they are tried after the coordinator.
     let keepers = ready(&[DataStrategy::CopyOnUse, DataStrategy::CacheOnUse]);
@@ -295,7 +297,6 @@ async fn member_of(
         .filter_map(|holder| snapshot.member(*holder).map(|holder| holder.node_id))
         .collect();
     // Replicas share the load by free download slots; the coordinator stays the fallback.
-    let replicas = replicas.min(holders.len());
     if replicas > 1 {
         let chosen = choose_holder(context, &holders[..replicas], now_ms()).await;
         let at = chosen.and_then(|chosen| holders.iter().position(|id| *id == chosen.node_id));
