@@ -61,7 +61,9 @@ const PASSED_HEADERS: &[&str] = &[
     "content-language",
     "expires",
     "if-match",
+    "if-modified-since",
     "if-none-match",
+    "if-unmodified-since",
     "range",
     "x-amz-checksum-algorithm",
     "x-amz-checksum-type",
@@ -75,6 +77,8 @@ const PASSED_HEADERS: &[&str] = &[
     "x-amz-copy-source-if-unmodified-since",
     "x-amz-metadata-directive",
     "x-amz-tagging-directive",
+    "x-amz-acl",
+    "x-amz-checksum-mode",
 ];
 
 /// Characters a key keeps unescaped in a forwarded path; `/` separates its segments.
@@ -165,10 +169,12 @@ pub(super) fn delegated_trailer(
     }
 }
 
-/// Whether a header carries request semantics the delegation must bind.
+/// Whether a header carries request semantics the delegation must bind; `accept` selects a
+/// folder index, which a forwarded read never asks for.
 fn semantic(name: &str) -> bool {
     DIGEST_HEADERS.contains(&name)
         || PASSED_HEADERS.contains(&name)
+        || name == "accept"
         || name.starts_with("x-amz-meta-")
         || name.starts_with("x-amz-checksum-")
 }
@@ -318,6 +324,18 @@ fn coordinator_error(forward: &Forward, status: http::StatusCode, body: &str) ->
     error
 }
 
+/// The body of a node's answer; a broken or oversized body is an error, never an empty answer.
+pub(super) async fn answer_text(response: reqwest::Response) -> S3Result<String> {
+    match crate::routes::storage::relay::capped_body(response).await {
+        Ok(body) => String::from_utf8(body)
+            .map_err(|_| s3_error!(ServiceUnavailable, "A member answered with invalid text")),
+        Err(error) => Err(s3_error!(
+            ServiceUnavailable,
+            "A member's answer broke off: {error}"
+        )),
+    }
+}
+
 pub(super) fn header(response: &reqwest::Response, name: &str) -> Option<String> {
     response
         .headers()
@@ -449,6 +467,8 @@ impl ArunaS3Service {
                 headers.insert(name, value);
             }
         }
+        // Set here so the delegation binds it; a forwarded read never asks for a folder index.
+        (headers.entry(http::header::ACCEPT)).or_insert(http::HeaderValue::from_static("*/*"));
         let query = request.query.as_deref();
         let digest = forwarded_digest(
             &request.method,

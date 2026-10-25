@@ -124,3 +124,23 @@ fn semantic_headers_bound() {
         issued
     );
 }
+
+#[test]
+fn consumed_headers_bound() {
+    let sent = headers(&[("accept", "*/*"), ("x-amz-acl", "private")]);
+    let issuer = forwarded_digest(&Method::GET, "spire", "a/", None, &sent);
+    // A changed `accept` could turn a read into a folder index, a changed ACL another policy.
+    for changed in [
+        headers(&[("accept", "text/html"), ("x-amz-acl", "private")]),
+        headers(&[("accept", "*/*"), ("x-amz-acl", "public-read")]),
+    ] {
+        assert_ne!(
+            issuer,
+            forwarded_digest(&Method::GET, "spire", "a/", None, &changed)
+        );
+    }
+    let original = headers(&[("x-amz-acl", "private"), ("x-amz-checksum-mode", "ENABLED")]);
+    let passed = passed_headers(&original, None);
+    assert!(passed.contains(&("x-amz-acl".to_string(), "private".to_string())));
+    assert!(passed.contains(&("x-amz-checksum-mode".to_string(), "ENABLED".to_string())));
+}

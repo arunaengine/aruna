@@ -21,7 +21,7 @@ use s3s::{S3Response, S3Result, s3_error};
 use ulid::Ulid;
 
 use super::ArunaS3Service;
-use super::forward::{Forward, ForwardBody, ForwardRequest, xml_field};
+use super::forward::{Forward, ForwardBody, ForwardRequest, answer_text, xml_field};
 use super::forward_list::{
     MAX_PAGE_BYTES, MAX_RANGES_PER_PAGE, elements, incomplete, range_query, timestamp, unreachable,
 };
@@ -169,7 +169,7 @@ impl ArunaS3Service {
             body: ForwardBody::Empty,
         };
         let body = match self.forward_write(user, &forward, request).await {
-            Ok(response) => response.text().await.unwrap_or_default(),
+            Ok(response) => answer_text(response).await?,
             Err(error) if unreachable(&error) => return Err(incomplete(binding.set_id, range)),
             Err(error) => return Err(error),
         };
@@ -245,10 +245,8 @@ impl ArunaS3Service {
                 next = Some(last.clone().map_or_else(start, |key| (key, None)));
                 break;
             }
-            let start = match first {
-                true => (marker.clone(), upload_id_marker),
-                false => (None, None),
-            };
+            // The key marker skips a common prefix in every range; the id only in the first.
+            let start = (marker.clone(), upload_id_marker.filter(|_| first));
             first = false;
             let part = match local(range) {
                 true => {

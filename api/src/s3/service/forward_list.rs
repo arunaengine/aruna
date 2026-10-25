@@ -19,7 +19,7 @@ use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::forward::{Forward, ForwardBody, ForwardRequest, xml_field};
+use super::forward::{Forward, ForwardBody, ForwardRequest, answer_text, xml_field};
 use super::listing::{ObjectListingPage, scoped_marker};
 use super::{ArunaS3Service, URL_ENCODE_SET};
 use crate::s3::auth::DelegatedRequest;
@@ -139,8 +139,12 @@ pub(super) fn incomplete(set_id: Ulid, range: &KeyRange) -> S3Error {
     error
 }
 
+/// Whether another holder may answer instead: the node was unreachable or could not serve
+/// the range from its own view, for example while it no longer holds it or catches up.
 pub(super) fn unreachable(error: &S3Error) -> bool {
-    error.code().as_str() == "CoordinatorUnreachable"
+    error
+        .status_code()
+        .is_none_or(|status| status.is_server_error())
 }
 
 /// The XML elements `tag` of a listing body.
@@ -158,6 +162,29 @@ pub(super) fn timestamp(text: Option<String>) -> Option<Timestamp> {
 
 pub(super) fn e_tag(text: Option<String>) -> Option<ETag> {
     text.and_then(|text| ETag::parse_http_header(text.as_bytes()).ok())
+}
+
+/// Where a holder resumes the first listed range: at the full position of the request, so a
+/// common prefix is skipped as a whole and not listed again after its name.
+fn remote_start(input: &ListBucketInput, first: bool) -> S3Result<Option<(&'static str, String)>> {
+    Ok(match (first, &input.continuation_token) {
+        (true, Some(token)) => ArunaS3Service::encode_list_token(Some(token))?
+            .map(|token| ("continuation-token", token)),
+        (true, None) => (input.start_after.clone())
+            .filter(|start| !start.is_empty())
+            .map(|start| ("start-after", start)),
+        (false, _) => None,
+    })
+}
+
+/// Narrows a holder's page to what this node's own scope of the caller allows, as a local
+/// page is narrowed.
+fn scope_part(part: &mut ObjectListingPage, scope: &SubpathScope, url_encoded: bool) {
+    let raw = |value: Option<&String>| {
+        ArunaS3Service::raw(value.map(String::as_str).unwrap_or_default(), url_encoded)
+    };
+    (part.contents).retain(|object| scope.allows_key(&raw(object.key.as_ref())));
+    (part.common_prefixes).retain(|group| scope.allows_prefix(&raw(group.prefix.as_ref())));
 }
 
 impl ArunaS3Service {
@@ -241,8 +268,12 @@ impl ArunaS3Service {
                 headers: Vec::new(),
                 body: ForwardBody::Empty,
             };
-            match self.forward_write(user, &forward, request).await {
-                Ok(response) => return Ok(response.text().await.unwrap_or_default()),
+            let answer = match self.forward_write(user, &forward, request).await {
+                Ok(response) => answer_text(response).await,
+                Err(error) => Err(error),
+            };
+            match answer {
+                Ok(body) => return Ok(body),
                 Err(error) if unreachable(&error) => continue,
                 Err(error) => return Err(error),
             }
@@ -256,7 +287,7 @@ impl ArunaS3Service {
         user: &UserAccess,
         context: (&DistributionBinding, &DistributionSnapshot),
         range: &KeyRange,
-        (input, start, remaining): (&ListBucketInput, Option<String>, usize),
+        (input, start, remaining): (&ListBucketInput, Option<(&'static str, String)>, usize),
         (owner, url_encoded): (Option<&Owner>, bool),
     ) -> S3Result<ObjectListingPage> {
         let mut base = vec![
@@ -270,7 +301,7 @@ impl ArunaS3Service {
                 .clone()
                 .map(|delimiter| ("delimiter", delimiter)),
         );
-        base.extend(start.map(|start| ("start-after", start)));
+        base.extend(start);
         let query = range_query(&base, range);
         let request = ("ListObjectsV2", input.bucket.as_str(), query);
         let body = self.ask_holders(user, context, range, request).await?;
@@ -334,6 +365,8 @@ impl ArunaS3Service {
             continuation_token: None,
         };
         let mut last_prefix = resume.as_ref().and_then(|(_, group)| group.clone());
+        // Only entries of this page move its token on; a resumed prefix would repeat it.
+        let mut page_prefix: Option<String> = None;
         let mut last_key: Option<String> = None;
         let ranges = snapshot.listed_ranges(&prefix);
         let ranges = ranges.into_iter().filter(|range| {
@@ -356,7 +389,7 @@ impl ArunaS3Service {
             let full = bounded && (visited == MAX_RANGES_PER_PAGE || bytes >= MAX_PAGE_BYTES);
             if remaining == 0 || full {
                 merged.continuation_token =
-                    scoped_marker(&input.bucket, last_key.as_deref(), last_prefix.as_deref())?;
+                    scoped_marker(&input.bucket, last_key.as_deref(), page_prefix.as_deref())?;
                 // Nothing listed yet: the next page starts at this range.
                 let next = merged
                     .continuation_token
@@ -376,16 +409,16 @@ impl ArunaS3Service {
                         .await?
                 }
                 false => {
-                    let start = match first {
-                        true => resume
-                            .as_ref()
-                            .map(|(key, group)| group.clone().unwrap_or(key.clone())),
-                        false => None,
-                    };
+                    let start = remote_start(&input, first)?;
                     let query = (&input, start, remaining);
                     let context = (binding, &snapshot);
-                    self.remote_objects(user, context, range, query, (owner.as_ref(), url_encoded))
-                        .await?
+                    let mut part = self
+                        .remote_objects(user, context, range, query, (owner.as_ref(), url_encoded))
+                        .await?;
+                    if let Some(scope) = scope {
+                        scope_part(&mut part, scope, url_encoded);
+                    }
+                    part
                 }
             };
             first = false;
@@ -403,7 +436,8 @@ impl ArunaS3Service {
                 if last_prefix.as_deref() == Some(raw.as_str()) {
                     continue;
                 }
-                last_prefix = Some(raw);
+                last_prefix = Some(raw.clone());
+                page_prefix = Some(raw);
                 merged.common_prefixes.push(prefix);
             }
             if let Some(object) = part.contents.last() {
@@ -463,6 +497,53 @@ mod tests {
             Some(("a b".to_string(), Some("m&n".to_string())))
         );
         assert_eq!(named_bounds(Some("list-type=2")), None);
+    }
+
+    #[test]
+    fn holder_resumes_group() {
+        let token = ListContinuationToken {
+            last_key: BlobHeadKey::object_prefix("spire", "d/").unwrap(),
+            last_common_prefix: Some("d/".to_string()),
+        };
+        let input = ListBucketInput {
+            bucket: "spire".to_string(),
+            group_id: Ulid::from_bytes([1; 16]),
+            continuation_token: Some(token.clone()),
+            max_keys: Some(10),
+            prefix: None,
+            delimiter: Some("/".to_string()),
+            start_after: None,
+        };
+        let (name, value) = remote_start(&input, true).unwrap().unwrap();
+        assert_eq!(name, "continuation-token");
+        let sent = ArunaS3Service::decode_list_token(Some(&value)).unwrap();
+        assert_eq!(sent, Some(token));
+        assert_eq!(remote_start(&input, false).unwrap(), None);
+    }
+
+    #[test]
+    fn next_holder_answers() {
+        let mut not_held = S3Error::with_message(S3ErrorCode::Custom("RangeNotHeld".into()), "");
+        not_held.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(unreachable(&not_held));
+        assert!(!unreachable(&s3_error!(AccessDenied, "denied")));
+    }
+
+    #[test]
+    fn holder_page_scoped() {
+        let mut part = ObjectListingPage {
+            contents: vec![Object {
+                key: Some("secret".to_string()),
+                ..Default::default()
+            }],
+            common_prefixes: vec![CommonPrefix {
+                prefix: Some("private/".to_string()),
+            }],
+            continuation_token: None,
+        };
+        // A scope without grants hides what the holder listed under its own rules.
+        scope_part(&mut part, &SubpathScope::default(), false);
+        assert!(part.contents.is_empty() && part.common_prefixes.is_empty());
     }
 
     #[test]

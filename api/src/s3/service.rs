@@ -256,6 +256,13 @@ impl ArunaS3Service {
         bucket: &str,
         prefix: &str,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        // A delegated request is never sent on, and an index would list other ranges.
+        if extensions.get::<DelegatedRequest>().is_some() {
+            return Err(s3_error!(
+                AccessDenied,
+                "Delegation refused: no folder index"
+            ));
+        }
         let extras = extensions
             .get::<PolicyRequestExtras>()
             .cloned()
@@ -1181,6 +1188,24 @@ impl S3 for ArunaS3Service {
                     )
                     .await
                 }
+                CopyPath::Relay(holder) => {
+                    let source = (
+                        source_bucket.as_str(),
+                        source_key.as_str(),
+                        source_version_id,
+                    );
+                    let read =
+                        (self.read_through(&user_access, &holder, source, &req.headers)).await?;
+                    let metadata = metadata_replace.then(|| {
+                        object_metadata(
+                            req.input.metadata.clone().unwrap_or_default(),
+                            req.input.content_type.as_deref(),
+                        )
+                    });
+                    let target = (dest_bucket, dest_key);
+                    self.relay_copy(&user_access, &forward, target, read, metadata)
+                        .await
+                }
                 CopyPath::Delegate => {
                     let request = forward::ForwardRequest {
                         method: http::Method::PUT,
@@ -1555,15 +1580,14 @@ impl S3 for ArunaS3Service {
             .forward_upload(&req.extensions, dest_info.as_ref(), &req.input.key)
             .await?
         {
+            let upload: String =
+                url::form_urlencoded::byte_serialize(req.input.upload_id.as_bytes()).collect();
+            let query = format!("partNumber={}&uploadId={upload}", req.input.part_number);
             return match self
                 .copy_path(&source_bucket_info, &source_key, &forward)
                 .await?
             {
                 CopyPath::Stream => {
-                    let upload: String =
-                        url::form_urlencoded::byte_serialize(req.input.upload_id.as_bytes())
-                            .collect();
-                    let query = format!("partNumber={}&uploadId={upload}", req.input.part_number);
                     let source = CopySource {
                         bucket: &source_bucket_info,
                         name: source_bucket,
@@ -1576,6 +1600,17 @@ impl S3 for ArunaS3Service {
                     let target = (req.input.bucket, req.input.key, query);
                     self.stream_part(&user_access, &forward, target, source, token.as_ref())
                         .await
+                }
+                CopyPath::Relay(holder) => {
+                    let source = (
+                        source_bucket.as_str(),
+                        source_key.as_str(),
+                        source_version_id,
+                    );
+                    let read =
+                        (self.read_through(&user_access, &holder, source, &req.headers)).await?;
+                    let target = (req.input.bucket, req.input.key, query);
+                    self.relay_part(&user_access, &forward, target, read).await
                 }
                 CopyPath::Delegate => {
                     let request = forward::ForwardRequest {

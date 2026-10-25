@@ -15,7 +15,8 @@ use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
 use futures_util::TryStreamExt;
 use http::{HeaderMap, Method};
 use s3s::dto::{
-    ETag, GetObjectOutput, HeadObjectOutput, StreamingBlob, Timestamp, TimestampFormat,
+    ChecksumType, ETag, GetObjectOutput, HeadObjectOutput, StreamingBlob, Timestamp,
+    TimestampFormat,
 };
 use s3s::{S3Response, S3Result};
 
@@ -75,6 +76,10 @@ fn user_metadata(response: &reqwest::Response) -> Option<HashMap<String, String>
     (!metadata.is_empty()).then_some(metadata)
 }
 
+fn checksum_type(response: &reqwest::Response) -> Option<ChecksumType> {
+    header(response, "x-amz-checksum-type").map(ChecksumType::from)
+}
+
 fn content_length(response: &reqwest::Response) -> Option<i64> {
     header(response, "content-length").and_then(|value| value.parse().ok())
 }
@@ -84,6 +89,12 @@ pub(super) fn forwarded_get(response: reqwest::Response) -> S3Response<GetObject
     let status = response.status();
     let output = GetObjectOutput {
         accept_ranges: header(&response, "accept-ranges"),
+        checksum_crc32: header(&response, "x-amz-checksum-crc32"),
+        checksum_crc32c: header(&response, "x-amz-checksum-crc32c"),
+        checksum_crc64nvme: header(&response, "x-amz-checksum-crc64nvme"),
+        checksum_sha1: header(&response, "x-amz-checksum-sha1"),
+        checksum_sha256: header(&response, "x-amz-checksum-sha256"),
+        checksum_type: checksum_type(&response),
         content_length: content_length(&response),
         content_range: header(&response, "content-range"),
         content_type: header(&response, "content-type"),
@@ -109,6 +120,12 @@ pub(super) fn forwarded_get(response: reqwest::Response) -> S3Response<GetObject
 pub(super) fn forwarded_head(response: &reqwest::Response) -> S3Response<HeadObjectOutput> {
     S3Response::new(HeadObjectOutput {
         accept_ranges: header(response, "accept-ranges"),
+        checksum_crc32: header(response, "x-amz-checksum-crc32"),
+        checksum_crc32c: header(response, "x-amz-checksum-crc32c"),
+        checksum_crc64nvme: header(response, "x-amz-checksum-crc64nvme"),
+        checksum_sha1: header(response, "x-amz-checksum-sha1"),
+        checksum_sha256: header(response, "x-amz-checksum-sha256"),
+        checksum_type: checksum_type(response),
         content_length: content_length(response),
         content_type: header(response, "content-type"),
         e_tag: e_tag(response),
@@ -194,6 +211,11 @@ mod tests {
             .header("last-modified", "Sat, 24 Oct 2026 10:00:00 GMT")
             .header("x-amz-version-id", "01JMETADATA0123456789ABCDE")
             .header("x-amz-meta-origin", "spire")
+            .header(
+                "x-amz-checksum-sha256",
+                "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+            )
+            .header("x-amz-checksum-type", "FULL_OBJECT")
             .body("abc")
             .unwrap();
         reqwest::Response::from(response)
@@ -234,12 +256,18 @@ mod tests {
             output.metadata.unwrap().get("origin").map(String::as_str),
             Some("spire")
         );
+        assert!(output.checksum_sha256.is_some());
+        assert_eq!(
+            output.checksum_type.as_ref().map(ChecksumType::as_str),
+            Some("FULL_OBJECT")
+        );
     }
 
     #[test]
     fn head_answer_mapped() {
         let output = forwarded_head(&holder_answer(200)).output;
         assert_eq!(output.content_length, Some(3));
+        assert!(output.checksum_sha256.is_some());
         assert_eq!(
             output.version_id.as_deref(),
             Some("01JMETADATA0123456789ABCDE")

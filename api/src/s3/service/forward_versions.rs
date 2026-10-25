@@ -222,10 +222,8 @@ impl ArunaS3Service {
                 next = Some(last.clone().map_or_else(start, |key| (key, None)));
                 break;
             }
-            let start = match first {
-                true => (marker.clone(), version_marker.clone()),
-                false => (None, None),
-            };
+            // The key marker skips a common prefix in every range; the id only in the first.
+            let start = (marker.clone(), version_marker.clone().filter(|_| first));
             first = false;
             let part = match snapshot.lists_locally(binding.member_id, range) {
                 true => {

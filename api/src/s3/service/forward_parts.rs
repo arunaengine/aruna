@@ -10,7 +10,7 @@ use s3s::dto::{
 use s3s::{S3Response, S3Result, s3_error};
 
 use super::ArunaS3Service;
-use super::forward::{header, xml_field};
+use super::forward::{answer_text, header, xml_field};
 
 /// Escapes text for an XML element body.
 fn escaped(text: &str) -> String {
@@ -80,7 +80,7 @@ impl ArunaS3Service {
         bucket: String,
         key: String,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let body = response.text().await.unwrap_or_default();
+        let body = answer_text(response).await?;
         let upload_id = xml_field(&body, "UploadId")
             .ok_or_else(|| s3_error!(InternalError, "The coordinator named no upload id"))?;
         Ok(S3Response::new(CreateMultipartUploadOutput {
@@ -96,7 +96,7 @@ impl ArunaS3Service {
         bucket: String,
         key: String,
     ) -> S3Result<S3Response<ListPartsOutput>> {
-        let body = response.text().await.unwrap_or_default();
+        let body = answer_text(response).await?;
         let number = |tag: &str| xml_field(&body, tag).and_then(|value| value.parse().ok());
         Ok(S3Response::new(ListPartsOutput {
             bucket: Some(bucket),
@@ -128,7 +128,7 @@ impl ArunaS3Service {
         response: reqwest::Response,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let version_id = header(&response, "x-amz-version-id");
-        let body = response.text().await.unwrap_or_default();
+        let body = answer_text(response).await?;
         if body.contains("<Error>") {
             let code = xml_field(&body, "Code").unwrap_or_default();
             let message = xml_field(&body, "Message").unwrap_or_default();
