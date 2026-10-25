@@ -838,3 +838,208 @@ async fn uploads_merge_ranges() {
     }
     assert_eq!(paged, ["a/up", "k/up", "q/up"]);
 }
+
+// An unsigned browser request for a public folder of a distributed bucket lists the folder
+// across its key ranges, as the S3 listing does, and every name is checked for Everyone.
+#[tokio::test]
+async fn folder_spans_ranges() {
+    use aruna_core::UserId;
+    let members = members(3, &["f/m", "p"], 0).await;
+    for key in ["f/a.txt", "f/z.txt", "g/other"] {
+        put(&members, 0, key, b"public").await;
+    }
+    members.publish().await;
+    let node = &members.nodes[0];
+    let mut anonymous = members.user_on(0);
+    anonymous.user_identity = UserId::nil(members.realm_id);
+    let mut get = request(get_input("f/"), Method::GET, anonymous, node.bucket().await);
+    get.headers
+        .insert(http::header::ACCEPT, "text/html".parse().unwrap());
+    let output = node.service.get_object(get).await.unwrap().output;
+    let html = String::from_utf8(body_of(output.body).await).unwrap();
+    assert!(html.contains("a.txt"), "{html}");
+    assert!(html.contains("z.txt"), "{html}");
+    assert!(!html.contains("other"), "{html}");
+}
+
+// The version 1 listing merges the ranges too and resumes after its marker.
+#[tokio::test]
+async fn listing_v1_merges() {
+    use s3s::dto::ListObjectsInput;
+    let members = members(3, &["h", "p"], 0).await;
+    for key in SPREAD {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    let node = &members.nodes[0];
+    let list = |marker: Option<&str>| {
+        let input = ListObjectsInput {
+            bucket: BUCKET.to_string(),
+            marker: marker.map(str::to_string),
+            ..Default::default()
+        };
+        (input, members.user_on(0))
+    };
+    let (input, user) = list(None);
+    let output = (node.service)
+        .list_objects(request(input, Method::GET, user, node.bucket().await))
+        .await
+        .unwrap()
+        .output;
+    let keys: Vec<String> = (output.contents.unwrap_or_default().into_iter())
+        .filter_map(|object| object.key)
+        .collect();
+    assert_eq!(keys, SPREAD);
+    let (input, user) = list(Some("a/2"));
+    let output = (node.service)
+        .list_objects(request(input, Method::GET, user, node.bucket().await))
+        .await
+        .unwrap()
+        .output;
+    let keys: Vec<String> = (output.contents.unwrap_or_default().into_iter())
+        .filter_map(|object| object.key)
+        .collect();
+    assert_eq!(keys, ["k/1", "q/1", "q/2"]);
+}
+
+// A relayed copy can replace the source's metadata like any copy.
+#[tokio::test]
+async fn relay_replaces_metadata() {
+    let members = members(3, &["h", "p"], 0).await;
+    put(&members, 0, "q/src", b"relayed").await;
+    copy(&members, 0, ("q/src", "k/dst"), Some(("lab", "relay")))
+        .await
+        .unwrap();
+    let (_, read) = read(&members, 1, "k/dst").await;
+    let metadata = read.metadata.unwrap_or_default();
+    assert_eq!(metadata.get("lab").map(String::as_str), Some("relay"));
+}
+
+// A HEAD of a missing key the member keeps records of is a plain miss.
+#[tokio::test]
+async fn head_miss_local() {
+    let members = members(3, &["h", "p"], 0).await;
+    let node = &members.nodes[0];
+    let input = s3s::dto::HeadObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "a/none".to_string(),
+        ..Default::default()
+    };
+    let head = request(input, Method::HEAD, members.user_on(0), node.bucket().await);
+    let error = node.service.head_object(head).await.unwrap_err();
+    assert_eq!(*error.code(), s3s::S3ErrorCode::NoSuchKey);
+}
+
+// An upload listing resumes after the tagged id clients see, and an ordinary bucket's
+// uploads list with their stored ids.
+#[tokio::test]
+async fn upload_markers_tagged() {
+    use aruna_operations::s3::bucket::create::CreateBucketOperation;
+    use s3s::dto::ListMultipartUploadsInput;
+    let members = members(3, &["h", "p"], 0).await;
+    let first = create_upload(&members, 0, "a/up").await;
+    create_upload(&members, 0, "k/up").await;
+    let node = &members.nodes[0];
+    let input = ListMultipartUploadsInput {
+        bucket: BUCKET.to_string(),
+        key_marker: Some("a/up".to_string()),
+        upload_id_marker: Some(first),
+        ..Default::default()
+    };
+    let list = request(input, Method::GET, members.user_on(0), node.bucket().await);
+    let output = node
+        .service
+        .list_multipart_uploads(list)
+        .await
+        .unwrap()
+        .output;
+    let keys: Vec<String> = (output.uploads.unwrap_or_default().into_iter())
+        .filter_map(|upload| upload.key)
+        .collect();
+    assert_eq!(keys, ["k/up"]);
+
+    let mut plain = node.bucket().await;
+    plain.distribution = None;
+    let create = CreateBucketOperation::new("plain".to_string(), plain.clone());
+    aruna_operations::driver::drive(create, &node.context)
+        .await
+        .unwrap();
+    let input = s3s::dto::CreateMultipartUploadInput {
+        bucket: "plain".to_string(),
+        key: "up".to_string(),
+        ..Default::default()
+    };
+    let create = request(input, Method::POST, members.user_on(0), plain.clone());
+    let upload_id = (node.service.create_multipart_upload(create).await.unwrap())
+        .output
+        .upload_id
+        .unwrap();
+    let input = ListMultipartUploadsInput {
+        bucket: "plain".to_string(),
+        ..Default::default()
+    };
+    let list = request(input, Method::GET, members.user_on(0), plain);
+    let output = node
+        .service
+        .list_multipart_uploads(list)
+        .await
+        .unwrap()
+        .output;
+    let ids: Vec<String> = (output.uploads.unwrap_or_default().into_iter())
+        .filter_map(|upload| upload.upload_id)
+        .collect();
+    assert_eq!(ids, [upload_id]);
+}
+
+/// A request that reached the handler without the access hook's context.
+fn bare<T>(input: T) -> S3Request<T> {
+    S3Request {
+        input,
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions: Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+// Upload requests without an authenticated caller are refused before any lookup.
+#[tokio::test]
+async fn uploads_need_caller() {
+    use s3s::dto::{AbortMultipartUploadInput, ListMultipartUploadsInput, ListPartsInput};
+    let members = members(1, &[], 0).await;
+    let node = &members.nodes[0];
+    let missing = s3s::S3ErrorCode::UnexpectedContent;
+    let abort = AbortMultipartUploadInput {
+        bucket: BUCKET.to_string(),
+        key: "a".to_string(),
+        upload_id: "u".to_string(),
+        ..Default::default()
+    };
+    let error = node
+        .service
+        .abort_multipart_upload(bare(abort))
+        .await
+        .unwrap_err();
+    assert_eq!(*error.code(), missing);
+    let parts = ListPartsInput {
+        bucket: BUCKET.to_string(),
+        key: "a".to_string(),
+        upload_id: "u".to_string(),
+        ..Default::default()
+    };
+    let error = node.service.list_parts(bare(parts)).await.unwrap_err();
+    assert_eq!(*error.code(), missing);
+    let uploads = ListMultipartUploadsInput {
+        bucket: BUCKET.to_string(),
+        ..Default::default()
+    };
+    let error = node
+        .service
+        .list_multipart_uploads(bare(uploads))
+        .await
+        .unwrap_err();
+    assert_eq!(*error.code(), missing);
+}
