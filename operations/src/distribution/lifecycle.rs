@@ -16,12 +16,14 @@ use aruna_core::keyspaces::{
     DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_LIFECYCLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
     RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, RangeAccount, RangeCounters, account_key, generation_key,
 };
 use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
+use aruna_core::structs::storage::distribution::lifecycle::MAX_CURSOR_BYTES;
 use aruna_core::structs::storage::distribution::snapshot::OpenTransfer;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, DistributionSnapshot, KeyRange, MemberState,
@@ -34,6 +36,7 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::create::submit;
+use super::imports::{keep_imports, open_imports};
 use super::purge::{
     PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, has_uploads,
     purge_range, purge_rest, read,
@@ -506,14 +509,25 @@ impl SetWork {
         };
         let watermark =
             postcard::to_allocvec(&Watermark::of(&counters)).map_err(|error| error.to_string())?;
-        // Imports and refreshes keep per-job checkpoints, not per-range cursors (see report).
+        // Open imports of the bucket go on at the new coordinator; refresh rounds start anew.
+        let jobs = open_imports(context, &snapshot.config.bucket).await?;
+        let import_cursor = match jobs.is_empty() {
+            true => None,
+            false => Some(postcard::to_allocvec(&jobs).map_err(|error| error.to_string())?),
+        };
+        if import_cursor
+            .as_ref()
+            .is_some_and(|jobs| jobs.len() > MAX_CURSOR_BYTES)
+        {
+            return Ok(Left::Waiting);
+        }
         let kind = StatementKind::TransferFenced {
             transfer_id: open.transfer_id,
             range_id: range.range_id,
             epoch: range.epoch,
             next_epoch: open.epoch,
             watermark,
-            import_cursor: None,
+            import_cursor,
             refresh_cursor: None,
             open_uploads: 0,
         };
@@ -535,13 +549,17 @@ impl SetWork {
         let (Some(fenced), None) = (open.fenced, open.completed) else {
             return Ok(Left::Waiting);
         };
-        let watermark = (snapshot.statements.iter())
+        let fenced_parts = (snapshot.statements.iter())
             .find(|signed| signed.statement.digest() == fenced)
             .and_then(|signed| match &signed.statement.kind {
-                StatementKind::TransferFenced { watermark, .. } => Some(watermark.clone()),
+                StatementKind::TransferFenced {
+                    watermark,
+                    import_cursor,
+                    ..
+                } => Some((watermark.clone(), import_cursor.clone())),
                 _ => None,
             });
-        let Some(bytes) = watermark else {
+        let Some((bytes, imports)) = fenced_parts else {
             return Ok(Left::Waiting);
         };
         let wanted: Watermark = postcard::from_bytes(&bytes).map_err(|error| error.to_string())?;
@@ -560,6 +578,16 @@ impl SetWork {
         let group_id = snapshot.config.owner_group;
         if !roots_checked(context, self.set_id, group_id, open.transfer_id).await? {
             return Ok(Left::Waiting);
+        }
+        // The former coordinator's open imports are kept to run once this node coordinates.
+        if let Some(imports) = imports {
+            let jobs: Vec<JobId> = postcard::from_bytes(&imports).map_err(|e| e.to_string())?;
+            let range = (self.set_id, open.range_id);
+            let from = (snapshot.config.members.iter()).find(|m| m.member_id == open.from);
+            let Some(from) = from.map(|member| member.node_id) else {
+                return Ok(Left::Waiting);
+            };
+            keep_imports(context, range, from, &jobs).await?;
         }
         let kind = StatementKind::TransferComplete {
             transfer_id: open.transfer_id,

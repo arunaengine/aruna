@@ -1102,6 +1102,11 @@ impl MetadataHandle {
                 };
                 (MetadataTransportMessage::SetPreviewResults { result }, None)
             }
+            MetadataTransportMessage::StagingSpec { job_id } => {
+                let spec = crate::distribution::imports::staging_spec(&context, peer, job_id);
+                let result = spec.await.map(Box::new);
+                (MetadataTransportMessage::StagingSpecResult { result }, None)
+            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)

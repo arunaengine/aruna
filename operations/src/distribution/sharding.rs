@@ -60,6 +60,10 @@ enum Tended {
 pub async fn maintain_ranges(context: &Arc<DriverContext>) -> Duration {
     let lifecycle = super::lifecycle::tend_lifecycle(context).await;
     let mut after = maintain_accounts(context).await;
+    // Imports handed over with a range start once this node coordinates it.
+    if let Err(error) = super::imports::continue_imports(context).await {
+        warn!(%error, "Handed over imports could not start");
+    }
     // Coordinators walk their ranges for the periodic source refresh, a few pages per pass.
     match super::refresh::refresh_ranges(context).await {
         Ok(true) => after = Duration::ZERO,

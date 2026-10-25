@@ -593,6 +593,13 @@ pub enum MetadataTransportMessage {
     SetPreviewResults {
         result: Result<Box<crate::metadata::api::SetPreviewPage>, MetadataReadError>,
     },
+    /// The spec of a staging job the former coordinator of a range hands over.
+    StagingSpec {
+        job_id: aruna_core::structs::execution::job::JobId,
+    },
+    StagingSpecResult {
+        result: Result<Box<aruna_core::structs::execution::job::StagingJobSpec>, MetadataReadError>,
+    },
 }
 
 /// One document as a holder serves it to a device.

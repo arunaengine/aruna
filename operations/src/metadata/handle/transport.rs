@@ -515,6 +515,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::BucketOwnerResult { .. } => "bucket_owner_result",
         MetadataTransportMessage::SetPreview { .. } => "set_preview",
         MetadataTransportMessage::SetPreviewResults { .. } => "set_preview_results",
+        MetadataTransportMessage::StagingSpec { .. } => "staging_spec",
+        MetadataTransportMessage::StagingSpecResult { .. } => "staging_spec_result",
     }
 }
 
@@ -677,6 +679,21 @@ impl MetadataHandle {
             .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::SetPreviewResults { result } => result.map(|page| *page),
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    pub async fn request_staging_spec(
+        &self,
+        node_id: NodeId,
+        job_id: aruna_core::structs::execution::job::JobId,
+    ) -> Result<aruna_core::structs::execution::job::StagingJobSpec, MetadataReadError> {
+        let request = MetadataTransportMessage::StagingSpec { job_id };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::StagingSpecResult { result } => result.map(|spec| *spec),
             _ => Err(MetadataReadError::Unavailable),
         }
     }
