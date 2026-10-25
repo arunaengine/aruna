@@ -23,7 +23,8 @@ const ROOT_PAGE: usize = 256;
 /// Unchecked roots one pass probes at most.
 const MAX_PROBES: usize = 8;
 /// Where the open sweep of each transfer goes on, and whether it found every root checked.
-static SWEEPS: Mutex<Option<HashMap<Ulid, (Vec<u8>, bool)>>> = Mutex::new(None);
+type Sweeps = HashMap<Ulid, (Vec<u8>, bool)>;
+static SWEEPS: Mutex<Option<Sweeps>> = Mutex::new(None);
 
 /// What a walk over a set's root rows found.
 #[derive(Default)]
@@ -44,7 +45,7 @@ pub async fn roots_checked(
     sweep_id: Ulid,
 ) -> Result<bool, String> {
     let prefix = set_id.to_bytes().to_vec();
-    let sweeps = |change: &mut dyn FnMut(&mut HashMap<Ulid, (Vec<u8>, bool)>)| {
+    let sweeps = |change: &mut dyn FnMut(&mut Sweeps)| {
         if let Ok(mut sweeps) = SWEEPS.lock() {
             change(sweeps.get_or_insert_with(HashMap::new));
         }
