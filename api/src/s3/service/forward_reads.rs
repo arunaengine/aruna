@@ -119,6 +119,16 @@ pub(super) fn forwarded_head(response: &reqwest::Response) -> S3Response<HeadObj
     })
 }
 
+/// The caller a delegation carries: the Everyone principal has no credential, so the
+/// delegation's own short window bounds it.
+pub(super) fn anonymous_window(user: &UserAccess) -> UserAccess {
+    let mut user = user.clone();
+    if user.user_identity.is_nil() {
+        user.expiry = SystemTime::now() + Duration::from_secs(ANONYMOUS_SECS);
+    }
+    user
+}
+
 impl ArunaS3Service {
     /// The holder a GET or HEAD of `key` goes to when this member keeps no records of the
     /// key's range, or `None` when this member answers it. A delegated read is never sent on.
@@ -158,11 +168,7 @@ impl ArunaS3Service {
         forward: &Forward,
         request: ForwardRequest,
     ) -> S3Result<reqwest::Response> {
-        let mut user = user.clone();
-        // The Everyone principal has no credential; the delegation's own window bounds it.
-        if user.user_identity.is_nil() {
-            user.expiry = SystemTime::now() + Duration::from_secs(ANONYMOUS_SECS);
-        }
+        let user = anonymous_window(user);
         let result = self.forward_write(&user, forward, request).await;
         if let Err(error) = &result
             && error

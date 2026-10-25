@@ -259,23 +259,32 @@ impl ArunaS3Service {
             .get::<PolicyRequestExtras>()
             .cloned()
             .ok_or_else(|| s3_error!(InternalError, "Missing policy context"))?;
-        let page = self
-            .run_object_listing(
-                LOV2I {
-                    bucket: bucket.to_owned(),
-                    group_id,
-                    continuation_token: None,
-                    max_keys: Some(ListBucketOperation::DEFAULT_MAX_KEYS),
-                    prefix: Some(prefix.to_owned()),
-                    delimiter: Some("/".to_owned()),
-                    start_after: None,
-                },
-                None,
-                false,
-                None,
-                None,
-            )
-            .await?;
+        let input = LOV2I {
+            bucket: bucket.to_owned(),
+            group_id,
+            continuation_token: None,
+            max_keys: Some(ListBucketOperation::DEFAULT_MAX_KEYS),
+            prefix: Some(prefix.to_owned()),
+            delimiter: Some("/".to_owned()),
+            start_after: None,
+        };
+        let distributed = (extensions.get::<BucketInfo>())
+            .and_then(|info| info.distribution.clone())
+            .zip(extensions.get::<UserAccess>());
+        // A distributed bucket's folder spans its key ranges, as its S3 listing does.
+        let page = match distributed {
+            Some((binding, user)) => {
+                let user = forward_reads::anonymous_window(user);
+                let shape = (None, false, None);
+                self.merged_objects(&user, &binding, input, shape, (None, true))
+                    .await?
+                    .0
+            }
+            None => {
+                self.run_object_listing(input, None, false, None, None)
+                    .await?
+            }
+        };
         let truncated = page.continuation_token.is_some();
         let folders = page
             .common_prefixes
