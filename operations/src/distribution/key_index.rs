@@ -216,6 +216,13 @@ impl RangeIndexes {
             }
             if keep.is_none() {
                 std::fs::remove_dir_all(&dir).or_else(ignore_missing)?;
+                // The set's directory goes with its last range; another range keeps it.
+                if let Some(set_dir) = dir.parent() {
+                    match std::fs::remove_dir(set_dir) {
+                        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                        other => other.or_else(ignore_missing)?,
+                    }
+                }
             }
             Ok(())
         })
@@ -527,5 +534,9 @@ mod tests {
         assert!(indexes.exists(set(), range(), 2).await.unwrap());
         indexes.prune(set(), range(), None).await.unwrap();
         assert!(indexes.search(set(), range(), 2, all).await.is_err());
+        assert!(
+            !dir.path().join(set().to_string()).exists(),
+            "no empty set directory"
+        );
     }
 }
