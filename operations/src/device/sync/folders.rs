@@ -25,6 +25,12 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::get_config::GetConfigOperation;
+use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
+use crate::s3::object::delete::DeleteObjectError;
+use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use crate::s3::object::versions::{
+    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
+};
 use crate::staging::offered_directory::{
     OfferedDirectoryError, WithdrawOfferInput, check_root, withdraw_offer,
 };
@@ -89,6 +95,12 @@ pub enum FolderError {
     Offer(#[from] OfferedDirectoryError),
     #[error("a download-only folder never propagates deletions")]
     DownloadOnly,
+    #[error(transparent)]
+    ListVersions(#[from] ListVersionsError),
+    #[error(transparent)]
+    DeleteObject(#[from] DeleteObjectError),
+    #[error(transparent)]
+    DeleteBucket(#[from] DeleteBucketError),
 }
 
 /// How much of a folder still needs attention. Every counter is derived from
@@ -527,7 +539,7 @@ pub(crate) async fn finish_unbind(
     let removed = match withdraw_offer(
         context,
         WithdrawOfferInput {
-            bucket: folder.local_bucket,
+            bucket: folder.local_bucket.clone(),
             realm_id: folder.created_by.realm_id,
             node_id,
             user_id: folder.created_by,
@@ -541,6 +553,7 @@ pub(crate) async fn finish_unbind(
         Err(OfferedDirectoryError::NotOffered(_)) => 0,
         Err(error) => return Err(error.into()),
     };
+    delete_local_bucket(context, &folder, node_id).await?;
     let Some(txn_id) = start_txn(context).await else {
         return Err(FolderError::Unavailable);
     };
@@ -556,6 +569,64 @@ pub(crate) async fn finish_unbind(
         return Err(FolderError::Unavailable);
     }
     Ok(removed)
+}
+
+/// Deletes the folder's device-local bucket and every version left in it. A bucket that is
+/// already gone, or was never created, counts as deleted.
+async fn delete_local_bucket(
+    context: &DriverContext,
+    folder: &SyncedFolder,
+    node_id: NodeId,
+) -> Result<(), FolderError> {
+    let bucket = &folder.local_bucket;
+    loop {
+        let listing = ListVersionsOperation::new(ListVersionsInput {
+            bucket: bucket.clone(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: None,
+        });
+        let page = drive(listing, context).await?;
+        if page.items.is_empty() {
+            break;
+        }
+        let entries = page
+            .items
+            .into_iter()
+            .map(|item| match item {
+                ListVersionsItem::Version {
+                    key, version_id, ..
+                }
+                | ListVersionsItem::DeleteMarker {
+                    key, version_id, ..
+                } => BulkDeleteEntry {
+                    key,
+                    version_id: Some(version_id),
+                },
+            })
+            .collect();
+        let input = BulkDeleteInput {
+            bucket: bucket.clone(),
+            entries,
+            group_id: folder.group_id,
+            realm_id: folder.created_by.realm_id,
+            node_id,
+            deleted_by: folder.created_by,
+            restrictions: None,
+        };
+        for outcome in delete_objects(context, input).await {
+            match outcome.result {
+                Ok(_) | Err(DeleteObjectError::NoSuchVersion) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    match drive(DeleteBucketOperation::new(bucket.clone()), context).await {
+        Ok(()) | Err(DeleteBucketError::NotFound) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Deletes every row one folder owns in a keyspace, page by page.
@@ -914,6 +985,57 @@ mod tests {
             .await
             .expect("the entries read");
         assert!(entries.is_empty());
+    }
+
+    // A cleanup cut short after the offer was withdrawn still deletes the folder's bucket. One cut
+    // short after the bucket delete finds it gone and finishes.
+    #[tokio::test]
+    async fn deletes_local_bucket() {
+        use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+        use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = Arc::new(fixture.driver_context);
+        let root = tempfile::tempdir().expect("root created");
+        std::fs::write(root.path().join("note.txt"), b"note").expect("file written");
+        let folder = SyncedFolder {
+            root: root.path().to_string_lossy().to_string(),
+            ..bound_folder(FolderState::Deleting)
+        };
+        let offer = OfferDirectoryInput {
+            bucket: folder.local_bucket.clone(),
+            root: folder.root.clone(),
+            group_id: folder.group_id,
+            realm_id: realm(),
+            node_id: node(),
+            user_id: folder.created_by,
+        };
+        offer_directory(&context, offer).await.expect("offered");
+        let withdrawal = WithdrawOfferInput {
+            bucket: folder.local_bucket.clone(),
+            realm_id: realm(),
+            node_id: node(),
+            user_id: folder.created_by,
+        };
+        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+
+        for attempt in ["withdrawn offer", "deleted bucket"] {
+            store_folder(&context, &folder).await.expect("row stored");
+            assert_eq!(
+                finish_unbind(&context, folder.folder_id, node()).await,
+                Ok(0),
+                "{attempt}"
+            );
+            assert_eq!(
+                read_bound(&context, folder.folder_id).await,
+                Err(FolderError::NotFound)
+            );
+            let bucket = GetBucketOperation::new(folder.local_bucket.clone());
+            assert!(
+                matches!(drive(bucket, &context).await, Err(GetBucketError::NotFound)),
+                "{attempt}"
+            );
+        }
     }
 
     // A reconcile pass that started before the owner's change keeps it, and a

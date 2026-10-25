@@ -205,6 +205,9 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
         }
         FolderError::Unavailable => ServerError::ServiceUnavailableReason(error.to_string()),
         FolderError::Offer(offer) => map_offer_error(offer),
+        FolderError::ListVersions(_)
+        | FolderError::DeleteObject(_)
+        | FolderError::DeleteBucket(_) => ServerError::InternalError(error.to_string()),
     }
 }
 
@@ -595,8 +598,7 @@ for. Nothing outside this device is decided here, so the owner binding is the wh
   removes it after any pass still running on it. A removal cut short, also by a restart, resumes in
   the next pass.
 - The binding, its merge bases, its queued uploads and its audit log are removed from this device.
-- The device's own observation bucket is emptied with delete markers; the realm objects the folder
-  published stay.
+- The device's own observation bucket is deleted; the realm objects the folder published stay.
 - The files on disk, including any conflicted copies and anything in the folder's trash, are left
   exactly as they are."#,
     params(("folder_id" = String, Path, description = "Folder ULID")),

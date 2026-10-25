@@ -770,6 +770,17 @@ async fn finishes_cancelled_unbind() -> TestResult<()> {
     );
     let (entries, _) = list_entries(&device.context, folder.folder_id, None, None).await?;
     assert!(entries.is_empty());
+    assert!(
+        matches!(
+            drive(
+                GetBucketOperation::new(folder.local_bucket.clone()),
+                &device.context
+            )
+            .await,
+            Err(GetBucketError::NotFound)
+        ),
+        "the unbind must not leave the folder's local bucket behind"
+    );
     Ok(())
 }
 
