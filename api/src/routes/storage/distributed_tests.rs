@@ -297,7 +297,7 @@ fn sharding_request_converts() {
 }
 
 #[test]
-fn errors_map_to_status() {
+fn errors_map_status() {
     let set_id = Ulid::from_bytes([1; 16]);
     for retryable in [
         GuardError::RecordMissing(set_id),
