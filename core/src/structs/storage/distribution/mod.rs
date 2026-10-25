@@ -17,6 +17,7 @@ pub mod delivery;
 pub mod fence;
 pub mod hint;
 pub mod inventory;
+pub mod lifecycle;
 pub mod membership;
 pub mod on_use;
 pub mod parking;

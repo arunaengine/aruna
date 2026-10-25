@@ -175,11 +175,13 @@ fn stale_automatic_dropped() {
     );
     assert_eq!(
         next_snapshot(realm(), Some(&head), &split(2)),
-        Err(DistributionError::Unsupported("split"))
+        Err(DistributionError::InvalidStatement(
+            "only an active set that is not being deleted splits"
+        ))
     );
     assert_eq!(
         next_snapshot(realm(), Some(&head), &DistributionRequest::DeleteCommit),
-        Err(DistributionError::Unsupported("delete commit"))
+        Err(DistributionError::NoDeletion)
     );
 }
 

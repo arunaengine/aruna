@@ -8,6 +8,10 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::lifecycle::{
+    TransferPlan, activate_transfer, commit_deletion, deletion_fenced, prepare_deletion,
+    prepare_transfer, transfer_complete, transfer_fenced,
+};
 use super::membership::{changeable, join, leave};
 use super::snapshot::{DistributionSnapshot, Lifecycle};
 use super::split::apply_split;
@@ -107,9 +111,9 @@ pub fn next_snapshot(
         (None, _) => return Err(DistributionError::UnknownSet),
         (Some(head), request) => {
             let mut next = head.clone();
-            // A split statement is evidence for the revision that applies it only.
+            // Automatic requests are evidence for the revision that applies them only.
             next.statements
-                .retain(|signed| !matches!(signed.statement.kind, StatementKind::Split { .. }));
+                .retain(|signed| signed.statement.kind.basis().is_none());
             accept(realm_id, &mut next, request)?;
             next.number = head.number + 1;
             next.previous = Some(head.digest());
@@ -202,10 +206,31 @@ fn accept(
         DistributionRequest::Create { .. } => Err(DistributionError::SetMismatch(next.set_id())),
         DistributionRequest::Join { member, ranges } => join(next, member, ranges),
         DistributionRequest::Leave { member_id } => leave(next, *member_id),
-        DistributionRequest::TransferPrepare { .. }
-        | DistributionRequest::TransferActivate { .. }
-        | DistributionRequest::DeletePrepare { .. }
-        | DistributionRequest::DeleteCommit => Err(DistributionError::Unsupported(request.name())),
+        DistributionRequest::TransferPrepare {
+            transfer_id,
+            range_id,
+            to,
+            epoch,
+            role,
+        } => {
+            let plan = TransferPlan {
+                transfer_id: *transfer_id,
+                range_id: *range_id,
+                to: *to,
+                epoch: *epoch,
+                role: *role,
+            };
+            prepare_transfer(next, &plan, None)
+        }
+        DistributionRequest::TransferActivate {
+            transfer_id,
+            range_id,
+        } => match next.open_transfer(*transfer_id) {
+            Some(open) if open.range_id == *range_id => activate_transfer(next, *transfer_id),
+            _ => Err(DistributionError::NoTransfer(*transfer_id)),
+        },
+        DistributionRequest::DeletePrepare { members } => prepare_deletion(next, members),
+        DistributionRequest::DeleteCommit => commit_deletion(next),
     }
 }
 
@@ -273,7 +298,28 @@ fn embed(
             next.statements.push(signed.clone());
             Ok(())
         }
-        kind => Err(DistributionError::Unsupported(kind.name())),
+        StatementKind::TransferPrepare {
+            transfer_id,
+            range_id,
+            to,
+            epoch,
+            role,
+            ..
+        } => {
+            let plan = TransferPlan {
+                transfer_id: *transfer_id,
+                range_id: *range_id,
+                to: *to,
+                epoch: *epoch,
+                role: *role,
+            };
+            prepare_transfer(next, &plan, Some(statement.member_id))?;
+            next.statements.push(signed.clone());
+            Ok(())
+        }
+        StatementKind::TransferFenced { .. } => transfer_fenced(next, signed),
+        StatementKind::TransferComplete { .. } => transfer_complete(next, signed),
+        StatementKind::DeleteFenced { .. } => deletion_fenced(next, signed),
     }
 }
 
