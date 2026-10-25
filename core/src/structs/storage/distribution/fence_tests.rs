@@ -42,6 +42,7 @@ fn fence(range_id: Ulid, epoch: u64) -> RangeFence {
         transfer_id: Ulid::from_bytes([4; 16]),
         epoch,
         since_ms: 1,
+        uploads_open: false,
     }
 }
 
@@ -58,6 +59,27 @@ fn range_fence_refuses_old_epochs() {
     );
     assert_eq!(local.check_write(&snapshot, lower, 2), Ok(()));
     assert_eq!(local.check_write(&snapshot, upper, 1), Ok(()));
+}
+
+#[test]
+fn grace_lets_completions_pass() {
+    // During the upload grace period only completions commit; closing it refuses them too.
+    let snapshot = pending();
+    let range = &snapshot.config.ranges[0];
+    let mut local = LocalFence::default();
+    local.fence_range(RangeFence {
+        uploads_open: true,
+        ..fence(range.range_id, 1)
+    });
+    let moving = Err(RouteError::Moving(range.range_id));
+    assert_eq!(local.check_write(&snapshot, range, 1), moving);
+    assert_eq!(local.check_completion(&snapshot, range, 1), Ok(()));
+    assert!(local.close_uploads(range.range_id));
+    assert!(
+        !local.close_uploads(range.range_id),
+        "closing twice changes nothing"
+    );
+    assert_eq!(local.check_completion(&snapshot, range, 1), moving);
 }
 
 #[test]

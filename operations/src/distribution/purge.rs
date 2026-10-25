@@ -151,6 +151,12 @@ async fn page(
     }
 }
 
+/// Whether the range still has an open upload.
+pub async fn has_uploads(context: &DriverContext, target: &PurgeTarget) -> Result<bool, String> {
+    let rows = page(context, UPLOAD_INVENTORY_KEYSPACE, target, None).await?;
+    Ok(!rows.is_empty())
+}
+
 /// Aborts one page of the range's open uploads; `true` while it found any, so the caller
 /// looks again until none is left.
 pub async fn abort_range_uploads(

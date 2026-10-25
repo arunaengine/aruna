@@ -64,6 +64,7 @@ fn local_fence_refuses_writes() {
         transfer_id: Ulid::from_bytes([3; 16]),
         epoch: 1,
         since_ms: 0,
+        uploads_open: false,
     });
     let fence = fence.to_bytes().unwrap();
     // The record still names this member, but its own fence takes precedence.
@@ -98,6 +99,40 @@ fn transaction_rechecks_authority() {
     assert_eq!(
         check_authority(&stale, "a", Some(&bytes), None),
         Err(GuardError::Route(RouteError::StaleRange(stale.range_id)))
+    );
+}
+
+#[test]
+fn completion_passes_grace() {
+    use crate::distribution::test_record::authority_rows;
+    use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
+    let (snapshot, bytes) = record(true);
+    let own = binding(&snapshot, 1, 5);
+    let range_id = snapshot.config.ranges[0].range_id;
+    let mut fence = LocalFence::default();
+    fence.fence_range(RangeFence {
+        range_id,
+        transfer_id: Ulid::from_bytes([3; 16]),
+        epoch: 1,
+        since_ms: 0,
+        uploads_open: true,
+    });
+    let open = fence.to_bytes().unwrap();
+    let rows = || authority_rows(Some(bytes.clone()), Some(open.clone()));
+    let moving = || GuardError::Route(RouteError::Moving(range_id));
+    // New writes stop at the fence; completions of open uploads pass until the grace ends.
+    assert_eq!(record_authority(&own, "a", rows()), Err(moving()));
+    let authority = record_completion(&own, "a", rows()).unwrap();
+    assert!(authority.completion);
+    assert_eq!(
+        check_authority(&authority, "a", Some(&bytes), Some(&open)),
+        Ok(())
+    );
+    fence.close_uploads(range_id);
+    let closed = fence.to_bytes().unwrap();
+    assert_eq!(
+        check_authority(&authority, "a", Some(&bytes), Some(&closed)),
+        Err(moving())
     );
 }
 

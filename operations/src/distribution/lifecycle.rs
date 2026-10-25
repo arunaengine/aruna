@@ -35,8 +35,8 @@ use ulid::Ulid;
 
 use super::create::submit;
 use super::purge::{
-    PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, purge_range,
-    purge_rest, read,
+    PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, has_uploads,
+    purge_range, purge_rest, read,
 };
 use super::sign_statement;
 use super::status::read_view;
@@ -49,6 +49,8 @@ const PURGE_PAGES: usize = 32;
 /// How soon the next pass comes while lifecycle work waits.
 pub const LIFECYCLE_POLL: Duration = Duration::from_secs(5);
 const FENCE_ATTEMPTS: usize = 4;
+/// How long uploads opened before a transfer fence may still complete before they are aborted.
+const UPLOAD_GRACE_MS: u64 = 5 * 60 * 1000;
 /// The set marker after which the next pass continues; a restart begins at the first set.
 static MARKER_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
@@ -346,7 +348,8 @@ impl SetWork {
         self.clear_set(context, false, budget).await
     }
 
-    /// The former coordinator's side: fence the range, abort its uploads, state the fence.
+    /// The former coordinator's side: fence the range, let its open uploads complete for a
+    /// bounded grace period, abort the rest, then state the fence.
     async fn hand_over(
         &self,
         context: &Arc<DriverContext>,
@@ -363,8 +366,9 @@ impl SetWork {
             transfer_id: open.transfer_id,
             epoch: range.epoch,
             since_ms: unix_timestamp_millis(),
+            uploads_open: true,
         };
-        update_fence(context, self.set_id, |local| {
+        let fenced = update_fence(context, self.set_id, |local| {
             local.fence_range(fence.clone())
         })
         .await?;
@@ -375,7 +379,19 @@ impl SetWork {
         let Some(binding) = local.binding.clone() else {
             return Ok(Left::Waiting);
         };
-        if abort_range_uploads(context, &self.target(snapshot, &binding, range)).await? {
+        let target = self.target(snapshot, &binding, range);
+        if let Some(grace) = fenced.range(range.range_id).filter(|f| f.uploads_open) {
+            let ends = grace.since_ms.saturating_add(UPLOAD_GRACE_MS);
+            if unix_timestamp_millis() < ends && has_uploads(context, &target).await? {
+                return Ok(Left::Waiting);
+            }
+            // Closing conflicts every completion still in flight, so none commits after it.
+            update_fence(context, self.set_id, |local| {
+                local.close_uploads(range.range_id)
+            })
+            .await?;
+        }
+        if abort_range_uploads(context, &target).await? {
             return Ok(Left::Waiting);
         }
         let Some(counters) = range_counters(context, self.set_id, range.range_id).await? else {

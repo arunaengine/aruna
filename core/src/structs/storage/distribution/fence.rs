@@ -18,6 +18,8 @@ pub struct RangeFence {
     pub epoch: u64,
     /// Unix milliseconds when the fence was set.
     pub since_ms: u64,
+    /// Uploads opened before the fence may still complete; closing this ends the grace period.
+    pub uploads_open: bool,
 }
 
 /// What this node fenced for one set. Installing a snapshot never clears it.
@@ -44,11 +46,35 @@ impl LocalFence {
         range: &KeyRange,
         epoch: u64,
     ) -> Result<(), RouteError> {
+        self.check(snapshot, range, epoch, false)
+    }
+
+    /// Whether the completion of an open upload may commit: as [`Self::check_write`], except
+    /// that a range fence still in its upload grace period lets it pass.
+    pub fn check_completion(
+        &self,
+        snapshot: &DistributionSnapshot,
+        range: &KeyRange,
+        epoch: u64,
+    ) -> Result<(), RouteError> {
+        self.check(snapshot, range, epoch, true)
+    }
+
+    fn check(
+        &self,
+        snapshot: &DistributionSnapshot,
+        range: &KeyRange,
+        epoch: u64,
+        completion: bool,
+    ) -> Result<(), RouteError> {
         if self.deletion.is_some() {
             return Err(RouteError::Deleting(snapshot.set_id()));
         }
-        let fenced = (self.ranges.iter())
-            .any(|fence| fence.epoch >= epoch && snapshot.descends(range, fence.range_id));
+        let fenced = (self.ranges.iter()).any(|fence| {
+            !(completion && fence.uploads_open)
+                && fence.epoch >= epoch
+                && snapshot.descends(range, fence.range_id)
+        });
         match fenced {
             true => Err(RouteError::Moving(range.range_id)),
             false => Ok(()),
@@ -74,6 +100,12 @@ impl LocalFence {
         self.ranges.retain(|known| known.range_id != fence.range_id);
         self.ranges.push(fence);
         true
+    }
+
+    /// Ends the upload grace period of `range_id`; `false` when it was already over.
+    pub fn close_uploads(&mut self, range_id: Ulid) -> bool {
+        let fence = (self.ranges.iter_mut()).find(|fence| fence.range_id == range_id);
+        fence.is_some_and(|fence| std::mem::replace(&mut fence.uploads_open, false))
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {

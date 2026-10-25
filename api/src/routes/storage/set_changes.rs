@@ -242,7 +242,8 @@ pub async fn leave_distributed(
 - Only a ready `copy` replica of the range can take it; a refusal names the eligible members.
 - The new coordinator takes a fresh epoch above every epoch of the set.
 - The current coordinator fences the range: writes to it fail with a retryable "range moving"
-  until the transfer activates. Open uploads of the range are aborted.
+  until the transfer activates. Multipart uploads of the range opened before the fence may
+  still complete for up to 5 minutes; the rest are aborted.
 - The new coordinator completes once its copy holds everything up to the fence; then it
   writes the range and the former coordinator forwards to it.
 - With role `leave` the former coordinator removes its copy once the new one and every

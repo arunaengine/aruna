@@ -8,7 +8,7 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
-use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
+use crate::distribution::guard::{GuardError, WriteAuthority, record_completion, record_read};
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, InventoryUpdate, stamp_head, stamp_version, version_written,
 };
@@ -1122,7 +1122,8 @@ impl CompleteUploadOperation {
         let Some(binding) = self.binding.as_ref() else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
-        match record_authority(binding, &self.input.key, event) {
+        // An upload opened before its range was fenced may still complete during the grace.
+        match record_completion(binding, &self.input.key, event) {
             Ok(authority) => {
                 self.version_epoch = authority.epoch;
                 self.authority = Some(authority);

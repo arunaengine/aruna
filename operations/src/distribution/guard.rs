@@ -50,6 +50,8 @@ pub struct WriteAuthority {
     pub binding: DistributionBinding,
     pub range_id: Ulid,
     pub epoch: OriginalEpoch,
+    /// The write completes an open upload, which a fence in its grace period still admits.
+    pub completion: bool,
 }
 
 /// The set's record and its local fence row, in this order.
@@ -122,12 +124,26 @@ pub fn write_target(
     record: Option<&[u8]>,
     fence: Option<&[u8]>,
 ) -> Result<WriteRoute, GuardError> {
+    target_for(binding, key, (record, fence), false)
+}
+
+/// [`write_target`]; a `completion` of an open upload passes a fence in its grace period.
+fn target_for(
+    binding: &DistributionBinding,
+    key: &str,
+    (record, fence): (Option<&[u8]>, Option<&[u8]>),
+    completion: bool,
+) -> Result<WriteRoute, GuardError> {
     let view = bound_record(binding, record)?;
     let snapshot = view.snapshot();
     let route = snapshot.write_route(binding.member_id, key)?;
     if let WriteRoute::Local { epoch, .. } = &route {
         let range = (snapshot.range_for(key)).ok_or(RouteError::NoRange(binding.set_id))?;
-        LocalFence::decode(fence)?.check_write(snapshot, range, epoch.0)?;
+        let fence = LocalFence::decode(fence)?;
+        match completion {
+            true => fence.check_completion(snapshot, range, epoch.0)?,
+            false => fence.check_write(snapshot, range, epoch.0)?,
+        }
     }
     Ok(route)
 }
@@ -139,11 +155,21 @@ pub fn write_authority(
     record: Option<&[u8]>,
     fence: Option<&[u8]>,
 ) -> Result<WriteAuthority, GuardError> {
-    match write_target(binding, key, record, fence)? {
+    authority_for(binding, key, (record, fence), false)
+}
+
+fn authority_for(
+    binding: &DistributionBinding,
+    key: &str,
+    rows: (Option<&[u8]>, Option<&[u8]>),
+    completion: bool,
+) -> Result<WriteAuthority, GuardError> {
+    match target_for(binding, key, rows, completion)? {
         WriteRoute::Local { range_id, epoch } => Ok(WriteAuthority {
             binding: binding.clone(),
             range_id,
             epoch,
+            completion,
         }),
         WriteRoute::Forward {
             range_id, node_id, ..
@@ -167,7 +193,7 @@ pub fn check_authority(
     let binding = &authority.binding;
     let view = bound_record(binding, record)?;
     let snapshot = view.snapshot();
-    let current = write_authority(binding, key, record, fence)?;
+    let current = authority_for(binding, key, (record, fence), authority.completion)?;
     let range = (snapshot.range_for(key)).ok_or(RouteError::NoRange(binding.set_id))?;
     if current.epoch != authority.epoch || !snapshot.descends(range, authority.range_id) {
         return Err(RouteError::StaleRange(authority.range_id).into());
@@ -413,6 +439,16 @@ pub fn record_authority(
 ) -> Result<WriteAuthority, GuardError> {
     let (record, fence) = authority_rows(event)?;
     write_authority(binding, key, record.as_deref(), fence.as_deref())
+}
+
+/// Reads the authority of an upload completion from the answer to [`record_read`].
+pub fn record_completion(
+    binding: &DistributionBinding,
+    key: &str,
+    event: Event,
+) -> Result<WriteAuthority, GuardError> {
+    let (record, fence) = authority_rows(event)?;
+    authority_for(binding, key, (record.as_deref(), fence.as_deref()), true)
 }
 
 /// Reads the epoch from the answer to [`record_read`].

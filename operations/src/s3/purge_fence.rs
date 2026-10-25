@@ -297,6 +297,7 @@ mod tests {
             transfer_id: Ulid::from_bytes([2; 16]),
             epoch: authority.epoch.0,
             since_ms: 0,
+            uploads_open: false,
         });
         let fenced = answer(bytes, Some(fence.to_bytes().unwrap()));
         assert_eq!(
