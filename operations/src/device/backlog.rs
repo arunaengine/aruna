@@ -300,11 +300,11 @@ mod tests {
         let (running, peak, seen) = (Arc::default(), Arc::default(), Arc::default());
         let queue = GateQueue {
             pages: vec![
-                (0..3).map(|id| entry(id, false)).collect(),
-                (3..6)
+                (0..6)
                     .map(|id| entry(id, false))
                     .chain([entry(5_000, false)])
                     .collect(),
+                (6..9).map(|id| entry(id, false)).collect(),
             ],
             gate: Arc::new(Barrier::new(3)),
             running: Arc::clone(&running),
@@ -316,6 +316,6 @@ mod tests {
         assert_eq!(running.load(Ordering::SeqCst), 0);
         let mut seen = seen.lock().unwrap().clone();
         seen.sort_unstable();
-        assert_eq!(seen, (0..6).collect::<Vec<_>>());
+        assert_eq!(seen, (0..9).collect::<Vec<_>>());
     }
 }
