@@ -3105,3 +3105,83 @@ async fn database_waits_group() {
         "{validation:?}"
     );
 }
+
+#[tokio::test]
+async fn database_applies_inbound() {
+    // A received database mark applies and leaves the topic open for the next event.
+    use aruna_core::structs::identity::database::{DatabaseEntry, DatabaseTarget};
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([62; 32]);
+    let actor = test_actor(
+        13,
+        UserId::local(Ulid::from_parts(1_650, 1), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
+    let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            document_target.clone(),
+            seed_config
+                .to_bytes(&actor)
+                .expect("config serializes")
+                .into(),
+        )],
+    )
+    .await
+    .expect("seed realm config writes");
+    let entry = DatabaseEntry {
+        entry_id: Ulid::from_parts(1_651, 1),
+        dataset_id: Ulid::from_parts(1_652, 1),
+        target: DatabaseTarget::Distributed {
+            set_id: Ulid::from_parts(1_653, 1),
+        },
+        owner_group: Ulid::from_parts(1_654, 1),
+    };
+    let ops = [
+        AdminDocumentOperation::DatabaseSet {
+            entry: entry.clone(),
+            predecessor: None,
+            consent: None,
+        },
+        AdminDocumentOperation::ConfigDescriptionSet {
+            description: "After Database".to_string(),
+        },
+    ];
+    for (seq, op) in (1..).zip(ops) {
+        let event = test_admin_event(
+            Ulid::from_parts(1_655 + seq, 1),
+            target.clone(),
+            &actor,
+            seq,
+            op,
+        );
+        apply_admin_operation(&storage, document_target.clone(), event)
+            .await
+            .expect("realm config event applies");
+    }
+    let config = stored_realm_config(&storage, realm_id).await;
+    assert_eq!(config.databases, vec![entry.clone()]);
+    assert_eq!(config.description, "After Database");
+
+    let removal = test_admin_event(
+        Ulid::from_parts(1_658, 1),
+        target,
+        &actor,
+        3,
+        AdminDocumentOperation::DatabaseRemoved {
+            entry_id: entry.entry_id,
+        },
+    );
+    apply_admin_operation(&storage, document_target, removal)
+        .await
+        .expect("database removal applies");
+    assert!(
+        stored_realm_config(&storage, realm_id)
+            .await
+            .databases
+            .is_empty()
+    );
+}

@@ -823,6 +823,8 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::ConfigComputeSet { .. }
             | AdminDocumentOperation::ConfigFederationSet { .. }
             | AdminDocumentOperation::ConfigPortalSet { .. }
+            | AdminDocumentOperation::DatabaseSet { .. }
+            | AdminDocumentOperation::DatabaseRemoved { .. }
             | AdminDocumentOperation::ConfigTokenRevoked { .. }
     )
 }
@@ -1416,7 +1418,7 @@ async fn apply_realm_config(
     let realm_id = validate_config_target(&document_target, &event)?;
     if !config_mutation_allowed(&event.op) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, federation updates, and token revocations"
+            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, federation updates, portal updates, database updates, and token revocations"
                 .to_string(),
         ));
     }
