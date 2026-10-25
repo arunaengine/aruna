@@ -550,7 +550,7 @@ pub(crate) async fn finish_unbind(
         clear_rows(context, key_space, folder_id).await?;
     }
     // The offer keeps the bucket read-only for clients until the bucket is gone.
-    delete_local_bucket(context, &folder, node_id).await?;
+    delete_local_bucket(context, &folder, node_id, CLEANUP_LIMIT).await?;
     match withdraw_offer(
         context,
         WithdrawOfferInput {
@@ -584,32 +584,40 @@ pub(crate) async fn finish_unbind(
     Ok(())
 }
 
-/// Deletes the folder's device-local bucket and every version left in it. A bucket that is
-/// already gone, or was never created, counts as deleted.
+/// Uploads and versions one cleanup pass removes at most, so writes that keep arriving cannot
+/// hold the folder lock. Anything left fails the bucket delete, and the next pass goes on.
+const CLEANUP_LIMIT: usize = 16_000;
+
+/// Deletes the folder's device-local bucket and every version left in it, removing at most
+/// `limit` uploads and `limit` versions. A bucket that is already gone, or was never created,
+/// counts as deleted.
 async fn delete_local_bucket(
     context: &DriverContext,
     folder: &SyncedFolder,
     node_id: NodeId,
+    limit: usize,
 ) -> Result<(), FolderError> {
     let bucket = &folder.local_bucket;
     // Checked first, so the routine missing bucket is not logged as a failed delete.
     if read_bucket(context, bucket).await?.is_none() {
         return Ok(());
     }
-    abort_uploads(context, bucket).await?;
-    loop {
+    abort_uploads(context, bucket, limit).await?;
+    let mut left = limit;
+    while left > 0 {
         let listing = ListVersionsOperation::new(ListVersionsInput {
             bucket: bucket.clone(),
             prefix: None,
             delimiter: None,
             key_marker: None,
             version_id_marker: None,
-            max_keys: None,
+            max_keys: Some(left.min(ListVersionsOperation::DEFAULT_MAX_KEYS)),
         });
         let page = drive(listing, context).await?;
         if page.items.is_empty() {
             break;
         }
+        left = left.saturating_sub(page.items.len());
         let entries = page
             .items
             .into_iter()
@@ -647,17 +655,22 @@ async fn delete_local_bucket(
     }
 }
 
-/// Aborts every multipart upload left in `bucket`, page by page. An upload still being completed
-/// fails this pass, so the next pass retries once it is done or its lease is stale.
-async fn abort_uploads(context: &DriverContext, bucket: &str) -> Result<(), FolderError> {
-    loop {
+/// Aborts up to `limit` multipart uploads left in `bucket`, page by page. An upload still being
+/// completed fails this pass, so the next pass retries once it is done or its lease is stale.
+async fn abort_uploads(
+    context: &DriverContext,
+    bucket: &str,
+    limit: usize,
+) -> Result<(), FolderError> {
+    let mut left = limit;
+    while left > 0 {
         let listing = ListUploadsOperation::new(ListUploadsInput {
             bucket: bucket.to_string(),
             prefix: None,
             delimiter: None,
             key_marker: None,
             upload_id_marker: None,
-            max_uploads: ListUploadsOperation::DEFAULT_MAX_UPLOADS,
+            max_uploads: left.min(ListUploadsOperation::DEFAULT_MAX_UPLOADS),
         })
         .including_in_progress()
         .complete_scan();
@@ -665,6 +678,7 @@ async fn abort_uploads(context: &DriverContext, bucket: &str) -> Result<(), Fold
         if page.uploads.is_empty() {
             return Ok(());
         }
+        left = left.saturating_sub(page.uploads.len());
         for upload in page.uploads {
             let resume = upload.status == MultipartUploadStatus::Aborting;
             let mut abort = AbortUploadOperation::new(AbortUploadInput {
@@ -682,6 +696,7 @@ async fn abort_uploads(context: &DriverContext, bucket: &str) -> Result<(), Fold
             }
         }
     }
+    Ok(())
 }
 
 /// Deletes every row one folder owns in a keyspace, page by page.
@@ -1126,6 +1141,38 @@ mod tests {
                 "{attempt}"
             );
         }
+    }
+
+    // A pass stops at its limit, so writes that keep arriving cannot hold the folder lock. The
+    // leftover upload fails the bucket delete, and the next pass deletes the bucket.
+    #[tokio::test]
+    async fn limits_cleanup_pass() {
+        use crate::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+        use aruna_core::structs::storage::routing::RoutingSnapshot;
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = Arc::new(fixture.driver_context);
+        let (_root, folder, _) = offered_folder(&context).await;
+        let second = CreateMultipartOperation::new(CreateMultipartInput {
+            bucket: folder.local_bucket.clone(),
+            key: "later.bin".to_string(),
+            group_id: folder.group_id,
+            created_by: folder.created_by,
+            checksum_hint: None,
+            routing: RoutingSnapshot::single(folder.group_id),
+        });
+        drive(second, &context).await.expect("second upload opened");
+
+        assert!(matches!(
+            delete_local_bucket(&context, &folder, node(), 1).await,
+            Err(FolderError::DeleteBucket(DeleteBucketError::NotEmpty))
+        ));
+        assert!(!bucket_gone(&context, &folder.local_bucket).await);
+        assert_eq!(
+            delete_local_bucket(&context, &folder, node(), 1).await,
+            Ok(())
+        );
+        assert!(bucket_gone(&context, &folder.local_bucket).await);
     }
 
     // A deleting folder's bucket without an offer, as after a crash before the offer was stored,
