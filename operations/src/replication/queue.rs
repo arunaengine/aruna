@@ -1259,6 +1259,15 @@ pub async fn process_blob_batch(
                 delete_blob_job(&context.storage_handle, job_key).await?;
                 succeeded = succeeded.saturating_add(1);
             }
+            // A member job ends only once delivered or no longer owed: a bootstrap counts a
+            // deleted job as delivered, so a refusal retries instead.
+            Ok(BlobJobOutcome::TerminalFailure) if job.distribution.is_some() => {
+                let refused = "the member did not take the version".to_string();
+                let retry_due_at =
+                    reschedule_blob_job(&context.storage_handle, job_key, &job, refused).await?;
+                next_due_ms = min_due_at(next_due_ms, retry_due_at);
+                failed = failed.saturating_add(1);
+            }
             Ok(BlobJobOutcome::TerminalFailure) => {
                 delete_blob_job(&context.storage_handle, job_key).await?;
                 failed = failed.saturating_add(1);
@@ -3449,6 +3458,43 @@ mod tests {
 
         assert_eq!(result.succeeded, 1);
         assert!(read_jobs(&storage).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refused_member_retries() {
+        // A member job that fails terminally stays queued, so a bootstrap never counts it
+        // as delivered.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let mut job = BlobJobRecord::new(on_demand_input(), None, 0).with_member(MemberTarget {
+            set_id: Ulid::from_parts(3, 3),
+            member_id: Ulid::from_parts(4, 4),
+        });
+        job.reference_advance = Some(reference_advance());
+        let (key_space, key, value) = blob_job_entry(&job).unwrap();
+        let write = StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+
+        let result = process_blob_batch(&context).await.expect("batch runs");
+
+        assert_eq!(result.failed, 1);
+        let jobs = read_jobs(&storage).await;
+        assert_eq!(jobs.len(), 1, "the refused member job stays queued");
+        assert_eq!(jobs[0].1.attempts, 1);
     }
 
     #[tokio::test]
