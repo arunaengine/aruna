@@ -199,7 +199,15 @@ impl SetWork {
         else {
             return Ok(Left::Settled);
         };
-        let binding = self.binding(context, snapshot, member).await?;
+        let bound = self.binding(context, snapshot).await?;
+        if let Some(left) = bound
+            .as_ref()
+            .filter(|binding| replaced(snapshot, member, binding))
+        {
+            // A replaced member's departure finishes before the new member's work.
+            return self.depart(context, snapshot, left, budget).await;
+        }
+        let binding = bound.filter(|binding| owns(self.set_id, member, binding));
         let local = Local { member, binding };
         if snapshot.lifecycle.deletion.is_some() {
             return self.delete(context, snapshot, &local, budget).await;
@@ -221,12 +229,11 @@ impl SetWork {
         Ok(left)
     }
 
-    /// The local bucket's binding, only while it is this member's bucket.
+    /// The local bucket's binding to this set.
     async fn binding(
         &self,
         context: &DriverContext,
         snapshot: &DistributionSnapshot,
-        member: &DistributionMember,
     ) -> Result<Option<DistributionBinding>, String> {
         let bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
         let Ok(info) = drive(bucket, context).await else {
@@ -234,7 +241,28 @@ impl SetWork {
         };
         Ok(info
             .distribution
-            .filter(|binding| owns(self.set_id, member, binding)))
+            .filter(|binding| binding.set_id == self.set_id))
+    }
+
+    /// Releases the bucket of a member a join replaced: fences it and clears the set's rows,
+    /// then unbinds it and drops the fence in one transaction.
+    async fn depart(
+        &self,
+        context: &DriverContext,
+        snapshot: &DistributionSnapshot,
+        binding: &DistributionBinding,
+        budget: &mut usize,
+    ) -> Result<Left, String> {
+        update_fence(context, self.set_id, |fence| {
+            !std::mem::replace(&mut fence.closed, true)
+        })
+        .await?;
+        if self.clear_set(context, true, budget).await? == Left::Waiting {
+            return Ok(Left::Waiting);
+        }
+        unbind(context, &snapshot.config.bucket, binding, true).await?;
+        // The new member's work follows in the next pass.
+        Ok(Left::Waiting)
     }
 
     /// Fences the whole set, states it as a coordinator, and purges once it is committed.
@@ -343,7 +371,7 @@ impl SetWork {
                 !std::mem::replace(&mut fence.closed, true)
             })
             .await?;
-            unbind(context, &snapshot.config.bucket, binding).await?;
+            unbind(context, &snapshot.config.bucket, binding, false).await?;
         }
         // The released bucket checks no fence; a later join of this node starts afresh.
         self.clear_set(context, false, budget).await
@@ -538,6 +566,16 @@ impl SetWork {
 
 /// Whether `binding` names the bucket of `member`: same set and member at its admitted
 /// incarnation. A member that never admitted owns the bucket it created, whatever incarnation.
+/// Whether `binding` names a former member of this node that a join replaced.
+fn replaced(
+    snapshot: &DistributionSnapshot,
+    member: &DistributionMember,
+    binding: &DistributionBinding,
+) -> bool {
+    binding.member_id != member.member_id
+        && snapshot.tombstoned(binding.member_id, binding.incarnation)
+}
+
 fn owns(set_id: Ulid, member: &DistributionMember, binding: &DistributionBinding) -> bool {
     binding.set_id == set_id
         && binding.member_id == member.member_id
@@ -636,11 +674,13 @@ pub(super) async fn update_fence(
     Err("the fence row kept changing concurrently".to_string())
 }
 
-/// Releases the member bucket as an ordinary bucket, only while it carries `binding`.
+/// Releases the member bucket as an ordinary bucket, only while it carries `binding`; with
+/// `drop_fence` the set's fence row goes in the same transaction.
 async fn unbind(
     context: &DriverContext,
     bucket: &str,
     binding: &DistributionBinding,
+    drop_fence: bool,
 ) -> Result<(), String> {
     let storage = &context.storage_handle;
     let started = storage
@@ -684,6 +724,14 @@ async fn unbind(
         txn_id: Some(txn_id),
     };
     storage.send_storage_effect(write).await;
+    if drop_fence {
+        let delete = StorageEffect::Delete {
+            key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+            key: LocalFence::key(binding.set_id).into(),
+            txn_id: Some(txn_id),
+        };
+        storage.send_storage_effect(delete).await;
+    }
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
@@ -722,6 +770,78 @@ mod tests {
             ..bound(6)
         };
         assert!(!owns(set_id, &member, &other));
+    }
+
+    #[tokio::test]
+    async fn replaced_member_departs() {
+        // A join replaced this node's member 3 before its bucket was released.
+        use crate::distribution::test_record::{realm, replicated, secret, store_record};
+        use crate::distribution::test_store::{context, get, open};
+        use aruna_core::structs::storage::distribution::snapshot::Tombstone;
+        use aruna_core::structs::storage::distribution::{DistributionView, SignedSnapshot};
+        let (mut snapshot, _) = replicated(true, 1);
+        let set_id = snapshot.set_id();
+        snapshot.tombstones.push(Tombstone {
+            member_id: Ulid::from_bytes([3; 16]),
+            incarnation: 5,
+        });
+        let view = DistributionView {
+            head: SignedSnapshot::sign(snapshot.clone(), realm(), &secret(1)).unwrap(),
+            conflict: None,
+        };
+        let (_dir, handle) = open();
+        store_record(&handle, set_id, view.to_bytes().unwrap()).await;
+        let left = DistributionBinding {
+            member_id: Ulid::from_bytes([3; 16]),
+            ..crate::distribution::test_record::binding(&snapshot, 2, 5)
+        };
+        let info = BucketInfo {
+            group_id: snapshot.config.owner_group,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: Some(left),
+        };
+        let account = account_key(set_id, snapshot.config.ranges[0].range_id);
+        for (space, key, value) in [
+            (
+                S3_BUCKET_KEYSPACE,
+                b"spire".to_vec(),
+                info.to_bytes().unwrap(),
+            ),
+            (RANGE_ACCOUNT_KEYSPACE, account.clone(), vec![1]),
+        ] {
+            let write = StorageEffect::Write {
+                key_space: space.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            };
+            handle.send_storage_effect(write).await;
+        }
+        let context = Arc::new(context(&handle));
+        let work = SetWork {
+            realm_id: realm(),
+            local: secret(2).public(),
+            set_id,
+        };
+        assert_eq!(work.run(&context, &mut 64).await, Ok(Left::Waiting));
+        let stored = get(&handle, S3_BUCKET_KEYSPACE, b"spire".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(BucketInfo::from_bytes(&stored).unwrap().distribution, None);
+        assert_eq!(get(&handle, RANGE_ACCOUNT_KEYSPACE, account).await, None);
+        let fence = get(
+            &handle,
+            DISTRIBUTION_FENCE_KEYSPACE,
+            LocalFence::key(set_id),
+        )
+        .await;
+        assert_eq!(fence, None, "the new member starts without the old fence");
     }
 
     #[test]

@@ -123,12 +123,18 @@ impl DistributionSnapshot {
         ranges.chain(transfers).max().unwrap_or_default()
     }
 
-    /// Whether the record holds work a node does on its own: an open transfer, a deletion or a
-    /// leaving member.
+    /// Whether the record holds work a node does on its own: an open transfer, a deletion, a
+    /// leaving member, or a created member that may replace one whose bucket is not released.
     pub fn lifecycle_open(&self) -> bool {
+        let members = self.config.members.iter();
+        let replacing = !self.tombstones.is_empty()
+            && (members.clone()).any(|member| member.state == MemberState::Created);
         !self.lifecycle.transfers.is_empty()
             || self.lifecycle.deletion.is_some()
-            || (self.config.members.iter()).any(|member| member.state == MemberState::Leaving)
+            || replacing
+            || members
+                .into_iter()
+                .any(|member| member.state == MemberState::Leaving)
     }
 
     /// Whether the set deleted or released this member incarnation.

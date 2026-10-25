@@ -183,6 +183,11 @@ fn leaving_member_rejoins() {
         rejoined.member(member_id(4)).unwrap().state,
         MemberState::Created
     );
+    assert!(
+        rejoined.lifecycle_open(),
+        "the node still releases the replaced member's bucket"
+    );
+    assert!(!active().lifecycle_open());
 }
 
 #[test]
