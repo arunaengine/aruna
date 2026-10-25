@@ -135,6 +135,7 @@ pub fn refusal_reason(refusal: &SyncRefusal) -> String {
         SyncRefusal::NotFound => "the realm does not know this document".to_string(),
         SyncRefusal::Invalid(reason) => reason.clone(),
         SyncRefusal::Unavailable => "no holder could serve this document".to_string(),
+        SyncRefusal::Coordinator(node) => format!("node {node} coordinates this key"),
     }
 }
 

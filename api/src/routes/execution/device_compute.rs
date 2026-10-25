@@ -202,7 +202,7 @@ fn map_publish_error(error: PublishRunError) -> ServerError {
         } => ServerError::Forbidden,
         PublishRunError::Unreachable(_) => ServerError::BadGatewayReason(error.to_string()),
         PublishRunError::Refused {
-            refusal: SyncRefusal::Unavailable,
+            refusal: SyncRefusal::Unavailable | SyncRefusal::Coordinator(_),
             ..
         }
         | PublishRunError::Crate(_)

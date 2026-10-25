@@ -371,6 +371,7 @@ fn refusal_text(refusal: &SyncRefusal) -> String {
         SyncRefusal::NotFound => "the member node does not know this member".to_string(),
         SyncRefusal::Invalid(reason) => reason.clone(),
         SyncRefusal::Unavailable => "the member node is unreachable or busy; retry".to_string(),
+        SyncRefusal::Coordinator(node) => format!("node {node} coordinates this key"),
     }
 }
 

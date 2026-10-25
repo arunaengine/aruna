@@ -14,6 +14,7 @@ use aruna_core::keyspaces::SYNC_RECEIPT_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::storage::distribution::{RouteError, WriteRoute};
 use aruna_core::structs::{
     ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
     SyncPullAck, SyncPullStatus, SyncRefusal, SyncVersionPage,
@@ -25,6 +26,7 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::distribution::guard::{GuardError, route_write};
 use crate::driver::{DriverContext, drive, routing_snapshot};
 use crate::forward::authorize::peer_acts_for;
 use crate::metadata::handle::WritePeerError;
@@ -226,6 +228,7 @@ async fn admit_pull(
     let node_id = local_node(context)?;
     let bucket = read_bucket(context, &request.target_bucket).await?;
     guard_target(context, &request.target_bucket).await?;
+    coordinates(context, &bucket, &request.target_key).await?;
     ensure_write(context, &auth, node_id, &bucket, request).await?;
     Ok((auth, node_id, bucket))
 }
@@ -239,6 +242,30 @@ async fn guard_target(context: &DriverContext, bucket: &str) -> Result<(), SyncR
             debug!(error = %error, bucket = %bucket, "A sync pull could not check its target bucket");
             Err(SyncRefusal::Unavailable)
         }
+    }
+}
+
+/// Only the coordinator of the key's range writes a distributed bucket; the device takes the
+/// pull there, since the pull reads the device's bytes under its own peer identity.
+async fn coordinates(
+    context: &Arc<DriverContext>,
+    bucket: &BucketInfo,
+    key: &str,
+) -> Result<(), SyncRefusal> {
+    let Some(binding) = bucket.distribution.as_ref() else {
+        return Ok(());
+    };
+    match route_write(context, binding, key).await {
+        Ok(WriteRoute::Local { .. }) => Ok(()),
+        Ok(WriteRoute::Forward { node_id, .. }) => Err(SyncRefusal::Coordinator(node_id)),
+        Err(
+            GuardError::RecordMissing(_)
+            | GuardError::Unreadable(_)
+            | GuardError::Route(
+                RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
+            ),
+        ) => Err(SyncRefusal::Unavailable),
+        Err(error) => Err(SyncRefusal::Invalid(error.to_string())),
     }
 }
 
@@ -641,6 +668,7 @@ pub(crate) fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
         SyncRefusal::NotFound => "not_found",
         SyncRefusal::Invalid(_) => "invalid",
         SyncRefusal::Unavailable => "unavailable",
+        SyncRefusal::Coordinator(_) => "coordinator",
     }
 }
 
@@ -1213,5 +1241,23 @@ mod tests {
         assert_eq!(listing_prefix("notes/"), "notes/");
         assert_eq!(relative_key("notesbook/x", "notes"), None);
         assert_eq!(relative_key("x", "").as_deref(), Some("x"));
+    }
+
+    #[tokio::test]
+    async fn pulls_move_to_coordinator() {
+        use crate::distribution::test_record::{binding, record, secret, store_record};
+        let fixture = policy_fixture(None).await;
+        let (snapshot, bytes) = record(true);
+        store_record(&fixture.context.storage_handle, snapshot.set_id(), bytes).await;
+        let mut bucket = bucket_info(fixture.group_id, fixture.auth.user_id);
+        bucket.distribution = Some(binding(&snapshot, 1, 5));
+        assert_eq!(coordinates(&fixture.context, &bucket, "a").await, Ok(()));
+        assert_eq!(
+            coordinates(&fixture.context, &bucket, "x").await,
+            Err(SyncRefusal::Coordinator(secret(2).public())),
+            "member 2 coordinates the upper range"
+        );
+        let ordinary = bucket_info(fixture.group_id, fixture.auth.user_id);
+        assert_eq!(coordinates(&fixture.context, &ordinary, "x").await, Ok(()));
     }
 }

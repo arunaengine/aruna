@@ -637,6 +637,9 @@ pub enum SyncRefusal {
     NotFound,
     Invalid(String),
     Unavailable,
+    /// The target key belongs to a range of a distributed bucket that this node does not
+    /// coordinate; the named coordinator node takes the pull.
+    Coordinator(crate::NodeId),
 }
 
 /// Where a realm node stands with one sync pull. A pull is accepted at once and polled until
