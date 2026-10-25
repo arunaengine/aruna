@@ -268,13 +268,37 @@ pub async fn route_write(
     binding: &DistributionBinding,
     key: &str,
 ) -> Result<WriteRoute, GuardError> {
+    route_for(context, binding, key, false).await
+}
+
+/// Where a request on an open upload of `key` goes; a range fence in its upload grace period
+/// keeps it on this node, so the upload can still complete.
+pub async fn route_upload(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+) -> Result<WriteRoute, GuardError> {
+    route_for(context, binding, key, true).await
+}
+
+async fn route_for(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+    completion: bool,
+) -> Result<WriteRoute, GuardError> {
     let read = StorageEffect::BatchRead {
         reads: authority_reads(binding.set_id),
         txn_id: None,
     };
     let event = context.storage_handle.send_storage_effect(read).await;
     let (record, fence) = authority_rows(event)?;
-    write_target(binding, key, record.as_deref(), fence.as_deref())
+    target_for(
+        binding,
+        key,
+        (record.as_deref(), fence.as_deref()),
+        completion,
+    )
 }
 
 /// This node's record of the bound set, when the bucket is still the admitted member.

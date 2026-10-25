@@ -17,7 +17,7 @@ use aruna_core::structs::storage::distribution::upload::UploadTag;
 use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
 use aruna_operations::distribution::delegate::{DelegationInput, issue_delegation, node_urls};
 use aruna_operations::distribution::guard::{
-    GuardError, route_read, route_write, upload_route, upload_tag, upload_tags,
+    GuardError, route_read, route_upload, route_write, upload_route, upload_tag, upload_tags,
 };
 use aruna_operations::distribution::status::node_reach;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
@@ -334,13 +334,38 @@ impl ArunaS3Service {
         bucket: Option<&BucketInfo>,
         key: &str,
     ) -> S3Result<Option<Forward>> {
+        self.forward_for(extensions, bucket, key, false).await
+    }
+
+    /// The coordinator a request on an open upload of `key` goes to; a range fence in its
+    /// upload grace period keeps the request here, so the upload can still complete.
+    pub(super) async fn forward_upload(
+        &self,
+        extensions: &http::Extensions,
+        bucket: Option<&BucketInfo>,
+        key: &str,
+    ) -> S3Result<Option<Forward>> {
+        self.forward_for(extensions, bucket, key, true).await
+    }
+
+    async fn forward_for(
+        &self,
+        extensions: &http::Extensions,
+        bucket: Option<&BucketInfo>,
+        key: &str,
+        upload: bool,
+    ) -> S3Result<Option<Forward>> {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(None);
         };
         if extensions.get::<DelegatedRequest>().is_some() {
             return Ok(None);
         }
-        match route_write(self.state.as_ref(), binding, key).await {
+        let route = match upload {
+            true => route_upload(self.state.as_ref(), binding, key).await,
+            false => route_write(self.state.as_ref(), binding, key).await,
+        };
+        match route {
             Ok(WriteRoute::Local { .. }) => Ok(None),
             Ok(WriteRoute::Forward {
                 range_id, node_id, ..

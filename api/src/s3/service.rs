@@ -1376,7 +1376,7 @@ impl S3 for ArunaS3Service {
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let bucket_info = bucket_info.as_ref();
         if let Some(forward) = self
-            .forward_target(&req.extensions, bucket_info, &req.input.key)
+            .forward_upload(&req.extensions, bucket_info, &req.input.key)
             .await?
         {
             let body = req.input.body.take().map(|body| {
@@ -1541,7 +1541,7 @@ impl S3 for ArunaS3Service {
         // The upload belongs to the coordinator of its key's range.
         let dest_info = req.extensions.get::<BucketInfo>().cloned();
         if let Some(forward) = self
-            .forward_target(&req.extensions, dest_info.as_ref(), &req.input.key)
+            .forward_upload(&req.extensions, dest_info.as_ref(), &req.input.key)
             .await?
         {
             return match self
@@ -1638,7 +1638,7 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
         if let Some(forward) = self
-            .forward_target(&req.extensions, bucket_info.as_ref(), &req.input.key)
+            .forward_upload(&req.extensions, bucket_info.as_ref(), &req.input.key)
             .await?
         {
             let body = forward_parts::completion_body(req.input.multipart_upload.as_ref());
@@ -1799,7 +1799,7 @@ impl S3 for ArunaS3Service {
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>();
         if let Some(forward) = self
-            .forward_target(&req.extensions, bucket_info, &req.input.key)
+            .forward_upload(&req.extensions, bucket_info, &req.input.key)
             .await?
         {
             let request = forward::ForwardRequest {
@@ -2216,7 +2216,7 @@ impl S3 for ArunaS3Service {
         // Uploads live on the coordinator of the key's range, so their parts are listed there.
         let bucket_info = req.extensions.get::<BucketInfo>();
         if let Some(forward) = self
-            .forward_target(&req.extensions, bucket_info, &req.input.key)
+            .forward_upload(&req.extensions, bucket_info, &req.input.key)
             .await?
         {
             let request = forward::ForwardRequest {
