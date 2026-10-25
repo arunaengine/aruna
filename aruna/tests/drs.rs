@@ -150,9 +150,9 @@ async fn crowded_hash_conflicts() -> TestResult<()> {
         for index in 0..=MAX_HASH_ALIASES {
             let row = HashIndex::new(
                 hash,
-                Ulid::new(),
+                Ulid::generate(),
                 seed.realm_id,
-                Ulid::new(),
+                Ulid::generate(),
                 node_id,
                 "crowded",
                 format!("copy/{index}"),
