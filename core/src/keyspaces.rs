@@ -465,6 +465,12 @@ pub const CRAQLE_TERMS_KEYSPACE: &str = "terms";
 pub const CRAQLE_QUADS_KEYSPACE: &str = "quads";
 pub const CRAQLE_GRAPHS_KEYSPACE: &str = "graphs";
 pub const CRAQLE_LOG_KEYSPACE: &str = "log";
+/// The local fence row of each distributed bucket set by set id; publication transactions read it.
+pub const DISTRIBUTION_FENCE_KEYSPACE: &str = "distribution_fences";
+/// Sets whose record holds open lifecycle work for this node, by set id, until it is settled.
+pub const DISTRIBUTION_LIFECYCLE_KEYSPACE: &str = "distribution_lifecycle";
+/// Streaming purge cursors of distributed bucket ranges by set id and range id.
+pub const DISTRIBUTION_PURGE_KEYSPACE: &str = "distribution_purge";
 
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
@@ -714,6 +720,9 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ABE_DUE_KEYSPACE,
     ABE_REISSUE_KEYSPACE,
     ABE_REKEY_KEYSPACE,
+    DISTRIBUTION_FENCE_KEYSPACE,
+    DISTRIBUTION_LIFECYCLE_KEYSPACE,
+    DISTRIBUTION_PURGE_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

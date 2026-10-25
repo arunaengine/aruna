@@ -4,7 +4,7 @@
 
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
-use crate::distribution::guard::{record_read, write_epoch};
+use crate::distribution::guard::{authority_read, authority_rows, write_epoch};
 use crate::node::usage_stats::{UsageCounterUpdate, schedule_snapshot_publish};
 use crate::replication::queue::schedule_blob_drain;
 use crate::staging::page_rows::{
@@ -155,7 +155,10 @@ impl PageImportOperation {
                 Event::Storage(StorageEvent::BatchReadResult { values }),
             ) => {
                 let guards = check_guards(&self.input, values)?;
-                let record = guards.binding.as_ref().map(record_read);
+                // Read in the page transaction, so a fence or record set meanwhile conflicts.
+                let txn_id = self.txn_id;
+                let record =
+                    (guards.binding.as_ref()).map(|binding| authority_read(binding.set_id, txn_id));
                 self.guards = Some(guards);
                 match record {
                     Some(read) => {
@@ -167,8 +170,9 @@ impl PageImportOperation {
             }
             (
                 PageImportState::ReadRecord,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
+                event @ Event::Storage(StorageEvent::BatchReadResult { .. }),
             ) => {
+                let (record, fence) = authority_rows(event)?;
                 let guards = self.guards.as_mut().ok_or(PageImportError::NotFinished)?;
                 let binding = guards
                     .binding
@@ -179,7 +183,10 @@ impl PageImportOperation {
                     .input
                     .entries
                     .iter()
-                    .map(|entry| write_epoch(binding, &entry.target_key, value.as_deref()))
+                    .map(|entry| {
+                        let key = &entry.target_key;
+                        write_epoch(binding, key, record.as_deref(), fence.as_deref())
+                    })
                     .collect::<Result<_, _>>()?;
                 self.read_secret()
             }

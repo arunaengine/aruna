@@ -100,3 +100,17 @@ pub(crate) async fn store_record(
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
 }
+
+/// The answer to a record and fence read with these values.
+pub(crate) fn authority_rows(
+    record: Option<Vec<u8>>,
+    fence: Option<Vec<u8>>,
+) -> aruna_core::events::Event {
+    use aruna_core::events::{Event, StorageEvent};
+    Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (b"record".to_vec().into(), record.map(Into::into)),
+            (b"fence".to_vec().into(), fence.map(Into::into)),
+        ],
+    })
+}

@@ -8,7 +8,7 @@ use crate::blob::records::{
     delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,
     write_version_effect,
 };
-use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, stamp_head, stamp_version, version_written,
 };
@@ -424,8 +424,9 @@ impl DeleteObjectOperation {
         self.set_hint = self.binding.as_ref().map(DistributionBinding::hint);
         match self.binding.as_ref() {
             Some(binding) => {
+                // Read in the marker transaction, so a fence or record set meanwhile conflicts.
                 self.state = DeleteObjectState::ReadRecord;
-                smallvec![record_read(binding)]
+                smallvec![authority_read(binding.set_id, self.txn_id)]
             }
             None => self.write_tombstone(),
         }

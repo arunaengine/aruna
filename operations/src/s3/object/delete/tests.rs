@@ -1827,10 +1827,8 @@ fn marker_carries_hint() {
         }));
         if let Some(record) = record {
             assert_eq!(operation.state, DeleteObjectState::ReadRecord);
-            operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: vec![2u8].into(),
-                value: Some(record.into()),
-            }));
+            let answer = crate::distribution::test_record::authority_rows(Some(record), None);
+            operation.step(answer);
         }
         assert_ne!(operation.state, DeleteObjectState::Error);
         (
@@ -1854,10 +1852,10 @@ fn member_marker_refused() {
     let mut operation = audit_op(None);
     operation.binding = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     operation.state = DeleteObjectState::ReadRecord;
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![2u8].into(),
-        value: Some(bytes.into()),
-    }));
+    operation.step(crate::distribution::test_record::authority_rows(
+        Some(bytes),
+        None,
+    ));
     assert!(matches!(
         operation.finalize(),
         Err(DeleteObjectError::Distribution(

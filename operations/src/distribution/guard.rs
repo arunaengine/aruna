@@ -8,11 +8,13 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+use aruna_core::keyspaces::{DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE};
+use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::upload::UploadTag;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionView, OriginalEpoch, ReadRoute, RouteError, WriteRoute,
 };
+use aruna_core::types::{Key, TxnId, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -41,28 +43,65 @@ pub enum GuardError {
     Unreadable(String),
 }
 
-/// Reads the set's record outside any transaction; a write reads it before its bytes move.
+/// The authority one write was routed under: the member, the key's range and its epoch.
+/// Its publication transaction checks it again against the rows [`authority_reads`] names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriteAuthority {
+    pub binding: DistributionBinding,
+    pub range_id: Ulid,
+    pub epoch: OriginalEpoch,
+}
+
+/// The set's record and its local fence row, in this order.
+pub fn authority_reads(set_id: Ulid) -> Vec<(String, Key)> {
+    let key: Key = set_id.to_bytes().to_vec().into();
+    vec![
+        (DISTRIBUTION_KEYSPACE.to_string(), key.clone()),
+        (DISTRIBUTION_FENCE_KEYSPACE.to_string(), key),
+    ]
+}
+
+/// Reads the set's record and fence row; a write reads them before its bytes move, and with
+/// `txn_id` its publication transaction reads them again.
 pub fn record_read(binding: &DistributionBinding) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: DISTRIBUTION_KEYSPACE.to_string(),
-        key: binding.set_id.to_bytes().to_vec().into(),
-        txn_id: None,
+    authority_read(binding.set_id, None)
+}
+
+pub fn authority_read(set_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::BatchRead {
+        reads: authority_reads(set_id),
+        txn_id,
     })
 }
 
-/// Where a write to `key` goes, from the record bytes this node holds.
-pub fn write_target(
+/// The record and fence values from the answer to [`authority_read`].
+pub fn authority_rows(event: Event) -> Result<(Option<Value>, Option<Value>), GuardError> {
+    match event {
+        Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 2 => {
+            let mut values = values.into_iter().map(|(_, value)| value);
+            Ok((values.next().flatten(), values.next().flatten()))
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(GuardError::Unreadable(error.to_string()))
+        }
+        other => Err(GuardError::Unreadable(format!(
+            "unexpected answer {other:?}"
+        ))),
+    }
+}
+
+/// The record of the bound set, while this bucket is still its admitted member.
+fn bound_record(
     binding: &DistributionBinding,
-    key: &str,
     record: Option<&[u8]>,
-) -> Result<WriteRoute, GuardError> {
+) -> Result<DistributionView, GuardError> {
     let set_id = binding.set_id;
     let view = record
         .map(DistributionView::from_bytes)
         .transpose()?
         .ok_or(GuardError::RecordMissing(set_id))?;
-    let snapshot = view.snapshot();
-    let member = snapshot
+    let member = view
+        .snapshot()
         .member(binding.member_id)
         .ok_or(RouteError::NotMember(set_id))?;
     // A replaced local bucket of the name is never taken for the admitted member.
@@ -72,7 +111,68 @@ pub fn write_target(
     {
         return Err(GuardError::Unbound(set_id));
     }
-    Ok(snapshot.write_route(binding.member_id, key)?)
+    Ok(view)
+}
+
+/// Where a write to `key` goes, from the record and fence bytes this node holds. A range this
+/// node fenced refuses the write even while its record still names it as the coordinator.
+pub fn write_target(
+    binding: &DistributionBinding,
+    key: &str,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<WriteRoute, GuardError> {
+    let view = bound_record(binding, record)?;
+    let snapshot = view.snapshot();
+    let route = snapshot.write_route(binding.member_id, key)?;
+    if let WriteRoute::Local { epoch, .. } = &route {
+        let range = (snapshot.range_for(key)).ok_or(RouteError::NoRange(binding.set_id))?;
+        LocalFence::decode(fence)?.check_write(snapshot, range, epoch.0)?;
+    }
+    Ok(route)
+}
+
+/// The authority a write to `key` takes here, or why it may not write here.
+pub fn write_authority(
+    binding: &DistributionBinding,
+    key: &str,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<WriteAuthority, GuardError> {
+    match write_target(binding, key, record, fence)? {
+        WriteRoute::Local { range_id, epoch } => Ok(WriteAuthority {
+            binding: binding.clone(),
+            range_id,
+            epoch,
+        }),
+        WriteRoute::Forward {
+            range_id, node_id, ..
+        } => Err(GuardError::NotCoordinator {
+            set_id: binding.set_id,
+            range_id,
+            node_id,
+        }),
+    }
+}
+
+/// Checks inside a publication transaction that the write still holds `authority`: same
+/// incarnation, the key's range descends from the routed one at the same epoch, and no fence
+/// set since covers it. A fence or record written after this read conflicts the commit.
+pub fn check_authority(
+    authority: &WriteAuthority,
+    key: &str,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<(), GuardError> {
+    let binding = &authority.binding;
+    let view = bound_record(binding, record)?;
+    let snapshot = view.snapshot();
+    let current = write_authority(binding, key, record, fence)?;
+    let range = (snapshot.range_for(key)).ok_or(RouteError::NoRange(binding.set_id))?;
+    if current.epoch != authority.epoch || !snapshot.descends(range, authority.range_id) {
+        return Err(RouteError::StaleRange(authority.range_id).into());
+    }
+    Ok(())
 }
 
 /// Where a read of `key`, or with `listing` of every key under it, is answered.
@@ -130,17 +230,9 @@ pub fn write_epoch(
     binding: &DistributionBinding,
     key: &str,
     record: Option<&[u8]>,
+    fence: Option<&[u8]>,
 ) -> Result<OriginalEpoch, GuardError> {
-    match write_target(binding, key, record)? {
-        WriteRoute::Local { epoch, .. } => Ok(epoch),
-        WriteRoute::Forward {
-            range_id, node_id, ..
-        } => Err(GuardError::NotCoordinator {
-            set_id: binding.set_id,
-            range_id,
-            node_id,
-        }),
-    }
+    write_authority(binding, key, record, fence).map(|authority| authority.epoch)
 }
 
 /// Where a write to `key` of a bound bucket goes, from this node's record; transports use it
@@ -150,22 +242,13 @@ pub async fn route_write(
     binding: &DistributionBinding,
     key: &str,
 ) -> Result<WriteRoute, GuardError> {
-    let read = StorageEffect::Read {
-        key_space: DISTRIBUTION_KEYSPACE.to_string(),
-        key: binding.set_id.to_bytes().to_vec().into(),
+    let read = StorageEffect::BatchRead {
+        reads: authority_reads(binding.set_id),
         txn_id: None,
     };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            write_target(binding, key, value.as_deref())
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(GuardError::Unreadable(error.to_string()))
-        }
-        other => Err(GuardError::Unreadable(format!(
-            "unexpected answer {other:?}"
-        ))),
-    }
+    let event = context.storage_handle.send_storage_effect(read).await;
+    let (record, fence) = authority_rows(event)?;
+    write_target(binding, key, record.as_deref(), fence.as_deref())
 }
 
 /// This node's record of the bound set, when the bucket is still the admitted member.
@@ -322,23 +405,33 @@ pub async fn record_holders(
         .collect())
 }
 
+/// Reads the write authority from the answer to [`record_read`].
+pub fn record_authority(
+    binding: &DistributionBinding,
+    key: &str,
+    event: Event,
+) -> Result<WriteAuthority, GuardError> {
+    let (record, fence) = authority_rows(event)?;
+    write_authority(binding, key, record.as_deref(), fence.as_deref())
+}
+
 /// Reads the epoch from the answer to [`record_read`].
 pub fn record_epoch(
     binding: &DistributionBinding,
     key: &str,
     event: Event,
 ) -> Result<OriginalEpoch, GuardError> {
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            write_epoch(binding, key, value.as_deref())
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(GuardError::Unreadable(error.to_string()))
-        }
-        other => Err(GuardError::Unreadable(format!(
-            "unexpected answer {other:?}"
-        ))),
-    }
+    record_authority(binding, key, event).map(|authority| authority.epoch)
+}
+
+/// Checks `authority` from the answer to [`authority_read`] inside a publication transaction.
+pub fn authority_answer(
+    authority: &WriteAuthority,
+    key: &str,
+    event: Event,
+) -> Result<(), GuardError> {
+    let (record, fence) = authority_rows(event)?;
+    check_authority(authority, key, record.as_deref(), fence.as_deref())
 }
 
 #[cfg(test)]

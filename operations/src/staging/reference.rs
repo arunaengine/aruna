@@ -8,7 +8,7 @@ use crate::connectors::repository::{
     source_connector_key,
 };
 use crate::connectors::resolver::secret_fingerprint;
-use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
@@ -191,7 +191,9 @@ pub async fn write_reference_version(
         // Only the coordinator of the key's range writes, at its epoch.
         let epoch = match binding.as_ref() {
             Some(binding) => {
-                let event = send_storage_effect(context, record_read(binding)).await?;
+                // Read in the write transaction, so a fence set meanwhile conflicts it.
+                let read = authority_read(binding.set_id, Some(txn_id));
+                let event = send_storage_effect(context, read).await?;
                 record_epoch(binding, &write.key, event)?
             }
             None => Default::default(),

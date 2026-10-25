@@ -24,7 +24,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::connectors::repository::connector_reference_write;
-use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
@@ -271,15 +271,19 @@ impl MintSuccessorOperation {
                     .transpose()?;
                 match bucket.and_then(|bucket| bucket.distribution) {
                     Some(binding) => {
+                        // Read in the mint transaction, so a fence set meanwhile conflicts it.
                         self.state = MintState::ReadRecord;
-                        let read = record_read(&binding);
+                        let read = authority_read(binding.set_id, Some(self.txn_id));
                         self.pending = Some((values, binding));
                         Ok(smallvec![read])
                     }
                     None => self.write_successor(values, OriginalEpoch::default()),
                 }
             }
-            (MintState::ReadRecord, event @ Event::Storage(StorageEvent::ReadResult { .. })) => {
+            (
+                MintState::ReadRecord,
+                event @ Event::Storage(StorageEvent::BatchReadResult { .. }),
+            ) => {
                 let (values, binding) = self.pending.take().ok_or(StorageError::InvalidEffect)?;
                 let epoch = record_epoch(&binding, &self.refresh.key, event)?;
                 self.write_successor(values, epoch)

@@ -2750,14 +2750,12 @@ fn bound_put(seed: u8) -> (PutObjectOperation, aruna_core::types::Effects) {
         key: b"mybucket".to_vec().into(),
         value: Some(bucket.to_bytes().unwrap().into()),
     }));
-    let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-        panic!("a bound bucket reads its record first, got {effects:?}");
+    let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+        panic!("a bound bucket reads its record and fence first, got {effects:?}");
     };
-    assert_eq!(key_space, DISTRIBUTION_KEYSPACE);
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: snapshot.set_id().to_bytes().to_vec().into(),
-        value: Some(bytes.into()),
-    }));
+    assert_eq!(reads[0].0, DISTRIBUTION_KEYSPACE);
+    let answer = crate::distribution::test_record::authority_rows(Some(bytes), None);
+    let effects = op.step(answer);
     (op, effects)
 }
 

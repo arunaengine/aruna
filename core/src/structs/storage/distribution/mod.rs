@@ -14,6 +14,7 @@ pub mod accounting;
 pub mod bootstrap;
 pub mod delegation;
 pub mod delivery;
+pub mod fence;
 pub mod hint;
 pub mod inventory;
 pub mod on_use;

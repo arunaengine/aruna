@@ -9,7 +9,7 @@ use crate::blob::managed_copy::{
 };
 use crate::blob::records::HeadAliasContext;
 use crate::connectors::repository::connector_reference_write;
-use crate::distribution::guard::{GuardError, record_epoch, record_read};
+use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
@@ -427,8 +427,9 @@ impl SuccessorMint {
             });
         }
         if let Some(binding) = self.binding.as_ref() {
+            // Read inside the commit boundary, so a fence or record set meanwhile conflicts.
             self.state = MintState::ReadRecord;
-            return Ok(Some(smallvec![record_read(binding)]));
+            return Ok(Some(smallvec![authority_read(binding.set_id, txn_id)]));
         }
         self.read_version(txn_id)
     }
