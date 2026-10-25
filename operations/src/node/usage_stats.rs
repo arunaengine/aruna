@@ -8,29 +8,18 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
-    USAGE_STATS_KEYSPACE,
-};
+use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::storage::abe::envelope_charge;
-use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
-    BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
-};
+use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredLayout;
-use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::{
-    BucketCounters, BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, GLOBAL_SHARD_COUNT,
-    NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY,
-    USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX, USAGE_REBUILD_KEY, UsageCounterError, UsageCounters,
-    UsageDelta, dirty_group_id, dirty_group_key, global_group_key, global_shard_index,
-    global_shard_key, global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key,
-    usage_bucket_key, usage_global_key, usage_group_id, usage_group_key, usage_group_prefix,
-    usage_node_id, usage_snapshot_key, usage_summary_key,
+    BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
+    SUMMARY_GROUP_PREFIX, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX,
+    USAGE_REBUILD_KEY, UsageCounterError, UsageCounters, UsageDelta, dirty_group_id,
+    dirty_group_key, global_group_key, global_shard_key, global_shard_keys, shard_for_archive,
+    shard_for_hash, usage_backend_key, usage_bucket_key, usage_global_key, usage_group_id,
+    usage_group_key, usage_group_prefix, usage_node_id, usage_snapshot_key, usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -38,16 +27,17 @@ use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::abe::copies::copy_version;
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::driver::{DriverContext, drive};
 use crate::storage_read::scan_all;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+
+pub use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
@@ -779,604 +769,6 @@ fn sum_global_usage(values: Vec<(Key, Option<Value>)>) -> Result<UsageCounters, 
     Ok(total)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RebuildStatsState {
-    Init,
-    ScanBuckets,
-    ScanBlobs,
-    ScanPending,
-    ScanHeads,
-    ScanVersions,
-    ScanEnvelopes,
-    ScanArchives,
-    ScanEnvelopeVersions,
-    ScanCopies,
-    ScanUploads,
-    ScanCounters,
-    StartWriteTransaction,
-    WriteCounters,
-    DeleteStaleCounters,
-    CommitTransaction,
-    Finish,
-    Error,
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum RebuildStatsError {
-    #[error(transparent)]
-    StorageError(#[from] StorageError),
-    #[error(transparent)]
-    ConversionError(#[from] ConversionError),
-    #[error(transparent)]
-    CounterError(#[from] UsageCounterError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
-    InvalidStateEvent {
-        state: RebuildStatsState,
-        expected: &'static str,
-        received: Event,
-    },
-    #[error("RebuildUsageStats failed")]
-    RebuildFailed,
-}
-
-/// Recomputes all usage counters in one transaction; runs at startup when counters
-/// are missing and as a repair tool, never concurrently with writes. An object is
-/// live when its head points at a non-delete version.
-#[derive(Debug, PartialEq)]
-pub struct RebuildStatsOperation {
-    state: RebuildStatsState,
-    txn_id: Option<TxnId>,
-    bucket_groups: HashMap<String, GroupId>,
-    blob_sizes: HashMap<Vec<u8>, u64>,
-    /// Original sizes of pending archives by archive key, for their versions' logical bytes.
-    pending_sizes: HashMap<Vec<u8>, u64>,
-    /// Pithos archives already charged: during promotion one archive has a known and a pending row.
-    charged_archives: HashSet<Vec<u8>>,
-    current_versions: HashMap<(String, String), ulid::Ulid>,
-    /// Envelope and archive mapping row bytes by envelope id.
-    envelope_sizes: HashMap<Vec<u8>, u64>,
-    global: UsageCounters,
-    global_shards: Vec<UsageCounters>,
-    backend_shards: HashMap<Vec<u8>, UsageCounters>,
-    groups: HashMap<GroupId, UsageCounters>,
-    /// Rows of each bucket, an empty bucket included.
-    bucket_rows: HashMap<String, BucketCounters>,
-    existing_counter_keys: Vec<Vec<u8>>,
-    stale_counter_deletes: Vec<(String, Key)>,
-    /// Materialized versions whose blob location row is gone; their bytes
-    /// cannot be recounted, so the rebuilt totals are low by that much.
-    orphan_versions: u64,
-    output: Option<Result<UsageCounters, RebuildStatsError>>,
-}
-
-impl Default for RebuildStatsOperation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RebuildStatsOperation {
-    const SCAN_LIMIT: usize = 1_000;
-
-    pub fn new() -> Self {
-        Self {
-            state: RebuildStatsState::Init,
-            txn_id: None,
-            bucket_groups: HashMap::new(),
-            blob_sizes: HashMap::new(),
-            pending_sizes: HashMap::new(),
-            charged_archives: HashSet::new(),
-            current_versions: HashMap::new(),
-            envelope_sizes: HashMap::new(),
-            global: UsageCounters::default(),
-            global_shards: vec![UsageCounters::default(); GLOBAL_SHARD_COUNT],
-            backend_shards: HashMap::new(),
-            groups: HashMap::new(),
-            bucket_rows: HashMap::new(),
-            existing_counter_keys: Vec::new(),
-            stale_counter_deletes: Vec::new(),
-            orphan_versions: 0,
-            output: None,
-        }
-    }
-
-    fn emit_error(&mut self, error: RebuildStatsError) -> Effects {
-        self.state = RebuildStatsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn iter_effect(&self, key_space: &str, start_after: Option<Key>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: None,
-            start: start_after.map(IterStart::After),
-            limit: Self::SCAN_LIMIT,
-            txn_id: None,
-        })
-    }
-
-    fn scan_keyspace(&self) -> Option<&'static str> {
-        match self.state {
-            RebuildStatsState::ScanBuckets => Some(S3_BUCKET_KEYSPACE),
-            RebuildStatsState::ScanBlobs => Some(BLOB_LOCATIONS_KEYSPACE),
-            RebuildStatsState::ScanPending => Some(PENDING_LOCATION_KEYSPACE),
-            RebuildStatsState::ScanHeads => Some(BLOB_HEAD_KEYSPACE),
-            RebuildStatsState::ScanVersions => Some(BLOB_VERSIONS_KEYSPACE),
-            RebuildStatsState::ScanEnvelopes => Some(ABE_ENVELOPE_KEYSPACE),
-            RebuildStatsState::ScanArchives => Some(ABE_ARCHIVE_KEYSPACE),
-            RebuildStatsState::ScanEnvelopeVersions => Some(ABE_VERSION_KEYSPACE),
-            RebuildStatsState::ScanCopies => Some(ABE_COPY_KEYSPACE),
-            RebuildStatsState::ScanUploads => Some(UPLOAD_KEYSPACE),
-            RebuildStatsState::ScanCounters => Some(USAGE_STATS_KEYSPACE),
-            _ => None,
-        }
-    }
-
-    fn group_entry(&mut self, group_id: GroupId) -> &mut UsageCounters {
-        self.groups.entry(group_id).or_default()
-    }
-
-    fn global_shard_entry(&mut self, group_id: GroupId) -> &mut UsageCounters {
-        &mut self.global_shards[global_shard_index(group_id)]
-    }
-
-    /// Books an object-level delta on its bucket's group, global shard and bucket rows.
-    fn book_bucket(
-        &mut self,
-        bucket: &str,
-        delta: &UsageCounters,
-    ) -> Result<(), RebuildStatsError> {
-        let Some(group_id) = self.bucket_groups.get(bucket).copied() else {
-            self.global_shards[0].add(delta)?;
-            return Ok(());
-        };
-        self.group_entry(group_id).add(delta)?;
-        self.global_shard_entry(group_id).add(delta)?;
-        if let Some(row) = self.bucket_rows.get_mut(bucket) {
-            let share = BucketDelta {
-                objects: delta.objects.into(),
-                logical_bytes: delta.logical_bytes.into(),
-                referenced_bytes: delta.referenced_bytes.into(),
-                ..Default::default()
-            };
-            row.apply(&share)?;
-        }
-        Ok(())
-    }
-
-    fn backend_entry(&mut self, backend: &BackendRef, shard: usize) -> &mut UsageCounters {
-        self.backend_shards
-            .entry(usage_backend_key(backend, shard))
-            .or_default()
-    }
-
-    fn consume_values(&mut self, values: &[(Key, Value)]) -> Result<(), RebuildStatsError> {
-        match self.state {
-            RebuildStatsState::ScanBuckets => {
-                for (key, value) in values {
-                    let info = BucketInfo::from_bytes(value.as_ref())?;
-                    let bucket = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
-                    let delta = UsageCounters {
-                        buckets: 1,
-                        ..Default::default()
-                    };
-                    self.global.add(&delta)?;
-                    self.group_entry(info.group_id).add(&delta)?;
-                    self.global_shard_entry(info.group_id).add(&delta)?;
-                    self.bucket_rows
-                        .insert(bucket.clone(), BucketCounters::default());
-                    self.bucket_groups.insert(bucket, info.group_id);
-                }
-            }
-            RebuildStatsState::ScanBlobs | RebuildStatsState::ScanPending => {
-                let pending = self.state == RebuildStatsState::ScanPending;
-                for (key, value) in values {
-                    let location = BackendLocation::from_bytes(value.as_ref())?;
-                    if location.staging || location.partial {
-                        continue;
-                    }
-                    let shard = match pending {
-                        true => {
-                            self.pending_sizes.insert(key.to_vec(), location.blob_size);
-                            shard_for_archive(location.ulid)
-                        }
-                        false => {
-                            let hash = BlobLocationKey::from_bytes(key.as_ref())?.blake3_hash;
-                            // Copies of one hash share a size, so the hash prefix keys the map.
-                            self.blob_sizes.insert(hash.to_vec(), location.blob_size);
-                            StoredDelta::of_copy(&location, 1, 0)
-                                .map_or_else(|| shard_for_hash(&hash), |stored| stored.shard)
-                        }
-                    };
-                    if matches!(location.format.layout, StoredLayout::Pithos(_))
-                        && !self
-                            .charged_archives
-                            .insert(ArchiveKey::of(&location).to_bytes())
-                    {
-                        continue;
-                    }
-                    let delta = UsageCounters {
-                        stored_blobs: 1,
-                        stored_bytes: location.stored_size(),
-                        ..Default::default()
-                    };
-                    self.global.add(&delta)?;
-                    self.global_shards[shard].add(&delta)?;
-                    self.backend_entry(&location.backend, shard)
-                        .add(&UsageCounters {
-                            stored_bytes: location.stored_size(),
-                            ..Default::default()
-                        })?;
-                }
-            }
-            RebuildStatsState::ScanHeads => {
-                for (key, value) in values {
-                    let head_key = BlobHeadKey::from_bytes(key.as_ref())?;
-                    let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
-                    self.current_versions
-                        .insert((head_key.bucket, head_key.key), pointer.version_id);
-                }
-            }
-            RebuildStatsState::ScanVersions => {
-                for (key, value) in values {
-                    let version = BlobVersion::from_bytes(value.as_ref())?;
-                    let version_key = VersionKey::from_bytes(key.as_ref())?;
-                    if let Some(row) = self.bucket_rows.get_mut(&version_key.bucket) {
-                        let marker = version.is_deleted();
-                        row.apply(&BucketDelta {
-                            versions: (!marker).into(),
-                            delete_markers: marker.into(),
-                            ..Default::default()
-                        })?;
-                    }
-                    let object = (version_key.bucket.clone(), version_key.key.clone());
-                    let current = self
-                        .current_versions
-                        .get(&object)
-                        .is_some_and(|version_id| *version_id == version_key.version_id);
-                    if current && !version.is_deleted() {
-                        let delta = UsageCounters {
-                            objects: 1,
-                            ..Default::default()
-                        };
-                        self.global.add(&delta)?;
-                        self.book_bucket(&version_key.bucket, &delta)?;
-                    }
-
-                    // An offered directory is charged only for its current observations.
-                    let charged = current
-                        || version
-                            .offered_size(&version_key.bucket, &version_key.key)
-                            .is_none();
-                    let Some((logical_bytes, referenced_bytes)) = (match version.state {
-                        BlobVersionState::Materialized { blob_hash, .. } => {
-                            let size = self.blob_sizes.get(blob_hash.as_slice()).copied();
-                            if size.is_none() {
-                                self.orphan_versions += 1;
-                            }
-                            size.map(|size| (size, 0))
-                        }
-                        BlobVersionState::Reference {
-                            cached_metadata, ..
-                        } => charged.then_some((0, cached_metadata.content_length)),
-                        BlobVersionState::PendingContent { archive, .. } => {
-                            let size = self.pending_sizes.get(&archive.to_bytes()).copied();
-                            if size.is_none() {
-                                self.orphan_versions += 1;
-                            }
-                            size.map(|size| (size, 0))
-                        }
-                        BlobVersionState::Deleted => None,
-                    }) else {
-                        continue;
-                    };
-                    let delta = UsageCounters {
-                        logical_bytes,
-                        referenced_bytes,
-                        ..Default::default()
-                    };
-                    self.global.add(&delta)?;
-                    self.book_bucket(&version_key.bucket, &delta)?;
-                }
-            }
-            RebuildStatsState::ScanEnvelopes | RebuildStatsState::ScanArchives => {
-                let archives = self.state == RebuildStatsState::ScanArchives;
-                for (key, value) in values {
-                    let bytes = match archives {
-                        true => envelope_charge(&[], value),
-                        false => value.len() as u64,
-                    };
-                    *self.envelope_sizes.entry(key.to_vec()).or_default() += bytes;
-                }
-            }
-            RebuildStatsState::ScanEnvelopeVersions | RebuildStatsState::ScanCopies => {
-                let copies = self.state == RebuildStatsState::ScanCopies;
-                for (key, value) in values {
-                    // A pending copy is charged its stored row until its envelope replaces it.
-                    let (version_key, logical_bytes) = match copies {
-                        true => (copy_version(key)?, value.len() as u64),
-                        false => (
-                            VersionKey::from_bytes(key.as_ref())?,
-                            self.envelope_sizes
-                                .get(value.as_ref())
-                                .copied()
-                                .unwrap_or(0),
-                        ),
-                    };
-                    let delta = UsageCounters {
-                        logical_bytes,
-                        ..Default::default()
-                    };
-                    self.global.add(&delta)?;
-                    self.book_bucket(&version_key.bucket, &delta)?;
-                }
-            }
-            RebuildStatsState::ScanUploads => {
-                for (_, value) in values {
-                    // Like the stale sweep, an undecodable record is left out, as no flow ends it.
-                    let Ok(upload) = MultipartUpload::from_bytes(value.as_ref()) else {
-                        warn!("rebuilt usage skips an undecodable multipart upload");
-                        continue;
-                    };
-                    if let Some(row) = self.bucket_rows.get_mut(&upload.bucket) {
-                        row.open_uploads = row.open_uploads.saturating_add(1);
-                    }
-                }
-            }
-            RebuildStatsState::ScanCounters => {
-                self.existing_counter_keys
-                    .extend(values.iter().map(|(key, _)| key.to_vec()));
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn next_scan(&mut self) -> Effects {
-        let next = match self.state {
-            RebuildStatsState::ScanBuckets => RebuildStatsState::ScanBlobs,
-            RebuildStatsState::ScanBlobs => RebuildStatsState::ScanPending,
-            RebuildStatsState::ScanPending => RebuildStatsState::ScanHeads,
-            RebuildStatsState::ScanHeads => RebuildStatsState::ScanVersions,
-            RebuildStatsState::ScanVersions => {
-                if self.orphan_versions > 0 {
-                    warn!(
-                        versions = self.orphan_versions,
-                        "rebuilt usage omits versions without a blob location row"
-                    );
-                }
-                RebuildStatsState::ScanEnvelopes
-            }
-            RebuildStatsState::ScanEnvelopes => RebuildStatsState::ScanArchives,
-            RebuildStatsState::ScanArchives => RebuildStatsState::ScanEnvelopeVersions,
-            RebuildStatsState::ScanEnvelopeVersions => RebuildStatsState::ScanCopies,
-            RebuildStatsState::ScanCopies => RebuildStatsState::ScanUploads,
-            RebuildStatsState::ScanUploads => RebuildStatsState::ScanCounters,
-            RebuildStatsState::ScanCounters => {
-                self.state = RebuildStatsState::StartWriteTransaction;
-                return smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })];
-            }
-            _ => return self.emit_error(RebuildStatsError::RebuildFailed),
-        };
-        self.state = next;
-        let key_space = match self.scan_keyspace() {
-            Some(key_space) => key_space,
-            None => return self.emit_error(RebuildStatsError::RebuildFailed),
-        };
-        smallvec![self.iter_effect(key_space, None)]
-    }
-
-    fn handle_page(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.emit_error(RebuildStatsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
-            });
-        };
-
-        if let Err(err) = self.consume_values(&values) {
-            return self.emit_error(err);
-        }
-
-        if let Some(start_after) = next_start_after {
-            let key_space = match self.scan_keyspace() {
-                Some(key_space) => key_space,
-                None => return self.emit_error(RebuildStatsError::RebuildFailed),
-            };
-            return smallvec![self.iter_effect(key_space, Some(start_after))];
-        }
-
-        self.next_scan()
-    }
-
-    fn handle_write_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(RebuildStatsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
-            });
-        };
-        self.txn_id = Some(txn_id);
-
-        let mut writes = Vec::with_capacity(GLOBAL_SHARD_COUNT + self.groups.len());
-        let mut write_keys = HashSet::with_capacity(GLOBAL_SHARD_COUNT + self.groups.len());
-        for (shard, counters) in self.global_shards.iter().enumerate() {
-            let key = global_shard_key(shard);
-            let bytes = match counters.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(err) => return self.emit_error(err.into()),
-            };
-            write_keys.insert(key.clone());
-            writes.push((USAGE_STATS_KEYSPACE.to_string(), key.into(), bytes.into()));
-        }
-        for (group_id, counters) in &self.groups {
-            let key = usage_group_key(*group_id);
-            let bytes = match counters.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(err) => return self.emit_error(err.into()),
-            };
-            write_keys.insert(key.clone());
-            writes.push((USAGE_STATS_KEYSPACE.to_string(), key.into(), bytes.into()));
-        }
-        for (bucket, counters) in &self.bucket_rows {
-            let key = usage_bucket_key(bucket);
-            let bytes = match counters.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(err) => return self.emit_error(err.into()),
-            };
-            write_keys.insert(key.clone());
-            writes.push((USAGE_STATS_KEYSPACE.to_string(), key.into(), bytes.into()));
-        }
-        for (key, counters) in &self.backend_shards {
-            let bytes = match counters.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(err) => return self.emit_error(err.into()),
-            };
-            write_keys.insert(key.clone());
-            writes.push((
-                USAGE_STATS_KEYSPACE.to_string(),
-                key.clone().into(),
-                bytes.into(),
-            ));
-        }
-        self.stale_counter_deletes = self
-            .existing_counter_keys
-            .iter()
-            .filter(|key| !write_keys.contains(*key))
-            .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.clone().into()))
-            .collect();
-
-        self.state = RebuildStatsState::WriteCounters;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_counters_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.emit_error(RebuildStatsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event,
-            });
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(RebuildStatsError::RebuildFailed);
-        };
-        if !self.stale_counter_deletes.is_empty() {
-            self.state = RebuildStatsState::DeleteStaleCounters;
-            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes: std::mem::take(&mut self.stale_counter_deletes),
-                txn_id: Some(txn_id),
-            })];
-        }
-        self.state = RebuildStatsState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_stale_deleted(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.emit_error(RebuildStatsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
-                received: event,
-            });
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(RebuildStatsError::RebuildFailed);
-        };
-        self.state = RebuildStatsState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(RebuildStatsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
-            });
-        };
-        self.state = RebuildStatsState::Finish;
-        self.output = Some(Ok(self.global));
-        smallvec![]
-    }
-}
-
-impl Operation for RebuildStatsOperation {
-    type Output = UsageCounters;
-    type Error = RebuildStatsError;
-
-    fn start(&mut self) -> Effects {
-        self.state = RebuildStatsState::ScanBuckets;
-        smallvec![self.iter_effect(S3_BUCKET_KEYSPACE, None)]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(RebuildStatsError::StorageError(error));
-        }
-
-        match self.state {
-            RebuildStatsState::Init => self.start(),
-            RebuildStatsState::ScanBuckets
-            | RebuildStatsState::ScanBlobs
-            | RebuildStatsState::ScanPending
-            | RebuildStatsState::ScanHeads
-            | RebuildStatsState::ScanVersions
-            | RebuildStatsState::ScanEnvelopes
-            | RebuildStatsState::ScanArchives
-            | RebuildStatsState::ScanEnvelopeVersions
-            | RebuildStatsState::ScanCopies
-            | RebuildStatsState::ScanUploads
-            | RebuildStatsState::ScanCounters => self.handle_page(event),
-            RebuildStatsState::StartWriteTransaction => self.handle_write_started(event),
-            RebuildStatsState::WriteCounters => self.handle_counters_written(event),
-            RebuildStatsState::DeleteStaleCounters => self.handle_stale_deleted(event),
-            RebuildStatsState::CommitTransaction => self.handle_transaction_committed(event),
-            RebuildStatsState::Finish | RebuildStatsState::Error => {
-                self.emit_error(RebuildStatsError::InvalidStateEvent {
-                    state: self.state.clone(),
-                    expected: "no event",
-                    received: event,
-                })
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RebuildStatsState::Finish | RebuildStatsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(counters)) => Ok(counters),
-            Some(Err(error)) => Err(error),
-            None => Err(RebuildStatsError::RebuildFailed),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
-    }
-}
-
 /// Debounce window for the coalesced node-usage snapshot publisher. `ShortenTimer`
 /// fires this long after a burst's first dirty write, so bursts collapse into one
 /// publish run with bounded latency.
@@ -2085,6 +1477,10 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::s3::bucket::create::CreateBucketOperation;
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+        UPLOAD_KEYSPACE,
+    };
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
@@ -2093,12 +1489,15 @@ mod tests {
     use aruna_core::structs::storage::blob::{
         BackendRef, BlobHeadKey, BucketInfo, CurrentVersionPointer,
     };
+    use aruna_core::structs::storage::blob::{BlobLocationKey, BlobVersion, VersionKey};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::{FrameLayout, StoredFormat, StoredLayout};
+    use aruna_core::structs::storage::multipart::MultipartUpload;
     use aruna_core::structs::storage::multipart::MultipartUploadStatus;
     use aruna_core::structs::storage::usage::global_shard_keys;
     use aruna_core::structs::storage::usage::usage_hash_key;
+    use aruna_core::structs::storage::usage::{BucketCounters, global_shard_index};
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
