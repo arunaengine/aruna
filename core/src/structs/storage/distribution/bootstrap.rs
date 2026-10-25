@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::inventory::range_interval;
 use super::{DistributionMember, DistributionSnapshot, KeyRange, MemberState};
 use crate::errors::ConversionError;
 
@@ -42,6 +43,26 @@ impl BootstrapCursor {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+impl BootstrapCursor {
+    /// The cursor a split child of the walked range continues with: what the parent queued
+    /// inside the child counts as walked, the parent's watermark and pending jobs stay.
+    pub fn for_child(&self, set_id: Ulid, child: &KeyRange) -> Self {
+        let (lower, upper) = range_interval(set_id, &child.lower, child.upper.as_deref());
+        let mut cursor = Self {
+            pending: self.pending.clone(),
+            ..Self::start(self.intent, self.watermark)
+        };
+        let after = self.after.as_ref();
+        if self.walked || after.is_some_and(|after| *after >= upper) {
+            cursor.walked = true;
+            cursor.done = self.done;
+        } else if let Some(after) = after.filter(|after| **after >= lower) {
+            cursor.after = Some(after.clone());
+        }
+        cursor
     }
 }
 
@@ -84,6 +105,35 @@ impl DistributionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_child_continues_walk() {
+        // A child keeps what the parent queued inside it and starts where the parent stood.
+        let set = Ulid::from_bytes([1; 16]);
+        let child = |lower: &str, upper: Option<&str>| KeyRange {
+            range_id: Ulid::from_bytes([2; 16]),
+            lower: lower.to_string(),
+            upper: upper.map(str::to_string),
+            lineage: Some(Ulid::from_bytes([3; 16])),
+            coordinator: Ulid::from_bytes([4; 16]),
+            epoch: 1,
+            replicas: Vec::new(),
+        };
+        let mut parent = BootstrapCursor::start([5; 32], 6);
+        parent.after =
+            Some(crate::structs::storage::distribution::inventory::head_position(set, "k"));
+        parent.pending = vec![vec![7]];
+        let lower = parent.for_child(set, &child("", Some("g")));
+        assert!(lower.walked && !lower.done);
+        assert_eq!(lower.pending, parent.pending);
+        let middle = parent.for_child(set, &child("g", Some("p")));
+        assert_eq!(middle.after, parent.after);
+        let upper = parent.for_child(set, &child("p", None));
+        assert_eq!(
+            (upper.after, upper.walked, upper.watermark),
+            (None, false, 6)
+        );
+    }
 
     #[test]
     fn keys_group_sets() {

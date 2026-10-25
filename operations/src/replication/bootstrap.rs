@@ -536,6 +536,7 @@ impl SetWalk {
         if !bound {
             return self.clear(context).await;
         }
+        self.clear_departed(context, &targets).await?;
         let mut outcome = Outcome::Settled;
         for target in targets {
             let walked = self.walk(context, &snapshot, local, target, budget).await?;
@@ -569,9 +570,19 @@ impl SetWalk {
         let mut done = true;
         for range in ranges {
             let key = bootstrap_key(self.set_id, target.member_id, range.range_id);
-            if let Some(cursor) = cursors.get(&key)
+            let own = cursors
+                .get(&key)
+                .filter(|c| c.intent == target.intent)
+                .cloned();
+            let cursor = match own {
+                Some(cursor) => Some(cursor),
+                None => {
+                    self.seed_child(context, snapshot, target, range, &cursors)
+                        .await?
+                }
+            };
+            if let Some(cursor) = cursor
                 && cursor.done
-                && cursor.intent == target.intent
             {
                 watermark = watermark.min(cursor.watermark);
                 continue;
@@ -633,6 +644,64 @@ impl SetWalk {
                 Ok(Outcome::Waiting)
             }
         }
+    }
+
+    /// A split child of a walked range continues from its ancestor's cursor instead of walking
+    /// again from the start; the derived cursor is stored for the page that follows.
+    async fn seed_child(
+        &self,
+        context: &DriverContext,
+        snapshot: &DistributionSnapshot,
+        target: &DistributionMember,
+        range: &KeyRange,
+        cursors: &HashMap<Vec<u8>, BootstrapCursor>,
+    ) -> Result<Option<BootstrapCursor>, String> {
+        let mut ancestor = range.lineage;
+        for _ in 0..=snapshot.retired.len() {
+            let Some(id) = ancestor else {
+                return Ok(None);
+            };
+            let key = bootstrap_key(self.set_id, target.member_id, id);
+            if let Some(parent) = cursors.get(&key).filter(|c| c.intent == target.intent) {
+                let child = parent.for_child(self.set_id, range);
+                let own = bootstrap_key(self.set_id, target.member_id, range.range_id);
+                let bytes = child.to_bytes().map_err(|error| error.to_string())?;
+                let write = StorageEffect::Write {
+                    key_space: BOOTSTRAP_KEYSPACE.to_string(),
+                    key: own.into(),
+                    value: bytes.into(),
+                    txn_id: None,
+                };
+                return match context.storage_handle.send_storage_effect(write).await {
+                    Event::Storage(StorageEvent::WriteResult { .. }) => Ok(Some(child)),
+                    other => Err(format!("a child cursor was not stored: {other:?}")),
+                };
+            }
+            ancestor = snapshot
+                .retired_range(id)
+                .and_then(|retired| retired.lineage);
+        }
+        Ok(None)
+    }
+
+    /// Deletes the cursors of members that no longer catch up, such as a member that left,
+    /// in one bounded batch per drain.
+    async fn clear_departed(
+        &self,
+        context: &DriverContext,
+        targets: &[&DistributionMember],
+    ) -> Result<(), String> {
+        let prefix = bootstrap_prefix(self.set_id);
+        let rows = scan(context, BOOTSTRAP_KEYSPACE, Some(prefix), CLEAR_BATCH).await?;
+        let departed = |key: &[u8]| {
+            let member = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
+            member.is_some_and(|id| !targets.iter().any(|t| t.member_id.to_bytes() == id))
+        };
+        let deletes = (rows.into_iter())
+            .filter(|(key, _)| departed(key))
+            .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), Key::from(key)))
+            .collect();
+        delete(context, deletes).await
     }
 
     /// Deletes the set's cursors in bounded batches; settled once none is left.
