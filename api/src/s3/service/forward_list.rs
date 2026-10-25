@@ -49,6 +49,8 @@ pub(super) enum Resume {
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
 pub(super) const MAX_RANGES_PER_PAGE: usize = 64;
+/// Bytes of keys and prefixes after which a merged page visits no further range.
+pub(super) const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
 fn query_digest(prefix: Option<&str>, delimiter: Option<&str>) -> [u8; 32] {
     let bytes = postcard::to_allocvec(&(prefix, delimiter)).unwrap_or_default();
@@ -347,10 +349,12 @@ impl ArunaS3Service {
                     .is_none_or(|from| range.lower.as_str() >= from)
         });
         let mut first = true;
+        let mut bytes = 0usize;
         for (visited, range) in ranges.enumerate() {
             let remaining =
                 max.saturating_sub(merged.contents.len() + merged.common_prefixes.len());
-            if remaining == 0 || (bounded && visited == MAX_RANGES_PER_PAGE) {
+            let full = bounded && (visited == MAX_RANGES_PER_PAGE || bytes >= MAX_PAGE_BYTES);
+            if remaining == 0 || full {
                 merged.continuation_token =
                     scoped_marker(&input.bucket, last_key.as_deref(), last_prefix.as_deref())?;
                 // Nothing listed yet: the next page starts at this range.
@@ -385,6 +389,15 @@ impl ArunaS3Service {
                 }
             };
             first = false;
+            let keys = part
+                .contents
+                .iter()
+                .filter_map(|object| object.key.as_ref());
+            let groups = part
+                .common_prefixes
+                .iter()
+                .filter_map(|group| group.prefix.as_ref());
+            bytes += keys.chain(groups).map(String::len).sum::<usize>();
             for prefix in part.common_prefixes {
                 let raw = Self::raw(prefix.prefix.as_deref().unwrap_or_default(), url_encoded);
                 if last_prefix.as_deref() == Some(raw.as_str()) {

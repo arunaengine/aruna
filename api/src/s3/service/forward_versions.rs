@@ -20,7 +20,9 @@ use ulid::Ulid;
 
 use super::ArunaS3Service;
 use super::forward::xml_field;
-use super::forward_list::{MAX_RANGES_PER_PAGE, e_tag, elements, range_query, timestamp};
+use super::forward_list::{
+    MAX_PAGE_BYTES, MAX_RANGES_PER_PAGE, e_tag, elements, range_query, timestamp,
+};
 
 /// The entries one range answered for a version listing, raw positions included.
 #[derive(Default)]
@@ -210,10 +212,11 @@ impl ArunaS3Service {
             })
         });
         let mut first = true;
+        let mut bytes = 0usize;
         for (visited, range) in ranges.enumerate() {
             let remaining =
                 max_keys.saturating_sub(versions.len() + markers.len() + prefixes.len());
-            if remaining == 0 || visited == MAX_RANGES_PER_PAGE {
+            if remaining == 0 || visited == MAX_RANGES_PER_PAGE || bytes >= MAX_PAGE_BYTES {
                 // Nothing listed yet: the nil version id starts the next page at this range.
                 let start = || (range.lower.clone(), Some(Ulid::nil().to_string()));
                 next = Some(last.clone().map_or_else(start, |key| (key, None)));
@@ -241,6 +244,10 @@ impl ArunaS3Service {
                         .await?
                 }
             };
+            let keys = (part.versions.iter().map(|(key, _)| key))
+                .chain(part.markers.iter().map(|(key, _)| key))
+                .chain(part.prefixes.iter());
+            bytes += keys.map(String::len).sum::<usize>();
             for raw in part.prefixes {
                 if prefixes.last() == Some(&raw) {
                     continue;
