@@ -29,6 +29,7 @@ use aruna_core::structs::execution::job::{
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
+use aruna_core::structs::identity::database::DatabaseEntry;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
@@ -460,9 +461,9 @@ where
     Ok(Rewrites { scanned, rows })
 }
 
-/// Realm configuration documents gained the catch-up wait, the session idle
-/// timeout, federation settings and portal features as their last values. Postcard is positional, so appending the
-/// defaults an older row lacks re-encodes it.
+/// Realm configuration documents gained the catch-up wait, the session idle timeout, federation
+/// settings, portal features and the database list as their last values. Postcard is positional,
+/// so appending the defaults an older row lacks re-encodes it.
 fn realm_configs(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
@@ -485,14 +486,16 @@ fn realm_configs(
 /// Appends the trailing defaults an older row lacks, shortest suffix first, so
 /// a row missing only the newest value keeps the one it already has.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
+    let databases = postcard::to_allocvec(&Vec::<DatabaseEntry>::new()).ok()?;
     let features = postcard::to_allocvec(&BTreeMap::<String, bool>::new()).ok()?;
     let federation = postcard::to_allocvec(&None::<FederationSettings>).ok()?;
     let idle = postcard::to_allocvec(&IDLE_AFTER_MS).ok()?;
     let catch_up = postcard::to_allocvec(&CATCH_UP_MS).ok()?;
-    let federation_on = [federation.as_slice(), &features].concat();
+    let features_on = [features.as_slice(), &databases].concat();
+    let federation_on = [federation.as_slice(), &features_on].concat();
     let idle_on = [idle.as_slice(), &federation_on].concat();
     let both = [catch_up.as_slice(), &idle_on].concat();
-    for suffix in [features, federation_on, idle_on, both] {
+    for suffix in [databases, features_on, federation_on, idle_on, both] {
         let mut bytes = value.to_vec();
         bytes.extend_from_slice(&suffix);
         if RealmConfigDocument::from_bytes(&bytes).is_ok() {
@@ -692,6 +695,7 @@ mod tests {
         ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
     };
+    use aruna_core::structs::identity::database::DatabaseEntry;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
@@ -862,8 +866,8 @@ mod tests {
 
     #[test]
     fn rewrites_realm_configs() {
-        // Legacy documents decode with default timeouts, no federation settings and no portal
-        // features. Current documents remain byte-identical.
+        // Legacy documents decode with default timeouts, no federation settings, no portal
+        // features and no databases. Current documents remain byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
@@ -873,7 +877,9 @@ mod tests {
         let federation = postcard::to_allocvec(&None::<super::FederationSettings>).unwrap();
         let idle = postcard::to_allocvec(&IDLE_AFTER_MS).unwrap();
         let catch_up = postcard::to_allocvec(&CATCH_UP_MS).unwrap();
-        let featureless = current[..current.len() - features.len()].to_vec();
+        let databases = postcard::to_allocvec(&Vec::<DatabaseEntry>::new()).unwrap();
+        let listless = current[..current.len() - databases.len()].to_vec();
+        let featureless = listless[..listless.len() - features.len()].to_vec();
         let unfederated = featureless[..featureless.len() - federation.len()].to_vec();
         let one_missing = unfederated[..unfederated.len() - idle.len()].to_vec();
         let both_missing = one_missing[..one_missing.len() - catch_up.len()].to_vec();
@@ -885,6 +891,7 @@ mod tests {
                 (b"newer", one_missing),
                 (b"main", unfederated),
                 (b"prior", featureless),
+                (b"latest", listless),
                 (b"new", current.clone()),
             ],
         );
@@ -893,12 +900,13 @@ mod tests {
 
         assert_eq!(
             (output.realm_configs_scanned, output.realm_configs_rewritten),
-            (5, 4)
+            (6, 5)
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
         assert_eq!(rows[b"main".as_slice()], current);
         assert_eq!(rows[b"prior".as_slice()], current);
+        assert_eq!(rows[b"latest".as_slice()], current);
         let migrated = RealmConfigDocument::from_bytes(&rows[b"old".as_slice()]).unwrap();
         assert_eq!(migrated.compute.catch_up_ms, CATCH_UP_MS);
         assert_eq!(migrated.compute.session_idle_ms, IDLE_AFTER_MS);
