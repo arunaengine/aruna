@@ -8,10 +8,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
-use aruna_core::keyspaces::{SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{
+    INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE,
+};
 use aruna_core::shutdown::Shutdown;
-use aruna_core::structs::storage::distribution::inventory::{HeadEntry, Position};
+use aruna_core::structs::storage::distribution::accounting::{Charge, RangeAccount};
+use aruna_core::structs::storage::distribution::inventory::{
+    Entry, HeadEntry, Position, range_interval,
+};
 use aruna_core::structs::storage::distribution::search::{IndexState, decode_feed};
 use aruna_core::types::{Key, Value};
 use aruna_storage::storage::StorageHandle;
@@ -19,7 +26,9 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::feed_store::{Located, drop_settled, iter, locate, put_row, read_many};
+use super::feed_store::{
+    Located, delete_row, drop_settled, iter, locate, put_row, read_many, split_key, storage_error,
+};
 use super::key_index::{IndexedKey, KeyChange, KeyIndexError, RangeIndexes};
 use crate::driver::DriverContext;
 
@@ -67,6 +76,8 @@ pub struct Feeder {
     indexes: Arc<RangeIndexes>,
     limits: FeedLimits,
     feed: Option<Vec<u8>>,
+    accounts: Option<Vec<u8>>,
+    states: Option<Vec<u8>>,
 }
 
 impl Feeder {
@@ -75,6 +86,8 @@ impl Feeder {
             indexes,
             limits,
             feed: None,
+            accounts: None,
+            states: None,
         }
     }
 
@@ -82,7 +95,11 @@ impl Feeder {
     pub async fn pass(&mut self, context: &DriverContext) -> bool {
         let storage = context.storage_handle.bulk();
         let mut changed = 0;
-        for (walk, result) in [("feed", self.feed_page(&storage).await)] {
+        for (walk, result) in [
+            ("feed", self.feed_page(&storage).await),
+            ("open", self.open_page(&storage).await),
+            ("build", self.state_page(&storage).await),
+        ] {
             match result {
                 Ok(count) => changed += count,
                 Err(error) => warn!(walk, error = %error, "Range search index pass failed"),
@@ -182,6 +199,170 @@ impl Feeder {
         }
         drop_settled(storage, settled).await
     }
+
+    /// Opens a building index for every live range of a page of account rows without one.
+    async fn open_page(&mut self, storage: &StorageHandle) -> Result<usize, FeedError> {
+        let (rows, next) = iter(
+            storage,
+            RANGE_ACCOUNT_KEYSPACE,
+            &self.accounts,
+            self.limits.account_rows,
+        )
+        .await?;
+        self.accounts = next;
+        let mut live = Vec::new();
+        for (key, value) in rows {
+            let account = RangeAccount::from_bytes(&value)?;
+            if !matches!(account.charge, Charge::Retired { .. }) {
+                live.push(key.to_vec());
+            }
+        }
+        let states = read_many(storage, SEARCH_INDEX_KEYSPACE, live.clone()).await?;
+        let mut opened = 0;
+        for (key, state) in live.into_iter().zip(states) {
+            if state.is_some() {
+                continue;
+            }
+            let (set_id, range_id) = split_key(&key)?;
+            // Leftovers of an earlier index of the range would hold stale keys.
+            self.indexes.prune(set_id, range_id, None).await?;
+            let state = IndexState::Building {
+                generation: 1,
+                cursor: None,
+            };
+            put_row(storage, SEARCH_INDEX_KEYSPACE, key, state.to_bytes()?).await?;
+            opened += 1;
+        }
+        Ok(opened)
+    }
+
+    /// Drops the indexes of ranges without a live account and builds the first building
+    /// index of the page; the walk stays at that range until its index is ready.
+    async fn state_page(&mut self, storage: &StorageHandle) -> Result<usize, FeedError> {
+        let (rows, next) = iter(
+            storage,
+            SEARCH_INDEX_KEYSPACE,
+            &self.states,
+            self.limits.state_rows,
+        )
+        .await?;
+        let keys = rows.iter().map(|(key, _)| key.to_vec()).collect();
+        let accounts = read_many(storage, RANGE_ACCOUNT_KEYSPACE, keys).await?;
+        let mut previous = self.states.take();
+        let mut changed = 0;
+        for ((key, state), account) in rows.into_iter().zip(accounts) {
+            let (set_id, range_id) = split_key(&key)?;
+            let account = account
+                .map(|value| RangeAccount::from_bytes(&value))
+                .transpose()?;
+            let account =
+                account.filter(|account| !matches!(account.charge, Charge::Retired { .. }));
+            match (account, IndexState::from_bytes(&state)?) {
+                (None, _) => {
+                    self.indexes.prune(set_id, range_id, None).await?;
+                    delete_row(storage, SEARCH_INDEX_KEYSPACE, key.to_vec()).await?;
+                    changed += 1;
+                }
+                (Some(account), IndexState::Building { generation, cursor }) => {
+                    let build = Build {
+                        key: key.to_vec(),
+                        set_id,
+                        range_id,
+                        generation,
+                    };
+                    let ready = self.build(storage, &build, &account, cursor).await?;
+                    if !ready {
+                        self.states = previous;
+                        return Ok(changed + 1);
+                    }
+                    changed += 1;
+                }
+                (Some(_), IndexState::Ready { .. }) => {}
+            }
+            previous = Some(key.to_vec());
+        }
+        self.states = next;
+        Ok(changed)
+    }
+
+    /// Adds up to `rebuild_pages` inventory pages of heads to a building index; true once the
+    /// walk reached the range's end and the index switched to ready.
+    async fn build(
+        &self,
+        storage: &StorageHandle,
+        build: &Build,
+        account: &RangeAccount,
+        mut cursor: Option<Vec<u8>>,
+    ) -> Result<bool, FeedError> {
+        let (lower, end) = range_interval(build.set_id, &account.lower, account.upper.as_deref());
+        for _ in 0..self.limits.rebuild_pages.max(1) {
+            let start = match &cursor {
+                Some(cursor) => IterStart::After(cursor.clone().into()),
+                None => IterStart::At(lower.clone().into()),
+            };
+            let effect = StorageEffect::IterRange {
+                key_space: INVENTORY_KEYSPACE.to_string(),
+                start,
+                end: IterEnd::Before(end.clone().into()),
+                limit: self.limits.rebuild_rows,
+                max_bytes: self.limits.rebuild_bytes,
+                txn_id: None,
+            };
+            let (rows, truncated) = match storage.send_storage_effect(effect).await {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => (values, next_start_after),
+                event => return Err(storage_error(event)),
+            };
+            let mut changes = Vec::new();
+            for (key, value) in &rows {
+                let position = Position::decode(key)?;
+                if position.entry == Entry::Head {
+                    let head = HeadEntry::from_bytes(value)?;
+                    changes.push(change_of(position.key, Some(head)));
+                }
+            }
+            let (set_id, range_id, generation) = (build.set_id, build.range_id, build.generation);
+            self.indexes
+                .apply(set_id, range_id, generation, changes)
+                .await?;
+            let Some(truncated) = truncated else {
+                let state = IndexState::Ready { generation };
+                put_row(
+                    storage,
+                    SEARCH_INDEX_KEYSPACE,
+                    build.key.clone(),
+                    state.to_bytes()?,
+                )
+                .await?;
+                self.indexes
+                    .prune(set_id, range_id, Some(generation))
+                    .await?;
+                return Ok(true);
+            };
+            cursor = Some(truncated.to_vec());
+            let state = IndexState::Building {
+                generation,
+                cursor: cursor.clone(),
+            };
+            put_row(
+                storage,
+                SEARCH_INDEX_KEYSPACE,
+                build.key.clone(),
+                state.to_bytes()?,
+            )
+            .await?;
+        }
+        Ok(false)
+    }
+}
+
+struct Build {
+    key: Vec<u8>,
+    set_id: Ulid,
+    range_id: Ulid,
+    generation: u64,
 }
 
 /// Runs the feeder of this node until shutdown; nodes without metadata keep no indexes.
@@ -220,3 +401,7 @@ fn change_of(key: String, head: Option<HeadEntry>) -> KeyChange {
         _ => KeyChange::Remove(key),
     }
 }
+
+#[cfg(test)]
+#[path = "index_feed_tests.rs"]
+mod tests;

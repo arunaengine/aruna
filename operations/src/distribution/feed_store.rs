@@ -33,6 +33,13 @@ impl Located {
     }
 }
 
+pub(super) fn split_key(key: &[u8]) -> Result<(Ulid, Ulid), ConversionError> {
+    let invalid = || ConversionError::InvalidLength("range state key".to_string());
+    let set_id = key.get(..16).ok_or_else(invalid)?.try_into()?;
+    let range_id = key.get(16..32).ok_or_else(invalid)?.try_into()?;
+    Ok((Ulid::from_bytes(set_id), Ulid::from_bytes(range_id)))
+}
+
 /// The installed range of the set that contains `key`, as the inventory update finds it.
 pub(super) async fn locate(
     storage: &StorageHandle,
@@ -188,6 +195,22 @@ pub(super) async fn put_row(
     };
     match storage.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        event => Err(storage_error(event)),
+    }
+}
+
+pub(super) async fn delete_row(
+    storage: &StorageHandle,
+    key_space: &str,
+    key: Vec<u8>,
+) -> Result<(), FeedError> {
+    let effect = StorageEffect::Delete {
+        key_space: key_space.to_string(),
+        key: key.into(),
+        txn_id: None,
+    };
+    match storage.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         event => Err(storage_error(event)),
     }
 }
