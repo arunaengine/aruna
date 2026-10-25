@@ -1917,15 +1917,17 @@ impl S3 for ArunaS3Service {
             .read_holder(&req.extensions, bucket_info.as_ref(), &key)
             .await?
         {
-            let request = forward::reads::read_request(
-                http::Method::GET,
-                "GetObject",
-                &bucket,
-                &key,
-                req.uri.query(),
-                &req.headers,
-            );
-            let response = self.forward_read(&user_access, &holder, request).await?;
+            let request = || {
+                forward::reads::read_request(
+                    http::Method::GET,
+                    "GetObject",
+                    &bucket,
+                    &key,
+                    req.uri.query(),
+                    &req.headers,
+                )
+            };
+            let response = self.read_object(&user_access, &holder, request).await?;
             return Ok(forward::reads::forwarded_get(response));
         }
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
@@ -2162,15 +2164,17 @@ impl S3 for ArunaS3Service {
             .read_holder(&req.extensions, bucket_info.as_ref(), &key)
             .await?
         {
-            let request = forward::reads::read_request(
-                http::Method::HEAD,
-                "HeadObject",
-                &bucket,
-                &key,
-                req.uri.query(),
-                &req.headers,
-            );
-            let response = self.forward_read(&user_access, &holder, request).await?;
+            let request = || {
+                forward::reads::read_request(
+                    http::Method::HEAD,
+                    "HeadObject",
+                    &bucket,
+                    &key,
+                    req.uri.query(),
+                    &req.headers,
+                )
+            };
+            let response = self.read_object(&user_access, &holder, request).await?;
             return Ok(forward::reads::forwarded_head(&response));
         }
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_operations::distribution::guard::route_read;
@@ -19,7 +20,7 @@ use s3s::dto::{
     ChecksumType, ETag, GetObjectOutput, HeadObjectOutput, StreamingBlob, Timestamp,
     TimestampFormat,
 };
-use s3s::{S3Response, S3Result};
+use s3s::{S3Error, S3Response, S3Result};
 
 use super::{Forward, ForwardBody, ForwardRequest, header, passed_headers, passed_query};
 use crate::s3::auth::DelegatedRequest;
@@ -144,6 +145,12 @@ pub(in crate::s3::service) fn forwarded_head(
     })
 }
 
+/// Whether a holder other than the coordinator missed the object: a replica may not have the
+/// key's newest versions yet, while the coordinator owns its head.
+fn replica_miss(error: &S3Error, holder: &Forward, coordinator: NodeId) -> bool {
+    holder.node_id != coordinator && error.status_code() == Some(http::StatusCode::NOT_FOUND)
+}
+
 /// The caller a delegation carries: the Everyone principal has no credential, so the
 /// delegation's own short window bounds it.
 pub(in crate::s3::service) fn anonymous_window(user: &UserAccess) -> UserAccess {
@@ -155,14 +162,15 @@ pub(in crate::s3::service) fn anonymous_window(user: &UserAccess) -> UserAccess 
 }
 
 impl ArunaS3Service {
-    /// The holder a GET or HEAD of `key` goes to when this member keeps no records of the
-    /// key's range, or `None` when this member answers it. A delegated read is never sent on.
+    /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, when this
+    /// member keeps no records of the key's range, or `None` when this member answers it.
+    /// A delegated read is never sent on.
     pub(in crate::s3::service) async fn read_holder(
         &self,
         extensions: &http::Extensions,
         bucket: Option<&BucketInfo>,
         key: &str,
-    ) -> S3Result<Option<Forward>> {
+    ) -> S3Result<Option<(Forward, NodeId)>> {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(None);
         };
@@ -179,11 +187,31 @@ impl ArunaS3Service {
         let node_id = choose_holder(self.state.as_ref(), &holders, now_ms())
             .await
             .map_or(coordinator, |chosen| chosen.node_id);
-        Ok(Some(Forward {
+        let holder = Forward {
             set_id: binding.set_id,
             range_id,
             node_id,
-        }))
+        };
+        Ok(Some((holder, coordinator)))
+    }
+
+    /// Sends a GET or HEAD to the chosen holder; a replica's miss goes on to the coordinator.
+    pub(in crate::s3::service) async fn read_object(
+        &self,
+        user: &UserAccess,
+        (holder, coordinator): &(Forward, NodeId),
+        request: impl Fn() -> ForwardRequest,
+    ) -> S3Result<reqwest::Response> {
+        match self.forward_read(user, holder, request()).await {
+            Err(error) if replica_miss(&error, holder, *coordinator) => {
+                let coordinator = Forward {
+                    node_id: *coordinator,
+                    ..holder.clone()
+                };
+                self.forward_read(user, &coordinator, request()).await
+            }
+            answer => answer,
+        }
     }
 
     /// Sends one read to the chosen holder; a holder that fails is skipped for a while.
@@ -276,6 +304,22 @@ mod tests {
             output.checksum_type.as_ref().map(ChecksumType::as_str),
             Some("FULL_OBJECT")
         );
+    }
+
+    #[test]
+    fn miss_asks_coordinator() {
+        let node = |seed| iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        let holder = Forward {
+            set_id: ulid::Ulid::from_bytes([1; 16]),
+            range_id: ulid::Ulid::from_bytes([2; 16]),
+            node_id: node(3),
+        };
+        let missing = s3s::s3_error!(NoSuchKey);
+        assert!(replica_miss(&missing, &holder, node(4)));
+        // The coordinator's own miss is final, and other errors are not a lagging copy.
+        assert!(!replica_miss(&missing, &holder, node(3)));
+        let denied = s3s::s3_error!(AccessDenied);
+        assert!(!replica_miss(&denied, &holder, node(4)));
     }
 
     #[test]
