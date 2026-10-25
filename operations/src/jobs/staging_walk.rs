@@ -21,7 +21,7 @@ use aruna_core::structs::execution::source_access::{
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::distribution::WriteRoute;
+use aruna_core::structs::storage::distribution::{DistributionView, WriteRoute};
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use tracing::warn;
@@ -33,7 +33,7 @@ use super::staging::{
 use super::staging_manifest::{ManifestDigest, manifest_digests};
 use super::store::{batch_delete, iter_prefix_page, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::distribution::guard::{authority_reads, authority_rows, write_target};
+use crate::distribution::guard::{GuardError, authority_reads, authority_rows, write_target};
 use crate::driver::drive;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::list_source::{
@@ -509,18 +509,29 @@ async fn segment_of(
     let Some(binding) = bucket.distribution.as_ref() else {
         return Ok(Bounds::Whole);
     };
-    let view = bound_view(&ctx.driver, binding)
-        .await
-        .map_err(|error| PageFailure::Retry(error.to_string()))?;
-    let snapshot = view.snapshot();
-    let coordinated = (snapshot.config.ranges.iter())
-        .filter(|range| {
-            matches!(
-                snapshot.write_route(binding.member_id, &range.lower),
-                Ok(WriteRoute::Local { .. })
-            )
-        })
-        .map(|range| (range.lower.clone(), range.upper.clone()));
+    let read = StorageEffect::BatchRead {
+        reads: authority_reads(binding.set_id),
+        txn_id: None,
+    };
+    let event = ctx.driver.storage_handle.send_storage_effect(read).await;
+    let retry = |error: GuardError| PageFailure::Retry(error.to_string());
+    let (record, fence) = authority_rows(event).map_err(retry)?;
+    let (record, fence) = (record.as_deref(), fence.as_deref());
+    let view = (record.map(DistributionView::from_bytes).transpose())
+        .map_err(|error| retry(error.into()))?
+        .ok_or_else(|| retry(GuardError::RecordMissing(binding.set_id)))?;
+    // A range this node fenced for a transfer is left to its new coordinator.
+    let mut coordinated = Vec::new();
+    for range in &view.snapshot().config.ranges {
+        match write_target(binding, &range.lower, record, fence) {
+            Ok(WriteRoute::Local { .. }) => {
+                coordinated.push((range.lower.clone(), range.upper.clone()))
+            }
+            Ok(WriteRoute::Forward { .. }) => {}
+            Err(error) if error.moved_away() => {}
+            Err(error) => return Err(retry(error)),
+        }
+    }
     Ok(next_segment(walk, coordinated))
 }
 
