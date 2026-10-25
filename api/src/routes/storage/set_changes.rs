@@ -237,7 +237,7 @@ pub async fn leave_distributed(
     post,
     path = "/data/groups/{group_id}/distributed-buckets/{set_id}/transfers",
     tag = "data/storage",
-    summary = "Move a range of a distributed bucket to another coordinator",
+    summary = "Move a distributed bucket range to another coordinator",
     description = r#"Opens a fenced transfer of one range to a ready `copy` replica of it.
 
 **Authentication**: realm bearer token with WRITE on the group's admin path; the publisher checks the forwarded token again.

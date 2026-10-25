@@ -204,9 +204,8 @@ pub async fn data_links(
     get,
     path = "/data/buckets/{bucket}/links",
     tag = "metadata/references",
-    summary = "List datasets that link a file, folder or bucket",
-    description = r#"Lists the readable metadata documents that link a file of this node's bucket, a
-folder of it, or the bucket root.
+    summary = "List datasets linking a file, folder or bucket",
+    description = r#"Lists the readable metadata documents that link a file of this node's bucket, a folder of it, or the bucket root.
 
 **Authentication**: realm bearer token with READ on the file (`key`) or on the bucket
 (`prefix`). Each document is filtered by the caller's READ permission.
@@ -349,8 +348,7 @@ pub struct PartOfResponse {
     path = "/data/buckets/{bucket}/objects/part-of",
     tag = "metadata/references",
     summary = "List the datasets a file is part of",
-    description = r#"Lists the datasets whose live linked parts contain a file: its derived
-`isPartOf`.
+    description = r#"Lists the datasets whose live linked parts contain a file: its derived `isPartOf`.
 
 **Authentication**: realm bearer token with READ on the file. Each dataset is filtered by the
 caller's READ permission; unreadable ones only set `hidden_references_exist`.
@@ -460,9 +458,8 @@ pub struct PartTargetResponse {
     get,
     path = "/metadata/links/target",
     tag = "metadata/references",
-    summary = "Resolve a linked part to the bucket that holds its files",
-    description = r#"Resolves the identifier of a linked part, a bucket root or a folder, to the
-bucket and prefix whose files it covers.
+    summary = "Resolve a linked part to its bucket",
+    description = r#"Resolves the identifier of a linked part, a bucket root or a folder, to the bucket and prefix whose files it covers.
 
 **Authentication**: realm bearer token. Listing the files afterwards needs READ on the bucket
 on the node that serves them; resolving grants nothing.

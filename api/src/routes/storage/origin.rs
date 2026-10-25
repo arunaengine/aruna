@@ -206,8 +206,7 @@ impl From<OriginView> for OriginResponse {
     path = "/data/buckets/{bucket}/objects/origin",
     tag = "data/storage",
     summary = "Read where a file version came from",
-    description = r#"Returns the origin record of one file version, its sync hop, the external source
-it is bound to, and the statements a dataset may add about it.
+    description = r#"Returns the origin record of one file version, its sync hop, the external source it is bound to, and the statements a dataset may add about it.
 
 **Authentication**: realm bearer token with READ on the file.
 
@@ -347,8 +346,7 @@ pub struct FileSourcesResponse {
     path = "/data/buckets/{bucket}/sources",
     tag = "data/storage",
     summary = "List how files get into a bucket",
-    description = r#"Lists the incoming paths of a bucket on this node: syncs that copy files into it
-and storage folders registered into it.
+    description = r#"Lists the incoming paths of a bucket on this node: syncs that copy files into it and storage folders registered into it.
 
 **Authentication**: realm bearer token with READ on the bucket.
 
