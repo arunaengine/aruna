@@ -325,6 +325,23 @@ mod tests {
             coordinator_error(&forward(), StatusCode::FORBIDDEN, body),
             ServerError::Forbidden
         ));
+        for (status, mapped) in [
+            (StatusCode::BAD_REQUEST, "400"),
+            (StatusCode::UNAUTHORIZED, "401"),
+            (StatusCode::NOT_FOUND, "404"),
+            (StatusCode::SERVICE_UNAVAILABLE, "503"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "502"),
+        ] {
+            let name = match coordinator_error(&forward(), status, body) {
+                ServerError::BadRequestMessage(message) if message == "bucket changed" => "400",
+                ServerError::Unauthorized => "401",
+                ServerError::NotFound => "404",
+                ServerError::ServiceUnavailableReason(_) => "503",
+                ServerError::BadGatewayReason(_) => "502",
+                other => panic!("unexpected mapping {other:?}"),
+            };
+            assert_eq!(name, mapped);
+        }
         let ServerError::ServiceUnavailableReason(message) = unreachable(&forward(), "unreachable")
         else {
             panic!("an unreachable coordinator answers 503");
