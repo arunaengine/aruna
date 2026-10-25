@@ -8,6 +8,7 @@ use crate::auth::{
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
 use crate::routes::git::location::StorageLocationRequest;
+use crate::routes::storage::objects::{ListRequest, object_page};
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
@@ -2074,6 +2075,7 @@ bucket level and READ on the bucket or listed prefix inside one.
 pub async fn list_data_paths(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
     Path(group_id): Path<String>,
     Query(query): Query<DataPathsQuery>,
 ) -> ServerResult<(StatusCode, Json<DataPathsResponse>)> {
@@ -2127,7 +2129,7 @@ pub async fn list_data_paths(
             require_data_read(&state, &auth, listing_path).await?;
             list_bucket_objects(
                 &state,
-                group_id,
+                (group_id, bearer.as_ref()),
                 &bucket,
                 &key_prefix,
                 query.delimiter.as_deref(),
@@ -2203,7 +2205,7 @@ async fn list_group_buckets(
 
 async fn list_bucket_objects(
     state: &ServerState,
-    group_id: Ulid,
+    (group_id, bearer): (Ulid, Option<&crate::auth::ValidatedBearer>),
     bucket: &str,
     key_prefix: &str,
     delimiter: Option<&str>,
@@ -2221,6 +2223,30 @@ async fn list_bucket_objects(
         });
     }
 
+    // A distributed bucket is listed across its key ranges.
+    if let Some(info) = distributed_bucket(state, bucket).await? {
+        let request = ListRequest {
+            bucket: bucket.to_string(),
+            prefix: (!key_prefix.is_empty()).then(|| key_prefix.to_string()),
+            delimiter: delimiter.map(str::to_string),
+            cursor: continuation_token.map(str::to_string),
+            limit,
+        };
+        let page = object_page(state, &info, bearer, request).await?;
+        let path = |key: &str| object_permission_path(realm_id, group_id, node_id, bucket, key);
+        let folders = page.prefixes.iter().map(|prefix| DataPathEntry {
+            permission_path: path(prefix),
+            kind: DataPathKind::Folder,
+        });
+        let objects = page.objects.iter().map(|object| DataPathEntry {
+            permission_path: path(&object.key),
+            kind: DataPathKind::Object,
+        });
+        return Ok(DataPathsResponse {
+            entries: folders.chain(objects).collect(),
+            continuation_token: page.next_cursor,
+        });
+    }
     let continuation_token = decode_object_token(continuation_token)?;
     let result = drive(
         ListBucketOperation::new(ListBucketInput {
@@ -2263,6 +2289,23 @@ async fn list_bucket_objects(
             .map(encode_object_token)
             .transpose()?,
     })
+}
+
+/// The bucket when it is a member of a distributed bucket.
+async fn distributed_bucket(
+    state: &ServerState,
+    bucket: &str,
+) -> ServerResult<Option<aruna_core::structs::storage::blob::BucketInfo>> {
+    match drive(
+        GetBucketOperation::new(bucket.to_string()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(info) => Ok(info.distribution.is_some().then_some(info)),
+        Err(GetBucketError::NotFound) => Ok(None),
+        Err(err) => Err(ServerError::InternalError(err.to_string())),
+    }
 }
 
 pub(crate) async fn get_bucket_group(

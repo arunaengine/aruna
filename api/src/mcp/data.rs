@@ -8,6 +8,7 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     request_auth, server_error, tool_extras,
 };
+use crate::routes::storage::objects::{ListRequest, object_page};
 use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::stream::BackendStream;
@@ -390,6 +391,25 @@ impl McpServer {
         .await
         .map_err(|error| object_error(error, "read"))?;
         let limit = input.limit.unwrap_or(100).clamp(1, 200);
+        // A distributed bucket is listed across its key ranges.
+        if bucket_info.distribution.is_some() {
+            let bearer = request_bearer(&parts);
+            let request = ListRequest {
+                bucket: input.bucket.clone(),
+                prefix: input.prefix,
+                delimiter: None,
+                cursor: input.cursor,
+                limit,
+            };
+            let page = object_page(&self.state, &bucket_info, bearer.as_ref(), request)
+                .await
+                .map_err(server_error)?;
+            return Ok(Json(ObjectsOutput {
+                bucket: input.bucket,
+                objects: page.objects,
+                next_cursor: page.next_cursor,
+            }));
+        }
         let cursor = input.cursor.as_deref().map(decode_cursor).transpose()?;
         let result = drive(
             ListBucketOperation::new(ListBucketInput {
