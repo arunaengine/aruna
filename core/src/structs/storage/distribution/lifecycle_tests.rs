@@ -141,7 +141,7 @@ fn transfer_moves_coordinator() {
 }
 
 #[test]
-fn transfer_needs_ready_copy_replica() {
+fn needs_ready_copy() {
     let head = active();
     let to_self = next_snapshot(
         realm(),
@@ -163,7 +163,7 @@ fn transfer_needs_ready_copy_replica() {
 }
 
 #[test]
-fn transfer_targets_are_ready_copies() {
+fn targets_ready_copies() {
     // Only ready copy replicas other than the coordinator may take the range.
     let mut head = active();
     let ids = |head: &DistributionSnapshot| -> Vec<Ulid> {
@@ -185,7 +185,7 @@ fn transfer_targets_are_ready_copies() {
 }
 
 #[test]
-fn range_ready_needs_every_replica() {
+fn readiness_needs_replicas() {
     // A former coordinator reclaims only while the range keeps all its listed copies.
     let mut head = active();
     let range = head.config.ranges[0].clone();
@@ -201,7 +201,7 @@ fn range_ready_needs_every_replica() {
 }
 
 #[test]
-fn transfer_binds_its_statements() {
+fn transfer_binds_statements() {
     let head = active();
     let prepared = step(&head, &prepare(&head, 2, TransferRole::Leave));
     // Only the former coordinator fences, only the new one completes, at the fenced watermark.
@@ -224,7 +224,7 @@ fn transfer_binds_its_statements() {
 }
 
 #[test]
-fn deletion_commits_after_fences() {
+fn deletion_awaits_fences() {
     let head = active();
     let members: Vec<_> = (1..=3).map(|seed| (member_id(seed), 7)).collect();
     let wrong = DistributionRequest::DeletePrepare {

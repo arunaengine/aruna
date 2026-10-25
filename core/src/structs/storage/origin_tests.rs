@@ -16,7 +16,7 @@ fn node() -> NodeId {
 }
 
 #[test]
-fn uploads_and_imports_stay_private() {
+fn uploads_imports_private() {
     // Uploader, device and storage paths are never projected into datasets.
     let upload = VersionOrigin::Upload {
         node_id: node(),
@@ -31,7 +31,7 @@ fn uploads_and_imports_stay_private() {
 }
 
 #[test]
-fn copies_and_syncs_name_the_original() {
+fn derived_name_original() {
     let copy = VersionOrigin::Copy { from: global(3) };
     assert_eq!(
         project(Some(&copy), None, None),
@@ -56,7 +56,7 @@ fn copies_and_syncs_name_the_original() {
 }
 
 #[test]
-fn sources_and_jobs_project() {
+fn sources_jobs_project() {
     let source = VersionOrigin::Source { database: None };
     let url = "https://s3.example.org/reads/a.fastq".to_string();
     assert_eq!(
@@ -75,7 +75,7 @@ fn sources_and_jobs_project() {
 }
 
 #[test]
-fn oversized_device_is_unbounded() {
+fn oversized_device_unbounded() {
     let upload = VersionOrigin::Upload {
         node_id: node(),
         device: Some("d".repeat(MAX_DEVICE_BYTES + 1)),
@@ -84,7 +84,7 @@ fn oversized_device_is_unbounded() {
 }
 
 #[test]
-fn source_url_joins_public_parts() {
+fn source_url_joins() {
     use crate::structs::execution::source_connector::SourceConnectorKind;
     use std::collections::HashMap;
     let descriptor = PortableSourceDescriptor {

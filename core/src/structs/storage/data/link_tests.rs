@@ -19,7 +19,7 @@ fn id(seed: u8) -> Ulid {
 }
 
 #[test]
-fn url_and_path_share_key() {
+fn spellings_share_key() {
     let global = GlobalId::Version {
         realm_id: realm(),
         version_id: id(1),
@@ -65,7 +65,7 @@ fn ignores_other_values() {
 }
 
 #[test]
-fn prefix_keys_keep_lengths_apart() {
+fn prefix_lengths_apart() {
     // `ab` must never be found by a probe for `abc`, and lengths sort ascending.
     let scope = LinkScope::Set {
         realm_id: realm(),
@@ -80,7 +80,7 @@ fn prefix_keys_keep_lengths_apart() {
 }
 
 #[test]
-fn scopes_do_not_overlap() {
+fn scopes_never_overlap() {
     let one = LinkScope::Node {
         realm_id: realm(),
         node_id: node(),

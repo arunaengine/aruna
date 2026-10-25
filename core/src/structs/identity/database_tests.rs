@@ -44,7 +44,7 @@ fn consent(entry: DatabaseEntry, predecessor: Option<AdminDocumentDot>) -> Datab
 }
 
 #[test]
-fn consent_binds_entry_and_predecessor() {
+fn consent_binds_entry() {
     let signed = consent(entry(1), Some(dot(1)));
     assert_eq!(signed.verify(realm(), &entry(1), Some(&dot(1))), Ok(()));
     // A consent never carries over to another entry or a later register version.
@@ -63,7 +63,7 @@ fn consent_binds_entry_and_predecessor() {
 }
 
 #[test]
-fn forged_signer_is_refused() {
+fn forged_signer_refused() {
     let mut signed = consent(entry(1), None);
     signed.signer = iroh::SecretKey::from_bytes(&[1; 32]).public();
     assert_eq!(
@@ -90,7 +90,7 @@ fn list_is_bounded() {
 }
 
 #[test]
-fn ordinary_bucket_name_checked() {
+fn ordinary_bucket_checked() {
     let mut ordinary = entry(1);
     ordinary.target = DatabaseTarget::Ordinary {
         node_id: iroh::SecretKey::from_bytes(&[7; 32]).public(),
@@ -100,7 +100,7 @@ fn ordinary_bucket_name_checked() {
 }
 
 #[test]
-fn removal_leaves_new_version() {
+fn removal_bumps_version() {
     // A removal must change the register version, so a consent given before it cannot be
     // replayed onto the empty entry.
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};

@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn set_id_binds_root() {
+    fn id_binds_root() {
         let base = root(1);
         assert_eq!(base.set_id(), root(1).set_id());
         assert_ne!(base.set_id(), root(4).set_id());

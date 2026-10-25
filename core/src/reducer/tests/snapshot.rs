@@ -109,7 +109,7 @@ fn keeps_highest_snapshot() {
 }
 
 #[test]
-fn reused_event_ids_apply() {
+fn reused_ids_apply() {
     // Event ids carry no authority: a foreign event cannot shadow the publisher's next one.
     let mut state = AdminDocumentState::new(target());
     let first = created();
@@ -157,7 +157,7 @@ fn equivocation_stops_changes() {
 }
 
 #[test]
-fn parked_fork_survives_newer_head() {
+fn parked_fork_survives() {
     // Forks at revision 2 waited while revision 4 installed; the pair still proves equivocation.
     let mut state = AdminDocumentState::new(target());
     let first = created();

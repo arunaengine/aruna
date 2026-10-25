@@ -90,7 +90,7 @@ fn stored(decision: ParkDecision) -> ParkedEntry {
 }
 
 #[test]
-fn keeps_highest_and_forks() {
+fn keeps_highest_forks() {
     let first = created();
     let public = settings(&first, true, false);
     let search = settings(&first, false, true);

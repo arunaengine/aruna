@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn samples_sort_by_priority() {
+    fn samples_by_priority() {
         let (set, range) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
         let entries: Vec<_> = ["a/1", "a/2", "b"].map(SampleEntry::of_key).into();
         assert_eq!(

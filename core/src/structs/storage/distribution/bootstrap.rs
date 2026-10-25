@@ -113,7 +113,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_child_continues_walk() {
+    fn child_continues_walk() {
         // A child keeps what the parent queued inside it and starts where the parent stood.
         let set = Ulid::from_bytes([1; 16]);
         let child = |lower: &str, upper: Option<&str>| KeyRange {

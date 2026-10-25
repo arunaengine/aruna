@@ -314,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn orders_history_newest_first() {
+    fn history_newest_first() {
         let position = |epoch, generation, seed| {
             version_position(set(), "k", OriginalEpoch(epoch), generation, id(seed))
         };
@@ -346,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_identity_names_source() {
+    fn reference_names_source() {
         use crate::structs::execution::source_access::SourceMetadata;
         use crate::structs::execution::source_connector::SourceConnectorKind;
         use crate::structs::execution::staging::{

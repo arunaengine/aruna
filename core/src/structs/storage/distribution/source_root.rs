@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn root_ignores_object_path() {
+    fn root_ignores_path() {
         // Every object of one source bucket shares one root; the connector id plays no part.
         let first = RootEntry::of(&source(SourceConnectorKind::S3, "a/1.fa")).unwrap();
         let second = RootEntry::of(&source(SourceConnectorKind::S3, "b/2.fa")).unwrap();
@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn native_sources_have_no_root() {
+    fn native_sources_rootless() {
         assert_eq!(
             RootEntry::of(&source(SourceConnectorKind::ArunaNative, "k")),
             None
@@ -202,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_marker_follows_root() {
+    fn checked_follows_root() {
         let (set_id, digest) = (Ulid::from_bytes([2; 16]), [3; 32]);
         let (root, checked) = (root_key(set_id, &digest), checked_key(set_id, &digest));
         assert!(root < checked && checked < root_key(set_id, &[4; 32]));

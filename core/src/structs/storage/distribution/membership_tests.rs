@@ -84,7 +84,7 @@ fn join_request(seed: u8, ranges: Vec<Ulid>) -> DistributionRequest {
 }
 
 #[test]
-fn joined_member_catches_up() {
+fn joiner_catches_up() {
     // A joined replica starts created, admits itself late and then catches up.
     let head = active();
     let range_id = head.config.ranges[0].range_id;
@@ -121,7 +121,7 @@ fn joined_member_catches_up() {
 }
 
 #[test]
-fn join_needs_fresh_member() {
+fn join_needs_newcomer() {
     let head = active();
     let mut member = newcomer(3, MetadataCoverage::All);
     member.incarnation = Some(1);
@@ -212,7 +212,7 @@ fn deletion_stops_changes() {
 }
 
 #[test]
-fn epochs_stay_above_record() {
+fn epoch_covers_ranges() {
     let mut head = active();
     assert_eq!(head.max_epoch(), 1);
     head.config.ranges[0].epoch = 4;

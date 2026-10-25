@@ -126,7 +126,7 @@ fn statements_checked_inside() {
 }
 
 #[test]
-fn snapshot_size_is_bounded() {
+fn snapshot_size_bounded() {
     let boundaries: Vec<String> = (1..crate::structs::storage::distribution::MAX_RANGES)
         .map(|index| format!("{index:05}{}", "k".repeat(500)))
         .collect();

@@ -47,7 +47,7 @@ fn fence(range_id: Ulid, epoch: u64) -> RangeFence {
 }
 
 #[test]
-fn range_fence_refuses_old_epochs() {
+fn refuses_old_epochs() {
     // A former coordinator never writes the fenced range at the fenced epoch again.
     let snapshot = pending();
     let (lower, upper) = (&snapshot.config.ranges[0], &snapshot.config.ranges[1]);
@@ -62,7 +62,7 @@ fn range_fence_refuses_old_epochs() {
 }
 
 #[test]
-fn grace_lets_completions_pass() {
+fn grace_passes_completions() {
     // During the upload grace period only completions commit; closing it refuses them too.
     let snapshot = pending();
     let range = &snapshot.config.ranges[0];
@@ -95,7 +95,7 @@ fn fences_never_lower() {
 }
 
 #[test]
-fn deletion_fence_closes_set() {
+fn deletion_closes_set() {
     let snapshot = pending();
     let range = &snapshot.config.ranges[1];
     let local = LocalFence {
@@ -113,7 +113,7 @@ fn deletion_fence_closes_set() {
 }
 
 #[test]
-fn clear_cursor_sorts_first() {
+fn clear_sorts_first() {
     // The clear cursor of a set sorts before its range purge cursors, so a walk after it skips it.
     let set_id = Ulid::from_bytes([3; 16]);
     let clear = ClearCursor::key(set_id);

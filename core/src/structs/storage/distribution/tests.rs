@@ -234,7 +234,7 @@ fn combinations_are_checked() {
 }
 
 #[test]
-fn range_behaviour_falls_back() {
+fn behaviour_falls_back() {
     let config = sharded(2, &["m"], 0);
     let member = &config.members[0];
     assert_eq!(config.range_behaviour(member), RangeBehaviour::ServeAndFill);
