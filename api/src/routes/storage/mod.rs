@@ -16,6 +16,7 @@ pub mod encryption;
 pub mod group_backends;
 pub mod imports;
 pub mod moves;
+pub mod objects;
 pub mod organize;
 pub mod origin;
 pub mod relay;

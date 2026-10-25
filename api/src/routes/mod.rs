@@ -77,6 +77,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::discovery::router())
         .merge(storage::distributed::router())
         .merge(storage::text::router())
+        .merge(storage::objects::router())
         .merge(storage::organize::router())
         .merge(storage::origin::router())
         .merge(storage::routing::router())
@@ -267,6 +268,7 @@ pub(crate) mod tests {
         ("GET", "/data/blobs/locations"),
         ("GET", "/data/buckets/{bucket}/distribution"),
         ("GET", "/data/buckets/{bucket}/links"),
+        ("GET", "/data/buckets/{bucket}/objects"),
         ("GET", "/data/buckets/{bucket}/objects/origin"),
         ("GET", "/data/buckets/{bucket}/objects/part-of"),
         ("GET", "/data/buckets/{bucket}/sources"),

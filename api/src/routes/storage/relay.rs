@@ -1,6 +1,7 @@
 //! Relays a REST write that reached a member of a distributed bucket to the coordinator of the
-//! key's range with the caller's bearer token (D12). The coordinator checks the token and the
-//! caller's permissions again on its own path; an unreachable coordinator fails the write.
+//! key's range, and a read to a holder, with the caller's bearer token (D12). The target checks
+//! the token and the caller's permissions again on its own path; an unreachable coordinator
+//! fails the write.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -145,6 +146,14 @@ pub(crate) async fn relay_json<T: DeserializeOwned>(
             ));
         }
     };
+    answer(forward, response).await
+}
+
+/// A node's successful answer decoded, or its refusal as this node's answer.
+async fn answer<T: DeserializeOwned>(
+    forward: &RestForward,
+    response: reqwest::Response,
+) -> ServerResult<(StatusCode, T)> {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -154,6 +163,39 @@ pub(crate) async fn relay_json<T: DeserializeOwned>(
         ServerError::BadGatewayReason(format!("the coordinator answer does not decode: {error}"))
     })?;
     Ok((status, answer))
+}
+
+/// Sends a GET of `path` to the forward's node with the caller's bearer token and decodes its
+/// answer; `None` when the node did not answer, so the caller may ask another holder.
+pub(crate) async fn relay_get<T: DeserializeOwned>(
+    state: &ServerState,
+    forward: &RestForward,
+    path: &str,
+    bearer: Option<&ValidatedBearer>,
+) -> ServerResult<Option<T>> {
+    let bearer = bearer.ok_or(ServerError::Unauthorized)?;
+    let urls = node_urls(state.get_ctx().as_ref(), forward.node_id).await;
+    let Some(base) = urls.and_then(|urls| urls.api) else {
+        return Ok(None);
+    };
+    let response = CLIENT
+        .get(relay_url(&base, path))
+        .header(header::AUTHORIZATION, format!("Bearer {}", bearer.as_str()))
+        .header(RELAY_HOP_HEADER, state.get_node_id().to_string())
+        .send()
+        .await;
+    match response {
+        Ok(response) => Ok(Some(answer(forward, response).await?.1)),
+        Err(error) => {
+            warn!(
+                node_id = %forward.node_id,
+                connect = error.is_connect(),
+                error = %error,
+                "A distributed bucket holder did not take a relayed read"
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
