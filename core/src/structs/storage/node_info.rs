@@ -196,6 +196,9 @@ pub struct NodeUtilization {
     pub heartbeat_at_ms: u64,
     /// DRS download slot use; live telemetry like the load.
     pub download_slots: Option<crate::download_slots::DownloadSlots>,
+    /// The bytes the node may store, the sum of its backend quotas; `None` while a backend has
+    /// no quota.
+    pub storage_capacity_bytes: Option<u64>,
 }
 
 #[cfg(test)]
@@ -236,6 +239,7 @@ mod tests {
                 load_permille: Some(250),
                 heartbeat_at_ms: 1_700_000_000_000,
                 download_slots: None,
+                storage_capacity_bytes: None,
             },
             updated_at_ms: 1_700_000_000_500,
             epoch,

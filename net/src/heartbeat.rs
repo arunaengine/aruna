@@ -189,6 +189,7 @@ mod tests {
                 load_permille: None,
                 heartbeat_at_ms: 0,
                 download_slots: None,
+                storage_capacity_bytes: None,
             },
             availability: Vec::new(),
             reservation: ComputeReservationSnapshot {

@@ -1,6 +1,6 @@
-//! Balances the coordinators of a distributed bucket: a coordinator whose node holds clearly
-//! more than the average of the set's member nodes proposes one transfer of one range to the
-//! least filled ready `copy` replica of it. One transfer per node at a time, with a cool-down.
+//! Balances the coordinators of a distributed bucket: a coordinator whose node is clearly fuller
+//! than the set's average, by stored bytes relative to capacity, proposes one transfer of one
+//! range to the least filled ready `copy` replica of it, one at a time and with a cool-down.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -38,8 +38,8 @@ pub struct Proposal {
     pub to: Ulid,
 }
 
-/// Picks one transfer from the fill of each member node, or none. Pure: `fill` holds the
-/// stored bytes of the nodes this node hears from, itself included.
+/// Picks one transfer from the fill of each member node, or none. Pure: `fill` holds the fill
+/// in permille of capacity of the nodes this node hears from, itself included.
 pub fn propose(
     snapshot: &DistributionSnapshot,
     local: NodeId,
@@ -79,6 +79,13 @@ pub fn propose(
         .map(|(_, range_id, to)| Proposal { range_id, to })
 }
 
+/// The fill of a node in permille of its capacity; `None` without a known capacity.
+pub fn permille(used: u64, capacity: Option<u64>) -> Option<u64> {
+    let capacity = capacity.filter(|capacity| *capacity > 0)?;
+    let fill = u128::from(used) * 1000 / u128::from(capacity);
+    Some(u64::try_from(fill).unwrap_or(u64::MAX))
+}
+
 /// Proposes one balancing transfer of a set to its publisher, when this node is over-full and
 /// no cool-down runs.
 pub async fn balance_set(
@@ -96,10 +103,20 @@ pub async fn balance_set(
     }
     let mut fill: BTreeMap<NodeId, u64> = fresh_heartbeats(context.net_handle.as_ref())
         .into_iter()
-        .map(|(node_id, held)| (node_id, held.heartbeat.utilization.storage_bytes_used))
+        .filter_map(|(node_id, held)| {
+            let utilization = held.heartbeat.utilization;
+            let used = utilization.storage_bytes_used;
+            Some((node_id, permille(used, utilization.storage_capacity_bytes)?))
+        })
         .collect();
+    let capacity = crate::effect_adapters::routing::node_routing(context)
+        .catalog
+        .capacity();
     match crate::node::usage_stats::read_local_global(&context.storage_handle).await {
-        Ok(usage) => fill.insert(local, usage.stored_bytes),
+        Ok(usage) => match permille(usage.stored_bytes, capacity) {
+            Some(own) => fill.insert(local, own),
+            None => return,
+        },
         Err(_) => return,
     };
     let Some(proposal) = propose(snapshot, local, &fill) else {

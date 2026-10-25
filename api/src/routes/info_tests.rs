@@ -1472,6 +1472,7 @@ async fn management_urls_follow() {
             load_permille: None,
             heartbeat_at_ms: 1_700_000_000_000,
             download_slots: None,
+            storage_capacity_bytes: None,
         },
         updated_at_ms: 1_700_000_000_500,
         epoch: aruna_core::structs::storage::node_info::AdvertisementEpoch {
@@ -1543,6 +1544,7 @@ async fn realm_node_details() {
             load_permille: None,
             heartbeat_at_ms: 1_700_000_000_000,
             download_slots: None,
+            storage_capacity_bytes: None,
         },
         updated_at_ms: 1_700_000_000_500,
         epoch: aruna_core::structs::storage::node_info::AdvertisementEpoch {

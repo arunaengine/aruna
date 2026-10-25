@@ -140,6 +140,7 @@ fn advertised(local: NodeId, draining: bool) -> NodeInfoDocument {
             load_permille: None,
             heartbeat_at_ms: 1,
             download_slots: None,
+            storage_capacity_bytes: None,
         },
         updated_at_ms: 1,
         epoch: AdvertisementEpoch::default(),

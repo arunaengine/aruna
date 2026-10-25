@@ -862,6 +862,7 @@ async fn remote_owner_url() {
             load_permille: None,
             heartbeat_at_ms: 1_700_000_000_000,
             download_slots: None,
+            storage_capacity_bytes: None,
         },
         updated_at_ms: 1_700_000_000_500,
         epoch: AdvertisementEpoch {

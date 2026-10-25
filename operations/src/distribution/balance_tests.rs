@@ -45,3 +45,18 @@ fn balanced_or_busy_sets_stay() {
     let (single, _) = replicated(true, 1);
     assert_eq!(propose(&single, secret(1).public(), &fill(900, 100)), None);
 }
+
+#[test]
+fn fill_is_relative() {
+    // A node with more bytes but more room is the less filled one.
+    let large = permille(900, Some(10_000)).unwrap();
+    let small = permille(300, Some(1_000)).unwrap();
+    assert!(large < small);
+    let snapshot = over_full();
+    assert_eq!(
+        propose(&snapshot, secret(1).public(), &fill(large, small)),
+        None
+    );
+    assert_eq!(permille(5, None), None, "an unknown capacity takes no part");
+    assert_eq!(permille(5, Some(0)), None);
+}

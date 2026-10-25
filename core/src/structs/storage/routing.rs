@@ -262,6 +262,13 @@ impl BackendCatalog {
         self.backends.get(name).map(|entry| entry.cleanup)
     }
 
+    /// The bytes the node's backends may store together: the sum of their quotas, `None` while
+    /// a backend has no quota.
+    pub fn capacity(&self) -> Option<u64> {
+        let quotas = self.backends.values().map(|entry| entry.quota_bytes);
+        quotas.sum::<Option<u64>>().filter(|capacity| *capacity > 0)
+    }
+
     /// Backends the operator capped, for the caller that reads their usage.
     pub fn quotas(&self) -> Vec<(String, u64)> {
         self.backends
@@ -1100,6 +1107,17 @@ mod tests {
         let catalog = catalog().with_quota("cold", Some(10));
 
         assert_eq!(catalog.quotas(), vec![("cold".to_string(), 10)]);
+    }
+
+    #[test]
+    fn capacity_needs_quotas() {
+        // One uncapped backend leaves the node's capacity unknown.
+        let partly = catalog().with_quota("cold", Some(10));
+        assert_eq!(partly.capacity(), None);
+        let capped = partly
+            .with_quota("default", Some(5))
+            .with_quota("tape", Some(1));
+        assert_eq!(capped.capacity(), Some(16));
     }
 
     #[test]

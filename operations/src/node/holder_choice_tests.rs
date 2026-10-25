@@ -50,6 +50,7 @@ fn utilization(slots: Option<DownloadSlots>) -> NodeUtilization {
         load_permille: None,
         heartbeat_at_ms: 0,
         download_slots: slots,
+        storage_capacity_bytes: None,
     }
 }
 

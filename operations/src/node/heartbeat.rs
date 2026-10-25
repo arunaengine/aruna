@@ -212,6 +212,7 @@ mod tests {
             load_permille,
             heartbeat_at_ms: 0,
             download_slots: None,
+            storage_capacity_bytes: None,
         }
     }
 
