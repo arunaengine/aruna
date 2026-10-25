@@ -131,20 +131,23 @@ impl BlobHandler {
         let Ok(slot) = self.spool_files.clone().try_acquire_owned() else {
             return BlobEvent::Error(BlobError::SpoolBudgetExhausted { limit });
         };
-        let opened = tokio::task::spawn_blocking(move || unnamed_file(&dir)).await;
-        let file = match opened {
-            Ok(Ok(file)) => file,
+        // The permits travel with the opening, so a cancelled read releases them only after it.
+        let opened = tokio::task::spawn_blocking(move || {
+            unnamed_file(&dir).map(|file| SpoolFile {
+                file,
+                _bytes: bytes,
+                _slot: slot,
+            })
+        })
+        .await;
+        let spool = match opened {
+            Ok(Ok(spool)) => spool,
             Ok(Err(error)) => {
                 return BlobEvent::Error(BlobError::WriteError(format!(
                     "spool file was not created: {error}"
                 )));
             }
             Err(error) => return BlobEvent::Error(BlobError::WriteError(error.to_string())),
-        };
-        let spool = SpoolFile {
-            file,
-            _bytes: bytes,
-            _slot: slot,
         };
         let fill = self.fill_spool(spool, size, blob);
         let filled = match deadline {
