@@ -392,19 +392,17 @@ impl PublishOperation {
                     .into(),
             ),
         ];
+        // A marker carries its revision, so a pass that settled an older one keeps it.
+        let tag = revision.number.to_be_bytes().to_vec();
         // The publisher may coordinate ranges too; it finds catching-up members like any node.
         if catch_up {
             let key = set_id.to_bytes().to_vec().into();
-            writes.push((CATCH_UP_KEYSPACE.to_string(), key, Vec::new().into()));
+            writes.push((CATCH_UP_KEYSPACE.to_string(), key, tag.clone().into()));
         }
         // Nodes find the sets whose transfers, deletion or departures they act on through it.
         if view.snapshot().lifecycle_open() {
             let key = set_id.to_bytes().to_vec().into();
-            writes.push((
-                DISTRIBUTION_LIFECYCLE_KEYSPACE.to_string(),
-                key,
-                Vec::new().into(),
-            ));
+            writes.push((DISTRIBUTION_LIFECYCLE_KEYSPACE.to_string(), key, tag.into()));
         }
         self.output = Some(Ok(revision));
         self.state = PublishState::Write;

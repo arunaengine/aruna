@@ -41,6 +41,7 @@ use super::protocol::ReplicationMode;
 use super::queue::{BlobJobRecord, blob_job_key, schedule_blob_drain};
 use super::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
 use crate::distribution::create::submit;
+use crate::distribution::lifecycle::settle_marker;
 use crate::distribution::sign_statement;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::GetBucketOperation;
@@ -452,7 +453,7 @@ pub async fn process_bootstrap(context: &DriverContext) -> Result<bool, String> 
     let (realm_id, local) = (*net.realm_id(), net.node_id());
     let mut budget = PAGE_BUDGET;
     let mut waiting = false;
-    for (key, _) in scan(context, CATCH_UP_KEYSPACE, None, SET_BATCH).await? {
+    for (key, seen) in scan(context, CATCH_UP_KEYSPACE, None, SET_BATCH).await? {
         let Ok(set_id) = <[u8; 16]>::try_from(key.as_slice()).map(Ulid::from_bytes) else {
             delete(context, vec![(CATCH_UP_KEYSPACE.to_string(), key.into())]).await?;
             continue;
@@ -463,9 +464,7 @@ pub async fn process_bootstrap(context: &DriverContext) -> Result<bool, String> 
             set_id,
         };
         match walk.run(context, &mut budget).await {
-            Ok(Outcome::Settled) => {
-                delete(context, vec![(CATCH_UP_KEYSPACE.to_string(), key.into())]).await?
-            }
+            Ok(Outcome::Settled) => settle_marker(context, CATCH_UP_KEYSPACE, &key, &seen).await?,
             Ok(Outcome::Waiting) => waiting = true,
             Ok(Outcome::Stated) => {}
             Err(error) => {

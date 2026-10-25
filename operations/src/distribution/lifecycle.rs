@@ -117,7 +117,7 @@ pub async fn tend_lifecycle(context: &Arc<DriverContext>) -> Option<Duration> {
     };
     let mut waiting = false;
     let mut budget = PURGE_PAGES;
-    for key in rows {
+    for (key, seen) in rows {
         let Ok(set_id) = <[u8; 16]>::try_from(key.as_slice()).map(Ulid::from_bytes) else {
             let _ = batch_delete(context, vec![marker(&key)]).await;
             continue;
@@ -129,7 +129,8 @@ pub async fn tend_lifecycle(context: &Arc<DriverContext>) -> Option<Duration> {
         };
         match set.run(context, &mut budget).await {
             Ok(Left::Settled) => {
-                if let Err(error) = batch_delete(context, vec![marker(&key)]).await {
+                let space = DISTRIBUTION_LIFECYCLE_KEYSPACE;
+                if let Err(error) = settle_marker(context, space, &key, &seen).await {
                     warn!(%set_id, %error, "A settled lifecycle row stays until the next pass");
                 }
             }
@@ -152,7 +153,7 @@ fn marker(key: &[u8]) -> (String, Key) {
 
 /// Reads the next batch of sets after the last one looked at, so sets that keep waiting never
 /// starve later ones; a short batch makes the next pass start over.
-async fn scan_markers(context: &DriverContext) -> Result<Vec<Vec<u8>>, String> {
+async fn scan_markers(context: &DriverContext) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
     let after = MARKER_CURSOR
         .lock()
         .map(|cursor| cursor.clone())
@@ -166,18 +167,75 @@ async fn scan_markers(context: &DriverContext) -> Result<Vec<Vec<u8>>, String> {
     };
     match context.storage_handle.send_storage_effect(iter).await {
         Event::Storage(StorageEvent::IterResult { values, .. }) => {
-            let keys: Vec<Vec<u8>> = values.into_iter().map(|(key, _)| key.to_vec()).collect();
-            let next = (keys.len() == SET_BATCH)
-                .then(|| keys.last().cloned())
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = (values.into_iter())
+                .map(|(key, value)| (key.to_vec(), value.to_vec()))
+                .collect();
+            let next = (rows.len() == SET_BATCH)
+                .then(|| rows.last().map(|(key, _)| key.clone()))
                 .flatten();
             if let Ok(mut cursor) = MARKER_CURSOR.lock() {
                 *cursor = next;
             }
-            Ok(keys)
+            Ok(rows)
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected scan answer {other:?}")),
     }
+}
+
+/// Deletes a set's marker row only while it still holds `seen`: a record installed since the
+/// pass read it wrote a newer revision, and its work is looked at again.
+pub(crate) async fn settle_marker(
+    context: &DriverContext,
+    key_space: &str,
+    key: &[u8],
+    seen: &[u8],
+) -> Result<(), String> {
+    let storage = &context.storage_handle;
+    let started = storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await;
+    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
+        return Err(format!("the marker transaction did not start: {started:?}"));
+    };
+    let read = StorageEffect::Read {
+        key_space: key_space.to_string(),
+        key: key.to_vec().into(),
+        txn_id: Some(txn_id),
+    };
+    let current = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        other => {
+            storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Err(format!("the marker was not read: {other:?}"));
+        }
+    };
+    if current.as_deref() != Some(seen) {
+        storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        return Ok(());
+    }
+    let effects = [
+        StorageEffect::BatchDelete {
+            deletes: vec![(key_space.to_string(), key.to_vec().into())],
+            txn_id: Some(txn_id),
+        },
+        StorageEffect::CommitTransaction { txn_id },
+    ];
+    for effect in effects {
+        if let Event::Storage(StorageEvent::Error { error }) =
+            storage.send_storage_effect(effect).await
+        {
+            storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Err(error.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// One set's lifecycle work on this node.
@@ -870,6 +928,37 @@ mod tests {
         )
         .await;
         assert_eq!(fence, None, "the new member starts without the old fence");
+    }
+
+    #[tokio::test]
+    async fn settling_keeps_newer() {
+        // A marker rewritten by a newer record after the pass read it stays.
+        let (_dir, storage_handle) = crate::distribution::test_store::open();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let space = DISTRIBUTION_LIFECYCLE_KEYSPACE;
+        let key = [1u8; 16];
+        let put = |revision: u64| StorageEffect::Write {
+            key_space: space.to_string(),
+            key: key.to_vec().into(),
+            value: revision.to_be_bytes().to_vec().into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(put(8)).await;
+        let seen = 7u64.to_be_bytes();
+        settle_marker(&context, space, &key, &seen).await.unwrap();
+        let kept = read(&context, space, key.to_vec()).await.unwrap();
+        assert!(kept.is_some(), "a newer marker stays");
+        settle_marker(&context, space, &key, &8u64.to_be_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read(&context, space, key.to_vec()).await.unwrap(), None);
     }
 
     #[test]
