@@ -61,11 +61,10 @@ where
         if bytes_done != watch.seen {
             progress(bytes_done).await;
         }
-        let wait = watch.wait;
-        if watch.stalled(bytes_done, total) {
+        let Some(wait) = watch.next_delay(bytes_done, total) else {
             warn!(node = %node_id, bytes_done, "A synced-folder pull stopped receiving bytes");
             return Err(SyncRefusal::Unavailable);
-        }
+        };
         tokio::time::sleep(wait).await;
         let message = match ask_again {
             true => request(),
@@ -112,7 +111,8 @@ impl Default for Progress {
         Self {
             seen: 0,
             stalls: 0,
-            wait: FIRST_POLL_AFTER,
+            // Halved because each answer doubles it before the next poll.
+            wait: FIRST_POLL_AFTER / 2,
         }
     }
 }
@@ -131,6 +131,11 @@ impl Progress {
             (false, false) => self.stalls.saturating_add(1),
         };
         self.stalls >= STALL_POLLS
+    }
+
+    /// Takes one answer and returns the delay before the next poll, or `None` once stalled.
+    fn next_delay(&mut self, bytes_done: u64, total: u64) -> Option<Duration> {
+        (!self.stalled(bytes_done, total)).then_some(self.wait)
     }
 }
 
@@ -171,6 +176,22 @@ mod tests {
             assert!(!watch.stalled(0, 100));
         }
         assert!(watch.stalled(0, 100));
+    }
+
+    #[test]
+    fn counts_full_polls() {
+        // The first poll comes after FIRST_POLL_AFTER; a stall needs STALL_POLLS full delays.
+        let mut watch = Progress::default();
+        let mut delays = Vec::new();
+        while let Some(wait) = watch.next_delay(0, 100) {
+            delays.push(wait);
+        }
+        assert_eq!(delays.first(), Some(&FIRST_POLL_AFTER));
+        let full = delays
+            .iter()
+            .filter(|wait| **wait == PULL_POLL_AFTER)
+            .count();
+        assert_eq!(full, STALL_POLLS as usize);
     }
 
     #[test]
