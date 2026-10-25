@@ -793,7 +793,7 @@ async fn set_heads(
             break;
         }
         if !here {
-            return holder_heads(context, (peer, auth), (&snapshot, range), listing).await;
+            return holder_heads(context, (peer, auth), (snapshot, range), listing).await;
         }
         let operation = InventoryVersionsOperation::new(InventoryVersionsInput {
             set_id: binding.set_id,
