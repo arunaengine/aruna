@@ -24,7 +24,7 @@ use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, issue_ticket, redeem_ticket,
 };
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::node::holder_choice::choose_holder;
+use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
 use aruna_operations::node::node_info::read_info_documents;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
@@ -1282,6 +1282,10 @@ async fn resolve_global(
     // A holder of the range may lack this version's bytes, so its miss proves no absence.
     let mut outcome = ResolveOutcome::Unavailable;
     for _ in 0..MAX_HOLDER_TRIES {
+        // A spent budget would make a healthy holder look unavailable.
+        if Instant::now() >= deadline {
+            break;
+        }
         let Some(holder) = choose_holder(&context, &remote, now_millis()).await else {
             break;
         };
@@ -1291,7 +1295,9 @@ async fn resolve_global(
                 return Ok(with_holders(ResolveOutcome::Found(object)));
             }
             ResolveOutcome::Denied => outcome = ResolveOutcome::Denied,
-            ResolveOutcome::NotFound | ResolveOutcome::Unavailable => {}
+            // A holder that could not answer is skipped by the next choices for a while.
+            ResolveOutcome::Unavailable => avoid_holder(&context, holder.node_id, now_millis()),
+            ResolveOutcome::NotFound => {}
         }
     }
     Ok(outcome)
