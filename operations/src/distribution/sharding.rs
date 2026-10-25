@@ -111,6 +111,9 @@ async fn maintain_accounts(context: &Arc<DriverContext>) -> Duration {
     if let Ok(mut cursor) = CURSOR.lock() {
         *cursor = start;
     }
+    for snapshot in records.values().flatten() {
+        super::balance::balance_set(context, realm_id, local, snapshot).await;
+    }
     match busy || more {
         true => Duration::ZERO,
         false => MAINTAIN_AFTER,
