@@ -1554,7 +1554,10 @@ fn hop_names_source() {
     let OriginVersion::Node(arn) = hop.from else {
         panic!("an ordinary source is named by its node ARN")
     };
-    assert_eq!((arn.bucket.as_str(), arn.key.as_str()), ("source-bucket", "raw/a.txt"));
+    assert_eq!(
+        (arn.bucket.as_str(), arn.key.as_str()),
+        ("source-bucket", "raw/a.txt")
+    );
 }
 
 #[test]
