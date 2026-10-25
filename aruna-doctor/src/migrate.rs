@@ -13,15 +13,16 @@ use aruna_core::federation::FederationSettings;
 use aruna_core::git::{GitRecord, LOCAL_OBJECTS, StoredObject};
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    BROKEN_VERSION_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE,
-    EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE,
-    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE,
-    IRI_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY,
-    NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
-    S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
-    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
+    BROKEN_VERSION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
+    DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
+    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE,
+    NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
+    QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE,
+    REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, S3_BUCKET_KEYSPACE,
+    S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE,
+    SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
+    UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -129,6 +130,8 @@ pub struct MigrateOutput {
     /// versions carried their distributed bucket fields and source digests.
     pub versions_scanned: usize,
     pub versions_rewritten: usize,
+    /// Index rows written for reference versions bound to a connector that had none.
+    pub connector_references_written: usize,
     /// Bucket records from before buckets carried a compression setting or a distribution.
     pub buckets_scanned: usize,
     pub buckets_rewritten: usize,
@@ -228,6 +231,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let iri_rows = db.keyspace(IRI_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
     let staging_rows = db.keyspace(STAGING_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let object_rows = db.keyspace(LOCAL_OBJECTS, KeyspaceCreateOptions::default)?;
+    let reference_rows =
+        db.keyspace(CONNECTOR_REFERENCE_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -254,6 +259,13 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let versions = rewrite_rows(&db, &version_rows, BLOB_VERSIONS_KEYSPACE, |value| {
         relaid::<BlobVersion, versions::LegacyVersion>(value, versions::LAYOUT)
     })?;
+    let references = versions::reference_rows(
+        &db,
+        &version_rows,
+        &versions.rows,
+        &reference_rows,
+        BLOB_VERSIONS_KEYSPACE,
+    )?;
     let buckets = rewrite_rows(&db, &bucket_rows, S3_BUCKET_KEYSPACE, |value| {
         relaid::<BucketInfo, buckets::LegacyBucket>(value, buckets::LAYOUT)
     })?;
@@ -367,6 +379,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&git_rows, &git_records.rows),
         (&size_rows, &sizes.rows),
         (&version_rows, &versions.rows),
+        (&reference_rows, &references),
         (&bucket_rows, &buckets.rows),
         (&login_rows, &logins.rows),
         (&index_rows, &index.writes),
@@ -472,6 +485,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         upload_blobs_queued: old_uploads.blob_deletes.len(),
         versions_scanned: versions.scanned,
         versions_rewritten: versions.rows.len(),
+        connector_references_written: references.len(),
         buckets_scanned: buckets.scanned,
         buckets_rewritten: buckets.rows.len(),
         info_ops_deleted: info_ops,
