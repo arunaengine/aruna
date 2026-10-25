@@ -1,3 +1,4 @@
+//! Tests database list entries: owner consent binding, signer checks, bounds and removal.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

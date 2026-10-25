@@ -1,8 +1,9 @@
-//! Defines the download ticket a node puts in a private download redirect (D33). It names one
-//! caller, one exact object version and one target node for a few seconds, is redeemed once,
-//! and is never a credential. Tickets are never logged.
+//! Defines the download ticket a node puts in a private download redirect (D33): one caller,
+//! one exact object version and one target node for a few seconds, redeemed once.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A ticket is never a credential, and tickets are never logged.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

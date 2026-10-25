@@ -1,8 +1,9 @@
-//! Defines the realm's database list: bounded pointers from a bucket to the dataset that
-//! describes it, and the owner consent a curator's mark needs when the bucket's group admins
-//! are other people. Entries hold only ids; texts stay in the dataset.
+//! Defines the realm's database list: bounded pointers from a bucket to its describing dataset,
+//! and the owner consent a curator's mark needs when the bucket's group admins are others.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Entries hold only ids; texts stay in the dataset.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

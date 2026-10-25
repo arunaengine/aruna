@@ -1,3 +1,4 @@
+//! Tests range splits of a set's record: who may split, refusals, ancestors and open uploads.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

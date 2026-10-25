@@ -1,8 +1,9 @@
 //! Spools a byte stream to an unnamed local temporary file, so its hashes are known before any
-//! byte is served. The file, its byte permit and its file slot live together until the read
-//! stream of the file ends or drops; a crash leaves nothing, since the file has no name.
+//! byte is served. The file, its byte permit and file slot live until its read stream ends.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// The read stream may also drop; a crash leaves nothing, since the file has no name.
 
 use super::BlobHandler;
 use super::runtime::SPOOL_BUDGET_MIB;

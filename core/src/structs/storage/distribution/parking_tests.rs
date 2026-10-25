@@ -1,3 +1,4 @@
+//! Tests parked snapshots of unknown publishers: the highest and forked ones and retry authority.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

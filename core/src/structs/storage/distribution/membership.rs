@@ -1,8 +1,9 @@
 //! Applies a group admin's `join` and `leave` to a set's record. A joined member starts created,
-//! admits itself, catches up from the coordinators and becomes ready; a leaving member keeps no
-//! range and receives no publication.
+//! admits itself, catches up from the coordinators and becomes ready.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A leaving member keeps no range and receives no publication.
 
 use ulid::Ulid;
 

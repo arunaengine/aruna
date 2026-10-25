@@ -1,8 +1,9 @@
-//! Names the Aruna data a metadata document links to, in the one canonical form its link
-//! postings are keyed by: URL, short path and ARN spellings of one identifier share a key.
-//! Prefix links keep their prefix symbolic, so a bucket link never expands per file.
+//! Names the Aruna data a metadata document links to, in the canonical form its postings are
+//! keyed by: URL, short path and ARN spellings of one identifier share a key.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Prefix links keep their prefix symbolic, so a bucket link never expands per file.
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;

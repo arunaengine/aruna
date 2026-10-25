@@ -1,8 +1,9 @@
-//! Defines the request-bound delegation a node signs when it forwards one S3 request it
-//! verified to the coordinator of a distributed bucket's range (D33). It carries the caller's
-//! identity and restrictions for exactly one request and is never a credential.
+//! Defines the request-bound delegation a node signs when it forwards one verified S3 request
+//! to the coordinator of a distributed bucket's range (D33). It is never a credential.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// It carries the caller's identity and restrictions for exactly one request.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

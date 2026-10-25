@@ -1,9 +1,10 @@
-//! Applies fenced transfers and deletion to a set's record: `transfer prepare` takes a fresh
-//! epoch, the former coordinator's `transfer fenced` and the new one's `transfer complete`
-//! activate it; `delete prepare` names the deletion identity, every coordinator's
-//! `delete fenced` lets it commit.
+//! Applies fenced transfers and deletion to a set's record: a transfer takes a fresh epoch and
+//! activates once fenced and completed; a deletion commits once every coordinator fenced it.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// The former coordinator states `transfer fenced` and the new one `transfer complete`;
+// `delete prepare` names the deletion identity and each coordinator states `delete fenced`.
 
 use ulid::Ulid;
 

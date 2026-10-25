@@ -1,3 +1,4 @@
+//! Tests set record requests: create binding, admissions, statements, activation and catch-up.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

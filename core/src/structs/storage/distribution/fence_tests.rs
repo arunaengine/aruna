@@ -1,3 +1,4 @@
+//! Tests range and deletion fences: old epochs, the upload grace period and cursor order.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

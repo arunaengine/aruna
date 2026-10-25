@@ -1,3 +1,4 @@
+//! Tests the transfer and deletion steps of a set's record and the replicas they need.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

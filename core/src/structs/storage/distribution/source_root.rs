@@ -1,8 +1,9 @@
 //! Names the source roots of a set's external references: the connector configuration without
-//! the object path, so a set has few of them. A member that takes over a range checks every
-//! root it holds versions of before it completes the transfer.
+//! the object path, so a set has few of them.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A member taking over a range checks every root it holds versions of before it completes.
 
 use std::collections::BTreeMap;
 

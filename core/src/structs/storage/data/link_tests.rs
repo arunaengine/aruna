@@ -1,3 +1,4 @@
+//! Tests data link parsing and posting keys: shared spellings, prefix forms and scope keys.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

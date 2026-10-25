@@ -1,3 +1,4 @@
+//! Tests joins and leaves of a set's record, rejoins, deletion and the epoch they keep.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

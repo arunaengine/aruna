@@ -1,3 +1,4 @@
+//! Tests version origins: what a dataset may name, bounds and public source URLs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

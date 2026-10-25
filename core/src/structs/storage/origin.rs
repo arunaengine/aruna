@@ -1,8 +1,9 @@
 //! Records where a file version came from, set once when the version is minted and never
-//! changed, and the hop record a sync adds to its destination. Both are server-authored and
-//! bounded; they never live in the user metadata map.
+//! changed, and the hop record a sync adds to its destination.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Both are server-authored and bounded; they never live in the user metadata map.
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
