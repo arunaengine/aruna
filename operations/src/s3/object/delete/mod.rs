@@ -560,6 +560,13 @@ impl DeleteObjectOperation {
     }
 
     fn read_all_versions(&mut self) -> Effects {
+        // A purge removes the whole key, so its head needs no older replacement.
+        if self.purge.is_some() {
+            let Some(version_id) = self.input.version_id else {
+                return self.emit_error(DeleteObjectError::InvalidOperationState);
+            };
+            return self.read_current_lookup(version_id);
+        }
         self.state = DeleteObjectState::ReadAllVersions;
         let prefix = match VersionKey::object_prefix(&self.input.bucket, &self.input.key) {
             Ok(prefix) => prefix.into(),

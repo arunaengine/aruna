@@ -631,6 +631,70 @@ fn removes_final_pointer() {
     ));
 }
 
+#[test]
+fn purge_skips_history() {
+    // A purge reads the head directly instead of every version of the key.
+    let user_id = test_user_id();
+    let version_id = Ulid::from_bytes([1u8; 16]);
+    let binding = DistributionBinding {
+        set_id: Ulid::from_bytes([3u8; 16]),
+        member_id: Ulid::from_bytes([4u8; 16]),
+        incarnation: 5,
+        revision: Default::default(),
+    };
+    let mut op = DeleteObjectOperation::new(DeleteObjectInput {
+        bucket: "bucket".to_string(),
+        key: "key".to_string(),
+        version_id: Some(version_id),
+        group_id: Ulid::generate(),
+        realm_id: RealmId::from_bytes([1u8; 32]),
+        node_id: test_node_id(),
+        deleted_by: user_id,
+    })
+    .purging(binding.clone());
+    op.start();
+    op.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: Ulid::generate(),
+    }));
+    let info = BucketInfo {
+        group_id: Ulid::generate(),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Default::default(),
+        distribution: Some(binding),
+    };
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: Some(info.to_bytes().unwrap().into()),
+    }));
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![1u8].into(),
+        value: Some(deleted_version_value(user_id)),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })]
+            if key_space == BLOB_HEAD_KEYSPACE
+    ));
+    let pointer = CurrentVersionPointer::new_with_generation(version_id, 20);
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![2u8].into(),
+        value: Some(pointer.to_bytes().unwrap().into()),
+    }));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
+                if key_space == BLOB_HEAD_KEYSPACE
+        ),
+        "the purged head is removed, not moved to an older version"
+    );
+}
+
 #[tokio::test]
 async fn missing_version_rejected() {
     let temp_handle = tempdir().unwrap();
