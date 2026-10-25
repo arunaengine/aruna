@@ -41,12 +41,26 @@ fn holders_are_copies() {
 #[test]
 fn probes_one_full_member() {
     let mut snapshot = ready_set();
-    // Assigned coverage: the coordinator of each range is asked, never this node.
+    // Assigned coverage: the holders of each range are asked, never this node.
     assert_eq!(
         probe_targets(&snapshot, secret(1).public()),
-        vec![secret(2).public()]
+        vec![vec![secret(2).public()]]
     );
-    assert_eq!(probe_targets(&snapshot, secret(3).public()).len(), 2);
+    // Each range's coordinator first, then its replica answers when the coordinator is down.
+    assert_eq!(
+        probe_targets(&snapshot, secret(3).public()),
+        vec![
+            vec![secret(1).public(), secret(2).public()],
+            vec![secret(2).public(), secret(1).public()],
+        ]
+    );
+    // A catching-up member proves nothing, so it is never asked.
+    snapshot.config.members[1].state = MemberState::CatchingUp;
+    assert_eq!(
+        probe_targets(&snapshot, secret(3).public()),
+        vec![vec![secret(1).public()]]
+    );
+    snapshot.config.members[1].state = MemberState::Ready;
     // One ready member with all coverage covers the whole set.
     let full = snapshot
         .config
@@ -57,7 +71,7 @@ fn probes_one_full_member() {
     full.coverage = MetadataCoverage::All;
     assert_eq!(
         probe_targets(&snapshot, secret(3).public()),
-        vec![secret(2).public()]
+        vec![vec![secret(2).public()]]
     );
 }
 

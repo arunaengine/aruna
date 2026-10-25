@@ -5,6 +5,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::HashMap;
+
 use aruna_core::NodeId;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -105,37 +107,54 @@ pub async fn key_holders(context: &DriverContext, set_id: Ulid, key: &str) -> Ve
     }
 }
 
-/// Whom to ask for the key of a version in `snapshot`: one ready member with `all` coverage,
-/// otherwise the coordinator of every range. `local` is never asked.
-pub fn probe_targets(snapshot: &DistributionSnapshot, local: NodeId) -> Vec<NodeId> {
-    let full = snapshot.config.members.iter().find(|member| {
-        member.node_id != local
-            && member.state == MemberState::Ready
-            && member.coverage == MetadataCoverage::All
-    });
-    if let Some(member) = full {
-        return vec![member.node_id];
-    }
-    let mut targets: Vec<NodeId> = snapshot
-        .config
-        .ranges
-        .iter()
-        .filter_map(|range| snapshot.member(range.coordinator))
+/// Whom to ask for a version in `snapshot`, as groups of alternatives that each cover part of
+/// the set: the ready `all` coverage members, else each range's ready record holders, its
+/// coordinator first. `local` is never asked; an empty group is a range only it holds.
+pub fn probe_targets(snapshot: &DistributionSnapshot, local: NodeId) -> Vec<Vec<NodeId>> {
+    let full: Vec<NodeId> = (snapshot.config.members.iter())
+        .filter(|member| {
+            member.node_id != local
+                && member.state == MemberState::Ready
+                && member.coverage == MetadataCoverage::All
+        })
         .map(|member| member.node_id)
-        .filter(|node_id| *node_id != local)
         .collect();
-    targets.dedup();
-    targets
+    if !full.is_empty() {
+        return vec![full];
+    }
+    let mut groups: Vec<Vec<NodeId>> = Vec::new();
+    for range in &snapshot.config.ranges {
+        let mut holders = snapshot.record_holders(range);
+        if let Some(at) = (holders.iter()).position(|member| member.member_id == range.coordinator)
+        {
+            holders[..=at].rotate_right(1);
+        }
+        let group: Vec<NodeId> = (holders.into_iter())
+            .map(|member| member.node_id)
+            .filter(|node_id| *node_id != local)
+            .collect();
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+/// Whether this node's member of `snapshot` is ready, so its own index proves absence.
+fn ready_here(snapshot: &DistributionSnapshot, local: NodeId) -> bool {
+    (snapshot.config.members.iter())
+        .any(|member| member.node_id == local && member.state == MemberState::Ready)
 }
 
 /// The snapshots of this node's records that `keep` accepts, at most `wanted` of them, and
-/// whether records were left unread because [`MAX_SETS`] were read.
+/// whether accepted records were dropped or records left unread because [`MAX_SETS`] were read.
 async fn scan_sets(
     context: &DriverContext,
     keep: impl Fn(&DistributionSnapshot) -> bool,
     wanted: usize,
 ) -> Result<(Vec<DistributionSnapshot>, bool), String> {
     let mut found = Vec::new();
+    let mut dropped = false;
     let mut start = None;
     let mut seen = 0usize;
     loop {
@@ -160,26 +179,28 @@ async fn scan_sets(
                 continue;
             };
             let snapshot = view.snapshot();
-            if keep(snapshot) && found.len() < wanted {
-                found.push(snapshot.clone());
+            match keep(snapshot) && found.len() < wanted {
+                true => found.push(snapshot.clone()),
+                false => dropped |= keep(snapshot),
             }
         }
         match next {
             Some(next) if seen < MAX_SETS => start = Some(next),
             Some(_) => return Ok((found, true)),
-            None => return Ok((found, false)),
+            None => return Ok((found, dropped)),
         }
     }
 }
 
-/// The snapshots of the sets whose hint `version_id` carries, from this node's records.
+/// The snapshots of the sets whose hint `version_id` carries, from this node's records, and
+/// whether some candidates were left out.
 pub async fn candidate_sets(
     context: &DriverContext,
     version_id: Ulid,
-) -> Result<Vec<DistributionSnapshot>, String> {
+) -> Result<(Vec<DistributionSnapshot>, bool), String> {
     let hint = SetHint::of_version(version_id);
     let keep = |snapshot: &DistributionSnapshot| SetHint::of_set(snapshot.set_id()) == hint;
-    Ok(scan_sets(context, keep, MAX_CANDIDATES).await?.0)
+    scan_sets(context, keep, MAX_CANDIDATES).await
 }
 
 /// The key this node's version id index holds for `version_id` in `set_id`.
@@ -232,7 +253,8 @@ async fn ask_set(
     deadline: Instant,
 ) -> SetAnswer {
     let set_id = snapshot.set_id();
-    if bound_here(context, snapshot).await {
+    let bound = bound_here(context, snapshot).await;
+    if bound {
         match indexed_key(context, set_id, version_id).await {
             Ok(Some(key)) => return SetAnswer::Found { key, local: true },
             Ok(None) => {}
@@ -242,22 +264,33 @@ async fn ask_set(
     let Some(net) = context.net_handle.as_ref() else {
         return SetAnswer::Unknown;
     };
-    let targets = probe_targets(snapshot, net.node_id());
-    if targets.is_empty() {
-        return SetAnswer::Absent;
-    }
+    // A catching-up member's own index is incomplete, so it proves no absence.
+    let local_proves = bound && ready_here(snapshot, net.node_id());
+    let mut answered: HashMap<NodeId, bool> = HashMap::new();
     let mut complete = true;
-    for node_id in targets {
-        if *probes >= MAX_PROBES || Instant::now() >= deadline {
-            return SetAnswer::Unknown;
+    for group in probe_targets(snapshot, net.node_id()) {
+        let mut covered = group.is_empty() && local_proves;
+        for node_id in group {
+            if covered {
+                break;
+            }
+            if let Some(known) = answered.get(&node_id) {
+                covered = *known;
+                continue;
+            }
+            if *probes >= MAX_PROBES || Instant::now() >= deadline {
+                return SetAnswer::Unknown;
+            }
+            *probes += 1;
+            let lookup = VersionKeyOperation::new(node_id, *net.realm_id(), set_id, version_id);
+            match drive_until(lookup, context, deadline).await {
+                Ok(MemberAnswer::Key(Some(key))) => return SetAnswer::Found { key, local: false },
+                Ok(MemberAnswer::Key(None)) => covered = true,
+                Ok(MemberAnswer::Versions { .. }) | Err(_) => {}
+            }
+            answered.insert(node_id, covered);
         }
-        *probes += 1;
-        let lookup = VersionKeyOperation::new(node_id, *net.realm_id(), set_id, version_id);
-        match drive_until(lookup, context, deadline).await {
-            Ok(MemberAnswer::Key(Some(key))) => return SetAnswer::Found { key, local: false },
-            Ok(MemberAnswer::Key(None)) => {}
-            Ok(MemberAnswer::Versions { .. }) | Err(_) => complete = false,
-        }
+        complete &= covered;
     }
     match complete {
         true => SetAnswer::Absent,
@@ -271,7 +304,7 @@ pub async fn resolve_version(
     version_id: Ulid,
     deadline: Instant,
 ) -> GlobalResolution {
-    let Ok(candidates) = candidate_sets(context, version_id).await else {
+    let Ok((candidates, truncated)) = candidate_sets(context, version_id).await else {
         return GlobalResolution::Unavailable;
     };
     if candidates.is_empty() {
@@ -279,7 +312,8 @@ pub async fn resolve_version(
     }
     let mut probes = 0usize;
     let mut found: Option<ResolvedVersion> = None;
-    let mut complete = true;
+    // Candidates left out may hold it, so their silence proves nothing.
+    let mut complete = !truncated;
     for snapshot in &candidates {
         match ask_set(context, snapshot, version_id, &mut probes, deadline).await {
             SetAnswer::Found { key, local } => {
@@ -385,13 +419,13 @@ impl ContentResolution {
     }
 }
 
-/// Whether this node's member of `snapshot` holds the records of every range.
+/// Whether this node's ready member of `snapshot` holds the records of every range.
 fn holds_every_range(snapshot: &DistributionSnapshot, local: NodeId) -> bool {
     let member = snapshot
         .config
         .members
         .iter()
-        .find(|member| member.node_id == local);
+        .find(|member| member.node_id == local && member.state == MemberState::Ready);
     member.is_some_and(|member| {
         snapshot.held_ranges(member.member_id).len() == snapshot.config.ranges.len()
     })
@@ -426,7 +460,8 @@ pub async fn resolve_content(
             break;
         }
         let set_id = snapshot.set_id();
-        if bound_here(context, snapshot).await {
+        let bound = bound_here(context, snapshot).await;
+        if bound {
             match content_versions(context, set_id, &identity, MAX_CONTENT_VERSIONS).await {
                 Ok((found, more)) => {
                     resolution.incomplete |= more;
@@ -438,20 +473,35 @@ pub async fn resolve_content(
                 continue;
             }
         }
-        for node_id in probe_targets(snapshot, local) {
-            if probes >= MAX_PROBES || Instant::now() >= deadline {
-                resolution.incomplete = true;
-                return resolution;
-            }
-            probes += 1;
-            let lookup = VersionKeyOperation::content(node_id, *net.realm_id(), set_id, identity);
-            match drive_until(lookup, context, deadline).await {
-                Ok(MemberAnswer::Versions { versions, more }) => {
+        let local_proves = bound && ready_here(snapshot, local);
+        let mut answered: HashMap<NodeId, bool> = HashMap::new();
+        for group in probe_targets(snapshot, local) {
+            let mut covered = group.is_empty() && local_proves;
+            for node_id in group {
+                if covered {
+                    break;
+                }
+                if let Some(known) = answered.get(&node_id) {
+                    covered = *known;
+                    continue;
+                }
+                if probes >= MAX_PROBES || Instant::now() >= deadline {
+                    resolution.incomplete = true;
+                    return resolution;
+                }
+                probes += 1;
+                let lookup =
+                    VersionKeyOperation::content(node_id, *net.realm_id(), set_id, identity);
+                if let Ok(MemberAnswer::Versions { versions, more }) =
+                    drive_until(lookup, context, deadline).await
+                {
                     resolution.incomplete |= more;
                     resolution.add(snapshot, versions, false);
+                    covered = true;
                 }
-                Ok(MemberAnswer::Key(_)) | Err(_) => resolution.incomplete = true,
+                answered.insert(node_id, covered);
             }
+            resolution.incomplete |= !covered;
         }
     }
     resolution
