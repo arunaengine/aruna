@@ -30,6 +30,9 @@ pub struct LocalFence {
     pub deletion: Option<[u8; 32]>,
     /// This member applies no incoming publication: it leaves or the set is deleted.
     pub closed: bool,
+    /// The byte copies each range had when this node fenced it; its own copy goes only once
+    /// the range has as many again without it.
+    pub copies: Vec<(Ulid, u32)>,
 }
 
 impl LocalFence {
@@ -88,6 +91,13 @@ impl LocalFence {
 
     pub fn range(&self, range_id: Ulid) -> Option<&RangeFence> {
         self.ranges.iter().find(|fence| fence.range_id == range_id)
+    }
+
+    /// The byte copies `range_id` had when it was fenced here; 0 when not recorded.
+    pub fn copies_of(&self, range_id: Ulid) -> u32 {
+        (self.copies.iter())
+            .find(|(fenced, _)| *fenced == range_id)
+            .map_or(0, |(_, copies)| *copies)
     }
 
     /// Fences `range_id` for `transfer_id`; fencing it again for the same transfer is a no-op.

@@ -25,7 +25,7 @@ use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
 use aruna_core::structs::storage::distribution::snapshot::OpenTransfer;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, DistributionSnapshot, KeyRange, MemberState,
-    Statement, StatementClaim, StatementKind,
+    MetadataCoverage, Statement, StatementClaim, StatementKind,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
@@ -461,8 +461,16 @@ impl SetWork {
             since_ms: unix_timestamp_millis(),
             uploads_open: true,
         };
+        // The byte copies the range has now; this node's copy goes only once it has them again.
+        let copies = snapshot.byte_holders(range, None).len();
+        let copies = u32::try_from(copies).unwrap_or(u32::MAX);
         let fenced = update_fence(context, self.set_id, |local| {
-            local.fence_range(fence.clone())
+            let fenced = local.fence_range(fence.clone());
+            if fenced {
+                local.copies.retain(|(id, _)| *id != range.range_id);
+                local.copies.push((range.range_id, copies));
+            }
+            fenced
         })
         .await?;
         if open.fenced.is_some() {
@@ -563,8 +571,9 @@ impl SetWork {
         Ok(Left::Waiting)
     }
 
-    /// Purges a range this node fenced for a transfer once the record no longer has it hold
-    /// the range at all and the range's coordinator and every listed replica are ready.
+    /// Purges a range this node fenced for a transfer, or each range split from it, once the
+    /// record no longer lists it as a byte holder, the range is ready and has at least as many
+    /// ready byte copies without this node as it had at the fence.
     async fn reclaim(
         &self,
         context: &Arc<DriverContext>,
@@ -572,7 +581,7 @@ impl SetWork {
         local: &Local<'_>,
         budget: &mut usize,
     ) -> Result<Left, String> {
-        let (Some(binding), member_id) = (local.binding.clone(), local.member.member_id) else {
+        let (Some(binding), member) = (local.binding.clone(), local.member) else {
             return Ok(Left::Settled);
         };
         let stored = read(
@@ -582,24 +591,9 @@ impl SetWork {
         )
         .await?;
         let fence = LocalFence::decode(stored.as_deref()).map_err(|error| error.to_string())?;
-        let held = snapshot.held_ranges(member_id);
         let mut left = Left::Settled;
-        for fenced in &fence.ranges {
-            let Some(range) =
-                (snapshot.config.ranges.iter()).find(|r| r.range_id == fenced.range_id)
-            else {
-                continue;
-            };
-            if held.iter().any(|r| r.range_id == range.range_id) {
-                continue;
-            }
-            let moving = snapshot
-                .lifecycle
-                .transfers
-                .iter()
-                .any(|t| t.range_id == range.range_id);
-            // The copies stay until the range keeps every listed replica without this node.
-            if moving || !snapshot.range_ready(range) {
+        for (range, ready) in given_away(snapshot, &fence, member) {
+            if !ready {
                 left = Left::Waiting;
                 continue;
             }
@@ -635,6 +629,42 @@ impl SetWork {
         }
         Ok(())
     }
+}
+
+/// The ranges `member` fenced and gave away, split children included, and whether each keeps
+/// its copies without it: not moving, listed members ready, as many byte holders as at the
+/// fence. An `all` coverage member keeps its records, so it gives nothing away.
+fn given_away<'a>(
+    snapshot: &'a DistributionSnapshot,
+    fence: &LocalFence,
+    member: &DistributionMember,
+) -> Vec<(&'a KeyRange, bool)> {
+    if member.coverage == MetadataCoverage::All {
+        return Vec::new();
+    }
+    let mut given = Vec::new();
+    for fenced in &fence.ranges {
+        let copies = usize::try_from(fence.copies_of(fenced.range_id)).unwrap_or(usize::MAX);
+        let ranges = (snapshot.config.ranges.iter())
+            .filter(|range| snapshot.descends(range, fenced.range_id))
+            .filter(|range| {
+                range.coordinator != member.member_id && !range.replicas.contains(&member.member_id)
+            });
+        for range in ranges {
+            let moving =
+                (snapshot.lifecycle.transfers.iter()).any(|t| t.range_id == range.range_id);
+            let ready = (snapshot
+                .byte_holders(range, Some(member.member_id))
+                .into_iter())
+            .filter(|holder| holder.state == MemberState::Ready)
+            .count();
+            given.push((
+                range,
+                !moving && snapshot.range_ready(range) && ready >= copies,
+            ));
+        }
+    }
+    given
 }
 
 /// Whether `binding` names the bucket of `member`: same set and member at its admitted
@@ -856,6 +886,44 @@ mod tests {
             ..bound(6)
         };
         assert!(!owns(set_id, &member, &other));
+    }
+
+    #[test]
+    fn reclaim_awaits_copies() {
+        // A range given away is purged only once it has its copies again, split children too.
+        use crate::distribution::test_record::member;
+        use aruna_core::structs::storage::distribution::fence::RangeFence;
+        let (mut snapshot, _) = crate::distribution::test_record::replicated(true, 1);
+        let parent = snapshot.config.ranges[0].range_id;
+        let child = &mut snapshot.config.ranges[0];
+        (child.range_id, child.lineage) = (Ulid::from_bytes([60; 16]), Some(parent));
+        (child.coordinator, child.replicas) = (member(2), Vec::new());
+        let former = snapshot.member(member(1)).unwrap().clone();
+        let mut fence = LocalFence::default();
+        fence.fence_range(RangeFence {
+            range_id: parent,
+            transfer_id: Ulid::from_bytes([61; 16]),
+            epoch: 1,
+            since_ms: 0,
+            uploads_open: false,
+        });
+        fence.copies.push((parent, 2));
+        let given = given_away(&snapshot, &fence, &former);
+        let child_id = Ulid::from_bytes([60; 16]);
+        assert_eq!(
+            given.len(),
+            1,
+            "the split child of the fenced range is found"
+        );
+        assert_eq!((given[0].0.range_id, given[0].1), (child_id, false));
+        fence.copies = vec![(parent, 1)];
+        assert!(
+            given_away(&snapshot, &fence, &former)[0].1,
+            "one copy is enough now"
+        );
+        let mut all = former.clone();
+        all.coverage = MetadataCoverage::All;
+        assert!(given_away(&snapshot, &fence, &all).is_empty());
     }
 
     #[tokio::test]

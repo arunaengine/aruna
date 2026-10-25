@@ -251,8 +251,9 @@ pub async fn leave_distributed(
 - The new coordinator completes once its copy holds everything up to the fence and it can
   read every external source root of the set's references through a connector of the group
   on its own node; then it writes the range and the former coordinator forwards to it.
-- With role `leave` the former coordinator removes its copy once the new one and every
-  other listed replica of the range are ready.
+- With role `leave` the former coordinator removes its copy once every listed member of the
+  range is ready and the range has as many copies without it as it had at the fence. A
+  member with `all` metadata coverage keeps its copy and stays a replica.
 - The answer is 202 once the transfer is open; its progress shows in the bucket status.
 - While the current coordinator is unreachable the transfer is refused with 503."#,
     params(

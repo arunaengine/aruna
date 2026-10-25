@@ -210,8 +210,17 @@ fn transfer_binds_its_statements() {
     assert!(next_snapshot(realm(), Some(&fence), &complete(&fence, 3, vec![1, 2])).is_err());
     assert!(next_snapshot(realm(), Some(&fence), &complete(&fence, 2, vec![9])).is_err());
     let done = step(&fence, &complete(&fence, 2, vec![1, 2]));
-    // With role "leave" the former coordinator keeps no copy of the range.
+    // A former coordinator with `all` coverage keeps its copy even with role "leave".
+    assert!(done.config.ranges[0].replicas.contains(&member_id(1)));
+    let mut assigned = fence.clone();
+    assigned.config.members[0].coverage = MetadataCoverage::Assigned;
+    let done = step(&assigned, &complete(&assigned, 2, vec![1, 2]));
+    // An assigned former coordinator keeps no copy of the range and leaves the set.
     assert!(!done.config.ranges[0].replicas.contains(&member_id(1)));
+    assert_eq!(
+        done.member(member_id(1)).unwrap().state,
+        MemberState::Leaving
+    );
 }
 
 #[test]

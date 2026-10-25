@@ -103,6 +103,19 @@ impl DistributionSnapshot {
             .collect()
     }
 
+    /// The members that keep the bytes of `range`, ready or not: its coordinator and its `copy`
+    /// replicas, without `except`.
+    pub fn byte_holders(&self, range: &KeyRange, except: Option<Ulid>) -> Vec<&DistributionMember> {
+        let listed = std::iter::once(&range.coordinator).chain(&range.replicas);
+        listed
+            .filter(|id| Some(**id) != except)
+            .filter_map(|id| self.member(*id))
+            .filter(|member| {
+                member.member_id == range.coordinator || member.strategy == DataStrategy::Copy
+            })
+            .collect()
+    }
+
     /// Whether the coordinator and every replica the record lists for `range` are ready.
     pub fn range_ready(&self, range: &KeyRange) -> bool {
         let ready = |id: &Ulid| (self.member(*id)).is_some_and(|m| m.state == MemberState::Ready);
@@ -261,13 +274,16 @@ pub(super) fn activate_transfer(
             "a transfer activates with its fenced and complete statements only",
         ));
     };
+    // An `all` coverage member keeps every range's records, so it keeps its copy as well:
+    // leaving would strand its bytes without the range's publications.
+    let keeps_all = (next.member(open.from)).is_some_and(|m| m.coverage == MetadataCoverage::All);
     let range = (next.config.ranges.iter_mut())
         .find(|range| range.range_id == open.range_id)
         .ok_or(DistributionError::NoTransfer(transfer_id))?;
     range.coordinator = open.to;
     range.epoch = open.epoch;
     range.replicas.retain(|replica| *replica != open.to);
-    if open.role == TransferRole::Replica {
+    if open.role == TransferRole::Replica || keeps_all {
         range.replicas.push(open.from);
     }
     let holds = (next.config.ranges.iter())
