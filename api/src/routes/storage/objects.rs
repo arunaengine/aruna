@@ -580,3 +580,7 @@ mod tests {
         assert_eq!(head.key, "d/");
     }
 }
+
+#[cfg(test)]
+#[path = "objects_tests.rs"]
+mod route_tests;
