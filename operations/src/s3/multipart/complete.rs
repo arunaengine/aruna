@@ -565,6 +565,8 @@ impl CompleteUploadOperation {
             return self.queue_cleanup_work(BlobCleanupWork::ReconcileReservation { location });
         };
         let (realm_id, ttl_ms) = (self.input.realm_id, self.rocrate_limits.holder_ttl_ms);
+        // Distributed buckets are found through their content indexes, not the DHT.
+        let announce = self.binding.is_none();
         // An in-place object is the only copy of its parts: a commit that did not land must
         // leave it to the upload, one that did to its version.
         let owner = match self.in_place_target(&location) {
@@ -573,11 +575,13 @@ impl CompleteUploadOperation {
                 blake3,
                 realm_id,
                 ttl_ms,
+                announce,
             },
             false => WriteOwner::Blob {
                 blake3,
                 realm_id,
                 ttl_ms,
+                announce,
             },
         };
         self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite { location, owner })
@@ -2004,6 +2008,7 @@ impl CompleteUploadOperation {
                         blake3,
                         realm_id: self.input.realm_id,
                         ttl_ms: self.rocrate_limits.holder_ttl_ms,
+                        announce: self.binding.is_none(),
                     },
                 });
             }
@@ -2013,6 +2018,7 @@ impl CompleteUploadOperation {
             .as_ref()
             .and_then(|location| location.get_blake3())
             && self.composed_location.as_ref() != self.final_location.as_ref()
+            && self.binding.is_none()
             && let Ok(blake3) = blake3.try_into()
         {
             works.push(BlobCleanupWork::RegisterDht {

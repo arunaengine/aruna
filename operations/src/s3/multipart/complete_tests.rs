@@ -344,6 +344,7 @@ fn commit_keeps_composed() {
                 blake3: [7u8; 32],
                 realm_id: op.input.realm_id,
                 ttl_ms: RoCrateLimits::default().holder_ttl_ms,
+                announce: true,
             },
         }
     );
@@ -385,6 +386,7 @@ fn release_on_failure() {
                     blake3: [7u8; 32],
                     realm_id: op.input.realm_id,
                     ttl_ms: op.rocrate_limits.holder_ttl_ms,
+                    announce: true,
                 },
             })
             .is_some()
@@ -439,6 +441,7 @@ fn exhausted_releases_hold() {
                     blake3: [7u8; 32],
                     realm_id: op.input.realm_id,
                     ttl_ms: op.rocrate_limits.holder_ttl_ms,
+                    announce: true,
                 },
             })
             .is_some()
@@ -655,6 +658,7 @@ fn uncertain_keeps_object() {
                 blake3: [7u8; 32],
                 realm_id: op.input.realm_id,
                 ttl_ms: RoCrateLimits::default().holder_ttl_ms,
+                announce: true,
             },
         }
     );
@@ -1316,6 +1320,7 @@ fn cleanup_covers_omitted() {
                 blake3,
                 realm_id,
                 ttl_ms,
+                ..
             },
         } if *blake3 == [7u8; 32]
             && location.get_blake3() == Some(&[7u8; 32][..])

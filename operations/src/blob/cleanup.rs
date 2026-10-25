@@ -472,9 +472,10 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
                     blake3,
                     realm_id,
                     ttl_ms,
+                    announce,
                 },
         } => {
-            let holder = (blake3, realm_id, ttl_ms);
+            let holder = (blake3, realm_id, ttl_ms, announce);
             reconcile_target(context, upload_id, Some(holder), location).await
         }
         // The committed metadata decides. An unreadable owner is not a proof of
@@ -491,7 +492,12 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
                             blake3,
                             realm_id,
                             ttl_ms,
+                            announce: true,
                         } => register_dht(context, blake3, realm_id, ttl_ms).await,
+                        // A copy of a distributed bucket is found through its content index.
+                        WriteOwner::Blob {
+                            announce: false, ..
+                        } => true,
                         WriteOwner::UploadPart { .. }
                         | WriteOwner::Upload { .. }
                         | WriteOwner::CompletedUpload { .. }
@@ -608,7 +614,7 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
 async fn reconcile_target(
     context: &DriverContext,
     upload_id: Ulid,
-    holder: Option<([u8; 32], RealmId, u64)>,
+    holder: Option<([u8; 32], RealmId, u64, bool)>,
     location: BackendLocation,
 ) -> RowOutcome {
     match owns_write(context, &WriteOwner::Upload { upload_id }, &location).await {
@@ -616,17 +622,21 @@ async fn reconcile_target(
         Some(true) => return RowOutcome::Kept,
         Some(false) => {}
     }
-    if let Some((blake3, realm_id, ttl_ms)) = holder {
+    if let Some((blake3, realm_id, ttl_ms, announce)) = holder {
         let owner = WriteOwner::Blob {
             blake3,
             realm_id,
             ttl_ms,
+            announce,
         };
         match owns_write(context, &owner, &location).await {
             None => return RowOutcome::Failed,
             Some(true) => {
                 if let Some(blob_handle) = context.blob_handle.as_ref() {
                     blob_handle.clear_reservation(location.ulid);
+                }
+                if !announce {
+                    return RowOutcome::Done;
                 }
                 return register_dht(context, blake3, realm_id, ttl_ms).await.into();
             }
@@ -1083,13 +1093,14 @@ mod tests {
         assert_eq!(remaining_rows(&storage).await, 0);
     }
 
-    fn reconcile_work(location: &BackendLocation) -> Vec<u8> {
+    fn reconcile_work(location: &BackendLocation, announce: bool) -> Vec<u8> {
         BlobCleanupWork::ReconcileWrite {
             location: location.clone(),
             owner: WriteOwner::Blob {
                 blake3: [7u8; 32],
                 realm_id: location.created_by.realm_id,
                 ttl_ms: RoCrateLimits::default().holder_ttl_ms,
+                announce,
             },
         }
         .to_bytes()
@@ -1098,7 +1109,14 @@ mod tests {
 
     #[tokio::test]
     async fn owned_write_waits() {
-        // The committed copy stays queued until its DHT holder is registered.
+        for announce in [true, false] {
+            owned_write(announce).await;
+        }
+    }
+
+    /// A committed copy stays queued until its DHT holder is registered; a copy of a distributed
+    /// bucket is never announced and settles at once.
+    async fn owned_write(announce: bool) {
         let (_dir, storage, context) = setup_context();
         let BlobCleanupWork::DeleteBlob { location } =
             BlobCleanupWork::from_bytes(&delete_work()).unwrap()
@@ -1119,13 +1137,14 @@ mod tests {
             event,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
-        write_rows(&storage, vec![reconcile_work(&location)]).await;
+        write_rows(&storage, vec![reconcile_work(&location, announce)]).await;
 
         let outcome = process_cleanup_batch(&context).await.unwrap();
 
-        assert_eq!(outcome.processed, 0);
-        assert_eq!(outcome.failed, 1);
-        assert_eq!(remaining_rows(&storage).await, 1);
+        let waiting = usize::from(announce);
+        assert_eq!(outcome.processed, 1 - waiting);
+        assert_eq!(outcome.failed, waiting);
+        assert_eq!(remaining_rows(&storage).await, waiting);
     }
 
     #[tokio::test]
@@ -1289,7 +1308,7 @@ mod tests {
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
                 key: location.ulid.to_bytes().to_vec().into(),
-                value: reconcile_work(&location).into(),
+                value: reconcile_work(&location, true).into(),
                 txn_id: None,
             })
             .await;
@@ -1314,7 +1333,7 @@ mod tests {
         else {
             panic!("expected a delete row")
         };
-        write_rows(&storage, vec![reconcile_work(&location)]).await;
+        write_rows(&storage, vec![reconcile_work(&location, true)]).await;
 
         let outcome = process_cleanup_batch(&context).await.unwrap();
 

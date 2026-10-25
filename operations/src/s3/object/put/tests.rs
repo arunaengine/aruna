@@ -798,6 +798,7 @@ fn release_on_failure() {
                     blake3: [7u8; 32],
                     realm_id,
                     ttl_ms: super::RoCrateLimits::default().holder_ttl_ms,
+                    announce: true,
                 },
             })
             .is_some()
@@ -951,6 +952,7 @@ fn unknown_keeps_blob() {
                     blake3: [7u8; 32],
                     realm_id,
                     ttl_ms: super::RoCrateLimits::default().holder_ttl_ms,
+                    announce: true,
                 },
             }
         );

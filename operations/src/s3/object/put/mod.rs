@@ -1942,6 +1942,7 @@ impl PutObjectOperation {
                 blake3,
                 realm_id: self.config.realm_id,
                 ttl_ms: self.rocrate_limits.holder_ttl_ms,
+                announce: self.binding.is_none(),
             },
         })
     }

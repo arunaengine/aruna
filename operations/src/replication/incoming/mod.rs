@@ -2249,6 +2249,7 @@ impl IncomingVersionOperation {
                 blake3,
                 realm_id: self.local_realm_id,
                 ttl_ms: self.rocrate_limits.holder_ttl_ms,
+                announce: !self.destination_bound,
             },
             // A pending archive is kept while its pending location names it.
             None if location.format.bucket_key().is_some() => WriteOwner::Pending,

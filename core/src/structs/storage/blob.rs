@@ -383,6 +383,8 @@ pub enum WriteOwner {
         blake3: [u8; 32],
         realm_id: RealmId,
         ttl_ms: u64,
+        /// Registers the copy in the DHT once owned; distributed buckets use content indexes.
+        announce: bool,
     },
     UploadPart {
         upload_id: Ulid,
@@ -399,6 +401,7 @@ pub enum WriteOwner {
         blake3: [u8; 32],
         realm_id: RealmId,
         ttl_ms: u64,
+        announce: bool,
     },
     /// An encrypted archive published before its content hash is known: kept while its
     /// `pending_locations` row names it.
