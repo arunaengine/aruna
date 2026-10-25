@@ -27,13 +27,13 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 
 use super::data_links::{DataLinkError, LinkBudget, LinkRows, document_rows, iter_page};
-use super::handle::REGISTRY_CANDIDATE_LIMIT;
 use super::queue_storage::{
     MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
     start_write_transaction,
 };
 use super::repository::{
-    StorageReadError, parse_registry_iter, parse_status_read, read_status_effect,
+    StorageReadError, parse_registry_iter, parse_registry_read, parse_status_read,
+    read_status_effect,
 };
 
 const INDEX_PAGE_SIZE: usize = 128;
@@ -252,20 +252,23 @@ fn group_key(prefix: &[u8], document_id: Ulid) -> Vec<u8> {
     key
 }
 
+/// The live documents whose current postings name `object_iri` through `predicate_iri`, with
+/// their subjects: backlink pages by document id and one point read per document, at most
+/// `limit` documents and a bounded number of index rows. Never a walk over the registry.
 pub(crate) async fn lookup_iri_references(
     storage: &StorageHandle,
-    registry_records: &[MetadataRegistryRecord],
     predicate_iri: &str,
     object_iri: &str,
-) -> Result<BTreeMap<Ulid, Vec<String>>, MetadataError> {
-    // The registry holds at most this many documents, so more postings mean a broken index.
+    limit: usize,
+) -> Result<(Vec<MetadataRegistryRecord>, BTreeMap<Ulid, Vec<String>>), MetadataError> {
     let mut budget = LinkBudget {
-        seeks: REGISTRY_CANDIDATE_LIMIT,
-        rows: REGISTRY_CANDIDATE_LIMIT.saturating_mul(2),
+        seeks: limit,
+        rows: limit.saturating_mul(2),
     };
-    let mut records = Vec::new();
+    let mut found = Vec::new();
+    let mut matches = BTreeMap::new();
     let mut after = None;
-    loop {
+    while found.len() < limit {
         let page = read_backlinks(
             storage,
             object_iri,
@@ -274,22 +277,44 @@ pub(crate) async fn lookup_iri_references(
             INDEX_PAGE_SIZE,
             &mut budget,
         )
-        .await?;
-        records.extend(page.documents.into_values().flatten());
+        .await;
+        let page = match page {
+            Ok(page) => page,
+            // The budget bounds the lookup; the documents found so far are the answer.
+            Err(MetadataIriError::BudgetExhausted) => break,
+            Err(error) => return Err(error.into()),
+        };
+        let mut records = Vec::with_capacity(page.documents.len());
+        for document_id in page.documents.keys() {
+            let read = storage
+                .send_effect(super::repository::read_document_registry(
+                    *document_id,
+                    None,
+                ))
+                .await;
+            if let Some(record) = parse_registry_read(read).map_err(status_error)? {
+                records.push(record);
+            }
+        }
+        let live = super::api::filter_live_records(storage, &records)
+            .await
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let postings = page.documents.into_values().flatten().collect();
+        let page_matches = collect_iri_matches(postings, &live, predicate_iri, object_iri);
+        for record in live {
+            if found.len() < limit
+                && let Some(subjects) = page_matches.get(&record.document_id)
+            {
+                matches.insert(record.document_id, subjects.clone());
+                found.push(record);
+            }
+        }
         match page.next {
             Some(next) => after = Some(next),
             None => break,
         }
     }
-    let registry_records = super::api::filter_live_records(storage, registry_records)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    Ok(collect_iri_matches(
-        records,
-        &registry_records,
-        predicate_iri,
-        object_iri,
-    ))
+    Ok((found, matches))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -740,6 +765,44 @@ mod tests {
             matches.get(&current_document_id),
             Some(&vec!["https://example.test/current".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn lookup_reads_points() {
+        // Candidates come from backlink rows and point reads, capped, without the registry list.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let cursor = Ulid::from_parts(2, 1);
+        let (first, stale, last) = (
+            Ulid::from_parts(5, 1),
+            Ulid::from_parts(5, 2),
+            Ulid::from_parts(5, 3),
+        );
+        for (doc, posted) in [
+            (first, cursor),
+            (stale, Ulid::from_parts(1, 1)),
+            (last, cursor),
+        ] {
+            write_document(&storage, doc, &[record(doc, posted, "p", OBJECT)]).await;
+            let registry = registry_record(doc, cursor);
+            let write = StorageEffect::Write {
+                key_space: aruna_core::keyspaces::DOCUMENT_INDEX_KEYSPACE.to_string(),
+                key: aruna_core::storage_entries::metadata_document_key(doc),
+                value: postcard::to_allocvec(&registry).unwrap().into(),
+                txn_id: None,
+            };
+            storage.send_storage_effect(write).await;
+        }
+        let (found, matches) = lookup_iri_references(&storage, "p", OBJECT, 8)
+            .await
+            .unwrap();
+        let ids: Vec<Ulid> = found.iter().map(|record| record.document_id).collect();
+        assert_eq!(ids, [first, last], "a stale posting names no document");
+        assert_eq!(matches.len(), 2);
+        let (capped, _) = lookup_iri_references(&storage, "p", OBJECT, 1)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 1);
     }
 
     #[tokio::test]

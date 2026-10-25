@@ -76,7 +76,11 @@ pub(super) async fn search_local_graphs(
         ));
     }
 
-    let records = list_read_records(inner.clone(), &span).await?;
+    // An IRI filter names its candidates through the backlink index, never the registry.
+    let records = match iri_filter {
+        Some(_) => Arc::new(Vec::new()),
+        None => list_read_records(inner.clone(), &span).await?,
+    };
     // Without a candidate filter the request spans the realm, so craqle
     // authorizes the index hits it returns instead of every visible graph.
     let lazy = iri_filter.is_none() && graph_iris.is_none() && group_id.is_none();
@@ -234,27 +238,18 @@ async fn search_candidate_graphs(
     iri_filter: Option<(String, String)>,
     span: &Span,
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
-    let iri_matches = match iri_filter.as_ref() {
-        Some((predicate_iri, object_iri)) => Some(
-            super::super::iri_index::lookup_iri_references(
+    let (records, iri_matches) = match iri_filter.as_ref() {
+        Some((predicate_iri, object_iri)) => {
+            let (found, matches) = super::super::iri_index::lookup_iri_references(
                 &inner.storage_handle,
-                records.as_ref(),
                 predicate_iri,
                 object_iri,
+                REGISTRY_CANDIDATE_LIMIT,
             )
-            .await?,
-        ),
-        None => None,
-    };
-    let records = match iri_matches.as_ref() {
-        Some(matches) => Arc::new(
-            records
-                .iter()
-                .filter(|record| matches.contains_key(&record.document_id))
-                .cloned()
-                .collect(),
-        ),
-        None => records,
+            .await?;
+            (Arc::new(found), Some(matches))
+        }
+        None => (records, None),
     };
 
     let authorization_started = Instant::now();
