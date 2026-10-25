@@ -48,7 +48,7 @@ pub(in crate::s3::service) enum Resume {
 }
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
-pub(in crate::s3::service) const MAX_RANGES_PER_PAGE: usize = 64;
+pub(in crate::s3::service) const MAX_PAGE_RANGES: usize = 64;
 /// Bytes of keys and prefixes after which a merged page visits no further range.
 pub(in crate::s3::service) const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -386,7 +386,7 @@ impl ArunaS3Service {
         for (visited, range) in ranges.enumerate() {
             let remaining =
                 max.saturating_sub(merged.contents.len() + merged.common_prefixes.len());
-            let full = bounded && (visited == MAX_RANGES_PER_PAGE || bytes >= MAX_PAGE_BYTES);
+            let full = bounded && (visited == MAX_PAGE_RANGES || bytes >= MAX_PAGE_BYTES);
             if remaining == 0 || full {
                 merged.continuation_token =
                     scoped_marker(&input.bucket, last_key.as_deref(), page_prefix.as_deref())?;

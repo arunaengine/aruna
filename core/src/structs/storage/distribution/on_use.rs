@@ -17,7 +17,7 @@ pub const CACHE_NAMESPACE: Ulid = Ulid::from_bytes(*b"cache-on-use--v1");
 /// Bytes the cache of one node keeps; admitting more evicts the oldest entries first.
 pub const CACHE_CAPACITY_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// A fill claim older than this is taken over: its filler stopped without releasing it.
-pub const FILL_CLAIM_TTL_MS: u64 = 15 * 60 * 1000;
+pub const CLAIM_TTL_MS: u64 = 15 * 60 * 1000;
 /// The key of the cache totals row; entry keys are 32 bytes long.
 pub const CACHE_TOTALS_KEY: &[u8] = b"totals";
 
@@ -59,7 +59,7 @@ pub struct FillClaim {
 impl FillClaim {
     /// Whether another filler may take this claim over at `now_ms`.
     pub fn stale(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.claimed_at_ms) >= FILL_CLAIM_TTL_MS
+        now_ms.saturating_sub(self.claimed_at_ms) >= CLAIM_TTL_MS
     }
 }
 
@@ -223,8 +223,8 @@ mod tests {
             claim_id: Ulid::nil(),
             claimed_at_ms: 1_000,
         };
-        assert!(!claim.stale(1_000 + FILL_CLAIM_TTL_MS - 1));
-        assert!(claim.stale(1_000 + FILL_CLAIM_TTL_MS));
+        assert!(!claim.stale(1_000 + CLAIM_TTL_MS - 1));
+        assert!(claim.stale(1_000 + CLAIM_TTL_MS));
         let set = Ulid::from_bytes([1; 16]);
         let version = Ulid::from_bytes([2; 16]);
         assert_ne!(

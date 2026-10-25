@@ -15,7 +15,7 @@ use crate::structs::storage::replication::VersionedObjectArn;
 /// A device name in an upload origin is at most this long.
 pub const MAX_DEVICE_BYTES: usize = 255;
 /// A storage key in an import origin is at most one S3 key long.
-pub const MAX_ORIGIN_KEY_BYTES: usize = 1024;
+pub const MAX_KEY_BYTES: usize = 1024;
 
 /// One exact object version elsewhere: the global id of a distributed bucket's version, or
 /// the versioned node ARN of an ordinary bucket's version.
@@ -65,10 +65,10 @@ impl VersionOrigin {
             Self::Upload { device, .. } => device
                 .as_ref()
                 .is_none_or(|device| device.len() <= MAX_DEVICE_BYTES),
-            Self::Storage { key, .. } => key.len() <= MAX_ORIGIN_KEY_BYTES,
+            Self::Storage { key, .. } => key.len() <= MAX_KEY_BYTES,
             Self::Copy {
                 from: OriginVersion::Node(arn),
-            } => arn.key.len() <= MAX_ORIGIN_KEY_BYTES,
+            } => arn.key.len() <= MAX_KEY_BYTES,
             Self::Source { .. } | Self::Copy { .. } | Self::Job { .. } => true,
         }
     }

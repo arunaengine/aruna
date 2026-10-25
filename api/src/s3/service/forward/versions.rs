@@ -18,7 +18,7 @@ use s3s::dto::{
 use s3s::{S3Result, s3_error};
 use ulid::Ulid;
 
-use super::list::{MAX_PAGE_BYTES, MAX_RANGES_PER_PAGE, e_tag, elements, range_query, timestamp};
+use super::list::{MAX_PAGE_BYTES, MAX_PAGE_RANGES, e_tag, elements, range_query, timestamp};
 use super::xml_field;
 use crate::s3::service::ArunaS3Service;
 
@@ -214,7 +214,7 @@ impl ArunaS3Service {
         for (visited, range) in ranges.enumerate() {
             let remaining =
                 max_keys.saturating_sub(versions.len() + markers.len() + prefixes.len());
-            if remaining == 0 || visited == MAX_RANGES_PER_PAGE || bytes >= MAX_PAGE_BYTES {
+            if remaining == 0 || visited == MAX_PAGE_RANGES || bytes >= MAX_PAGE_BYTES {
                 // Nothing listed yet: the nil version id starts the next page at this range.
                 let start = || (range.lower.clone(), Some(Ulid::nil().to_string()));
                 next = Some(last.clone().map_or_else(start, |key| (key, None)));

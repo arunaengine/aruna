@@ -21,7 +21,7 @@ use s3s::{S3Response, S3Result, s3_error};
 use ulid::Ulid;
 
 use super::list::{
-    MAX_PAGE_BYTES, MAX_RANGES_PER_PAGE, elements, incomplete, range_query, timestamp, unreachable,
+    MAX_PAGE_BYTES, MAX_PAGE_RANGES, elements, incomplete, range_query, timestamp, unreachable,
 };
 use super::{Forward, ForwardBody, ForwardRequest, answer_text, xml_field};
 use crate::s3::error::guard_error;
@@ -239,7 +239,7 @@ impl ArunaS3Service {
         let mut bytes = 0usize;
         for (visited, range) in ranges.enumerate() {
             let remaining = max_uploads.saturating_sub(uploads.len() + prefixes.len());
-            if remaining == 0 || visited == MAX_RANGES_PER_PAGE || bytes >= MAX_PAGE_BYTES {
+            if remaining == 0 || visited == MAX_PAGE_RANGES || bytes >= MAX_PAGE_BYTES {
                 // Nothing listed yet: the nil upload id starts the next page at this range.
                 let start = || (range.lower.clone(), Some(Ulid::nil().to_string()));
                 next = Some(last.clone().map_or_else(start, |key| (key, None)));

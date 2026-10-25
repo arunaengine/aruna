@@ -8,7 +8,7 @@ use crate::distribution::test_store::{context, get, open};
 use crate::driver::drive;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::distribution::on_use::{
-    CacheTotals, FILL_CLAIM_TTL_MS, attachment_key, claim_key,
+    CLAIM_TTL_MS, CacheTotals, attachment_key, claim_key,
 };
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_storage::storage::StorageHandle;
@@ -105,7 +105,7 @@ async fn claims_fill_once() {
     );
     assert_eq!(claim(&handle, 2, 2_000).await, Claimed::Busy);
     assert_eq!(
-        claim(&handle, 2, 1_001 + FILL_CLAIM_TTL_MS).await,
+        claim(&handle, 2, 1_001 + CLAIM_TTL_MS).await,
         Claimed::Claimed
     );
 }

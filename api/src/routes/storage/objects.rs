@@ -40,7 +40,7 @@ use crate::server::state::ServerState;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
-const MAX_RANGES_PER_PAGE: usize = 64;
+const MAX_PAGE_RANGES: usize = 64;
 /// Bytes of keys and prefixes after which a merged page visits no further range.
 const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -290,7 +290,7 @@ async fn merged_page(
     for (visited, range) in ranges.enumerate() {
         let listed = page.objects.len() + page.prefixes.len();
         let remaining = request.limit.saturating_sub(listed);
-        if remaining == 0 || visited == MAX_RANGES_PER_PAGE || bytes >= MAX_PAGE_BYTES {
+        if remaining == 0 || visited == MAX_PAGE_RANGES || bytes >= MAX_PAGE_BYTES {
             // A page that listed nothing continues at this range, never at its own start.
             let next = match last_key.as_ref().filter(|_| listed > 0) {
                 Some(key) => Resume::After {
