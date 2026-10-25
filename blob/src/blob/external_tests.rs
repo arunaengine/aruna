@@ -45,6 +45,26 @@ async fn pages_in_order() {
 }
 
 #[tokio::test]
+async fn refuses_large_unordered() {
+    let context = setup_two_backends().await;
+    let handler = context.blob_handle.handler.clone();
+    let root = context._temp_dir.path().join("hot");
+    for path in ["raw/a.txt", "raw/b.txt", "raw/c.txt"] {
+        place(&root, path, b"data");
+    }
+    let backend = BackendRef::Node("default".to_string());
+
+    // The file system lists without order, so a folder above the budget is refused.
+    let refused = handler.external_page(&backend, "raw/", None, 1, 2).await;
+    assert!(
+        matches!(refused, Err(BlobError::ListError(_))),
+        "{refused:?}"
+    );
+    let listed = handler.external_page(&backend, "raw/", None, 1, 10).await;
+    assert!(matches!(listed, Ok(BlobEvent::ExternalListed { .. })));
+}
+
+#[tokio::test]
 async fn hashes_in_place() {
     let context = setup_two_backends().await;
     let handler = context.blob_handle.handler.clone();
