@@ -57,6 +57,13 @@ enum Tended {
 
 /// One bounded pass over the range accounts. Returns when the next pass should run.
 pub async fn maintain_ranges(context: &Arc<DriverContext>) -> Duration {
+    let lifecycle = super::lifecycle::tend_lifecycle(context).await;
+    let after = maintain_accounts(context).await;
+    lifecycle.map_or(after, |lifecycle| lifecycle.min(after))
+}
+
+/// One bounded pass over the range accounts.
+async fn maintain_accounts(context: &Arc<DriverContext>) -> Duration {
     let Some(net) = context.net_handle.as_ref() else {
         return MAINTAIN_AFTER;
     };

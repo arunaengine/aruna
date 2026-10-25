@@ -5,7 +5,8 @@
 
 use super::*;
 use aruna_core::keyspaces::{
-    CATCH_UP_KEYSPACE, DISTRIBUTION_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE,
+    CATCH_UP_KEYSPACE, DISTRIBUTION_KEYSPACE, DISTRIBUTION_LIFECYCLE_KEYSPACE,
+    DISTRIBUTION_PUBLISHER_KEYSPACE,
 };
 use aruna_core::structs::storage::distribution::parking::{Authority, publisher_authority};
 use aruna_core::structs::storage::distribution::{PublisherCutoff, SignedSnapshot, publisher_key};
@@ -218,6 +219,12 @@ async fn distribution_writes(
         let key = set_id.to_bytes().to_vec().into();
         (CATCH_UP_KEYSPACE.to_string(), key, Value::from(Vec::new()))
     });
+    // Nodes find the sets whose transfers, deletion or departures they act on through this row.
+    let lifecycle = head.lifecycle_open().then(|| {
+        let key = set_id.to_bytes().to_vec().into();
+        let space = DISTRIBUTION_LIFECYCLE_KEYSPACE.to_string();
+        (space, key, Value::from(Vec::new()))
+    });
     Ok(Some(
         vec![
             (
@@ -234,6 +241,7 @@ async fn distribution_writes(
         ]
         .into_iter()
         .chain(catch_up)
+        .chain(lifecycle)
         .collect(),
     ))
 }

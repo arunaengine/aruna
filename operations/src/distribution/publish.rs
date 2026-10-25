@@ -14,7 +14,7 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, SnapshotSignEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     CATCH_UP_KEYSPACE, DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE,
-    DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+    DISTRIBUTION_LIFECYCLE_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminApplyStatus, AdminDocumentError, AdminDocumentState};
@@ -396,6 +396,15 @@ impl PublishOperation {
         if catch_up {
             let key = set_id.to_bytes().to_vec().into();
             writes.push((CATCH_UP_KEYSPACE.to_string(), key, Vec::new().into()));
+        }
+        // Nodes find the sets whose transfers, deletion or departures they act on through it.
+        if view.snapshot().lifecycle_open() {
+            let key = set_id.to_bytes().to_vec().into();
+            writes.push((
+                DISTRIBUTION_LIFECYCLE_KEYSPACE.to_string(),
+                key,
+                Vec::new().into(),
+            ));
         }
         self.output = Some(Ok(revision));
         self.state = PublishState::Write;

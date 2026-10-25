@@ -11,8 +11,9 @@ use aruna_core::UserId;
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE, DISTRIBUTION_PURGE_KEYSPACE,
-    INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
+    ATTACHMENT_KEYSPACE, BOOTSTRAP_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE,
+    DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_PURGE_KEYSPACE, INVENTORY_KEYSPACE,
+    KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::structs::identity::realm::RealmId;
@@ -33,6 +34,7 @@ use crate::driver::{DriverContext, drive, now_ms};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
+use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 
 /// Inventory rows one page purges at most.
 const PAGE_ROWS: usize = 64;
@@ -147,6 +149,102 @@ async fn page(
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected purge page answer {other:?}")),
     }
+}
+
+/// Aborts one page of the range's open uploads; `true` while it found any, so the caller
+/// looks again until none is left.
+pub async fn abort_range_uploads(
+    context: &DriverContext,
+    target: &PurgeTarget,
+) -> Result<bool, String> {
+    let rows = page(context, UPLOAD_INVENTORY_KEYSPACE, target, None).await?;
+    abort_uploads(context, target, &rows).await?;
+    Ok(!rows.is_empty())
+}
+
+/// Deletes one page of versions the inventory does not name, from the bucket's own listing,
+/// so the member bucket ends up empty. The listing restarts at the first key each time.
+pub async fn purge_rest(context: &DriverContext, target: &PurgeTarget) -> Result<(), String> {
+    if !still_bound(context, &target.bucket, &target.binding).await? {
+        return Ok(());
+    }
+    let list = ListVersionsOperation::new(ListVersionsInput {
+        bucket: target.bucket.clone(),
+        prefix: None,
+        delimiter: None,
+        key_marker: None,
+        version_id_marker: None,
+        max_keys: Some(PAGE_ROWS),
+    });
+    let listed = drive(list, context)
+        .await
+        .map_err(|error| error.to_string())?;
+    for item in listed.items {
+        let (ListVersionsItem::Version {
+            key, version_id, ..
+        }
+        | ListVersionsItem::DeleteMarker {
+            key, version_id, ..
+        }) = item;
+        delete_version(context, target, &key, version_id).await?;
+    }
+    Ok(())
+}
+
+/// Deletes what this node keeps of a set besides its bucket: inventory, accounting, bootstrap
+/// cursors, purge cursors and copy-on-use attachments with their bytes. The fence row stays
+/// with `keep_fence`, so nothing writes into a deleted set again.
+pub async fn clear_set_rows(
+    context: &DriverContext,
+    set_id: Ulid,
+    keep_fence: bool,
+) -> Result<(), String> {
+    let prefix = set_id.to_bytes().to_vec();
+    loop {
+        let iter = StorageEffect::Iter {
+            key_space: ATTACHMENT_KEYSPACE.to_string(),
+            prefix: Some(prefix.clone().into()),
+            start: None,
+            limit: PAGE_ROWS,
+            txn_id: None,
+        };
+        let rows = match context.storage_handle.send_storage_effect(iter).await {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+            other => return Err(format!("unexpected scan answer {other:?}")),
+        };
+        if rows.is_empty() {
+            break;
+        }
+        for (key, value) in rows {
+            if let Ok(attachment) = Attachment::from_bytes(&value) {
+                drop_copy(context, &attachment.location).await;
+            }
+            batch_delete(context, vec![(ATTACHMENT_KEYSPACE.to_string(), key)]).await?;
+        }
+    }
+    let spaces = [
+        INVENTORY_KEYSPACE,
+        UPLOAD_INVENTORY_KEYSPACE,
+        VERSION_INDEX_KEYSPACE,
+        RANGE_INDEX_KEYSPACE,
+        RANGE_ACCOUNT_KEYSPACE,
+        RANGE_COUNTER_KEYSPACE,
+        KEY_SAMPLE_KEYSPACE,
+        BOOTSTRAP_KEYSPACE,
+        DISTRIBUTION_PURGE_KEYSPACE,
+    ];
+    for key_space in spaces {
+        clear_prefix(context, key_space, prefix.clone()).await?;
+    }
+    if !keep_fence {
+        batch_delete(
+            context,
+            vec![(DISTRIBUTION_FENCE_KEYSPACE.to_string(), prefix.into())],
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn abort_uploads(
