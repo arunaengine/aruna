@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::decode_error;
 use super::session_refs::Layout;
+use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
@@ -103,15 +103,16 @@ pub(super) fn reference_rows(
     rewrites: &[(Vec<u8>, Vec<u8>)],
     index: &OptimisticTxKeyspace,
     name: &str,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ExplorerError> {
+) -> Result<Rewrites, ExplorerError> {
     let rewrites: BTreeMap<&[u8], &[u8]> = rewrites
         .iter()
         .map(|(key, value)| (key.as_slice(), value.as_slice()))
         .collect();
     let read = db.read_tx();
-    let mut rows = Vec::new();
+    let (mut scanned, mut rows) = (0, Vec::new());
     for entry in read.iter(versions) {
         let (key, stored) = entry.into_inner()?;
+        scanned += 1;
         let value = rewrites.get(key.as_ref()).copied().unwrap_or(&stored);
         let version =
             BlobVersion::from_bytes(value).map_err(|error| decode_error(name, &key, error))?;
@@ -130,7 +131,7 @@ pub(super) fn reference_rows(
             rows.push((row.to_vec(), value.to_vec()));
         }
     }
-    Ok(rows)
+    Ok(Rewrites { scanned, rows })
 }
 
 #[cfg(test)]
