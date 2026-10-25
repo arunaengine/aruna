@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -84,9 +85,8 @@ async fn maintain_accounts(context: &Arc<DriverContext>) -> Duration {
             let Some((set_id, range_id, account)) = decode(&key, &value) else {
                 continue;
             };
-            if !records.contains_key(&set_id) {
-                let record = read_record(context, set_id).await;
-                records.insert(set_id, record);
+            if let Entry::Vacant(slot) = records.entry(set_id) {
+                slot.insert(read_record(context, set_id).await);
             }
             let Some(Some(snapshot)) = records.get(&set_id) else {
                 continue;
@@ -207,7 +207,7 @@ async fn read_record(context: &DriverContext, set_id: Ulid) -> Option<Distributi
     let bytes = read(context, DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec()).await?;
     let view = DistributionView::from_bytes(&bytes).ok()?;
     // A conflicted set takes no configuration changes, splits included.
-    (!view.conflicted()).then(|| view.head.snapshot)
+    (!view.conflicted()).then_some(view.head.snapshot)
 }
 
 /// One range account this node holds, with the record of its set.

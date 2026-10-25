@@ -32,6 +32,9 @@ use super::feed_store::{
 use super::key_index::{IndexedKey, KeyChange, KeyIndexError, RangeIndexes};
 use crate::driver::DriverContext;
 
+/// The key changes of one range and the feed rows they settle.
+type RangeBatch = (Vec<KeyChange>, Vec<(Key, Value)>);
+
 const IDLE_INTERVAL: Duration = Duration::from_secs(2);
 const BUSY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -120,8 +123,7 @@ impl Feeder {
         .await?;
         self.feed = next;
         let mut located: Vec<Located> = Vec::new();
-        let mut batches: BTreeMap<(Ulid, Ulid), (Vec<KeyChange>, Vec<(Key, Value)>)> =
-            BTreeMap::new();
+        let mut batches: BTreeMap<(Ulid, Ulid), RangeBatch> = BTreeMap::new();
         let mut settled = Vec::new();
         for (key, value) in rows {
             let (position, head) = match (Position::decode(&key), decode_feed(&value)) {

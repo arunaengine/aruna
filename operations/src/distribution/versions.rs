@@ -306,7 +306,7 @@ impl InventoryVersionsOperation {
                 encoding,
                 ..
             } => {
-                let location = BlobLocationKey::new(*blob_hash, encoding.clone(), backend.clone());
+                let location = BlobLocationKey::new(*blob_hash, *encoding, backend.clone());
                 Some((
                     BLOB_LOCATIONS_KEYSPACE.to_string(),
                     location.to_bytes().into(),

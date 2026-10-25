@@ -252,16 +252,15 @@ pub async fn list_databases(
     entries.sort_by_key(|entry| entry.entry_id);
     let limit = limit.clamp(1, 100);
     let mut listed = Vec::new();
-    let mut examined = 0usize;
     let mut last = None;
-    for entry in entries
+    for (examined, entry) in entries
         .into_iter()
         .filter(|entry| after.is_none_or(|after| entry.entry_id > after))
+        .enumerate()
     {
         if listed.len() >= limit || examined >= limit.saturating_mul(4) {
             return Ok((listed, last));
         }
-        examined += 1;
         last = Some(entry.entry_id);
         let bucket = match can_read_bucket(context, realm_id, &caller.auth, &entry).await? {
             Some(bucket) => bucket,

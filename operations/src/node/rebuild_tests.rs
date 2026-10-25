@@ -36,6 +36,7 @@ use ulid::Ulid;
 
 use super::{RebuildStatsError, RebuildStatsOperation};
 use crate::driver::DriverContext;
+use crate::node::rebuild_counts::CounterDeltas;
 
 const GROUP_A: GroupId = Ulid::from_parts(1, 1);
 const GROUP_B: GroupId = Ulid::from_parts(2, 2);
@@ -213,7 +214,7 @@ async fn fixture(ctx: &DriverContext) -> u64 {
 async fn run(
     mut operation: RebuildStatsOperation,
     ctx: &DriverContext,
-    live: Option<(Vec<(Key, UsageDelta)>, Vec<(Key, BucketDelta)>)>,
+    live: Option<CounterDeltas>,
 ) -> (Result<UsageCounters, RebuildStatsError>, Vec<Option<Key>>) {
     let mut live = live;
     let mut prefixes = Vec::new();

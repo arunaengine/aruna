@@ -230,7 +230,7 @@ impl ArunaS3Service {
             let part = match snapshot.lists_locally(binding.member_id, range) {
                 true => {
                     let id = (start.1.as_deref())
-                        .map(|id| Ulid::from_string(id))
+                        .map(Ulid::from_string)
                         .transpose()
                         .map_err(|_| s3_error!(InvalidArgument, "Invalid version-id-marker"))?;
                     let ranged = (binding.set_id, range);

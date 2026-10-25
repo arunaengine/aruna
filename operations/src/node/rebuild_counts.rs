@@ -36,6 +36,9 @@ pub(crate) type Joined = HashMap<(&'static str, Vec<u8>), Option<Value>>;
 
 pub(crate) type Object = (String, String);
 
+/// Usage and bucket deltas of one page, keyed by their counter rows.
+pub(crate) type CounterDeltas = (Vec<(Key, UsageDelta)>, Vec<(Key, BucketDelta)>);
+
 /// What a rebuild has counted so far, and the deltas of the page not yet committed. Grows
 /// with buckets and one page, never with objects.
 #[derive(Debug, Default, PartialEq)]
@@ -71,7 +74,7 @@ impl RebuildCounts {
     }
 
     /// The page's deltas, aimed at the rebuild rows of their counters.
-    pub(crate) fn take_deltas(&mut self) -> (Vec<(Key, UsageDelta)>, Vec<(Key, BucketDelta)>) {
+    pub(crate) fn take_deltas(&mut self) -> CounterDeltas {
         let usage = std::mem::take(&mut self.usage)
             .into_iter()
             .map(|(key, delta)| (Key::from(usage_shadow_key(&key)), delta))
