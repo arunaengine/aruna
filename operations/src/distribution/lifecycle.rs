@@ -38,6 +38,7 @@ use super::purge::{
     PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, has_uploads,
     purge_range, purge_rest, read,
 };
+use super::roots::roots_checked;
 use super::sign_statement;
 use super::status::read_view;
 use crate::driver::{DriverContext, drive};
@@ -416,7 +417,8 @@ impl SetWork {
         Ok(Left::Waiting)
     }
 
-    /// The new coordinator's side: complete once its copy reached the fenced watermark.
+    /// The new coordinator's side: complete once its copy reached the fenced watermark and
+    /// every source root it holds references of is checked.
     async fn take_over(
         &self,
         context: &Arc<DriverContext>,
@@ -441,6 +443,11 @@ impl SetWork {
             .await?
             .is_some_and(|counters| wanted.reached_by(&counters));
         if !reached || local.binding.is_none() {
+            return Ok(Left::Waiting);
+        }
+        // Every source root of what it applied must be readable here before it takes over.
+        let group_id = snapshot.config.owner_group;
+        if !roots_checked(context, self.set_id, group_id).await? {
             return Ok(Left::Waiting);
         }
         let kind = StatementKind::TransferComplete {

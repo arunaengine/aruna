@@ -244,8 +244,9 @@ pub async fn leave_distributed(
 - The current coordinator fences the range: writes to it fail with a retryable "range moving"
   until the transfer activates. Multipart uploads of the range opened before the fence may
   still complete for up to 5 minutes; the rest are aborted.
-- The new coordinator completes once its copy holds everything up to the fence; then it
-  writes the range and the former coordinator forwards to it.
+- The new coordinator completes once its copy holds everything up to the fence and it can
+  read every external source root of the set's references through a connector of the group
+  on its own node; then it writes the range and the former coordinator forwards to it.
 - With role `leave` the former coordinator removes its copy once the new one and every
   other listed replica of the range are ready.
 - The answer is 202 once the transfer is open; its progress shows in the bucket status.
