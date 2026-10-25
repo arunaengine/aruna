@@ -9,8 +9,8 @@ use s3s::dto::{
 };
 use s3s::{S3Response, S3Result, s3_error};
 
-use super::ArunaS3Service;
-use super::forward::{answer_text, header, xml_field};
+use super::{answer_text, header, xml_field};
+use crate::s3::service::ArunaS3Service;
 
 /// Escapes text for an XML element body.
 fn escaped(text: &str) -> String {
@@ -20,7 +20,7 @@ fn escaped(text: &str) -> String {
 }
 
 /// The completion body the coordinator parses, built from the parts the caller listed.
-pub(super) fn completion_body(upload: Option<&CompletedMultipartUpload>) -> String {
+pub(in crate::s3::service) fn completion_body(upload: Option<&CompletedMultipartUpload>) -> String {
     let mut body = String::from("<CompleteMultipartUpload>");
     let parts = upload.and_then(|upload| upload.parts.as_ref());
     for part in parts.into_iter().flatten() {
@@ -50,7 +50,7 @@ pub(super) fn completion_body(upload: Option<&CompletedMultipartUpload>) -> Stri
 }
 
 /// The parts of a ListParts answer, in their order.
-pub(super) fn listed_parts(body: &str) -> Vec<Part> {
+pub(in crate::s3::service) fn listed_parts(body: &str) -> Vec<Part> {
     body.split("<Part>")
         .skip(1)
         .filter_map(|part| part.split("</Part>").next())
@@ -75,7 +75,7 @@ fn e_tag(text: Option<String>) -> Option<ETag> {
 }
 
 impl ArunaS3Service {
-    pub(super) async fn forwarded_create(
+    pub(in crate::s3::service) async fn forwarded_create(
         response: reqwest::Response,
         bucket: String,
         key: String,
@@ -91,7 +91,7 @@ impl ArunaS3Service {
         }))
     }
 
-    pub(super) async fn forwarded_list(
+    pub(in crate::s3::service) async fn forwarded_list(
         response: reqwest::Response,
         bucket: String,
         key: String,
@@ -111,7 +111,9 @@ impl ArunaS3Service {
         }))
     }
 
-    pub(super) fn forwarded_part(response: &reqwest::Response) -> S3Response<UploadPartOutput> {
+    pub(in crate::s3::service) fn forwarded_part(
+        response: &reqwest::Response,
+    ) -> S3Response<UploadPartOutput> {
         S3Response::new(UploadPartOutput {
             e_tag: e_tag(header(response, "etag")),
             checksum_crc32: header(response, "x-amz-checksum-crc32"),
@@ -124,7 +126,7 @@ impl ArunaS3Service {
     }
 
     /// A completion can fail after its status line, so an error body still counts as failure.
-    pub(super) async fn forwarded_complete(
+    pub(in crate::s3::service) async fn forwarded_complete(
         response: reqwest::Response,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let version_id = header(&response, "x-amz-version-id");

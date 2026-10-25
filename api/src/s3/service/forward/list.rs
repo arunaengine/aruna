@@ -19,12 +19,12 @@ use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::forward::{Forward, ForwardBody, ForwardRequest, answer_text, xml_field};
-use super::listing::{ObjectListingPage, scoped_marker};
-use super::{ArunaS3Service, URL_ENCODE_SET};
+use super::{Forward, ForwardBody, ForwardRequest, answer_text, xml_field};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
 use crate::s3::scope::SubpathScope;
+use crate::s3::service::listing::{ObjectListingPage, scoped_marker};
+use crate::s3::service::{ArunaS3Service, URL_ENCODE_SET};
 
 /// The query parameters a forwarded listing names its key range with.
 const LOWER_PARAM: &str = "aruna-lower";
@@ -42,15 +42,15 @@ struct BoundToken {
 /// Where a merged listing continues: after a listed entry, or at the first key of a range when
 /// a page visited its bound number of ranges without an entry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(super) enum Resume {
+pub(in crate::s3::service) enum Resume {
     After(ListContinuationToken),
     From(String),
 }
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
-pub(super) const MAX_RANGES_PER_PAGE: usize = 64;
+pub(in crate::s3::service) const MAX_RANGES_PER_PAGE: usize = 64;
 /// Bytes of keys and prefixes after which a merged page visits no further range.
-pub(super) const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+pub(in crate::s3::service) const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
 fn query_digest(prefix: Option<&str>, delimiter: Option<&str>) -> [u8; 32] {
     let bytes = postcard::to_allocvec(&(prefix, delimiter)).unwrap_or_default();
@@ -61,7 +61,7 @@ fn query_digest(prefix: Option<&str>, delimiter: Option<&str>) -> [u8; 32] {
 }
 
 /// The token a merged page ends with.
-pub(super) fn encode_bound(
+pub(in crate::s3::service) fn encode_bound(
     set_id: Ulid,
     (prefix, delimiter): (Option<&str>, Option<&str>),
     position: Option<&Resume>,
@@ -81,7 +81,7 @@ pub(super) fn encode_bound(
 }
 
 /// The position a merged token resumes at; a token of another set or query is refused.
-pub(super) fn decode_bound(
+pub(in crate::s3::service) fn decode_bound(
     set_id: Ulid,
     (prefix, delimiter): (Option<&str>, Option<&str>),
     token: Option<&str>,
@@ -113,7 +113,7 @@ fn named_bounds(query: Option<&str>) -> Option<(String, Option<String>)> {
 }
 
 /// The query of a listing a holder answers for one range.
-pub(super) fn range_query(base: &[(&str, String)], range: &KeyRange) -> String {
+pub(in crate::s3::service) fn range_query(base: &[(&str, String)], range: &KeyRange) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     for (name, value) in base {
         query.append_pair(name, value);
@@ -126,7 +126,7 @@ pub(super) fn range_query(base: &[(&str, String)], range: &KeyRange) -> String {
 }
 
 /// No holder of a range answered, so the listing cannot be complete.
-pub(super) fn incomplete(set_id: Ulid, range: &KeyRange) -> S3Error {
+pub(in crate::s3::service) fn incomplete(set_id: Ulid, range: &KeyRange) -> S3Error {
     let mut error = S3Error::with_message(
         S3ErrorCode::Custom("ListingIncomplete".into()),
         format!(
@@ -141,14 +141,14 @@ pub(super) fn incomplete(set_id: Ulid, range: &KeyRange) -> S3Error {
 
 /// Whether another holder may answer instead: the node was unreachable or could not serve
 /// the range from its own view, for example while it no longer holds it or catches up.
-pub(super) fn unreachable(error: &S3Error) -> bool {
+pub(in crate::s3::service) fn unreachable(error: &S3Error) -> bool {
     error
         .status_code()
         .is_none_or(|status| status.is_server_error())
 }
 
 /// The XML elements `tag` of a listing body.
-pub(super) fn elements<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
+pub(in crate::s3::service) fn elements<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
     let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
     body.split(open.as_str())
         .skip(1)
@@ -156,11 +156,11 @@ pub(super) fn elements<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
         .collect()
 }
 
-pub(super) fn timestamp(text: Option<String>) -> Option<Timestamp> {
+pub(in crate::s3::service) fn timestamp(text: Option<String>) -> Option<Timestamp> {
     text.and_then(|text| Timestamp::parse(TimestampFormat::DateTime, &text).ok())
 }
 
-pub(super) fn e_tag(text: Option<String>) -> Option<ETag> {
+pub(in crate::s3::service) fn e_tag(text: Option<String>) -> Option<ETag> {
     text.and_then(|text| ETag::parse_http_header(text.as_bytes()).ok())
 }
 
@@ -188,14 +188,14 @@ fn scope_part(part: &mut ObjectListingPage, scope: &SubpathScope, url_encoded: b
 }
 
 impl ArunaS3Service {
-    pub(super) fn encoded(&self, value: String, url_encoded: bool) -> String {
+    pub(in crate::s3::service) fn encoded(&self, value: String, url_encoded: bool) -> String {
         match url_encoded {
             true => utf8_percent_encode(&value, URL_ENCODE_SET).to_string(),
             false => value,
         }
     }
 
-    pub(super) fn raw(value: &str, url_encoded: bool) -> String {
+    pub(in crate::s3::service) fn raw(value: &str, url_encoded: bool) -> String {
         match url_encoded {
             true => percent_decode_str(value).decode_utf8_lossy().into_owned(),
             false => value.to_string(),
@@ -203,7 +203,7 @@ impl ArunaS3Service {
     }
 
     /// The bounds a forwarded listing names, when this member keeps every range inside them.
-    pub(super) async fn delegated_listing(
+    pub(in crate::s3::service) async fn delegated_listing(
         &self,
         extensions: &http::Extensions,
         bucket: Option<&BucketInfo>,
@@ -231,7 +231,7 @@ impl ArunaS3Service {
         }
     }
 
-    pub(super) async fn snapshot(
+    pub(in crate::s3::service) async fn snapshot(
         &self,
         binding: &DistributionBinding,
     ) -> S3Result<DistributionSnapshot> {
@@ -242,7 +242,7 @@ impl ArunaS3Service {
     }
 
     /// Asks the holders of `range` in turn; only a range nobody answers ends the listing.
-    pub(super) async fn ask_holders(
+    pub(in crate::s3::service) async fn ask_holders(
         &self,
         user: &UserAccess,
         (binding, snapshot): (&DistributionBinding, &DistributionSnapshot),
@@ -335,7 +335,7 @@ impl ArunaS3Service {
     }
 
     /// One merged object page over every range under the prefix, at most `max_keys` entries.
-    pub(super) async fn merged_objects(
+    pub(in crate::s3::service) async fn merged_objects(
         &self,
         user: &UserAccess,
         binding: &DistributionBinding,

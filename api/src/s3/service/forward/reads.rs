@@ -20,10 +20,10 @@ use s3s::dto::{
 };
 use s3s::{S3Response, S3Result};
 
-use super::ArunaS3Service;
-use super::forward::{Forward, ForwardBody, ForwardRequest, header, passed_headers, passed_query};
+use super::{Forward, ForwardBody, ForwardRequest, header, passed_headers, passed_query};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
+use crate::s3::service::ArunaS3Service;
 
 /// How long an anonymous caller's stand-in credential lasts; the delegation is shorter.
 const ANONYMOUS_SECS: u64 = 60;
@@ -35,7 +35,7 @@ fn now_ms() -> u64 {
 }
 
 /// The read of one object the holder receives instead of this node.
-pub(super) fn read_request(
+pub(in crate::s3::service) fn read_request(
     method: Method,
     operation: &'static str,
     bucket: &str,
@@ -85,7 +85,9 @@ fn content_length(response: &reqwest::Response) -> Option<i64> {
 }
 
 /// The holder's GET answer as this node's, its body streamed through.
-pub(super) fn forwarded_get(response: reqwest::Response) -> S3Response<GetObjectOutput> {
+pub(in crate::s3::service) fn forwarded_get(
+    response: reqwest::Response,
+) -> S3Response<GetObjectOutput> {
     let status = response.status();
     let output = GetObjectOutput {
         accept_ranges: header(&response, "accept-ranges"),
@@ -117,7 +119,9 @@ pub(super) fn forwarded_get(response: reqwest::Response) -> S3Response<GetObject
 }
 
 /// The holder's HEAD answer as this node's.
-pub(super) fn forwarded_head(response: &reqwest::Response) -> S3Response<HeadObjectOutput> {
+pub(in crate::s3::service) fn forwarded_head(
+    response: &reqwest::Response,
+) -> S3Response<HeadObjectOutput> {
     S3Response::new(HeadObjectOutput {
         accept_ranges: header(response, "accept-ranges"),
         checksum_crc32: header(response, "x-amz-checksum-crc32"),
@@ -138,7 +142,7 @@ pub(super) fn forwarded_head(response: &reqwest::Response) -> S3Response<HeadObj
 
 /// The caller a delegation carries: the Everyone principal has no credential, so the
 /// delegation's own short window bounds it.
-pub(super) fn anonymous_window(user: &UserAccess) -> UserAccess {
+pub(in crate::s3::service) fn anonymous_window(user: &UserAccess) -> UserAccess {
     let mut user = user.clone();
     if user.user_identity.is_nil() {
         user.expiry = SystemTime::now() + Duration::from_secs(ANONYMOUS_SECS);
@@ -149,7 +153,7 @@ pub(super) fn anonymous_window(user: &UserAccess) -> UserAccess {
 impl ArunaS3Service {
     /// The holder a GET or HEAD of `key` goes to when this member keeps no records of the
     /// key's range, or `None` when this member answers it. A delegated read is never sent on.
-    pub(super) async fn read_holder(
+    pub(in crate::s3::service) async fn read_holder(
         &self,
         extensions: &http::Extensions,
         bucket: Option<&BucketInfo>,
@@ -179,7 +183,7 @@ impl ArunaS3Service {
     }
 
     /// Sends one read to the chosen holder; a holder that fails is skipped for a while.
-    pub(super) async fn forward_read(
+    pub(in crate::s3::service) async fn forward_read(
         &self,
         user: &UserAccess,
         forward: &Forward,

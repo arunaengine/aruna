@@ -18,11 +18,9 @@ use s3s::dto::{
 use s3s::{S3Result, s3_error};
 use ulid::Ulid;
 
-use super::ArunaS3Service;
-use super::forward::xml_field;
-use super::forward_list::{
-    MAX_PAGE_BYTES, MAX_RANGES_PER_PAGE, e_tag, elements, range_query, timestamp,
-};
+use super::list::{MAX_PAGE_BYTES, MAX_RANGES_PER_PAGE, e_tag, elements, range_query, timestamp};
+use super::xml_field;
+use crate::s3::service::ArunaS3Service;
 
 /// The entries one range answered for a version listing, raw positions included.
 #[derive(Default)]
@@ -81,7 +79,7 @@ impl ArunaS3Service {
     }
 
     /// The versions of the key range a forwarded listing names, from this member's inventory.
-    pub(super) async fn range_versions(
+    pub(in crate::s3::service) async fn range_versions(
         &self,
         binding: &DistributionBinding,
         input: ListObjectVersionsInput,
@@ -181,7 +179,7 @@ impl ArunaS3Service {
     }
 
     /// One merged version page over every range under the prefix.
-    pub(super) async fn merged_versions(
+    pub(in crate::s3::service) async fn merged_versions(
         &self,
         user: &UserAccess,
         binding: &DistributionBinding,

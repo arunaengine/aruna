@@ -20,13 +20,13 @@ use s3s::dto::{
 use s3s::{S3Response, S3Result, s3_error};
 use ulid::Ulid;
 
-use super::ArunaS3Service;
-use super::forward::{Forward, ForwardBody, ForwardRequest, answer_text, xml_field};
-use super::forward_list::{
+use super::list::{
     MAX_PAGE_BYTES, MAX_RANGES_PER_PAGE, elements, incomplete, range_query, timestamp, unreachable,
 };
-use super::listing::list_uploads_output;
+use super::{Forward, ForwardBody, ForwardRequest, answer_text, xml_field};
 use crate::s3::error::guard_error;
+use crate::s3::service::ArunaS3Service;
+use crate::s3::service::listing::list_uploads_output;
 
 /// The entries one range answered for an upload listing, raw keys included.
 #[derive(Default)]
@@ -44,7 +44,7 @@ fn url_of(input: &ListMultipartUploadsInput) -> bool {
 
 impl ArunaS3Service {
     /// One range's open uploads from this member's upload inventory, ids as clients see them.
-    pub(super) async fn range_uploads(
+    pub(in crate::s3::service) async fn range_uploads(
         &self,
         binding: &DistributionBinding,
         input: ListMultipartUploadsInput,
@@ -206,7 +206,7 @@ impl ArunaS3Service {
     }
 
     /// One merged upload page over every range under the prefix.
-    pub(super) async fn merged_uploads(
+    pub(in crate::s3::service) async fn merged_uploads(
         &self,
         user: &UserAccess,
         binding: &DistributionBinding,

@@ -9,12 +9,6 @@ mod bucket;
 mod copy;
 mod encryption;
 mod forward;
-mod forward_copy;
-mod forward_list;
-mod forward_parts;
-mod forward_reads;
-mod forward_uploads;
-mod forward_versions;
 mod listing;
 mod payload;
 
@@ -35,8 +29,8 @@ use self::response::{attach_reference_refresh, object_metadata, reference_metada
 use aruna_core::structs::storage::format::Compression;
 
 use self::copy::{copy_object_response, copy_part_response, copy_source_conditions};
-use self::forward_copy::{CopyPath, CopySource};
-use self::forward_list::{Resume, decode_bound, encode_bound};
+use self::forward::copy::{CopyPath, CopySource};
+use self::forward::list::{Resume, decode_bound, encode_bound};
 use self::listing::{
     ObjectListingPage, list_parts_output, list_uploads_output, marker_continuation_token,
     next_marker_for,
@@ -282,7 +276,7 @@ impl ArunaS3Service {
         // A distributed bucket's folder spans its key ranges, as its S3 listing does.
         let page = match distributed {
             Some((binding, user)) => {
-                let user = forward_reads::anonymous_window(user);
+                let user = forward::reads::anonymous_window(user);
                 let shape = (None, false, None);
                 self.merged_objects(&user, &binding, input, shape, (None, true))
                     .await?
@@ -1687,7 +1681,7 @@ impl S3 for ArunaS3Service {
             .forward_upload(&req.extensions, bucket_info.as_ref(), &req.input.key)
             .await?
         {
-            let body = forward_parts::completion_body(req.input.multipart_upload.as_ref());
+            let body = forward::parts::completion_body(req.input.multipart_upload.as_ref());
             let mut headers = forward::passed_headers(&req.headers, Some(body.len() as i64));
             headers.retain(|(name, _)| name != "content-type");
             headers.push(("content-type".to_string(), "application/xml".to_string()));
@@ -1705,7 +1699,7 @@ impl S3 for ArunaS3Service {
         }
         // A forwarded completion lists exactly the parts the issuer bound.
         if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
-            let body = forward_parts::completion_body(req.input.multipart_upload.as_ref());
+            let body = forward::parts::completion_body(req.input.multipart_upload.as_ref());
             let bound = matches!(delegated.payload, Payload::Digest(digest)
                 if digest == body_digest(body.as_bytes()));
             if !bound {
@@ -1921,7 +1915,7 @@ impl S3 for ArunaS3Service {
             .read_holder(&req.extensions, bucket_info.as_ref(), &key)
             .await?
         {
-            let request = forward_reads::read_request(
+            let request = forward::reads::read_request(
                 http::Method::GET,
                 "GetObject",
                 &bucket,
@@ -1930,7 +1924,7 @@ impl S3 for ArunaS3Service {
                 &req.headers,
             );
             let response = self.forward_read(&user_access, &holder, request).await?;
-            return Ok(forward_reads::forwarded_get(response));
+            return Ok(forward::reads::forwarded_get(response));
         }
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
 
@@ -2175,7 +2169,7 @@ impl S3 for ArunaS3Service {
             .read_holder(&req.extensions, bucket_info.as_ref(), &key)
             .await?
         {
-            let request = forward_reads::read_request(
+            let request = forward::reads::read_request(
                 http::Method::HEAD,
                 "HeadObject",
                 &bucket,
@@ -2184,7 +2178,7 @@ impl S3 for ArunaS3Service {
                 &req.headers,
             );
             let response = self.forward_read(&user_access, &holder, request).await?;
-            return Ok(forward_reads::forwarded_head(&response));
+            return Ok(forward::reads::forwarded_head(&response));
         }
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
         let operation = HeadObjectOperation::new(HOI {

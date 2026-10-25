@@ -22,13 +22,13 @@ use s3s::dto::{
 };
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 
-use super::ArunaS3Service;
-use super::forward::{Forward, ForwardBody, ForwardRequest, answer_text, header, xml_field};
+use super::{Forward, ForwardBody, ForwardRequest, answer_text, header, xml_field};
 use crate::s3::error::{IntoS3Error, guard_error};
+use crate::s3::service::ArunaS3Service;
 
 /// How a copy reaches the coordinator of its destination key.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CopyPath {
+pub(in crate::s3::service) enum CopyPath {
     /// This member keeps the source and streams it as a forwarded write.
     Stream,
     /// The coordinator keeps the source's records and copies itself.
@@ -86,7 +86,7 @@ fn answered_metadata(response: &reqwest::Response) -> HashMap<String, String> {
 }
 
 /// The source a member streams: one whole version, or one byte range for a part.
-pub(super) struct CopySource<'a> {
+pub(in crate::s3::service) struct CopySource<'a> {
     pub bucket: &'a BucketInfo,
     pub name: String,
     pub key: String,
@@ -150,7 +150,11 @@ impl ArunaS3Service {
     }
 
     /// Refuses a copy this node writes itself when it does not keep the source.
-    pub(super) async fn ensure_source(&self, bucket: &BucketInfo, key: &str) -> S3Result<()> {
+    pub(in crate::s3::service) async fn ensure_source(
+        &self,
+        bucket: &BucketInfo,
+        key: &str,
+    ) -> S3Result<()> {
         if self.keeps_source(bucket, key).await? {
             return Ok(());
         }
@@ -164,7 +168,7 @@ impl ArunaS3Service {
     }
 
     /// How a copy whose destination `forward` coordinates reaches it.
-    pub(super) async fn copy_path(
+    pub(in crate::s3::service) async fn copy_path(
         &self,
         bucket: &BucketInfo,
         key: &str,
@@ -197,7 +201,7 @@ impl ArunaS3Service {
 
     /// Reads a copy source through the member that keeps it, under the caller's authority
     /// there; a failed condition fails the copy.
-    pub(super) async fn read_through(
+    pub(in crate::s3::service) async fn read_through(
         &self,
         user: &UserAccess,
         holder: &Forward,
@@ -216,7 +220,7 @@ impl ArunaS3Service {
     }
 
     /// Streams a source read through its holder to the destination's coordinator.
-    pub(super) async fn relay_copy(
+    pub(in crate::s3::service) async fn relay_copy(
         &self,
         user: &UserAccess,
         forward: &Forward,
@@ -235,7 +239,7 @@ impl ArunaS3Service {
     }
 
     /// Streams a source range read through its holder to the upload's coordinator.
-    pub(super) async fn relay_part(
+    pub(in crate::s3::service) async fn relay_part(
         &self,
         user: &UserAccess,
         forward: &Forward,
@@ -275,7 +279,7 @@ impl ArunaS3Service {
     }
 
     /// Streams a source this member keeps to the destination's coordinator as its write.
-    pub(super) async fn stream_copy(
+    pub(in crate::s3::service) async fn stream_copy(
         &self,
         user: &UserAccess,
         forward: &Forward,
@@ -331,7 +335,7 @@ impl ArunaS3Service {
     }
 
     /// Streams a source range this member keeps to the upload's coordinator as one part.
-    pub(super) async fn stream_part(
+    pub(in crate::s3::service) async fn stream_part(
         &self,
         user: &UserAccess,
         forward: &Forward,
@@ -393,7 +397,7 @@ impl ArunaS3Service {
     }
 
     /// The coordinator's answer to a delegated CopyObject.
-    pub(super) async fn delegated_copy(
+    pub(in crate::s3::service) async fn delegated_copy(
         response: reqwest::Response,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let version_id = header(&response, "x-amz-version-id");
@@ -417,7 +421,7 @@ impl ArunaS3Service {
     }
 
     /// The coordinator's answer to a delegated UploadPartCopy.
-    pub(super) async fn delegated_part(
+    pub(in crate::s3::service) async fn delegated_part(
         response: reqwest::Response,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let source_version = header(&response, "x-amz-copy-source-version-id");

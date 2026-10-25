@@ -4,6 +4,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub(super) mod copy;
+pub(super) mod list;
+pub(super) mod parts;
+pub(super) mod reads;
+mod uploads;
+mod versions;
+
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -678,5 +685,4 @@ impl ArunaS3Service {
 }
 
 #[cfg(test)]
-#[path = "forward_tests.rs"]
 mod tests;
