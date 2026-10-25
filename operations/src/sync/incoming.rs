@@ -1667,6 +1667,13 @@ mod tests {
             }),
             reference_advance_count: Some(0),
             placement_policies: Vec::new(),
+            original_epoch: Default::default(),
+            version_generation: 0,
+            logical_identity: None,
+            distribution: None,
+            version_origin: None,
+            version_hop: None,
+            sync_source: None,
         };
 
         assert_eq!(
