@@ -401,7 +401,10 @@ impl InventoryUpdate {
                 if existing.version == added.entry {
                     continue;
                 }
-                if let Some(identity) = existing.version.identity {
+                // Deletes run after the writes, so a row the update writes again stays.
+                if let Some(identity) = existing.version.identity
+                    && added.entry.identity != Some(identity)
+                {
                     let content = content_key(set_id, &identity, added.version_id);
                     self.deletes
                         .push((CONTENT_INDEX_KEYSPACE.into(), content.into()));

@@ -146,6 +146,21 @@ async fn indexes_content_identity() {
 }
 
 #[tokio::test]
+async fn update_keeps_content() {
+    // An entry that changes form but keeps its identity stays in the content index.
+    let (_dir, handle) = open();
+    single_range(&handle).await;
+    assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
+    let mut update = put("a", 1, 1, 10);
+    update.change.added[0].entry.referenced = true;
+    update.change.head = HeadChange::Keep;
+    assert!(apply(&handle, update).await.unwrap());
+    let content = content_key(set(), &stored(10).identity.unwrap(), id(1));
+    let kept = get(&handle, CONTENT_INDEX_KEYSPACE, content).await;
+    assert!(kept.is_some(), "the rewritten row is not deleted again");
+}
+
+#[tokio::test]
 async fn replay_changes_nothing() {
     let (_dir, handle) = open();
     single_range(&handle).await;
