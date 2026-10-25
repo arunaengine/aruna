@@ -410,3 +410,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "usage_tests.rs"]
+mod route_tests;
