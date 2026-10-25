@@ -77,6 +77,7 @@ pub async fn drain_publish_queue(context: &Arc<DriverContext>) -> DrainOutcome {
             realm_id,
             node_id,
         },
+        1,
     )
     .await
 }
@@ -96,7 +97,7 @@ impl QueueDrain for PublishDrain<'_> {
         read_page(self.context, cursor).await
     }
 
-    async fn forward(&mut self, entry: PublishEntry) -> ForwardOutcome {
+    async fn forward(&self, entry: PublishEntry) -> ForwardOutcome {
         let Some(claim) = claim_entry(
             self.context,
             self.config,

@@ -10,6 +10,7 @@ use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use aruna_tasks::TaskHandle;
+use futures_util::StreamExt;
 use tracing::warn;
 
 use crate::tasks::queue_backoff::retry_delay_ms;
@@ -115,24 +116,29 @@ pub(crate) trait QueueDrain {
         cursor: Option<Key>,
     ) -> impl Future<Output = Option<(Vec<Self::Entry>, Option<Key>)>> + Send;
 
-    fn forward(&mut self, entry: Self::Entry) -> impl Future<Output = ForwardOutcome> + Send;
+    fn forward(&self, entry: Self::Entry) -> impl Future<Output = ForwardOutcome> + Send;
 }
 
 /// Drains one queue page by page: entries that are not due are skipped, the
-/// rest go to `forward`. `forward` reports whether the entry asks for another
-/// pass, so each queue keeps its own claim ordering.
-pub(crate) async fn drain_queue<Q: QueueDrain>(now_ms: u64, mut queue: Q) -> DrainOutcome {
+/// rest go to `forward`, at most `in_flight` at once. `forward` reports whether
+/// the entry asks for another pass, so each queue keeps its own claim ordering.
+pub(crate) async fn drain_queue<Q: QueueDrain>(
+    now_ms: u64,
+    mut queue: Q,
+    in_flight: usize,
+) -> DrainOutcome {
     let mut cursor: Option<Key> = None;
     let mut needs_recheck = false;
     loop {
         let Some((entries, next)) = queue.read(cursor).await else {
             return DrainOutcome::Deferred;
         };
-        for entry in entries {
-            if !entry.is_due(now_ms) {
-                continue;
-            }
-            needs_recheck |= matches!(queue.forward(entry).await, ForwardOutcome::Recheck);
+        let due = entries.into_iter().filter(|entry| entry.is_due(now_ms));
+        let mut outcomes = futures_util::stream::iter(due)
+            .map(|entry| queue.forward(entry))
+            .buffer_unordered(in_flight.max(1));
+        while let Some(outcome) = outcomes.next().await {
+            needs_recheck |= outcome == ForwardOutcome::Recheck;
         }
         match next {
             Some(next) => cursor = Some(next),
@@ -157,10 +163,11 @@ pub(crate) async fn arm_timer(task_handle: &TaskHandle, task_key: TaskKey, failu
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use aruna_core::types::Key;
+    use tokio::sync::Barrier;
 
     use super::{ForwardOutcome, QueueDrain, RetryView, drain_queue};
     use crate::device::drain::DrainOutcome;
@@ -206,7 +213,7 @@ mod tests {
             }
         }
 
-        async fn forward(&mut self, entry: Entry) -> ForwardOutcome {
+        async fn forward(&self, entry: Entry) -> ForwardOutcome {
             self.forwarded.fetch_add(1, Ordering::SeqCst);
             match entry.recheck {
                 true => ForwardOutcome::Recheck,
@@ -224,7 +231,7 @@ mod tests {
         // Processing the last entry may still ask for another pass, so the
         // outcome must not claim that entries remain or that none do.
         let queue = FakeQueue::new(vec![Some(vec![entry(0, true)])], Arc::default());
-        assert_eq!(drain_queue(0, queue).await, DrainOutcome::Recheck);
+        assert_eq!(drain_queue(0, queue, 1).await, DrainOutcome::Recheck);
     }
 
     #[tokio::test]
@@ -232,13 +239,13 @@ mod tests {
         // A failed claim also asks for another pass: the entry may have
         // advanced rather than the queue being empty.
         let queue = FakeQueue::new(vec![Some(vec![entry(0, true)])], Arc::default());
-        assert_eq!(drain_queue(0, queue).await, DrainOutcome::Recheck);
+        assert_eq!(drain_queue(0, queue, 1).await, DrainOutcome::Recheck);
     }
 
     #[tokio::test]
     async fn skips_future_entries() {
         let queue = FakeQueue::new(vec![Some(vec![entry(1_000, true)])], Arc::default());
-        assert_eq!(drain_queue(999, queue).await, DrainOutcome::Idle);
+        assert_eq!(drain_queue(999, queue, 1).await, DrainOutcome::Idle);
     }
 
     #[tokio::test]
@@ -250,13 +257,67 @@ mod tests {
             vec![Some(vec![entry(0, true)]), None],
             Arc::clone(&forwarded),
         );
-        assert_eq!(drain_queue(0, queue).await, DrainOutcome::Deferred);
+        assert_eq!(drain_queue(0, queue, 1).await, DrainOutcome::Deferred);
         assert_eq!(forwarded.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn settles_without_recheck() {
         let queue = FakeQueue::new(vec![Some(vec![entry(0, false)])], Arc::default());
-        assert_eq!(drain_queue(0, queue).await, DrainOutcome::Idle);
+        assert_eq!(drain_queue(0, queue, 1).await, DrainOutcome::Idle);
+    }
+
+    /// Entries wait at a barrier as wide as the limit, so the limit is reached and never passed.
+    struct GateQueue {
+        pages: Vec<Vec<Entry>>,
+        gate: Arc<Barrier>,
+        running: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        seen: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl QueueDrain for GateQueue {
+        type Entry = Entry;
+
+        async fn read(&mut self, _cursor: Option<Key>) -> Option<(Vec<Entry>, Option<Key>)> {
+            let entries = self.pages.remove(0);
+            let next = (!self.pages.is_empty()).then(|| Key::from(vec![1]));
+            Some((entries, next))
+        }
+
+        async fn forward(&self, entry: Entry) -> ForwardOutcome {
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            self.seen.lock().unwrap().push(entry.due_at_ms);
+            self.gate.wait().await;
+            // The last to arrive must still count as running when the next forward starts.
+            tokio::task::yield_now().await;
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            ForwardOutcome::Settled
+        }
+    }
+
+    #[tokio::test]
+    async fn bounds_in_flight() {
+        let (running, peak, seen) = (Arc::default(), Arc::default(), Arc::default());
+        let queue = GateQueue {
+            pages: vec![
+                (0..6)
+                    .map(|id| entry(id, false))
+                    .chain([entry(5_000, false)])
+                    .collect(),
+                (6..9).map(|id| entry(id, false)).collect(),
+            ],
+            gate: Arc::new(Barrier::new(3)),
+            running: Arc::clone(&running),
+            peak: Arc::clone(&peak),
+            seen: Arc::clone(&seen),
+        };
+        assert_eq!(drain_queue(1_000, queue, 3).await, DrainOutcome::Idle);
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..9).collect::<Vec<_>>());
     }
 }
