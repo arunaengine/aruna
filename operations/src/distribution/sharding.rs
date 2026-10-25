@@ -60,6 +60,12 @@ enum Tended {
 pub async fn maintain_ranges(context: &Arc<DriverContext>) -> Duration {
     let lifecycle = super::lifecycle::tend_lifecycle(context).await;
     let mut after = maintain_accounts(context).await;
+    // Coordinators walk their ranges for the periodic source refresh, a few pages per pass.
+    match super::refresh::refresh_ranges(context).await {
+        Ok(true) => after = Duration::ZERO,
+        Ok(false) => {}
+        Err(error) => warn!(%error, "The periodic source refresh could not run"),
+    }
     // Version links metadata could not verify in a set are retried here, a page per pass.
     match crate::metadata::data_links::retry_unverified(context).await {
         Ok(true) => after = Duration::ZERO,
