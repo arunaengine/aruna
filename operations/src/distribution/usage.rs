@@ -13,7 +13,7 @@ use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, RangeAccount, RangeCounters, account_key, generation_key, pending_key,
 };
 use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{Key, TxnId, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -79,10 +79,11 @@ pub fn sum_rows(values: &[Option<Value>]) -> Result<RangeCounters, UsageError> {
 async fn batch_read(
     context: &DriverContext,
     reads: Vec<(String, Key)>,
+    txn_id: TxnId,
 ) -> Result<Vec<Option<Value>>, UsageError> {
     let read = StorageEffect::BatchRead {
         reads,
-        txn_id: None,
+        txn_id: Some(txn_id),
     };
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -116,35 +117,24 @@ pub async fn held_ranges(
     else {
         return Ok(None);
     };
-    let set_id = binding.set_id;
-    let held: Vec<Ulid> = snapshot
-        .held_ranges(binding.member_id)
-        .iter()
-        .map(|range| range.range_id)
-        .collect();
-    let reads = held
-        .iter()
-        .map(|range| {
-            (
-                RANGE_ACCOUNT_KEYSPACE.to_string(),
-                account_key(set_id, *range).into(),
-            )
-        })
-        .collect();
-    let mut accounts = Vec::with_capacity(held.len());
-    for (range_id, value) in held.iter().zip(batch_read(context, reads).await?) {
-        if let Some(value) = value {
-            accounts.push((*range_id, RangeAccount::from_bytes(&value)?));
+    // Accounts and the counter rows they name are read from one snapshot, so a generation
+    // switch in between never pairs an account with another generation's row.
+    let txn_id = match (context.storage_handle)
+        .send_storage_effect(StorageEffect::StartTransaction { read: true })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(StorageError::ReadError(format!("unexpected answer {other:?}")).into());
         }
-    }
-    let keys: BTreeSet<Vec<u8>> = charged_rows(set_id, &accounts).into_iter().collect();
-    let reads = (keys.iter())
-        .map(|key| (RANGE_COUNTER_KEYSPACE.to_string(), key.clone().into()))
-        .collect();
-    let mut values = BTreeMap::new();
-    for (key, value) in keys.into_iter().zip(batch_read(context, reads).await?) {
-        values.insert(key, sum_rows(&[value])?);
-    }
+    };
+    let rows = charged_ranges(context, &binding, &snapshot, txn_id).await;
+    (context.storage_handle)
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
+    let (accounts, values) = rows?;
+    let set_id = binding.set_id;
     // A node-wide usage rebuild also leaves range counters unconfirmed.
     let confirmed = usage_complete(context).await?;
     let ranges = (accounts.iter())
@@ -161,6 +151,49 @@ pub async fn held_ranges(
         })
         .collect();
     Ok(Some((binding, snapshot, ranges)))
+}
+
+/// The accounts of the ranges this member holds and the counter rows they charge, read in
+/// `txn_id`.
+async fn charged_ranges(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    snapshot: &DistributionSnapshot,
+    txn_id: TxnId,
+) -> Result<(Vec<(Ulid, RangeAccount)>, BTreeMap<Vec<u8>, RangeCounters>), UsageError> {
+    let set_id = binding.set_id;
+    let held: Vec<Ulid> = snapshot
+        .held_ranges(binding.member_id)
+        .iter()
+        .map(|range| range.range_id)
+        .collect();
+    let reads = held
+        .iter()
+        .map(|range| {
+            (
+                RANGE_ACCOUNT_KEYSPACE.to_string(),
+                account_key(set_id, *range).into(),
+            )
+        })
+        .collect();
+    let mut accounts = Vec::with_capacity(held.len());
+    for (range_id, value) in held.iter().zip(batch_read(context, reads, txn_id).await?) {
+        if let Some(value) = value {
+            accounts.push((*range_id, RangeAccount::from_bytes(&value)?));
+        }
+    }
+    let keys: BTreeSet<Vec<u8>> = charged_rows(set_id, &accounts).into_iter().collect();
+    let reads = (keys.iter())
+        .map(|key| (RANGE_COUNTER_KEYSPACE.to_string(), key.clone().into()))
+        .collect();
+    let mut values = BTreeMap::new();
+    for (key, value) in keys
+        .into_iter()
+        .zip(batch_read(context, reads, txn_id).await?)
+    {
+        values.insert(key, sum_rows(&[value])?);
+    }
+    Ok((accounts, values))
 }
 
 /// Adds the rows of `ranges`, each distinct row once.
@@ -256,6 +289,62 @@ mod tests {
         };
         let total = sum_held(&[child(1, 2), child(2, -1)]).unwrap();
         assert_eq!(total.objects, 11, "the shared parent row is added once");
+    }
+
+    #[tokio::test]
+    async fn reads_held_counters() {
+        // The charged rows of the held ranges come with their accounts, read in one snapshot.
+        use crate::distribution::test_record::{binding, record, store_record};
+        use crate::distribution::test_store::{context, open};
+        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+        use aruna_core::structs::storage::blob::BucketInfo;
+        let (_dir, handle) = open();
+        let context = context(&handle);
+        let (snapshot, bytes) = record(true);
+        let set_id = snapshot.set_id();
+        store_record(&handle, set_id, bytes).await;
+        let info = BucketInfo {
+            group_id: snapshot.config.owner_group,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: Some(binding(&snapshot, 1, 5)),
+        };
+        let range_id = snapshot.config.ranges[0].range_id;
+        let counted = RangeCounters {
+            objects: 4,
+            ..RangeCounters::default()
+        };
+        let writes = vec![
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                b"spire".to_vec().into(),
+                info.to_bytes().unwrap().into(),
+            ),
+            (
+                RANGE_ACCOUNT_KEYSPACE.to_string(),
+                account_key(set_id, range_id).into(),
+                account(Charge::Active(3)).to_bytes().unwrap().into(),
+            ),
+            (
+                RANGE_COUNTER_KEYSPACE.to_string(),
+                generation_key(set_id, range_id, 3).into(),
+                counted.to_bytes().unwrap().into(),
+            ),
+        ];
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        handle.send_storage_effect(write).await;
+        let (_, _, held) = held_ranges(&context, "spire").await.unwrap().unwrap();
+        assert_eq!(held.len(), 1, "member 1 holds the lower shard only");
+        assert_eq!(sum_held(&held).unwrap().objects, 4);
+        assert!(held[0].complete);
     }
 
     #[test]
