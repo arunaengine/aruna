@@ -191,15 +191,15 @@ async fn building_range_incomplete() {
 #[tokio::test]
 async fn prefix_window_continues() {
     let ready = IndexState::Ready { generation: 1 };
-    let test = distributed(ready, &["run/a", "run/b", "run0/c", "rum/d"]).await;
-    let mut prefix = test.input(owner(&test.fixture), "run/");
+    let test = distributed(ready, &["job/a", "job/b", "job0/c", "jo/d"]).await;
+    let mut prefix = test.input(owner(&test.fixture), "job/");
     prefix.key_match = ObjectKeyMatch::Prefix;
     prefix.limit = 1;
     let first = test.search(prefix.clone(), 100).await;
-    assert_eq!(keys(&first), ["run/a"]);
+    assert_eq!(keys(&first), ["job/a"]);
     prefix.start_after = first.next_start_after;
     let second = test.search(prefix, 100).await;
-    assert_eq!(keys(&second), ["run/b"]);
+    assert_eq!(keys(&second), ["job/b"]);
     assert_eq!(second.next_start_after, None);
 }
 
