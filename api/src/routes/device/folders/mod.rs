@@ -607,7 +607,7 @@ for. Nothing outside this device is decided here, so the owner binding is the wh
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        (status = 503, description = "The realm configuration has not reached this device yet, or a concurrent change to the folder caused a storage conflict; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -671,7 +671,7 @@ for.
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is still being bound", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        (status = 503, description = "The realm configuration has not reached this device yet, or a concurrent change to the folder caused a storage conflict; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -730,7 +730,7 @@ for."#,
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is still being bound", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        (status = 503, description = "The realm configuration has not reached this device yet, or a concurrent change to the folder caused a storage conflict; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
