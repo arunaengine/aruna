@@ -14,15 +14,15 @@ use aruna_core::git::{GitRecord, LOCAL_OBJECTS, StoredObject};
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BROKEN_VERSION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
-    DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
-    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE,
-    NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE,
-    QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE,
-    REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, S3_BUCKET_KEYSPACE,
-    S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE,
-    SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
-    UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
+    COPY_WAIT_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
+    FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE,
+    JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
+    NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
+    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -148,10 +148,12 @@ pub struct MigrateOutput {
     /// Finished staging checkpoints from before the directory queue; unfinished ones are
     /// deleted, so their job walks its source again, and count as `staging_job_state` below.
     pub staging_checkpoints_rewritten: usize,
-    /// Rows rewritten by keyspace whose shape gained trailing fields with distributed buckets.
+    /// Rows rewritten by keyspace whose shape gained trailing fields with distributed buckets,
+    /// or that moved with their replication job.
     pub relaid_rows: BTreeMap<&'static str, usize>,
     /// Rows deleted by keyspace: refresh jobs and IRI index rows in a replaced key layout,
-    /// replication jobs moved to their new key and unfinished staging checkpoints.
+    /// replication jobs moved to their new key with their key waits and plaintext requests,
+    /// and unfinished staging checkpoints.
     pub stale_rows_deleted: BTreeMap<&'static str, usize>,
 }
 
@@ -228,6 +230,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let broken_rows = db.keyspace(BROKEN_VERSION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let replication_rows = db.keyspace(REPLICATION_JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
     let refresh_rows = db.keyspace(REFRESH_JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let wait_rows = db.keyspace(COPY_WAIT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let consent_rows = db.keyspace(PLAINTEXT_COPY_KEYSPACE, KeyspaceCreateOptions::default)?;
     let iri_rows = db.keyspace(IRI_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
     let staging_rows = db.keyspace(STAGING_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let object_rows = db.keyspace(LOCAL_OBJECTS, KeyspaceCreateOptions::default)?;
@@ -319,15 +323,21 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         padded::<BrokenVersion>(&db, &broken_rows, BROKEN_VERSION_KEYSPACE, versions::LAYOUT)?,
         padded::<StoredObject>(&db, &object_rows, LOCAL_OBJECTS, git::LAYOUT)?,
     ];
-    let replication = layouts::replication_jobs(&db, &replication_rows, REPLICATION_JOB_KEYSPACE)?;
+    let (replication, renamed) =
+        layouts::replication_jobs(&db, &replication_rows, REPLICATION_JOB_KEYSPACE)?;
     relaid_rows.push((
         &replication_rows,
         REPLICATION_JOB_KEYSPACE,
         replication.rows,
     ));
+    // Key waits and plaintext requests name their job by key, so they move in the same commit.
+    let waits = layouts::job_rows(&db, &wait_rows, layouts::WAITS, &renamed)?;
+    let consents = layouts::job_rows(&db, &consent_rows, layouts::CONSENTS, &renamed)?;
+    relaid_rows.push((&wait_rows, COPY_WAIT_KEYSPACE, waits.rows));
+    relaid_rows.push((&consent_rows, PLAINTEXT_COPY_KEYSPACE, consents.rows));
     let announced = layouts::cleanup_rows(&db, &cleanup_rows)?.rows;
     relaid_rows.push((&cleanup_rows, BLOB_CLEANUP_KEYSPACE, announced));
-    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 4] = [
+    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 6] = [
         (
             &refresh_rows,
             REFRESH_JOB_KEYSPACE,
@@ -344,6 +354,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             replication.removed,
         ),
         (&staging_rows, STAGING_STATE_KEYSPACE, staged.restarted),
+        (&wait_rows, COPY_WAIT_KEYSPACE, waits.removed),
+        (&consent_rows, PLAINTEXT_COPY_KEYSPACE, consents.removed),
     ];
     let keys = node_secret(&db)?.map(|secret| {
         (
