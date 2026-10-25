@@ -5,13 +5,15 @@
 
 use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, SEARCH_INDEX_KEYSPACE};
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::search::IndexState;
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use aruna_core::types::{Key, TxnId};
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use futures_util::future::join_all;
 use ulid::Ulid;
 
@@ -21,7 +23,7 @@ use super::{
     load_live, start_read,
 };
 use crate::distribution::index_feed::state_key;
-use crate::distribution::key_index::{KeyQuery, RangeIndexes};
+use crate::distribution::key_index::{KeyPage, KeyQuery, RangeIndexes};
 use crate::driver::DriverContext;
 use crate::replication::members::read_record;
 
@@ -52,10 +54,10 @@ pub(super) async fn search_ranges(
         // Without the record the ranges are unknown, so nothing is covered.
         return Ok(page(Vec::new(), None, 1, 0));
     };
-    let after = (input.start_after.as_deref())
-        .map(BlobHeadKey::from_bytes)
-        .transpose()?
-        .map(|head| head.key);
+    let after = match input.start_after.as_deref() {
+        Some(position) => Some(BlobHeadKey::from_bytes(&open_position(position)?)?.key),
+        None => None,
+    };
     let (start, end) = window(input, after);
     let mut local = Vec::new();
     let mut remote = 0;
@@ -78,17 +80,16 @@ pub(super) async fn search_ranges(
             start: start.clone(),
             end: end.clone(),
             names: names.clone(),
-            limit: budget - examined,
+            limit: budget.saturating_sub(examined).max(1),
         };
         let found = search_chunk(context, &search, chunk, query).await?;
-        for keys in found {
-            let Some(mut keys) = keys else {
+        for found in found {
+            let Some(found) = found else {
                 incomplete += 1;
                 continue;
             };
-            keys.truncate(budget - examined);
-            examined += keys.len();
-            let last = keys.last().cloned();
+            examined += found.examined;
+            let (mut keys, last) = (found.keys, found.last);
             keys.retain(|key| input.key_match.matches(key, &input.query));
             for candidate in resolve_keys(context, input, &bucket, &keys).await? {
                 if !authorize(context, input, &mut evaluators, &candidate).await? {
@@ -101,12 +102,16 @@ pub(super) async fn search_ranges(
                     return Ok(page(visible, next, incomplete, remote));
                 }
             }
-            if examined >= budget {
-                // Zero-hit and denied pages stop here too and continue after the last key.
-                let next = last
-                    .map(|key| BlobHeadKey::new(bucket.as_str(), key).to_bytes())
-                    .transpose()?;
-                return Ok(page(visible, next, incomplete, remote));
+            if let Some(last) = last {
+                // Zero-hit and denied pages stop here too and continue after the last key,
+                // sealed so the caller never learns a key it may not read.
+                let position = BlobHeadKey::new(bucket.as_str(), last).to_bytes()?;
+                return Ok(page(
+                    visible,
+                    Some(seal_position(&position)?),
+                    incomplete,
+                    remote,
+                ));
             }
         }
     }
@@ -119,7 +124,7 @@ async fn search_chunk(
     search: &RangeSearch,
     chunk: &[Ulid],
     query: KeyQuery,
-) -> Result<Vec<Option<Vec<String>>>, SearchObjectsError> {
+) -> Result<Vec<Option<KeyPage>>, SearchObjectsError> {
     let set_id = search.binding.set_id;
     let reads = (chunk.iter())
         .map(|range_id| {
@@ -144,6 +149,40 @@ async fn search_chunk(
         }
     });
     Ok(join_all(searches).await)
+}
+
+/// Starts a sealed position; no head key encoding starts with it, as bucket names are short.
+const SEALED: u8 = 0xFF;
+
+/// This process's key for sealed positions; a restart makes older sealed cursors invalid.
+static POSITION_KEY: LazyLock<[u8; 32]> = LazyLock::new(rand::random);
+
+/// A head key position encrypted and authenticated with this node's key, so a cursor carries
+/// no key name; only this node opens it again.
+pub(super) fn seal_position(position: &[u8]) -> Result<Vec<u8>, SearchObjectsError> {
+    let nonce: [u8; 24] = rand::random();
+    let cipher = XChaCha20Poly1305::new((&*POSITION_KEY).into());
+    let sealed = (cipher.encrypt(&XNonce::from(nonce), position))
+        .map_err(|_| SearchObjectsError::Storage("search position not sealed".to_string()))?;
+    Ok([&[SEALED][..], &nonce, &sealed].concat())
+}
+
+/// The head key of a position: a sealed one is opened, a plain one is passed on.
+pub(super) fn open_position(position: &[u8]) -> Result<Vec<u8>, SearchObjectsError> {
+    let Some(sealed) = position.strip_prefix(&[SEALED]) else {
+        return Ok(position.to_vec());
+    };
+    let (nonce, sealed) = sealed
+        .split_at_checked(24)
+        .ok_or(SearchObjectsError::Position)?;
+    let nonce: [u8; 24] = nonce.try_into().map_err(|_| SearchObjectsError::Position)?;
+    let cipher = XChaCha20Poly1305::new((&*POSITION_KEY).into());
+    (cipher.decrypt(&XNonce::from(nonce), sealed)).map_err(|_| SearchObjectsError::Position)
+}
+
+/// Whether `position` is a sealed one, which only its node can check.
+pub fn sealed_position(position: &[u8]) -> bool {
+    position.first() == Some(&SEALED)
 }
 
 /// The keys a page may return: after the cursor and, for a prefix, inside the prefix.

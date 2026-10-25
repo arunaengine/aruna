@@ -9,12 +9,12 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
-use tantivy::query::{AllQuery, BooleanQuery, InvertedIndexRangeQuery, Occur, Query, TermQuery};
 use tantivy::schema::{FAST, Field, IndexRecordOption, STORED, STRING, Schema, TEXT};
 use tantivy::tokenizer::TokenStream;
-use tantivy::{Index, IndexReader, IndexWriter, Order, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{
+    DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, TERMINATED, TantivyDocument, Term,
+};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use ulid::Ulid;
@@ -58,14 +58,24 @@ pub enum KeyChange {
     Remove(String),
 }
 
-/// Keys between `start` and `end` in key order, at most `limit`; with `names`, only keys
-/// that hold every name token of that text.
+/// Keys between `start` and `end` in key order, examining at most `limit` keys per index
+/// segment; with `names`, only keys that hold every name token of that text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyQuery {
     pub start: Bound<String>,
     pub end: Bound<String>,
     pub names: Option<String>,
     pub limit: usize,
+}
+
+/// The live matching keys of the examined part of a window, in key order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KeyPage {
+    pub keys: Vec<String>,
+    /// Keys looked at, live, deleted or not matching.
+    pub examined: usize,
+    /// The last examined key when the window continues after it; `None` once it is read.
+    pub last: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -160,7 +170,7 @@ impl RangeIndexes {
         range_id: Ulid,
         generation: u64,
         query: KeyQuery,
-    ) -> Result<Vec<String>, KeyIndexError> {
+    ) -> Result<KeyPage, KeyIndexError> {
         let dir = self.directory(set_id, range_id, generation);
         self.blocking(move |indexes| {
             let open = indexes.open_index(&dir, false)?;
@@ -299,40 +309,76 @@ fn write_changes(open: &OpenIndex, changes: &[KeyChange]) -> Result<(), KeyIndex
     Ok(())
 }
 
-fn search_keys(open: &OpenIndex, query: &KeyQuery) -> Result<Vec<String>, KeyIndexError> {
-    if query.limit == 0 {
-        return Ok(Vec::new());
-    }
+/// Walks the key terms of every segment in key order, each at most `query.limit` terms, so
+/// the work is bounded by the limit and never by the range's size. Keys up to the smallest
+/// segment end are examined everywhere; the page continues after that key.
+fn search_keys(open: &OpenIndex, query: &KeyQuery) -> Result<KeyPage, KeyIndexError> {
     let fields = fields(&open.index.schema())?;
-    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-    let term = |text: &String| Term::from_field_text(fields.key, text);
-    if !matches!(
-        (&query.start, &query.end),
-        (Bound::Unbounded, Bound::Unbounded)
-    ) {
-        let range = InvertedIndexRangeQuery::new(
-            query.start.as_ref().map(term),
-            query.end.as_ref().map(term),
-        );
-        clauses.push((Occur::Must, Box::new(range)));
-    }
-    if let Some(names) = &query.names {
-        let mut analyzer = open.index.tokenizer_for_field(fields.name)?;
-        let mut tokens = analyzer.token_stream(names);
-        while let Some(token) = tokens.next() {
-            let term = Term::from_field_text(fields.name, &token.text);
-            let query = TermQuery::new(term, IndexRecordOption::Basic);
-            clauses.push((Occur::Must, Box::new(query)));
+    let mut analyzer = open.index.tokenizer_for_field(fields.name)?;
+    let mut tokens = |text: &str| {
+        let mut stream = analyzer.token_stream(text);
+        let mut found = Vec::new();
+        while let Some(token) = stream.next() {
+            found.push(token.text.clone());
+        }
+        found
+    };
+    let wanted = query.names.as_deref().map(&mut tokens);
+    let limit = query.limit.max(1);
+    let searcher = open.reader.searcher();
+    let mut seen = std::collections::BTreeMap::<String, bool>::new();
+    let mut end: Option<String> = None;
+    for segment in searcher.segment_readers() {
+        let inverted = segment.inverted_index(fields.key)?;
+        let mut range = inverted.terms().range();
+        range = match &query.start {
+            Bound::Included(start) => range.ge(start.as_bytes()),
+            Bound::Excluded(start) => range.gt(start.as_bytes()),
+            Bound::Unbounded => range,
+        };
+        range = match &query.end {
+            Bound::Included(stop) => range.le(stop.as_bytes()),
+            Bound::Excluded(stop) => range.lt(stop.as_bytes()),
+            Bound::Unbounded => range,
+        };
+        let mut stream = range.into_stream()?;
+        let mut read = 0usize;
+        while read < limit && stream.advance() {
+            read += 1;
+            let key = String::from_utf8_lossy(stream.key()).into_owned();
+            let postings = IndexRecordOption::Basic;
+            let mut docs = inverted.read_postings_from_terminfo(stream.value(), postings)?;
+            let mut alive = false;
+            while docs.doc() != TERMINATED && !alive {
+                alive = !segment.is_deleted(docs.doc());
+                docs.advance();
+            }
+            *seen.entry(key.clone()).or_default() |= alive;
+            if read == limit {
+                end = Some(end.map_or(key.clone(), |end| end.min(key)));
+            }
         }
     }
-    let query_box: Box<dyn Query> = match clauses.is_empty() {
-        true => Box::new(AllQuery),
-        false => Box::new(BooleanQuery::new(clauses)),
-    };
-    let collector =
-        TopDocs::with_limit(query.limit).order_by_string_fast_field(KEY_FIELD, Order::Asc);
-    let found = open.reader.searcher().search(&query_box, &collector)?;
-    Ok(found.into_iter().filter_map(|(key, _)| key).collect())
+    if let Some(end) = &end {
+        seen.retain(|key, _| key <= end);
+    }
+    let examined = seen.len();
+    let keys = (seen.into_iter())
+        .filter(|(_, alive)| *alive)
+        .map(|(key, _)| key)
+        .filter(|key| {
+            let Some(wanted) = &wanted else {
+                return true;
+            };
+            let found = tokens(key);
+            wanted.iter().all(|token| found.contains(token))
+        })
+        .collect();
+    Ok(KeyPage {
+        keys,
+        examined,
+        last: end,
+    })
 }
 
 #[cfg(test)]
@@ -377,7 +423,7 @@ mod tests {
         indexes.apply(set(), range(), 1, changes).await.unwrap();
 
         let all = query(Bound::Unbounded, Bound::Unbounded, None, 10);
-        let found = indexes.search(set(), range(), 1, all).await.unwrap();
+        let found = indexes.search(set(), range(), 1, all).await.unwrap().keys;
         assert_eq!(
             found,
             [
@@ -393,11 +439,15 @@ mod tests {
             None,
             10,
         );
-        let found = indexes.search(set(), range(), 1, prefix).await.unwrap();
+        let found = indexes
+            .search(set(), range(), 1, prefix)
+            .await
+            .unwrap()
+            .keys;
         assert_eq!(found.len(), 2, "the prefix window holds both run-1 keys");
 
         let names = query(Bound::Unbounded, Bound::Unbounded, Some("FASTQ"), 10);
-        let found = indexes.search(set(), range(), 1, names).await.unwrap();
+        let found = indexes.search(set(), range(), 1, names).await.unwrap().keys;
         assert_eq!(found, ["run-1/sample_a.fastq", "run-2/reads.fastq"]);
 
         let after = query(
@@ -408,10 +458,11 @@ mod tests {
         );
         let found = indexes.search(set(), range(), 1, after).await.unwrap();
         assert_eq!(
-            found,
+            found.keys,
             ["run-1/sample_b.bam"],
             "continues after the key, bounded"
         );
+        assert_eq!(found.last.as_deref(), Some("run-1/sample_b.bam"));
     }
 
     #[tokio::test]
@@ -425,12 +476,34 @@ mod tests {
             .search(set(), range(), 1, all.clone())
             .await
             .unwrap();
-        assert_eq!(found, ["a/x", "b/y"], "a replayed put keeps one document");
+        assert_eq!(
+            found.keys,
+            ["a/x", "b/y"],
+            "a replayed put keeps one document"
+        );
 
         let changes = vec![KeyChange::Remove("a/x".to_string())];
         indexes.apply(set(), range(), 1, changes).await.unwrap();
         let found = indexes.search(set(), range(), 1, all).await.unwrap();
-        assert_eq!(found, ["b/y"]);
+        assert_eq!(found.keys, ["b/y"]);
+    }
+
+    // Keys that do not match still count, so a query with few hits stops at its limit.
+    #[tokio::test]
+    async fn examined_keys_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = Arc::new(RangeIndexes::new(dir.path()));
+        let changes = ["a.bam", "b.bam", "c.bam", "d.fastq"].map(put).to_vec();
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+
+        let names = query(Bound::Unbounded, Bound::Unbounded, Some("fastq"), 2);
+        let first = indexes.search(set(), range(), 1, names).await.unwrap();
+        assert_eq!((first.keys.len(), first.examined), (0, 2));
+        assert_eq!(first.last.as_deref(), Some("b.bam"));
+        let rest = query(Bound::Excluded("b.bam"), Bound::Unbounded, Some("fastq"), 2);
+        let second = indexes.search(set(), range(), 1, rest).await.unwrap();
+        assert_eq!(second.keys, ["d.fastq"]);
+        assert_eq!(second.last.as_deref(), Some("d.fastq"));
     }
 
     #[tokio::test]

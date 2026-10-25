@@ -51,7 +51,9 @@ async fn keys(indexes: &Arc<RangeIndexes>, generation: u64) -> Vec<String> {
         names: None,
         limit: 100,
     };
-    (indexes.search(set(), range_id(), generation, query).await).unwrap()
+    (indexes.search(set(), range_id(), generation, query).await)
+        .unwrap()
+        .keys
 }
 
 #[tokio::test]
@@ -249,6 +251,6 @@ async fn split_reindexes_children() {
             .indexes
             .search(set(), range, generation, query)
             .await;
-        assert_eq!(found.unwrap(), [expected]);
+        assert_eq!(found.unwrap().keys, [expected]);
     }
 }

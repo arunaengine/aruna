@@ -158,8 +158,12 @@ async fn denied_pages_bounded() {
     let cursor = first
         .next_start_after
         .expect("the budget ends the page early");
+    // The position of a key the caller may not see is sealed, never readable.
+    assert!(sealed_position(&cursor));
+    let hidden = b"b/needle-2";
+    assert!(!cursor.windows(hidden.len()).any(|part| part == hidden));
     assert_eq!(
-        cursor,
+        open_position(&cursor).unwrap(),
         BlobHeadKey::new("spire", "b/needle-2").to_bytes().unwrap()
     );
 

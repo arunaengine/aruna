@@ -31,6 +31,8 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 #[path = "index_search.rs"]
 mod index_search;
 
+pub use index_search::sealed_position;
+
 const HEAD_SCAN_BATCH: usize = 1_000;
 pub const SEARCH_MAX_LIMIT: usize = 100;
 
@@ -111,6 +113,8 @@ pub enum SearchObjectsError {
     Storage(String),
     #[error("object inventory scan budget exhausted")]
     Unavailable,
+    #[error("the search position is no longer valid")]
+    Position,
 }
 
 #[derive(Debug)]

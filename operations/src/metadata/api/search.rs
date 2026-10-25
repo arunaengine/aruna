@@ -195,7 +195,9 @@ impl SignedCursor<ObjectCursorPayload> {
             })?;
             if !nodes.insert(partition.node_id)
                 || partition.start_after.as_ref().is_some_and(|key| {
-                    key.len() > SEARCH_MAX_BYTES || BlobHeadKey::from_bytes(key).is_err()
+                    // A sealed position is checked by the node that sealed it.
+                    let plain = !crate::s3::object::search::sealed_position(key);
+                    key.len() > SEARCH_MAX_BYTES || plain && BlobHeadKey::from_bytes(key).is_err()
                 })
             {
                 return Err(MetadataApiError::InvalidCursor(
