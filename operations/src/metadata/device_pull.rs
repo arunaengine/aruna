@@ -15,6 +15,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::distribution::{RouteError, WriteRoute};
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::{
     ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
     SyncPullAck, SyncPullStatus, SyncRefusal, SyncVersionPage,
@@ -527,6 +528,7 @@ async fn commit_pull(
     })
     .with_bucket_guard(bucket.clone())
     .with_metadata(pull_tags(request))
+    .with_version_origin(Some(pull_origin(node_id, request)))
     .with_fence(guards, receipts);
     let result = drive(operation, context).await.map_err(|error| {
         debug!(error = %error, "A forwarded sync pull could not be written");
@@ -587,6 +589,14 @@ fn pull_tags(request: &SyncPull) -> HashMap<String, String> {
             request.source.node_id.to_string(),
         ),
     ])
+}
+
+/// An upload this node received from the authenticated device that published the version.
+fn pull_origin(node_id: NodeId, request: &SyncPull) -> VersionOrigin {
+    VersionOrigin::Upload {
+        node_id,
+        device: Some(request.source.node_id.to_string()),
+    }
 }
 
 /// The receipt row of this device version: absent until the version or marker commits.
@@ -1176,6 +1186,17 @@ mod tests {
             }),
             created_at: SystemTime::UNIX_EPOCH,
         }
+    }
+
+    // A pulled version names the device it came from in its origin, within the size budget.
+    #[test]
+    fn origin_names_device() {
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let request = pull_request(false);
+        let origin = pull_origin(node_id, &request);
+        let device = Some(request.source.node_id.to_string());
+        assert_eq!(origin, VersionOrigin::Upload { node_id, device });
+        assert!(origin.bounded());
     }
 
     #[test]
