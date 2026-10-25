@@ -4,7 +4,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -288,14 +288,6 @@ pub(crate) async fn lookup_iri_references(
     ))
 }
 
-/// One referencing document's link to a scanned object, at one predicate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IriBacklink {
-    pub document_id: Ulid,
-    pub predicate_iri: String,
-    pub subject_iris: Vec<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IriFreshnessState {
     Current,
@@ -308,25 +300,6 @@ pub(crate) enum IriFreshnessState {
 pub(crate) struct IriFreshness {
     pub state: IriFreshnessState,
     pub oldest_status_updated: Option<u64>,
-}
-
-/// Backlinks to `object_iri`. A `predicate_iri` uses the predicate-first index
-/// prefix; without it the keyspace is scanned and filtered on the object, since
-/// the object is not a key prefix. Both fence stale document cursors.
-pub(crate) async fn lookup_iri_backlinks(
-    storage: &StorageHandle,
-    registry_records: &[MetadataRegistryRecord],
-    object_iri: &str,
-    predicate_iri: Option<&str>,
-) -> Result<Vec<IriBacklink>, MetadataError> {
-    let prefix = predicate_iri.map(|predicate| iri_reference_prefix(predicate, object_iri));
-    let records = scan_records(storage, prefix).await?;
-    Ok(collect_iri_backlinks(
-        records,
-        registry_records,
-        object_iri,
-        predicate_iri,
-    ))
 }
 
 /// Materialization state of the given documents, one status read each; callers pass the
@@ -370,52 +343,6 @@ pub(crate) async fn iri_index_freshness(
         state,
         oldest_status_updated,
     })
-}
-
-async fn scan_records(
-    storage: &StorageHandle,
-    prefix: Option<ByteView>,
-) -> Result<Vec<IriIndexRecord>, MetadataIriError> {
-    let mut start_after = None;
-    let mut records = Vec::new();
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: IRI_INDEX_KEYSPACE.to_string(),
-                prefix: prefix.clone(),
-                start: start_after.map(IterStart::After),
-                limit: INDEX_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
-        match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                if records.len().saturating_add(values.len()) > REGISTRY_CANDIDATE_LIMIT {
-                    return Err(MetadataIriError::UnexpectedEvent(
-                        "metadata IRI reference candidate limit exceeded".to_string(),
-                    ));
-                }
-                for (_, value) in values {
-                    records.push(
-                        postcard::from_bytes::<IriIndexRecord>(&value)
-                            .map_err(ConversionError::from)?,
-                    );
-                }
-                match next_start_after {
-                    Some(next) => start_after = Some(next),
-                    None => break,
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(MetadataIriError::UnexpectedEvent(format!("{other:?}")));
-            }
-        }
-    }
-    Ok(records)
 }
 
 fn status_current(status: &MaterializationStatusRecord, record: &MetadataRegistryRecord) -> bool {
@@ -589,7 +516,7 @@ fn collect_iri_matches(
     let current_cursors = registry_records
         .iter()
         .map(|record| (record.document_id, record.last_event_id))
-        .collect::<HashMap<_, _>>();
+        .collect::<std::collections::HashMap<_, _>>();
     let mut matches = BTreeMap::<Ulid, BTreeSet<String>>::new();
     for record in records {
         if record.predicate_iri != predicate_iri
@@ -606,39 +533,6 @@ fn collect_iri_matches(
     matches
         .into_iter()
         .map(|(document_id, subject_iris)| (document_id, subject_iris.into_iter().collect()))
-        .collect()
-}
-
-fn collect_iri_backlinks(
-    records: Vec<IriIndexRecord>,
-    registry_records: &[MetadataRegistryRecord],
-    object_iri: &str,
-    predicate_iri: Option<&str>,
-) -> Vec<IriBacklink> {
-    let current_cursors = registry_records
-        .iter()
-        .map(|record| (record.document_id, record.last_event_id))
-        .collect::<HashMap<_, _>>();
-    let mut grouped = BTreeMap::<(Ulid, String), BTreeSet<String>>::new();
-    for record in records {
-        if record.object_iri != object_iri
-            || predicate_iri.is_some_and(|predicate| record.predicate_iri != predicate)
-            || current_cursors.get(&record.document_id) != Some(&record.document_cursor)
-        {
-            continue;
-        }
-        grouped
-            .entry((record.document_id, record.predicate_iri))
-            .or_default()
-            .extend(record.subject_iris);
-    }
-    grouped
-        .into_iter()
-        .map(|((document_id, predicate_iri), subject_iris)| IriBacklink {
-            document_id,
-            predicate_iri,
-            subject_iris: subject_iris.into_iter().collect(),
-        })
         .collect()
 }
 

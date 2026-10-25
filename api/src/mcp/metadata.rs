@@ -556,6 +556,7 @@ impl McpServer {
                 predicate: input.predicate,
                 limit: input.limit,
                 resolve: false,
+                after: None,
             },
         )
         .await

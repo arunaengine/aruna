@@ -114,6 +114,7 @@ pub(crate) fn map_references_response(
             .into_iter()
             .map(map_reference_entry)
             .collect(),
+        next_after: execution.next_after.map(|id| id.to_string()),
     }
 }
 

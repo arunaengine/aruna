@@ -3187,6 +3187,7 @@ async fn references_route(
             predicate: predicate.map(str::to_string),
             limit,
             resolve,
+            after: None,
         }),
     )
     .await

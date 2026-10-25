@@ -34,19 +34,25 @@ use std::sync::Arc;
 filtered by the caller's READ permission, so an unreadable referencing document is omitted.
 
 **Behavior**
-- The scan is answered from the local node's reference index only, without realm fan-out, so
+- The lookup is answered from the local node's reference index only, without realm fan-out, so
   references held solely by other nodes are missing and a just-accepted write may not be indexed
   yet.
-- When the scan is empty and `iri` is a known graph IRI, or when `resolve` is set, the matching
-  document's summary is returned as a single predicate-less entry.
+- Documents are returned in document id order, with one entry per predicate that names `iri`.
+  Each returned document is checked for its current revision and the caller's READ permission;
+  a page can therefore hold fewer than `limit` documents while `next_after` is still set.
+- When the first page is empty and `iri` is a known graph IRI, or when `resolve` is set, the
+  matching document's summary is returned as a single predicate-less entry.
 
 **Limits**
-- Results are capped at `limit` and there is no continuation."#,
+- At most `limit` documents per page; continue with `after` set to the previous `next_after`.
+- A lookup that would read more index rows than one page allows answers 503 instead of
+  scanning."#,
     params(
         ("iri" = String, Query, description = "Referenced object IRI to find backlinks for, such as a document graph IRI or any IRI appearing as a triple object. Must be a valid absolute IRI"),
         ("predicate" = Option<String>, Query, description = "Optional exact predicate IRI filter, such as http://schema.org/conformsTo. Must be a valid absolute IRI and is matched exactly"),
-        ("limit" = Option<usize>, Query, description = "Page size (default 25, silently clamped to a maximum of 100)"),
-        ("resolve" = Option<bool>, Query, description = "Resolve iri as a document graph IRI and return that document's summary as a single predicate-less entry, skipping the backlink scan. Default false")
+        ("limit" = Option<usize>, Query, description = "Documents per page (default 25, silently clamped to a maximum of 100)"),
+        ("resolve" = Option<bool>, Query, description = "Resolve iri as a document graph IRI and return that document's summary as a single predicate-less entry, skipping the backlink lookup. Default false"),
+        ("after" = Option<String>, Query, description = "Document id to continue after: the next_after of the previous page")
     ),
     responses(
         (
@@ -93,7 +99,8 @@ filtered by the caller's READ permission, so an unreadable referencing document 
         ),
         (status = 400, description = "Missing iri, or an iri or predicate that is not a valid absolute IRI", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
+        (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
+        (status = 503, description = "The reference index could not answer within the page budget", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -113,6 +120,7 @@ pub async fn metadata_references(
             predicate: params.predicate,
             limit: params.limit,
             resolve: params.resolve,
+            after: params.after,
         },
     )
     .await
