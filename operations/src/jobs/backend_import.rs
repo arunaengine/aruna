@@ -544,6 +544,7 @@ async fn import_object(
         Err(PutObjectError::HeadChanged | PutObjectError::HistoryDeleted) => {
             return Ok(Outcome::Skipped);
         }
+        Err(error) if moved_away(&error) => return Ok(Outcome::Ignored),
         Err(error) => return Err(put_failure(error)),
     }
     // As for any put, a failed queue write after the commit leaves the obligation for repair.
@@ -945,6 +946,7 @@ async fn recover(
                 Err(PutObjectError::HeadChanged | PutObjectError::VersionExists) => {
                     return Ok(Some(Outcome::Skipped));
                 }
+                Err(error) if moved_away(&error) => return Ok(Some(Outcome::Ignored)),
                 Err(error) => return Err(put_failure(error)),
             }
             if !keep_head {
@@ -1365,6 +1367,7 @@ async fn add_version(
             | PutObjectError::VersionExists
             | PutObjectError::HistoryDeleted,
         ) => return Ok(Outcome::Skipped),
+        Err(error) if moved_away(&error) => return Ok(Outcome::Ignored),
         Err(error) => return Err(put_failure(error)),
     }
     if !keep_head {
@@ -1762,6 +1765,16 @@ async fn put_version(
 
 /// Only a refusal of this one object fails it and lets the run go on; storage and other
 /// system errors end the run for a retry, so the checkpoint never passes an undecided object.
+/// Whether the key's range of a distributed bucket is another coordinator's, or moves there;
+/// that coordinator's run imports it.
+fn moved_away(error: &PutObjectError) -> bool {
+    match error {
+        PutObjectError::Distribution(error)
+        | PutObjectError::PurgeFence(PurgeFenceError::Distribution(error)) => error.moved_away(),
+        _ => false,
+    }
+}
+
 fn put_failure(error: PutObjectError) -> ItemError {
     use PolicyGateError::{Denied, ForeignPolicy, Invalid, NoSubject, Required};
     match error {

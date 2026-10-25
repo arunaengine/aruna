@@ -106,12 +106,17 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
                         checkpoint.bytes_current = checkpoint.bytes_current.saturating_add(size);
                     }
                 }
-                Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => record_failure(
-                    &mut checkpoint,
-                    &item.source_path,
-                    &item.target_key,
-                    message,
-                ),
+                // A key whose range moved meanwhile belongs to its new coordinator's job.
+                Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
+                    if !moved_away(ctx, spec, &item.target_key).await {
+                        record_failure(
+                            &mut checkpoint,
+                            &item.source_path,
+                            &item.target_key,
+                            message,
+                        )
+                    }
+                }
                 Err(ItemFailure::System(message)) => return retryable_error(message),
                 Err(ItemFailure::Lasting(message)) => {
                     return finish_failed(ctx, permanent_error(message)).await;
@@ -292,6 +297,12 @@ async fn imported_elsewhere(
         .await
         .map_err(ItemFailure::System)?;
     Ok(own.first() == Some(&false))
+}
+
+/// Whether `key` of the distributed destination moved to another coordinator after this job
+/// took it, so a failed write of it is that coordinator's to retry.
+pub(super) async fn moved_away(ctx: &JobContext, spec: &StagingJobSpec, key: &str) -> bool {
+    matches!(imported_elsewhere(ctx, spec, key).await, Ok(true))
 }
 
 /// The live destination bucket, only while it is still the one the job was submitted for.

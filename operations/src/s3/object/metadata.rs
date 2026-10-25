@@ -30,7 +30,7 @@ use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::node::usage_stats::schedule_snapshot_publish;
 use crate::replication::queue::schedule_blob_drain;
-use crate::s3::object::refresh_mint::MintSuccessorOperation;
+use crate::s3::object::refresh_mint::{MintError, MintSuccessorOperation};
 use crate::s3::object::refresh_observe::ObserveSourceOperation;
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 use crate::tasks::task_persistence::persist_task_effect;
@@ -433,6 +433,11 @@ pub async fn refresh_with_context(
                 );
                 match drive(mint, context).await {
                     Ok(written) => minted = written,
+                    // The key's range moved to another coordinator, which refreshes it there.
+                    Err(MintError::Distribution(error)) if error.moved_away() => {
+                        abort_reference_refresh(context, txn_id).await;
+                        return Ok(());
+                    }
                     Err(error) => {
                         abort_reference_refresh(context, txn_id).await;
                         return Err(error.to_string());

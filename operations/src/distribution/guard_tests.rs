@@ -137,6 +137,19 @@ fn completion_passes_grace() {
 }
 
 #[test]
+fn moved_keys_belong_elsewhere() {
+    // Jobs skip keys of another coordinator or a moving range, and retry a pending set.
+    let (snapshot, bytes) = record(true);
+    let own = binding(&snapshot, 1, 5);
+    let forwarded = write_epoch(&own, "x", Some(&bytes), None).unwrap_err();
+    assert!(forwarded.moved_away());
+    let range_id = snapshot.config.ranges[0].range_id;
+    assert!(GuardError::Route(RouteError::Moving(range_id)).moved_away());
+    assert!(!GuardError::Route(RouteError::Pending(snapshot.set_id())).moved_away());
+    assert!(!GuardError::RecordMissing(snapshot.set_id()).moved_away());
+}
+
+#[test]
 fn reads_held_only() {
     let (snapshot, bytes) = record(true);
     let own = binding(&snapshot, 1, 5);

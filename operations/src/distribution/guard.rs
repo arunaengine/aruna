@@ -43,6 +43,20 @@ pub enum GuardError {
     Unreadable(String),
 }
 
+impl GuardError {
+    /// Whether the key is not this member's to write anymore: another coordinator holds or
+    /// takes over its range, or the member or the set goes away.
+    pub fn moved_away(&self) -> bool {
+        matches!(
+            self,
+            Self::NotCoordinator { .. }
+                | Self::Route(
+                    RouteError::Moving(_) | RouteError::Deleting(_) | RouteError::NotMember(_)
+                )
+        )
+    }
+}
+
 /// The authority one write was routed under: the member, the key's range and its epoch.
 /// Its publication transaction checks it again against the rows [`authority_reads`] names.
 #[derive(Clone, Debug, Eq, PartialEq)]
