@@ -262,8 +262,8 @@ pub(crate) async fn lookup_iri_references(
     limit: usize,
 ) -> Result<(Vec<MetadataRegistryRecord>, BTreeMap<Ulid, Vec<String>>), MetadataError> {
     let mut budget = LinkBudget {
-        seeks: limit,
-        rows: limit.saturating_mul(2),
+        seeks: limit.max(INDEX_PAGE_SIZE),
+        rows: limit.saturating_mul(2).max(INDEX_PAGE_SIZE * 2),
     };
     let mut found = Vec::new();
     let mut matches = BTreeMap::new();
