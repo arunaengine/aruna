@@ -464,6 +464,12 @@ pub fn folder_bucket(folder_id: Ulid) -> String {
     format!("folder-{}", folder_id.to_string().to_lowercase())
 }
 
+/// The folder whose device-local bucket `bucket` is, if it is one.
+pub(crate) fn bucket_folder(bucket: &str) -> Option<Ulid> {
+    let folder_id = Ulid::from_string(bucket.strip_prefix("folder-")?).ok()?;
+    (folder_bucket(folder_id) == bucket).then_some(folder_id)
+}
+
 /// Whether two roots are the same directory or one contains the other. The
 /// comparison is textual: a folder is bound by the path the owner gave.
 fn overlaps(left: &str, right: &str) -> bool {
@@ -1047,8 +1053,11 @@ mod tests {
 
         let root = tempfile::tempdir().expect("root created");
         std::fs::write(root.path().join("note.txt"), b"note").expect("file written");
+        let folder_id = Ulid::generate();
         let folder = SyncedFolder {
+            folder_id,
             root: root.path().to_string_lossy().to_string(),
+            local_bucket: folder_bucket(folder_id),
             ..bound_folder(FolderState::Deleting)
         };
         let offer = OfferDirectoryInput {
@@ -1117,6 +1126,36 @@ mod tests {
                 "{attempt}"
             );
         }
+    }
+
+    // A deleting folder's bucket without an offer, as after a crash before the offer was stored,
+    // is read-only for clients, and the cleanup still deletes it.
+    #[tokio::test]
+    async fn guards_unoffered_bucket() {
+        use crate::staging::offered_directory::guard_bucket_write;
+
+        let fixture = crate::tests::staging::setup_driver_context().await;
+        let context = Arc::new(fixture.driver_context);
+        let (_root, folder, _) = offered_folder(&context).await;
+        let bucket = folder.local_bucket.clone();
+        let withdrawal = WithdrawOfferInput {
+            bucket: bucket.clone(),
+            realm_id: realm(),
+            node_id: node(),
+            user_id: folder.created_by,
+        };
+        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+
+        assert_eq!(
+            guard_bucket_write(&context, &bucket).await,
+            Err(OfferedDirectoryError::ReadOnly(bucket.clone()))
+        );
+        assert_eq!(
+            finish_unbind(&context, folder.folder_id, node()).await,
+            Ok(())
+        );
+        assert!(bucket_gone(&context, &bucket).await);
+        assert_eq!(guard_bucket_write(&context, &bucket).await, Ok(()));
     }
 
     // A cleanup cut short midway, here by an upload being completed, leaves the bucket read-only
