@@ -10,7 +10,7 @@ use aruna_core::NodeId;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
 use aruna_core::document::DocumentTarget;
 use aruna_core::federation::FederationSettings;
-use aruna_core::git::GitRecord;
+use aruna_core::git::{GitRecord, LOCAL_OBJECTS, StoredObject};
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BROKEN_VERSION_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE,
@@ -227,6 +227,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let refresh_rows = db.keyspace(REFRESH_JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
     let iri_rows = db.keyspace(IRI_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
     let staging_rows = db.keyspace(STAGING_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let object_rows = db.keyspace(LOCAL_OBJECTS, KeyspaceCreateOptions::default)?;
 
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
@@ -304,6 +305,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             OBLIGATION,
         )?,
         padded::<BrokenVersion>(&db, &broken_rows, BROKEN_VERSION_KEYSPACE, versions::LAYOUT)?,
+        padded::<StoredObject>(&db, &object_rows, LOCAL_OBJECTS, git::LAYOUT)?,
     ];
     let replication = layouts::replication_jobs(&db, &replication_rows, REPLICATION_JOB_KEYSPACE)?;
     relaid_rows.push((

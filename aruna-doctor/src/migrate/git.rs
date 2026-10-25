@@ -131,6 +131,7 @@ mod tests {
     use super::super::migrate_output;
     use super::super::tests::{read, strip, write};
     use super::*;
+    use aruna_core::git::LOCAL_OBJECTS;
     use aruna_core::keyspaces::GIT_RECORD_KEYSPACE;
 
     #[test]
@@ -195,5 +196,35 @@ mod tests {
         assert!(record.validate());
         let again = migrate_output(database).expect("migration repeats");
         assert_eq!(again.git_records_rewritten, 0);
+    }
+
+    #[test]
+    fn pads_local_objects() {
+        // This node's own copy of a pack, stored before objects named a global id.
+        let object = StoredObject {
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            group_id: Some(Ulid::from(6)),
+            bucket: "datasets-x".into(),
+            key: "git-packs/x.pack".into(),
+            version_id: Ulid::from(1),
+            size: 42,
+            sha256: "ab".repeat(32),
+            blake3: [3; 32],
+            global: None,
+        };
+        let current = postcard::to_allocvec(&object).expect("object encodes");
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let database = path.to_str().expect("path");
+        let old = current[..current.len() - 1].to_vec();
+        write(&path, LOCAL_OBJECTS, vec![(b"copy", old)]);
+
+        let output = migrate_output(database).expect("migration runs");
+
+        assert_eq!(output.relaid_rows[LOCAL_OBJECTS], 1);
+        let rows = read(&path, LOCAL_OBJECTS);
+        assert_eq!(rows[b"copy".as_slice()], current);
+        let again = migrate_output(database).expect("migration repeats");
+        assert!(!again.relaid_rows.contains_key(LOCAL_OBJECTS));
     }
 }
