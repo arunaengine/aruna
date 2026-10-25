@@ -118,3 +118,7 @@ pub async fn write_text_object(
     };
     Ok(Json(store_text(&state, &auth, &info, input).await?))
 }
+
+#[cfg(test)]
+#[path = "text_tests.rs"]
+mod tests;
