@@ -1,7 +1,8 @@
-//! Re-encodes bucket records from before buckets carried a compression setting.
+//! Re-encodes bucket records from before buckets carried a compression setting or a distribution.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::session_refs::Layout;
 use aruna_core::UserId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{BucketCorsConfiguration, BucketInfo};
@@ -22,6 +23,9 @@ pub(super) struct LegacyBucket {
     placement_policies: Vec<PlacementPolicyRef>,
     placement_policy_generation: u64,
 }
+
+/// Buckets before the distribution binding.
+pub(super) const LAYOUT: Layout = &[("BucketInfo", 8)];
 
 impl From<LegacyBucket> for BucketInfo {
     fn from(old: LegacyBucket) -> Self {
@@ -72,5 +76,28 @@ mod tests {
         assert_eq!(bucket.placement_policy_generation, 3);
         let again = migrate_output(database).expect("migration repeats");
         assert_eq!(again.buckets_rewritten, 0);
+    }
+
+    #[test]
+    fn adds_no_distribution() {
+        let bucket = BucketInfo::from(LegacyBucket {
+            group_id: Ulid::from(4),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 3,
+        });
+        let current = bucket.to_bytes().expect("encodes");
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let old = current[..current.len() - 1].to_vec();
+        write(&path, S3_BUCKET_KEYSPACE, vec![(b"data", old)]);
+
+        let output = migrate_output(path.to_str().expect("path")).expect("migration runs");
+
+        assert_eq!(output.buckets_rewritten, 1);
+        assert_eq!(read(&path, S3_BUCKET_KEYSPACE)[b"data".as_slice()], current);
     }
 }

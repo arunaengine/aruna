@@ -1,7 +1,9 @@
-//! Re-encodes Git records from before packs moved into Fjall, including queued publishes.
+//! Re-encodes Git records from before packs moved into Fjall or objects named a global id,
+//! including queued publishes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::session_refs::Layout;
 use aruna_core::git::{
     GitChange, GitCheckpoint, GitPack, GitRecord, LfsLock, RefUpdate, StoredObject,
 };
@@ -65,6 +67,9 @@ struct Checkpoint {
     covered: Vec<Ulid>,
 }
 
+/// Objects before the global id.
+pub(super) const LAYOUT: Layout = &[("StoredObject", 8)];
+
 fn pack(object: &StoredObject) -> GitPack {
     GitPack {
         sha256: object.sha256.clone(),
@@ -124,7 +129,7 @@ impl From<LegacyRecord> for GitRecord {
 #[cfg(test)]
 mod tests {
     use super::super::migrate_output;
-    use super::super::tests::{read, write};
+    use super::super::tests::{read, strip, write};
     use super::*;
     use aruna_core::keyspaces::GIT_RECORD_KEYSPACE;
 
@@ -143,6 +148,7 @@ mod tests {
             blake3: [3; 32],
             global: None,
         };
+        let current = postcard::to_allocvec(&object).expect("object encodes");
         let old = LegacyRecord {
             event_id: Ulid::from(5),
             realm_id,
@@ -165,7 +171,9 @@ mod tests {
                 made: Vec::new(),
             },
         };
+        // The object is stored without its global id, as before distributed buckets.
         let bytes = postcard::to_allocvec(&old).expect("old record encodes");
+        let bytes = strip(&bytes, &current, 1);
         let temp = tempfile::tempdir().expect("temporary directory");
         let path = temp.path().join("db");
         let database = path.to_str().expect("path");

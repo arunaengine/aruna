@@ -38,7 +38,9 @@ use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use session_refs::Layout;
 use std::collections::BTreeMap;
 use std::path::Path;
 use ulid::Ulid;
@@ -95,7 +97,8 @@ pub struct MigrateOutput {
     /// Checkpoints of RO-Crate import and export jobs.
     pub checkpoints_scanned: usize,
     pub checkpoints_rewritten: usize,
-    /// Git records from before packs moved into Fjall, stored and queued for publishing.
+    /// Git records from before packs moved into Fjall or objects named a global id, stored and
+    /// queued for publishing.
     pub git_records_scanned: usize,
     pub git_records_rewritten: usize,
     pub git_outbox_rewritten: usize,
@@ -110,10 +113,11 @@ pub struct MigrateOutput {
     pub upload_parts_deleted: usize,
     /// Stored blobs of deleted parts, queued for the cleanup drain.
     pub upload_blobs_queued: usize,
-    /// Blob versions from before materialized versions named their encoding class.
+    /// Blob versions from before materialized versions named their encoding class, or before
+    /// versions carried their distributed bucket fields and source digests.
     pub versions_scanned: usize,
     pub versions_rewritten: usize,
-    /// Bucket records from before buckets carried a compression setting.
+    /// Bucket records from before buckets carried a compression setting or a distribution.
     pub buckets_scanned: usize,
     pub buckets_rewritten: usize,
     /// Ops of the former node info topics, which held a heartbeat every minute.
@@ -199,18 +203,16 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         SYNC_OUTBOX_KEYSPACE,
         (mapping, rewritten::<PersistentIdMapping, LegacyMapping>),
     )?;
-    let git_records =
-        rewrites::<GitRecord, git::LegacyRecord>(&db, &git_rows, GIT_RECORD_KEYSPACE)?;
+    let git_records = rewrite_rows(&db, &git_rows, GIT_RECORD_KEYSPACE, git_record)?;
     let sizes = sizes::missing_sizes(&db, &event_rows, &size_rows)?;
     let stale = sessions::stale_sessions(&db, &session_rows, &expiry_rows, &owner_rows)?;
     let old_uploads = uploads::stale_uploads(&db, &upload_rows, &part_rows)?;
-    let versions = rewrites::<BlobVersion, versions::LegacyVersion>(
-        &db,
-        &version_rows,
-        BLOB_VERSIONS_KEYSPACE,
-    )?;
-    let buckets =
-        rewrites::<BucketInfo, buckets::LegacyBucket>(&db, &bucket_rows, S3_BUCKET_KEYSPACE)?;
+    let versions = rewrite_rows(&db, &version_rows, BLOB_VERSIONS_KEYSPACE, |value| {
+        relaid::<BlobVersion, versions::LegacyVersion>(value, versions::LAYOUT)
+    })?;
+    let buckets = rewrite_rows(&db, &bucket_rows, S3_BUCKET_KEYSPACE, |value| {
+        relaid::<BucketInfo, buckets::LegacyBucket>(value, buckets::LAYOUT)
+    })?;
     let info = info_topics::info_cleanup(
         &db,
         sync_path,
@@ -231,7 +233,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         &db,
         &outbox_rows,
         SYNC_OUTBOX_KEYSPACE,
-        (record, rewritten::<GitRecord, git::LegacyRecord>),
+        (record, git_record),
     )?;
     let index = mappings::index_rebuild(
         &db,
@@ -447,12 +449,22 @@ where
     Current: Serialize + for<'a> Deserialize<'a> + From<Legacy>,
     Legacy: for<'a> Deserialize<'a>,
 {
+    rewrite_rows(db, keyspace, name, rewritten::<Current, Legacy>)
+}
+
+/// Rows of one keyspace that `rewrite` re-encodes; a row it cannot read stops the migration.
+fn rewrite_rows(
+    db: &OptimisticTxDatabase,
+    keyspace: &OptimisticTxKeyspace,
+    name: &str,
+    rewrite: impl Fn(&[u8]) -> Result<Option<Vec<u8>>, postcard::Error>,
+) -> Result<Rewrites, ExplorerError> {
     let mut scanned = 0;
     let mut rows = Vec::new();
     for entry in db.read_tx().iter(keyspace) {
         let (key, value) = entry.into_inner()?;
         scanned += 1;
-        match rewritten::<Current, Legacy>(value.as_ref()) {
+        match rewrite(value.as_ref()) {
             Ok(Some(bytes)) => rows.push((key.to_vec(), bytes)),
             Ok(None) => {}
             Err(error) => return Err(decode_error(name, &key, error)),
@@ -530,6 +542,28 @@ where
     }
     let legacy: Legacy = postcard::from_bytes(value)?;
     Ok(Some(postcard::to_allocvec(&Current::from(legacy))?))
+}
+
+/// Rewrites a row stored before the structs `layout` names gained their later fields, in the
+/// current or the `Legacy` shape. `None` means every byte reads as the current shape; maps
+/// re-encode in another order, so a round trip cannot tell.
+fn relaid<Current, Legacy>(value: &[u8], layout: Layout) -> Result<Option<Vec<u8>>, postcard::Error>
+where
+    Current: Serialize + DeserializeOwned + From<Legacy>,
+    Legacy: DeserializeOwned,
+{
+    if session_refs::decode::<Current>(value, &[]).is_ok() {
+        return Ok(None);
+    }
+    let current = match session_refs::decode::<Current>(value, layout) {
+        Ok(current) => current,
+        Err(_) => session_refs::decode::<Legacy>(value, layout)?.into(),
+    };
+    Ok(Some(postcard::to_allocvec(&current)?))
+}
+
+fn git_record(value: &[u8]) -> Result<Option<Vec<u8>>, postcard::Error> {
+    relaid::<GitRecord, git::LegacyRecord>(value, git::LAYOUT)
 }
 
 fn decode_error(name: &str, key: &[u8], error: impl std::fmt::Display) -> ExplorerError {
@@ -756,6 +790,19 @@ mod tests {
             txn.insert(keyspace.clone(), key, value);
         }
         txn.commit().unwrap().unwrap();
+    }
+
+    /// `bytes` with every copy of `current` cut by its last `removed` bytes: a nested value in
+    /// a layout that lacked its trailing fields.
+    pub(super) fn strip(bytes: &[u8], current: &[u8], removed: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while let Some(at) = rest.windows(current.len()).position(|part| part == current) {
+            out.extend_from_slice(&rest[..at + current.len() - removed]);
+            rest = &rest[at + current.len()..];
+        }
+        out.extend_from_slice(rest);
+        out
     }
 
     pub(super) fn read(path: &Path, keyspace: &str) -> BTreeMap<Vec<u8>, Vec<u8>> {

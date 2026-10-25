@@ -52,14 +52,12 @@ pub(super) fn job_rows(
 
 /// The current record of an older row; every byte of the row must be used.
 fn upgraded(value: &[u8]) -> Option<JobRecord> {
-    const CURRENT: usize = 4;
-    if let Ok(legacy) = session_refs::decode::<LegacyJob>(value, CURRENT) {
+    if let Ok(legacy) = session_refs::decode::<LegacyJob>(value, &[]) {
         return Some(legacy.into());
     }
-    // Session references with three fields lack the linked login, with two also the name.
-    for fields in [3, 2] {
-        let record = session_refs::decode::<JobRecord>(value, fields)
-            .or_else(|_| session_refs::decode::<LegacyJob>(value, fields).map(Into::into));
+    for layout in [session_refs::NO_LOGIN, session_refs::NO_NAME] {
+        let record = session_refs::decode::<JobRecord>(value, layout)
+            .or_else(|_| session_refs::decode::<LegacyJob>(value, layout).map(Into::into));
         if let Ok(mut record) = record {
             record.plan_digest = record.plan_digest.map(|_| record.payload.plan_digest());
             return Some(record);
