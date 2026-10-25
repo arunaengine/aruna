@@ -326,3 +326,149 @@ fn openapi_lists_objects() {
             .is_some()
     );
 }
+
+mod mint {
+    use super::super::{ObjectPlacementRequest, mint_object_placement};
+    use crate::auth::ValidatedBearer;
+    use crate::error::ServerError;
+    use crate::mcp::data::{WriteObjectInput, store_text};
+    use crate::routes::storage::deletion::bucket_info;
+    use crate::tests::distributed::{
+        BUCKET, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api, write,
+    };
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+    use aruna_core::structs::placement::policy::PlacementSubject;
+    use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
+    use axum::Extension;
+    use axum::Json;
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use ulid::Ulid;
+
+    fn request(key: &str, version_id: &str) -> ObjectPlacementRequest {
+        ObjectPlacementRequest {
+            key: key.to_string(),
+            mutation_id: Ulid::from_bytes([5; 16]).to_string(),
+            expected_version_id: version_id.to_string(),
+            expected_generation: 0,
+            policies: Vec::new(),
+        }
+    }
+
+    async fn mint(
+        node: &Node,
+        auth: &AuthContext,
+        request: ObjectPlacementRequest,
+    ) -> Result<super::super::ObjectPlacementResponse, ServerError> {
+        let minted = mint_object_placement(
+            State(node.state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+            HeaderMap::new(),
+            Path(BUCKET.to_string()),
+            Json(request),
+        )
+        .await?;
+        Ok(minted.0)
+    }
+
+    /// Advertises this node's placement subject, so it admits governed data.
+    async fn advertise(node: &Node) {
+        let record = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: node_id(LOCAL),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .unwrap();
+        let (key, value) = (NODE_SUBJECT_KEY.to_vec(), record.to_bytes().unwrap());
+        write(&node.state, NODE_SUBJECT_KEYSPACE, key, value).await;
+    }
+
+    #[tokio::test]
+    async fn mint_checks_caller() {
+        let node = node_state().await;
+        let version = Ulid::from_bytes([6; 16]).to_string();
+        assert!(matches!(
+            mint(&node, &node.stranger, request("a.md", &version)).await,
+            Err(ServerError::Forbidden)
+        ));
+        let Err(ServerError::ServiceUnavailableReason(reason)) =
+            mint(&node, &node.owner, request("a.md", &version)).await
+        else {
+            panic!("a node without a placement subject mints nothing");
+        };
+        assert_eq!(reason, "no_placement_subject");
+        advertise(&node).await;
+        assert!(matches!(
+            mint(&node, &node.owner, request("a.md", "not-a-version")).await,
+            Err(ServerError::BadRequest)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mints_successor() {
+        let node = node_state().await;
+        advertise(&node).await;
+        let info = bucket_info(&node.state, BUCKET).await.unwrap();
+        let input = WriteObjectInput {
+            bucket: BUCKET.to_string(),
+            key: "a.md".to_string(),
+            text: "x".to_string(),
+            content_type: None,
+        };
+        let stored = store_text(&node.state, &node.owner, &info, input)
+            .await
+            .unwrap();
+        let head = BlobHeadKey::new(BUCKET, "a.md").to_bytes().unwrap();
+        let read = StorageEffect::Read {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            key: head.into(),
+            txn_id: None,
+        };
+        let storage = &node.state.get_ctx().storage_handle;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(head), ..
+        }) = storage.send_storage_effect(read).await
+        else {
+            panic!("the stored object has a head");
+        };
+        let generation = CurrentVersionPointer::from_bytes(&head).unwrap().generation;
+        let request = |version_id: &str| ObjectPlacementRequest {
+            expected_generation: generation,
+            ..request("a.md", version_id)
+        };
+        let minted = mint(&node, &node.owner, request(&stored.version_id)).await;
+        let minted = minted.unwrap();
+        assert_eq!(minted.outcome, "minted");
+        assert!(minted.version_id.is_some_and(|id| id != stored.version_id));
+        // The same mutation id again replays the first outcome.
+        let again = mint(&node, &node.owner, request(&stored.version_id)).await;
+        assert_eq!(again.unwrap().outcome, "replayed");
+    }
+
+    #[tokio::test]
+    async fn relays_to_coordinator() {
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let answer = r#"{"outcome":"minted","version_id":"v","materialized":true,"policies":[]}"#;
+        let peer = mock_peer(StatusCode::OK, answer).await;
+        publish_api(&node.state, node_id(PEER), &peer.url).await;
+        let version = Ulid::from_bytes([6; 16]).to_string();
+        let relayed = mint(&node, &node.owner, request("z.md", &version))
+            .await
+            .unwrap();
+        assert_eq!(relayed.version_id.as_deref(), Some("v"));
+        let paths = peer.paths.lock().unwrap().clone();
+        assert_eq!(
+            paths,
+            vec!["/api/v1/data/buckets/routed/placement/objects".to_string()]
+        );
+    }
+}
