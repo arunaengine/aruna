@@ -1213,3 +1213,41 @@ async fn policy_denies_role() {
     let stored = GroupAuthorizationDocument::from_bytes(&value).unwrap();
     assert_eq!(stored.roles.len(), auth_doc.roles.len());
 }
+
+#[tokio::test]
+async fn prefix_hides_keys() {
+    use crate::routes::storage::objects::{ObjectListQuery, list_objects};
+    let (state, _tempdir) = setup_state().await;
+    let owner = UserId::local(Ulid::generate(), state.get_realm_id());
+    let group_id = seed_group(&state, owner).await;
+    seed_bucket(&state, "data", group_id).await;
+    for (index, key) in ["imag", "imaging/scan.tif"].iter().enumerate() {
+        seed_object(&state, "data", key, owner, index as u8 + 1).await;
+    }
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    // READ on the literal key `imag` must not reveal `imaging/scan.tif`.
+    let mut auth = member_auth(owner);
+    auth.path_restrictions = Some(vec![PathRestriction {
+        pattern: object_permission_path(realm_id, group_id, node_id, "data", "imag"),
+        permission: Permission::READ,
+    }]);
+    let Json(page) = list_objects(
+        State(state.clone()),
+        Extension(Some(auth)),
+        Extension(None),
+        axum::http::HeaderMap::new(),
+        Path("data".to_string()),
+        Query(ObjectListQuery {
+            prefix: Some("imag".to_string()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let keys: Vec<_> = page
+        .objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["imag"]);
+}

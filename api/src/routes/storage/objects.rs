@@ -11,6 +11,7 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BucketInfo, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
+use aruna_operations::auth::permission_rules::permission_rules;
 use aruna_operations::distribution::guard::{bound_view, lists_interval};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::object::list::{
@@ -32,7 +33,7 @@ use crate::mcp::data::{ObjectOutput, object_output};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
-use crate::routes::storage::relay::{RestForward, relay_get};
+use crate::routes::storage::relay::{RestForward, relay_get, relayed_set};
 use crate::server::state::ServerState;
 
 /// Entries one page returns by default and at most.
@@ -140,15 +141,20 @@ pub(crate) async fn object_page(
     match info.distribution.as_ref() {
         Some(binding) => merged_page(state, info, binding, bearer, request).await,
         None => {
-            let token = match request.cursor.as_deref().map(decode_resume).transpose()? {
-                Some(Resume::After { key, group }) => {
-                    Some(resume_token(&request.bucket, &key, group.as_deref())?)
-                }
-                Some(Resume::From(_)) => return Err(invalid_cursor()),
-                None => None,
-            };
+            let token = local_token(&request)?;
             local_part(state, info, &request, (token, None), None).await
         }
+    }
+}
+
+/// The local listing position a cursor of an unmerged listing names.
+fn local_token(request: &ListRequest) -> ServerResult<Option<ListContinuationToken>> {
+    match request.cursor.as_deref().map(decode_resume).transpose()? {
+        Some(Resume::After { key, group }) => {
+            Ok(Some(resume_token(&request.bucket, &key, group.as_deref())?))
+        }
+        Some(Resume::From(_)) => Err(invalid_cursor()),
+        None => Ok(None),
     }
 }
 
@@ -197,13 +203,13 @@ async fn local_part(
 }
 
 /// The relayed listing of one range on a holder.
-fn range_path(request: &ListRequest, start_after: Option<&str>, range: &KeyRange) -> String {
+fn range_path(request: &ListRequest, cursor: Option<&str>, range: &KeyRange) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query.append_pair("limit", &request.limit.to_string());
     for (name, value) in [
         ("prefix", request.prefix.as_deref()),
         ("delimiter", request.delimiter.as_deref()),
-        ("start_after", start_after),
+        ("cursor", cursor),
         ("lower", Some(range.lower.as_str())),
         ("upper", range.upper.as_deref()),
     ] {
@@ -224,9 +230,9 @@ async fn remote_part(
     (binding, holders): (&DistributionBinding, Vec<aruna_core::NodeId>),
     range: &KeyRange,
     bearer: Option<&ValidatedBearer>,
-    (request, start_after): (&ListRequest, Option<String>),
+    (request, cursor): (&ListRequest, Option<String>),
 ) -> ServerResult<ObjectListResponse> {
-    let path = range_path(request, start_after.as_deref(), range);
+    let path = range_path(request, cursor.as_deref(), range);
     for node_id in holders {
         let forward = RestForward {
             set_id: binding.set_id,
@@ -282,11 +288,11 @@ async fn merged_page(
     let mut first = true;
     let mut bytes = 0usize;
     for (visited, range) in ranges.enumerate() {
-        let remaining = request
-            .limit
-            .saturating_sub(page.objects.len() + page.prefixes.len());
+        let listed = page.objects.len() + page.prefixes.len();
+        let remaining = request.limit.saturating_sub(listed);
         if remaining == 0 || visited == MAX_RANGES_PER_PAGE || bytes >= MAX_PAGE_BYTES {
-            let next = match &last_key {
+            // A page that listed nothing continues at this range, never at its own start.
+            let next = match last_key.as_ref().filter(|_| listed > 0) {
                 Some(key) => Resume::After {
                     key: key.clone(),
                     group: last_group.clone().filter(|group| group >= key),
@@ -315,19 +321,15 @@ async fn merged_page(
                 local_part(state, info, &sub, (token, None), bounds).await?
             }
             false => {
-                let start_after = start.map(|(key, group)| group.unwrap_or(key));
+                // The full position, so a common prefix is skipped as a whole.
+                let cursor = (start
+                    .map(|(key, group)| encode_resume(&Resume::After { key, group })))
+                .transpose()?;
                 let holders = (snapshot.record_holders(range).into_iter())
                     .filter(|member| member.member_id != binding.member_id)
                     .map(|member| member.node_id)
                     .collect();
-                remote_part(
-                    state,
-                    (binding, holders),
-                    range,
-                    bearer,
-                    (&sub, start_after),
-                )
-                .await?
+                remote_part(state, (binding, holders), range, bearer, (&sub, cursor)).await?
             }
         };
         let keys = (part.objects.iter().map(|object| &object.key)).chain(part.prefixes.iter());
@@ -350,14 +352,9 @@ async fn merged_page(
             last_key = Some(object.key.clone());
         }
         page.objects.extend(part.objects);
+        // The range's own position, which also moves on when nothing in it was shown.
         if part.next_cursor.is_some() {
-            if let Some(key) = &last_key {
-                let next = Resume::After {
-                    key: key.clone(),
-                    group: last_group.clone().filter(|group| group >= key),
-                };
-                page.next_cursor = Some(encode_resume(&next)?);
-            }
+            page.next_cursor = part.next_cursor;
             break;
         }
     }
@@ -382,6 +379,7 @@ async fn relayed_bounds(
             "range bounds apply only to distributed buckets".into(),
         ));
     };
+    relayed_set(info, headers)?;
     if !headers.contains_key(RELAY_HOP_HEADER) {
         return Err(ServerError::BadRequestReason(
             "range bounds are only accepted from another member".into(),
@@ -472,18 +470,41 @@ pub async fn list_objects(
         limit: query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
     };
     if let Some(bounds) = relayed_bounds(&state, &info, &headers, &query).await? {
+        let token = local_token(&request)?;
         let page = local_part(
             &state,
             &info,
             &request,
-            (None, query.start_after),
+            (token, query.start_after),
             Some(bounds),
         );
-        return Ok(Json(page.await?));
+        return Ok(Json(
+            readable_page(&state, &auth, &info, page.await?).await?,
+        ));
     }
-    Ok(Json(
-        object_page(&state, &info, bearer.as_ref(), request).await?,
-    ))
+    let page = object_page(&state, &info, bearer.as_ref(), request).await?;
+    Ok(Json(readable_page(&state, &auth, &info, page).await?))
+}
+
+/// The page without the keys and prefixes the caller may not read: READ on a listed prefix
+/// covers the literal prefix only, and denies or restrictions below it still apply.
+async fn readable_page(
+    state: &ServerState,
+    auth: &AuthContext,
+    info: &BucketInfo,
+    mut page: ObjectListResponse,
+) -> ServerResult<ObjectListResponse> {
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let root = bucket_permission_path(realm_id, info.group_id, node_id, &page.bucket);
+    let rules = permission_rules(&state.get_ctx(), auth, &root)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let path =
+        |key: &str| object_permission_path(realm_id, info.group_id, node_id, &page.bucket, key);
+    let readable = |key: &str| rules.allows(&path(key), &Permission::READ);
+    page.objects.retain(|object| readable(&object.key));
+    page.prefixes.retain(|prefix| readable(prefix));
+    Ok(page)
 }
 
 #[cfg(test)]
@@ -523,8 +544,33 @@ mod tests {
         };
         assert_eq!(
             range_path(&request, Some("q&r"), &range),
-            "/data/buckets/b/objects?limit=5&prefix=a+b%2F&start_after=q%26r&lower=m"
+            "/data/buckets/b/objects?limit=5&prefix=a+b%2F&cursor=q%26r&lower=m"
         );
+    }
+
+    #[test]
+    fn cursor_skips_group() {
+        // A holder resumes past the whole common prefix, not just after its name.
+        let request = ListRequest {
+            bucket: "b".to_string(),
+            prefix: None,
+            delimiter: Some("/".to_string()),
+            cursor: Some(
+                encode_resume(&Resume::After {
+                    key: "d/".to_string(),
+                    group: Some("d/".to_string()),
+                })
+                .unwrap(),
+            ),
+            limit: 5,
+        };
+        let token = local_token(&request).unwrap().unwrap();
+        assert_eq!(token.last_common_prefix.as_deref(), Some("d/"));
+        let from = ListRequest {
+            cursor: Some(encode_resume(&Resume::From("m".to_string())).unwrap()),
+            ..request
+        };
+        assert!(local_token(&from).is_err());
     }
 
     #[test]
