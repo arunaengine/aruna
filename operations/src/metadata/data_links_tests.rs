@@ -298,3 +298,58 @@ async fn truncation_is_marked() {
     stored(rows, &storage).await;
     assert_eq!(truncated_documents(&storage, 10).await.unwrap(), 0);
 }
+
+// A verified retry moves the posting to its set; a newer materialization's row is kept.
+#[tokio::test]
+async fn retry_settles_unverified() {
+    let dir = tempdir().unwrap();
+    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let (document, version_id, set_id) = (
+        Ulid::from_bytes([1; 16]),
+        Ulid::from_bytes([6; 16]),
+        Ulid::from_bytes([5; 16]),
+    );
+    let unverified = DataLink::Unverified {
+        realm_id: realm(),
+        version_id,
+    };
+    let links = BTreeMap::from([(unverified.clone(), LinkPosting::default())]);
+    stored(
+        plan_link_rows(&storage, document, &links).await.unwrap(),
+        &storage,
+    )
+    .await;
+    let key = ByteView::from(posting_key(&unverified.key(), document));
+    assert_eq!(
+        unverified_parts(&key),
+        Some((realm(), version_id, document))
+    );
+    let value = ByteView::from(LinkPosting::default().to_bytes().unwrap());
+
+    // A row that changed since it was read stays as it is.
+    let stale = ByteView::from(Vec::new());
+    settle_unverified(&storage, (&key, &stale), document, None)
+        .await
+        .unwrap();
+    assert_eq!(unverified_versions(&storage, 10).await.unwrap(), 1);
+
+    let verified = DataLink::SetVersion {
+        realm_id: realm(),
+        set_id,
+        version_id,
+    };
+    let verified_key = verified.key();
+    settle_unverified(&storage, (&key, &value), document, Some(verified))
+        .await
+        .unwrap();
+    assert_eq!(unverified_versions(&storage, 10).await.unwrap(), 0);
+    let (rows, _) = set_postings(&storage, &scope(), set_id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // The document's own rows name the set posting, so its next projection replaces it.
+    let rows = document_rows(&storage, DOCUMENT_LINK_KEYSPACE, document)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![posting_key(&verified_key, document)]);
+}

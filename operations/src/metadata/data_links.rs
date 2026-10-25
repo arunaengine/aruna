@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Mutex;
+use tokio::time::Instant;
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -14,6 +16,7 @@ use aruna_core::keyspaces::{
     MATERIALIZATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataError;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::data_link::{
     DataLink, LinkPosting, LinkScope, MAX_DOCUMENT_LINKS, MAX_LINK_SUBJECTS, document_key,
@@ -28,6 +31,9 @@ use byteview::ByteView;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
+
+use crate::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version};
+use crate::driver::DriverContext;
 
 const PAGE_SIZE: usize = 256;
 const BATCH_SIZE: usize = 256;
@@ -404,28 +410,16 @@ pub(crate) async fn associate_versions(
     }
     let members = local_members(storage).await?;
     for (realm_id, version_id, posting) in versions {
-        let hint = SetHint::of_version(version_id);
-        let mut verified = false;
-        for set_id in members.get(&hint).into_iter().flatten() {
-            let index = read_value(
-                storage,
-                VERSION_INDEX_KEYSPACE,
-                index_key(*set_id, version_id),
-            )
-            .await?;
-            if index.is_some() {
-                links.insert(
-                    DataLink::SetVersion {
-                        realm_id,
-                        set_id: *set_id,
-                        version_id,
-                    },
-                    posting.clone(),
-                );
-                verified = true;
-            }
+        let sets = local_sets(storage, &members, version_id).await?;
+        for set_id in &sets {
+            let link = DataLink::SetVersion {
+                realm_id,
+                set_id: *set_id,
+                version_id,
+            };
+            links.insert(link, posting.clone());
         }
-        if !verified {
+        if sets.is_empty() {
             links.insert(
                 DataLink::Unverified {
                     realm_id,
@@ -433,6 +427,180 @@ pub(crate) async fn associate_versions(
                 },
                 posting,
             );
+        }
+    }
+    Ok(())
+}
+
+/// The sets among `members` whose version id index on this node holds `version_id`.
+async fn local_sets(
+    storage: &StorageHandle,
+    members: &BTreeMap<SetHint, Vec<Ulid>>,
+    version_id: Ulid,
+) -> Result<Vec<Ulid>, DataLinkError> {
+    let mut sets = Vec::new();
+    for set_id in members
+        .get(&SetHint::of_version(version_id))
+        .into_iter()
+        .flatten()
+    {
+        let key = index_key(*set_id, version_id);
+        if read_value(storage, VERSION_INDEX_KEYSPACE, key)
+            .await?
+            .is_some()
+        {
+            sets.push(*set_id);
+        }
+    }
+    Ok(sets)
+}
+
+/// Unverified version links one background pass tries to verify.
+const RETRY_PAGE: usize = 16;
+/// The unverified posting the next pass continues after; a restart begins again at the start.
+static RETRY_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// Tries a page of the version links no member could verify at materialization: through a
+/// local member's index, else by asking the set's members. A verified link gains its set
+/// posting; a version no set holds stops counting. Returns whether more links follow.
+pub(crate) async fn retry_unverified(context: &DriverContext) -> Result<bool, DataLinkError> {
+    let storage = &context.storage_handle;
+    let start = (RETRY_CURSOR.lock().ok())
+        .and_then(|cursor| cursor.clone())
+        .map(|after| IterStart::After(after.into()));
+    let prefix = ByteView::from(unverified_key());
+    let (rows, next) =
+        iter_page(storage, DATA_LINK_KEYSPACE, Some(prefix), start, RETRY_PAGE).await?;
+    let members = match rows.is_empty() {
+        true => BTreeMap::new(),
+        false => local_members(storage).await?,
+    };
+    for (key, value) in rows {
+        let Some((realm_id, version_id, document_id)) = unverified_parts(&key) else {
+            continue;
+        };
+        let local = local_sets(storage, &members, version_id).await?;
+        let verified = match local.first() {
+            Some(set_id) => Some(Some(*set_id)),
+            None => {
+                let deadline = Instant::now() + RESOLVE_BUDGET;
+                match resolve_version(context, version_id, deadline).await {
+                    GlobalResolution::Found(found) => Some(Some(found.set_id)),
+                    GlobalResolution::NotFound => Some(None),
+                    GlobalResolution::Unavailable | GlobalResolution::Ambiguous => None,
+                }
+            }
+        };
+        let Some(set_id) = verified else {
+            continue;
+        };
+        let link = set_id.map(|set_id| DataLink::SetVersion {
+            realm_id,
+            set_id,
+            version_id,
+        });
+        settle_unverified(storage, (&key, &value), document_id, link).await?;
+    }
+    if let Ok(mut cursor) = RETRY_CURSOR.lock() {
+        *cursor = next.as_ref().map(|next| next.to_vec());
+    }
+    Ok(next.is_some())
+}
+
+/// The realm, version and document of an unverified posting key.
+fn unverified_parts(key: &[u8]) -> Option<(RealmId, Ulid, Ulid)> {
+    let rest = key.strip_prefix(unverified_key().as_slice())?;
+    let realm: [u8; 32] = rest.get(..32)?.try_into().ok()?;
+    let version: [u8; 16] = rest.get(32..48)?.try_into().ok()?;
+    let document = posting_document(key).filter(|_| rest.len() == 64)?;
+    Some((
+        RealmId::from_bytes(realm),
+        Ulid::from_bytes(version),
+        document,
+    ))
+}
+
+/// Replaces an unverified posting by its set posting, or drops it, while the document's
+/// materialization has not replaced it meanwhile.
+async fn settle_unverified(
+    storage: &StorageHandle,
+    (key, value): (&ByteView, &ByteView),
+    document_id: Ulid,
+    link: Option<DataLink>,
+) -> Result<(), DataLinkError> {
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(DataLinkError::UnexpectedEvent(format!("{other:?}"))),
+    };
+    let current = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: DATA_LINK_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        other => {
+            let _ = storage
+                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                .await;
+            return Err(DataLinkError::UnexpectedEvent(format!("{other:?}")));
+        }
+    };
+    let mut writes = Vec::new();
+    if let Some(link) = link {
+        let posting = posting_key(&link.key(), document_id);
+        let row = document_key(document_id, &posting);
+        writes.push((
+            DOCUMENT_LINK_KEYSPACE.to_string(),
+            row.into(),
+            ByteView::from(Vec::new()),
+        ));
+        writes.push((
+            DATA_LINK_KEYSPACE.to_string(),
+            posting.into(),
+            value.clone(),
+        ));
+    }
+    let deletes = vec![
+        (DATA_LINK_KEYSPACE.to_string(), key.clone()),
+        (
+            DOCUMENT_LINK_KEYSPACE.to_string(),
+            document_key(document_id, key).into(),
+        ),
+    ];
+    let effects = match current.as_ref() == Some(value) {
+        true => vec![
+            StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(txn_id),
+            },
+            StorageEffect::BatchDelete {
+                deletes,
+                txn_id: Some(txn_id),
+            },
+            StorageEffect::CommitTransaction { txn_id },
+        ],
+        false => vec![StorageEffect::AbortTransaction { txn_id }],
+    };
+    for effect in effects {
+        match storage.send_storage_effect(effect).await {
+            // A materialization that won the race keeps its own rows.
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }) => return Ok(()),
+            Event::Storage(StorageEvent::Error { error }) => {
+                let _ = storage
+                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+                    .await;
+                return Err(error.into());
+            }
+            _ => {}
         }
     }
     Ok(())

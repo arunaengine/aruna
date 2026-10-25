@@ -59,7 +59,13 @@ enum Tended {
 /// One bounded pass over the range accounts. Returns when the next pass should run.
 pub async fn maintain_ranges(context: &Arc<DriverContext>) -> Duration {
     let lifecycle = super::lifecycle::tend_lifecycle(context).await;
-    let after = maintain_accounts(context).await;
+    let mut after = maintain_accounts(context).await;
+    // Version links metadata could not verify in a set are retried here, a page per pass.
+    match crate::metadata::data_links::retry_unverified(context).await {
+        Ok(true) => after = Duration::ZERO,
+        Ok(false) => {}
+        Err(error) => warn!(%error, "Unverified data links could not be retried"),
+    }
     lifecycle.map_or(after, |lifecycle| lifecycle.min(after))
 }
 
