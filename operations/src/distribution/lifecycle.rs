@@ -42,7 +42,7 @@ use super::roots::roots_checked;
 use super::sign_statement;
 use super::status::read_view;
 use crate::driver::{DriverContext, drive};
-use crate::s3::bucket::get::GetBucketOperation;
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 /// Sets one pass looks at, and purge pages it spends at most.
 const SET_BATCH: usize = 16;
@@ -236,12 +236,7 @@ impl SetWork {
         snapshot: &DistributionSnapshot,
     ) -> Result<Option<DistributionBinding>, String> {
         let bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
-        let Ok(info) = drive(bucket, context).await else {
-            return Ok(None);
-        };
-        Ok(info
-            .distribution
-            .filter(|binding| binding.set_id == self.set_id))
+        set_binding(self.set_id, drive(bucket, context).await)
     }
 
     /// Releases the bucket of a member a join replaced: fences it and clears the set's rows,
@@ -582,6 +577,19 @@ fn owns(set_id: Ulid, member: &DistributionMember, binding: &DistributionBinding
         && (member.incarnation).is_none_or(|admitted| admitted == binding.incarnation)
 }
 
+/// The bucket's binding to the set from a bucket read; only a missing bucket means it is
+/// gone, any other failure keeps the set's state for the next pass.
+fn set_binding(
+    set_id: Ulid,
+    read: Result<BucketInfo, GetBucketError>,
+) -> Result<Option<DistributionBinding>, String> {
+    match read {
+        Ok(info) => Ok(info.distribution.filter(|bound| bound.set_id == set_id)),
+        Err(GetBucketError::NotFound) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// The active counters this node keeps for a range, while its account is not split or rebuilt.
 pub(super) async fn range_counters(
     context: &DriverContext,
@@ -842,6 +850,16 @@ mod tests {
         )
         .await;
         assert_eq!(fence, None, "the new member starts without the old fence");
+    }
+
+    #[test]
+    fn read_failure_retries() {
+        // Only a missing bucket clears the set; a failed read retries instead.
+        let set_id = Ulid::from_bytes([1; 16]);
+        let gone = set_binding(set_id, Err(GetBucketError::NotFound));
+        assert_eq!(gone, Ok(None));
+        let failed = set_binding(set_id, Err(GetBucketError::Incomplete));
+        assert!(failed.is_err(), "a failed read is not an absent bucket");
     }
 
     #[test]
