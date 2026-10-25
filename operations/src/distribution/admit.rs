@@ -8,7 +8,9 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, StatementSignEvent, StorageEvent};
-use aruna_core::keyspaces::{BUCKET_CREATION_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    BUCKET_CREATION_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
@@ -16,6 +18,7 @@ use aruna_core::structs::storage::distribution::accounting::account_key;
 use aruna_core::structs::storage::distribution::{
     KeyRange, SignedStatement, Statement, StatementClaim,
 };
+use aruna_core::structs::storage::usage::USAGE_REBUILD_KEY;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -51,6 +54,8 @@ pub enum AdmitError {
     NotFinished,
     #[error("unexpected event in state {state}: got {got}")]
     UnexpectedEvent { state: &'static str, got: String },
+    #[error("usage counters are being rebuilt; new ranges are admitted once they are complete")]
+    UsageIncomplete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +105,11 @@ impl AdmitOperation {
             let key = account_key(self.config.set_id, range.range_id);
             (RANGE_ACCOUNT_KEYSPACE.to_string(), Key::from(key))
         }));
+        // Incomplete usage counters never count as free capacity.
+        reads.push((
+            USAGE_STATS_KEYSPACE.to_string(),
+            Key::from(USAGE_REBUILD_KEY.to_vec()),
+        ));
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
             txn_id: Some(txn_id),
@@ -107,8 +117,9 @@ impl AdmitOperation {
     }
 
     /// The bucket must carry this member's binding for its own incarnation; ranges without an
-    /// account row are opened.
-    fn plan(&mut self, values: Vec<Option<Value>>) -> Result<Effects, AdmitError> {
+    /// account row are opened, never while this node's usage counters are being rebuilt.
+    fn plan(&mut self, mut values: Vec<Option<Value>>) -> Result<Effects, AdmitError> {
+        let rebuilding = values.pop().flatten().is_some();
         let mut values = values.into_iter();
         let bucket = values.next().flatten();
         let creation = values.next().flatten();
@@ -146,6 +157,9 @@ impl AdmitOperation {
         };
         if missing.is_empty() {
             return Ok(self.sign(claim));
+        }
+        if rebuilding {
+            return Err(AdmitError::UsageIncomplete);
         }
         let txn_id = self.txn_id.ok_or(AdmitError::NotFinished)?;
         let writes = open_ranges(self.config.set_id, &missing)?;

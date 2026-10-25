@@ -165,3 +165,21 @@ async fn unsigned_opens_nothing() {
     ));
     assert!(!opened(&handle, None).await);
 }
+
+#[tokio::test]
+async fn rebuilding_usage_refused() {
+    let (_dir, handle) = open();
+    bucket(&handle, member_id(), 42, 42).await;
+    let marker = Effect::Storage(StorageEffect::Write {
+        key_space: USAGE_STATS_KEYSPACE.to_string(),
+        key: USAGE_REBUILD_KEY.to_vec().into(),
+        value: Vec::new().into(),
+        txn_id: None,
+    });
+    send(&handle, marker).await;
+    assert_eq!(run(&handle, true).await, Err(AdmitError::UsageIncomplete));
+    assert!(
+        !opened(&handle, None).await,
+        "no range opens while usage counters are incomplete"
+    );
+}
