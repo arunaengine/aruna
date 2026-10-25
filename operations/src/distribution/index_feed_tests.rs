@@ -200,3 +200,55 @@ async fn drops_gone_ranges() {
     assert!(get(handle, SEARCH_INDEX_KEYSPACE, key).await.is_none());
     assert!(!fixture.indexes.exists(set(), gone, 1).await.unwrap());
 }
+
+#[tokio::test]
+async fn split_reindexes_children() {
+    use crate::distribution::split::{SplitConfig, SplitOperation};
+    use crate::driver::drive;
+
+    let fixture = fixture().await;
+    let handle = &fixture.handle;
+    assert!(apply(handle, write(set(), "a", 1, 3)).await.unwrap());
+    assert!(apply(handle, write(set(), "x", 2, 4)).await.unwrap());
+    let mut feeder = Feeder::new(fixture.indexes.clone(), FeedLimits::default());
+    feeder.pass(&context(handle)).await;
+    assert_eq!(
+        state(handle).await,
+        Some(IndexState::Ready { generation: 1 })
+    );
+
+    let (left, right) = (Ulid::from_bytes([2; 16]), Ulid::from_bytes([3; 16]));
+    let split = SplitOperation::new(SplitConfig {
+        set_id: set(),
+        range_id: range_id(),
+        split_key: "m".to_string(),
+        left,
+        right,
+    });
+    drive(split, &context(handle)).await.unwrap();
+    let child = |range: Ulid| state_key(set(), range);
+    for _ in 0..8 {
+        feeder.pass(&context(handle)).await;
+    }
+    // The retired parent's index is gone; each child is built from its own keys.
+    assert!(state(handle).await.is_none());
+    for (range, expected) in [(left, "a"), (right, "x")] {
+        let value = get(handle, SEARCH_INDEX_KEYSPACE, child(range))
+            .await
+            .unwrap();
+        let IndexState::Ready { generation } = IndexState::from_bytes(&value).unwrap() else {
+            panic!("the child index is built");
+        };
+        let query = KeyQuery {
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+            names: None,
+            limit: 10,
+        };
+        let found = fixture
+            .indexes
+            .search(set(), range, generation, query)
+            .await;
+        assert_eq!(found.unwrap(), [expected]);
+    }
+}
