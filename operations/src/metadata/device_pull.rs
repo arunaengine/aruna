@@ -14,7 +14,9 @@ use aruna_core::keyspaces::SYNC_RECEIPT_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::distribution::{RouteError, WriteRoute};
+use aruna_core::structs::storage::distribution::{
+    DistributionBinding, DistributionSnapshot, KeyRange, RouteError, WriteRoute,
+};
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::{
     ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
@@ -27,12 +29,14 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::distribution::guard::{GuardError, route_write};
+use crate::distribution::guard::{GuardError, bound_view, route_write};
+use crate::distribution::versions::{InventoryVersionsInput, InventoryVersionsOperation};
 use crate::driver::{DriverContext, drive, routing_snapshot};
 use crate::forward::authorize::peer_acts_for;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
+use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::replication::queue::{complete_put, queue_live};
@@ -699,6 +703,15 @@ async fn list_heads(
     let node_id = local_node(context)?;
     let info = read_bucket(context, &bucket).await?;
     ensure_read(context, &auth, node_id, info.group_id, &bucket).await?;
+    if let Some(binding) = info.distribution.as_ref() {
+        let listing = SetListing {
+            bucket,
+            prefix,
+            cursor,
+            limit,
+        };
+        return set_heads(context, (peer, &auth), binding, listing).await;
+    }
     let (key_marker, version_id_marker) = match cursor {
         Some(cursor) => (Some(cursor.key), cursor.version_id),
         None => (None, None),
@@ -726,6 +739,123 @@ async fn list_heads(
         version_id: result.next_version_marker,
     });
     SyncVersionPage::new(heads, next).map_err(|error| SyncRefusal::Invalid(error.to_string()))
+}
+
+/// Ranges one page of a distributed bucket's heads visits at most.
+const MAX_PAGE_RANGES: usize = 64;
+
+/// One device listing of a distributed bucket's heads.
+struct SetListing {
+    bucket: String,
+    prefix: String,
+    cursor: Option<SyncListCursor>,
+    limit: SyncPageLimit,
+}
+
+/// One page of a distributed bucket's heads in key order, range by range from this member's
+/// inventory. A range it keeps no records of ends the page there; a page that starts there is
+/// read from a holder of the range for a device, and refused for a forwarded listing.
+async fn set_heads(
+    context: &Arc<DriverContext>,
+    (peer, auth): (NodeId, &AuthContext),
+    binding: &DistributionBinding,
+    listing: SetListing,
+) -> Result<SyncVersionPage, SyncRefusal> {
+    let view = bound_view(context, binding)
+        .await
+        .map_err(|_| SyncRefusal::Unavailable)?;
+    let snapshot = view.snapshot();
+    let prefix = (!listing.prefix.is_empty()).then(|| listing_prefix(&listing.prefix));
+    let (mut marker, mut version_marker) = match listing.cursor.clone() {
+        Some(cursor) => (Some(cursor.key), cursor.version_id),
+        None => (None, None),
+    };
+    let start = marker.clone().unwrap_or_default();
+    let ranges = (snapshot
+        .listed_ranges(prefix.as_deref().unwrap_or_default())
+        .into_iter())
+    .filter(|range| {
+        range
+            .upper
+            .as_deref()
+            .is_none_or(|upper| start.as_str() < upper)
+    });
+    let (mut heads, mut next) = (Vec::new(), None);
+    for (visited, range) in ranges.enumerate() {
+        let remaining = listing.limit.get().saturating_sub(heads.len());
+        let here = snapshot.lists_locally(binding.member_id, range);
+        if remaining == 0 || visited == MAX_PAGE_RANGES || (!here && visited > 0) {
+            // The nil version id starts the next page at the first key of this range.
+            next = Some(SyncListCursor {
+                key: range.lower.clone(),
+                version_id: Some(Ulid::nil()),
+            });
+            break;
+        }
+        if !here {
+            return holder_heads(context, (peer, auth), (&snapshot, range), listing).await;
+        }
+        let operation = InventoryVersionsOperation::new(InventoryVersionsInput {
+            set_id: binding.set_id,
+            bucket: listing.bucket.clone(),
+            prefix: prefix.clone(),
+            delimiter: None,
+            key_marker: marker.take(),
+            version_id_marker: version_marker.take(),
+            max_keys: remaining,
+            lower: range.lower.clone(),
+            upper: range.upper.clone(),
+        });
+        let result = drive(operation, context.as_ref())
+            .await
+            .map_err(|_| SyncRefusal::Unavailable)?;
+        heads.extend(
+            result
+                .items
+                .iter()
+                .filter_map(|item| head_of(item, &listing.prefix)),
+        );
+        if result.is_truncated {
+            next = Some(SyncListCursor {
+                key: result.next_key_marker.unwrap_or_default(),
+                version_id: result.next_version_marker,
+            });
+            break;
+        }
+    }
+    SyncVersionPage::new(heads, next).map_err(|error| SyncRefusal::Invalid(error.to_string()))
+}
+
+/// The page a ready holder of `range` answers; only a device's listing is passed on, once.
+async fn holder_heads(
+    context: &Arc<DriverContext>,
+    (peer, auth): (NodeId, &AuthContext),
+    (snapshot, range): (&DistributionSnapshot, &KeyRange),
+    listing: SetListing,
+) -> Result<SyncVersionPage, SyncRefusal> {
+    let config = load_realm_config(context, auth.realm_id)
+        .await
+        .ok_or(SyncRefusal::Unavailable)?;
+    let device = node_kind(&config, peer).is_some_and(|kind| kind.owner().is_some());
+    let local = local_node(context)?;
+    let holder = (snapshot.record_holders(range).into_iter())
+        .map(|member| member.node_id)
+        .find(|node_id| *node_id != local && *node_id != peer);
+    let (Some(holder), true, Some(metadata)) = (holder, device, context.metadata_handle.as_ref())
+    else {
+        return Err(SyncRefusal::Unavailable);
+    };
+    let message = MetadataTransportMessage::ForwardListVersions {
+        auth_token: aruna_core::metadata::AuthToken::internal(auth.clone()),
+        bucket: listing.bucket,
+        prefix: listing.prefix,
+        cursor: listing.cursor,
+        limit: listing.limit,
+    };
+    match metadata.request_forwarded_write(holder, message).await {
+        Ok(MetadataTransportMessage::ForwardedVersions { result }) => result,
+        _ => Err(SyncRefusal::Unavailable),
+    }
 }
 
 /// The listing prefix a bound folder maps to, always ending in a separator so
@@ -1266,6 +1396,36 @@ mod tests {
         assert_eq!(listing_prefix("notes/"), "notes/");
         assert_eq!(relative_key("notesbook/x", "notes"), None);
         assert_eq!(relative_key("x", "").as_deref(), Some("x"));
+    }
+
+    // A distributed bucket lists range by range: the page ends where a range this member keeps
+    // no records of begins, and a forwarded listing that starts there is refused, not passed on.
+    #[tokio::test]
+    async fn lists_set_ranges() {
+        use crate::distribution::test_record::{binding, record, store_record};
+        let fixture = policy_fixture(None).await;
+        let (snapshot, bytes) = record(true);
+        store_record(&fixture.context.storage_handle, snapshot.set_id(), bytes).await;
+        let binding = binding(&snapshot, 1, 5);
+        let listing = |cursor| SetListing {
+            bucket: "spire".to_string(),
+            prefix: String::new(),
+            cursor,
+            limit: SyncPageLimit::default(),
+        };
+        let peer = (fixture.node_id, &fixture.auth);
+        let page = set_heads(&fixture.context, peer, &binding, listing(None))
+            .await
+            .unwrap();
+        let (heads, next) = page.into_parts();
+        assert!(heads.is_empty());
+        let next = next.expect("the upper range follows");
+        assert_eq!(
+            (next.key.as_str(), next.version_id),
+            ("m", Some(Ulid::nil()))
+        );
+        let forwarded = set_heads(&fixture.context, peer, &binding, listing(Some(next))).await;
+        assert_eq!(forwarded, Err(SyncRefusal::Unavailable));
     }
 
     #[tokio::test]
