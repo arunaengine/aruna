@@ -252,3 +252,166 @@ async fn node_grant_refused() {
             .is_some_and(|text| text.contains("node glob"))
     );
 }
+
+/// A copy of `source` to `dest` sent to node `on`, with the copy source header a client sets.
+async fn copy(
+    members: &Members,
+    on: usize,
+    (source, dest): (&str, &str),
+    metadata: Option<(&str, &str)>,
+) -> s3s::S3Result<s3s::dto::CopyObjectOutput> {
+    use s3s::dto::{CopyObjectInput, CopySource, MetadataDirective};
+    let node = &members.nodes[on];
+    let mut input = CopyObjectInput::builder()
+        .bucket(BUCKET.to_string())
+        .key(dest.to_string())
+        .copy_source(CopySource::Bucket {
+            bucket: BUCKET.into(),
+            key: source.into(),
+            version_id: None,
+        })
+        .build()
+        .unwrap();
+    if let Some((name, value)) = metadata {
+        input.metadata_directive = Some(MetadataDirective::from_static(MetadataDirective::REPLACE));
+        input.metadata = Some(std::collections::HashMap::from([(
+            name.to_string(),
+            value.to_string(),
+        )]));
+    }
+    let mut copy = request(input, Method::PUT, members.user_on(on), node.bucket().await);
+    let header = format!("{BUCKET}/{source}");
+    copy.headers
+        .insert("x-amz-copy-source", header.parse().unwrap());
+    node.service
+        .copy_object(copy)
+        .await
+        .map(|response| response.output)
+}
+
+/// The body and metadata `key` holds on node `on`.
+async fn read(members: &Members, on: usize, key: &str) -> (Vec<u8>, s3s::dto::GetObjectOutput) {
+    let node = &members.nodes[on];
+    let get = request(
+        get_input(key),
+        Method::GET,
+        members.user_on(on),
+        node.bucket().await,
+    );
+    let mut output = node.service.get_object(get).await.unwrap().output;
+    let body = body_of(output.body.take()).await;
+    (body, output)
+}
+
+/// The origin the version of `key` on node `on` records.
+async fn origin_of(
+    members: &Members,
+    on: usize,
+    key: &str,
+) -> Option<aruna_core::structs::storage::origin::VersionOrigin> {
+    let node = &members.nodes[on];
+    let local = (members.realm_id, node.node_id());
+    let view =
+        aruna_operations::s3::object::origin::read_origin(&node.context, local, BUCKET, key, None)
+            .await
+            .unwrap();
+    view.origin
+}
+
+fn global_copy(
+    members: &Members,
+    version: &str,
+) -> Option<aruna_core::structs::storage::origin::VersionOrigin> {
+    use aruna_core::structs::storage::global_id::GlobalId;
+    use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
+    Some(VersionOrigin::Copy {
+        from: OriginVersion::Global(GlobalId::Version {
+            realm_id: members.realm_id,
+            version_id: version.parse().unwrap(),
+        }),
+    })
+}
+
+// A member keeping the source streams it to the destination's coordinator, which records
+// the copy's origin and the replaced metadata as a local copy would.
+#[tokio::test]
+async fn copy_streams_source() {
+    let members = members(3, &["h", "p"], 0).await;
+    let source = put(&members, 0, "a/src", b"streamed").await;
+    let output = copy(&members, 0, ("a/src", "k/dst"), Some(("lab", "spire")))
+        .await
+        .unwrap();
+    assert_eq!(
+        output.copy_source_version_id.as_deref(),
+        Some(source.as_str())
+    );
+    let (body, read) = read(&members, 1, "k/dst").await;
+    assert_eq!(body, b"streamed");
+    assert_eq!(read.version_id, output.version_id);
+    let metadata = read.metadata.unwrap_or_default();
+    assert_eq!(metadata.get("lab").map(String::as_str), Some("spire"));
+    assert_eq!(
+        origin_of(&members, 1, "k/dst").await,
+        global_copy(&members, &source)
+    );
+}
+
+// When only the destination's coordinator keeps the source, it copies from its own records.
+#[tokio::test]
+async fn copy_delegated_coordinator() {
+    let members = members(3, &["h", "p"], 0).await;
+    let source = put(&members, 0, "k/src", b"delegated").await;
+    let output = copy(&members, 0, ("k/src", "k/dst"), None).await.unwrap();
+    assert_eq!(
+        output.copy_source_version_id.as_deref(),
+        Some(source.as_str())
+    );
+    assert!(
+        output
+            .copy_object_result
+            .and_then(|result| result.e_tag)
+            .is_some()
+    );
+    let (body, read) = read(&members, 1, "k/dst").await;
+    assert_eq!(body, b"delegated");
+    assert_eq!(read.version_id, output.version_id);
+}
+
+// A source neither this member nor the coordinator keeps is read through its holder and
+// relayed, still recorded as a copy of that exact version.
+#[tokio::test]
+async fn copy_relays_holder() {
+    let members = members(3, &["h", "p"], 0).await;
+    let source = put(&members, 0, "q/src", b"relayed").await;
+    let output = copy(&members, 0, ("q/src", "k/dst"), None).await.unwrap();
+    assert_eq!(
+        output.copy_source_version_id.as_deref(),
+        Some(source.as_str())
+    );
+    let (body, _) = read(&members, 1, "k/dst").await;
+    assert_eq!(body, b"relayed");
+    assert_eq!(
+        origin_of(&members, 1, "k/dst").await,
+        global_copy(&members, &source)
+    );
+}
+
+// A copy this member writes itself needs the source here; the refusal names who keeps it.
+#[tokio::test]
+async fn copy_source_elsewhere() {
+    let members = members(3, &["h", "p"], 0).await;
+    put(&members, 0, "k/src", b"far").await;
+    let error = copy(&members, 0, ("k/src", "a/dst"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        *error.code(),
+        s3s::S3ErrorCode::Custom("CopySourceNotHeld".into())
+    );
+    assert_eq!(
+        error.status_code(),
+        Some(http::StatusCode::SERVICE_UNAVAILABLE)
+    );
+    let holder = members.nodes[1].node_id().to_string();
+    assert!(error.message().is_some_and(|text| text.contains(&holder)));
+}
