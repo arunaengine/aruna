@@ -302,7 +302,9 @@ impl SetWork {
         }
         let Some(binding) = local.binding.clone() else {
             // The member bucket is gone or replaced: nothing of the set is left here.
-            return self.clear_set(context, true, budget).await;
+            return self
+                .clear_set(context, (&snapshot.config.bucket, true), budget)
+                .await;
         };
         for range in &snapshot.config.ranges {
             let target = self.target(snapshot, &binding, range);
@@ -315,7 +317,8 @@ impl SetWork {
                 .bound_to(binding.clone());
         match drive(delete, context.as_ref()).await {
             Ok(()) | Err(crate::s3::bucket::delete::DeleteBucketError::NotFound) => {
-                self.clear_set(context, true, budget).await
+                self.clear_set(context, (&snapshot.config.bucket, true), budget)
+                    .await
             }
             Err(error) => {
                 // Versions the inventory did not name block the delete; their walk follows.
@@ -351,10 +354,10 @@ impl SetWork {
     async fn clear_set(
         &self,
         context: &DriverContext,
-        keep_fence: bool,
+        (bucket, keep_fence): (&str, bool),
         budget: &mut usize,
     ) -> Result<Left, String> {
-        match clear_set_rows(context, self.set_id, keep_fence, budget).await? {
+        match clear_set_rows(context, (self.set_id, bucket), keep_fence, budget).await? {
             Purged::Done => Ok(Left::Settled),
             Purged::More => Ok(Left::Waiting),
         }
@@ -376,7 +379,8 @@ impl SetWork {
             unbind(context, &snapshot.config.bucket, binding, false).await?;
         }
         // The released bucket checks no fence; a later join of this node starts afresh.
-        self.clear_set(context, false, budget).await
+        self.clear_set(context, (&snapshot.config.bucket, false), budget)
+            .await
     }
 
     /// The former coordinator's side: fence the range, let its open uploads complete for a

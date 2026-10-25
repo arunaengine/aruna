@@ -124,6 +124,17 @@ pub async fn still_bound(
     }
 }
 
+/// Whether `bucket` is bound to the set at all, under any member and incarnation.
+async fn bound_to_set(context: &DriverContext, bucket: &str, set_id: Ulid) -> Result<bool, String> {
+    match drive(GetBucketOperation::new(bucket.to_string()), context).await {
+        Ok(info) => Ok(info
+            .distribution
+            .is_some_and(|bound| bound.set_id == set_id)),
+        Err(GetBucketError::NotFound) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 async fn page(
     context: &DriverContext,
     key_space: &str,
@@ -216,13 +227,12 @@ const CLEARED: [&str; 13] = [
     DISTRIBUTION_PURGE_KEYSPACE,
 ];
 
-/// Deletes what this node keeps of a set besides its bucket: copy-on-use attachments with
-/// their bytes, inventory, accounting, search indexes, bootstrap and purge cursors, at most
-/// `pages` pages per call from a durable cursor. The fence row stays with `keep_fence`, so
-/// nothing writes into a deleted set again.
+/// Deletes what this node keeps of a set besides its bucket, at most `pages` pages per call
+/// from a durable cursor; the fence row stays with `keep_fence`. Once `bucket` is bound to the
+/// set again, by a replacement incarnation, the rows are its own and the clear ends.
 pub async fn clear_set_rows(
     context: &DriverContext,
-    set_id: Ulid,
+    (set_id, bucket): (Ulid, &str),
     keep_fence: bool,
     pages: &mut usize,
 ) -> Result<Purged, String> {
@@ -235,6 +245,14 @@ pub async fn clear_set_rows(
             return Ok(Purged::More);
         }
         *pages -= 1;
+        if bound_to_set(context, bucket, set_id).await? {
+            batch_delete(
+                context,
+                vec![(DISTRIBUTION_PURGE_KEYSPACE.to_string(), key.into())],
+            )
+            .await?;
+            return Ok(Purged::Done);
+        }
         let space = match cursor.step {
             0 => ATTACHMENT_KEYSPACE,
             step => CLEARED[usize::from(step) - 1],
@@ -641,7 +659,7 @@ mod tests {
         loop {
             passes += 1;
             let mut pages = 1;
-            let cleared = clear_set_rows(&context, set_id, true, &mut pages).await;
+            let cleared = clear_set_rows(&context, (set_id, "spire"), true, &mut pages).await;
             if cleared.unwrap() == Purged::Done {
                 break;
             }
@@ -672,6 +690,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_keeps_rows() {
+        // A bucket bound to the set again owns the set's rows; the clear leaves them.
+        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+        use aruna_core::structs::storage::blob::BucketInfo;
+        let (_dir, handle) = open();
+        let context = context(handle);
+        let set_id = Ulid::from_bytes([1; 16]);
+        write(&context, INVENTORY_KEYSPACE, row(set_id, 1), vec![1])
+            .await
+            .unwrap();
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([2; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: Some(DistributionBinding {
+                set_id,
+                member_id: Ulid::from_bytes([3; 16]),
+                incarnation: 9,
+                revision: Default::default(),
+            }),
+        };
+        let bucket = b"spire".to_vec();
+        write(
+            &context,
+            S3_BUCKET_KEYSPACE,
+            bucket,
+            info.to_bytes().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut pages = usize::MAX;
+        let cleared = clear_set_rows(&context, (set_id, "spire"), false, &mut pages).await;
+        assert_eq!(cleared.unwrap(), Purged::Done);
+        let kept = read(&context, INVENTORY_KEYSPACE, row(set_id, 1))
+            .await
+            .unwrap();
+        assert!(kept.is_some(), "the replacement's inventory stays");
+    }
+
+    #[tokio::test]
     async fn clears_search_rows() {
         // Content index, search feed and search index rows leave with the set.
         let (_dir, handle) = open();
@@ -687,7 +750,7 @@ mod tests {
             write(&context, space, key.clone(), vec![1]).await.unwrap();
         }
         let mut pages = usize::MAX;
-        let cleared = clear_set_rows(&context, set_id, false, &mut pages).await;
+        let cleared = clear_set_rows(&context, (set_id, "spire"), false, &mut pages).await;
         assert_eq!(cleared.unwrap(), Purged::Done);
         for space in spaces {
             let gone = read(&context, space, key.clone()).await.unwrap();
