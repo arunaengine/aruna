@@ -57,7 +57,7 @@ fn shared_topic(realm_id: RealmId, suffix: &[u8]) -> TopicId {
     TopicId::hash(bytes)
 }
 
-fn cursor_key(topic_id: &TopicId) -> Vec<u8> {
+pub(super) fn cursor_key(topic_id: &TopicId) -> Vec<u8> {
     [b"topic-cursor/".as_slice(), topic_id.as_bytes()].concat()
 }
 

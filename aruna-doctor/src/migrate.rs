@@ -67,6 +67,7 @@ mod session_refs;
 mod sessions;
 mod sizes;
 mod staging;
+mod sync_ops;
 mod uploads;
 mod user_sessions;
 mod vault;
@@ -241,6 +242,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let reference_rows =
         db.keyspace(CONNECTOR_REFERENCE_KEYSPACE, KeyspaceCreateOptions::default)?;
 
+    sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
     let pending =
