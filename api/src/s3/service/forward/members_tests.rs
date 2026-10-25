@@ -601,3 +601,240 @@ async fn part_copy_paths() {
     let error = coordinator.service.list_parts(list).await.unwrap_err();
     assert_eq!(*error.code(), s3s::S3ErrorCode::NoSuchUpload);
 }
+
+/// One merged object page through node `on`: keys, prefixes and the next token.
+async fn page(
+    members: &Members,
+    on: usize,
+    input: s3s::dto::ListObjectsV2Input,
+) -> s3s::S3Result<(Vec<String>, Vec<String>, Option<String>)> {
+    let node = &members.nodes[on];
+    let list = request(input, Method::GET, members.user_on(on), node.bucket().await);
+    let output = node.service.list_objects_v2(list).await?.output;
+    let keys = (output.contents.unwrap_or_default().into_iter())
+        .filter_map(|object| object.key)
+        .collect();
+    let prefixes = (output.common_prefixes.unwrap_or_default().into_iter())
+        .filter_map(|group| group.prefix)
+        .collect();
+    Ok((keys, prefixes, output.next_continuation_token))
+}
+
+fn list_input(max_keys: i32) -> s3s::dto::ListObjectsV2Input {
+    s3s::dto::ListObjectsV2Input {
+        bucket: BUCKET.to_string(),
+        max_keys: Some(max_keys),
+        ..Default::default()
+    }
+}
+
+const SPREAD: [&str; 5] = ["a/1", "a/2", "k/1", "q/1", "q/2"];
+
+// A listing merges every range in key order, local and remote, and its token resumes the
+// next page exactly after the last key, across range bounds.
+#[tokio::test]
+async fn listing_merges_ranges() {
+    let members = members(3, &["h", "p"], 0).await;
+    for key in SPREAD {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    let (keys, _, next) = page(&members, 0, list_input(100)).await.unwrap();
+    assert_eq!(keys, SPREAD);
+    assert_eq!(next, None);
+
+    let mut seen = Vec::new();
+    let mut token = None;
+    loop {
+        let input = s3s::dto::ListObjectsV2Input {
+            continuation_token: token.clone(),
+            ..list_input(2)
+        };
+        let (keys, _, next) = page(&members, 0, input).await.unwrap();
+        assert!(keys.len() <= 2);
+        seen.extend(keys);
+        match next {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, SPREAD);
+
+    let after = s3s::dto::ListObjectsV2Input {
+        start_after: Some("k/1".to_string()),
+        ..list_input(100)
+    };
+    let (keys, _, _) = page(&members, 0, after).await.unwrap();
+    assert_eq!(keys, ["q/1", "q/2"]);
+}
+
+// Prefixes group keys across ranges once each, and a token of another query is refused.
+#[tokio::test]
+async fn listing_groups_prefixes() {
+    let members = members(3, &["h", "p"], 0).await;
+    for key in SPREAD {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    let grouped = s3s::dto::ListObjectsV2Input {
+        delimiter: Some("/".to_string()),
+        ..list_input(100)
+    };
+    let (keys, prefixes, _) = page(&members, 0, grouped).await.unwrap();
+    assert!(keys.is_empty());
+    assert_eq!(prefixes, ["a/", "k/", "q/"]);
+
+    let (_, _, token) = page(&members, 0, list_input(1)).await.unwrap();
+    let other = s3s::dto::ListObjectsV2Input {
+        prefix: Some("q/".to_string()),
+        continuation_token: token,
+        ..list_input(1)
+    };
+    let error = page(&members, 0, other).await.unwrap_err();
+    assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidArgument);
+}
+
+// A range no holder answers ends the listing as incomplete instead of a short page.
+#[tokio::test]
+async fn listing_incomplete_holder() {
+    let mut members = members(3, &["h", "p"], 0).await;
+    put(&members, 0, "q/1", b"far").await;
+    members.nodes[2].stop().await;
+    let error = page(&members, 0, list_input(100)).await.unwrap_err();
+    assert_eq!(
+        *error.code(),
+        s3s::S3ErrorCode::Custom("ListingIncomplete".into())
+    );
+    assert_eq!(
+        error.status_code(),
+        Some(http::StatusCode::SERVICE_UNAVAILABLE)
+    );
+    // A prefix inside the ranges still reachable lists without the stopped member.
+    let near = s3s::dto::ListObjectsV2Input {
+        prefix: Some("a/".to_string()),
+        ..list_input(100)
+    };
+    assert!(page(&members, 0, near).await.is_ok());
+}
+
+// Versions list across ranges newest first per key, delete markers included, and the
+// markers of a short page resume the next one.
+#[tokio::test]
+async fn versions_merge_ranges() {
+    use s3s::dto::{DeleteObjectInput, ListObjectVersionsInput};
+    let members = members(3, &["h", "p"], 0).await;
+    put(&members, 0, "a/1", b"one").await;
+    let first = put(&members, 0, "k/1", b"old").await;
+    let second = put(&members, 0, "k/1", b"new").await;
+    put(&members, 0, "q/1", b"far").await;
+    let node = &members.nodes[0];
+    let input = DeleteObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "q/1".to_string(),
+        ..Default::default()
+    };
+    let delete = request(
+        input,
+        Method::DELETE,
+        members.user_on(0),
+        node.bucket().await,
+    );
+    node.service.delete_object(delete).await.unwrap();
+
+    let list = |input: ListObjectVersionsInput| async {
+        let list = request(input, Method::GET, members.user_on(0), node.bucket().await);
+        node.service
+            .list_object_versions(list)
+            .await
+            .unwrap()
+            .output
+    };
+    let all = list(ListObjectVersionsInput {
+        bucket: BUCKET.to_string(),
+        ..Default::default()
+    })
+    .await;
+    let versions: Vec<(String, String)> = (all.versions.unwrap_or_default().into_iter())
+        .map(|version| (version.key.unwrap(), version.version_id.unwrap()))
+        .collect();
+    let keys: Vec<&str> = versions.iter().map(|(key, _)| key.as_str()).collect();
+    assert_eq!(keys, ["a/1", "k/1", "k/1", "q/1"]);
+    assert_eq!(versions[1].1, second);
+    assert_eq!(versions[2].1, first);
+    let markers = all.delete_markers.unwrap_or_default();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].key.as_deref(), Some("q/1"));
+    assert_eq!(markers[0].is_latest, Some(true));
+
+    let mut seen = 0;
+    let (mut key_marker, mut version_marker) = (None, None);
+    loop {
+        let page = list(ListObjectVersionsInput {
+            bucket: BUCKET.to_string(),
+            max_keys: Some(1),
+            key_marker: key_marker.clone(),
+            version_id_marker: version_marker.clone(),
+            ..Default::default()
+        })
+        .await;
+        let count = page.versions.unwrap_or_default().len();
+        seen += count + page.delete_markers.unwrap_or_default().len();
+        if page.is_truncated != Some(true) {
+            break;
+        }
+        (key_marker, version_marker) = (page.next_key_marker, page.next_version_id_marker);
+    }
+    assert_eq!(seen, 5);
+}
+
+// Open uploads list across ranges with the ids clients use, each range from its
+// coordinator, and the upload markers page through them one by one.
+#[tokio::test]
+async fn uploads_merge_ranges() {
+    use s3s::dto::ListMultipartUploadsInput;
+    let members = members(3, &["h", "p"], 0).await;
+    let mut opened = Vec::new();
+    for key in ["a/up", "k/up", "q/up"] {
+        opened.push((key.to_string(), create_upload(&members, 0, key).await));
+    }
+    let node = &members.nodes[0];
+    let list = |input: ListMultipartUploadsInput| async {
+        let list = request(input, Method::GET, members.user_on(0), node.bucket().await);
+        node.service
+            .list_multipart_uploads(list)
+            .await
+            .unwrap()
+            .output
+    };
+    let all = list(ListMultipartUploadsInput {
+        bucket: BUCKET.to_string(),
+        ..Default::default()
+    })
+    .await;
+    let listed: Vec<(String, String)> = (all.uploads.unwrap_or_default().into_iter())
+        .map(|upload| (upload.key.unwrap(), upload.upload_id.unwrap()))
+        .collect();
+    assert_eq!(listed, opened);
+
+    let mut paged = Vec::new();
+    let (mut key_marker, mut upload_marker) = (None, None);
+    loop {
+        let page = list(ListMultipartUploadsInput {
+            bucket: BUCKET.to_string(),
+            max_uploads: Some(1),
+            key_marker: key_marker.clone(),
+            upload_id_marker: upload_marker.clone(),
+            ..Default::default()
+        })
+        .await;
+        paged.extend(
+            page.uploads
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|u| u.key),
+        );
+        if page.is_truncated != Some(true) {
+            break;
+        }
+        (key_marker, upload_marker) = (page.next_key_marker, page.next_upload_id_marker);
+    }
+    assert_eq!(paged, ["a/up", "k/up", "q/up"]);
+}
