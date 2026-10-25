@@ -235,3 +235,175 @@ fn search_kind_names() {
     assert_eq!(SearchKind::Groups.as_str(), "groups");
     assert_eq!(SearchKind::Users.as_str(), "users");
 }
+
+// A write refusal keeps its meaning for the caller: a bad body is the caller's to fix, a
+// quota a conflict, a rebuild or a moved range retryable, everything else this node's fault.
+#[test]
+fn put_errors_mapped() {
+    use crate::error::ServerError;
+    use aruna_operations::distribution::guard::GuardError;
+    for error in [
+        PutObjectError::MissingBody,
+        PutObjectError::IncompleteBody,
+        PutObjectError::Unmapped,
+    ] {
+        assert!(matches!(
+            put_server_error(error),
+            ServerError::BadRequestReason(_)
+        ));
+    }
+    let quota = PutObjectError::QuotaExceeded { limit: 1, usage: 2 };
+    assert!(matches!(put_server_error(quota), ServerError::Conflict(_)));
+    let rebuilding = put_server_error(PutObjectError::UsageRebuilding);
+    assert!(matches!(
+        rebuilding,
+        ServerError::ServiceUnavailableReason(_)
+    ));
+    let set_id = ulid::Ulid::from_bytes([3; 16]);
+    let moved = put_server_error(PutObjectError::Distribution(GuardError::RecordMissing(
+        set_id,
+    )));
+    assert!(!matches!(moved, ServerError::InternalError(_)));
+    for error in [
+        PutObjectError::InvalidOperationState,
+        PutObjectError::NoTransactionFound,
+        PutObjectError::MissingOutput,
+        PutObjectError::MissingHash("blake3".to_string()),
+        PutObjectError::InvalidPreassignedVersion,
+        PutObjectError::ObjectExists,
+        PutObjectError::PutObjectFailed,
+        PutObjectError::HeadChanged,
+        PutObjectError::FenceTaken,
+    ] {
+        assert!(matches!(
+            put_server_error(error),
+            ServerError::InternalError(_)
+        ));
+    }
+}
+
+// A version held only by other members is this node's failure to read, never a missing key.
+#[test]
+fn held_read_internal() {
+    let held = aruna_operations::distribution::pull::HeldElsewhere {
+        set_id: ulid::Ulid::from_bytes([4; 16]),
+        version_id: ulid::Ulid::from_bytes([5; 16]),
+        identity: [6; 32],
+        blake3: None,
+        size: 1,
+        metadata: HashMap::new(),
+        version_created_at: None,
+        source_policies: Vec::new(),
+    };
+    let error = body(map_get_error(GetObjectError::HeldElsewhere(Box::new(held))));
+    assert_eq!(error["code"], "Internal error");
+}
+
+mod distributed {
+    //! The data tools on a member of a distributed bucket.
+    use super::*;
+    use crate::tests::members::{BUCKET, Members, members};
+    use aruna_core::structs::identity::auth::NodeCapabilities;
+    use rmcp::handler::server::wrapper::Parameters;
+
+    async fn server(members: &Members, on: usize) -> McpServer {
+        let node = &members.nodes[on];
+        let capabilities = NodeCapabilities::user_node(members.realm_id).unwrap();
+        let state = crate::tests::routes::test_state(
+            node.context.clone(),
+            members.realm_id,
+            node.node_id(),
+            capabilities,
+        )
+        .await;
+        McpServer::new(Arc::new(state))
+    }
+
+    fn parts(members: &Members) -> http::request::Parts {
+        let auth = AuthContext {
+            user_id: members.user.user_identity,
+            realm_id: members.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let (mut parts, ()) = http::Request::new(()).into_parts();
+        parts.extensions.insert(Some(auth));
+        parts
+            .extensions
+            .insert(None::<crate::auth::ValidatedBearer>);
+        parts
+    }
+
+    fn write(key: &str) -> WriteObjectInput {
+        WriteObjectInput {
+            bucket: BUCKET.to_string(),
+            key: key.to_string(),
+            text: "noted".to_string(),
+            content_type: None,
+        }
+    }
+
+    // A text write to a key this member coordinates is stored here as a new version, and the
+    // listing of the range it keeps shows it.
+    #[tokio::test]
+    async fn writes_and_lists() {
+        let members = members(3, &["h", "p"], 0).await;
+        let server = server(&members, 0).await;
+        let written = server
+            .write_object(Extension(parts(&members)), Parameters(write("a/note")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!((written.key.as_str(), written.size), ("a/note", 5));
+        let input = ListObjectsInput {
+            bucket: BUCKET.to_string(),
+            prefix: Some("a/".to_string()),
+            cursor: None,
+            limit: None,
+        };
+        let listed = server
+            .list_objects(Extension(parts(&members)), Parameters(input))
+            .await
+            .unwrap()
+            .0;
+        let keys: Vec<&str> = listed
+            .objects
+            .iter()
+            .map(|object| object.key.as_str())
+            .collect();
+        assert_eq!(keys, ["a/note"]);
+        assert_eq!(listed.objects[0].size, Some(5));
+    }
+
+    // A text write to a key another member coordinates is relayed under the caller's own
+    // bearer token, which that member checks; without a token, or while the member cannot be
+    // reached, the write fails and nothing is stored here.
+    #[tokio::test]
+    async fn relay_needs_coordinator() {
+        let members = members(3, &["h", "p"], 0).await;
+        let server = server(&members, 0).await;
+        let mut bearer = parts(&members);
+        let token = crate::auth::ValidatedBearer::new_for_test("caller-token");
+        bearer.extensions.insert(Some(token));
+        for (parts, code) in [
+            (parts(&members), "Not authorized"),
+            (bearer, "Service unavailable"),
+        ] {
+            let written = server
+                .write_object(Extension(parts), Parameters(write("k/note")))
+                .await;
+            let Err(refused) = written else {
+                panic!("the write cannot reach its coordinator");
+            };
+            assert_eq!(super::body(refused)["code"], code);
+        }
+        let node = &members.nodes[0];
+        let input = HeadObjectInput {
+            bucket: BUCKET.to_string(),
+            key: "k/note".to_string(),
+            version_id: None,
+        };
+        let head = drive(HeadObjectOperation::new(input), &node.context).await;
+        assert!(head.is_err(), "nothing is stored on the relaying member");
+    }
+}
