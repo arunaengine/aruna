@@ -13,21 +13,31 @@ use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StatementSignEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_LIFECYCLE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_LIFECYCLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
+    RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::distribution::fence::LocalFence;
+use aruna_core::structs::storage::distribution::accounting::{
+    Charge, RangeAccount, RangeCounters, account_key, generation_key,
+};
+use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
+use aruna_core::structs::storage::distribution::snapshot::OpenTransfer;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, DistributionSnapshot, KeyRange, MemberState,
     Statement, StatementClaim, StatementKind,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::create::submit;
-use super::purge::{PurgeTarget, Purged, batch_delete, clear_set_rows, purge_range, purge_rest};
+use super::purge::{
+    PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, purge_range,
+    purge_rest, read,
+};
 use super::sign_statement;
 use super::status::read_view;
 use crate::driver::{DriverContext, drive};
@@ -39,6 +49,32 @@ const PURGE_PAGES: usize = 32;
 /// How soon the next pass comes while lifecycle work waits.
 pub const LIFECYCLE_POLL: Duration = Duration::from_secs(5);
 const FENCE_ATTEMPTS: usize = 4;
+
+/// What a range held when its former coordinator fenced it; the new coordinator completes
+/// once its own counters of the range reach it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Watermark {
+    pub versions: i128,
+    pub delete_markers: i128,
+    pub max_epoch: u64,
+}
+
+impl Watermark {
+    fn of(counters: &RangeCounters) -> Self {
+        Self {
+            versions: counters.versions,
+            delete_markers: counters.delete_markers,
+            max_epoch: counters.max_epoch.0,
+        }
+    }
+
+    /// Whether counters of the receiving copy hold at least what the fenced range held.
+    pub fn reached_by(&self, counters: &RangeCounters) -> bool {
+        counters.versions >= self.versions
+            && counters.delete_markers >= self.delete_markers
+            && counters.max_epoch.0 >= self.max_epoch
+    }
+}
 
 /// What one set left to do on this node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,6 +189,16 @@ impl SetWork {
         let mut left = Left::Settled;
         if member.state == MemberState::Leaving {
             left = left.and(self.leave(context, snapshot, &local).await?);
+        }
+        for open in &snapshot.lifecycle.transfers {
+            if open.from == member.member_id {
+                left = left.and(self.hand_over(context, snapshot, &local, open).await?);
+            } else if open.to == member.member_id {
+                left = left.and(self.take_over(context, snapshot, &local, open).await?);
+            }
+        }
+        if !view.conflicted() {
+            left = left.and(self.reclaim(context, snapshot, &local, budget).await?);
         }
         Ok(left)
     }
@@ -279,6 +325,150 @@ impl SetWork {
         self.clear_set(context, false).await
     }
 
+    /// The former coordinator's side: fence the range, abort its uploads, state the fence.
+    async fn hand_over(
+        &self,
+        context: &Arc<DriverContext>,
+        snapshot: &DistributionSnapshot,
+        local: &Local<'_>,
+        open: &OpenTransfer,
+    ) -> Result<Left, String> {
+        let Some(range) = (snapshot.config.ranges.iter()).find(|r| r.range_id == open.range_id)
+        else {
+            return Ok(Left::Settled);
+        };
+        let fence = RangeFence {
+            range_id: range.range_id,
+            transfer_id: open.transfer_id,
+            epoch: range.epoch,
+            since_ms: unix_timestamp_millis(),
+        };
+        update_fence(context, self.set_id, |local| {
+            local.fence_range(fence.clone())
+        })
+        .await?;
+        if open.fenced.is_some() {
+            // Keep the set until the range is reclaimed after the activation.
+            return Ok(Left::Waiting);
+        }
+        let Some(binding) = local.binding.clone() else {
+            return Ok(Left::Waiting);
+        };
+        if abort_range_uploads(context, &self.target(snapshot, &binding, range)).await? {
+            return Ok(Left::Waiting);
+        }
+        let Some(counters) = range_counters(context, self.set_id, range.range_id).await? else {
+            return Ok(Left::Waiting);
+        };
+        let watermark =
+            postcard::to_allocvec(&Watermark::of(&counters)).map_err(|error| error.to_string())?;
+        // Imports and refreshes keep per-job checkpoints, not per-range cursors (see report).
+        let kind = StatementKind::TransferFenced {
+            transfer_id: open.transfer_id,
+            range_id: range.range_id,
+            epoch: range.epoch,
+            next_epoch: open.epoch,
+            watermark,
+            import_cursor: None,
+            refresh_cursor: None,
+            open_uploads: 0,
+        };
+        let subject = open.transfer_id.to_bytes();
+        self.state(context, snapshot, local.member, &subject, kind)
+            .await?;
+        Ok(Left::Waiting)
+    }
+
+    /// The new coordinator's side: complete once its copy reached the fenced watermark.
+    async fn take_over(
+        &self,
+        context: &Arc<DriverContext>,
+        snapshot: &DistributionSnapshot,
+        local: &Local<'_>,
+        open: &OpenTransfer,
+    ) -> Result<Left, String> {
+        let (Some(fenced), None) = (open.fenced, open.completed) else {
+            return Ok(Left::Waiting);
+        };
+        let watermark = (snapshot.statements.iter())
+            .find(|signed| signed.statement.digest() == fenced)
+            .and_then(|signed| match &signed.statement.kind {
+                StatementKind::TransferFenced { watermark, .. } => Some(watermark.clone()),
+                _ => None,
+            });
+        let Some(bytes) = watermark else {
+            return Ok(Left::Waiting);
+        };
+        let wanted: Watermark = postcard::from_bytes(&bytes).map_err(|error| error.to_string())?;
+        let reached = range_counters(context, self.set_id, open.range_id)
+            .await?
+            .is_some_and(|counters| wanted.reached_by(&counters));
+        if !reached || local.binding.is_none() {
+            return Ok(Left::Waiting);
+        }
+        let kind = StatementKind::TransferComplete {
+            transfer_id: open.transfer_id,
+            range_id: open.range_id,
+            fenced,
+            watermark: bytes,
+        };
+        let subject = open.transfer_id.to_bytes();
+        self.state(context, snapshot, local.member, &subject, kind)
+            .await?;
+        Ok(Left::Waiting)
+    }
+
+    /// Purges a range this node fenced for a transfer once the record no longer has it hold
+    /// the range at all and the new coordinator is ready.
+    async fn reclaim(
+        &self,
+        context: &Arc<DriverContext>,
+        snapshot: &DistributionSnapshot,
+        local: &Local<'_>,
+        budget: &mut usize,
+    ) -> Result<Left, String> {
+        let (Some(binding), member_id) = (local.binding.clone(), local.member.member_id) else {
+            return Ok(Left::Settled);
+        };
+        let stored = read(
+            context,
+            DISTRIBUTION_FENCE_KEYSPACE,
+            LocalFence::key(self.set_id),
+        )
+        .await?;
+        let fence = LocalFence::decode(stored.as_deref()).map_err(|error| error.to_string())?;
+        let held = snapshot.held_ranges(member_id);
+        let mut left = Left::Settled;
+        for fenced in &fence.ranges {
+            let Some(range) =
+                (snapshot.config.ranges.iter()).find(|r| r.range_id == fenced.range_id)
+            else {
+                continue;
+            };
+            let moving = snapshot
+                .lifecycle
+                .transfers
+                .iter()
+                .any(|t| t.range_id == range.range_id);
+            let ready = snapshot
+                .member(range.coordinator)
+                .is_some_and(|coordinator| coordinator.state == MemberState::Ready);
+            let kept = held.iter().any(|r| r.range_id == range.range_id);
+            if moving || kept || !ready {
+                left = left.and(match moving {
+                    true => Left::Waiting,
+                    false => Left::Settled,
+                });
+                continue;
+            }
+            let target = self.target(snapshot, &binding, range);
+            if purge_range(context, &target, budget).await? == Purged::More {
+                left = Left::Waiting;
+            }
+        }
+        Ok(left)
+    }
+
     /// Signs a lifecycle statement with this node's key and hands it to the publisher.
     async fn state(
         &self,
@@ -303,6 +493,33 @@ impl SetWork {
         }
         Ok(())
     }
+}
+
+/// The active counters this node keeps for a range, while its account is not split or rebuilt.
+pub(super) async fn range_counters(
+    context: &DriverContext,
+    set_id: Ulid,
+    range_id: Ulid,
+) -> Result<Option<RangeCounters>, String> {
+    let Some(account) = read(
+        context,
+        RANGE_ACCOUNT_KEYSPACE,
+        account_key(set_id, range_id),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let account = RangeAccount::from_bytes(&account).map_err(|error| error.to_string())?;
+    let (Charge::Active(generation), None) = (account.charge, account.rebuild) else {
+        return Ok(None);
+    };
+    let row = generation_key(set_id, range_id, generation);
+    let counters = read(context, RANGE_COUNTER_KEYSPACE, row).await?;
+    (counters.map(|value| RangeCounters::from_bytes(&value)))
+        .transpose()
+        .map(|counters| Some(counters.unwrap_or_default()))
+        .map_err(|error| error.to_string())
 }
 
 /// Changes the set's fence row in one transaction; `change` says whether it changed anything.
@@ -424,5 +641,36 @@ async fn unbind(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         other => Err(format!("the bucket was not released: {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::storage::distribution::OriginalEpoch;
+
+    #[test]
+    fn completion_waits_for_every_count() {
+        // The new coordinator completes only once its copy holds what the fenced range held.
+        let fenced = RangeCounters {
+            versions: 5,
+            delete_markers: 2,
+            max_epoch: OriginalEpoch(3),
+            ..RangeCounters::default()
+        };
+        let watermark = Watermark::of(&fenced);
+        assert!(watermark.reached_by(&fenced));
+        let behind = RangeCounters {
+            delete_markers: 1,
+            ..fenced
+        };
+        assert!(!watermark.reached_by(&behind));
+        let older = RangeCounters {
+            max_epoch: OriginalEpoch(2),
+            ..fenced
+        };
+        assert!(!watermark.reached_by(&older));
+        let bytes = postcard::to_allocvec(&watermark).unwrap();
+        assert_eq!(postcard::from_bytes::<Watermark>(&bytes).unwrap(), watermark);
     }
 }
