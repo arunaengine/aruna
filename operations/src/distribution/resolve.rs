@@ -45,8 +45,8 @@ pub struct ResolvedVersion {
     pub version_id: Ulid,
     /// This node's member bucket is bound to the set and its index holds the version.
     pub local: bool,
-    /// Ready members that keep the bytes of the key's range: its coordinator and its `copy`
-    /// replicas, this node included when it is one.
+    /// Ready members that keep the bytes of the key's range: its coordinator, its `copy`
+    /// replicas and then the replicas keeping copies on use, this node included when it is one.
     pub holders: Vec<NodeId>,
 }
 
@@ -61,19 +61,27 @@ pub enum GlobalResolution {
     Ambiguous,
 }
 
-/// The ready members that keep the bytes of `key`'s range.
+/// The ready members that keep the bytes of `key`'s range: its coordinator and `copy` replicas,
+/// then the replicas that keep copies on use, which serve a kept copy or read it through.
 pub fn range_holders(snapshot: &DistributionSnapshot, key: &str) -> Vec<NodeId> {
     let Some(range) = snapshot.range_for(key) else {
         return Vec::new();
     };
-    let ready = |member_id: &Ulid, copy_only: bool| {
+    let ready = |member_id: &Ulid, strategies: &[DataStrategy]| {
         snapshot.member(*member_id).filter(|member| {
             member.state == MemberState::Ready
-                && (!copy_only || member.strategy == DataStrategy::Copy)
+                && (strategies.is_empty() || strategies.contains(&member.strategy))
         })
     };
-    std::iter::once(ready(&range.coordinator, false))
-        .chain(range.replicas.iter().map(|replica| ready(replica, true)))
+    let keeping = [DataStrategy::CopyOnUse, DataStrategy::CacheOnUse];
+    std::iter::once(ready(&range.coordinator, &[]))
+        .chain(
+            range
+                .replicas
+                .iter()
+                .map(|id| ready(id, &[DataStrategy::Copy])),
+        )
+        .chain(range.replicas.iter().map(|id| ready(id, &keeping)))
         .flatten()
         .map(|member| member.node_id)
         .collect()

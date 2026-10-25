@@ -24,8 +24,14 @@ fn holders_are_copies() {
         range_holders(&snapshot, "a"),
         vec![secret(1).public(), secret(2).public()]
     );
-    // A replica that fetches on use keeps no bytes to serve from.
+    // A replica that keeps copies on use may serve one, after the coordinator.
     snapshot.config.members[1].strategy = DataStrategy::CacheOnUse;
+    assert_eq!(
+        range_holders(&snapshot, "a"),
+        vec![secret(1).public(), secret(2).public()]
+    );
+    // A streaming replica keeps no bytes to serve from.
+    snapshot.config.members[1].strategy = DataStrategy::Stream;
     assert_eq!(range_holders(&snapshot, "a"), vec![secret(1).public()]);
     // A member that is not ready serves nothing.
     snapshot.config.members[0].state = MemberState::CatchingUp;

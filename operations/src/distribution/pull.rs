@@ -39,8 +39,9 @@ use ulid::Ulid;
 use super::keep::{ClaimFillOperation, Claimed, KeptCopy, PublishKeptOperation, Published};
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::driver::{DriverContext, drive, now_ms};
-use crate::replication::bao_read::{BaoReadOutput, managed_read};
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
+use crate::node::holder_choice::{avoid_holder, choose_holder};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
+use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{
     GetObjectError, GetObjectResult, HolderFailures, ObjectInfo, ObjectRangeRequest,
 };
@@ -276,24 +277,35 @@ async fn member_of(
     let range = snapshot
         .range_for(&request.key)
         .ok_or(GetObjectError::HoldersUnavailable)?;
-    let copies = range.replicas.iter().filter(|replica| {
-        snapshot.member(**replica).is_some_and(|replica| {
-            replica.strategy == DataStrategy::Copy && replica.state == MemberState::Ready
+    let ready = |strategies: &'static [DataStrategy]| {
+        range.replicas.iter().filter(move |replica| {
+            snapshot.member(**replica).is_some_and(|replica| {
+                strategies.contains(&replica.strategy) && replica.state == MemberState::Ready
+            })
         })
-    });
-    let mut holders: Vec<NodeId> = copies
+    };
+    let copies: Vec<&Ulid> = ready(&[DataStrategy::Copy]).collect();
+    let replicas = copies.len();
+    // Members that keep copies on use may serve one; they are tried after the coordinator.
+    let keepers = ready(&[DataStrategy::CopyOnUse, DataStrategy::CacheOnUse]);
+    let mut holders: Vec<NodeId> = (copies.into_iter())
         .chain(std::iter::once(&range.coordinator))
+        .chain(keepers)
         .filter(|holder| **holder != member.member_id)
         .filter_map(|holder| snapshot.member(*holder).map(|holder| holder.node_id))
         .collect();
-    // Replicas share the load; the coordinator stays the last resort.
-    if let Some(replicas) = holders
-        .len()
-        .checked_sub(1)
-        .filter(|replicas| *replicas > 1)
-    {
-        let spread = (Ulid::generate().random() % replicas as u128) as usize;
-        holders[..replicas].rotate_left(spread);
+    // Replicas share the load by free download slots; the coordinator stays the fallback.
+    let replicas = replicas.min(holders.len());
+    if replicas > 1 {
+        let chosen = choose_holder(context, &holders[..replicas], now_ms()).await;
+        let at = chosen.and_then(|chosen| holders.iter().position(|id| *id == chosen.node_id));
+        match at {
+            Some(at) => holders[..=at].rotate_right(1),
+            None => {
+                let spread = (Ulid::generate().random() % replicas as u128) as usize;
+                holders[..replicas].rotate_left(spread);
+            }
+        }
     }
     let settings = read_row(
         context,
@@ -335,9 +347,15 @@ async fn from_holders(
             known_refs: Vec::new(),
             range: range.clone(),
         };
-        if let Some(BaoReadOutput::Stream { blob, .. }) =
-            failures.consider(managed_read(context, *holder, read).await)
-        {
+        let result = managed_read(context, *holder, read).await;
+        // A holder that failed to serve is skipped by the next holder choices for a while.
+        if matches!(
+            result,
+            Err(BaoReadError::Blob(_) | BaoReadError::Refused(BaoReadRefusal::BackendFailure))
+        ) {
+            avoid_holder(context, *holder, now_ms());
+        }
+        if let Some(BaoReadOutput::Stream { blob, .. }) = failures.consider(result) {
             return Ok(blob);
         }
     }
