@@ -1214,10 +1214,11 @@ mod tests {
     }
 
     // A pass stops at its limit, so writes that keep arriving cannot hold the folder lock. The
-    // leftover upload fails the bucket delete, and the next pass deletes the bucket.
+    // leftover upload and version fail the bucket delete, and the next pass deletes the bucket.
     #[tokio::test]
     async fn limits_cleanup_pass() {
         use crate::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+        use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
         use aruna_core::structs::storage::routing::RoutingSnapshot;
 
         let fixture = crate::tests::staging::setup_driver_context().await;
@@ -1232,12 +1233,46 @@ mod tests {
             routing: RoutingSnapshot::single(folder.group_id),
         });
         drive(second, &context).await.expect("second upload opened");
+        std::fs::write(std::path::Path::new(&folder.root).join("more.txt"), b"more")
+            .expect("file written");
+        let offer = OfferDirectoryInput {
+            bucket: folder.local_bucket.clone(),
+            root: folder.root.clone(),
+            group_id: folder.group_id,
+            realm_id: realm(),
+            node_id: node(),
+            user_id: folder.created_by,
+        };
+        offer_directory(&context, offer)
+            .await
+            .expect("offer refreshed");
 
         assert!(matches!(
             delete_local_bucket(&context, &folder, node(), 1).await,
             Err(FolderError::DeleteBucket(DeleteBucketError::NotEmpty))
         ));
         assert!(!bucket_gone(&context, &folder.local_bucket).await);
+        let uploads = ListUploadsOperation::new(ListUploadsInput {
+            bucket: folder.local_bucket.clone(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            upload_id_marker: None,
+            max_uploads: ListUploadsOperation::DEFAULT_MAX_UPLOADS,
+        })
+        .including_in_progress();
+        let uploads = drive(uploads, &context).await.expect("uploads listed");
+        assert_eq!(uploads.uploads.len(), 1);
+        let versions = ListVersionsOperation::new(ListVersionsInput {
+            bucket: folder.local_bucket.clone(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: None,
+        });
+        let versions = drive(versions, &context).await.expect("versions listed");
+        assert_eq!(versions.items.len(), 1);
         assert_eq!(
             delete_local_bucket(&context, &folder, node(), 1).await,
             Ok(())
