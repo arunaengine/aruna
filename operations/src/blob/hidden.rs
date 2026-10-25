@@ -484,6 +484,10 @@ async fn kept_protected(
     namespace: Ulid,
     deadline: Instant,
 ) -> Result<bool, String> {
+    // An evicted copy a read still holds stays until the read ends.
+    if crate::distribution::pull::pinned_path(&key.backend_path) {
+        return Ok(true);
+    }
     let name = std::path::Path::new(&key.backend_path)
         .file_name()
         .and_then(|name| name.to_str())

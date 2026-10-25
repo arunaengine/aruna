@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::SystemTime;
 
 use aruna_core::NodeId;
@@ -33,13 +34,17 @@ use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::types::{Key, KeySpace, Value};
 use bytes::Bytes;
+use futures_util::StreamExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 use ulid::Ulid;
 
-use super::keep::{ClaimFillOperation, Claimed, KeptCopy, PublishKeptOperation, Published};
+use super::keep::{
+    ClaimFillOperation, Claimed, KeepError, KeptCopy, PublishKeptOperation, Published,
+};
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::driver::{DriverContext, drive, now_ms};
-use crate::node::holder_choice::{avoid_holder, choose_holder};
+use crate::node::holder_choice::{avoid_holder, candidates, choose_holder};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{
@@ -47,6 +52,55 @@ use crate::s3::object::get::{
 };
 
 type Blob = BackendStream<Result<Bytes, StreamError>>;
+
+/// Fills that run detached from their read at once; a read finding none free keeps nothing.
+const DETACHED_FILLS: usize = 8;
+
+static FILL_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(DETACHED_FILLS)));
+
+/// Kept copies being read, by backend path, with their reader counts.
+static PINS: LazyLock<StdMutex<HashMap<String, usize>>> = LazyLock::new(Default::default);
+
+/// A slot for one detached fill, or `None` when all run; nobody waits for one.
+pub(super) fn fill_slot() -> Option<OwnedSemaphorePermit> {
+    FILL_SLOTS.clone().try_acquire_owned().ok()
+}
+
+/// One read's hold on a kept copy: eviction leaves the bytes of a held copy to the hidden
+/// sweep, which spares them too while a read holds them.
+struct ReadPin(String);
+
+impl Drop for ReadPin {
+    fn drop(&mut self) {
+        let mut pins = PINS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = pins.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Whether a read holds the kept copy at `backend_path`.
+pub fn pinned_path(backend_path: &str) -> bool {
+    let pins = PINS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    pins.contains_key(backend_path)
+}
+
+/// `blob` of the kept copy at `location`, which stays held until the stream ends or drops.
+pub fn pinned_blob(location: &BackendLocation, blob: Blob) -> Blob {
+    let path = location.backend_path.clone();
+    let mut pins = PINS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *pins.entry(path.clone()).or_default() += 1;
+    drop(pins);
+    let pin = ReadPin(path);
+    let held = blob.0.inspect(move |_| {
+        let _ = &pin;
+    });
+    BackendStream(Box::pin(held))
+}
 
 /// A distributed version whose record this member holds without its bytes.
 #[derive(Clone, Debug, PartialEq)]
@@ -169,6 +223,7 @@ pub struct PullRequest {
 /// How this member answers reads of the version's range.
 #[derive(Clone, Debug, PartialEq)]
 struct Member {
+    member_id: Ulid,
     strategy: DataStrategy,
     behaviour: RangeBehaviour,
     /// An encrypting bucket keeps nothing in plain text, so it only streams.
@@ -201,14 +256,19 @@ pub async fn pull_through(
             let whole = from_holders(context, &request, &member.holders, None).await?;
             spool_range(context, &request.held, whole, range).await?
         }
-        PullPlan::FillFirst(kind) => match fill(context, &request, kind, &member.holders).await {
+        PullPlan::FillFirst(kind) => match fill(context, &request, kind, &member).await {
             Some(location) => read_kept(context, location, range).await?,
             None => from_holders(context, &request, &member.holders, range).await?,
         },
         PullPlan::ServeAndFill(kind) => {
-            let (background, filled) = (context.clone(), request.clone());
-            let holders = member.holders.clone();
-            tokio::spawn(async move { fill(&background, &filled, kind, &holders).await });
+            if let Some(slot) = fill_slot() {
+                let (background, filled) = (context.clone(), request.clone());
+                let member = member.clone();
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    fill(&background, &filled, kind, &member).await
+                });
+            }
             from_holders(context, &request, &member.holders, range).await?
         }
     };
@@ -308,16 +368,26 @@ async fn member_of(
             }
         }
     }
+    // Holders that failed lately or have no fresh heartbeat are asked only when no other is.
+    let fresh: Vec<NodeId> = (candidates(context, &holders, now_ms()).await.into_iter())
+        .map(|candidate| candidate.node_id)
+        .collect();
+    if !fresh.is_empty() {
+        holders.retain(|holder| fresh.contains(holder));
+    }
     let settings = read_row(
         context,
         BUCKET_ENCRYPTION_KEYSPACE,
         request.bucket.as_bytes().to_vec(),
     )
     .await?;
+    // Governed versions are served only from registered copies, never from kept ones.
     let keeping = BucketEncryption::from_row(settings.as_deref())?
         .active_key()
-        .is_none();
+        .is_none()
+        && request.held.source_policies.is_empty();
     Ok(Member {
+        member_id: member.member_id,
         strategy: member.strategy,
         behaviour: snapshot.config.range_behaviour(member),
         keeping,
@@ -405,11 +475,16 @@ async fn read_kept(
         .as_ref()
         .ok_or(GetObjectError::GetObjectFailed)?;
     let read = match range {
-        Some(range) => BlobEffect::ReadRange { location, range },
-        None => BlobEffect::Read { location },
+        Some(range) => BlobEffect::ReadRange {
+            location: location.clone(),
+            range,
+        },
+        None => BlobEffect::Read {
+            location: location.clone(),
+        },
     };
     match blob_handle.send_blob_effect(read).await {
-        Event::Blob(BlobEvent::ReadFinished { blob, .. }) => Ok(blob),
+        Event::Blob(BlobEvent::ReadFinished { blob, .. }) => Ok(pinned_blob(&location, blob)),
         _ => Err(GetObjectError::GetObjectFailed),
     }
 }
@@ -421,9 +496,14 @@ async fn fill(
     context: &DriverContext,
     request: &PullRequest,
     kind: KeptKind,
-    holders: &[NodeId],
+    member: &Member,
 ) -> Option<BackendLocation> {
     let held = &request.held;
+    // A copy the cache can never hold is not fetched at all.
+    if !admitted(kind, held.size) {
+        return None;
+    }
+    let holders = &member.holders;
     let claim = claim_key(kind, held.set_id, held.version_id, held.blake3);
     let claimed = FillClaim {
         claim_id: Ulid::generate(),
@@ -456,14 +536,15 @@ async fn fill(
         claim_key: claim.clone(),
         capacity: CACHE_CAPACITY_BYTES,
         order: Ulid::generate(),
+        member_id: member.member_id,
     };
-    match drive(PublishKeptOperation::new(copy), context).await {
-        Ok(Published::Kept { evicted }) => {
-            for evicted in evicted {
-                drop_copy(context, &evicted).await;
-            }
-            Some(location)
-        }
+    match drop_evicted(
+        context,
+        drive(PublishKeptOperation::new(copy), context).await,
+    )
+    .await
+    {
+        Ok(Published::Kept { .. }) => Some(location),
         Ok(Published::Unkept) => {
             drop_copy(context, &location).await;
             None
@@ -514,6 +595,27 @@ async fn write_copy(
         Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
         _ => Err("unexpected answer to the copy write".to_string()),
     }
+}
+
+/// Whether a kept copy of `size` bytes may be fetched: a cache entry must fit the cache.
+pub(super) fn admitted(kind: KeptKind, size: u64) -> bool {
+    kind != KeptKind::Cache || size <= CACHE_CAPACITY_BYTES
+}
+
+/// Deletes the copies a publication evicted; a copy a read still holds is left to the sweep.
+pub(super) async fn drop_evicted(
+    context: &DriverContext,
+    published: Result<Published, KeepError>,
+) -> Result<Published, KeepError> {
+    if let Ok(Published::Kept { evicted }) = &published {
+        for evicted in evicted
+            .iter()
+            .filter(|copy| !pinned_path(&copy.backend_path))
+        {
+            drop_copy(context, evicted).await;
+        }
+    }
+    published
 }
 
 pub(super) async fn drop_copy(context: &DriverContext, location: &BackendLocation) {

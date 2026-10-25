@@ -13,9 +13,9 @@ use crate::connectors::repository::connector_reference_write;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::pull::{
     HeldElsewhere, PullRequest, kept_location, kept_reads, kept_source_location, kept_source_reads,
-    pull_through,
+    pinned_blob, pull_through,
 };
-use crate::distribution::source_keep::{SourceKeep, keep_later};
+use crate::distribution::source_keep::{SourceKeep, keep_first};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
@@ -56,10 +56,12 @@ use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPoli
 use aruna_core::structs::storage::abe::AbeEffect;
 use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::abe_access::{KeyGrant, MAX_REQUESTS};
+use aruna_core::structs::storage::blob::HiddenBlobKey;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::distribution::on_use::{ATTACHMENT_NAMESPACE, CACHE_NAMESPACE};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease, TokenCredential,
 };
@@ -375,6 +377,8 @@ pub struct GetObjectOperation {
     held: Option<HeldElsewhere>,
     /// The logical identity of a reference in a distributed bucket, its kept copy's key.
     source_identity: Option<[u8; 32]>,
+    /// The distributed bucket of such a reference, whose members may keep its bytes.
+    source_set: Option<Ulid>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
     /// Active key of an encrypting bucket whose reference or unsealed copy is read.
     reference_key: Option<BucketKeyRef>,
@@ -427,6 +431,7 @@ impl GetObjectOperation {
             source_policies: Vec::new(),
             held: None,
             source_identity: None,
+            source_set: None,
             output: None,
             reference_key: None,
             reference_lease: None,
@@ -658,6 +663,10 @@ impl GetObjectOperation {
                     source_policies: version.placement_policies,
                 };
                 self.version_created_at = held.version_created_at;
+                // A governed version is never kept, so only its holders serve it.
+                if !held.source_policies.is_empty() {
+                    return self.emit_error(GetObjectError::HeldElsewhere(Box::new(held)));
+                }
                 self.state = GetObjectState::ReadKept;
                 let reads = kept_reads(&held);
                 self.held = Some(held);
@@ -738,6 +747,10 @@ impl GetObjectOperation {
         else {
             return self.resolve_reference();
         };
+        self.source_set = Some(binding.set_id);
+        if !self.source_policies.is_empty() {
+            return self.resolve_reference();
+        }
         self.state = GetObjectState::ReadSourceKept;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: kept_source_reads(binding.set_id, version_id, identity),
@@ -761,6 +774,26 @@ impl GetObjectOperation {
         match size.and_then(|size| kept_source_location(&values, size)) {
             Some(location) => self.read_multipart_summary(location, self.resolved_version_id),
             None => self.resolve_reference(),
+        }
+    }
+
+    /// A distributed member whose source failed reads the bytes from a member keeping a copy,
+    /// so data stays readable without its origin; elsewhere the failure stands.
+    fn source_failed(&mut self, error: GetObjectError) -> Effects {
+        let held = (self.source_set.zip(self.source_identity))
+            .zip(self.resolved_version_id.zip(self.reference_cached.as_ref()))
+            .map(|((set_id, blake3), (version_id, cached))| HeldElsewhere {
+                set_id,
+                version_id,
+                blake3,
+                size: cached.content_length,
+                metadata: self.metadata.clone(),
+                version_created_at: None,
+                source_policies: self.source_policies.clone(),
+            });
+        match held {
+            Some(held) => self.emit_error(GetObjectError::HeldElsewhere(Box::new(held))),
+            None => self.emit_error(error),
         }
     }
 
@@ -858,7 +891,7 @@ impl GetObjectOperation {
             }
             Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                 result: Err(error),
-            }) => self.emit_error(error.into()),
+            }) => self.source_failed(error.into()),
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
@@ -1246,7 +1279,7 @@ impl GetObjectOperation {
                 self.emit_error(GetObjectError::ReferenceSourceChanged)
             }
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
-                self.emit_error(error.into())
+                self.source_failed(error.into())
             }
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -1772,7 +1805,7 @@ impl GetObjectOperation {
                 error: StagingSourceError::ConditionFailed,
             }) => self.queue_changed_refresh(),
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
-                self.emit_error(error.into())
+                self.source_failed(error.into())
             }
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -2004,26 +2037,42 @@ pub async fn get_object_token(
     let range = input.range.clone();
     let (user_id, realm_id) = (input.user_identity, input.realm_id);
     let (bucket, key, group_id) = (input.bucket.clone(), input.key.clone(), input.group_id);
-    let result = read_local(context, input, restrictions.clone(), token.as_ref()).await;
+    let again = input.clone();
+    let mut result = read_local(context, input, restrictions.clone(), token.as_ref()).await;
     // A member of a distributed bucket receives references without a connector id; the one it
     // read from the source may be kept.
-    if let Ok(read) = &result
-        && read.source_metadata.is_some()
-        && read.location.is_none()
-        && read
-            .source_binding
-            .as_ref()
-            .is_some_and(|source| source.connector_id.is_none())
-        && let Some(version_id) = read.resolved_version_id.or(read.version_id)
+    let keep = match &result {
+        Ok(read)
+            if read.source_metadata.is_some()
+                && read.location.is_none()
+                && (read.source_binding.as_ref())
+                    .is_some_and(|source| source.connector_id.is_none()) =>
+        {
+            (read.resolved_version_id.or(read.version_id)).map(|version_id| SourceKeep {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+                group_id,
+                user_id,
+                ranged: range.is_some(),
+            })
+        }
+        _ => None,
+    };
+    // A member that fills first serves the range from the copy it just kept.
+    if let Some(keep) = keep
+        && keep_first(context, keep).await
     {
-        let keep = SourceKeep {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id,
-            group_id,
-            user_id,
-        };
-        keep_later(context, keep);
+        result = read_local(context, again, restrictions.clone(), token.as_ref()).await;
+    }
+    if let Ok(read) = &mut result
+        && let Some(location) = read
+            .location
+            .as_ref()
+            .filter(|location| kept_copy(location))
+    {
+        let empty = BackendStream(Box::pin(futures_util::stream::empty()));
+        read.blob = pinned_blob(location, std::mem::replace(&mut read.blob, empty));
     }
     if let Err(GetObjectError::HeldElsewhere(held)) = result {
         let auth = AuthContext {
@@ -2071,6 +2120,13 @@ pub async fn get_object_token(
         result.resolved_range = Some(resolved);
     }
     Ok(result)
+}
+
+/// Whether `location` is a copy a member keeps on use, which eviction may remove.
+fn kept_copy(location: &BackendLocation) -> bool {
+    HiddenBlobKey::try_from(location)
+        .and_then(|key| key.namespace())
+        .is_ok_and(|namespace| namespace == ATTACHMENT_NAMESPACE || namespace == CACHE_NAMESPACE)
 }
 
 /// The bytes of `range` from a stream of the whole object; the rest is skipped.

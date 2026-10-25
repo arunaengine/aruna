@@ -1187,7 +1187,8 @@ impl IncomingBaoOperation {
         self.read_location()
     }
 
-    /// A record-only version of a distributed bucket this node may keep a copy of.
+    /// A record-only version of a distributed bucket this node may keep a copy of, or an
+    /// external reference of it, whose kept copy serves while its source is unavailable.
     fn held_version(&self, version: &BlobVersion) -> Option<HeldElsewhere> {
         let BlobVersionState::Reference {
             source,
@@ -1197,7 +1198,11 @@ impl IncomingBaoOperation {
         else {
             return None;
         };
-        let (set_id, blake3) = HeldElsewhere::of(source, version.identity)?;
+        let external = match self.request.target {
+            BaoReadTarget::Version { set_id, .. } => version.identity.map(|id| (set_id, id)),
+            _ => None,
+        };
+        let (set_id, blake3) = HeldElsewhere::of(source, version.identity).or(external)?;
         Some(HeldElsewhere {
             set_id,
             version_id: self.exact_target()?.version,

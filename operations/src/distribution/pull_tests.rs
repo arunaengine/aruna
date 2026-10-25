@@ -182,6 +182,22 @@ async fn asks_range_holders() {
     assert_eq!(member.holders, vec![secret(2).public()]);
     assert_eq!(member.strategy, DataStrategy::Copy);
     assert!(member.keeping);
+    let governed = PullRequest {
+        held: HeldElsewhere {
+            source_policies: vec![PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([7; 16]),
+                digest: [7; 32],
+            }],
+            ..request.held.clone()
+        },
+        ..request.clone()
+    };
+    assert!(
+        !member_of(&context(&handle), &governed)
+            .await
+            .unwrap()
+            .keeping
+    );
     let stranger = PullRequest {
         held: held(9),
         ..request

@@ -15,7 +15,7 @@ use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, BucketInfo, VersionKey};
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::distribution::on_use::{
-    CACHE_CAPACITY_BYTES, FillClaim, KeptKind, claim_key,
+    CACHE_CAPACITY_BYTES, FillClaim, KeptKind, PullPlan, claim_key,
 };
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::types::GroupId;
@@ -23,7 +23,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::keep::{ClaimFillOperation, Claimed, KeptCopy, PublishKeptOperation, Published};
-use super::pull::{HeldElsewhere, drop_copy, read_row, release};
+use super::pull::{HeldElsewhere, admitted, drop_copy, drop_evicted, fill_slot, read_row, release};
 use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
 use crate::driver::{DriverContext, drive, now_ms};
 use crate::s3::object::get::strong_validator;
@@ -37,22 +37,49 @@ pub struct SourceKeep {
     /// The bucket's group, whose connector of the source root reads the bytes.
     pub group_id: GroupId,
     pub user_id: UserId,
+    /// The read asked for a byte range, so the member's range behaviour applies.
+    pub ranged: bool,
 }
 
-/// Keeps the reference's bytes in the background when this member keeps bytes on use.
-pub fn keep_later(context: &DriverContext, keep: SourceKeep) {
+/// Keeps the reference's bytes per the member's strategy and range behaviour: before the read
+/// is served when it fills first (`true`), else in the background when a fill slot is free.
+pub async fn keep_first(context: &DriverContext, keep: SourceKeep) -> bool {
+    let plan = match plan(context, &keep).await {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return false,
+        Err(reason) => {
+            warn!(reason, version_id = %keep.version_id, "A reference was not kept");
+            return false;
+        }
+    };
+    if keep.ranged && plan.pull == PullPlan::FillFirst(plan.kind) {
+        return match keep_source(context, &keep, plan).await {
+            Ok(kept) => kept,
+            Err(reason) => {
+                warn!(reason, version_id = %keep.version_id, "A reference was not kept");
+                false
+            }
+        };
+    }
+    let Some(slot) = fill_slot() else {
+        return false;
+    };
     let context = context.clone();
     tokio::spawn(async move {
-        if let Err(reason) = keep_source(&context, &keep).await {
+        let _slot = slot;
+        if let Err(reason) = keep_source(&context, &keep, plan).await {
             warn!(reason, version_id = %keep.version_id, "A reference was not kept");
         }
     });
+    false
 }
 
 /// What a keeping member keeps of one reference version.
 struct Plan {
     kind: KeptKind,
+    pull: PullPlan,
     set_id: Ulid,
+    member_id: Ulid,
     identity: [u8; 32],
     version: BlobVersion,
 }
@@ -73,6 +100,10 @@ async fn plan(context: &DriverContext, keep: &SourceKeep) -> Result<Option<Plan>
     let BlobVersionState::Reference { source, .. } = &version.state else {
         return Ok(None);
     };
+    // Governed versions are served only from registered copies, never from kept ones.
+    if !version.placement_policies.is_empty() {
+        return Ok(None);
+    }
     let Some(identity) = version
         .identity
         .filter(|_| HeldElsewhere::of(source, version.identity).is_none())
@@ -114,23 +145,41 @@ async fn plan(context: &DriverContext, keep: &SourceKeep) -> Result<Option<Plan>
         return Ok(None);
     };
     let view = DistributionView::from_bytes(&record).map_err(|error| fault(&error))?;
-    let kind = view
-        .snapshot()
-        .member(binding.member_id)
-        .and_then(|member| KeptKind::of(member.strategy));
-    Ok(kind.map(|kind| Plan {
+    let snapshot = view.snapshot();
+    let Some(member) = snapshot.member(binding.member_id) else {
+        return Ok(None);
+    };
+    let behaviour = snapshot.config.range_behaviour(member);
+    // A passthrough range read keeps nothing, like a read through a holder.
+    let (kind, pull) = match PullPlan::choose(member.strategy, behaviour, keep.ranged, true) {
+        pull @ (PullPlan::FillFirst(kind) | PullPlan::ServeAndFill(kind)) => (kind, pull),
+        PullPlan::Stream | PullPlan::SpoolFirst => return Ok(None),
+    };
+    let size = match &version.state {
+        BlobVersionState::Reference {
+            cached_metadata, ..
+        } => cached_metadata.content_length,
+        _ => return Ok(None),
+    };
+    if !admitted(kind, size) {
+        return Ok(None);
+    }
+    Ok(Some(Plan {
         kind,
+        pull,
         set_id: binding.set_id,
+        member_id: binding.member_id,
         identity,
         version,
     }))
 }
 
-/// Claims, reads, verifies and publishes one kept copy of a reference.
-async fn keep_source(context: &DriverContext, keep: &SourceKeep) -> Result<(), String> {
-    let Some(plan) = plan(context, keep).await? else {
-        return Ok(());
-    };
+/// Claims, reads, verifies and publishes one kept copy of a reference; `true` once kept.
+async fn keep_source(
+    context: &DriverContext,
+    keep: &SourceKeep,
+    plan: Plan,
+) -> Result<bool, String> {
     let claim = claim_key(plan.kind, plan.set_id, keep.version_id, plan.identity);
     let claimed = FillClaim {
         claim_id: Ulid::generate(),
@@ -138,7 +187,7 @@ async fn keep_source(context: &DriverContext, keep: &SourceKeep) -> Result<(), S
     };
     match drive(ClaimFillOperation::new(claim.clone(), claimed), context).await {
         Ok(Claimed::Claimed) => {}
-        Ok(Claimed::Busy) => return Ok(()),
+        Ok(Claimed::Busy) => return Ok(false),
         Err(error) => return Err(error.to_string()),
     }
     let copy = match read_copy(context, keep, &plan).await {
@@ -160,17 +209,18 @@ async fn keep_source(context: &DriverContext, keep: &SourceKeep) -> Result<(), S
         claim_key: claim.clone(),
         capacity: CACHE_CAPACITY_BYTES,
         order: Ulid::generate(),
+        member_id: plan.member_id,
     };
-    match drive(PublishKeptOperation::new(kept), context).await {
-        Ok(Published::Kept { evicted }) => {
-            for evicted in evicted {
-                drop_copy(context, &evicted).await;
-            }
-            Ok(())
-        }
+    match drop_evicted(
+        context,
+        drive(PublishKeptOperation::new(kept), context).await,
+    )
+    .await
+    {
+        Ok(Published::Kept { .. }) => Ok(true),
         Ok(Published::Unkept) => {
             drop_copy(context, &location).await;
-            Ok(())
+            Ok(false)
         }
         Err(error) => {
             drop_copy(context, &location).await;

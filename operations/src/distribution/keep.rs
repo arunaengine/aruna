@@ -9,10 +9,11 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE,
-    FILL_CLAIM_KEYSPACE,
+    DISTRIBUTION_KEYSPACE, FILL_CLAIM_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::on_use::{
     Attachment, CACHE_TOTALS_KEY, CacheEntry, CacheTotals, FillClaim, KeptKind, attachment_key,
@@ -215,6 +216,8 @@ pub struct KeptCopy {
     pub capacity: u64,
     /// Admission order of a new cache entry.
     pub order: Ulid,
+    /// The member keeping an attachment; a member gone from the set's record keeps nothing.
+    pub member_id: Ulid,
 }
 
 /// What publishing did.
@@ -230,7 +233,8 @@ pub enum Published {
 enum PublishState {
     Init,
     Start,
-    /// Reads the set's fence row: a deleted or departing member keeps nothing new.
+    /// Reads the set's fence row and record: a deleted, departing or departed member keeps
+    /// nothing new.
     ReadFence,
     ReadCache,
     Evict,
@@ -471,17 +475,40 @@ impl Operation for PublishKeptOperation {
             (PublishState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
                 self.txn_id = Some(txn_id);
                 self.state = PublishState::ReadFence;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
-                    key: LocalFence::key(self.copy.set_id).into(),
+                let set_key = LocalFence::key(self.copy.set_id);
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads: vec![
+                        (
+                            DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+                            set_key.clone().into()
+                        ),
+                        (DISTRIBUTION_KEYSPACE.to_string(), set_key.into()),
+                    ],
                     txn_id: Some(txn_id),
                 })]
             }
-            (PublishState::ReadFence, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                match LocalFence::decode(value.as_deref()) {
+            (PublishState::ReadFence, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                let (Some((_, fence)), Some((_, record))) = (values.first(), values.get(1)) else {
+                    return self.fail(KeepError::NotFinished);
+                };
+                match LocalFence::decode(fence.as_deref()) {
                     Ok(fence) if !fence.receiving() => return self.unkept(),
                     Ok(_) => {}
                     Err(error) => return self.fail(error.into()),
+                }
+                // Departure cleanup drops the fence row last; the record no longer names us then.
+                let view = match record
+                    .as_deref()
+                    .map(DistributionView::from_bytes)
+                    .transpose()
+                {
+                    Ok(view) => view,
+                    Err(error) => return self.fail(error.into()),
+                };
+                let member =
+                    view.is_some_and(|view| view.snapshot().member(self.copy.member_id).is_some());
+                if self.copy.kind == KeptKind::Attachment && !member {
+                    return self.unkept();
                 }
                 let Some(txn_id) = self.txn_id else {
                     return self.fail(KeepError::NotFinished);

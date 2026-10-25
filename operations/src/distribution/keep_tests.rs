@@ -49,6 +49,21 @@ fn cached(seed: u8, size: u64, capacity: u64) -> KeptCopy {
         claim_key: claim_key(KeptKind::Cache, id(1), id(seed), [seed; 32]),
         capacity,
         order: id(seed),
+        member_id: id(1),
+    }
+}
+
+/// An attachment of member `seed` of the stored two-shard record.
+async fn attached(handle: &StorageHandle, seed: u8) -> KeptCopy {
+    use crate::distribution::test_record::{member, record, store_record};
+    let (snapshot, bytes) = record(true);
+    store_record(handle, snapshot.set_id(), bytes).await;
+    KeptCopy {
+        kind: KeptKind::Attachment,
+        set_id: snapshot.set_id(),
+        claim_key: claim_key(KeptKind::Attachment, snapshot.set_id(), id(3), [3; 32]),
+        member_id: member(seed),
+        ..cached(3, 10, 0)
     }
 }
 
@@ -99,10 +114,7 @@ async fn claims_fill_once() {
 #[tokio::test]
 async fn publishes_attachment() {
     let (_dir, handle) = open();
-    let copy = KeptCopy {
-        kind: KeptKind::Attachment,
-        ..cached(3, 10, 0)
-    };
+    let copy = attached(&handle, 1).await;
     let claim = copy.claim_key.clone();
     let claimed = FillClaim {
         claim_id: id(9),
@@ -118,9 +130,13 @@ async fn publishes_attachment() {
     let published = publish(&handle, copy.clone()).await;
 
     assert_eq!(published, Published::Kept { evicted: vec![] });
-    let row = get(&handle, ATTACHMENT_KEYSPACE, attachment_key(id(1), id(3)))
-        .await
-        .unwrap();
+    let row = get(
+        &handle,
+        ATTACHMENT_KEYSPACE,
+        attachment_key(copy.set_id, id(3)),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         Attachment::from_bytes(&row).unwrap().location,
         copy.location
@@ -214,5 +230,16 @@ async fn fenced_member_keeps_nothing() {
     };
     assert_eq!(publish(&handle, copy).await, Published::Unkept);
     let row = get(&handle, ATTACHMENT_KEYSPACE, attachment_key(id(1), id(3))).await;
+    assert_eq!(row, None);
+}
+
+// A fill that outlives its member's departure keeps nothing once the record drops the member.
+#[tokio::test]
+async fn departed_keeps_nothing() {
+    let (_dir, handle) = open();
+    let copy = attached(&handle, 9).await;
+    let set_id = copy.set_id;
+    assert_eq!(publish(&handle, copy).await, Published::Unkept);
+    let row = get(&handle, ATTACHMENT_KEYSPACE, attachment_key(set_id, id(3))).await;
     assert_eq!(row, None);
 }
