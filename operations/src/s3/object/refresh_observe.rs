@@ -7,10 +7,10 @@ use aruna_core::errors::{
     ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
+use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, BucketInfo, VersionKey};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -86,10 +86,20 @@ impl ObserveSourceOperation {
 
     fn step_inner(&mut self, event: Event) -> Result<Effects, ObserveError> {
         match (self.state, event) {
-            (ObserveState::ReadVersion, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let version = value
+            (
+                ObserveState::ReadVersion,
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+            ) => {
+                let mut values = values.into_iter().map(|(_, value)| value);
+                let (version, bucket) = (values.next().flatten(), values.next().flatten());
+                let version = version
                     .map(|value| BlobVersion::from_bytes(value.as_ref()))
                     .transpose()?;
+                // The bucket's group may read a reference through its own connector of the root.
+                let group_id = bucket
+                    .map(|value| BucketInfo::from_bytes(value.as_ref()))
+                    .transpose()?
+                    .map(|bucket| bucket.group_id);
                 let Some(BlobVersion {
                     state: BlobVersionState::Reference { source, .. },
                     ..
@@ -100,7 +110,7 @@ impl ObserveSourceOperation {
                 self.state = ObserveState::ResolveAccess;
                 Ok(smallvec![resolve_binding_effect(ResolveBindingInput {
                     source,
-                    group_id: None,
+                    group_id,
                 })])
             }
             (
@@ -140,9 +150,12 @@ impl Operation for ObserveSourceOperation {
             Err(error) => return self.fail(error.into()),
         };
         self.state = ObserveState::ReadVersion;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.into(),
+        let bucket = self.version_key.bucket.as_bytes().to_vec();
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (BLOB_VERSIONS_KEYSPACE.to_string(), key.into()),
+                (S3_BUCKET_KEYSPACE.to_string(), bucket.into()),
+            ],
             txn_id: None,
         })]
     }
@@ -177,6 +190,72 @@ impl Operation for ObserveSourceOperation {
 mod tests {
     use super::*;
     use ulid::Ulid;
+
+    // A member's reference names no connector, so the bucket's group resolves its source.
+    #[test]
+    fn resolves_with_group() {
+        use aruna_core::structs::execution::source_access::SourceMetadata;
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_core::structs::execution::staging::{
+            PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+        };
+        use aruna_core::structs::storage::format::Compression;
+        use std::time::SystemTime;
+
+        let group_id = Ulid::from_bytes([2; 16]);
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: Default::default(),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+                namespace: None,
+            },
+            connector_id: None,
+        };
+        let observation = SourceMetadata {
+            content_length: 4,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let at = SystemTime::UNIX_EPOCH;
+        let version = BlobVersion::reference(source, observation, at, Default::default(), at);
+        let bucket = BucketInfo {
+            group_id,
+            created_at: at,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        let mut operation = ObserveSourceOperation::new(VersionKey::new("b", "k", Ulid::nil()));
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    b"v".to_vec().into(),
+                    Some(version.to_bytes().unwrap().into()),
+                ),
+                (
+                    b"b".to_vec().into(),
+                    Some(bucket.to_bytes().unwrap().into()),
+                ),
+            ],
+        }));
+
+        assert_eq!(operation.state, ObserveState::ResolveAccess);
+        assert!(format!("{effects:?}").contains(&format!("group_id: Some({group_id:?})")));
+    }
 
     // A failed head fails the observation, so the queued refresh is retried later.
     #[test]
