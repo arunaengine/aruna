@@ -526,20 +526,12 @@ pub(crate) async fn references_preflight_local(
         .into_values()
         .flatten()
         .any(|record| record.realm_id == realm_id);
-    let index_state = match (freshness.state, pending_for_realm) {
-        (crate::metadata::iri_index::IriFreshnessState::Current, false) => {
-            MetadataIndexState::Current
-        }
-        (crate::metadata::iri_index::IriFreshnessState::Current, true)
-        | (crate::metadata::iri_index::IriFreshnessState::Pending, _) => {
-            MetadataIndexState::Pending
-        }
-        (crate::metadata::iri_index::IriFreshnessState::Failed, false) => {
-            MetadataIndexState::Failed
-        }
-        (crate::metadata::iri_index::IriFreshnessState::Failed, true)
-        | (crate::metadata::iri_index::IriFreshnessState::Mixed, _) => MetadataIndexState::Mixed,
-    };
+    // A queued or failed materialization has no postings yet, so its references are missing.
+    let (queued, dead) =
+        crate::metadata::data_links::unsettled_documents(&context.storage_handle, 1)
+            .await
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    let index_state = index_state(freshness.state, pending_for_realm || queued > 0, dead > 0);
     let (selected, saturated) = visible_prefix(visible, request.limit);
     let mut titles = HashMap::<Ulid, String>::new();
     let mut visible_references = Vec::with_capacity(selected.len());
@@ -589,6 +581,24 @@ pub(crate) async fn references_preflight_local(
         path_style_available: s3_endpoint.is_some() || !aliases_seen,
         saturated,
     })
+}
+
+/// The index state of the returned documents, with documents still to be materialized
+/// (`pending`) and documents whose materialization failed (`failed`) on this node.
+pub(super) fn index_state(
+    returned: crate::metadata::iri_index::IriFreshnessState,
+    pending: bool,
+    failed: bool,
+) -> MetadataIndexState {
+    use crate::metadata::iri_index::IriFreshnessState;
+    let pending = pending || returned == IriFreshnessState::Pending;
+    let failed = failed || returned == IriFreshnessState::Failed;
+    match (returned == IriFreshnessState::Mixed, pending, failed) {
+        (true, _, _) | (false, true, true) => MetadataIndexState::Mixed,
+        (false, false, true) => MetadataIndexState::Failed,
+        (false, true, false) => MetadataIndexState::Pending,
+        (false, false, false) => MetadataIndexState::Current,
+    }
 }
 
 /// Keeps the first `limit` references in watermark order and reports whether more exist.
