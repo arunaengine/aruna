@@ -191,3 +191,28 @@ async fn refuses_unkeepable() {
         }
     );
 }
+
+// A member fenced for a deletion keeps no new copy, so its purge leaves nothing behind.
+#[tokio::test]
+async fn fenced_member_keeps_nothing() {
+    let (_dir, handle) = open();
+    let fence = LocalFence {
+        deletion: Some([4; 32]),
+        closed: true,
+        ..LocalFence::default()
+    };
+    let write = Effect::Storage(StorageEffect::Write {
+        key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+        key: LocalFence::key(id(1)).into(),
+        value: fence.to_bytes().unwrap().into(),
+        txn_id: None,
+    });
+    crate::distribution::test_store::send(&handle, write).await;
+    let copy = KeptCopy {
+        kind: KeptKind::Attachment,
+        ..cached(3, 10, 0)
+    };
+    assert_eq!(publish(&handle, copy).await, Published::Unkept);
+    let row = get(&handle, ATTACHMENT_KEYSPACE, attachment_key(id(1), id(3))).await;
+    assert_eq!(row, None);
+}

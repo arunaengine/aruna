@@ -8,10 +8,12 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE, FILL_CLAIM_KEYSPACE,
+    ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE,
+    FILL_CLAIM_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::on_use::{
     Attachment, CACHE_TOTALS_KEY, CacheEntry, CacheTotals, FillClaim, KeptKind, attachment_key,
 };
@@ -228,6 +230,8 @@ pub enum Published {
 enum PublishState {
     Init,
     Start,
+    /// Reads the set's fence row: a deleted or departing member keeps nothing new.
+    ReadFence,
     ReadCache,
     Evict,
     Write,
@@ -438,6 +442,7 @@ impl PublishKeptOperation {
         match self.state {
             PublishState::Init => "init",
             PublishState::Start => "start",
+            PublishState::ReadFence => "read_fence",
             PublishState::ReadCache => "read_cache",
             PublishState::Evict => "evict",
             PublishState::Write => "write",
@@ -465,6 +470,22 @@ impl Operation for PublishKeptOperation {
         match (self.state, event) {
             (PublishState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
                 self.txn_id = Some(txn_id);
+                self.state = PublishState::ReadFence;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+                    key: LocalFence::key(self.copy.set_id).into(),
+                    txn_id: Some(txn_id),
+                })]
+            }
+            (PublishState::ReadFence, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                match LocalFence::decode(value.as_deref()) {
+                    Ok(fence) if !fence.receiving() => return self.unkept(),
+                    Ok(_) => {}
+                    Err(error) => return self.fail(error.into()),
+                }
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(KeepError::NotFinished);
+                };
                 if self.copy.kind == KeptKind::Attachment {
                     return self.write_kept();
                 }
