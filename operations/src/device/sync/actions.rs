@@ -12,8 +12,8 @@ use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, SyncActionRecord, SyncBase,
-    SyncedFolder, WriteGuard,
+    ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, FolderState, SyncActionRecord,
+    SyncBase, SyncedFolder, WriteGuard,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -74,6 +74,9 @@ pub async fn apply_action(
     input: ApplyActionInput,
 ) -> Result<SyncActionRecord, ActionError> {
     let folder = read_bound(context, input.folder_id).await?;
+    if folder.state == FolderState::Deleting {
+        return Err(FolderError::NotFound.into());
+    }
     match input.scope.clone() {
         ActionScope::Entry { relative } => apply_entry(context, &folder, &input, &relative).await,
         ActionScope::AllPending => apply_pending(context, &folder, &input).await,

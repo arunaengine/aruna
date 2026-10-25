@@ -547,7 +547,7 @@ pub(crate) async fn finish_unbind(
         return Ok(());
     }
     for key_space in [SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNC_LOG_KEYSPACE] {
-        clear_rows(context, key_space, folder_id).await?;
+        clear_rows(context, key_space, folder_id, CLEANUP_LIMIT).await?;
     }
     // The offer keeps the bucket read-only for clients until the bucket is gone.
     delete_local_bucket(context, &folder, node_id, CLEANUP_LIMIT).await?;
@@ -584,8 +584,8 @@ pub(crate) async fn finish_unbind(
     Ok(())
 }
 
-/// Uploads and versions one cleanup pass removes at most, so writes that keep arriving cannot
-/// hold the folder lock. Anything left fails the bucket delete, and the next pass goes on.
+/// Rows, uploads and versions one cleanup pass removes at most, so writes that keep arriving
+/// cannot hold the folder lock. Anything left fails this pass, and the next pass goes on.
 const CLEANUP_LIMIT: usize = 16_000;
 
 /// Deletes the folder's device-local bucket and every version left in it, removing at most
@@ -699,12 +699,15 @@ async fn abort_uploads(
     Ok(())
 }
 
-/// Deletes every row one folder owns in a keyspace, page by page.
+/// Deletes up to `limit` rows one folder owns in a keyspace, page by page. Rows left over fail
+/// this pass, so the folder row and its offer stay for the next pass.
 async fn clear_rows(
     context: &Arc<DriverContext>,
     key_space: &str,
     folder_id: Ulid,
+    limit: usize,
 ) -> Result<(), FolderError> {
+    let mut left = limit;
     loop {
         let (values, _) = scan_page(context, scan_folder(key_space, folder_id, None, None))
             .await
@@ -712,10 +715,15 @@ async fn clear_rows(
         if values.is_empty() {
             return Ok(());
         }
-        let deletes = values
+        if left == 0 {
+            return Err(FolderError::Unavailable);
+        }
+        let deletes: Vec<_> = values
             .into_iter()
+            .take(left)
             .map(|(key, _)| (key_space.to_string(), key))
             .collect();
+        left -= deletes.len();
         if !delete_rows(context, deletes, None).await {
             return Err(FolderError::Unavailable);
         }
@@ -1056,6 +1064,68 @@ mod tests {
             .await
             .expect("the entries read");
         assert!(entries.is_empty());
+    }
+
+    // Rows that keep arriving cannot hold the folder lock: a pass stops at its limit, and the
+    // next pass deletes the rest.
+    #[tokio::test]
+    async fn limits_row_cleanup() {
+        use super::super::repository::{base_entry, write_rows};
+
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let folder_id = Ulid::generate();
+        let rows = ["a.txt", "b.txt"]
+            .map(|relative| base_entry(folder_id, relative, &base_row()).expect("base encodes"));
+        assert!(write_rows(&context, rows.to_vec(), None).await);
+
+        assert_eq!(
+            clear_rows(&context, SYNC_BASE_KEYSPACE, folder_id, 1).await,
+            Err(FolderError::Unavailable)
+        );
+        let (entries, _) = list_entries(&context, folder_id, None, None)
+            .await
+            .expect("the entries read");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            clear_rows(&context, SYNC_BASE_KEYSPACE, folder_id, 1).await,
+            Ok(())
+        );
+        let (entries, _) = list_entries(&context, folder_id, None, None)
+            .await
+            .expect("the entries read");
+        assert!(entries.is_empty());
+    }
+
+    // An owner action on a folder whose cleanup is running writes no audit row for it to remove.
+    #[tokio::test]
+    async fn actions_refuse_deleting() {
+        use super::super::actions::{ActionError, ApplyActionInput, apply_action};
+        use aruna_core::structs::{ActionKind, ActionScope};
+
+        let (_dir, context) = context().await;
+        let context = Arc::new(context);
+        let folder = SyncedFolder {
+            folder_id: Ulid::generate(),
+            ..bound_folder(FolderState::Deleting)
+        };
+        store_folder(&context, &folder).await.expect("row stored");
+        let input = ApplyActionInput {
+            folder_id: folder.folder_id,
+            kind: ActionKind::KeepLocal,
+            scope: ActionScope::AllPending,
+            expected: None,
+            actor: folder.created_by,
+        };
+
+        assert!(matches!(
+            apply_action(&context, input).await,
+            Err(ActionError::Folder(FolderError::NotFound))
+        ));
+        let (actions, _) = list_actions(&context, folder.folder_id, None)
+            .await
+            .expect("the log reads");
+        assert!(actions.is_empty());
     }
 
     /// A deleting folder whose bucket offers one file, and an upload opened in that bucket.
