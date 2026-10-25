@@ -14,7 +14,8 @@ use std::marker::PhantomData;
 /// The serde name of `SessionRef`, whose older layouts lack trailing fields.
 const SESSION_REF: &str = "SessionRef";
 
-/// Stored field counts by serde struct name; a listed struct lacks its later fields.
+/// Stored field counts by serde struct name, or by the comma-joined field names of a struct
+/// variant, which has no serde name; a listed struct lacks its later fields.
 pub(super) type Layout = &'static [(&'static str, usize)];
 
 /// Session references before the linked login, and before the display name too.
@@ -395,6 +396,16 @@ impl<'de, A: VariantAccess<'de>> VariantAccess<'de> for Access<A> {
         visitor: V,
     ) -> Result<V::Value, A::Error> {
         let layout = self.layout;
-        self.inner.struct_variant(names, Wrap { visitor, layout })
+        let stored = layout.iter().find(|(known, _)| *known == names.join(","));
+        let Some(&(_, fields)) = stored.filter(|(_, fields)| *fields < names.len()) else {
+            return self.inner.struct_variant(names, Wrap { visitor, layout });
+        };
+        let padded = Padded {
+            visitor,
+            layout,
+            fields,
+            total: names.len(),
+        };
+        self.inner.tuple_variant(fields, padded)
     }
 }

@@ -62,6 +62,7 @@ mod info_topics;
 mod jobs;
 mod layouts;
 mod mappings;
+mod removals;
 mod session_refs;
 mod sessions;
 mod sizes;
@@ -115,6 +116,8 @@ pub struct MigrateOutput {
     pub git_records_scanned: usize,
     pub git_records_rewritten: usize,
     pub git_outbox_rewritten: usize,
+    /// Queued realm config node removals of this node from before the publisher cutoffs.
+    pub outbox_removals_rewritten: usize,
     /// Size rows written for logged metadata events that had none.
     pub event_sizes_written: usize,
     /// S3 sessions in an older format are deleted; their holders mint new ones.
@@ -256,6 +259,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         SYNC_OUTBOX_KEYSPACE,
         (mapping, rewritten::<PersistentIdMapping, LegacyMapping>),
     )?;
+    let removals = removals::removal_rows(&db, &outbox_rows, SYNC_OUTBOX_KEYSPACE)?;
     let git_records = rewrite_rows(&db, &git_rows, GIT_RECORD_KEYSPACE, git_record)?;
     let sizes = sizes::missing_sizes(&db, &event_rows, &size_rows)?;
     let stale = sessions::stale_sessions(&db, &session_rows, &expiry_rows, &owner_rows)?;
@@ -388,6 +392,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&mapping_rows, &mappings.rows),
         (&outbox_rows, &outbox.rows),
         (&outbox_rows, &git_outbox.rows),
+        (&outbox_rows, &removals.rows),
         (&git_rows, &git_records.rows),
         (&size_rows, &sizes.rows),
         (&version_rows, &versions.rows),
@@ -488,6 +493,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         git_records_scanned: git_records.scanned,
         git_records_rewritten: git_records.rows.len(),
         git_outbox_rewritten: git_outbox.rows.len(),
+        outbox_removals_rewritten: removals.rows.len(),
         event_sizes_written: sizes.rows.len(),
         sessions_scanned: stale.scanned,
         sessions_deleted: stale.sessions.len(),

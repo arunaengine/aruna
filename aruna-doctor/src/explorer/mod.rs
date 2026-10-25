@@ -24,4 +24,6 @@ pub(super) enum ExplorerError {
     KeyspaceNotFound(String),
     #[error("decode failed: {0}")]
     Decode(String),
+    #[error("migration refused: {0}")]
+    Refused(String),
 }
