@@ -112,15 +112,17 @@ async fn resolve_pid(
         && let Some(holder) =
             choose_holder(ctx.as_ref(), state.get_node_id(), document_id, now_ms()).await
     {
-        let api = holder
-            .urls
-            .api
-            .as_deref()
-            .unwrap_or_default()
-            .trim_end_matches('/');
-        return redirect(&format!("{api}/metadata/{document_id}/rocrate?here=true"));
+        let api = holder.urls.api.as_deref().unwrap_or_default();
+        return redirect(&rocrate_url(api, document_id));
     }
     landing_response(document_id, resolved)
+}
+
+/// The pinned RO-Crate read of `document_id` on a holder's published api base, which may
+/// already carry the `/api/v1` nest.
+fn rocrate_url(api: &str, document_id: Ulid) -> String {
+    let path = format!("/metadata/{document_id}/rocrate?here=true");
+    crate::routes::storage::relay::relay_url(api, &path)
 }
 
 fn now_ms() -> u64 {
@@ -685,6 +687,14 @@ async fn withdraw_pid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holder_redirect_nested() {
+        let id = Ulid::from_bytes([1; 16]);
+        let pinned = format!("https://b.example/api/v1/metadata/{id}/rocrate?here=true");
+        assert_eq!(rocrate_url("https://b.example/", id), pinned);
+        assert_eq!(rocrate_url("https://b.example/api/v1", id), pinned);
+    }
 
     // the RO-Crate Location header targets the read route
     #[test]
