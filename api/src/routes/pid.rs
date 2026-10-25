@@ -781,4 +781,99 @@ mod tests {
             .is_err()
         );
     }
+
+    /// An active public PID redirects to the RO-Crate read; with no holder chosen, on this node.
+    #[tokio::test]
+    async fn redirects_public_pid() {
+        use crate::tests::routes::{
+            seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state,
+            test_storage, write_doc,
+        };
+        use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, ID_MAPPING_KEYSPACE};
+        use aruna_core::storage_entries::metadata_document_key;
+        use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+        use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::persistent_id_key;
+        use aruna_core::structs::placement::record::PlacementRef;
+
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let node_id = iroh::SecretKey::from_bytes(&[8; 32]).public();
+        let user_id = aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id,
+            realm_id,
+        };
+        let context = Arc::new(test_context(storage));
+        seed_realm_config(&context, realm_id, &actor).await;
+        seed_realm_auth(&context, realm_id, &actor).await;
+        let document_id = Ulid::from_bytes([10; 16]);
+        let group_id = Ulid::from_bytes([11; 16]);
+        seed_group_docs(&context, realm_id, &actor, group_id, "public", user_id).await;
+        let revision = aruna_core::structs::PersistentIdRevision {
+            event_id: Ulid::from_bytes([7; 16]),
+            actor: node_id,
+            occurred_at_ms: 9,
+        };
+        let path = "datasets/public".to_string();
+        let mut mapping = PersistentIdMapping::requested(
+            document_id,
+            false,
+            user_id,
+            aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
+            true,
+            path.clone(),
+            revision.clone(),
+        );
+        assert!(mapping.activate(user_id, revision));
+        let record = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: path.clone(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                &path,
+                document_id,
+            ),
+            placement: PlacementRef::NIL,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            establishing_event_id: Ulid::from_bytes([8; 16]),
+            last_event_id: Ulid::from_bytes([9; 16]),
+        };
+        let mapping_row = mapping.to_bytes().unwrap();
+        let key = persistent_id_key(document_id);
+        write_doc(
+            &context,
+            ID_MAPPING_KEYSPACE,
+            key.into(),
+            mapping_row.into(),
+        )
+        .await;
+        let record_row = postcard::to_allocvec(&record).unwrap();
+        let key = metadata_document_key(document_id);
+        write_doc(&context, DOCUMENT_INDEX_KEYSPACE, key, record_row.into()).await;
+        let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
+        let state = Arc::new(test_state(context, realm_id, node_id, capabilities).await);
+
+        let response = resolve_pid(State(state.clone()), Path(document_id.to_string())).await;
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let location = response.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap();
+        assert_eq!(location, rocrate_location(document_id));
+        let malformed = resolve_pid(State(state), Path("not-a-ulid".to_string())).await;
+        assert_eq!(malformed.status(), StatusCode::NOT_FOUND);
+    }
 }
