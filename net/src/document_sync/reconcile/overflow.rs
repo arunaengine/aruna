@@ -3,6 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::HashMap;
+
+use aruna_core::structs::storage::distribution::SignedSnapshot;
+use aruna_core::structs::storage::distribution::parking::{Authority, snapshot_of};
+use aruna_core::structs::storage::distribution::snapshot::forked;
+
 use super::cursor::{applied_cursor_clock, applied_cursor_value, topic_cursor_key};
 use super::*;
 
@@ -15,6 +21,8 @@ const FULL_PREFIX: &[u8] = b"overflow-full/";
 const MAX_OVERFLOW_TOPICS: usize = 16;
 /// Pages one pass replays per topic.
 const REPLAY_PAGES: usize = 4;
+/// Sets whose last replayed snapshot one pass keeps as fork evidence.
+const MAX_EVIDENCE: usize = 64;
 
 fn overflow_key(topic_id: ::irokle::TopicId) -> ByteView {
     topic_key(OVERFLOW_PREFIX, topic_id)
@@ -117,6 +125,7 @@ impl DocumentSyncService {
             .await?;
         let main = applied_cursor_clock(storage, topic_id, genesis, applied)?;
         let mut cache = ConfigValidationCache::default();
+        let mut evidence = HashMap::new();
         for _ in 0..REPLAY_PAGES {
             let batch = match clock.dominates(&main) {
                 true => None,
@@ -150,7 +159,9 @@ impl DocumentSyncService {
                     &mut cache,
                 )
                 .await?;
-                if validation != AdminEventValidation::Accepted {
+                if validation != AdminEventValidation::Accepted
+                    || self.replay_fork(&mut evidence, &event).await?
+                {
                     continue;
                 }
                 let handled = apply_distribution_operation(&self.storage, target, *event).await?;
@@ -171,6 +182,37 @@ impl DocumentSyncService {
         let value = applied_cursor_value(storage, topic_id, genesis, &clock)?;
         self.storage_write(APPLIED_OPS_KEYSPACE.to_string(), scan_key, value)
             .await
+    }
+
+    /// Installs a replayed snapshot together with the last replayed one of its set when the
+    /// two prove equivocation, so a newer head cannot hide the fork. Returns whether it did.
+    async fn replay_fork(
+        &self,
+        evidence: &mut HashMap<Ulid, AdminDocumentEvent>,
+        event: &AdminDocumentEvent,
+    ) -> Result<bool> {
+        let (AdminDocumentTarget::Distribution { realm_id, set_id }, Some(signed)) =
+            (&event.target, snapshot_of(event))
+        else {
+            return Ok(false);
+        };
+        if let Some(earlier) = evidence.get(set_id)
+            && let Some(first) = snapshot_of(earlier)
+            && forked(&first.snapshot, &signed.snapshot)
+        {
+            let membership = Membership::read(&self.storage, *realm_id).await?;
+            let current =
+                |signed: &SignedSnapshot| membership.authority(signed) == Authority::Current;
+            if current(first) && current(signed) {
+                let pair = [earlier.clone(), event.clone()];
+                install_events(&self.storage, &pair, *set_id).await?;
+                return Ok(true);
+            }
+        }
+        if evidence.len() < MAX_EVIDENCE || evidence.contains_key(set_id) {
+            evidence.insert(*set_id, event.clone());
+        }
+        Ok(false)
     }
 
     /// Ends a sweep at the topic cursor: the checkpoint moves to the first snapshot that found

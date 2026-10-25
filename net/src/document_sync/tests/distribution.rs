@@ -673,3 +673,79 @@ async fn overflow_replays_snapshot() {
     );
     service.shutdown().await;
 }
+
+#[tokio::test]
+async fn overflow_keeps_forks() {
+    // Two replayed snapshots of one number behind a newer head still prove equivocation.
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    const LOCAL: u8 = 47;
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(LOCAL).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm(),
+    )
+    .expect("document sync service opens");
+    let target = DocumentTarget::RealmConfig { realm_id: realm() };
+    let topic_id = target.sync_topic_id(realm(), &PlacementRef::NIL);
+    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
+    config.ensure_node(node(LOCAL), RealmNodeKind::Management);
+    config.ensure_node(node(PUBLISHER), RealmNodeKind::Server);
+    let row = target_write_entry(
+        target.clone(),
+        config.to_bytes(&actor(LOCAL)).unwrap().into(),
+    );
+    batch_write_to(&storage, vec![row]).await.unwrap();
+    let admitted = admitted(&created(), MEMBER);
+    let mut head = vec![created(), admitted.clone()];
+    for _ in 0..2 {
+        let mut next = head.last().unwrap().clone();
+        next.number += 1;
+        next.previous = Some(head.last().unwrap().digest());
+        head.push(next);
+    }
+    for snapshot in head.clone() {
+        let outcome = receive(&storage, published(PUBLISHER, snapshot, PUBLISHER)).await;
+        assert_eq!(outcome, AdminEventValidation::Accepted);
+    }
+    let mut fork = admitted.clone();
+    fork.config.settings.public = true;
+    let publish = |snapshot: DistributionSnapshot| {
+        let event = published(PUBLISHER, snapshot, PUBLISHER);
+        let signature = secret(PUBLISHER).sign(&event.signing_bytes(&PlacementRef::NIL).unwrap());
+        DocumentSyncPublish::AdminOperation {
+            target: target.clone(),
+            event: Box::new(event),
+            placement: PlacementRef::NIL,
+            allow_genesis: true,
+            origin_signature: Some(signature),
+        }
+    };
+    let published = service
+        .publish_documents(vec![publish(admitted), publish(fork)], Vec::new())
+        .await;
+    assert!(matches!(
+        published,
+        DocumentNetEvent::DocumentsPublished { .. }
+    ));
+    reset_test_cursor(&service, topic_id).await;
+    service.reconcile_document_topics([topic_id]).await.unwrap();
+    assert!(!stored(&storage).await.unwrap().conflicted());
+    let topic = service.node().storage().topic_state(&topic_id).unwrap();
+    let genesis = topic.expect("topic exists").genesis;
+    let start = ::irokle::ActorClock::default();
+    service
+        .record_overflow(topic_id, genesis, &start)
+        .await
+        .unwrap();
+    service.replay_overflow().await.unwrap();
+    let view = stored(&storage).await.unwrap();
+    assert_eq!(&view.head.snapshot, head.last().unwrap());
+    assert!(view.conflicted(), "the replayed pair keeps the fork");
+    service.shutdown().await;
+}
