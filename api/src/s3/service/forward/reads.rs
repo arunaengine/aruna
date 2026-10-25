@@ -90,14 +90,17 @@ pub(in crate::s3::service) fn forwarded_get(
     response: reqwest::Response,
 ) -> S3Response<GetObjectOutput> {
     let status = response.status();
+    // A ranged answer carries no full-object checksum, as in S3.
+    let partial = status == http::StatusCode::PARTIAL_CONTENT;
+    let checksum = |name| header(&response, name).filter(|_| !partial);
     let output = GetObjectOutput {
         accept_ranges: header(&response, "accept-ranges"),
-        checksum_crc32: header(&response, "x-amz-checksum-crc32"),
-        checksum_crc32c: header(&response, "x-amz-checksum-crc32c"),
-        checksum_crc64nvme: header(&response, "x-amz-checksum-crc64nvme"),
-        checksum_sha1: header(&response, "x-amz-checksum-sha1"),
-        checksum_sha256: header(&response, "x-amz-checksum-sha256"),
-        checksum_type: checksum_type(&response),
+        checksum_crc32: checksum("x-amz-checksum-crc32"),
+        checksum_crc32c: checksum("x-amz-checksum-crc32c"),
+        checksum_crc64nvme: checksum("x-amz-checksum-crc64nvme"),
+        checksum_sha1: checksum("x-amz-checksum-sha1"),
+        checksum_sha256: checksum("x-amz-checksum-sha256"),
+        checksum_type: checksum_type(&response).filter(|_| !partial),
         content_length: content_length(&response),
         content_range: header(&response, "content-range"),
         content_type: header(&response, "content-type"),
@@ -261,6 +264,13 @@ mod tests {
             output.metadata.unwrap().get("origin").map(String::as_str),
             Some("spire")
         );
+        assert!(output.checksum_sha256.is_none());
+        assert!(output.checksum_type.is_none());
+    }
+
+    #[test]
+    fn full_answer_checksummed() {
+        let output = forwarded_get(holder_answer(200)).output;
         assert!(output.checksum_sha256.is_some());
         assert_eq!(
             output.checksum_type.as_ref().map(ChecksumType::as_str),

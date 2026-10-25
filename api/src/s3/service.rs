@@ -25,7 +25,9 @@ use self::attributes::{
     RequestedAttributes, attributes_checksum, attributes_output, attributes_parts, parse_max_parts,
     parse_part_marker,
 };
-use self::response::{attach_reference_refresh, object_metadata, reference_metadata_refresh};
+use self::response::{
+    attach_reference_refresh, full_object_checksums, object_metadata, reference_metadata_refresh,
+};
 use aruna_core::structs::storage::format::Compression;
 
 use self::copy::{copy_object_response, copy_part_response, copy_source_conditions};
@@ -2012,16 +2014,7 @@ impl S3 for ArunaS3Service {
             ..Default::default()
         };
         if checksum_mode_enabled(&req.headers) {
-            output.apply_checksums(encode_checksums(
-                checksum_response_hashes(
-                    result.info.checksum_type,
-                    &result.info.hashes,
-                    &result.info.composite_hashes,
-                ),
-                ChecksumSelection::AllStored,
-                map_checksum_type(result.info.checksum_type),
-                result.info.part_count,
-            ));
+            full_object_checksums(&mut output, &result.info);
         }
 
         Ok(if resolved_range.is_some() {

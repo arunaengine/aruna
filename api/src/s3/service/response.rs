@@ -6,7 +6,7 @@ use super::{ArunaS3Service, reference_etag};
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, encode_checksums,
 };
-use crate::s3::util::{map_checksum_type, sse_header, stored_encrypted};
+use crate::s3::util::{checksum_response_hashes, map_checksum_type, sse_header, stored_encrypted};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -20,7 +20,7 @@ use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRef
 use aruna_operations::s3::object::put::PutObjectResult;
 use s3s::dto::{
     CompleteMultipartUploadOutput, DeleteObjectOutput, DeleteObjectsOutput, DeletedObject, ETag,
-    Error as S3DeleteError, LastModified, PutObjectOutput,
+    Error as S3DeleteError, GetObjectOutput, LastModified, PutObjectOutput,
 };
 use s3s::{S3Response, S3Result, s3_error};
 use std::str::FromStr;
@@ -68,6 +68,19 @@ pub(super) fn reference_metadata_refresh(
         node_id,
         auth_context,
     })
+}
+
+/// Adds the stored full-object checksums to a GET answer; a ranged answer gets none, as in S3.
+pub(super) fn full_object_checksums(output: &mut GetObjectOutput, info: &ObjectInfo) {
+    if output.content_range.is_some() {
+        return;
+    }
+    output.apply_checksums(encode_checksums(
+        checksum_response_hashes(info.checksum_type, &info.hashes, &info.composite_hashes),
+        ChecksumSelection::AllStored,
+        map_checksum_type(info.checksum_type),
+        info.part_count,
+    ));
 }
 
 pub(super) fn attach_reference_refresh<T: 'static>(
@@ -581,5 +594,30 @@ mod tests {
             .filter_map(|object| object.key)
             .collect();
         assert_eq!(keys, vec!["remote".to_string(), "local".to_string()]);
+    }
+
+    #[test]
+    fn ranged_get_unchecksummed() {
+        use aruna_core::structs::checksum::HASH_SHA256;
+        use aruna_core::structs::storage::multipart::MultipartChecksumType;
+        let info = ObjectInfo {
+            size: 10,
+            version_created_at: None,
+            etag: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            hashes: std::collections::HashMap::from([(HASH_SHA256.to_string(), vec![7; 32])]),
+            composite_hashes: std::collections::HashMap::new(),
+            part_count: None,
+        };
+        let mut full = GetObjectOutput::default();
+        full_object_checksums(&mut full, &info);
+        assert!(full.checksum_sha256.is_some());
+        let mut ranged = GetObjectOutput {
+            content_range: Some("bytes 0-2/10".to_string()),
+            ..Default::default()
+        };
+        full_object_checksums(&mut ranged, &info);
+        assert!(ranged.checksum_sha256.is_none());
+        assert!(ranged.checksum_type.is_none());
     }
 }
