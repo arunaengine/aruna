@@ -125,3 +125,87 @@ async fn newer_intent_restarts() {
         "a later join catches up again"
     );
 }
+
+/// Member 1 coordinates both shards; member 2 keeps a copy of each and catches up.
+fn catching_up() -> DistributionSnapshot {
+    use crate::distribution::test_record::{member, replicated};
+    use aruna_core::structs::storage::distribution::MemberState;
+    let (mut snapshot, _) = replicated(true, 1);
+    snapshot.config.ranges[1].coordinator = member(1);
+    snapshot.config.ranges[1].replicas = vec![member(2)];
+    let target = (snapshot.config.members.iter_mut()).find(|m| m.member_id == member(2));
+    target.unwrap().state = MemberState::CatchingUp;
+    snapshot
+}
+
+fn walker(snapshot: &DistributionSnapshot) -> SetWalk {
+    SetWalk {
+        realm_id: RealmId::from_bytes([9; 32]),
+        local: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+        set_id: snapshot.set_id(),
+    }
+}
+
+#[tokio::test]
+async fn ranges_take_turns() {
+    // A drain whose budget ends before a range starts the next drain at that range.
+    use crate::distribution::test_record::member;
+    let (_dir, handle) = open();
+    let context = context(&handle);
+    let snapshot = catching_up();
+    let walk = walker(&snapshot);
+    let local = snapshot.member(member(1)).unwrap();
+    let target = snapshot.member(member(2)).unwrap();
+    let second = &snapshot.config.ranges[1];
+    let key = bootstrap_key(walk.set_id, target.member_id, second.range_id);
+    for _ in 0..2 {
+        let mut budget = 1;
+        let outcome = walk
+            .walk(&context, &snapshot, local, target, &mut budget)
+            .await;
+        assert_eq!(outcome.unwrap(), Outcome::Waiting);
+    }
+    assert!(
+        get(&handle, BOOTSTRAP_KEYSPACE, key).await.is_some(),
+        "the second range had its turn"
+    );
+}
+
+#[tokio::test]
+async fn child_keeps_cursor() {
+    // A split child with a cursor of its own is never seeded from its ancestor again.
+    use crate::distribution::test_record::member;
+    let (_dir, handle) = open();
+    let context = context(&handle);
+    let snapshot = catching_up();
+    let walk = walker(&snapshot);
+    let target = snapshot.member(member(2)).unwrap();
+    let parent = snapshot.config.ranges[0].clone();
+    let child = KeyRange {
+        range_id: Ulid::from_bytes([42; 16]),
+        lineage: Some(parent.range_id),
+        ..parent.clone()
+    };
+    let store = |range_id: Ulid, cursor: BootstrapCursor| {
+        let key = bootstrap_key(walk.set_id, target.member_id, range_id);
+        let write = StorageEffect::Write {
+            key_space: BOOTSTRAP_KEYSPACE.to_string(),
+            key: key.into(),
+            value: cursor.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        let handle = handle.clone();
+        async move { handle.send_storage_effect(write).await }
+    };
+    store(parent.range_id, BootstrapCursor::start(target.intent, 3)).await;
+    let seeded = walk.seed_child(&context, &snapshot, target, &child).await;
+    assert_eq!(seeded.unwrap().map(|c| c.watermark), Some(3));
+    let mut progressed = BootstrapCursor::start(target.intent, 3);
+    progressed.done = true;
+    store(child.range_id, progressed.clone()).await;
+    let again = walk.seed_child(&context, &snapshot, target, &child).await;
+    assert_eq!(again.unwrap(), None);
+    let key = bootstrap_key(walk.set_id, target.member_id, child.range_id);
+    let kept = get(&handle, BOOTSTRAP_KEYSPACE, key).await.unwrap();
+    assert_eq!(BootstrapCursor::from_bytes(&kept).unwrap(), progressed);
+}

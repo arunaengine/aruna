@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -26,7 +26,7 @@ use aruna_core::structs::storage::distribution::inventory::{
     Entry, Position, VersionEntry, range_interval,
 };
 use aruna_core::structs::storage::distribution::{
-    DistributionMember, DistributionSnapshot, KeyRange, MAX_RANGES, Statement, StatementClaim,
+    DistributionMember, DistributionSnapshot, KeyRange, Statement, StatementClaim,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -56,6 +56,10 @@ const PAGE_BUDGET: usize = 32;
 const CLEAR_BATCH: usize = 1024;
 /// How soon the drain looks again while a bootstrap waits for its jobs.
 pub const BOOTSTRAP_POLL: Duration = Duration::from_secs(5);
+/// The set after which the next drain continues; a restart begins at the first set.
+static SET_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// The range each walk of a set and member continues at, so later ranges get their turn.
+static RANGE_TURNS: Mutex<Option<HashMap<(Ulid, Ulid), usize>>> = Mutex::new(None);
 
 /// One page of one range's walk for one catching-up member.
 #[derive(Clone, Debug, PartialEq)]
@@ -381,17 +385,17 @@ impl Operation for BootstrapPage {
     }
 }
 
-/// Rows of one keyspace under `prefix`, at most `limit`.
+/// Rows of one keyspace under `prefix` after `after`, at most `limit`.
 async fn scan(
     context: &DriverContext,
     key_space: &str,
-    prefix: Option<Vec<u8>>,
+    (prefix, after): (Option<Vec<u8>>, Option<Vec<u8>>),
     limit: usize,
 ) -> Result<Vec<(Vec<u8>, Value)>, String> {
     let iter = StorageEffect::Iter {
         key_space: key_space.to_string(),
         prefix: prefix.map(Key::from),
-        start: None,
+        start: after.map(|key| IterStart::After(key.into())),
         limit,
         txn_id: None,
     };
@@ -417,6 +421,41 @@ async fn delete(context: &DriverContext, deletes: Vec<(String, Key)>) -> Result<
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected delete answer {other:?}")),
+    }
+}
+
+/// One stored cursor, read on its own key.
+async fn read_cursor(
+    context: &DriverContext,
+    key: Vec<u8>,
+) -> Result<Option<BootstrapCursor>, String> {
+    let read = StorageEffect::Read {
+        key_space: BOOTSTRAP_KEYSPACE.to_string(),
+        key: key.into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| BootstrapCursor::from_bytes(&value))
+            .transpose()
+            .map_err(|error| error.to_string()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected cursor answer {other:?}")),
+    }
+}
+
+/// The range index a walk continues at; with `next` it records where the next walk starts.
+fn turn(walk: (Ulid, Ulid), next: Option<usize>) -> usize {
+    let Ok(mut turns) = RANGE_TURNS.lock() else {
+        return 0;
+    };
+    let turns = turns.get_or_insert_with(HashMap::new);
+    match next {
+        Some(index) => {
+            turns.insert(walk, index);
+            index
+        }
+        None => turns.get(&walk).copied().unwrap_or(0),
     }
 }
 
@@ -453,7 +492,21 @@ pub async fn process_bootstrap(context: &DriverContext) -> Result<bool, String> 
     let (realm_id, local) = (*net.realm_id(), net.node_id());
     let mut budget = PAGE_BUDGET;
     let mut waiting = false;
-    for (key, seen) in scan(context, CATCH_UP_KEYSPACE, None, SET_BATCH).await? {
+    // Sets after the last batch come next, so waiting sets never starve later ones.
+    let after = SET_CURSOR
+        .lock()
+        .map(|cursor| cursor.clone())
+        .unwrap_or(None);
+    let rows = scan(context, CATCH_UP_KEYSPACE, (None, after), SET_BATCH).await?;
+    let next = (rows.len() == SET_BATCH)
+        .then(|| rows.last().map(|(key, _)| key.clone()))
+        .flatten();
+    if let Ok(mut cursor) = SET_CURSOR.lock() {
+        *cursor = next.clone();
+    }
+    // A pass that stopped short of the end looks again soon.
+    waiting |= next.is_some();
+    for (key, seen) in rows {
         let Ok(set_id) = <[u8; 16]>::try_from(key.as_slice()).map(Ulid::from_bytes) else {
             delete(context, vec![(CATCH_UP_KEYSPACE.to_string(), key.into())]).await?;
             continue;
@@ -558,27 +611,18 @@ impl SetWalk {
         if ranges.is_empty() {
             return Ok(Outcome::Settled);
         }
-        let mut prefix = bootstrap_prefix(self.set_id);
-        prefix.extend_from_slice(&target.member_id.to_bytes());
-        let cursors: HashMap<Vec<u8>, BootstrapCursor> =
-            (scan(context, BOOTSTRAP_KEYSPACE, Some(prefix), MAX_RANGES + 1).await?)
-                .into_iter()
-                .filter_map(|(key, value)| Some((key, BootstrapCursor::from_bytes(&value).ok()?)))
-                .collect();
+        let turns = (self.set_id, target.member_id);
+        let first = turn(turns, None) % ranges.len();
         let mut watermark = u64::MAX;
         let mut done = true;
-        for range in ranges {
+        let order = (first..ranges.len()).chain(0..first);
+        for index in order {
+            let range = ranges[index];
             let key = bootstrap_key(self.set_id, target.member_id, range.range_id);
-            let own = cursors
-                .get(&key)
-                .filter(|c| c.intent == target.intent)
-                .cloned();
+            let own = (read_cursor(context, key).await?).filter(|c| c.intent == target.intent);
             let cursor = match own {
                 Some(cursor) => Some(cursor),
-                None => {
-                    self.seed_child(context, snapshot, target, range, &cursors)
-                        .await?
-                }
+                None => self.seed_child(context, snapshot, target, range).await?,
             };
             if let Some(cursor) = cursor
                 && cursor.done
@@ -587,8 +631,10 @@ impl SetWalk {
                 continue;
             }
             if *budget == 0 {
+                // The next drain starts at this range; nothing is stated before all are done.
+                turn(turns, Some(index));
                 done = false;
-                continue;
+                break;
             }
             *budget -= 1;
             let page = BootstrapPage::new(PageConfig {
@@ -648,24 +694,29 @@ impl SetWalk {
     }
 
     /// A split child of a walked range continues from its ancestor's cursor instead of walking
-    /// again from the start; the derived cursor is stored for the page that follows.
+    /// again from the start; the derived cursor is stored for the page that follows. Only a
+    /// child without a cursor of its own is seeded, so an ancestor never resets its progress.
     async fn seed_child(
         &self,
         context: &DriverContext,
         snapshot: &DistributionSnapshot,
         target: &DistributionMember,
         range: &KeyRange,
-        cursors: &HashMap<Vec<u8>, BootstrapCursor>,
     ) -> Result<Option<BootstrapCursor>, String> {
+        let own = bootstrap_key(self.set_id, target.member_id, range.range_id);
+        if read_cursor(context, own.clone()).await?.is_some() {
+            // A cursor of a former intent starts over in the page, never from an ancestor.
+            return Ok(None);
+        }
         let mut ancestor = range.lineage;
         for _ in 0..=snapshot.retired.len() {
             let Some(id) = ancestor else {
                 return Ok(None);
             };
             let key = bootstrap_key(self.set_id, target.member_id, id);
-            if let Some(parent) = cursors.get(&key).filter(|c| c.intent == target.intent) {
+            let parent = (read_cursor(context, key).await?).filter(|c| c.intent == target.intent);
+            if let Some(parent) = parent {
                 let child = parent.for_child(self.set_id, range);
-                let own = bootstrap_key(self.set_id, target.member_id, range.range_id);
                 let bytes = child.to_bytes().map_err(|error| error.to_string())?;
                 let write = StorageEffect::Write {
                     key_space: BOOTSTRAP_KEYSPACE.to_string(),
@@ -693,7 +744,13 @@ impl SetWalk {
         targets: &[&DistributionMember],
     ) -> Result<(), String> {
         let prefix = bootstrap_prefix(self.set_id);
-        let rows = scan(context, BOOTSTRAP_KEYSPACE, Some(prefix), CLEAR_BATCH).await?;
+        let rows = scan(
+            context,
+            BOOTSTRAP_KEYSPACE,
+            (Some(prefix), None),
+            CLEAR_BATCH,
+        )
+        .await?;
         let departed = |key: &[u8]| {
             let member = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
             member.is_some_and(|id| !targets.iter().any(|t| t.member_id.to_bytes() == id))
@@ -708,7 +765,13 @@ impl SetWalk {
     /// Deletes the set's cursors in bounded batches; settled once none is left.
     async fn clear(&self, context: &DriverContext) -> Result<Outcome, String> {
         let prefix = bootstrap_prefix(self.set_id);
-        let rows = scan(context, BOOTSTRAP_KEYSPACE, Some(prefix), CLEAR_BATCH).await?;
+        let rows = scan(
+            context,
+            BOOTSTRAP_KEYSPACE,
+            (Some(prefix), None),
+            CLEAR_BATCH,
+        )
+        .await?;
         let settled = rows.len() < CLEAR_BATCH;
         let deletes = (rows.into_iter())
             .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), Key::from(key)))
