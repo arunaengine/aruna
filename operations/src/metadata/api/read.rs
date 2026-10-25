@@ -177,10 +177,9 @@ const REFERENCE_BUDGET: LinkBudget = LinkBudget {
     rows: 4096,
 };
 
-/// Backlink lookup: reads one page of the local IRI reference index postings that name `iri`
-/// as an object, by document id after `after`. Each returned document is checked on its own:
-/// its live record must match the posting's cursor and be readable. An empty first page for a
-/// known graph IRI, or `resolve`, returns one predicate-less summary. Local-node-only.
+/// Reads one local page of the documents naming `iri` as an object, by document id after
+/// `after`; each must be live at the posting's cursor and readable. An empty first page for a
+/// known graph IRI, or `resolve`, returns one predicate-less summary.
 pub async fn references_metadata(
     context: &DriverContext,
     realm_id: RealmId,
