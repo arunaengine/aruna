@@ -1,8 +1,10 @@
 //! Issues and redeems download tickets for private redirects to a chosen holder (D33). The
-//! issuer signs what it verified about the caller; the target redeems a ticket once, with the
-//! same revocation check a direct authenticated read makes, then checks its own path.
+//! issuer signs what it verified about the caller; the target redeems a ticket once.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Redemption makes the same revocation check as a direct authenticated read, then the target
+// checks its own path.
 
 use std::sync::Arc;
 

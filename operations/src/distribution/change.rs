@@ -1,8 +1,9 @@
 //! Sends a group admin's membership and ownership changes of a distributed bucket to its
-//! publisher: join, leave, transfer, settings and deletion. A change that needs a coordinator
-//! waits while that coordinator is unreachable; nothing is queued.
+//! publisher: join, leave, transfer, settings and deletion.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A change that needs a coordinator waits while it is unreachable; nothing is queued.
 
 use std::sync::Arc;
 

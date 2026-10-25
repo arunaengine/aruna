@@ -1,8 +1,10 @@
 //! Keeps one tantivy key index per range of a distributed bucket, in a directory per index
-//! generation: a raw key field for exact deletes, key order and prefixes, and a tokenized
-//! name field that splits keys at path and name separators.
+//! generation.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A raw key field serves exact deletes, key order and prefixes; a tokenized name field splits
+// keys at path and name separators.
 
 use std::collections::HashMap;
 use std::ops::Bound;

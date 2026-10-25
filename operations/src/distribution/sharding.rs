@@ -1,8 +1,9 @@
-//! Tends the key ranges this node holds: runs the accounting of a split the record installed,
-//! rebuilds split children until their handoff, and lets a coordinator split a range whose
-//! maintained counters pass the bucket's thresholds. Every pass is bounded and resumes.
+//! Tends the key ranges this node holds: split accounting, rebuilds of split children until
+//! handoff, and a coordinator's split of a range whose counters pass the bucket's thresholds.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Every pass is bounded and resumes.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;

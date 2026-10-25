@@ -1,9 +1,10 @@
-//! Resolves a distributed bucket's global version id on any realm node: candidate sets by hint,
-//! the key from a local version id index or one probe per set or range. A bare content hash is
-//! resolved the same way through content indexes. Budgets are bounded; an exhausted budget or a
-//! silent range is "not resolvable now", never absence.
+//! Resolves a distributed bucket's global version id, or a bare content hash, on any realm
+//! node: candidate sets by hint, then a local index or one probe per set or range.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Budgets are bounded; an exhausted budget or a silent range is "not resolvable now", never
+// absence.
 
 use std::collections::HashMap;
 

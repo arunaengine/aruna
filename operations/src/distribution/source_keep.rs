@@ -1,8 +1,10 @@
-//! Keeps the source bytes of an external reference on a copy-on-use or cache-on-use member:
-//! after a read served it from its source, the whole object is read again, bound to its ETag
-//! or checked against its digests, and published like any kept copy; else nothing is kept.
+//! Keeps the source bytes of an external reference on a copy-on-use or cache-on-use member
+//! after a read served it from its source.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// The whole object is read again, bound to its ETag or checked against its digests, and
+// published like any kept copy; else nothing is kept.
 
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};

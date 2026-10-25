@@ -1,8 +1,9 @@
 //! Checks the source roots a member holds references of before it completes a transfer: each
-//! root is probed once through the member's own connector of it in the set's group. One pass
-//! reads one page of roots; a sweep that met an unreadable root starts over.
+//! root is probed once through the member's own connector of it in the set's group.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// One pass reads one page of roots; a sweep that met an unreadable root starts over.
 
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};

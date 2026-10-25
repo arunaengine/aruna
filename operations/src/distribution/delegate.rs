@@ -1,8 +1,10 @@
 //! Issues and accepts request-bound delegations for S3 writes forwarded to a range's
-//! coordinator (D33). The issuer signs one request it verified; the target checks the issuer,
-//! the validity window and a single-use nonce, then runs its own permission checks.
+//! coordinator (D33). The issuer signs one request it verified.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// The target checks the issuer, the validity window and a single-use nonce, then runs its own
+// permission checks.
 
 use std::sync::Arc;
 

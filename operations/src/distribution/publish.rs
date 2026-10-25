@@ -1,8 +1,10 @@
 //! Accepts one request on the set's publisher: validates it against the current head, checks
-//! group admin WRITE for admin requests and commits the signed revision, the accepted request
-//! and the outbox row in one transaction. Only committed revisions are published.
+//! group admin WRITE for admin requests and commits it in one transaction.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// That transaction holds the signed revision, the accepted request and the outbox row.
+// Only committed revisions are published.
 
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{

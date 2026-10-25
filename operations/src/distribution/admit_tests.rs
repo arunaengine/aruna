@@ -1,3 +1,4 @@
+//! Tests member admission against real storage: opened ranges, bucket checks and signing.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

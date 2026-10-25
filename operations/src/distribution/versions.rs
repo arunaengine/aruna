@@ -1,8 +1,9 @@
 //! Lists the versions of one key range of a distributed bucket by seeking in its ordered
-//! inventory: bounded interval reads, newest first per key, then one hydration of the page's
-//! version rows. No key's whole history is read for a short page.
+//! inventory, newest first per key, then hydrates the page's version rows once.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Interval reads are bounded, so no key's whole history is read for a short page.
 
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

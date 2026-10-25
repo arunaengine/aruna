@@ -1,8 +1,9 @@
-//! Keeps the range search indexes of distributed buckets current: applies the durable feed
-//! rows, opens an index for every live range, builds it from the inventory heads with a
-//! durable cursor and drops the indexes of ranges that are gone.
+//! Keeps the range search indexes of distributed buckets current: applies the feed rows, builds
+//! an index per live range from inventory heads and drops the indexes of ranges that are gone.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Feed rows and the build cursor are durable.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

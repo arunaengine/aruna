@@ -1,3 +1,4 @@
+//! Tests global version resolution: probe targets and the bounded content page.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

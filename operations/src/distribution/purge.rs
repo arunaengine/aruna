@@ -1,10 +1,10 @@
-//! Purges what a member bucket holds of one range of a distributed bucket: first the open
-//! uploads from the upload inventory, then every key from the ordered inventory, whole keys
-//! with all their versions and kept copies. Pages are bounded, a durable cursor resumes them
-//! and nothing is counted first. Every page checks that the bucket still carries the recorded
-//! set, member and incarnation; an absent or replaced bucket means the purge is done.
+//! Purges what a member bucket holds of one range of a distributed bucket: open uploads first,
+//! then every key from the ordered inventory with all its versions and kept copies.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Pages are bounded, a durable cursor resumes them and nothing is counted first. Each page
+// checks the bucket's set, member and incarnation; an absent or replaced bucket ends the purge.
 
 use aruna_core::NodeId;
 use aruna_core::UserId;

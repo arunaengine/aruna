@@ -1,3 +1,4 @@
+//! Tests distributed bucket creation plans for replica and shard presets and refused inputs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

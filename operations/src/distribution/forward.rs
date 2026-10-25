@@ -1,8 +1,9 @@
-//! Carries distributed bucket configuration between nodes: a member creates and admits its local
-//! bucket for a caller's forwarded bearer token (D12), and admin requests and member statements
-//! reach the set's publisher, which alone accepts them (D33). Nothing is queued.
+//! Carries distributed bucket configuration between nodes: a member creates and admits its
+//! bucket for a forwarded bearer token (D12); admin requests and statements reach the publisher.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Only the publisher accepts them (D33). Nothing is queued.
 
 use std::sync::Arc;
 use std::time::SystemTime;

@@ -1,8 +1,9 @@
 //! Guards local writes to a distributed bucket: only the coordinator of the key's range writes,
-//! and its versions carry the range's epoch. Every other member forwards or refuses the write
-//! with the coordinator named; nothing waits in a queue.
+//! and its versions carry the range's epoch.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Every other member forwards or refuses the write with the coordinator named; nothing waits.
 
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};

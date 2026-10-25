@@ -1,3 +1,4 @@
+//! Tests coordinator balancing: one range moves from a full node, balanced sets stay.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

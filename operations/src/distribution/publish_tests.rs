@@ -1,3 +1,4 @@
+//! Tests the publisher's request acceptance: atomic commit, admin checks, replays and conflicts.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

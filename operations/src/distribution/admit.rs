@@ -1,6 +1,5 @@
-//! Admits one member on its own node: checks that the local bucket carries the member's
-//! binding, opens the ranges whose records it holds and signs its admission statement, all in
-//! one storage transaction.
+//! Admits one member on its own node in one storage transaction: checks the local bucket's
+//! binding, opens the ranges whose records it holds and signs its admission statement.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

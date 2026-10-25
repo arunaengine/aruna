@@ -1,8 +1,10 @@
-//! Reads the bytes of a distributed version this member keeps the record of but no copy: from a
-//! holder of the version's range, verified by bao against its BLAKE3 and read under the
-//! caller's authority on that holder, then kept as the member's data strategy says.
+//! Reads the bytes of a distributed version this member keeps the record of but no copy, from
+//! a holder of the version's range, verified by bao against its BLAKE3.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// The read runs under the caller's authority on that holder; the bytes are then kept as the
+// member's data strategy says.
 
 use std::collections::HashMap;
 use std::ops::Range;

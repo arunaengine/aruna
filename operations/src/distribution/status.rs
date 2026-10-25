@@ -1,6 +1,5 @@
 //! Summarizes a distributed bucket from this node's record and heartbeats: members, ranges, a
-//! degraded range per unreachable coordinator, and whether configuration changes can reach
-//! the publisher.
+//! degraded range per unreachable coordinator, and whether changes can reach the publisher.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

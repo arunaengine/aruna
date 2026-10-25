@@ -1,3 +1,4 @@
+//! Tests listing a range's versions: order, markers, range bounds and grouped folders.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

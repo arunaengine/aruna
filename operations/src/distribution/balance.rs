@@ -1,8 +1,9 @@
-//! Balances the coordinators of a distributed bucket: a coordinator whose node is clearly fuller
-//! than the set's average, by stored bytes relative to capacity, proposes one transfer of one
-//! range to the least filled ready `copy` replica of it, one at a time and with a cool-down.
+//! Balances a distributed bucket's coordinators: a coordinator on a node clearly fuller than
+//! the set's average proposes moving one range to its least filled ready `copy` replica.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Fullness is stored bytes relative to capacity; one transfer runs at a time, with a cool-down.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

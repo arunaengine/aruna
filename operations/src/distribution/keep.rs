@@ -1,8 +1,9 @@
 //! Publishes the bytes a member keeps on use. A fill first claims its copy, so concurrent reads
-//! fetch it once; a verified copy is then published in one transaction: an attachment row, or
-//! a cache entry that evicts the oldest entries until the cache has room.
+//! fetch it once, then publishes the verified copy in one transaction.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// The copy becomes an attachment row, or a cache entry that evicts the oldest entries for room.
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

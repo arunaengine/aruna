@@ -1,10 +1,10 @@
-//! Does this node's part of the open lifecycle work of its sets: it fences a set for deletion,
-//! states the fence and purges its member bucket once the deletion commits; it fences a range
-//! it transfers away, drains its uploads and states the fence; it completes a transfer it
-//! receives; it reclaims a range it gave away and releases its bucket when it leaves. Every
-//! pass is bounded and resumes from durable state.
+//! Does this node's part of its sets' open lifecycle work: deletion fences and purges, transfer
+//! fences and completions, reclaims of ranges it gave away and bucket release when it leaves.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A transfer away drains its uploads before its fence is stated; a deletion purges the member
+// bucket once it commits. Every pass is bounded and resumes from durable state.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -1,8 +1,9 @@
 //! Creates a distributed bucket on this node, its publisher, and admits its members: the create
-//! revision, one member creation per node under the caller's bearer token, the members' signed
-//! admissions, then activation once every coordinator and replica is admitted.
+//! revision, one member creation per node under the caller's bearer token, signed admissions.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// The set activates once every coordinator and replica is admitted.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

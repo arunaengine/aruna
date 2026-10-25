@@ -1,8 +1,9 @@
 //! Lists the open multipart uploads of one key range of a distributed bucket by seeking in its
-//! upload inventory in key order, then reads only the page's upload records. Nothing walks the
-//! node's uploads of other buckets or sorts uploads in memory.
+//! upload inventory in key order, then reads only the page's upload records.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Nothing walks the node's uploads of other buckets or sorts uploads in memory.
 
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
