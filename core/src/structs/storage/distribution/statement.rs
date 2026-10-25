@@ -83,6 +83,8 @@ pub enum StatementKind {
         member_id: Ulid,
         /// The intent of the catching-up member, so a later join catches up again.
         intent: [u8; 32],
+        /// The id and epoch of each range it delivered; a changed range voids the statement.
+        ranges: Vec<(Ulid, u64)>,
         watermark: u64,
     },
     /// An automatic balancing transfer proposed by the range's coordinator.
@@ -163,13 +165,14 @@ impl Statement {
         }
     }
 
-    /// A coordinator's statement that `target` caught up with its ranges. Its id is derived
-    /// from both members and the target's intent, so a retry is embedded once.
+    /// A coordinator's statement that `target` caught up with `ranges`. Its id is derived from
+    /// both members, the target's intent and the ranges, so a retry is embedded once.
     pub fn caught_up(
         realm_id: RealmId,
         set_id: Ulid,
         signer: &DistributionMember,
         target: &DistributionMember,
+        ranges: Vec<(Ulid, u64)>,
         watermark: u64,
     ) -> Self {
         let mut hasher = blake3::Hasher::new();
@@ -178,6 +181,10 @@ impl Statement {
         hasher.update(&signer.member_id.to_bytes());
         hasher.update(&target.member_id.to_bytes());
         hasher.update(&target.intent);
+        for (range_id, epoch) in &ranges {
+            hasher.update(&range_id.to_bytes());
+            hasher.update(&epoch.to_be_bytes());
+        }
         let mut id = [0; 16];
         id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
         Self {
@@ -190,6 +197,7 @@ impl Statement {
             kind: StatementKind::CaughtUp {
                 member_id: target.member_id,
                 intent: target.intent,
+                ranges,
                 watermark,
             },
         }

@@ -254,9 +254,10 @@ fn caught_up_readies() {
         head.member(member_id(1)).unwrap(),
         head.member(member_id(2)).unwrap(),
     );
-    let statement = Statement::caught_up(realm(), head.set_id(), coordinator, edge, 7);
+    let cover = head.catch_up_cover(member_id(1), member_id(2));
+    let statement = Statement::caught_up(realm(), head.set_id(), coordinator, edge, cover, 7);
     let request = DistributionRequest::Statement(Box::new(statement.clone().sign(&secret(1))));
-    let forged = Statement::caught_up(realm(), head.set_id(), edge, edge, 7);
+    let forged = Statement::caught_up(realm(), head.set_id(), edge, edge, Vec::new(), 7);
     let forged = DistributionRequest::Statement(Box::new(forged.sign(&secret(2))));
     assert!(
         next_snapshot(realm(), Some(&head), &forged).is_err(),
@@ -275,4 +276,97 @@ fn caught_up_readies() {
         "the statement leaves the record with the catch-up"
     );
     assert!(next_snapshot(realm(), Some(&ready), &request).is_err());
+}
+
+/// Members 1 and 2 coordinate one shard each; stream edge member 3 is admitted after activation.
+fn sharded_edge() -> DistributionSnapshot {
+    use crate::structs::storage::distribution::DataStrategy;
+    use crate::structs::storage::distribution::presets::{add_edges, shard_layout};
+    let nodes = [
+        (member_id(1), secret(1).public()),
+        (member_id(2), secret(2).public()),
+    ];
+    let mut layout = shard_layout(root().set_id(), &nodes, &["m".to_string()], 0).unwrap();
+    add_edges(
+        &mut layout,
+        &[(member_id(3), secret(3).public())],
+        DataStrategy::Stream,
+    )
+    .unwrap();
+    let mut config = config();
+    config.members = layout.members;
+    config.ranges = layout.ranges;
+    let create = DistributionRequest::Create {
+        root: root(),
+        config,
+    };
+    let mut head = next_snapshot(realm(), None, &create).unwrap();
+    let intent = head.config.members[0].intent;
+    for member in [1, 2, 3] {
+        if member == 3 {
+            head = step(&head, &DistributionRequest::Activate);
+        }
+        let signed = statement(member, member + 40, intent, StatementKind::Admit);
+        let request = DistributionRequest::Statement(Box::new(signed.sign(&secret(member))));
+        head = step(&head, &request);
+    }
+    head
+}
+
+fn state_caught(
+    head: &DistributionSnapshot,
+    signer: u8,
+    ranges: Vec<(Ulid, u64)>,
+) -> DistributionRequest {
+    let (coordinator, edge) = (
+        head.member(member_id(signer)).unwrap(),
+        head.member(member_id(3)).unwrap(),
+    );
+    let statement = Statement::caught_up(realm(), head.set_id(), coordinator, edge, ranges, 7);
+    DistributionRequest::Statement(Box::new(statement.sign(&secret(signer))))
+}
+
+#[test]
+fn caught_up_ranges() {
+    use crate::structs::storage::distribution::MemberState;
+    let head = sharded_edge();
+    let cover = |head: &DistributionSnapshot, signer: u8| {
+        head.catch_up_cover(member_id(signer), member_id(3))
+    };
+    let mut stale = cover(&head, 1);
+    stale[0].1 += 1;
+    for ranges in [stale, Vec::new(), cover(&head, 2)] {
+        let request = state_caught(&head, 1, ranges);
+        assert!(next_snapshot(realm(), Some(&head), &request).is_err());
+    }
+    let first = step(&head, &state_caught(&head, 1, cover(&head, 1)));
+    // Member 1 splits its range, so its statement no longer proves what the edge holds.
+    let coordinator = first.member(member_id(1)).unwrap();
+    let range = &first.config.ranges[0];
+    let split = Statement::split(
+        realm(),
+        first.set_id(),
+        coordinator,
+        first.number,
+        range,
+        "f/",
+    );
+    let split = DistributionRequest::Statement(Box::new(split.sign(&secret(1))));
+    let split = step(&first, &split);
+    let second = step(&split, &state_caught(&split, 2, cover(&split, 2)));
+    let edge = second.member(member_id(3)).unwrap();
+    assert_eq!(edge.state, MemberState::CatchingUp);
+    assert!(
+        second
+            .statements
+            .iter()
+            .all(|signed| signed.statement.member_id != member_id(1)
+                || !matches!(signed.statement.kind, StatementKind::CaughtUp { .. })),
+        "the voided statement leaves the record"
+    );
+    let ready = step(&second, &state_caught(&second, 1, cover(&second, 1)));
+    assert_eq!(
+        ready.member(member_id(3)).unwrap().state,
+        MemberState::Ready
+    );
 }

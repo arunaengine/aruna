@@ -114,9 +114,9 @@ pub fn next_snapshot(
             // Automatic requests are evidence for the revision that applies them only.
             next.statements
                 .retain(|signed| signed.statement.kind.basis().is_none());
+            next.previous = Some(head.digest());
             accept(realm_id, &mut next, request)?;
             next.number = head.number + 1;
-            next.previous = Some(head.digest());
             if request.admin() {
                 next.admin_number = next.number;
             }
@@ -288,10 +288,16 @@ fn embed(
             Ok(())
         }
         StatementKind::CaughtUp {
-            member_id, intent, ..
+            member_id,
+            intent,
+            ranges,
+            ..
         } => {
+            let target = (*member_id, *intent);
+            caught_up(next, statement.member_id, target, ranges)?;
             next.statements.push(signed.clone());
-            caught_up(next, statement.member_id, *member_id, *intent)
+            ready_caught(next, *member_id, *intent);
+            Ok(())
         }
         StatementKind::Split { .. } => {
             apply_split(next, statement)?;
@@ -323,13 +329,13 @@ fn embed(
     }
 }
 
-/// Takes a coordinator's catch-up statement for `target` and makes the member ready once every
-/// coordinator of a range it holds stated it; the statements then leave the record.
+/// Checks a coordinator's catch-up statement for `target`: it names exactly the ranges and
+/// epochs the signer delivers to the member now. Statements a later change voided leave.
 fn caught_up(
     next: &mut DistributionSnapshot,
     signer: Ulid,
-    target: Ulid,
-    intent: [u8; 32],
+    (target, intent): (Ulid, [u8; 32]),
+    ranges: &[(Ulid, u64)],
 ) -> Result<(), DistributionError> {
     let member = next
         .member(target)
@@ -339,38 +345,66 @@ fn caught_up(
             "the member is not catching up for this intent",
         ));
     }
+    if ranges.is_empty() || next.catch_up_cover(signer, target) != ranges {
+        return Err(DistributionError::InvalidStatement(
+            "the statement does not name the ranges the signer delivers to the member",
+        ));
+    }
+    let voided: BTreeSet<Ulid> = (next.statements.iter())
+        .filter(|signed| {
+            caught_for(signed, target)
+                .is_some_and(|stated| stated != intent || !current(next, signed, target))
+        })
+        .map(|signed| signed.statement.statement_id)
+        .collect();
+    next.statements
+        .retain(|signed| !voided.contains(&signed.statement.statement_id));
+    Ok(())
+}
+
+/// Makes the member ready once every coordinator of a range it holds stated its current
+/// ranges; the statements then leave the record.
+fn ready_caught(next: &mut DistributionSnapshot, target: Ulid, intent: [u8; 32]) {
     let coordinators: BTreeSet<Ulid> = next
         .held_ranges(target)
         .iter()
         .map(|range| range.coordinator)
         .filter(|coordinator| *coordinator != target)
         .collect();
-    if !coordinators.contains(&signer) {
-        return Err(DistributionError::InvalidStatement(
-            "the signer coordinates no range the member holds",
-        ));
-    }
-    let stated = |signed: &SignedStatement| match signed.statement.kind {
-        StatementKind::CaughtUp {
-            member_id,
-            intent: stated,
-            ..
-        } => member_id == target && stated == intent,
-        _ => false,
-    };
     let signers: BTreeSet<Ulid> = (next.statements.iter())
-        .filter(|signed| stated(signed))
+        .filter(|signed| caught_for(signed, target) == Some(intent))
+        .filter(|signed| current(next, signed, target))
         .map(|signed| signed.statement.member_id)
         .collect();
     if coordinators.is_subset(&signers) {
-        next.statements.retain(|signed| !stated(signed));
+        next.statements
+            .retain(|signed| caught_for(signed, target).is_none());
         if let Some(member) =
             (next.config.members.iter_mut()).find(|member| member.member_id == target)
         {
             member.state = MemberState::Ready;
         }
     }
-    Ok(())
+}
+
+/// The intent a catch-up statement for `target` names.
+fn caught_for(signed: &SignedStatement, target: Ulid) -> Option<[u8; 32]> {
+    match &signed.statement.kind {
+        StatementKind::CaughtUp {
+            member_id, intent, ..
+        } => (*member_id == target).then_some(*intent),
+        _ => None,
+    }
+}
+
+/// Whether a catch-up statement still names the ranges its signer delivers to `target`.
+fn current(next: &DistributionSnapshot, signed: &SignedStatement, target: Ulid) -> bool {
+    match &signed.statement.kind {
+        StatementKind::CaughtUp { ranges, .. } => {
+            next.catch_up_cover(signed.statement.member_id, target) == *ranges
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

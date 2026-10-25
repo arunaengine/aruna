@@ -95,9 +95,20 @@ fn joined_member_catches_up() {
         member.intent,
         join_intent(
             head.set_id(),
-            head.number,
-            &newcomer(3, MetadataCoverage::Assigned)
+            head.digest(),
+            &newcomer(3, MetadataCoverage::Assigned),
+            &[range_id]
         )
+    );
+    let other = DistributionRequest::Join {
+        member: newcomer(3, MetadataCoverage::All),
+        ranges: vec![range_id],
+    };
+    let other = step(&head, &other);
+    assert_ne!(
+        other.member(member_id(3)).unwrap().intent,
+        member.intent,
+        "the intent binds the complete join request"
     );
     assert!(joined.config.ranges[0].replicas.contains(&member_id(3)));
     assert!(joined.serving(), "a created replica does not stop service");

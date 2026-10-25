@@ -100,6 +100,12 @@ impl DistributionSnapshot {
             })
             .collect()
     }
+
+    /// The id and epoch of each range `coordinator` walks for `member`, as a catch-up names them.
+    pub fn catch_up_cover(&self, coordinator: Ulid, member: Ulid) -> Vec<(Ulid, u64)> {
+        let ranges = self.catch_up_ranges(coordinator, member).into_iter();
+        ranges.map(|range| (range.range_id, range.epoch)).collect()
+    }
 }
 
 #[cfg(test)]

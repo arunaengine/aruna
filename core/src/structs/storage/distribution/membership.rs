@@ -9,17 +9,18 @@ use ulid::Ulid;
 use super::snapshot::{DistributionSnapshot, Tombstone};
 use super::{DistributionError, DistributionMember, MemberState, SetPhase};
 
-const JOIN_DOMAIN: &[u8] = b"aruna-distribution-join-v1";
+const JOIN_DOMAIN: &str = "aruna-distribution-join-v1";
 
-/// The intent a joined member's admission names: the set, the head it joined on and the member.
-pub fn join_intent(set_id: Ulid, head: u64, member: &DistributionMember) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(JOIN_DOMAIN);
-    hasher.update(&set_id.to_bytes());
-    hasher.update(&head.to_be_bytes());
-    hasher.update(&member.member_id.to_bytes());
-    hasher.update(member.node_id.as_bytes());
-    *hasher.finalize().as_bytes()
+/// The intent a joined member's admission names: the set, the digest of the head it joined on
+/// and the complete join request, so an admission never moves to another join.
+pub fn join_intent(
+    set_id: Ulid,
+    previous: [u8; 32],
+    member: &DistributionMember,
+    ranges: &[Ulid],
+) -> [u8; 32] {
+    let bytes = postcard::to_allocvec(&(JOIN_DOMAIN, set_id, previous, member, ranges));
+    *blake3::hash(&bytes.unwrap_or_default()).as_bytes()
 }
 
 /// Refuses configuration changes while the set is being deleted.
@@ -72,8 +73,9 @@ pub(super) fn join(
             range.replicas.push(member.member_id);
         }
     }
+    let previous = next.previous.ok_or(DistributionError::UnknownSet)?;
     let mut joined = member.clone();
-    joined.intent = join_intent(next.set_id(), next.number, member);
+    joined.intent = join_intent(next.set_id(), previous, member, ranges);
     next.config.members.push(joined);
     Ok(())
 }

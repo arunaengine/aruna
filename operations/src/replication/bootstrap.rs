@@ -626,7 +626,9 @@ impl SetWalk {
         target: &DistributionMember,
         watermark: u64,
     ) -> Result<Outcome, String> {
-        let statement = Statement::caught_up(self.realm_id, self.set_id, local, target, watermark);
+        let cover = snapshot.catch_up_cover(local.member_id, target.member_id);
+        let statement =
+            Statement::caught_up(self.realm_id, self.set_id, local, target, cover, watermark);
         let claim = StatementClaim {
             signer: self.local,
             statement,
