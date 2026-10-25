@@ -212,6 +212,7 @@ pub(super) async fn stage_item(
                 key: target_key.to_string(),
                 expected_bucket,
                 inherited_policies: Vec::new(),
+                restrictions: spec.auth_context.path_restrictions.clone(),
             },
         )
         .await

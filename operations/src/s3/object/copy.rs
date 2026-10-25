@@ -574,6 +574,7 @@ async fn preserve_reference(
             metadata: metadata.clone(),
             inherited_policies: head.source_policies,
             connector_guard: None,
+            restrictions: input.restrictions,
         },
     )
     .await?;

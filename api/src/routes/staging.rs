@@ -1453,6 +1453,7 @@ async fn reference_blob(
             key: request.key.clone(),
             expected_bucket: bucket_info,
             inherited_policies: Vec::new(),
+            restrictions: auth.path_restrictions.clone(),
         },
     )
     .await

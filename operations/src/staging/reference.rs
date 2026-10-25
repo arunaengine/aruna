@@ -16,6 +16,7 @@ use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
+use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
@@ -32,6 +33,7 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
@@ -60,6 +62,8 @@ pub struct MaterializeReferenceInput {
     /// Refs the reference carries over from an object it derives from; they
     /// are unioned with the bucket default and never dropped.
     pub inherited_policies: Vec<PlacementPolicyRef>,
+    /// The writer's path restrictions, which its replication obligation keeps.
+    pub restrictions: Option<Vec<PathRestriction>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -124,6 +128,7 @@ pub async fn stage_reference_blob(
             version_source: version_source.clone(),
             metadata: head_result.metadata.clone(),
             inherited_policies: input.inherited_policies,
+            restrictions: input.restrictions,
             connector_guard: Some((
                 head_result.connector.clone(),
                 head_result.secret_fingerprint,
@@ -158,6 +163,8 @@ pub struct ReferenceWrite {
     pub inherited_policies: Vec<PlacementPolicyRef>,
     /// The connector the binding was resolved through, re-checked at commit.
     pub connector_guard: Option<(SourceConnector, Option<[u8; 16]>)>,
+    /// The writer's path restrictions, which its replication obligation keeps.
+    pub restrictions: Option<Vec<PathRestriction>>,
 }
 
 /// Writes the reference version in one transaction and says whether anything
@@ -336,6 +343,23 @@ pub async fn write_reference_version(
             };
             apply_storage_effect(context, Effect::Storage(row)).await?;
         }
+        // The obligation commits with the version, so its fan-out survives a crash.
+        let auth = AuthContext {
+            user_id: write.user_id,
+            realm_id: write.realm_id,
+            path_restrictions: write.restrictions.clone(),
+            session: None,
+        };
+        let obligation = build_live_obligation(
+            write.node_id,
+            auth,
+            write.bucket.clone(),
+            write.key.clone(),
+            version_id,
+            false,
+            Some(txn_id),
+        )?;
+        apply_storage_effect(context, obligation).await?;
 
         let referenced_bytes = write.metadata.content_length;
         let added = AddedVersion {
@@ -636,12 +660,13 @@ mod tests {
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::driver::drive;
     use crate::node::usage_stats::RebuildStatsOperation;
+    use crate::replication::queue::{LiveObligationRecord, live_obligation_key};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE,
-        SOURCE_INDEX_KEYSPACE, USAGE_STATS_KEYSPACE,
+        REPLICATION_OBLIGATION_KEYSPACE, SOURCE_INDEX_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
     use aruna_core::node_vault::NodeVaultKey;
     use aruna_core::stream::BackendStream;
@@ -995,6 +1020,7 @@ mod tests {
                 key: "object.txt".to_string(),
                 expected_bucket,
                 inherited_policies: Vec::new(),
+                restrictions: None,
             },
         )
         .await
@@ -1096,6 +1122,7 @@ mod tests {
                 key: "object.txt".to_string(),
                 expected_bucket,
                 inherited_policies: Vec::new(),
+                restrictions: None,
             },
         )
         .await;
@@ -1164,6 +1191,7 @@ mod tests {
             key: "object.txt".to_string(),
             expected_bucket,
             inherited_policies: Vec::new(),
+            restrictions: None,
         };
 
         let first = stage_reference_blob(context, input.clone()).await.unwrap();
@@ -1213,6 +1241,7 @@ mod tests {
                 key: "object.txt".into(),
                 expected_bucket: bucket.clone(),
                 inherited_policies: Vec::new(),
+                restrictions: None,
             },
         )
         .await
@@ -1236,12 +1265,30 @@ mod tests {
             },
             inherited_policies: Vec::new(),
             connector_guard: None,
+            restrictions: None,
         };
         assert_eq!(
             write_reference_version(context, input(8)).await.unwrap(),
             (planned, true)
         );
         assert_ne!(planned, original.version_id);
+        // The written version commits with its replication obligation.
+        let record = LiveObligationRecord::new(
+            node_id,
+            AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            "bucket-a".into(),
+            "object.txt".into(),
+            planned,
+            false,
+        );
+        let key = live_obligation_key(&record).unwrap();
+        let obligation = read_value(context, REPLICATION_OBLIGATION_KEYSPACE, key.to_vec()).await;
+        assert!(obligation.is_some(), "the reference has no obligation");
         assert_eq!(
             write_reference_version(context, input(8)).await.unwrap(),
             (planned, false)
@@ -1309,6 +1356,7 @@ mod tests {
             },
             inherited_policies: Vec::new(),
             connector_guard: None,
+            restrictions: None,
         };
         write_reference_version(context, write).await.unwrap();
 
