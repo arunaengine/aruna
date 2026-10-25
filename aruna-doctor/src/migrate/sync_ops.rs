@@ -1,5 +1,5 @@
-//! Refuses the migration while the document sync store holds ops this node has not applied that
-//! this release cannot read, as old node removals or Git records from an earlier release.
+//! Refuses the migration while the document sync store holds ops this node has not applied,
+//! admitted or still pending, that this release cannot read, as old node removals or Git records.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,9 +8,9 @@ use super::{git_record, session_refs};
 use crate::explorer::ExplorerError;
 use aruna_core::document::{DocumentEvent, DocumentTarget};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
-use irokle::{ActorClock, ActorId, Event, FjallStorage, OpId, Storage, TopicId, TopicPayload};
+use irokle::{ActorClock, ActorId, Event, FjallStorage, Op, OpId, Storage, TopicId, TopicPayload};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The applied cursor the node keeps per document topic.
@@ -22,8 +22,31 @@ struct AppliedCursor {
     marks: BTreeMap<ActorId, OpId>,
 }
 
-/// Fails with recovery steps when an op past the applied cursor of a document topic cannot be
-/// read by this release; the node would drop it, so its change would never apply.
+/// Ops of the pending pool one page reads.
+const PENDING_PAGE: usize = 256;
+
+/// The document sync ops found that this release cannot read.
+#[derive(Default)]
+struct Unread {
+    count: usize,
+    first: Option<TopicId>,
+}
+
+impl Unread {
+    fn check(&mut self, op: &Op) {
+        if let TopicPayload::Event(envelope) = &op.signed.body.payload
+            && envelope.type_id == DocumentEvent::TYPE_ID
+            && !readable(&envelope.payload)
+        {
+            self.count += 1;
+            self.first.get_or_insert(op.signed.body.topic_id);
+        }
+    }
+}
+
+/// Fails with recovery steps when an op this node has not applied cannot be read by this
+/// release: one past the applied cursor of a document topic, or one still waiting in the
+/// pending pool. The node would drop it, so its change would never apply.
 pub(super) fn unread_ops(
     db: &OptimisticTxDatabase,
     sync_path: &Path,
@@ -34,8 +57,9 @@ pub(super) fn unread_ops(
     }
     let storage = FjallStorage::open(sync_path)?;
     let read = db.read_tx();
-    let (mut unread, mut first) = (0usize, None);
-    for topic in storage.list_topics()? {
+    let mut unread = Unread::default();
+    let topics = storage.list_topics()?;
+    for topic in &topics {
         if topic.event_type_id != DocumentEvent::TYPE_ID {
             continue;
         }
@@ -46,27 +70,59 @@ pub(super) fn unread_ops(
                 let Some(op_id) = storage.actor_index(&topic.topic_id, actor_id, actor_seq)? else {
                     continue;
                 };
-                let Some(op) = storage.get_op(&op_id)? else {
-                    continue;
-                };
-                if let TopicPayload::Event(envelope) = op.signed.body.payload
-                    && !readable(&envelope.payload)
-                {
-                    unread += 1;
-                    first.get_or_insert(topic.topic_id);
+                if let Some(op) = storage.get_op(&op_id)? {
+                    unread.check(&op);
                 }
             }
         }
     }
-    let Some(topic_id) = first else {
+    let provisional = storage.provisional_topics()?.into_iter();
+    let topic_ids =
+        (topics.iter().map(|topic| topic.topic_id)).chain(provisional.map(|topic| topic.topic_id));
+    pending_ops(&storage, topic_ids.collect(), &mut unread)?;
+    let Some(topic_id) = unread.first else {
         return Ok(());
     };
     Err(ExplorerError::Refused(format!(
-        "{unread} document sync ops this node has not applied yet came from an earlier release \
+        "{} document sync ops this node has not applied yet came from an earlier release \
          and this release cannot read them (first in topic {topic_id}). Start the node with the \
          earlier release until its document sync has applied them, stop it, then run the \
-         migration again"
+         migration again",
+        unread.count
     )))
+}
+
+/// Checks every op of the pending pool: those waiting for a dependency, found as the waiters
+/// of each topic's missing dependencies, and those ready for admission, read page by page.
+fn pending_ops(
+    storage: &FjallStorage,
+    topic_ids: BTreeSet<TopicId>,
+    unread: &mut Unread,
+) -> Result<(), ExplorerError> {
+    let mut seen = BTreeSet::new();
+    for topic_id in &topic_ids {
+        // A waiting op lists every dependency it misses, a waiting op among them too.
+        for dependency in storage.pending_missing_deps(topic_id)? {
+            for (_, op) in storage.pending_waiters(&dependency)? {
+                if seen.insert(op.id) {
+                    unread.check(&op);
+                }
+            }
+        }
+    }
+    let mut after = None;
+    loop {
+        let page = storage.ready_pending_after(after.as_ref(), PENDING_PAGE)?;
+        for (_, op) in &page {
+            if seen.insert(op.id) {
+                unread.check(op);
+            }
+        }
+        match page.last() {
+            Some((_, op)) if page.len() == PENDING_PAGE => after = Some(op.id),
+            _ => return Ok(()),
+        }
+    }
 }
 
 /// The clock the node replays a topic from. A cursor of another genesis, or whose positions
@@ -230,5 +286,86 @@ mod tests {
             vec![(cursor_key(&topic_id).as_slice(), cursor)],
         );
         migrate_output(database).expect("applied ops do not stop the migration");
+    }
+
+    /// Buffers an op of `topic_id` as a peer sent it: waiting for a dependency that never
+    /// arrived, or with `ready` set, depending only on `ready` and waiting for admission.
+    fn buffer(
+        storage: &FjallStorage,
+        topic_id: TopicId,
+        envelope: EventEnvelope,
+        (seq, ready): (u64, Option<OpId>),
+    ) {
+        let signer = Ed25519Signer::from_bytes(&[72; 32]);
+        let author = signer.peer_id();
+        let actor_id = irokle::actor_id_for(topic_id, author);
+        let dependency = ready.unwrap_or_else(|| OpId::hash(seq.to_be_bytes()));
+        let missing: std::collections::BTreeSet<OpId> = match ready {
+            Some(_) => Default::default(),
+            None => [dependency].into(),
+        };
+        let body = irokle::OpBody {
+            topic_id,
+            author,
+            actor_id,
+            actor_seq: seq,
+            actor_prev: None,
+            deps: [dependency].into(),
+            generation: 9,
+            payload: TopicPayload::Event(envelope),
+        };
+        let op = Op::sign(body, &signer).unwrap();
+        let meta = irokle::storage::OpMeta {
+            id: op.id,
+            topic_id,
+            author,
+            actor_id,
+            actor_seq: seq,
+            actor_prev: None,
+            deps: [dependency].into(),
+            generation: 9,
+            observed_clock: ActorClock::default(),
+            ready: ready.is_some(),
+            missing_deps: missing,
+        };
+        storage.put_pending_op(author, op, meta).unwrap();
+    }
+
+    /// An op still waiting for a dependency is checked too: once it arrives the node would
+    /// apply the op, so an old one stops the migration as an admitted one does.
+    #[test]
+    fn refuses_unread_pending() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let database = path.to_str().expect("path");
+        let sync = path.join("document-sync");
+        let topic_id = TopicId::hash(b"documents");
+        let signer = Ed25519Signer::from_bytes(&[5; 32]);
+        let actor_id = irokle::actor_id_for(topic_id, signer.peer_id());
+        let storage = FjallStorage::open(&sync).expect("sync store");
+        let genesis = TopicGenesis {
+            event_type_id: DocumentEvent::TYPE_ID.to_string(),
+            initial_peers: Default::default(),
+            replication_policy: ReplicationPolicy::default(),
+        };
+        let genesis = Oplog::with_storage(storage.clone())
+            .create_topic_genesis(topic_id, actor_id, genesis, &signer)
+            .expect("genesis");
+        buffer(&storage, topic_id, current_event(), (2, None));
+        drop(storage);
+        migrate_output(database).expect("a current waiting op does not stop the migration");
+
+        let storage = FjallStorage::open(&sync).expect("sync store");
+        let old = EventEnvelope::new::<DocumentEvent>(old_removal().into());
+        buffer(&storage, topic_id, old.clone(), (3, None));
+        // One more, ready for admission, is found by the paged listing of ready ops.
+        buffer(&storage, topic_id, old, (4, Some(genesis.id)));
+        assert_eq!(storage.ready_pending_after(None, 8).unwrap().len(), 1);
+        drop(storage);
+        let error = migrate_output(database).expect_err("unread pending ops stop it");
+        let ExplorerError::Refused(message) = error else {
+            panic!("the migration refuses: {error}");
+        };
+        assert!(message.starts_with("2 document sync ops"), "{message}");
     }
 }
