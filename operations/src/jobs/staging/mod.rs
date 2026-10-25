@@ -3,6 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod manifest;
+mod walk;
+
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::{
     JobError, JobId, JobResultPayload, StagingJobCheckpoint, StagingJobPhase, StagingJobSpec,
@@ -13,12 +16,12 @@ use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use tracing::warn;
 
-use super::executor::{JobContext, JobRunOutcome};
-use super::staging_manifest::read_manifest_chunk;
-use super::staging_walk::{
+use self::manifest::read_manifest_chunk;
+use self::walk::{
     PageFailure, check_access, clear_queue, finish_failed, item_phase, record_failure, start_walk,
     walk_page,
 };
+use super::executor::{JobContext, JobRunOutcome};
 use super::store::{put_job_rows, read_state};
 use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
 use crate::driver::drive;
@@ -294,7 +297,7 @@ async fn imported_elsewhere(
     key: &str,
 ) -> Result<bool, ItemFailure> {
     let bucket = pinned_bucket(ctx, spec).await?;
-    let own = super::staging_walk::coordinated(ctx, &bucket, &[key])
+    let own = walk::coordinated(ctx, &bucket, &[key])
         .await
         .map_err(ItemFailure::System)?;
     Ok(own.first() == Some(&false))
@@ -405,9 +408,9 @@ fn permanent_error(message: impl Into<String>) -> JobRunOutcome {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::super::staging_walk::{directory_list_path, record_failure};
+    use super::walk::{directory_list_path, record_failure};
     use super::*;
-    use crate::staging::page_rows::MAX_ERROR_SAMPLE;
+    use crate::staging::page::rows::MAX_ERROR_SAMPLE;
     use ulid::Ulid;
 
     fn test_spec() -> StagingJobSpec {

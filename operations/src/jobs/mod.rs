@@ -29,8 +29,6 @@ mod route;
 pub mod runtime;
 pub mod service;
 pub mod staging;
-mod staging_manifest;
-mod staging_walk;
 pub mod store;
 pub mod submit;
 pub mod workflow;

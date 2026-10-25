@@ -14,13 +14,13 @@ use aruna_core::types::Key;
 use byteview::ByteView;
 use futures_util::TryStreamExt;
 
-use super::executor::JobContext;
-use super::staging_walk::{
+use super::walk::{
     PageFailure, canonical_walker_path, clear_rows, commit_rows, record_failure,
     source_permission_path,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::drive;
+use crate::jobs::executor::JobContext;
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};

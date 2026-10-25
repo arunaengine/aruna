@@ -26,26 +26,26 @@ use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use tracing::warn;
 
-use super::executor::{JobContext, JobRunOutcome};
-use super::staging::{
-    ItemFailure, moved_away, persist_rows, pinned_bucket, queue_key, stage_item, sync_progress,
-};
-use super::staging_manifest::{
+use super::manifest::{
     ManifestDigest, lasting_head, lasting_resolution, lasting_source, manifest_digests,
 };
-use super::store::{batch_delete, iter_prefix_page, read_state};
+use super::{
+    ItemFailure, moved_away, persist_rows, pinned_bucket, queue_key, stage_item, sync_progress,
+};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::distribution::guard::{GuardError, authority_reads, authority_rows, write_target};
 use crate::driver::drive;
+use crate::jobs::executor::{JobContext, JobRunOutcome};
+use crate::jobs::store::{batch_delete, iter_prefix_page, read_state};
 use crate::s3::object::origin::database_entry;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
 };
-use crate::staging::page_import::{
+use crate::staging::page::import::{
     PageEntry, PageImportError, PageImportInput, PageImportOperation,
 };
-use crate::staging::page_rows::MAX_ERROR_SAMPLE;
+use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 
 /// Entries one reference page lists and registers in one transaction.
 const STAGING_PAGE_SIZE: usize = 500;

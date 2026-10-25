@@ -57,6 +57,7 @@ SMALL_DOMAINS = {
     "operations/src/harvest": "harvest operation scope; hoisting recreates harvest_*",
     "operations/src/harvest/oai_pmh": "grouped shared-prefix domain",
     "operations/src/jobs/export": "grouped shared-prefix domain",
+    "operations/src/jobs/staging": "grouped shared-prefix domain",
     "operations/src/jobs/store": "coherent ownership scope",
     "operations/src/metadata/forward": "grouped shared-prefix domain",
     "operations/src/metadata/profile": "grouped shared-prefix domain",
