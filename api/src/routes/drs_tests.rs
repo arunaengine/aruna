@@ -357,6 +357,7 @@ async fn rejects_nonlocal_version() {
         let response = get_object(
             State(state.clone()),
             Extension(Some(auth.clone())),
+            Extension(None),
             ConnectInfo("127.0.0.1:1".parse().unwrap()),
             HeaderMap::new(),
             Path(arn.to_string()),
@@ -398,6 +399,7 @@ async fn returns_missing_version() {
     let response = get_object(
         State(state),
         Extension(Some(auth)),
+        Extension(None),
         ConnectInfo("127.0.0.1:1".parse().unwrap()),
         HeaderMap::new(),
         Path(missing.to_string()),

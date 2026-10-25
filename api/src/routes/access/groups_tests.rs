@@ -814,6 +814,7 @@ async fn folds_group_buckets() {
     let (status, Json(body)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
     )
@@ -857,6 +858,7 @@ async fn bucket_folds_objects() {
     let (status, Json(body)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
     )
@@ -910,6 +912,7 @@ async fn round_trips_bucket() {
     let (_status, Json(listing)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
     )
@@ -924,6 +927,7 @@ async fn round_trips_bucket() {
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(bucket_path.clone()))),
     )
@@ -968,6 +972,7 @@ async fn paginates_object_pages() {
         let (_status, Json(body)) = list_data_paths(
             State(state.clone()),
             Extension(Some(member_auth(owner))),
+            Extension(None),
             Path(group_id.to_string()),
             Query(DataPathsQuery {
                 prefix: Some(prefix.clone()),
@@ -1010,6 +1015,7 @@ async fn path_matches_helper() {
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
     )
@@ -1042,6 +1048,7 @@ async fn hides_foreign_bucket() {
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
     )
@@ -1061,6 +1068,7 @@ async fn non_member_forbidden() {
     let result = list_data_paths(
         State(state),
         Extension(Some(outsider)),
+        Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
     )
@@ -1104,6 +1112,7 @@ async fn empty_role_forbidden() {
     let result = list_data_paths(
         State(state),
         Extension(Some(member_auth(limited))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
     )
@@ -1116,6 +1125,7 @@ async fn rejects_anonymous_caller() {
     let (state, _tempdir) = setup_state().await;
     let result = list_data_paths(
         State(state),
+        Extension(None),
         Extension(None),
         Path(Ulid::generate().to_string()),
         Query(DataPathsQuery::default()),
