@@ -61,11 +61,12 @@ where
         if bytes_done != watch.seen {
             progress(bytes_done).await;
         }
+        let wait = watch.wait;
         if watch.stalled(bytes_done, total) {
             warn!(node = %node_id, bytes_done, "A synced-folder pull stopped receiving bytes");
             return Err(SyncRefusal::Unavailable);
         }
-        tokio::time::sleep(watch.wait).await;
+        tokio::time::sleep(wait).await;
         let message = match ask_again {
             true => request(),
             false => MetadataTransportMessage::ForwardPullStatus {
