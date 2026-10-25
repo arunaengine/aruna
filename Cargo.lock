@@ -679,6 +679,7 @@ dependencies = [
  "smallvec",
  "spargebra",
  "sysinfo",
+ "tantivy",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

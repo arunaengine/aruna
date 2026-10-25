@@ -51,6 +51,7 @@ use crate::auth::bearer_token::{
     ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_linked_owner,
     realm_token_revoked, realm_user_cutoff,
 };
+use crate::distribution::key_index::RangeIndexes;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::sync::mirror_repair::RECONCILE_GRACE;
@@ -149,6 +150,9 @@ async fn create_sync_bucket(
     .await?;
     Ok(())
 }
+
+/// The directory below the metadata storage path that holds the range search indexes.
+const RANGE_INDEX_DIR: &str = "range-indexes";
 
 #[derive(Clone)]
 pub struct MetadataHandle {
@@ -277,6 +281,7 @@ struct MetadataInner {
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
     peer_contacts: PeerContacts,
     sync_pulls: crate::metadata::device_pull::PullRegistry,
+    range_indexes: Arc<RangeIndexes>,
 }
 
 #[derive(Clone)]
@@ -548,9 +553,15 @@ impl MetadataHandle {
                 profile_shacl,
                 peer_contacts: PeerContacts::default(),
                 sync_pulls: Default::default(),
+                range_indexes: Arc::new(RangeIndexes::new(path.join(RANGE_INDEX_DIR))),
             }),
             storage_priority: StoragePriority::Foreground,
         })
+    }
+
+    /// The search indexes of the distributed bucket ranges this node holds.
+    pub fn range_indexes(&self) -> Arc<RangeIndexes> {
+        self.inner.range_indexes.clone()
     }
 
     /// The device pulls this node is running.
