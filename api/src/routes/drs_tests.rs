@@ -968,4 +968,170 @@ mod global {
         let foreign = resolve(&node, (None, None), &id, (false, Some(ticket))).await;
         assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
     }
+
+    async fn download(
+        node: &Node,
+        auth: Option<&AuthContext>,
+        id: &str,
+        ticket: Option<String>,
+    ) -> Response {
+        download_object(
+            State(node.state.clone()),
+            Extension(auth.cloned()),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            Query(DownloadQuery {
+                object_id: id.to_string(),
+                here: false,
+                ticket,
+            }),
+        )
+        .await
+    }
+
+    async fn object_status(node: &Node, auth: &AuthContext, id: &str) -> StatusCode {
+        get_object(
+            State(node.state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            Path(id.to_string()),
+        )
+        .await
+        .status()
+    }
+
+    #[tokio::test]
+    async fn downloads_by_query() {
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let served = download(&node, Some(&node.owner), &id, None).await;
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(body(served).await, "bytes");
+        // A set id names no object.
+        let set = GlobalId::Set {
+            realm_id: node.state.get_realm_id(),
+            set_id: ulid::Ulid::from_bytes([3; 16]),
+            prefix: String::new(),
+        };
+        let named = download(&node, Some(&node.owner), &set.to_url(), None).await;
+        assert_eq!(named.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn member_arns_resolve() {
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let version_id = id.rsplit('/').next().unwrap().parse().unwrap();
+        let arn = |version_id| {
+            VersionedObjectArn::new(
+                node.state.get_realm_id(),
+                node.state.get_node_id(),
+                BUCKET,
+                "a.md",
+                version_id,
+            )
+            .unwrap()
+            .to_string()
+        };
+        // A member bucket's object answers under its global id.
+        let found = get_object(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            Path(arn(version_id)),
+        )
+        .await;
+        assert_eq!(found.status(), StatusCode::OK);
+        let found: serde_json::Value = serde_json::from_str(&body(found).await).unwrap();
+        assert_eq!(found["aliases"], serde_json::json!([id]));
+        // A node ARN proves no absence in a distributed bucket.
+        let missing = arn(ulid::Ulid::from_bytes([4; 16]));
+        assert_eq!(
+            object_status(&node, &node.owner, &missing).await,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn content_hashes_searched() {
+        let node = node_state().await;
+        mirror(&node.state, node.group_id, BUCKET).await;
+        stored(&node).await;
+        // A hash nothing holds is searched in the distributed indexes and stays absent.
+        let unknown = format!("{DATA_PREFIX}{}", hex::encode([7u8; 32]));
+        assert_eq!(
+            object_status(&node, &node.owner, &unknown).await,
+            StatusCode::NOT_FOUND
+        );
+        // A caller who may not read the local copy is refused the distributed one too.
+        let known = format!("{DATA_PREFIX}{}", blake3::hash(b"bytes").to_hex());
+        assert_eq!(
+            object_status(&node, &node.stranger, &known).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            object_status(&node, &node.owner, &known).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_bytes_unavailable() {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+        use aruna_core::structs::storage::blob::VersionKey;
+        let node = node_state().await;
+        mirror(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let version_id = id.rsplit('/').next().unwrap().parse().unwrap();
+        let key = VersionKey::new(BUCKET, "a.md", version_id)
+            .to_bytes()
+            .unwrap();
+        let delete = StorageEffect::Delete {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: None,
+        };
+        node.state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(delete)
+            .await;
+        // The index names the version, but no holder answered for the missing bytes.
+        assert_eq!(
+            object_status(&node, &node.owner, &id).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn redeems_own_tickets() {
+        use aruna_operations::auth::bearer_token::token_grant;
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let input = TicketInput {
+            target: node.state.get_node_id(),
+            user_id: node.owner.user_id,
+            grant: token_grant(&unsigned_token(&node.owner)).unwrap(),
+            restrictions: None,
+            session: None,
+            object_id: id.clone(),
+        };
+        let now = now_millis() / 1000;
+        let ticket = issue_ticket(&node.state.get_ctx(), input, now).unwrap();
+        let ticket = ticket.encode().unwrap();
+        let first = download(&node, None, &id, Some(ticket.clone())).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        // A ticket is spent by its first download.
+        let again = download(&node, None, &id, Some(ticket)).await;
+        assert_eq!(again.status(), StatusCode::FORBIDDEN);
+    }
 }
