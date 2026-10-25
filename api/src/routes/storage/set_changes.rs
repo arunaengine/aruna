@@ -395,3 +395,7 @@ pub async fn delete_distributed(
         Json(change_response(set_id, revision)),
     ))
 }
+
+#[cfg(test)]
+#[path = "set_changes_tests.rs"]
+mod tests;
