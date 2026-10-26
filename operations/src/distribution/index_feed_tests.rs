@@ -7,12 +7,14 @@ use std::ops::Bound;
 
 use super::*;
 use crate::distribution::key_index::KeyQuery;
+use crate::distribution::test_record::{record, searched, store_record};
 use crate::distribution::test_store::{apply, context, get, install, open, purge, range, write};
 use aruna_core::structs::storage::distribution::inventory::head_position;
 use tempfile::TempDir;
 
+/// The set of [`searched`], which keeps a search index.
 fn set() -> Ulid {
-    Ulid::from_bytes([4; 16])
+    searched().0.set_id()
 }
 
 fn range_id() -> Ulid {
@@ -28,6 +30,7 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let (dir, handle) = open();
+    store_record(&handle, set(), searched().1).await;
     install(&handle, set(), &[range(1, "", None)]).await;
     let index_dir = tempfile::tempdir().unwrap();
     let indexes = Arc::new(RangeIndexes::new(index_dir.path()));
@@ -253,4 +256,36 @@ async fn split_reindexes_children() {
             .await;
         assert_eq!(found.unwrap().keys, [expected]);
     }
+}
+
+// A set without a search index gets no range index, and its feed rows are dropped unapplied.
+#[tokio::test]
+async fn search_off_skips() {
+    let (_dir, handle) = open();
+    let (snapshot, bytes) = record(true);
+    let set_id = snapshot.set_id();
+    store_record(&handle, set_id, bytes).await;
+    install(&handle, set_id, &[range(1, "", None)]).await;
+    assert!(apply(&handle, write(set_id, "a/one", 1, 3)).await.unwrap());
+    let index_dir = tempfile::tempdir().unwrap();
+    let indexes = Arc::new(RangeIndexes::new(index_dir.path()));
+    let mut feeder = Feeder::new(indexes.clone(), FeedLimits::default());
+
+    feeder.pass(&context(&handle)).await;
+
+    let state = get(
+        &handle,
+        SEARCH_INDEX_KEYSPACE,
+        state_key(set_id, range_id()),
+    )
+    .await;
+    assert!(state.is_none());
+    let feed = get(
+        &handle,
+        SEARCH_FEED_KEYSPACE,
+        head_position(set_id, "a/one"),
+    )
+    .await;
+    assert!(feed.is_none());
+    assert!(!indexes.exists(set_id, range_id(), 1).await.unwrap());
 }

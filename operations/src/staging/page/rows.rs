@@ -470,7 +470,13 @@ fn register_rows(
         generation: pointer.generation,
         entry: entry_of(&version, entry.observation.content_length),
     };
-    let change = version_written(guards.binding.as_ref(), &entry.target_key, added, true);
+    let change =
+        version_written(guards.binding.as_ref(), &entry.target_key, added, true).map(|change| {
+            InventoryChange {
+                feed: guards.search,
+                ..change
+            }
+        });
     // The inventory saw the full binding; the stored one names its root by digest.
     let (version, root) = compact_version(version)?;
     let root = root.map(|root| root.digest().map(|digest| (digest, root)));

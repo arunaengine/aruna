@@ -32,6 +32,7 @@ use super::feed_store::{
 };
 use super::key_index::{IndexedKey, KeyChange, KeyIndexError, RangeIndexes};
 use crate::driver::DriverContext;
+use crate::replication::members::read_record;
 
 /// The key changes of one range and the feed rows they settle.
 type RangeBatch = (Vec<KeyChange>, Vec<(Key, Value)>);
@@ -101,8 +102,8 @@ impl Feeder {
         let mut changed = 0;
         for (walk, result) in [
             ("feed", self.feed_page(&storage).await),
-            ("open", self.open_page(&storage).await),
-            ("build", self.state_page(&storage).await),
+            ("open", self.open_page(context, &storage).await),
+            ("build", self.state_page(context, &storage).await),
         ] {
             match result {
                 Ok(count) => changed += count,
@@ -203,8 +204,13 @@ impl Feeder {
         drop_settled(storage, settled).await
     }
 
-    /// Opens a building index for every live range of a page of account rows without one.
-    async fn open_page(&mut self, storage: &StorageHandle) -> Result<usize, FeedError> {
+    /// Opens a building index for every live range of a page of account rows without one,
+    /// in sets that keep a search index.
+    async fn open_page(
+        &mut self,
+        context: &DriverContext,
+        storage: &StorageHandle,
+    ) -> Result<usize, FeedError> {
         let (rows, next) = iter(
             storage,
             RANGE_ACCOUNT_KEYSPACE,
@@ -222,11 +228,15 @@ impl Feeder {
         }
         let states = read_many(storage, SEARCH_INDEX_KEYSPACE, live.clone()).await?;
         let mut opened = 0;
+        let mut searched = BTreeMap::new();
         for (key, state) in live.into_iter().zip(states) {
             if state.is_some() {
                 continue;
             }
             let (set_id, range_id) = split_key(&key)?;
+            if !search_on(context, &mut searched, set_id).await? {
+                continue;
+            }
             // Leftovers of an earlier index of the range would hold stale keys.
             self.indexes.prune(set_id, range_id, None).await?;
             let state = IndexState::Building {
@@ -239,9 +249,14 @@ impl Feeder {
         Ok(opened)
     }
 
-    /// Drops the indexes of ranges without a live account and builds the first building
-    /// index of the page; the walk stays at that range until its index is ready.
-    async fn state_page(&mut self, storage: &StorageHandle) -> Result<usize, FeedError> {
+    /// Drops the indexes of ranges without a live account or whose set keeps no search index,
+    /// and builds the first building index of the page; the walk stays at that range until its
+    /// index is ready.
+    async fn state_page(
+        &mut self,
+        context: &DriverContext,
+        storage: &StorageHandle,
+    ) -> Result<usize, FeedError> {
         let (rows, next) = iter(
             storage,
             SEARCH_INDEX_KEYSPACE,
@@ -253,6 +268,7 @@ impl Feeder {
         let accounts = read_many(storage, RANGE_ACCOUNT_KEYSPACE, keys).await?;
         let mut previous = self.states.take();
         let mut changed = 0;
+        let mut searched = BTreeMap::new();
         for ((key, state), account) in rows.into_iter().zip(accounts) {
             let (set_id, range_id) = split_key(&key)?;
             let account = account
@@ -260,6 +276,10 @@ impl Feeder {
                 .transpose()?;
             let account =
                 account.filter(|account| !matches!(account.charge, Charge::Retired { .. }));
+            let account = match account {
+                Some(account) if search_on(context, &mut searched, set_id).await? => Some(account),
+                _ => None,
+            };
             match (account, IndexState::from_bytes(&state)?) {
                 (None, _) => {
                     self.indexes.prune(set_id, range_id, None).await?;
@@ -387,6 +407,23 @@ pub fn spawn_index_feed(context: Arc<DriverContext>, shutdown: &Shutdown) {
             }
         }
     });
+}
+
+/// Whether set `set_id` keeps a search index, from this node's record; without one it does not.
+async fn search_on(
+    context: &DriverContext,
+    searched: &mut BTreeMap<Ulid, bool>,
+    set_id: Ulid,
+) -> Result<bool, FeedError> {
+    if let Some(search) = searched.get(&set_id) {
+        return Ok(*search);
+    }
+    let view = read_record(context, set_id)
+        .await
+        .map_err(FeedError::Storage)?;
+    let search = view.is_some_and(|view| view.snapshot().config.settings.search_index);
+    searched.insert(set_id, search);
+    Ok(search)
 }
 
 /// The index state row of a range, keyed like its account row.

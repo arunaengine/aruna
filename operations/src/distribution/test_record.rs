@@ -30,6 +30,23 @@ pub(crate) fn record(active: bool) -> (DistributionSnapshot, Vec<u8>) {
 
 /// The two shards of [`record`], each with `replicas` copies on the other member.
 pub(crate) fn replicated(active: bool, replicas: usize) -> (DistributionSnapshot, Vec<u8>) {
+    with_settings(active, replicas, DistributionSettings::default())
+}
+
+/// The active record of [`record`] with a search index kept.
+pub(crate) fn searched() -> (DistributionSnapshot, Vec<u8>) {
+    let settings = DistributionSettings {
+        search_index: true,
+        ..DistributionSettings::default()
+    };
+    with_settings(true, 0, settings)
+}
+
+fn with_settings(
+    active: bool,
+    replicas: usize,
+    settings: DistributionSettings,
+) -> (DistributionSnapshot, Vec<u8>) {
     let root = SetRoot {
         publisher: secret(1).public(),
         owner_group: Ulid::from_bytes([90; 16]),
@@ -48,7 +65,7 @@ pub(crate) fn replicated(active: bool, replicas: usize) -> (DistributionSnapshot
             node_set: None,
             members: layout.members,
             ranges: layout.ranges,
-            settings: DistributionSettings::default(),
+            settings,
         },
     };
     let mut head = next_snapshot(realm(), None, &create).unwrap();

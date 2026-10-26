@@ -79,6 +79,8 @@ pub struct InventoryChange {
     pub upload: Option<(Ulid, bool)>,
     /// The source root of a received external reference, which a new coordinator checks.
     pub root: Option<RootEntry>,
+    /// Whether a changed head feeds the range's search index; off when the set keeps none.
+    pub feed: bool,
 }
 
 impl InventoryChange {
@@ -91,6 +93,7 @@ impl InventoryChange {
             head: HeadChange::Keep,
             upload: None,
             root: None,
+            feed: true,
         }
     }
 }
@@ -780,9 +783,11 @@ impl KeyPlan {
         }
         let position = head_position(self.change.set_id, &self.change.key);
         // The search feed row carries the new head to the range's index in this transaction.
-        let feed = feed_value(new.as_ref())?;
-        self.writes
-            .push(row(SEARCH_FEED_KEYSPACE, position.clone(), feed));
+        if self.change.feed {
+            let feed = feed_value(new.as_ref())?;
+            self.writes
+                .push(row(SEARCH_FEED_KEYSPACE, position.clone(), feed));
+        }
         match new {
             Some(head) => {
                 self.writes

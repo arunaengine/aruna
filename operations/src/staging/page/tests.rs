@@ -810,6 +810,13 @@ async fn page_maintains_inventory() {
     );
     assert!(has_row(handle, head_position(set_id, "a")).await);
     assert!(has_row(handle, head_position(set_id, "b")).await);
+    // The set keeps no search index, so the page feeds none.
+    let feed = crate::distribution::test_store::get(
+        handle,
+        aruna_core::keyspaces::SEARCH_FEED_KEYSPACE,
+        head_position(set_id, "a"),
+    );
+    assert!(feed.await.is_none());
 }
 
 // A page whose keys reach a range another member coordinates writes nothing.
