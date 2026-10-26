@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, pinned_route, relay_route,
-    relay_targets, relay_url, relayed_headers,
+    API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, pinned_route, pinned_targets,
+    relay_route, relay_targets, relay_url, relayed_headers,
 };
 use crate::error::{ErrorResponse, ServerError};
 use axum::body::to_bytes;
@@ -100,6 +100,29 @@ fn management_answers_itself() {
         ),
         None
     );
+}
+
+#[test]
+fn requests_reach_owner() {
+    // A database request asked of any management node is relayed to the request owner.
+    let route = Some("/api/v1/system/realm/databases/requests/{request_id}/approve");
+    assert_eq!(
+        relay_route(&Method::POST, route, true, false),
+        Some("/system/realm/databases/requests/{request_id}/approve")
+    );
+    assert_eq!(relay_route(&Method::POST, route, true, true), None);
+    let owner = iroh::SecretKey::from_bytes(&[1; 32]).public();
+    let url = "https://owner.example.test".to_string();
+    let peers = vec!["https://peer.example.test".to_string()];
+    let known = Some((owner, Some(url.clone())));
+    assert_eq!(
+        pinned_targets(known.clone(), peers.clone(), true),
+        [url.clone()]
+    );
+    assert_eq!(pinned_targets(known, peers.clone(), false), [url]);
+    let unpublished = Some((owner, None));
+    assert!(pinned_targets(unpublished.clone(), peers.clone(), true).is_empty());
+    assert_eq!(pinned_targets(unpublished, peers.clone(), false), peers);
 }
 
 #[test]
