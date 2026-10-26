@@ -5,6 +5,9 @@
 // Pages add their counts to the rebuild rows while storage adds every later delta there too,
 // so the rows are exact when the walk ends and replace the live counter rows.
 
+// Each page commit saves the position after it. Storage keeps the rows as the rebuild began,
+// so a restarted rebuild reads them unchanged and resumes there, rereading only the buckets.
+
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,11 +30,14 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     VersionKey,
 };
-use aruna_core::structs::storage::usage::{UsageCounterError, UsageCounters};
+use aruna_core::structs::storage::usage::{
+    RebuildProgress, USAGE_PROGRESS_KEY, UsageCounterError, UsageCounters,
+};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{info, warn};
+use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::node::rebuild_counts::{Joined, RebuildCounts, is_pithos, named_size, usable};
@@ -86,12 +92,15 @@ pub fn spawn_usage_rebuild(
 pub enum RebuildStatsState {
     Init,
     Begin,
+    ReadProgress,
     ReadConfig,
     Page,
     Joins,
     Fallback,
     StartPage,
+    PageMarker,
     AddPage,
+    SaveProgress,
     CommitPage,
     CloseSnapshot,
     Finish,
@@ -115,7 +124,12 @@ pub enum RebuildStatsError {
     },
     #[error("RebuildUsageStats failed")]
     RebuildFailed,
+    #[error("another usage rebuild replaced this one")]
+    Superseded,
 }
+
+/// A walk position: walk index, quota bucket and the start of the next page.
+type Position = (usize, usize, Option<IterStart>);
 
 /// The walks in their order. Buckets come first for the bucket groups; the versions of
 /// buckets whose group has a quota come before all other versions.
@@ -132,7 +146,27 @@ enum Walk {
     Uploads,
 }
 
+/// The walks in their order; a saved position names one by its index.
+const WALKS: [Walk; 9] = [
+    Walk::Buckets,
+    Walk::QuotaVersions,
+    Walk::QuotaEnvelopes,
+    Walk::Versions,
+    Walk::Envelopes,
+    Walk::Copies,
+    Walk::Blobs,
+    Walk::Pending,
+    Walk::Uploads,
+];
+
 impl Walk {
+    fn index(self) -> usize {
+        WALKS
+            .iter()
+            .position(|walk| *walk == self)
+            .unwrap_or(WALKS.len())
+    }
+
     fn key_space(self) -> &'static str {
         match self {
             Walk::Buckets => S3_BUCKET_KEYSPACE,
@@ -198,6 +232,10 @@ pub struct RebuildStatsOperation {
     copy_cursor: Option<IterStart>,
     sizes: HashMap<[u8; 32], Option<u64>>,
     counts: RebuildCounts,
+    /// The rebuild this walk belongs to, from the saved progress.
+    generation: Option<Ulid>,
+    /// The saved position to resume at after the bucket walk recounted the bucket map.
+    resume: Option<Position>,
     output: Option<Result<UsageCounters, RebuildStatsError>>,
 }
 
@@ -225,6 +263,8 @@ impl RebuildStatsOperation {
             copy_cursor: None,
             sizes: HashMap::new(),
             counts: RebuildCounts::default(),
+            generation: None,
+            resume: None,
             output: None,
         }
     }
@@ -263,14 +303,45 @@ impl RebuildStatsOperation {
             return self.unexpected("TransactionStarted", event);
         };
         self.snapshot = Some(txn_id);
+        self.state = RebuildStatsState::ReadProgress;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: Key::from(USAGE_PROGRESS_KEY.to_vec()),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// Takes the saved position and totals; the walk restarts at the buckets either way.
+    fn handle_progress(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected("ReadResult", event);
+        };
+        let progress = match marker_progress(value) {
+            Ok(progress) => progress,
+            Err(error) => return self.fail(error),
+        };
+        self.generation = Some(progress.generation);
+        self.counts.total = progress.total;
+        self.counts.orphan_versions = progress.orphan_versions;
+        let start = (progress.start).map(|(key, inclusive)| match inclusive {
+            true => IterStart::At(key.into()),
+            false => IterStart::After(key.into()),
+        });
+        if progress.walk > 0 || start.is_some() {
+            self.resume = Some((progress.walk.into(), progress.scope as usize, start));
+        }
         let Some(realm_id) = self.realm_id else {
             return self.start_walk(Walk::Buckets);
+        };
+        let snapshot = match self.snapshot_id() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return self.fail(error),
         };
         self.state = RebuildStatsState::ReadConfig;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: REALM_CONFIG_KEYSPACE.to_string(),
             key: DocumentTarget::RealmConfig { realm_id }.storage_key(),
-            txn_id: Some(txn_id),
+            txn_id: Some(snapshot),
         })]
     }
 
@@ -536,11 +607,14 @@ impl RebuildStatsOperation {
     }
 
     fn book_rows(&mut self) -> Result<(), RebuildStatsError> {
-        self.counts.seed_shards();
-        let (joined, sizes) = (&self.joined, &self.sizes);
         for (key, value) in std::mem::take(&mut self.rows) {
+            let replayed = self.walk == Walk::Buckets && self.replayed(&key);
+            let (joined, sizes) = (&self.joined, &self.sizes);
             let counts = &mut self.counts;
             match self.walk {
+                Walk::Buckets if replayed => {
+                    counts.remember(&key, &value)?;
+                }
                 Walk::Buckets => counts.bucket(&key, &value)?,
                 Walk::QuotaVersions | Walk::Versions => {
                     counts.version(&key, &value, joined, sizes)?
@@ -560,6 +634,27 @@ impl RebuildStatsOperation {
             return self.unexpected("TransactionStarted", event);
         };
         self.page_txn = Some(txn_id);
+        self.state = RebuildStatsState::PageMarker;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: Key::from(USAGE_PROGRESS_KEY.to_vec()),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// The page commits only into the rebuild that the saved progress still names.
+    fn handle_page_marker(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected("ReadResult", event);
+        };
+        match marker_progress(value) {
+            Ok(progress) if Some(progress.generation) == self.generation => {}
+            Ok(_) => return self.fail(RebuildStatsError::Superseded),
+            Err(error) => return self.fail(error),
+        }
+        let Some(txn_id) = self.page_txn else {
+            return self.fail(RebuildStatsError::RebuildFailed);
+        };
         let (deltas, buckets) = self.counts.take_deltas();
         self.state = RebuildStatsState::AddPage;
         smallvec![Effect::Storage(StorageEffect::AddUsage {
@@ -573,6 +668,22 @@ impl RebuildStatsOperation {
     fn handle_page_added(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected("BatchWriteResult", event);
+        };
+        let (Some(txn_id), Ok(progress)) = (self.page_txn, self.progress()) else {
+            return self.fail(RebuildStatsError::RebuildFailed);
+        };
+        self.state = RebuildStatsState::SaveProgress;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: Key::from(USAGE_PROGRESS_KEY.to_vec()),
+            value: Value::from(progress),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_progress_saved(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.unexpected("WriteResult", event);
         };
         let Some(txn_id) = self.page_txn else {
             return self.fail(RebuildStatsError::RebuildFailed);
@@ -606,9 +717,73 @@ impl RebuildStatsOperation {
 
     fn walk_done(&mut self) -> Effects {
         self.counts.last_head = None;
+        if self.walk == Walk::Buckets
+            && let Some((walk, scope, start)) = self.resume.take()
+            && walk > 0
+        {
+            return self.resume_at(walk, scope, start);
+        }
         if let Some(walk) = self.walk.next() {
             return self.start_walk(walk);
         }
+        self.close_walks()
+    }
+
+    /// Continues at a saved position; past the last walk the rebuild only finishes.
+    fn resume_at(&mut self, walk: usize, scope: usize, start: Option<IterStart>) -> Effects {
+        let Some(walk) = WALKS.get(walk).copied() else {
+            return self.close_walks();
+        };
+        self.walk = walk;
+        self.scope = scope;
+        self.cursor = start;
+        if walk.scoped() && scope >= self.counts.quota_buckets.len() {
+            return self.walk_done();
+        }
+        self.page_effect()
+    }
+
+    /// Bucket rows the saved position is past were counted before; they only fill the map.
+    fn replayed(&self, key: &Key) -> bool {
+        match &self.resume {
+            Some((walk, _, _)) if *walk > 0 => true,
+            Some((_, _, Some(IterStart::After(last)))) => key <= last,
+            Some((_, _, Some(IterStart::At(first)))) => key < first,
+            _ => false,
+        }
+    }
+
+    /// The position after the booked page, as `advance` will take it.
+    fn following(&self) -> Position {
+        let walk = self.walk.index();
+        if let Some(next) = &self.next {
+            return (walk, self.scope, Some(next.clone()));
+        }
+        if self.walk.scoped() && self.scope + 1 < self.counts.quota_buckets.len() {
+            return (walk, self.scope + 1, None);
+        }
+        (walk + 1, 0, None)
+    }
+
+    fn progress(&self) -> Result<Vec<u8>, RebuildStatsError> {
+        let generation = self.generation.ok_or(RebuildStatsError::RebuildFailed)?;
+        let (walk, scope, start) = self.following();
+        let start = start.map(|start| match start {
+            IterStart::At(key) => (key.to_vec(), true),
+            IterStart::After(key) => (key.to_vec(), false),
+        });
+        let progress = RebuildProgress {
+            generation,
+            walk: u8::try_from(walk).map_err(|_| RebuildStatsError::RebuildFailed)?,
+            scope: u32::try_from(scope).map_err(|_| RebuildStatsError::RebuildFailed)?,
+            start,
+            total: self.counts.total,
+            orphan_versions: self.counts.orphan_versions,
+        };
+        Ok(progress.to_bytes()?)
+    }
+
+    fn close_walks(&mut self) -> Effects {
         if self.counts.orphan_versions > 0 {
             warn!(
                 versions = self.counts.orphan_versions,
@@ -646,6 +821,12 @@ impl RebuildStatsOperation {
     }
 }
 
+/// The saved progress; a begun rebuild always has one.
+fn marker_progress(value: Option<Value>) -> Result<RebuildProgress, RebuildStatsError> {
+    let value = value.ok_or(RebuildStatsError::RebuildFailed)?;
+    Ok(RebuildProgress::from_bytes(value.as_ref())?)
+}
+
 impl Operation for RebuildStatsOperation {
     type Output = UsageCounters;
     type Error = RebuildStatsError;
@@ -664,12 +845,15 @@ impl Operation for RebuildStatsOperation {
         match self.state {
             RebuildStatsState::Init => self.start(),
             RebuildStatsState::Begin => self.handle_begin(event),
+            RebuildStatsState::ReadProgress => self.handle_progress(event),
             RebuildStatsState::ReadConfig => self.handle_config(event),
             RebuildStatsState::Page => self.handle_page(event),
             RebuildStatsState::Joins => self.handle_joins(event),
             RebuildStatsState::Fallback => self.handle_copy(event),
             RebuildStatsState::StartPage => self.handle_page_started(event),
+            RebuildStatsState::PageMarker => self.handle_page_marker(event),
             RebuildStatsState::AddPage => self.handle_page_added(event),
+            RebuildStatsState::SaveProgress => self.handle_progress_saved(event),
             RebuildStatsState::CommitPage => self.handle_page_committed(event),
             RebuildStatsState::CloseSnapshot => self.handle_closed(event),
             RebuildStatsState::Finish => self.handle_finished(event),

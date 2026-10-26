@@ -19,9 +19,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::{
-    BucketDelta, GLOBAL_SHARD_COUNT, UsageCounters, UsageDelta, global_group_key, global_shard_key,
-    shard_for_archive, shard_for_hash, usage_backend_key, usage_bucket_key, usage_group_key,
-    usage_shadow_key,
+    BucketDelta, UsageCounters, UsageDelta, global_group_key, global_shard_key, shard_for_archive,
+    shard_for_hash, usage_backend_key, usage_bucket_key, usage_group_key, usage_shadow_key,
 };
 use aruna_core::types::{GroupId, Key, Value};
 use tracing::warn;
@@ -49,7 +48,6 @@ pub(crate) struct RebuildCounts {
     pub(crate) quota_buckets: BTreeSet<String>,
     usage: BTreeMap<Vec<u8>, UsageDelta>,
     buckets: BTreeMap<Vec<u8>, BucketDelta>,
-    seeded: bool,
     pub(crate) total: UsageCounters,
     /// Versions whose location row is gone; their bytes cannot be counted.
     pub(crate) orphan_versions: u64,
@@ -58,17 +56,6 @@ pub(crate) struct RebuildCounts {
 }
 
 impl RebuildCounts {
-    /// Every global shard row exists after a rebuild, an empty one included.
-    pub(crate) fn seed_shards(&mut self) {
-        if self.seeded {
-            return;
-        }
-        for shard in 0..GLOBAL_SHARD_COUNT {
-            self.add_usage(global_shard_key(shard), UsageDelta::default());
-        }
-        self.seeded = true;
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.usage.is_empty() && self.buckets.is_empty()
     }
@@ -86,23 +73,33 @@ impl RebuildCounts {
         (usage, buckets)
     }
 
-    pub(crate) fn bucket(&mut self, key: &Key, value: &Value) -> Result<(), RebuildStatsError> {
+    /// Notes a bucket's group, and whether its group has a quota, without counting it.
+    pub(crate) fn remember(
+        &mut self,
+        key: &Key,
+        value: &Value,
+    ) -> Result<(String, GroupId), RebuildStatsError> {
         let info = BucketInfo::from_bytes(value.as_ref())?;
         let bucket = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
+        let quota = self.quota.as_ref();
+        if quota.is_some_and(|quota| quota.effective_group_ceiling(&info.group_id).is_some()) {
+            self.quota_buckets.insert(bucket.clone());
+        }
+        self.bucket_groups.insert(bucket.clone(), info.group_id);
+        Ok((bucket, info.group_id))
+    }
+
+    pub(crate) fn bucket(&mut self, key: &Key, value: &Value) -> Result<(), RebuildStatsError> {
+        let (bucket, group_id) = self.remember(key, value)?;
         let delta = UsageCounters {
             buckets: 1,
             ..Default::default()
         };
         self.total.add(&delta)?;
-        self.add_usage(usage_group_key(info.group_id), signed(&delta));
-        self.add_usage(global_group_key(info.group_id), signed(&delta));
+        self.add_usage(usage_group_key(group_id), signed(&delta));
+        self.add_usage(global_group_key(group_id), signed(&delta));
         // Each bucket keeps a row, an empty one included.
         self.add_bucket(usage_bucket_key(&bucket), BucketDelta::default());
-        let quota = self.quota.as_ref();
-        if quota.is_some_and(|quota| quota.effective_group_ceiling(&info.group_id).is_some()) {
-            self.quota_buckets.insert(bucket.clone());
-        }
-        self.bucket_groups.insert(bucket, info.group_id);
         Ok(())
     }
 
