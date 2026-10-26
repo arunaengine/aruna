@@ -20,10 +20,10 @@ use aruna_core::keyspaces::{
     JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
     NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
     REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
-    S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
-    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE,
-    USER_SESSION_KEYSPACE,
+    ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE,
+    SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
+    SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -41,8 +41,7 @@ use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS}
 use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyIntent, PolicyMutationRecord,
 };
-use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo, CurrentVersionPointer};
-use aruna_core::structs::storage::broken::BrokenVersion;
+use aruna_core::structs::storage::blob::{BucketInfo, CurrentVersionPointer};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
@@ -137,6 +136,8 @@ pub struct MigrateOutput {
     pub versions_rewritten: usize,
     /// Index rows written for reference versions bound to a connector that had none.
     pub connector_references_written: usize,
+    /// Source root records written for the bindings stored compact.
+    pub source_roots_written: usize,
     /// Bucket records from before buckets carried a compression setting or a distribution.
     pub buckets_scanned: usize,
     pub buckets_rewritten: usize,
@@ -243,6 +244,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let object_rows = db.keyspace(LOCAL_OBJECTS, KeyspaceCreateOptions::default)?;
     let reference_rows =
         db.keyspace(CONNECTOR_REFERENCE_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let root_rows = db.keyspace(ROOT_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
     let records =
@@ -268,9 +270,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let sizes = sizes::missing_sizes(&db, &event_rows, &size_rows)?;
     let stale = sessions::stale_sessions(&db, &session_rows, &expiry_rows, &owner_rows)?;
     let old_uploads = uploads::stale_uploads(&db, &upload_rows, &part_rows)?;
-    let versions = rewrite_rows(&db, &version_rows, BLOB_VERSIONS_KEYSPACE, |value| {
-        relaid::<BlobVersion, versions::LegacyVersion>(value, versions::LAYOUT)
-    })?;
+    let (versions, roots) = versions::compact_rows(&db, &version_rows, BLOB_VERSIONS_KEYSPACE)?;
     let references = versions::reference_rows(
         &db,
         &version_rows,
@@ -328,7 +328,17 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             REPLICATION_OBLIGATION_KEYSPACE,
             OBLIGATION,
         )?,
-        padded::<BrokenVersion>(&db, &broken_rows, BROKEN_VERSION_KEYSPACE, versions::LAYOUT)?,
+        (
+            &broken_rows,
+            BROKEN_VERSION_KEYSPACE,
+            rewrite_rows(
+                &db,
+                &broken_rows,
+                BROKEN_VERSION_KEYSPACE,
+                versions::broken_version,
+            )?
+            .rows,
+        ),
         padded::<StoredObject>(&db, &object_rows, LOCAL_OBJECTS, git::LAYOUT)?,
     ];
     let (replication, renamed) =
@@ -406,6 +416,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&size_rows, &sizes.rows),
         (&version_rows, &versions.rows),
         (&reference_rows, &references.rows),
+        (&root_rows, &roots),
         (&bucket_rows, &buckets.rows),
         (&login_rows, &logins.rows),
         (&index_rows, &index.writes),
@@ -513,6 +524,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         versions_scanned: versions.scanned,
         versions_rewritten: versions.rows.len(),
         connector_references_written: references.rows.len(),
+        source_roots_written: roots.len(),
         buckets_scanned: buckets.scanned,
         buckets_rewritten: buckets.rows.len(),
         info_ops_deleted: info_ops,
