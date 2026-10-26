@@ -1,6 +1,5 @@
-//! Delivers a distributed bucket's reference records to a member in bounded pages: the
-//! coordinator builds a page from its queued member jobs, the member applies it in one
-//! transaction and answers only after that commit.
+//! Delivers a distributed bucket's reference records to a member in bounded pages, applied in
+//! one transaction on the member and acknowledged only after that commit.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

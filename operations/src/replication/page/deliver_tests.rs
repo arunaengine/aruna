@@ -1,6 +1,5 @@
-//! Tests the drain from a coordinator's obligations to a member through reference pages: a
-//! backlog larger than a page arrives exactly once, a lost answer is replayed without counting
-//! twice, and two versions of one key keep their head order.
+//! Tests that a backlog larger than a reference page arrives exactly once, in head order, and
+//! that a lost answer is replayed without counting twice.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
