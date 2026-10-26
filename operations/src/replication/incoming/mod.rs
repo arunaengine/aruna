@@ -3866,8 +3866,19 @@ impl IncomingVersionOperation {
     }
 }
 
+/// The reference version `manifest` publishes as a bound member stores it, before compaction.
+pub(crate) fn member_reference(
+    manifest: VersionReplicationManifest,
+    publisher: NodeId,
+    realm_id: RealmId,
+) -> Result<BlobVersion, IncomingVersionError> {
+    let mut operation = IncomingVersionOperation::new(Ulid::nil(), publisher, realm_id, manifest);
+    operation.destination_bound = true;
+    operation.reference_version()
+}
+
 /// Whether a stored version is the incoming one; a local refresh changes only `last_refresh`.
-fn same_reference(existing: &BlobVersion, incoming: &BlobVersion) -> bool {
+pub(crate) fn same_reference(existing: &BlobVersion, incoming: &BlobVersion) -> bool {
     let mut existing = existing.clone();
     if let (
         BlobVersionState::Reference { last_refresh, .. },
