@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, relay_route, relay_targets,
-    relay_url, relayed_headers,
+    API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, pinned_route, relay_route,
+    relay_targets, relay_url, relayed_headers,
 };
 use crate::error::{ErrorResponse, ServerError};
 use axum::body::to_bytes;
@@ -132,6 +132,18 @@ fn uses_installed_urls() {
         "a resolved peer is never displaced by an installed copy"
     );
     assert!(relay_targets(Vec::new(), Vec::new()).is_empty());
+}
+
+#[test]
+fn requests_stay_pinned() {
+    // Pending database requests live on one management node, so no fallback target is tried.
+    assert!(pinned_route("/system/realm/databases"));
+    assert!(pinned_route("/system/realm/databases/requests"));
+    assert!(pinned_route(
+        "/system/realm/databases/requests/{request_id}/approve"
+    ));
+    assert!(!pinned_route("/system/realm/databases/{entry_id}"));
+    assert!(!pinned_route("/system/realm/quota"));
 }
 
 #[test]

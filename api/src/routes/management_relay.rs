@@ -157,8 +157,12 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
 
     // Targets are tried in order, but only a failure that provably predates
     // processing may move a non-idempotent request on to the next target.
+    let limit = match pinned_route(route) {
+        true => 1,
+        false => RELAY_TARGET_LIMIT,
+    };
     let mut unknown = None;
-    for target in targets.iter().take(RELAY_TARGET_LIMIT) {
+    for target in targets.iter().take(limit) {
         let url = relay_url(target, &uri);
         let mut outgoing = RELAY_CLIENT
             .request(method.clone(), &url)
@@ -201,6 +205,12 @@ async fn relay(state: &Arc<ServerState>, route: &'static str, request: Request) 
 /// any processing; later failures are only safe to repeat for an idempotent method.
 fn may_try_next(method: &Method, is_connect: bool) -> bool {
     is_connect || method == Method::GET
+}
+
+/// Routes whose state lives in one management node's local store: a database request is kept
+/// where it was made, so a fallback node would hide it or start a second, unseen one.
+fn pinned_route(route: &str) -> bool {
+    route.starts_with("/system/realm/databases/requests") || route == "/system/realm/databases"
 }
 
 /// Whether a node-local enrollment miss may be tried on the next target.
