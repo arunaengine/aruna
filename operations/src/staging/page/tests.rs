@@ -928,6 +928,70 @@ fn bakrep_entry(index: usize) -> PageEntry {
     }
 }
 
+/// Prints the bytes each row kind gained per entry between `before` and `after`.
+fn print_sizes(
+    label: &str,
+    before: &HashMap<&'static str, usize>,
+    after: &HashMap<&'static str, usize>,
+    entries: usize,
+) {
+    let mut rows: Vec<_> = (after.iter())
+        .map(|(space, bytes)| (*space, bytes - before.get(space).copied().unwrap_or(0)))
+        .filter(|(_, bytes)| *bytes > 0)
+        .collect();
+    rows.sort();
+    let total: usize = rows.iter().map(|(_, bytes)| bytes / entries).sum();
+    for (space, bytes) in rows {
+        println!("{label} {space}: {} bytes per entry", bytes / entries);
+    }
+    println!("{label} total: {total} bytes per entry");
+}
+
+// The same measurement for a distributed bucket, inventory rows included.
+#[tokio::test]
+async fn distributed_sizes_measured() {
+    use crate::distribution::test_store::{install, range};
+    use crate::driver::drive;
+    use crate::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+
+    const ENTRIES: usize = 100;
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let connector = bakrep_connector(context).await;
+    let group_id = bucket().group_id;
+    let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
+    let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
+    let set_id = snapshot.set_id();
+    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
+    let write = StorageEffect::Write {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: b"shared".to_vec().into(),
+        value: bound.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    handle.send_storage_effect(write).await;
+    install(handle, set_id, &[range(1, "", None)]).await;
+    crate::jobs::store::insert_job(handle, &record(token()))
+        .await
+        .unwrap();
+    let before = keyspace_bytes(handle).await;
+    let page = PageImportInput {
+        connector,
+        bucket: "shared".to_string(),
+        expected_bucket: bound,
+        ..input((0..ENTRIES).map(bakrep_entry).collect())
+    };
+    drive(PageImportOperation::new(page), context)
+        .await
+        .unwrap();
+
+    let after = keyspace_bytes(handle).await;
+    print_sizes("distributed", &before, &after, ENTRIES);
+}
+
 // Prints the stored bytes per entry and row kind of a realistic bakrep page; a measurement
 // for the entry size work, not a size contract. Run with `--nocapture` to read it.
 #[tokio::test]
@@ -956,14 +1020,5 @@ async fn entry_sizes_measured() {
         .unwrap();
 
     let after = keyspace_bytes(handle).await;
-    let mut rows: Vec<_> = (after.iter())
-        .map(|(space, bytes)| (*space, bytes - before.get(space).copied().unwrap_or(0)))
-        .filter(|(_, bytes)| *bytes > 0)
-        .collect();
-    rows.sort();
-    let total: usize = rows.iter().map(|(_, bytes)| bytes / ENTRIES).sum();
-    for (space, bytes) in rows {
-        println!("{space}: {} bytes per entry", bytes / ENTRIES);
-    }
-    println!("total: {total} bytes per entry");
+    print_sizes("plain", &before, &after, ENTRIES);
 }
