@@ -36,7 +36,7 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::create::submit;
-use super::imports::{fenced_imports, fetch_imports, keep_resume};
+use super::imports::{drop_resume, fenced_imports, fetch_imports, keep_resume};
 use super::purge::{
     PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, has_uploads,
     purge_range, purge_rest, read,
@@ -645,6 +645,16 @@ impl SetWork {
         )
         .await?;
         let fence = LocalFence::decode(stored.as_deref()).map_err(|error| error.to_string())?;
+        // Imports kept for a transfer away are dropped once it is no longer open.
+        for fenced in &fence.ranges {
+            let transfers = &snapshot.lifecycle.transfers;
+            if !transfers
+                .iter()
+                .any(|t| t.transfer_id == fenced.transfer_id)
+            {
+                drop_resume(context, fenced.transfer_id).await?;
+            }
+        }
         let mut left = Left::Settled;
         for (range, ready) in given_away(snapshot, &fence, member) {
             if !ready {
@@ -1050,6 +1060,92 @@ mod tests {
         )
         .await;
         assert_eq!(fence, None, "the new member starts without the old fence");
+    }
+
+    #[tokio::test]
+    async fn drops_settled_imports() {
+        // A former coordinator drops the imports it kept for a transfer no longer open only.
+        use crate::distribution::imports::keep_resume;
+        use crate::distribution::test_record::store_record;
+        use crate::distribution::test_record::{binding, member, realm, replicated, secret};
+        use crate::distribution::test_store::{context, get, open};
+        use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+        use aruna_core::structs::storage::distribution::fence::RangeFence;
+        use aruna_core::structs::storage::distribution::{
+            DistributionView, SignedSnapshot, TransferRole,
+        };
+        let (mut snapshot, _) = replicated(true, 1);
+        let set_id = snapshot.set_id();
+        let ranges = [0, 1].map(|index| snapshot.config.ranges[index].range_id);
+        let (settled, open_id) = (Ulid::from_bytes([61; 16]), Ulid::from_bytes([62; 16]));
+        snapshot.lifecycle.transfers.push(OpenTransfer {
+            transfer_id: open_id,
+            range_id: ranges[1],
+            from: member(2),
+            to: member(1),
+            epoch: 2,
+            role: TransferRole::Replica,
+            fenced: None,
+            completed: None,
+        });
+        let view = DistributionView {
+            head: SignedSnapshot::sign(snapshot.clone(), realm(), &secret(1)).unwrap(),
+            conflict: None,
+        };
+        let (_dir, handle) = open();
+        store_record(&handle, set_id, view.to_bytes().unwrap()).await;
+        let info = BucketInfo {
+            group_id: snapshot.config.owner_group,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: Some(binding(&snapshot, 1, 5)),
+        };
+        let mut fence = LocalFence::default();
+        for (range_id, transfer_id) in [(ranges[0], settled), (ranges[1], open_id)] {
+            fence.fence_range(RangeFence {
+                range_id,
+                transfer_id,
+                epoch: 1,
+                since_ms: 0,
+                uploads_open: false,
+            });
+        }
+        for (space, key, value) in [
+            (S3_BUCKET_KEYSPACE, b"spire".to_vec(), info.to_bytes()),
+            (
+                DISTRIBUTION_FENCE_KEYSPACE,
+                LocalFence::key(set_id),
+                fence.to_bytes(),
+            ),
+        ] {
+            let write = StorageEffect::Write {
+                key_space: space.to_string(),
+                key: key.into(),
+                value: value.unwrap().into(),
+                txn_id: None,
+            };
+            handle.send_storage_effect(write).await;
+        }
+        let context = Arc::new(context(&handle));
+        for transfer_id in [settled, open_id] {
+            keep_resume(&context, "spire", transfer_id).await.unwrap();
+        }
+        let work = SetWork {
+            realm_id: realm(),
+            local: secret(1).public(),
+            set_id,
+        };
+        assert_eq!(work.run(&context, &mut 64).await, Ok(Left::Waiting));
+        let jobs = |id: Ulid| [b"import_jobs/".as_slice(), &id.to_bytes()].concat();
+        let kept = get(&handle, NODE_STATE_KEYSPACE, jobs(settled)).await;
+        assert_eq!(kept, None, "a transfer no longer open keeps no imports");
+        let kept = get(&handle, NODE_STATE_KEYSPACE, jobs(open_id)).await;
+        assert!(kept.is_some(), "an open transfer keeps its imports");
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::accounting::{Charge, RangeAccount, account_key};
-use aruna_core::structs::storage::distribution::fence::{ClearCursor, PurgeCursor};
+use aruna_core::structs::storage::distribution::fence::{ClearCursor, LocalFence, PurgeCursor};
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, Position, VersionEntry, content_key, head_position, index_key, range_interval,
 };
@@ -31,6 +31,7 @@ use aruna_core::types::{GroupId, Key, Value};
 use ulid::Ulid;
 
 use super::feed_store::split_key;
+use super::imports::drop_resume;
 use super::pull::drop_copy;
 use crate::driver::{DriverContext, drive, now_ms};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -293,6 +294,11 @@ pub async fn clear_set_rows(
         batch_delete(context, deletes).await?;
         let value = cursor.to_bytes().map_err(|error| error.to_string())?;
         write(context, DISTRIBUTION_PURGE_KEYSPACE, key.clone(), value).await?;
+    }
+    let fence = read(context, DISTRIBUTION_FENCE_KEYSPACE, prefix.clone()).await?;
+    let fence = LocalFence::decode(fence.as_deref()).map_err(|error| error.to_string())?;
+    for fenced in &fence.ranges {
+        drop_resume(context, fenced.transfer_id).await?;
     }
     let mut deletes = vec![(DISTRIBUTION_PURGE_KEYSPACE.to_string(), key.into())];
     if !keep_fence {
@@ -665,6 +671,9 @@ mod tests {
     #[tokio::test]
     async fn bounded_clearing_resumes() {
         // Each pass spends at most its pages; the next resumes at the cursor until the set is gone.
+        use crate::distribution::imports::keep_resume;
+        use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+        use aruna_core::structs::storage::distribution::fence::RangeFence;
         let (_dir, handle) = open();
         let context = context(handle);
         let (set_id, other) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
@@ -685,7 +694,28 @@ mod tests {
         .await
         .unwrap();
         let fence = set_id.to_bytes().to_vec();
-        write(&context, DISTRIBUTION_FENCE_KEYSPACE, fence.clone(), vec![])
+        let transfer_id = Ulid::from_bytes([4; 16]);
+        let mut fenced = LocalFence::default();
+        fenced.fence_range(RangeFence {
+            range_id: Ulid::from_bytes([3; 16]),
+            transfer_id,
+            epoch: 1,
+            since_ms: 0,
+            uploads_open: false,
+        });
+        let stored = fenced.to_bytes().unwrap();
+        write(&context, DISTRIBUTION_FENCE_KEYSPACE, fence.clone(), stored)
+            .await
+            .unwrap();
+        // The imports kept for the set's transfer away leave with the set.
+        keep_resume(&context, "spire", transfer_id).await.unwrap();
+        let resume = [
+            b"import_resume/".as_slice(),
+            &transfer_id.to_bytes(),
+            &[1; 16],
+        ]
+        .concat();
+        write(&context, NODE_STATE_KEYSPACE, resume, vec![1])
             .await
             .unwrap();
         let reservation = account_key(set_id, Ulid::from_bytes([3; 16]));
@@ -729,6 +759,11 @@ mod tests {
         assert_eq!(cursor.unwrap(), None, "a finished clear leaves no cursor");
         let kept = read(&context, DISTRIBUTION_FENCE_KEYSPACE, fence).await;
         assert!(kept.unwrap().is_some(), "a deleted set keeps its fence");
+        let imports = clear_page(&context, NODE_STATE_KEYSPACE, b"import_", None).await;
+        assert!(
+            imports.unwrap().is_empty(),
+            "no kept import of the set stays"
+        );
         let released = read(&context, CAPACITY_RESERVATION_KEYSPACE, reservation).await;
         assert_eq!(released.unwrap(), None, "the set's capacity is released");
     }

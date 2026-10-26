@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
+use super::purge::clear_prefix;
 use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
 use crate::connectors::list_connectors::{ListSourceInput, ListSourceOperation};
 use crate::driver::{DriverContext, drive};
@@ -125,6 +126,20 @@ pub(crate) async fn fenced_imports(
         }
     }
     Ok(jobs)
+}
+
+/// Drops what [`keep_resume`] kept for `transfer_id` once the transfer is no longer open.
+pub(crate) async fn drop_resume(context: &DriverContext, transfer_id: Ulid) -> Result<(), String> {
+    let key: Key = jobs_key(transfer_id).into();
+    if read_value(context, NODE_STATE_KEYSPACE, key.clone())
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let prefix = [RESUME_PREFIX, &transfer_id.to_bytes()].concat();
+    clear_prefix(context, NODE_STATE_KEYSPACE, prefix).await?;
+    delete(context, key).await
 }
 
 /// A staging job of this node as it hands it over to a member of the set its bucket is bound
@@ -560,6 +575,13 @@ mod tests {
             staging_spec(context, stranger, (transfer_id, job_id)).await,
             Err(MetadataReadError::Forbidden)
         );
+
+        // Once the transfer is no longer open, its kept positions and job list go.
+        drop_resume(context, transfer_id).await.unwrap();
+        let handed = staging_spec(context, member, (transfer_id, job_id)).await;
+        assert_eq!(handed.unwrap().resume, None);
+        let jobs = read_value(context, NODE_STATE_KEYSPACE, jobs_key(transfer_id).into()).await;
+        assert_eq!(jobs, Ok(None));
     }
 
     // Only unfinished imports into the transferred bucket are handed over.
