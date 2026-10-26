@@ -389,8 +389,10 @@ pub enum RunDelete {
     Deleted,
     /// No run of this caller is listed on this node.
     NotFound,
-    /// The run has not finished, or its container cleanup is still queued.
-    Unfinished,
+    /// The job is in this state and still live; it must be cancelled first.
+    Unfinished(JobState),
+    /// The run's container cleanup is still queued.
+    CleanupPending,
 }
 
 /// Removes a finished run of `user_id` from this node in one transaction: its
@@ -437,11 +439,14 @@ async fn run_delete_txn(
     else {
         return Ok(RunDelete::NotFound);
     };
-    if record.created_by != user_id || !matches!(record.payload, JobPayload::Execution(_)) {
+    if record.created_by != user_id || record.payload.is_internal() {
         return Ok(RunDelete::NotFound);
     }
+    if !matches!(record.payload, JobPayload::Execution(_)) {
+        return hide_settled(storage, txn_id, record).await;
+    }
     if !record.state.is_terminal() {
-        return Ok(RunDelete::Unfinished);
+        return Ok(RunDelete::Unfinished(record.state));
     }
     // A queued cleanup still needs this row to fence and remove the container.
     if read_job_record(storage, cleanup_job_id(job_id), Some(txn_id))
@@ -449,7 +454,7 @@ async fn run_delete_txn(
         .map_err(JobMutationError::Storage)?
         .is_some_and(|cleanup| !cleanup.state.is_terminal())
     {
-        return Ok(RunDelete::Unfinished);
+        return Ok(RunDelete::CleanupPending);
     }
     let mut deletes = prune_delete_entries(&record);
     let mut start_after = None;
@@ -474,6 +479,35 @@ async fn run_delete_txn(
             None => break,
         }
     }
+    batch_delete(storage, deletes, Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)?;
+    Ok(RunDelete::Deleted)
+}
+
+/// Takes a settled job other than a run off this node's list and makes it due for pruning,
+/// which removes its rows page by page, as staging rows can be too many for one transaction.
+async fn hide_settled(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    record: JobRecord,
+) -> Result<RunDelete, JobMutationError> {
+    if !record.is_settled() {
+        return Ok(RunDelete::Unfinished(record.state));
+    }
+    let listed = owner_index_key(record.created_by, record.created_at_ms, record.job_id);
+    let row = read_raw(storage, JOB_INDEX_KEYSPACE, listed.clone(), Some(txn_id)).await;
+    if row.map_err(JobMutationError::Storage)?.is_none() {
+        return Ok(RunDelete::NotFound);
+    }
+    let mut hidden = record.clone();
+    hidden.retention_ms = 0;
+    let (writes, mut deletes) = index_deltas(&record, &hidden)
+        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    deletes.push((JOB_INDEX_KEYSPACE.to_string(), listed));
+    batch_write(storage, writes, Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)?;
     batch_delete(storage, deletes, Some(txn_id))
         .await
         .map_err(JobMutationError::Storage)?;

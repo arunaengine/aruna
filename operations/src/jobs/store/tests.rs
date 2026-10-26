@@ -349,6 +349,28 @@ async fn claim_moves_index() {
     assert_eq!(parsed, job_id);
 }
 
+// A job its node gave up on is cancelled for good, after which it can be deleted.
+#[tokio::test]
+async fn exhausted_job_cancels() {
+    let (_dir, storage) = temp_storage();
+    let mut record = queued_record(JobId::from_bytes([0x44; 16]));
+    record.state = JobState::Indeterminate;
+    record.locally_exhausted = true;
+    insert_job(&storage, &record).await.unwrap();
+
+    let outcome = set_cancel_requested(&storage, record.job_id, 9_000)
+        .await
+        .unwrap();
+
+    let CancelRequestOutcome::Cancelled(cancelled) = outcome else {
+        panic!("an exhausted job must settle as cancelled");
+    };
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert!(!cancelled.locally_exhausted && cancelled.cancel_requested);
+    let deleted = delete_finished_run(&storage, record.created_by, record.job_id).await;
+    assert_eq!(deleted.unwrap(), RunDelete::Deleted);
+}
+
 fn claim_rows(old: &JobRecord, new: &JobRecord) -> (usize, usize) {
     let (writes, deletes) = index_deltas(old, new).unwrap();
     let written = writes
@@ -1436,7 +1458,12 @@ async fn run_delete_rules() {
     );
     assert_eq!(
         delete(owner, running.job_id).await.unwrap(),
-        RunDelete::Unfinished
+        RunDelete::Unfinished(JobState::Running)
+    );
+    // Another kind of job leaves the list at once and is pruned later.
+    assert_eq!(
+        delete(owner, probe.job_id).await.unwrap(),
+        RunDelete::Deleted
     );
     assert_eq!(
         delete(owner, probe.job_id).await.unwrap(),
@@ -1462,7 +1489,12 @@ async fn run_delete_rules() {
         .unwrap();
     let ids: Vec<JobId> = listed.iter().map(|record| record.job_id).collect();
     assert!(!ids.contains(&finished.job_id));
+    assert!(!ids.contains(&probe.job_id));
     assert!(ids.contains(&running.job_id));
+    let hidden = read_job_record(&storage, probe.job_id, None).await.unwrap();
+    let keys = schedule_keys(&storage).await;
+    let due = job_prune_key(hidden.unwrap().finished_at_ms.unwrap(), probe.job_id);
+    assert!(keys.contains(&due), "the deleted job is due for pruning");
     let (entries, _) = iter_prefix_page(
         &storage,
         JOB_ENTRY_KEYSPACE,

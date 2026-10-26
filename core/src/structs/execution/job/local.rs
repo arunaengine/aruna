@@ -704,6 +704,8 @@ fn in_process_transition(from: JobState, to: JobState) -> bool {
             // Local retry exhaustion without a job-specific verdict parks here too.
             | (Claimed, Indeterminate)
             | (Running, Indeterminate)
+            // Cancelling a job parked there settles it.
+            | (Indeterminate, Cancelled)
             | (Claimed, AwaitingKey)
             | (Running, AwaitingKey)
             | (AwaitingKey, Queued)

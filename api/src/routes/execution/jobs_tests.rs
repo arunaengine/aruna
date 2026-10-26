@@ -979,6 +979,47 @@ async fn delete_job_rules() {
     assert!(matches!(result, Err(ServerError::NotFound)));
 }
 
+// A job its node gave up on is abortable and then deletable; a live one names its state.
+#[tokio::test]
+async fn exhausted_job_removable() {
+    let (_dir, state) = build_state().await;
+    let owner = user(2);
+    let (stuck, live) = (JobId::from_bytes([0x61; 16]), JobId::from_bytes([0x62; 16]));
+    let mut record = job_for(stuck, owner, 1000);
+    record.has_run = true;
+    record.state = JobState::Indeterminate;
+    record.locally_exhausted = true;
+    let mut running = job_for(live, owner, 1000);
+    running.state = JobState::Running;
+    let storage = &state.get_ctx().storage_handle;
+    insert_job(storage, &record).await.unwrap();
+    insert_job(storage, &running).await.unwrap();
+    let delete = |id: JobId| {
+        delete_job(
+            State(state.clone()),
+            Extension(auth_for(owner)),
+            Path(id.to_string()),
+        )
+    };
+
+    let (_, Json(cancelled)) = cancel_job(
+        State(state.clone()),
+        Extension(auth_for(owner)),
+        Extension(None),
+        Path(stuck.to_string()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(cancelled.state, "cancelled");
+    assert_eq!(delete(stuck).await.unwrap(), StatusCode::NO_CONTENT);
+    assert!(matches!(delete(stuck).await, Err(ServerError::NotFound)));
+    let Err(ServerError::Conflict(reason)) = delete(live).await else {
+        panic!("a running job cannot be deleted");
+    };
+    assert!(reason.contains("running"), "{reason}");
+}
+
 #[tokio::test]
 async fn cancel_is_idempotent() {
     let (_dir, state) = build_state().await;
