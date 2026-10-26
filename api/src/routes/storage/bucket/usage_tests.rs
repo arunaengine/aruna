@@ -132,3 +132,122 @@ async fn answers_held_ranges() {
         Err(ServerError::Conflict(_))
     ));
 }
+
+// A reference page import into an ordinary bucket shows in the bucket's usage, as in its
+// group's: objects, versions and referenced bytes.
+#[tokio::test]
+async fn reference_import_counted() {
+    use aruna_core::structs::execution::job::{
+        JobClaim, JobId, JobPayload, JobRecord, StagingJobCheckpoint, StagingJobPhase,
+    };
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_operations::connectors::create_connector::{
+        SourceConnectorInput, SourceConnectorOperation,
+    };
+    use aruna_operations::driver::drive;
+    use aruna_operations::staging::page::import::{
+        PageEntry, PageImportInput, PageImportOperation,
+    };
+    use std::time::{Duration, SystemTime};
+
+    let node = node_state().await;
+    let ctx = node.state.get_ctx();
+    let input = SourceConnectorInput {
+        group_id: node.group_id,
+        created_by: node.owner.user_id,
+        name: "public".to_string(),
+        kind: SourceConnectorKind::S3,
+        public_config: std::collections::HashMap::from([
+            ("bucket".to_string(), "source".to_string()),
+            ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ("skip_signature".to_string(), "true".to_string()),
+        ]),
+        secret_config: Default::default(),
+    };
+    let connector = drive(SourceConnectorOperation::new(input), ctx.as_ref())
+        .await
+        .unwrap()
+        .connector;
+    let (job_id, claim_token) = (JobId::from_bytes([7; 16]), Ulid::from_bytes([6; 16]));
+    let payload = JobPayload::Probe {
+        steps: 1,
+        step_sleep_ms: 0,
+        fail_at: None,
+        panic_at: None,
+        cleanup_marker: None,
+    };
+    let local = node.state.get_node_id();
+    let mut record = JobRecord::new(job_id, payload, node.owner.user_id, local, 1, 1, None);
+    record.claim = Some(JobClaim {
+        holder_node_id: local,
+        claim_token,
+        lease_expires_ms: u64::MAX,
+    });
+    aruna_operations::jobs::store::insert_job(&ctx.storage_handle, &record)
+        .await
+        .unwrap();
+    let checkpoint = StagingJobCheckpoint {
+        phase: StagingJobPhase::Registering,
+        flat: Some(true),
+        items_done: 0,
+        prefixes_done: 1,
+        walk: None,
+        manifest: None,
+        queue_head: 0,
+        queue_tail: 0,
+        items_current: 0,
+        items_succeeded: 0,
+        items_failed: 0,
+        items_total: None,
+        bytes_current: 0,
+        bytes_total: None,
+        bytes_discovered: 0,
+        current_path: None,
+        errors: Vec::new(),
+    };
+    let entry = |name: &str| PageEntry {
+        source_path: format!("data/{name}"),
+        target_key: name.to_string(),
+        observation: SourceMetadata {
+            content_length: 5,
+            content_type: None,
+            etag: Some(format!("\"{name}\"")),
+            last_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(60)),
+            source_version: None,
+            digests: Default::default(),
+        },
+    };
+    let page = PageImportInput {
+        job_id,
+        claim_token,
+        realm_id: node.owner.realm_id,
+        group_id: node.group_id,
+        user_id: node.owner.user_id,
+        auth_context: node.owner.clone(),
+        node_id: local,
+        bucket: BUCKET.to_string(),
+        expected_bucket: bucket_info(&node.state, BUCKET).await.unwrap(),
+        connector,
+        secret_fingerprint: None,
+        entries: vec![entry("a"), entry("b")],
+        checkpoint,
+        checkpoint_key: job_id.to_bytes().to_vec().into(),
+        writes: Vec::new(),
+        deletes: Vec::new(),
+        now: SystemTime::UNIX_EPOCH + Duration::from_secs(120),
+        database: None,
+    };
+    drive(PageImportOperation::new(page), ctx.as_ref())
+        .await
+        .unwrap();
+
+    let answer = usage(&node, &node.owner, HeaderMap::new(), false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (answer.objects, answer.versions, answer.referenced_bytes),
+        (2, 2, 10)
+    );
+}
