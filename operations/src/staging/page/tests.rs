@@ -1022,3 +1022,70 @@ async fn entry_sizes_measured() {
     let after = keyspace_bytes(handle).await;
     print_sizes("plain", &before, &after, ENTRIES);
 }
+
+/// Drives `operation` against `handle` and counts its storage request/response exchanges.
+async fn count_exchanges(
+    mut operation: PageImportOperation,
+    handle: &aruna_storage::StorageHandle,
+) -> (usize, Result<PageImportResult, PageImportError>) {
+    let mut exchanges = 0;
+    let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
+    while let Some(effect) = effects.pop_front() {
+        let event = match effect {
+            Effect::Storage(effect) => {
+                exchanges += 1;
+                handle.send_storage_effect(effect).await
+            }
+            Effect::Task(
+                TaskEffect::ShortenTimer { key, after } | TaskEffect::ResetTimer { key, after },
+            ) => Event::Task(TaskEvent::TimerScheduled { key, after }),
+            other => panic!("unexpected effect: {other:?}"),
+        };
+        effects.extend(operation.step(event));
+    }
+    (exchanges, operation.finalize())
+}
+
+// Prints the storage exchanges of four 500-key pages into one distributed range, the last ones
+// with a full key sample; a measurement, not a contract. Run with `--nocapture` to read it.
+#[tokio::test]
+async fn page_exchanges_measured() {
+    use crate::distribution::test_store::{install, range};
+    use crate::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+
+    const ENTRIES: usize = 500;
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let connector = bakrep_connector(context).await;
+    let group_id = bucket().group_id;
+    let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
+    let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
+    let set_id = snapshot.set_id();
+    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
+    let write = StorageEffect::Write {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: b"shared".to_vec().into(),
+        value: bound.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    handle.send_storage_effect(write).await;
+    install(handle, set_id, &[range(1, "", None)]).await;
+    crate::jobs::store::insert_job(handle, &record(token()))
+        .await
+        .unwrap();
+    for page in 0..4 {
+        let entries = (page * ENTRIES..(page + 1) * ENTRIES).map(bakrep_entry);
+        let input = PageImportInput {
+            connector: connector.clone(),
+            bucket: "shared".to_string(),
+            expected_bucket: bound.clone(),
+            ..input(entries.collect())
+        };
+        let (exchanges, result) = count_exchanges(PageImportOperation::new(input), handle).await;
+        assert_eq!(result.unwrap().registered, ENTRIES as u64);
+        println!("distributed page {page}: {exchanges} storage exchanges for {ENTRIES} keys");
+    }
+}
