@@ -265,22 +265,56 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<ByteView, PageFailure> {
     Ok(ByteView::from(bytes?))
 }
 
-/// Source keys where the lanes of the prefix at `walk` start after its first: the distinct
-/// characters that follow the longest start every key shares, found by one-key listings and
-/// grouped into at most `parts` lanes. None when the keys cannot be told apart in a few probes.
+/// Source keys where the lanes of the prefix at `walk` start after its first. One-key listings
+/// find the occupied starts below the prefix and refine all of them a level further, round by
+/// round, until there are at least `parts` or the probes run out; the starts are then grouped
+/// into at most `parts` lanes. None when the keys cannot be told apart in a few probes.
 async fn split_points(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     walk: &StagingWalk,
     parts: usize,
 ) -> Result<Vec<String>, PageFailure> {
-    let mut shared = walk.source_path.clone();
     let mut probes = 0;
-    while parts > 1 && probes < MAX_PROBES {
+    let mut starts = vec![walk.source_path.clone()];
+    while parts > 1 && starts.len() < parts && probes < MAX_PROBES {
+        let mut refined = Vec::with_capacity(starts.len());
+        for start in &starts {
+            let branches = branches(ctx, spec, walk, start, &mut probes).await?;
+            match branches.is_empty() {
+                true => refined.push(start.clone()),
+                false => refined.extend(branches),
+            }
+        }
+        if refined.len() == starts.len() {
+            break;
+        }
+        starts = refined;
+    }
+    if starts.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let lanes = parts.min(starts.len());
+    Ok((1..lanes)
+        .map(|lane| starts[lane * starts.len() / lanes].clone())
+        .collect())
+}
+
+/// The occupied starts one character past the longest start every key below `shared` has in
+/// common; empty when one key or none lies below it, or the probes run out first.
+async fn branches(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    walk: &StagingWalk,
+    shared: &str,
+    probes: &mut usize,
+) -> Result<Vec<String>, PageFailure> {
+    let mut shared = shared.to_string();
+    while *probes < MAX_PROBES {
         let mut next = Vec::new();
         let mut lower = shared.clone();
-        while probes < MAX_PROBES {
-            probes += 1;
+        while *probes < MAX_PROBES {
+            *probes += 1;
             let Some(key) = first_key(ctx, spec, walk, &lower).await? else {
                 break;
             };
@@ -302,9 +336,10 @@ async fn split_points(
             [] => return Ok(Vec::new()),
             [only] => shared.push(*only),
             _ => {
-                let lanes = parts.min(next.len());
-                let starts = (1..lanes).map(|lane| next[lane * next.len() / lanes]);
-                return Ok(starts.map(|first| format!("{shared}{first}")).collect());
+                return Ok(next
+                    .iter()
+                    .map(|first| format!("{shared}{first}"))
+                    .collect());
             }
         }
     }
@@ -481,7 +516,7 @@ mod tests {
         assert_eq!((completed_items, failed_items), (19, 1));
     }
 
-    // The splits of a prefix are the distinct characters after the start its keys share.
+    // The splits of a prefix refine the distinct characters after the start its keys share.
     #[tokio::test]
     async fn splits_shared_start() {
         let keys = ["p/SAMD1", "p/SAMD2", "p/SAMEA1", "p/SAMN1", "p/SAMN2"];
@@ -498,8 +533,33 @@ mod tests {
         let splits = split_points(&ctx, &spec, &walk, 4).await.ok().unwrap();
         server.abort();
 
-        assert_eq!(splits, vec!["p/SAME".to_string(), "p/SAMN".to_string()]);
-        assert_eq!(target_of(&walk, &splits[1]).as_deref(), Some("t/SAMN"));
+        assert_eq!(splits, ["p/SAMD2", "p/SAME", "p/SAMN1"]);
+        assert_eq!(target_of(&walk, &splits[2]).as_deref(), Some("t/SAMN1"));
+    }
+
+    // Keys that all start with `SAM` and branch only into `SAMD` and `SAME` still split into
+    // the full number of lanes, inside both branches.
+    #[tokio::test]
+    async fn splits_sample_space() {
+        let keys = (["SAMD", "SAMEA"].iter())
+            .flat_map(|sample| (0..300).map(move |index| format!("p/{sample}{index:08}")))
+            .collect();
+        let (endpoint, server) = s3_listing(keys).await;
+        let (ctx, spec, _dir) = job_context(endpoint, &[("p", "t")], None).await;
+        let walk = StagingWalk {
+            source_path: "p/".to_string(),
+            target_prefix: "t".to_string(),
+            cursor: None,
+            queue_row: None,
+            from: None,
+        };
+
+        let splits = split_points(&ctx, &spec, &walk, 4).await.ok().unwrap();
+        server.abort();
+
+        assert_eq!(splits.len(), 3, "{splits:?}");
+        assert!(splits.iter().any(|split| split.starts_with("p/SAMD")));
+        assert!(splits.iter().any(|split| split.starts_with("p/SAME")));
     }
 
     /// A page of two files of the job's bucket, as the walk builds it.
