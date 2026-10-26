@@ -9,18 +9,19 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
+use aruna_core::keyspaces::{SOURCE_ID_KEYSPACE, SOURCE_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_connector::{
     SourceConnector, SourceConnectorKind, SourceConnectorSecret,
 };
+use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::connectors::repository::{
-    LIST_CONNECTOR_SIZE, parse_connector_read, parse_secret_read, read_connector_effect,
-    read_secret_effect, source_connector_key,
+    LIST_CONNECTOR_SIZE, connector_id_key, parse_connector_read, parse_secret_read,
+    read_connector_effect, read_secret_effect, source_connector_key,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
@@ -254,21 +255,30 @@ impl SourceConnectorOperation {
             Ok(bytes) => bytes,
             Err(error) => return self.emit_error(error.into()),
         };
-        let writes = vec![(
-            aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
-            source_connector_key(connector.group_id, connector.connector_id),
-            connector_bytes.into(),
-        )];
-        let effect = match secret.as_ref().map(SourceConnectorSecret::to_secret) {
-            Some(Ok(bytes)) => crate::groups::fence::write_group_secret(
-                self.input.group_id,
-                writes,
-                SourceConnectorSecret::vault_entry(connector_id),
-                bytes,
+        let id_row = (
+            SOURCE_ID_KEYSPACE.to_string(),
+            connector_id_key(connector_id),
+        );
+        let writes = vec![
+            (
+                aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
+                source_connector_key(connector.group_id, connector.connector_id),
+                connector_bytes.into(),
             ),
+            (
+                id_row.0.clone(),
+                id_row.1.clone(),
+                self.input.group_id.to_bytes().to_vec().into(),
+            ),
+        ];
+        let sealed = match secret.as_ref().map(SourceConnectorSecret::to_secret) {
+            Some(Ok(bytes)) => Some((SourceConnectorSecret::vault_entry(connector_id), bytes)),
             Some(Err(error)) => return self.emit_error(error.into()),
-            None => crate::groups::fence::write_group_records(self.input.group_id, writes),
+            None => None,
         };
+        // The id row is read in the write's transaction: a second creator of the id conflicts.
+        let effect =
+            crate::groups::fence::write_group_new(self.input.group_id, writes, sealed, id_row);
 
         self.connector = Some(connector);
         self.secret = secret;
@@ -277,8 +287,16 @@ impl SourceConnectorOperation {
     }
 
     fn handle_records_written(&mut self, event: Event) -> Effects {
-        if let Err(error) = crate::groups::fence::group_write_result(event) {
-            return self.emit_error(error.into());
+        match crate::groups::fence::group_write_result(event) {
+            Ok(()) => {}
+            Err(GroupWriteError::Taken) => return self.emit_error(SourceConnectorError::IdTaken),
+            // A given id another creator wrote first conflicts with this transaction.
+            Err(GroupWriteError::Storage(StorageError::TransactionConflict))
+                if self.chosen_id.is_some() =>
+            {
+                return self.emit_error(SourceConnectorError::IdTaken);
+            }
+            Err(error) => return self.emit_error(error.into()),
         }
 
         let Some(connector) = self.connector.clone() else {
@@ -471,5 +489,33 @@ mod tests {
         )
         .await;
         assert_eq!(reuse, Err(SourceConnectorError::IdTaken));
+    }
+
+    // Two groups registering one new id at the same time: exactly one gets it.
+    #[tokio::test]
+    async fn concurrent_id_once() {
+        let tempdir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let id = ulid::Ulid::from_bytes([4; 16]);
+        let create = |group: u8| {
+            let input = public_input(ulid::Ulid::from_bytes([group; 16]), "bakrep");
+            drive(SourceConnectorOperation::with_id(input, id), &context)
+        };
+
+        let (first, second) = tokio::join!(create(1), create(2));
+
+        let outcomes = [first.is_ok(), second.is_ok()];
+        assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1);
+        let refused = [first, second].into_iter().find_map(Result::err);
+        assert_eq!(refused, Some(SourceConnectorError::IdTaken));
     }
 }

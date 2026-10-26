@@ -258,10 +258,16 @@ impl DeleteSourceOperation {
     }
 
     fn delete_records(&mut self) -> Effects {
-        let deletes = vec![(
-            aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
-            source_connector_key(self.input.group_id, self.input.connector_id),
-        )];
+        let deletes = vec![
+            (
+                aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE.to_string(),
+                source_connector_key(self.input.group_id, self.input.connector_id),
+            ),
+            (
+                aruna_core::keyspaces::SOURCE_ID_KEYSPACE.to_string(),
+                crate::connectors::repository::connector_id_key(self.input.connector_id),
+            ),
+        ];
 
         self.state = DeleteSourceState::DeleteRecords;
         smallvec![Effect::Storage(StorageEffect::BatchDelete {

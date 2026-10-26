@@ -26,6 +26,22 @@ pub fn write_group_records(group_id: GroupId, writes: Vec<(String, Key, Value)>)
     ))
 }
 
+/// Like [`write_group_records`], refused with [`GroupWriteError::Taken`] when `absent` exists;
+/// the row is read in the write's transaction, so a concurrent writer of it conflicts.
+pub fn write_group_new(
+    group_id: GroupId,
+    writes: Vec<(String, Key, Value)>,
+    secret: Option<(VaultEntry, SecretBytes)>,
+    absent: (String, Key),
+) -> Effect {
+    let mut operation = GroupWriteOperation::new(group_id, writes);
+    operation.secret = secret;
+    operation.absent = Some(absent);
+    Effect::SubOperation(boxed_suboperation(operation, |result| {
+        Event::SubOperation(SubOperationEvent::GroupWritten { result })
+    }))
+}
+
 /// Like [`write_group_records`], and seals `secret` into the node vault in the same transaction.
 pub fn write_group_secret(
     group_id: GroupId,
@@ -81,6 +97,7 @@ pub struct GroupWriteOperation {
     group_id: GroupId,
     writes: Vec<(String, Key, Value)>,
     secret: Option<(VaultEntry, SecretBytes)>,
+    absent: Option<(String, Key)>,
     txn_id: Option<TxnId>,
     state: State,
     output: Option<Result<(), GroupWriteError>>,
@@ -92,6 +109,7 @@ impl GroupWriteOperation {
             group_id,
             writes,
             secret: None,
+            absent: None,
             txn_id: None,
             state: State::Init,
             output: None,
@@ -102,6 +120,14 @@ impl GroupWriteOperation {
     pub fn with_secret(mut self, entry: VaultEntry, secret: SecretBytes) -> Self {
         self.secret = Some((entry, secret));
         self
+    }
+
+    fn write(&mut self) -> Effects {
+        self.state = State::Write;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes: std::mem::take(&mut self.writes),
+            txn_id: self.txn_id,
+        })]
     }
 
     fn fail(&mut self, error: GroupWriteError) -> Effects {
@@ -131,9 +157,15 @@ impl Operation for GroupWriteOperation {
                 self.txn_id = Some(txn_id);
                 self.state = State::Read;
                 let (key_space, key) = group_fence_key(self.group_id);
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space,
-                    key,
+                let Some(absent) = self.absent.clone() else {
+                    return smallvec![Effect::Storage(StorageEffect::Read {
+                        key_space,
+                        key,
+                        txn_id: Some(txn_id),
+                    })];
+                };
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads: vec![(key_space, key), absent],
                     txn_id: Some(txn_id),
                 })]
             }
@@ -141,11 +173,17 @@ impl Operation for GroupWriteOperation {
                 if let Err(error) = check_group_write(value.as_deref()) {
                     return self.fail(error);
                 }
-                self.state = State::Write;
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes: std::mem::take(&mut self.writes),
-                    txn_id: self.txn_id,
-                })]
+                self.write()
+            }
+            (State::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                let mut values = values.into_iter().map(|(_, value)| value);
+                if let Err(error) = check_group_write(values.next().flatten().as_deref()) {
+                    return self.fail(error);
+                }
+                if values.next().flatten().is_some() {
+                    return self.fail(GroupWriteError::Taken);
+                }
+                self.write()
             }
             (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
                 if self.secret.is_some() =>
