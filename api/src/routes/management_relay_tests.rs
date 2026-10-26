@@ -117,7 +117,7 @@ fn requests_reach_owner() {
     let known = Some((owner, Some(url.clone())));
     assert_eq!(
         pinned_targets(known.clone(), peers.clone(), true),
-        [url.clone()]
+        std::slice::from_ref(&url)
     );
     assert_eq!(pinned_targets(known, peers.clone(), false), [url]);
     let unpublished = Some((owner, None));
