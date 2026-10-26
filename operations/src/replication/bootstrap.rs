@@ -47,12 +47,13 @@ use crate::distribution::sign_statement;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::GetBucketOperation;
 
-/// Inventory rows one page queues at most; the next page waits until they are delivered.
-const PAGE_ROWS: usize = 64;
-const PAGE_BYTES: usize = 1 << 20;
+/// Inventory rows one page queues at most, one reference page; the next page waits until they
+/// are delivered.
+const PAGE_ROWS: usize = super::page::PAGE_RECORDS;
+const PAGE_BYTES: usize = 8 << 20;
 /// Sets and pages one drain works on at most.
 const SET_BATCH: usize = 16;
-const PAGE_BUDGET: usize = 32;
+const PAGE_BUDGET: usize = 8;
 /// Rows one drain deletes at most while it clears the cursors of a settled set.
 const CLEAR_BATCH: usize = 1024;
 /// How soon the drain looks again while a bootstrap waits for its jobs.
@@ -73,6 +74,8 @@ pub struct PageConfig {
     pub intent: [u8; 32],
     pub range: KeyRange,
     pub now_ms: u64,
+    /// Inventory rows the page reads at most.
+    pub rows: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,7 +246,7 @@ impl BootstrapPage {
             key_space: INVENTORY_KEYSPACE.to_string(),
             start,
             end: IterEnd::Before(upper.into()),
-            limit: PAGE_ROWS,
+            limit: self.config.rows,
             max_bytes: PAGE_BYTES,
             txn_id: None,
         })])
@@ -647,6 +650,7 @@ impl SetWalk {
                 intent: target.intent,
                 range: range.clone(),
                 now_ms: unix_timestamp_millis(),
+                rows: PAGE_ROWS,
             });
             match drive(page, context)
                 .await

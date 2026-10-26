@@ -12,6 +12,9 @@ fn set() -> Ulid {
     Ulid::from_bytes([9; 16])
 }
 
+/// Rows a test page reads, small enough for a key with more versions than one page.
+const ROWS: usize = 64;
+
 fn config(intent: u8) -> PageConfig {
     PageConfig {
         realm_id: RealmId::from_bytes([9; 32]),
@@ -22,6 +25,7 @@ fn config(intent: u8) -> PageConfig {
         intent: [intent; 32],
         range: range(1, "", None),
         now_ms: 7,
+        rows: ROWS,
     }
 }
 
@@ -91,12 +95,12 @@ async fn continues_inside_key() {
     // A key with more versions than one page resumes after the last queued version.
     let (_dir, handle) = open();
     install(&handle, set(), &[range(1, "", None)]).await;
-    let count = PAGE_ROWS as u8 + 6;
+    let count = ROWS as u8 + 6;
     for seed in 1..=count {
         assert!(apply(&handle, write(set(), "k", seed, 3)).await.unwrap());
     }
     // The key's head row takes one place of the first page; it queues nothing.
-    assert_eq!(page(&handle, 1).await, PageProgress::Queued(PAGE_ROWS - 1));
+    assert_eq!(page(&handle, 1).await, PageProgress::Queued(ROWS - 1));
     let first = cursor(&handle).await;
     assert!(!first.walked);
     deliver(&handle).await;
