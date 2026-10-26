@@ -26,6 +26,8 @@ struct ProgressInner {
     unit: String,
     /// Set once this execution committed a resumable checkpoint.
     checkpointed: AtomicBool,
+    /// Wakes the heartbeat to persist a committed checkpoint's progress at once.
+    flush: tokio::sync::Notify,
 }
 
 impl ProgressReporter {
@@ -36,6 +38,7 @@ impl ProgressReporter {
                 total: Mutex::new(progress.total),
                 unit: progress.unit.clone(),
                 checkpointed: AtomicBool::new(false),
+                flush: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -55,6 +58,12 @@ impl ProgressReporter {
     /// Records that a durable checkpoint advanced, so a later transient failure costs no attempt.
     pub fn checkpoint(&self) {
         self.inner.checkpointed.store(true, Ordering::Relaxed);
+        self.inner.flush.notify_one();
+    }
+
+    /// Completes once a checkpoint asked for its progress to be persisted.
+    pub async fn flush_requested(&self) {
+        self.inner.flush.notified().await
     }
 
     pub fn checkpointed(&self) -> bool {

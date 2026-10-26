@@ -932,7 +932,11 @@ async fn heartbeat_loop(
                     Err(error) => warn!(job_id = %job_id, error = %error, "Lease renew failed"),
                 }
             }
-            _ = flush.tick() => {
+            // A committed checkpoint is persisted at once, so the record keeps up with its rows.
+            _ = futures_util::future::select(
+                Box::pin(flush.tick()),
+                Box::pin(progress.flush_requested()),
+            ) => {
                 match flush_progress(&storage, job_id, token, progress.snapshot(), unix_timestamp_millis()).await {
                     Ok(renew) => if renew.cancel_requested { cancel.cancel(); }
                     Err(JobMutationError::TokenMismatch) => return,
@@ -1490,6 +1494,17 @@ mod tests {
         assert_eq!(record.state, JobState::Queued);
         assert!(record.claim.is_none());
         assert_eq!(record.attempts, 0);
+    }
+
+    // A committed checkpoint asks the heartbeat to persist its progress without waiting.
+    #[test]
+    fn checkpoint_requests_flush() {
+        let record = probe_record(JobId::from_bytes([0x17; 16]), 1, 0, None);
+        let progress = ProgressReporter::from_progress(&record.progress);
+        assert!(progress.flush_requested().now_or_never().is_none());
+        progress.checkpoint();
+        assert!(progress.flush_requested().now_or_never().is_some());
+        assert!(progress.checkpointed());
     }
 
     // Transient failures after a committed checkpoint never exhaust a long job; failures
