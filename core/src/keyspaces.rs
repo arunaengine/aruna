@@ -488,6 +488,9 @@ pub const DISTRIBUTION_LIFECYCLE_KEYSPACE: &str = "distribution_lifecycle";
 pub const DISTRIBUTION_PURGE_KEYSPACE: &str = "distribution_purge";
 /// Source roots of a set's external references by set id and root digest, with check markers.
 pub const SOURCE_ROOT_KEYSPACE: &str = "distribution_source_roots";
+/// The source roots stored versions name by digest: kind, public settings and login namespace,
+/// kept once per node instead of in every version.
+pub const ROOT_RECORD_KEYSPACE: &str = "source_root_records";
 /// IRI index postings by document first, so a materialization replaces exactly its own rows.
 pub const DOCUMENT_IRI_KEYSPACE: &str = "metadata_document_iris";
 /// Head changes of distributed buckets waiting for the range search indexes, by head position.
@@ -759,6 +762,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DISTRIBUTION_LIFECYCLE_KEYSPACE,
     DISTRIBUTION_PURGE_KEYSPACE,
     SOURCE_ROOT_KEYSPACE,
+    ROOT_RECORD_KEYSPACE,
     BUCKET_FREE_INDEX,
     CONTENT_INDEX_KEYSPACE,
     DOCUMENT_IRI_KEYSPACE,

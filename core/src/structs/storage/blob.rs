@@ -1404,6 +1404,16 @@ impl BlobVersion {
         self.state.is_deleted()
     }
 
+    /// The source binding, to swap a stored compact binding for its full form or back.
+    pub fn source_binding_mut(&mut self) -> Option<&mut VersionSourceBinding> {
+        match &mut self.state {
+            BlobVersionState::Reference { source, .. } => Some(source),
+            BlobVersionState::Materialized { source, .. }
+            | BlobVersionState::PendingContent { source, .. } => source.as_mut(),
+            BlobVersionState::Deleted => None,
+        }
+    }
+
     pub fn is_materialized(&self) -> bool {
         self.state.is_materialized()
     }
@@ -1715,6 +1725,7 @@ mod tests {
                     capabilities: Vec::new(),
                     origin_node_id: None,
                     namespace: None,
+                    root: None,
                 },
                 connector_id,
             };
@@ -2015,6 +2026,7 @@ mod tests {
                 capabilities: vec!["versioned".to_string()],
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };
