@@ -2615,7 +2615,8 @@ async fn scan_due_jobs(
     let cursor = read_replication_cursor(storage).await?;
     let start_after = cursor.after.clone();
     let mut jobs = Vec::new();
-    let mut next_due_ms = cursor.next_due_ms;
+    // A pass from the start drops the last pass's due time, which may already be past.
+    let mut next_due_ms = cursor.next_due_ms.filter(|_| start_after.is_some());
     let mut canonical_changed = false;
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
@@ -4433,6 +4434,41 @@ mod tests {
         assert_eq!(result.processed, 0);
         assert!(!result.has_more_due);
         assert!(result.next_due_after.is_some());
+    }
+
+    #[tokio::test]
+    async fn past_due_settles() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        // A finished pass remembered a retry that has since run and left the queue empty.
+        let stale = ReplicationScanCursor {
+            generation: 1,
+            after: None,
+            next_due_ms: Some(1),
+        };
+        advance_replication_cursor(&storage, stale)
+            .await
+            .expect("stale cursor persists");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        for _ in 0..2 {
+            let result = process_blob_batch(&context)
+                .await
+                .expect("empty drain succeeds");
+            assert!(!result.has_more_due);
+            assert_eq!(
+                result.next_due_after, None,
+                "an empty queue must not re-arm"
+            );
+        }
     }
 
     #[tokio::test]
