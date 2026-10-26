@@ -13,6 +13,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
+use aruna_core::structs::storage::distribution::capacity::RangeSize;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, DistributionRequest, DistributionRevision,
     DistributionSnapshot, SignedSnapshot, SignedStatement,
@@ -26,6 +27,7 @@ use ulid::Ulid;
 use super::admit::{AdmitConfig, AdmitError, AdmitOperation};
 use super::publish::{PublishConfig, PublishError, PublishOperation};
 use crate::driver::{DriverContext, drive};
+use crate::effect_adapters::routing::node_routing;
 use crate::forward::authorize::is_sync_eligible;
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::{authorize_peer, authorize_pull};
@@ -187,12 +189,13 @@ pub(crate) async fn serve_admission(
         auth_token,
         snapshot,
         member_id,
+        sizes,
     } = message
     else {
         return reject("unexpected admission message");
     };
     let result = match caller(context, peer, auth_token).await {
-        Ok(auth) => admit_member(context, &auth, &snapshot, member_id).await,
+        Ok(auth) => admit_member(context, &auth, &snapshot, (member_id, &sizes)).await,
         Err(refusal) => Err(refusal),
     };
     if let Err(refusal) = &result {
@@ -204,12 +207,13 @@ pub(crate) async fn serve_admission(
 }
 
 /// Creates this node's member bucket for the caller, or finds it again on a retry, then
-/// admits it. Any other bucket of the name fails.
+/// admits it against this node's capacity with the ranges' expected `sizes`. Any other bucket
+/// of the name fails.
 pub(crate) async fn admit_member(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
     signed: &SignedSnapshot,
-    member_id: Ulid,
+    (member_id, sizes): (Ulid, &[RangeSize]),
 ) -> Result<SignedStatement, SyncRefusal> {
     let net = context
         .net_handle
@@ -254,11 +258,17 @@ pub(crate) async fn admit_member(
             .into_iter()
             .cloned()
             .collect(),
+        strategy: member.strategy,
+        coverage: member.coverage,
+        sizes: sizes.to_vec(),
+        capacity: node_routing(context).catalog.capacity(),
     };
     drive(AdmitOperation::new(admit), context.as_ref())
         .await
         .map_err(|error| match error {
-            AdmitError::BindingChanged(_) => SyncRefusal::Invalid(error.to_string()),
+            AdmitError::BindingChanged(_)
+            | AdmitError::CapacityUnknown
+            | AdmitError::InsufficientCapacity { .. } => SyncRefusal::Invalid(error.to_string()),
             _ => SyncRefusal::Unavailable,
         })
 }

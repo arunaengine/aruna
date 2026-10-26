@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::distribution::capacity::RangeSize;
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionError, DistributionMember, DistributionRequest, DistributionRevision,
     DistributionSettings, DistributionSnapshot, MemberState, MetadataCoverage, RangeBehaviour,
@@ -36,6 +37,8 @@ pub struct JoinInput {
     pub range_behaviour: Option<RangeBehaviour>,
     /// Ranges the member keeps a copy of; `all` coverage members may name none.
     pub ranges: Vec<Ulid>,
+    /// Expected sizes of the set's ranges, for the member's capacity admission.
+    pub sizes: Vec<RangeSize>,
 }
 
 /// This node, and the set's head while configuration changes may proceed.
@@ -151,7 +154,7 @@ pub async fn join_member(
         ranges: input.ranges,
     };
     send(context, (local, &snapshot), caller.clone(), request).await?;
-    admit_pending(context, caller.0, caller.1, set_id).await
+    admit_pending(context, caller.0, caller.1, set_id, &input.sizes).await
 }
 
 /// Marks a member leaving; a coordinator transfers its ranges first.

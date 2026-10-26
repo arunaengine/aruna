@@ -20,6 +20,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementPolicyRef};
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::storage::distribution::capacity::RangeSize;
 use aruna_core::structs::storage::distribution::{
     DistributionRequest, DistributionRevision, SignedSnapshot, SignedStatement,
 };
@@ -550,6 +551,8 @@ pub enum MetadataTransportMessage {
         auth_token: AuthToken,
         snapshot: Box<SignedSnapshot>,
         member_id: Ulid,
+        /// Expected sizes of the ranges the member accepts, for its capacity admission.
+        sizes: Vec<RangeSize>,
     },
     AdmittedMember {
         result: Result<Box<SignedStatement>, SyncRefusal>,

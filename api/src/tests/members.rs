@@ -379,6 +379,10 @@ async fn admitted_set(
                 .into_iter()
                 .cloned()
                 .collect(),
+            strategy: member.strategy,
+            coverage: member.coverage,
+            sizes: Vec::new(),
+            capacity: None,
         };
         let statement = drive(AdmitOperation::new(admit), &node.context)
             .await

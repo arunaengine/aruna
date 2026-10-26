@@ -184,6 +184,7 @@ pub async fn join_distributed(
             .iter()
             .map(|value| id(value))
             .collect::<ServerResult<_>>()?,
+        sizes: Vec::new(),
     };
     let report = join_member(&state.get_ctx(), (&auth, bearer), set_id, input)
         .await

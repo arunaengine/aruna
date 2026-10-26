@@ -11,6 +11,7 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::distribution::capacity::RangeSize;
 use aruna_core::structs::storage::distribution::presets::{
     Layout, add_edges, replica_layout, shard_layout,
 };
@@ -165,7 +166,8 @@ pub async fn create_set(
     )
     .await?;
     // The set exists from here on, so every later failure still names it.
-    match admit_pending(context, auth, bearer, set_id).await {
+    // The ranges of a new set are empty.
+    match admit_pending(context, auth, bearer, set_id, &[]).await {
         Ok(report) => Ok(report),
         Err(error) => Ok(CreationReport {
             set_id,
@@ -178,11 +180,13 @@ pub async fn create_set(
 
 /// Admits every member the record has not admitted yet and activates the set once every
 /// coordinator and replica is in. A failed member keeps the set pending; nothing is deleted.
+/// Each member checks its node's capacity against the ranges' expected `sizes`.
 pub async fn admit_pending(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
     bearer: Option<AuthToken>,
     set_id: Ulid,
+    sizes: &[RangeSize],
 ) -> Result<CreationReport, CreateError> {
     let local = context
         .net_handle
@@ -205,10 +209,12 @@ pub async fn admit_pending(
             Some(_) => Ok(()),
             None => {
                 let statement = match (member.node_id == local, bearer.clone()) {
-                    (true, _) => admit_member(context, auth, &signed, member.member_id).await,
+                    (true, _) => {
+                        admit_member(context, auth, &signed, (member.member_id, sizes)).await
+                    }
                     (false, Some(token)) => {
-                        request_admission(context, member.node_id, token, &signed, member.member_id)
-                            .await
+                        let member = (member.node_id, member.member_id, sizes);
+                        request_admission(context, member, token, &signed).await
                     }
                     (false, None) => Err(SyncRefusal::Unauthorized),
                 };
@@ -349,10 +355,9 @@ pub(crate) async fn publish_remote(
 /// Asks a member's node to create and admit its local bucket under the caller's bearer token.
 pub(crate) async fn request_admission(
     context: &Arc<DriverContext>,
-    node_id: NodeId,
+    (node_id, member_id, sizes): (NodeId, Ulid, &[RangeSize]),
     auth_token: AuthToken,
     snapshot: &SignedSnapshot,
-    member_id: Ulid,
 ) -> Result<SignedStatement, SyncRefusal> {
     let metadata = context
         .metadata_handle
@@ -362,6 +367,7 @@ pub(crate) async fn request_admission(
         auth_token,
         snapshot: Box::new(snapshot.clone()),
         member_id,
+        sizes: sizes.to_vec(),
     };
     match metadata.request_forwarded_write(node_id, message).await {
         Ok(MetadataTransportMessage::AdmittedMember { result }) => result.map(|signed| *signed),
