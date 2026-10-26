@@ -29,6 +29,7 @@ use aruna_operations::distribution::guard::bound_view;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
+use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -669,7 +670,7 @@ Nothing is authorized later while the job runs.
         (status = 403, description = "Token from another realm, or no READ on a source path or WRITE on a target key", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, or a connector or source path does not exist", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
-        (status = 503, description = "Job placement or the structured id clock is unavailable; the response carries `Retry-After` and the identical body may be resubmitted", body = ErrorResponse)
+        (status = 503, description = "Job placement or the structured id clock is unavailable, or a key range of the distributed bucket is moving away from this node; the response carries `Retry-After` and the identical body may be resubmitted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1496,6 +1497,12 @@ async fn coordinator_jobs(
         .await
         .map_err(crate::routes::storage::distributed::map_guard_error)?;
     let snapshot = view.snapshot();
+    // Refused before any relay, as the local job would be while a range moves away from here.
+    let moving = (snapshot.lifecycle.transfers.iter()).any(|open| open.from == binding.member_id);
+    if moving {
+        let error = SubmitJobError::RangeMoving(binding.set_id);
+        return Err(ServerError::ServiceUnavailableReason(error.to_string()));
+    }
     let local = state.get_node_id();
     let (mut coordinates, mut nodes) = (false, Vec::<RestForward>::new());
     for range in &snapshot.config.ranges {

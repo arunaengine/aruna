@@ -584,6 +584,99 @@ mod tests {
         assert_eq!(jobs, Ok(None));
     }
 
+    // A transfer away that opens while a staging job is admitted refuses the job: the admission
+    // retries once the record changed under it, so no job lands after the transfer's job scan.
+    #[tokio::test]
+    async fn refuses_moving_admission() {
+        use crate::distribution::test_record::store_record;
+        use crate::distribution::test_record::{binding, member, realm, record, secret};
+        use crate::jobs::submit::{SubmitJobError, SubmitJobOperation, SubmitJobSpec};
+        use aruna_core::effects::Effect;
+        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+        use aruna_core::operation::Operation;
+        use aruna_core::structs::execution::job::WorkspaceMode;
+        use aruna_core::structs::storage::distribution::snapshot::OpenTransfer;
+        use aruna_core::structs::storage::distribution::{SignedSnapshot, TransferRole};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let (mut snapshot, bytes) = record(true);
+        let set_id = snapshot.set_id();
+        store_record(&storage, set_id, bytes).await;
+        let spec = spec("spire");
+        let bucket = BucketInfo {
+            group_id: spec.group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: spec.auth_context.user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: Some(binding(&snapshot, 1, 5)),
+        };
+        let write = StorageEffect::Write {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: b"spire".to_vec().into(),
+            value: bucket.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+        snapshot.lifecycle.transfers.push(OpenTransfer {
+            transfer_id: Ulid::from_bytes([8; 16]),
+            range_id: snapshot.config.ranges[0].range_id,
+            from: member(1),
+            to: member(2),
+            epoch: 2,
+            role: TransferRole::Replica,
+            fenced: None,
+            completed: None,
+        });
+        let head = SignedSnapshot::sign(snapshot, realm(), &secret(1)).unwrap();
+        let moving = DistributionView {
+            head,
+            conflict: None,
+        };
+        let submission = SubmitJobSpec {
+            created_by: spec.auth_context.user_id,
+            owner_node_id: spec.node_id,
+            payload: JobPayload::Staging(spec),
+            dedup_key: None,
+            now_ms: 1,
+            retention_ms: 1,
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+            active_cap: None,
+        };
+        let mut operation = SubmitJobOperation::new(submission, JobId::from_bytes([1; 16]));
+        let mut effects = operation.start().into_vec();
+        let mut raced = false;
+        while let Some(Effect::Storage(effect)) = effects.pop() {
+            // The transfer opens after the admission read the record, before it commits.
+            if !raced && matches!(effect, StorageEffect::CommitTransaction { .. }) {
+                store_record(&storage, set_id, moving.to_bytes().unwrap()).await;
+                raced = true;
+            }
+            let event = storage.send_storage_effect(effect).await;
+            if !operation.is_complete() {
+                effects = operation.step(event).into_vec();
+            }
+        }
+        assert!(raced);
+        assert_eq!(
+            operation.finalize(),
+            Err(SubmitJobError::RangeMoving(set_id))
+        );
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        assert!(open_imports(&context, "spire").await.unwrap().is_empty());
+    }
+
     // Only unfinished imports into the transferred bucket are handed over.
     #[tokio::test]
     async fn open_bucket_imports() {
