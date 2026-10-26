@@ -298,57 +298,63 @@ pub async fn wait_for_placement(
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
     let target = DocumentTarget::RealmConfig { realm_id };
 
-    tokio::time::timeout(timeout, async {
-        let mut attempt = 0;
-        loop {
-            let config = drive(GetConfigOperation::new(realm_id), driver_ctx).await?;
-            if node_is_ready(&config, node_id) {
-                info!(
-                    realm_id = %realm_id,
-                    node_id = %node_id,
-                    kind = kind_label(&config, node_id),
-                    "Onboarding complete: the node joined its realm"
-                );
-                return Ok::<(), Box<dyn std::error::Error>>(());
-            }
-
-            match device_owner {
-                // A device has no membership in the realm-config topic, so it
-                // re-reads the documents the same way it first fetched them.
-                Some(owner) => {
-                    let budget = timeout.min(DEVICE_FETCH_BUDGET);
-                    if !fetch_from_peers(driver_ctx, owner, vec![bootstrap_peer], budget).await {
-                        warn!(peer = %bootstrap_peer, "Retrying the device realm document fetch");
-                    }
-                }
-                None => {
-                    if let Err(error) = sync_peer_topic(
-                        driver_ctx
-                            .net_handle
-                            .as_ref()
-                            .ok_or("net handle unavailable")?,
-                        target.sync_topic_id(
-                            realm_id,
-                            &aruna_core::structs::placement::record::PlacementRef::NIL,
-                        ),
-                        bootstrap_peer,
-                        &target,
-                        timeout,
-                    )
-                    .await
-                    {
-                        warn!(error = %error, "Retrying onboarding placement sync");
-                    }
-                }
-            }
-            tokio::time::sleep(backoff(attempt)).await;
-            attempt = attempt.saturating_add(1);
+    let mut deadline = tokio::time::Instant::now() + timeout;
+    let mut attempt = 0;
+    loop {
+        let config = drive(GetConfigOperation::new(realm_id), driver_ctx).await?;
+        if node_is_ready(&config, node_id) {
+            info!(
+                realm_id = %realm_id,
+                node_id = %node_id,
+                kind = kind_label(&config, node_id),
+                "Onboarding complete: the node joined its realm"
+            );
+            return Ok(());
         }
-    })
-    .await
-    .map_err(|_| {
-        format!("timed out after {timeout:?} waiting for onboarding placement for node {node_id}")
-    })?
+
+        let failure = match device_owner {
+            // A device has no membership in the realm-config topic, so it
+            // re-reads the documents the same way it first fetched them.
+            Some(owner) => {
+                let budget = timeout.min(DEVICE_FETCH_BUDGET);
+                if !fetch_from_peers(driver_ctx, owner, vec![bootstrap_peer], budget).await {
+                    warn!(peer = %bootstrap_peer, "Retrying the device realm document fetch");
+                }
+                None
+            }
+            None => sync_peer_topic(
+                driver_ctx
+                    .net_handle
+                    .as_ref()
+                    .ok_or("net handle unavailable")?,
+                target.sync_topic_id(
+                    realm_id,
+                    &aruna_core::structs::placement::record::PlacementRef::NIL,
+                ),
+                bootstrap_peer,
+                &target,
+                timeout,
+            )
+            .await
+            .err(),
+        };
+        let now = tokio::time::Instant::now();
+        if let Some(failure) = failure {
+            warn!(error = %failure, "Retrying onboarding placement sync");
+            // An unreachable peer restarts the budget; a peer that answers must place us in time.
+            if let SyncFailure::Unreachable(_) = failure {
+                deadline = deadline.max(now + timeout);
+            }
+        }
+        if now >= deadline {
+            return Err(format!(
+                "timed out after {timeout:?} waiting for onboarding placement for node {node_id}"
+            )
+            .into());
+        }
+        tokio::time::sleep(backoff(attempt)).await;
+        attempt = attempt.saturating_add(1);
+    }
 }
 
 /// Node-kind label for the completion log; the owner of a device stays out of it.
@@ -415,13 +421,38 @@ fn unique_user_topic(
     synced_topics.insert(topic).then_some(topic)
 }
 
+/// Why one document sync with the bootstrap peer failed.
+#[derive(Debug, thiserror::Error)]
+enum SyncFailure {
+    /// The peer did not answer in time, as while it restarts.
+    #[error("{0}")]
+    Unreachable(String),
+    /// The peer answered and refused, or answered something unexpected.
+    #[error("{0}")]
+    Refused(String),
+}
+
+/// The deadline after a failed attempt, `None` once the failure is final. An unreachable peer
+/// restarts the budget, so a join only gives up on refusals that outlast it.
+fn retry_deadline(
+    deadline: tokio::time::Instant,
+    failure: &SyncFailure,
+    now: tokio::time::Instant,
+    budget: Duration,
+) -> Option<tokio::time::Instant> {
+    match failure {
+        SyncFailure::Unreachable(_) => Some(deadline.max(now + budget)),
+        SyncFailure::Refused(_) => (now < deadline).then_some(deadline),
+    }
+}
+
 async fn sync_peer_topic(
     net_handle: &aruna_net::NetHandle,
     topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
     document_for_error: &DocumentTarget,
     timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), SyncFailure> {
     let document_for_error = document_for_error.clone();
     let sync = net_handle.send_effect(Effect::Net(NetEffect::DocumentSync(
         DocumentEffect::SyncDocument {
@@ -429,21 +460,21 @@ async fn sync_peer_topic(
             peers: vec![bootstrap_peer],
         },
     )));
-    let event = tokio::time::timeout(timeout, sync)
-        .await
-        .map_err(|_| {
-            format!(
-                "timed out after {timeout:?} fetching onboarding document {document_for_error:?} from bootstrap peer {bootstrap_peer}"
-            )
-        })?;
+    let event = tokio::time::timeout(timeout, sync).await.map_err(|_| {
+        SyncFailure::Unreachable(format!(
+            "timed out after {timeout:?} fetching onboarding document {document_for_error:?} from bootstrap peer {bootstrap_peer}"
+        ))
+    })?;
 
     match event {
         Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled { .. })) => Ok(()),
         Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
-            Err(error.into())
+            Err(SyncFailure::Refused(error.to_string()))
         }
-        Event::Net(NetEvent::Error(error)) => Err(format!("{error:?}").into()),
-        other => Err(format!("unexpected document sync result: {other:?}").into()),
+        Event::Net(NetEvent::Error(error)) => Err(SyncFailure::Refused(format!("{error:?}"))),
+        other => Err(SyncFailure::Refused(format!(
+            "unexpected document sync result: {other:?}"
+        ))),
     }
 }
 
@@ -456,18 +487,22 @@ async fn sync_with_retry(
     document: &DocumentTarget,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let mut deadline = tokio::time::Instant::now() + timeout;
     let mut attempt = 0;
     loop {
-        match sync_peer_topic(net_handle, topic, bootstrap_peer, document, timeout).await {
-            Ok(()) => return Ok(()),
-            Err(error) if tokio::time::Instant::now() < deadline => {
-                warn!(error = %error, document = ?document, "Retrying onboarding document sync");
-                tokio::time::sleep(backoff(attempt)).await;
-                attempt = attempt.saturating_add(1);
-            }
-            Err(error) => return Err(error),
-        }
+        let error =
+            match sync_peer_topic(net_handle, topic, bootstrap_peer, document, timeout).await {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+        let now = tokio::time::Instant::now();
+        let Some(next) = retry_deadline(deadline, &error, now, timeout) else {
+            return Err(error.into());
+        };
+        deadline = next;
+        warn!(error = %error, document = ?document, "Retrying onboarding document sync");
+        tokio::time::sleep(backoff(attempt)).await;
+        attempt = attempt.saturating_add(1);
     }
 }
 

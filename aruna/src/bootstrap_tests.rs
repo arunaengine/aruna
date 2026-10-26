@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    backoff, ensure_onboarding_secret, node_is_ready, prepare_core_documents,
-    publish_core_documents, sync_peer_topic, sync_with_retry, unique_user_topic,
+    SyncFailure, backoff, ensure_onboarding_secret, node_is_ready, prepare_core_documents,
+    publish_core_documents, retry_deadline, sync_peer_topic, sync_with_retry, unique_user_topic,
     watch_target_needed,
 };
 use crate::identity::PersistedNodeIdentity;
@@ -73,6 +73,32 @@ fn backoff_grows_capped() {
     assert_eq!(backoff(4), Duration::from_millis(1_600));
     assert_eq!(backoff(6), Duration::from_secs(5));
     assert_eq!(backoff(u32::MAX), Duration::from_secs(5));
+}
+
+// A bootstrap peer that is restarting is waited for, however long it takes; a peer that
+// answers with a refusal ends the join once the budget is spent.
+#[test]
+fn unreachable_peer_waited() {
+    let budget = Duration::from_secs(60);
+    let start = tokio::time::Instant::now();
+    let deadline = start + budget;
+    let unreachable = SyncFailure::Unreachable("timed out".to_string());
+    let refused = SyncFailure::Refused("not a member".to_string());
+    let late = start + Duration::from_secs(600);
+
+    assert_eq!(
+        retry_deadline(deadline, &unreachable, late, budget),
+        Some(late + budget)
+    );
+    assert_eq!(
+        retry_deadline(deadline, &unreachable, start, budget),
+        Some(deadline)
+    );
+    assert_eq!(
+        retry_deadline(deadline, &refused, start, budget),
+        Some(deadline)
+    );
+    assert_eq!(retry_deadline(deadline, &refused, late, budget), None);
 }
 
 // Only a device takes the metadata route, and it is the persisted owner that
