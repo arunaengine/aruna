@@ -77,6 +77,8 @@ pub struct PageImportInput {
     pub entries: Vec<PageEntry>,
     /// The checkpoint after this page; the page's outcome is added before it is written.
     pub checkpoint: StagingJobCheckpoint,
+    /// The row the checkpoint is written to: the job's own, or one prefix lane's.
+    pub checkpoint_key: Key,
     /// Further job rows committed with the page, such as directory queue changes.
     pub writes: Vec<(KeySpace, Key, Value)>,
     pub deletes: Vec<(KeySpace, Key)>,
@@ -388,7 +390,7 @@ pub(crate) fn page_rows(
     checkpoint.items_failed = checkpoint.items_failed.saturating_add(result.kept);
     writes.push((
         STAGING_STATE_KEYSPACE.to_string(),
-        ByteView::from(input.job_id.to_bytes().to_vec()),
+        input.checkpoint_key.clone(),
         ByteView::from(postcard::to_allocvec(checkpoint).map_err(ConversionError::from)?),
     ));
     writes.extend(input.writes.iter().cloned());

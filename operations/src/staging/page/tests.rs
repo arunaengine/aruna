@@ -134,6 +134,7 @@ fn input(entries: Vec<PageEntry>) -> PageImportInput {
         secret_fingerprint: None,
         entries,
         checkpoint: checkpoint(),
+        checkpoint_key: ByteView::from(JobId::from_bytes([5; 16]).to_bytes().to_vec()),
         writes: Vec::new(),
         deletes: Vec::new(),
         now: SystemTime::UNIX_EPOCH + Duration::from_secs(2_000),

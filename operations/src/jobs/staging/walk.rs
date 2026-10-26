@@ -30,7 +30,8 @@ use super::manifest::{
     ManifestDigest, lasting_head, lasting_resolution, lasting_source, manifest_digests,
 };
 use super::{
-    ItemFailure, moved_away, persist_rows, pinned_bucket, queue_key, stage_item, sync_progress,
+    ItemFailure, checkpoint_key, moved_away, persist_slot, pinned_bucket, queue_key, stage_item,
+    sync_progress,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::distribution::guard::{GuardError, authority_reads, authority_rows, write_target};
@@ -196,7 +197,9 @@ struct StagedFile {
 pub(super) async fn walk_page(
     ctx: &JobContext,
     spec: &StagingJobSpec,
+    slot: Option<u64>,
     checkpoint: &mut StagingJobCheckpoint,
+    ahead: &mut Option<Ahead>,
 ) -> Result<(), PageFailure> {
     let Some(walk) = checkpoint.walk.clone() else {
         return Ok(());
@@ -207,19 +210,18 @@ pub(super) async fn walk_page(
     let mut next = checkpoint.clone();
     let mut writes = Vec::new();
     let mut deletes = Vec::new();
-    // A flat walk into a distributed bucket lists only the key ranges this node coordinates.
-    let segment = match (flat, walk.queue_row) {
-        (true, None) => match segment_of(ctx, spec, &walk).await? {
-            Bounds::Whole => None,
-            Bounds::Segment(segment) => Some(segment),
-            Bounds::Done => {
-                next.walk = None;
-                return commit_rows(ctx, checkpoint, next, writes, deletes).await;
-            }
-        },
-        _ => None,
+    let listed = match ahead.take().filter(|ahead| ahead.walk == walk) {
+        Some(ahead) => ahead.listing,
+        None => listing(ctx, spec, &walk, flat).await?,
     };
-    let mut page = match list_page(ctx, spec, &walk, (flat, segment.as_ref())).await {
+    let (segment, listed) = match listed {
+        Listing::Done => {
+            next.walk = None;
+            return commit_slot(ctx, slot, checkpoint, next, writes, deletes).await;
+        }
+        Listing::Page(segment, listed) => (segment, listed),
+    };
+    let mut page = match listed {
         Ok(page) => Some(page),
         Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
             record_failure(&mut next, &walk.source_path, &walk.target_prefix, message);
@@ -299,7 +301,7 @@ pub(super) async fn walk_page(
     next.phase = item_phase(spec);
     let Some(page) = page else {
         // The listing failed for good: record that and move on.
-        return commit_rows(ctx, checkpoint, next, writes, deletes).await;
+        return commit_slot(ctx, slot, checkpoint, next, writes, deletes).await;
     };
     let rows = PageRows {
         files,
@@ -307,11 +309,58 @@ pub(super) async fn walk_page(
         deletes,
     };
     match spec.strategy {
-        StagingStrategy::Reference => import_page(ctx, spec, checkpoint, next, rows, page).await,
+        StagingStrategy::Reference => {
+            // The next page of a flat walk is listed while this one commits; one page at most.
+            let following = (next.walk.clone()).filter(|walk| flat && walk.queue_row.is_none());
+            let prefetch = async {
+                let walk = following?;
+                let listing = listing(ctx, spec, &walk, flat).await.ok()?;
+                Some(Ahead { walk, listing })
+            };
+            let import = import_page(ctx, spec, slot, checkpoint, next, rows, page);
+            let (imported, fetched) = tokio::join!(import, prefetch);
+            if imported.is_ok() {
+                *ahead = fetched;
+            }
+            imported
+        }
         StagingStrategy::Snapshot | StagingStrategy::Sync => {
             snapshot_page(ctx, spec, checkpoint, next, rows).await
         }
     }
+}
+
+/// A listing made ahead for the walk position it was made for.
+pub(super) struct Ahead {
+    walk: StagingWalk,
+    listing: Listing,
+}
+
+/// What one listing of a walk position found.
+enum Listing {
+    /// No coordinated range of the walk is left.
+    Done,
+    Page(Option<Segment>, Result<ListStagingResult, ItemFailure>),
+}
+
+/// Lists the page at `walk`; a flat walk into a distributed bucket lists only the key ranges
+/// this node coordinates.
+async fn listing(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    walk: &StagingWalk,
+    flat: bool,
+) -> Result<Listing, PageFailure> {
+    let segment = match (flat, walk.queue_row) {
+        (true, None) => match segment_of(ctx, spec, walk).await? {
+            Bounds::Whole => None,
+            Bounds::Segment(segment) => Some(segment),
+            Bounds::Done => return Ok(Listing::Done),
+        },
+        _ => None,
+    };
+    let page = list_page(ctx, spec, walk, (flat, segment.as_ref())).await;
+    Ok(Listing::Page(segment, page))
 }
 
 /// What one listing page adds: files to stage and the job's queue changes.
@@ -328,13 +377,38 @@ pub(super) async fn commit_rows(
     writes: Vec<(KeySpace, Key, Value)>,
     deletes: Vec<(KeySpace, Key)>,
 ) -> Result<(), PageFailure> {
-    persist_rows(ctx, &next, writes, deletes)
+    commit_slot(ctx, None, checkpoint, next, writes, deletes).await
+}
+
+async fn commit_slot(
+    ctx: &JobContext,
+    slot: Option<u64>,
+    checkpoint: &mut StagingJobCheckpoint,
+    next: StagingJobCheckpoint,
+    writes: Vec<(KeySpace, Key, Value)>,
+    deletes: Vec<(KeySpace, Key)>,
+) -> Result<(), PageFailure> {
+    persist_slot(ctx, slot, &next, writes, deletes)
         .await
         .map_err(PageFailure::Retry)?;
-    *checkpoint = next;
-    sync_progress(ctx, checkpoint);
-    ctx.progress.checkpoint();
+    committed(ctx, slot, checkpoint, next);
     Ok(())
+}
+
+/// Takes a committed checkpoint over; a lane adds its own progress to the job's.
+fn committed(
+    ctx: &JobContext,
+    slot: Option<u64>,
+    checkpoint: &mut StagingJobCheckpoint,
+    next: StagingJobCheckpoint,
+) {
+    let before = checkpoint.items_current;
+    *checkpoint = next;
+    match slot {
+        None => sync_progress(ctx, checkpoint),
+        Some(_) => (ctx.progress).advance(checkpoint.items_current.saturating_sub(before)),
+    }
+    ctx.progress.checkpoint();
 }
 
 async fn list_page(
@@ -563,6 +637,7 @@ async fn own_files(
 async fn import_page(
     ctx: &JobContext,
     spec: &StagingJobSpec,
+    slot: Option<u64>,
     checkpoint: &mut StagingJobCheckpoint,
     mut next: StagingJobCheckpoint,
     rows: PageRows,
@@ -625,6 +700,7 @@ async fn import_page(
             secret_fingerprint: page.secret_fingerprint,
             entries,
             checkpoint: next,
+            checkpoint_key: checkpoint_key(ctx.job_id, slot),
             writes: rows.writes,
             deletes: rows.deletes,
             now: SystemTime::now(),
@@ -635,9 +711,7 @@ async fn import_page(
     .await;
     match result {
         Ok(result) => {
-            *checkpoint = result.checkpoint;
-            sync_progress(ctx, checkpoint);
-            ctx.progress.checkpoint();
+            committed(ctx, slot, checkpoint, result.checkpoint);
             Ok(())
         }
         Err(error @ (PageImportError::BucketChanged | PageImportError::TooManyBytes(_))) => {

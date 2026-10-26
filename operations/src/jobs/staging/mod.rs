@@ -40,7 +40,7 @@ pub async fn read_staging_checkpoint(
     read_state(
         &context.storage_handle,
         STAGING_STATE_KEYSPACE,
-        staging_checkpoint_key(job_id),
+        checkpoint_key(job_id, None),
         "staging checkpoint read",
     )
     .await
@@ -72,6 +72,7 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
     if let Err(error) = persist_rows(ctx, &checkpoint, Vec::new(), Vec::new()).await {
         return retryable_error(error);
     }
+    let mut ahead = None;
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -144,7 +145,7 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
         }
         let page = match checkpoint.manifest.is_some() {
             true => read_manifest_chunk(ctx, spec, &mut checkpoint).await,
-            false => walk_page(ctx, spec, &mut checkpoint).await,
+            false => walk_page(ctx, spec, None, &mut checkpoint, &mut ahead).await,
         };
         if let Err(outcome) = page {
             return match outcome {
@@ -240,7 +241,7 @@ pub(crate) async fn seed_checkpoint(
     let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
     let write = aruna_core::effects::StorageEffect::Write {
         key_space: STAGING_STATE_KEYSPACE.to_string(),
-        key: staging_checkpoint_key(job_id),
+        key: checkpoint_key(job_id, None),
         value: ByteView::from(value),
         txn_id: None,
     };
@@ -419,13 +420,24 @@ pub(super) fn sync_progress(ctx: &JobContext, checkpoint: &StagingJobCheckpoint)
 pub(super) async fn persist_rows(
     ctx: &JobContext,
     checkpoint: &StagingJobCheckpoint,
+    writes: Vec<(KeySpace, Key, Value)>,
+    deletes: Vec<(KeySpace, Key)>,
+) -> Result<(), String> {
+    persist_slot(ctx, None, checkpoint, writes, deletes).await
+}
+
+/// Writes the checkpoint of the job or of prefix lane `slot` with the given job rows.
+pub(super) async fn persist_slot(
+    ctx: &JobContext,
+    slot: Option<u64>,
+    checkpoint: &StagingJobCheckpoint,
     mut writes: Vec<(KeySpace, Key, Value)>,
     deletes: Vec<(KeySpace, Key)>,
 ) -> Result<(), String> {
     let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
     writes.push((
         STAGING_STATE_KEYSPACE.to_string(),
-        staging_checkpoint_key(ctx.job_id),
+        checkpoint_key(ctx.job_id, slot),
         ByteView::from(value),
     ));
     put_job_rows(
@@ -439,8 +451,13 @@ pub(super) async fn persist_rows(
     .map_err(|error| error.to_string())
 }
 
-fn staging_checkpoint_key(job_id: JobId) -> ByteView {
-    ByteView::from(job_id.to_bytes().to_vec())
+/// The checkpoint row of a job, or of its prefix lane `slot`, which extends the job's key.
+pub(crate) fn checkpoint_key(job_id: JobId, slot: Option<u64>) -> ByteView {
+    let mut key = job_id.to_bytes().to_vec();
+    if let Some(slot) = slot {
+        key.extend_from_slice(&slot.to_be_bytes());
+    }
+    ByteView::from(key)
 }
 
 pub(super) fn queue_key(job_id: JobId, position: u64) -> Key {
@@ -472,7 +489,7 @@ mod pure_tests {
     use crate::staging::page::rows::MAX_ERROR_SAMPLE;
     use ulid::Ulid;
 
-    fn test_spec() -> StagingJobSpec {
+    pub(super) fn test_spec() -> StagingJobSpec {
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         StagingJobSpec {
             auth_context: aruna_core::structs::identity::auth::AuthContext {
