@@ -711,6 +711,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn split_reclaim_releases() {
+        // A split moves the parent's reservation to its children; reclaiming both releases it.
+        use crate::distribution::split::{SplitConfig, SplitOperation};
+        use crate::distribution::test_store::{apply, install, range, write as update};
+        let (_dir, handle) = open();
+        let context = context(handle.clone());
+        let set_id = Ulid::from_bytes([5; 16]);
+        let ids = [1, 2, 3].map(|seed| Ulid::from_bytes([seed; 16]));
+        install(&handle, set_id, &[range(1, "", None)]).await;
+        for (key, seed) in [("a", 1), ("c", 2), ("x", 3)] {
+            assert!(apply(&handle, update(set_id, key, seed, 1)).await.unwrap());
+        }
+        let reserved = |id| account_key(set_id, id);
+        let charge = 3000u64.to_be_bytes().to_vec();
+        write(
+            &context,
+            CAPACITY_RESERVATION_KEYSPACE,
+            reserved(ids[0]),
+            charge,
+        )
+        .await
+        .unwrap();
+        let split = SplitOperation::new(SplitConfig {
+            set_id,
+            range_id: ids[0],
+            split_key: "m".to_string(),
+            left: ids[1],
+            right: ids[2],
+        });
+        drive(split, &context).await.unwrap();
+        let mut parts = Vec::new();
+        for id in ids {
+            let row = read(&context, CAPACITY_RESERVATION_KEYSPACE, reserved(id)).await;
+            parts.push(
+                row.unwrap()
+                    .map(|row| u64::from_be_bytes(row.as_ref().try_into().unwrap())),
+            );
+        }
+        assert_eq!(parts, vec![None, Some(2000), Some(1000)]);
+        for child in &ids[1..] {
+            clear_range_rows(&context, set_id, *child).await.unwrap();
+        }
+        let prefix = set_id.to_bytes();
+        let left = clear_page(&context, CAPACITY_RESERVATION_KEYSPACE, &prefix, None).await;
+        assert!(left.unwrap().is_empty(), "no charge of the set stays");
+    }
+
+    #[tokio::test]
     async fn replacement_keeps_rows() {
         // A bucket bound to the set again owns the set's rows; the clear leaves them.
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;

@@ -1,5 +1,5 @@
-//! Splits the accounting of one range: freezes the parent's counters as the charged
-//! snapshot, opens two child ranges with pending rows and rebuilds, and divides the sample.
+//! Splits the accounting of one range: freezes the parent's counters as the charged snapshot,
+//! opens two child ranges with pending rows and rebuilds, divides sample and reservation.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,7 +7,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE,
+    CAPACITY_RESERVATION_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
+    RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::accounting::{
@@ -62,6 +63,8 @@ pub struct SplitOperation {
     state: State,
     txn_id: Option<TxnId>,
     parent: Option<RangeAccount>,
+    /// The bytes this node reserved for the parent at admission.
+    reserved: Option<u64>,
     deletes: Vec<(String, Key)>,
     counts: Vec<(Key, RangeCounters)>,
     result: Option<Result<(), SplitError>>,
@@ -97,6 +100,7 @@ impl SplitOperation {
             state: State::Init,
             txn_id: None,
             parent: None,
+            reserved: None,
             deletes: Vec::new(),
             counts: Vec::new(),
             result: None,
@@ -210,6 +214,27 @@ impl SplitOperation {
             ));
             self.deletes.push((KEY_SAMPLE_KEYSPACE.to_string(), key));
         }
+        if let Some(bytes) = self.reserved {
+            // The children take over the parent's reservation, divided like the sample.
+            let left_bytes = match left_size + right_size {
+                0 => bytes / 2,
+                sampled => u64::try_from(i128::from(bytes) * left_size / sampled).unwrap_or(bytes),
+            };
+            for (child, part) in [
+                (config.left, left_bytes),
+                (config.right, bytes - left_bytes),
+            ] {
+                let key = account(child);
+                writes.push(row(
+                    CAPACITY_RESERVATION_KEYSPACE,
+                    key,
+                    part.to_be_bytes().into(),
+                ));
+            }
+            let parent_row = account(parent_id).into();
+            self.deletes
+                .push((CAPACITY_RESERVATION_KEYSPACE.to_string(), parent_row));
+        }
         let parent_count = sample_count_key(set_id, parent_id);
         self.deletes
             .push((RANGE_COUNTER_KEYSPACE.to_string(), parent_count.into()));
@@ -230,17 +255,28 @@ impl SplitOperation {
             (State::Started, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
                 self.txn_id = Some(txn_id);
                 self.state = State::ReadAccount;
-                Ok(smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: RANGE_ACCOUNT_KEYSPACE.to_string(),
-                    key: account_key(set_id, range_id).into(),
+                let key = Key::from(account_key(set_id, range_id));
+                Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads: vec![
+                        (RANGE_ACCOUNT_KEYSPACE.to_string(), key.clone()),
+                        (CAPACITY_RESERVATION_KEYSPACE.to_string(), key),
+                    ],
                     txn_id: Some(txn_id),
                 })])
             }
-            (State::ReadAccount, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+            (State::ReadAccount, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                let mut values = values.into_iter().map(|(_, value)| value);
+                let value = values.next().flatten();
                 let value = value.ok_or(SplitError::RangeMissing(range_id))?;
                 let parent = RangeAccount::from_bytes(&value)?;
                 self.check(&parent)?;
                 self.parent = Some(parent);
+                let invalid = || ConversionError::InvalidLength("capacity reservation row".into());
+                let reserved = values.next().flatten().map(|value| {
+                    let bytes = value.as_ref().try_into().map_err(|_| invalid());
+                    bytes.map(u64::from_be_bytes)
+                });
+                self.reserved = reserved.transpose()?;
                 self.state = State::ReadSample;
                 Ok(smallvec![Effect::Storage(StorageEffect::Iter {
                     key_space: KEY_SAMPLE_KEYSPACE.to_string(),
