@@ -511,3 +511,7 @@ pub async fn part_target(
         held_here: target.held_here,
     }))
 }
+
+#[cfg(test)]
+#[path = "links_tests.rs"]
+mod tests;
