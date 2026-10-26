@@ -653,7 +653,15 @@ pub async fn delete_owned_run(
     user_id: UserId,
     job_id: JobId,
 ) -> Result<RunDelete, JobMutationError> {
-    let outcome = delete_finished_run(&context.storage_handle, user_id, job_id).await?;
+    let storage = &context.storage_handle;
+    let mut outcome = delete_finished_run(storage, user_id, job_id).await?;
+    // A queued job is cancelled first; one that never ran settles at once and goes with it.
+    if let RunDelete::Unfinished(JobState::Queued | JobState::AwaitingKey) = outcome {
+        let cancelled = set_cancel_requested(storage, job_id, unix_timestamp_millis()).await?;
+        if let CancelRequestOutcome::Cancelled(_) = cancelled {
+            outcome = delete_finished_run(storage, user_id, job_id).await?;
+        }
+    }
     // A deleted job other than a run is pruned by the timer, which is moved up here.
     if outcome == RunDelete::Deleted
         && let Some(task_handle) = context.task_handle.as_ref()

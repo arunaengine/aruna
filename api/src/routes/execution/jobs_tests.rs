@@ -1018,6 +1018,13 @@ async fn exhausted_job_removable() {
         panic!("a running job cannot be deleted");
     };
     assert!(reason.contains("running"), "{reason}");
+    // A job still waiting in the queue is cancelled and deleted in one call.
+    let waiting = JobId::from_bytes([0x63; 16]);
+    insert_job(storage, &job_for(waiting, owner, 1000))
+        .await
+        .unwrap();
+    assert_eq!(delete(waiting).await.unwrap(), StatusCode::NO_CONTENT);
+    assert!(matches!(delete(waiting).await, Err(ServerError::NotFound)));
 }
 
 #[tokio::test]
