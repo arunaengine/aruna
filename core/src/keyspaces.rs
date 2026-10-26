@@ -412,6 +412,8 @@ pub const RUN_CRATE_KEYSPACE: &str = "job_run_crate";
 /// keyed like `job_run_crate`. Device-local and never replicated.
 pub const RUN_PUBLISH_KEYSPACE: &str = "job_run_publish";
 pub const ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
+/// The live claim of an unsettled job, keyed like `jobs`; rewritten only when the claim changes.
+pub const JOB_CLAIM_KEYSPACE: &str = "job_claims";
 /// Signed immutable output records, keyed by ExecutionId.
 pub const OUTPUT_RECORD_KEYSPACE: &str = "job_output_records";
 pub const JOB_ENTRY_KEYSPACE: &str = "job_entries";
@@ -702,6 +704,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     RUN_CRATE_KEYSPACE,
     RUN_PUBLISH_KEYSPACE,
     ATTEMPT_CONTROL_KEYSPACE,
+    JOB_CLAIM_KEYSPACE,
     OUTPUT_RECORD_KEYSPACE,
     JOB_ENTRY_KEYSPACE,
     FAMILY_RECORD_KEYSPACE,

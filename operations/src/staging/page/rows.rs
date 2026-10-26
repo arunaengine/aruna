@@ -7,7 +7,7 @@ use crate::distribution::guard::GuardError;
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::jobs::store::decode_job_record;
+use crate::jobs::store::ClaimGuard;
 use crate::node::usage_stats::UsageUpdateError;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
@@ -17,7 +17,7 @@ use aruna_core::UserId;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, JOB_KEYSPACE, PURGE_FENCE_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, JOB_CLAIM_KEYSPACE, PURGE_FENCE_KEYSPACE,
     S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
@@ -49,7 +49,7 @@ pub const MAX_PAGE_ENTRIES: usize = 1000;
 pub const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Most per-entry errors a staging checkpoint keeps; the failed counter counts all of them.
 pub const MAX_ERROR_SAMPLE: usize = 100;
-/// Rows read ahead of the heads: purge fence, bucket, connector and job record.
+/// Rows read ahead of the heads: purge fence, bucket, connector and job claim.
 pub(crate) const GUARD_READS: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,7 +203,7 @@ pub(crate) fn guard_reads(
             SOURCE_INDEX_KEYSPACE.to_string(),
             source_connector_key(connector.group_id, connector.connector_id),
         ),
-        (JOB_KEYSPACE.to_string(), job_record_key(input.job_id)),
+        (JOB_CLAIM_KEYSPACE.to_string(), job_record_key(input.job_id)),
     ];
     for entry in &input.entries {
         let head = BlobHeadKey::new(&input.bucket, &entry.target_key).to_bytes()?;
@@ -253,19 +253,13 @@ pub(crate) fn check_guards(
     if connector.as_ref() != Some(&input.connector) {
         return Err(PageImportError::ConnectorChanged);
     }
-    let record = values
+    let claim = values
         .next()
         .flatten()
-        .map(|value| decode_job_record(value.as_ref()))
+        .map(|value| ClaimGuard::from_bytes(value.as_ref()))
         .transpose()?
+        .filter(|claim| claim.claim_token == input.claim_token)
         .ok_or(PageImportError::ClaimLost)?;
-    let claimed = record
-        .claim
-        .as_ref()
-        .is_some_and(|claim| claim.claim_token == input.claim_token);
-    if !claimed || record.is_settled() {
-        return Err(PageImportError::ClaimLost);
-    }
     let heads = values
         .map(|value| {
             value
@@ -275,7 +269,7 @@ pub(crate) fn check_guards(
         .collect::<Result<_, _>>()?;
     Ok(PageGuards {
         policies,
-        job_created_ms: record.created_at_ms,
+        job_created_ms: claim.created_at_ms,
         heads,
         set_hint: binding.as_ref().map(DistributionBinding::hint),
         binding,

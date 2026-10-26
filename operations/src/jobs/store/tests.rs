@@ -349,6 +349,41 @@ async fn claim_moves_index() {
     assert_eq!(parsed, job_id);
 }
 
+fn claim_rows(old: &JobRecord, new: &JobRecord) -> (usize, usize) {
+    let (writes, deletes) = index_deltas(old, new).unwrap();
+    let written = writes
+        .iter()
+        .filter(|(space, ..)| space == JOB_CLAIM_KEYSPACE);
+    let deleted = deletes
+        .iter()
+        .filter(|(space, _)| space == JOB_CLAIM_KEYSPACE);
+    (written.count(), deleted.count())
+}
+
+// Lease renewals and progress flushes leave the claim row alone; a new claim or settling moves it.
+#[test]
+fn claim_row_moves() {
+    let mut claimed = queued_record(JobId::from_bytes([3u8; 16]));
+    claimed.state = JobState::Running;
+    claimed.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: Ulid::from_bytes([4u8; 16]),
+        lease_expires_ms: 5_000,
+    });
+    let mut renewed = claimed.clone();
+    renewed.progress.current = 7;
+    renewed.claim.as_mut().unwrap().lease_expires_ms = 9_000;
+    let mut taken = renewed.clone();
+    taken.claim.as_mut().unwrap().claim_token = Ulid::from_bytes([5u8; 16]);
+    let mut settled = renewed.clone();
+    settled.state = JobState::Succeeded;
+
+    assert_eq!(claim_rows(&queued_record(claimed.job_id), &claimed), (1, 0));
+    assert_eq!(claim_rows(&claimed, &renewed), (0, 0));
+    assert_eq!(claim_rows(&renewed, &taken), (1, 0));
+    assert_eq!(claim_rows(&renewed, &settled), (0, 1));
+}
+
 // Perf budget: a claim is start + read + batch-write + batch-delete + commit.
 #[tokio::test]
 async fn claim_transition_bounded() {

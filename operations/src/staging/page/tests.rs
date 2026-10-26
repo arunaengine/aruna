@@ -165,6 +165,11 @@ fn record(claim_token: Ulid) -> JobRecord {
     record
 }
 
+fn claim(record: &JobRecord) -> Option<Value> {
+    let guard = crate::jobs::store::ClaimGuard::of(record)?;
+    value(guard.to_bytes().unwrap())
+}
+
 fn value(bytes: Vec<u8>) -> Option<Value> {
     Some(ByteView::from(bytes))
 }
@@ -180,10 +185,7 @@ fn guards(fence: Option<Value>, record: &JobRecord, heads: Vec<Option<Value>>) -
             Key::from(b"connector".to_vec()),
             value(connector().to_bytes().unwrap()),
         ),
-        (
-            Key::from(b"job".to_vec()),
-            value(record.to_bytes().unwrap()),
-        ),
+        (Key::from(b"job".to_vec()), claim(record)),
     ];
     values.extend(
         heads
@@ -553,6 +555,57 @@ async fn replay_charges_once() {
     let test = setup_driver_context().await;
     let context = &test.driver_context;
     let group_id = bucket().group_id;
+// A progress flush and a lease renewal that commit while the page is open must not conflict.
+#[tokio::test]
+async fn flush_keeps_page() {
+    use crate::jobs::store::{flush_progress, renew_lease};
+    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let storage = &context.storage_handle;
+    let group_id = bucket().group_id;
+    let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
+    let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
+    let job = record(token());
+    crate::jobs::store::insert_job(storage, &job).await.unwrap();
+    let mut operation = PageImportOperation::new(PageImportInput {
+        connector,
+        expected_bucket,
+        ..input(vec![entry("a")])
+    });
+
+    let mut pending = std::collections::VecDeque::from(operation.start().into_vec());
+    while let Some(effect) = pending.pop_front() {
+        let Effect::Storage(effect) = effect else {
+            break;
+        };
+        let commit = matches!(effect, StorageEffect::CommitTransaction { .. });
+        if commit {
+            let progress = job.progress.clone();
+            flush_progress(storage, job.job_id, token(), progress, 2)
+                .await
+                .unwrap();
+            renew_lease(storage, job.job_id, token(), 3, None)
+                .await
+                .unwrap();
+        }
+        let event = storage.send_storage_effect(effect).await;
+        if commit {
+            assert!(
+                matches!(
+                    event,
+                    Event::Storage(StorageEvent::TransactionCommitted { .. })
+                ),
+                "the page must commit, got {event:?}"
+            );
+            return;
+        }
+        pending.extend(operation.step(event));
+    }
+    panic!("the page never reached its commit");
+}
+
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
     crate::jobs::store::insert_job(&context.storage_handle, &record(token()))
@@ -631,10 +684,7 @@ fn guards_carry_hint() {
             Key::from(b"connector".to_vec()),
             value(connector().to_bytes().unwrap()),
         ),
-        (
-            Key::from(b"job".to_vec()),
-            value(record(token()).to_bytes().unwrap()),
-        ),
+        (Key::from(b"job".to_vec()), claim(&record(token()))),
         (Key::from(b"head".to_vec()), None),
     ];
     let input = input(vec![entry("a")]);

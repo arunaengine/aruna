@@ -10,9 +10,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE,
-    DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE,
-    KEY_WAIT_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE,
-    SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
+    DEDUP_INDEX_KEYSPACE, JOB_CLAIM_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
+    JOB_STATE_KEYSPACE, KEY_WAIT_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE,
+    RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
@@ -53,6 +53,44 @@ pub use state::*;
 
 pub(super) type JobWrites = Vec<(KeySpace, Key, Value)>;
 pub(super) type JobDeletes = Vec<(KeySpace, Key)>;
+
+/// The claim row a page import guards on, so lease renewals and progress flushes,
+/// which rewrite only the job record, never conflict with a page commit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClaimGuard {
+    pub claim_token: Ulid,
+    pub created_at_ms: u64,
+}
+
+impl ClaimGuard {
+    pub(crate) fn of(record: &JobRecord) -> Option<Self> {
+        let claim = record.claim.as_ref().filter(|_| !record.is_settled())?;
+        Some(Self {
+            claim_token: claim.claim_token,
+            created_at_ms: record.created_at_ms,
+        })
+    }
+
+    fn write(record: &JobRecord) -> Result<Option<(KeySpace, Key, Value)>, ConversionError> {
+        let Some(guard) = Self::of(record) else {
+            return Ok(None);
+        };
+        let value = ByteView::from(guard.to_bytes()?);
+        Ok(Some((
+            JOB_CLAIM_KEYSPACE.to_string(),
+            job_record_key(record.job_id),
+            value,
+        )))
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactTombstone {
@@ -150,6 +188,7 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
         job_record_key(record.job_id),
         ByteView::from(record.to_bytes()?),
     )];
+    writes.extend(ClaimGuard::write(record)?);
     if let Some(schedule) = job_schedule_key(record) {
         writes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), schedule, empty_value()));
     }
@@ -188,6 +227,10 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
 pub fn prune_delete_entries(record: &JobRecord) -> JobDeletes {
     let mut deletes = vec![
         (JOB_KEYSPACE.to_string(), job_record_key(record.job_id)),
+        (
+            JOB_CLAIM_KEYSPACE.to_string(),
+            job_record_key(record.job_id),
+        ),
         (RUN_CRATE_KEYSPACE.to_string(), run_crate_key(record.job_id)),
         (
             JOB_INDEX_KEYSPACE.to_string(),
@@ -250,6 +293,12 @@ pub(super) fn index_deltas(
         ByteView::from(new.to_bytes()?),
     )];
     let mut deletes = Vec::new();
+    if ClaimGuard::of(old) != ClaimGuard::of(new) {
+        match ClaimGuard::write(new)? {
+            Some(write) => writes.push(write),
+            None => deletes.push((JOB_CLAIM_KEYSPACE.to_string(), job_record_key(new.job_id))),
+        }
+    }
 
     let old_schedule = job_schedule_key(old);
     let new_schedule = job_schedule_key(new);
