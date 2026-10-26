@@ -4,10 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::path::{Component, Path};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StagingSourceError;
+use aruna_core::errors::{StagingSourceError, StorageError};
 use aruna_core::keyspaces::{STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::execution::job::{
@@ -24,6 +24,7 @@ use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::distribution::{DistributionView, WriteRoute};
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
+use tokio::sync::Mutex;
 use tracing::warn;
 
 use super::manifest::{
@@ -45,7 +46,7 @@ use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
 };
 use crate::staging::page::import::{
-    PageEntry, PageImportError, PageImportInput, PageImportOperation,
+    PageEntry, PageImportError, PageImportInput, PageImportOperation, PageImportResult,
 };
 use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 
@@ -56,6 +57,10 @@ const SNAPSHOT_PAGE_SIZE: usize = 100;
 
 /// Queue rows one cleanup pass deletes.
 const QUEUE_CLEANUP_PAGE: usize = 256;
+/// Page transactions one listed page runs at most while their commits conflict.
+const PAGE_ATTEMPTS: u32 = 8;
+/// Pause before the next page transaction, times the attempts so far.
+const CONFLICT_PAUSE: Duration = Duration::from_millis(20);
 
 /// Starts the next listing: the next queued directory, else the next spec prefix.
 /// `Ok(false)` once nothing is left to list.
@@ -182,6 +187,8 @@ pub(super) fn record_failure(
 pub(super) enum PageFailure {
     Retry(String),
     Permanent(String),
+    /// Page transactions kept conflicting with other writers; the job is deferred.
+    Conflict(String),
 }
 
 /// A file a listing page found, mapped to its destination key.
@@ -194,13 +201,13 @@ struct StagedFile {
 }
 
 /// Lists one page of the current walk and records it, with the walk's next position and the
-/// queue changes, in one write.
+/// queue changes, in one write. Lanes share `turn`, so their page transactions run one at a time.
 pub(super) async fn walk_page(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     (slot, upper): (Option<u64>, Option<&str>),
     checkpoint: &mut StagingJobCheckpoint,
-    ahead: &mut Option<Ahead>,
+    (ahead, turn): (&mut Option<Ahead>, Option<&Mutex<()>>),
 ) -> Result<(), PageFailure> {
     let Some(walk) = checkpoint.walk.clone() else {
         return Ok(());
@@ -318,7 +325,7 @@ pub(super) async fn walk_page(
                 let listing = listing(ctx, spec, &walk, (flat, upper)).await.ok()?;
                 Some(Ahead { walk, listing })
             };
-            let import = import_page(ctx, spec, slot, checkpoint, next, rows, page);
+            let import = import_page(ctx, spec, (slot, turn), checkpoint, next, rows, page);
             let (imported, fetched) = tokio::join!(import, prefetch);
             if imported.is_ok() {
                 *ahead = fetched;
@@ -700,7 +707,7 @@ async fn own_files(
 async fn import_page(
     ctx: &JobContext,
     spec: &StagingJobSpec,
-    slot: Option<u64>,
+    (slot, turn): (Option<u64>, Option<&Mutex<()>>),
     checkpoint: &mut StagingJobCheckpoint,
     mut next: StagingJobCheckpoint,
     rows: PageRows,
@@ -751,30 +758,35 @@ async fn import_page(
         (bucket.distribution.as_ref()).map(|binding| binding.set_id),
     )
     .await;
-    let result = drive(
-        PageImportOperation::new(PageImportInput {
-            job_id: ctx.job_id,
-            claim_token: ctx.claim_token,
-            realm_id: spec.auth_context.realm_id,
-            group_id: spec.group_id,
-            user_id: spec.auth_context.user_id,
-            auth_context: spec.auth_context.clone(),
-            node_id: spec.node_id,
-            bucket: spec.bucket.clone(),
-            expected_bucket: bucket,
-            connector: page.connector,
-            secret_fingerprint: page.secret_fingerprint,
-            entries,
-            checkpoint: next,
-            checkpoint_key: checkpoint_key(ctx.job_id, slot),
-            writes: rows.writes,
-            deletes: rows.deletes,
-            now: SystemTime::now(),
-            database,
-        }),
-        &ctx.driver,
-    )
-    .await;
+    let input = PageImportInput {
+        job_id: ctx.job_id,
+        claim_token: ctx.claim_token,
+        realm_id: spec.auth_context.realm_id,
+        group_id: spec.group_id,
+        user_id: spec.auth_context.user_id,
+        auth_context: spec.auth_context.clone(),
+        node_id: spec.node_id,
+        bucket: spec.bucket.clone(),
+        expected_bucket: bucket,
+        connector: page.connector,
+        secret_fingerprint: page.secret_fingerprint,
+        entries,
+        checkpoint: next,
+        checkpoint_key: checkpoint_key(ctx.job_id, slot),
+        writes: rows.writes,
+        deletes: rows.deletes,
+        now: SystemTime::now(),
+        database,
+    };
+    let result = {
+        // Listing and the reads above run in parallel; the page transactions take turns.
+        let _turn = match turn {
+            Some(turn) => Some(turn.lock().await),
+            None => None,
+        };
+        let run = |input| drive(PageImportOperation::new(input), &ctx.driver);
+        retry_page(ctx, input, run).await
+    };
     match result {
         Ok(result) => {
             committed(ctx, slot, checkpoint, result.checkpoint);
@@ -783,8 +795,38 @@ async fn import_page(
         Err(error @ (PageImportError::BucketChanged | PageImportError::TooManyBytes(_))) => {
             Err(PageFailure::Permanent(error.to_string()))
         }
-        // A changed connector, a lost claim or a conflict replays the page from its cursor.
+        Err(error @ PageImportError::Storage(StorageError::TransactionConflict)) => {
+            Err(PageFailure::Conflict(error.to_string()))
+        }
+        // A changed connector or a lost claim replays the page from its cursor.
         Err(error) => Err(PageFailure::Retry(error.to_string())),
+    }
+}
+
+/// Runs the page transaction of `input` again while its commit conflicts, at most
+/// [`PAGE_ATTEMPTS`] times. Each run is a new transaction that checks every guard again.
+pub(super) async fn retry_page<R, F>(
+    ctx: &JobContext,
+    input: PageImportInput,
+    mut run: R,
+) -> Result<PageImportResult, PageImportError>
+where
+    R: FnMut(PageImportInput) -> F,
+    F: Future<Output = Result<PageImportResult, PageImportError>>,
+{
+    let mut attempts = 1;
+    loop {
+        let result = run(input.clone()).await;
+        let conflict = PageImportError::Storage(StorageError::TransactionConflict);
+        if result.as_ref().err() != Some(&conflict) || attempts >= PAGE_ATTEMPTS {
+            return result;
+        }
+        tokio::select! {
+            _ = ctx.cancel.cancelled() => return result,
+            _ = ctx.shutdown.cancelled() => return result,
+            _ = tokio::time::sleep(CONFLICT_PAUSE * attempts) => {}
+        }
+        attempts += 1;
     }
 }
 

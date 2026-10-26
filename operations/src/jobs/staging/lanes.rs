@@ -13,6 +13,7 @@ use aruna_core::structs::execution::staging::StagingStrategy;
 use byteview::ByteView;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use tokio::sync::Mutex;
 
 use super::walk::{PageFailure, directory_list_path, first_key, target_of, walk_page};
 use super::{checkpoint_key, persist_rows};
@@ -142,12 +143,15 @@ pub(super) async fn run_lanes(
     ctx.progress
         .set_current(main.items_current.saturating_add(resumed));
     let stop = AtomicBool::new(false);
+    // The lanes list in parallel, but their page transactions take turns, so they never
+    // conflict with each other on shared range rows.
+    let turn = Mutex::new(());
     let mut lanes = FuturesUnordered::new();
     let mut failure = None;
     loop {
         while failure.is_none() && lanes.len() < LANE_LIMIT && !stopped(ctx, &stop) {
             if let Some(lane) = open.pop() {
-                lanes.push(run_lane(ctx, spec, lane, &stop));
+                lanes.push(run_lane(ctx, spec, lane, (&stop, &turn)));
                 continue;
             }
             let opened = start_prefix(ctx, spec, main, LANE_LIMIT - lanes.len()).await?;
@@ -312,7 +316,7 @@ async fn run_lane(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     (slot, mut lane, upper): Lane,
-    stop: &AtomicBool,
+    (stop, turn): (&AtomicBool, &Mutex<()>),
 ) -> (u64, Result<Option<StagingJobCheckpoint>, PageFailure>) {
     let mut ahead = None;
     loop {
@@ -323,7 +327,8 @@ async fn run_lane(
             return (slot, Ok(None));
         }
         let bounds = (Some(slot), upper.as_deref());
-        if let Err(error) = walk_page(ctx, spec, bounds, &mut lane, &mut ahead).await {
+        let walking = (&mut ahead, Some(turn));
+        if let Err(error) = walk_page(ctx, spec, bounds, &mut lane, walking).await {
             return (slot, Err(error));
         }
     }
@@ -332,7 +337,14 @@ async fn run_lane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::staging::walk::retry_page;
+    use crate::staging::page::import::{
+        PageImportError, PageImportInput, PageImportOperation, PageImportResult,
+    };
     use aruna_core::structs::execution::job::{StagingJobError, StagingJobPrefix};
+
+    /// A connector endpoint the tests never reach.
+    const UNUSED: &str = "http://127.0.0.1:9";
 
     fn spec(targets: &[&str]) -> StagingJobSpec {
         let mut spec = super::super::pure_tests::test_spec();
@@ -488,6 +500,152 @@ mod tests {
 
         assert_eq!(splits, vec!["p/SAME".to_string(), "p/SAMN".to_string()]);
         assert_eq!(target_of(&walk, &splits[1]).as_deref(), Some("t/SAMN"));
+    }
+
+    /// A page of two files of the job's bucket, as the walk builds it.
+    async fn page_input(ctx: &JobContext, spec: &StagingJobSpec) -> PageImportInput {
+        use crate::connectors::repository::{parse_connector_read, read_connector_effect};
+        use crate::staging::page::import::PageEntry;
+        let effect = read_connector_effect(spec.group_id, spec.connector_id, None);
+        let event = crate::distribution::test_store::send(&ctx.driver.storage_handle, effect);
+        let connector = parse_connector_read(event.await).ok().flatten().unwrap();
+        let expected_bucket = super::super::pinned_bucket(ctx, spec).await.ok().unwrap();
+        let entries = ["x", "y"].map(|name| PageEntry {
+            source_path: format!("a/{name}"),
+            target_key: format!("ta/{name}"),
+            observation: aruna_core::structs::execution::source_access::SourceMetadata {
+                content_length: 3,
+                content_type: None,
+                etag: Some("\"e\"".to_string()),
+                last_modified: None,
+                source_version: None,
+                digests: Default::default(),
+            },
+        });
+        PageImportInput {
+            job_id: ctx.job_id,
+            claim_token: ctx.claim_token,
+            realm_id: spec.auth_context.realm_id,
+            group_id: spec.group_id,
+            user_id: spec.auth_context.user_id,
+            auth_context: spec.auth_context.clone(),
+            node_id: spec.node_id,
+            bucket: spec.bucket.clone(),
+            expected_bucket,
+            connector,
+            secret_fingerprint: None,
+            entries: entries.to_vec(),
+            checkpoint: super::super::initial_checkpoint(spec),
+            checkpoint_key: checkpoint_key(ctx.job_id, Some(0)),
+            writes: Vec::new(),
+            deletes: Vec::new(),
+            now: std::time::SystemTime::now(),
+            database: None,
+        }
+    }
+
+    /// The stored value of a row.
+    async fn stored(ctx: &JobContext, key_space: &str, key: Vec<u8>) -> ByteView {
+        let value =
+            crate::distribution::test_store::get(&ctx.driver.storage_handle, key_space, key);
+        ByteView::from(value.await.unwrap())
+    }
+
+    /// Runs the page transaction, but another writer rewrites `row` right before the commit,
+    /// so the commit conflicts.
+    async fn interfered(
+        ctx: &JobContext,
+        input: PageImportInput,
+        (key_space, key, value): (&str, ByteView, ByteView),
+    ) -> Result<PageImportResult, PageImportError> {
+        use aruna_core::effects::{Effect, StorageEffect};
+        use aruna_core::events::Event;
+        use aruna_core::operation::Operation;
+        use aruna_core::task::{TaskEffect, TaskEvent};
+        let handle = &ctx.driver.storage_handle;
+        let mut operation = PageImportOperation::new(input);
+        let mut effects: std::collections::VecDeque<Effect> =
+            operation.start().into_iter().collect();
+        while let Some(effect) = effects.pop_front() {
+            let event = match effect {
+                Effect::Storage(effect @ StorageEffect::CommitTransaction { .. }) => {
+                    let write = StorageEffect::Write {
+                        key_space: key_space.to_string(),
+                        key: key.clone(),
+                        value: value.clone(),
+                        txn_id: None,
+                    };
+                    handle.send_storage_effect(write).await;
+                    handle.send_storage_effect(effect).await
+                }
+                Effect::Storage(effect) => handle.send_storage_effect(effect).await,
+                Effect::Task(
+                    TaskEffect::ShortenTimer { key, after } | TaskEffect::ResetTimer { key, after },
+                ) => Event::Task(TaskEvent::TimerScheduled { key, after }),
+                other => panic!("unexpected effect: {other:?}"),
+            };
+            effects.extend(operation.step(event));
+        }
+        operation.finalize()
+    }
+
+    /// Runs `input` through the retry, the first run conflicting on the rewrite of `row`.
+    async fn retried(
+        ctx: &JobContext,
+        input: PageImportInput,
+        row: (&str, ByteView, ByteView),
+    ) -> (usize, Result<PageImportResult, PageImportError>) {
+        use crate::driver::drive;
+        let mut runs = 0;
+        let result = retry_page(ctx, input, |input| {
+            runs += 1;
+            let (first, row) = (runs == 1, row.clone());
+            async move {
+                match first {
+                    true => interfered(ctx, input, row).await,
+                    false => drive(PageImportOperation::new(input), &ctx.driver).await,
+                }
+            }
+        })
+        .await;
+        (runs, result)
+    }
+
+    // A page whose commit conflicts with another writer runs again in a new transaction and
+    // registers its files, so its lane goes on instead of stopping the others.
+    #[tokio::test]
+    async fn conflict_retries_page() {
+        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+        let (ctx, spec, _dir) = job_context(UNUSED.to_string(), &[("a", "ta")], None).await;
+        let input = page_input(&ctx, &spec).await;
+        let key = spec.bucket.as_bytes().to_vec();
+        let value = stored(&ctx, S3_BUCKET_KEYSPACE, key.clone()).await;
+
+        let row = (S3_BUCKET_KEYSPACE, ByteView::from(key), value);
+        let (runs, result) = retried(&ctx, input, row).await;
+
+        assert_eq!(runs, 2, "the first run conflicted");
+        assert_eq!(result.ok().map(|result| result.registered), Some(2));
+    }
+
+    // The run after a conflict checks every guard again: a claim lost meanwhile stops it.
+    #[tokio::test]
+    async fn retry_rechecks_guards() {
+        use crate::jobs::store::ClaimGuard;
+        use aruna_core::keyspaces::JOB_CLAIM_KEYSPACE;
+        use aruna_core::structs::execution::job::job_record_key;
+        let (ctx, spec, _dir) = job_context(UNUSED.to_string(), &[("a", "ta")], None).await;
+        let input = page_input(&ctx, &spec).await;
+        let key = job_record_key(ctx.job_id).to_vec();
+        let claim = stored(&ctx, JOB_CLAIM_KEYSPACE, key.clone()).await;
+        let mut claim = ClaimGuard::from_bytes(&claim).unwrap();
+        claim.claim_token = ulid::Ulid::from_bytes([8; 16]);
+
+        let value = ByteView::from(claim.to_bytes().unwrap());
+        let (runs, result) = retried(&ctx, input, (JOB_CLAIM_KEYSPACE, key.into(), value)).await;
+
+        assert_eq!(runs, 2);
+        assert_eq!(result.err(), Some(PageImportError::ClaimLost));
     }
 
     /// A claimed reference import of `prefixes`, source and target, from a connector at

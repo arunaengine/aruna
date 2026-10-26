@@ -156,6 +156,7 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(PageFailure::Retry(message)) => return retryable_error(message),
+                Err(PageFailure::Conflict(message)) => return conflict_error(message),
                 Err(PageFailure::Permanent(message)) => {
                     return finish_failed(ctx, permanent_error(message)).await;
                 }
@@ -170,11 +171,15 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
         }
         let page = match checkpoint.manifest.is_some() {
             true => read_manifest_chunk(ctx, spec, &mut checkpoint).await,
-            false => walk_page(ctx, spec, (None, None), &mut checkpoint, &mut ahead).await,
+            false => {
+                let walking = (&mut ahead, None);
+                walk_page(ctx, spec, (None, None), &mut checkpoint, walking).await
+            }
         };
         if let Err(outcome) = page {
             return match outcome {
                 PageFailure::Retry(message) => retryable_error(message),
+                PageFailure::Conflict(message) => conflict_error(message),
                 PageFailure::Permanent(message) => {
                     finish_failed(ctx, permanent_error(message)).await
                 }
@@ -501,6 +506,11 @@ pub(super) enum ItemFailure {
 
 fn retryable_error(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::retryable(message.into()))
+}
+
+/// Storage conflicts are transient: the job runs again later without spending an attempt.
+fn conflict_error(message: impl Into<String>) -> JobRunOutcome {
+    JobRunOutcome::Deferred(JobError::retryable(message.into()))
 }
 
 fn permanent_error(message: impl Into<String>) -> JobRunOutcome {
