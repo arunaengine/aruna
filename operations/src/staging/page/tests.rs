@@ -542,19 +542,6 @@ fn page_bounds_entries() {
     );
 }
 
-// Runs the page twice against real storage: the commit is atomic and the replay finds the
-// registered head, so usage and connector rows are counted once.
-#[tokio::test]
-async fn replay_charges_once() {
-    use crate::driver::drive;
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
-    use aruna_core::effects::IterStart;
-    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-    use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
-
-    let test = setup_driver_context().await;
-    let context = &test.driver_context;
-    let group_id = bucket().group_id;
 // A progress flush and a lease renewal that commit while the page is open must not conflict.
 #[tokio::test]
 async fn flush_keeps_page() {
@@ -606,6 +593,19 @@ async fn flush_keeps_page() {
     panic!("the page never reached its commit");
 }
 
+// Runs the page twice against real storage: the commit is atomic and the replay finds the
+// registered head, so usage and connector rows are counted once.
+#[tokio::test]
+async fn replay_charges_once() {
+    use crate::driver::drive;
+    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_core::effects::IterStart;
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let group_id = bucket().group_id;
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
     crate::jobs::store::insert_job(&context.storage_handle, &record(token()))
