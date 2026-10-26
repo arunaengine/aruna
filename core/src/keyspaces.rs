@@ -493,6 +493,9 @@ pub const SEARCH_INDEX_KEYSPACE: &str = "distribution_search_indexes";
 pub const DATABASE_UNLINKED_KEYSPACE: &str = "database_unlinked";
 /// The value each row a running usage rebuild reads had when the rebuild began, kept on change.
 pub const USAGE_PREIMAGE_KEYSPACE: &str = "usage_rebuild_preimages";
+/// Bytes this node admitted for distributed bucket members: a member row by set id with its
+/// bucket and cache budget, and a row per held range by set and range id.
+pub const CAPACITY_RESERVATION_KEYSPACE: &str = "distribution_capacity_reservations";
 
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
@@ -756,6 +759,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SEARCH_INDEX_KEYSPACE,
     DATABASE_UNLINKED_KEYSPACE,
     USAGE_PREIMAGE_KEYSPACE,
+    CAPACITY_RESERVATION_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

@@ -12,10 +12,10 @@ use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, BOOTSTRAP_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE,
-    CONTENT_INDEX_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_PURGE_KEYSPACE,
-    INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
-    RANGE_INDEX_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE, SOURCE_ROOT_KEYSPACE,
-    UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
+    CAPACITY_RESERVATION_KEYSPACE, CONTENT_INDEX_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE,
+    DISTRIBUTION_PURGE_KEYSPACE, INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
+    RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE,
+    SOURCE_ROOT_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::DistributionBinding;
@@ -219,7 +219,7 @@ pub async fn purge_rest(context: &DriverContext, target: &PurgeTarget) -> Result
 }
 
 /// The keyspaces a set's local rows are cleared from, in step order after the attachments.
-const CLEARED: [&str; 13] = [
+const CLEARED: [&str; 14] = [
     INVENTORY_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE,
     VERSION_INDEX_KEYSPACE,
@@ -232,6 +232,7 @@ const CLEARED: [&str; 13] = [
     CONTENT_INDEX_KEYSPACE,
     SEARCH_FEED_KEYSPACE,
     SEARCH_INDEX_KEYSPACE,
+    CAPACITY_RESERVATION_KEYSPACE,
     DISTRIBUTION_PURGE_KEYSPACE,
 ];
 
@@ -502,7 +503,7 @@ async fn drop_cached(context: &DriverContext, identity: [u8; 32]) -> Result<(), 
 }
 
 /// Deletes the accounting rows this node keeps for the range: its account, counters, key
-/// sample and search index, in bounded batches.
+/// sample, search index and capacity reservation, in bounded batches.
 async fn clear_range_rows(
     context: &DriverContext,
     set_id: Ulid,
@@ -514,6 +515,7 @@ async fn clear_range_rows(
         KEY_SAMPLE_KEYSPACE,
         RANGE_ACCOUNT_KEYSPACE,
         SEARCH_INDEX_KEYSPACE,
+        CAPACITY_RESERVATION_KEYSPACE,
     ] {
         clear_prefix(context, key_space, prefix.clone()).await?;
     }
@@ -663,6 +665,15 @@ mod tests {
         write(&context, DISTRIBUTION_FENCE_KEYSPACE, fence.clone(), vec![])
             .await
             .unwrap();
+        let reservation = account_key(set_id, Ulid::from_bytes([3; 16]));
+        write(
+            &context,
+            CAPACITY_RESERVATION_KEYSPACE,
+            reservation.clone(),
+            vec![1],
+        )
+        .await
+        .unwrap();
         let mut passes = 0;
         loop {
             passes += 1;
@@ -695,6 +706,8 @@ mod tests {
         assert_eq!(cursor.unwrap(), None, "a finished clear leaves no cursor");
         let kept = read(&context, DISTRIBUTION_FENCE_KEYSPACE, fence).await;
         assert!(kept.unwrap().is_some(), "a deleted set keeps its fence");
+        let released = read(&context, CAPACITY_RESERVATION_KEYSPACE, reservation).await;
+        assert_eq!(released.unwrap(), None, "the set's capacity is released");
     }
 
     #[tokio::test]

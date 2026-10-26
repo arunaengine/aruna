@@ -12,6 +12,7 @@ use crate::types::GroupId;
 
 pub mod accounting;
 pub mod bootstrap;
+pub mod capacity;
 pub mod delegation;
 pub mod delivery;
 pub mod fence;
