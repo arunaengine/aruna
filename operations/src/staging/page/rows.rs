@@ -15,6 +15,7 @@ use crate::staging::descriptor::build_source_binding;
 use crate::staging::root_record::{compact_version, root_write};
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
+use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
@@ -39,7 +40,7 @@ use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEp
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{GroupId, Key, KeySpace, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -54,6 +55,11 @@ pub const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_ERROR_SAMPLE: usize = 100;
 /// Rows read ahead of the heads: purge fence, bucket, connector and job claim.
 pub(crate) const GUARD_READS: usize = 4;
+/// Rows of other keys the head read may meet between the page's keys before the page reads its
+/// heads one by one instead.
+const HEAD_SLACK: usize = 1000;
+/// Most bytes the head read takes.
+const HEAD_READ_BYTES: usize = 4 << 20;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PageEntry {
@@ -106,6 +112,10 @@ pub enum PageImportState {
     Init,
     StartTransaction,
     ReadGuards,
+    /// Reads the heads in the key interval of the page, which proves absent keys absent.
+    ReadHeads,
+    /// Reads the heads key by key, when the interval holds too many other keys.
+    ReadHeadKeys,
     /// Reads a distributed bucket's record: every entry's key must be coordinated here.
     ReadRecord,
     /// Reads whether an ordinary bucket has a sync relationship that replicates its versions.
@@ -204,7 +214,7 @@ pub(crate) fn guard_reads(
     input: &PageImportInput,
 ) -> Result<Vec<(KeySpace, Key)>, ConversionError> {
     let connector = &input.connector;
-    let mut reads = vec![
+    let reads = vec![
         (PURGE_FENCE_KEYSPACE.to_string(), fence_key(&input.bucket)),
         (
             S3_BUCKET_KEYSPACE.to_string(),
@@ -216,20 +226,76 @@ pub(crate) fn guard_reads(
         ),
         (JOB_CLAIM_KEYSPACE.to_string(), job_record_key(input.job_id)),
     ];
-    for entry in &input.entries {
-        let head = BlobHeadKey::new(&input.bucket, &entry.target_key).to_bytes()?;
-        reads.push((BLOB_HEAD_KEYSPACE.to_string(), head.into()));
-    }
     Ok(reads)
 }
 
+fn head_keys(input: &PageImportInput) -> Result<Vec<Vec<u8>>, ConversionError> {
+    (input.entries.iter())
+        .map(|entry| BlobHeadKey::new(&input.bucket, &entry.target_key).to_bytes())
+        .collect()
+}
+
+/// One read of the head rows between the page's smallest and largest key; `None` for an
+/// empty page. Read in the transaction, a head written in the interval meanwhile conflicts.
+pub(crate) fn head_range(
+    input: &PageImportInput,
+    txn_id: TxnId,
+) -> Result<Option<StorageEffect>, ConversionError> {
+    let keys = head_keys(input)?;
+    let (Some(first), Some(last)) = (keys.iter().min(), keys.iter().max()) else {
+        return Ok(None);
+    };
+    Ok(Some(StorageEffect::IterRange {
+        key_space: BLOB_HEAD_KEYSPACE.to_string(),
+        start: IterStart::At(first.clone().into()),
+        end: IterEnd::Through(last.clone().into()),
+        limit: keys.len() + HEAD_SLACK,
+        max_bytes: HEAD_READ_BYTES,
+        txn_id: Some(txn_id),
+    }))
+}
+
+/// Reads of the page's heads, one per entry in entry order.
+pub(crate) fn head_reads(input: &PageImportInput) -> Result<Vec<(KeySpace, Key)>, ConversionError> {
+    let keys = head_keys(input)?.into_iter();
+    Ok(keys
+        .map(|key| (BLOB_HEAD_KEYSPACE.to_string(), key.into()))
+        .collect())
+}
+
+/// Each entry's head among the rows of the page's key interval.
+pub(crate) fn interval_heads(
+    input: &PageImportInput,
+    rows: Vec<(Key, Value)>,
+) -> Result<Vec<Option<CurrentVersionPointer>>, PageImportError> {
+    let rows: BTreeMap<Vec<u8>, Value> = (rows.into_iter())
+        .map(|(key, value)| (key.to_vec(), value))
+        .collect();
+    let heads = head_keys(input)?
+        .into_iter()
+        .map(|key| rows.get(&key).cloned());
+    decode_heads(heads)
+}
+
+/// The heads of [`head_reads`], in entry order.
+pub(crate) fn decode_heads(
+    values: impl IntoIterator<Item = Option<Value>>,
+) -> Result<Vec<Option<CurrentVersionPointer>>, PageImportError> {
+    let heads = (values.into_iter()).map(|value| {
+        let head = value.map(|value| CurrentVersionPointer::from_bytes(value.as_ref()));
+        head.transpose()
+    });
+    Ok(heads.collect::<Result<_, _>>()?)
+}
+
 /// Checks every guard of a single reference write: purge fence, bucket incarnation,
-/// connector and job claim. Placement defaults come from the bucket row read here.
+/// connector and job claim. Placement defaults come from the bucket row read here; the heads
+/// are read next.
 pub(crate) fn check_guards(
     input: &PageImportInput,
     values: Vec<(Key, Option<Value>)>,
 ) -> Result<PageGuards, PageImportError> {
-    if values.len() != GUARD_READS + input.entries.len() {
+    if values.len() != GUARD_READS {
         return Err(StorageError::ReadError("short guard read".to_string()).into());
     }
     let mut values = values.into_iter().map(|(_, value)| value);
@@ -271,17 +337,10 @@ pub(crate) fn check_guards(
         .transpose()?
         .filter(|claim| claim.claim_token == input.claim_token)
         .ok_or(PageImportError::ClaimLost)?;
-    let heads = values
-        .map(|value| {
-            value
-                .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
-                .transpose()
-        })
-        .collect::<Result<_, _>>()?;
     Ok(PageGuards {
         policies,
         job_created_ms: claim.created_at_ms,
-        heads,
+        heads: Vec::new(),
         set_hint: binding.as_ref().map(DistributionBinding::hint),
         binding,
         epochs: Vec::new(),

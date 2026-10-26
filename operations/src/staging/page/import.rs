@@ -8,7 +8,8 @@ use crate::distribution::guard::{authority_read, authority_rows, write_epochs};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::replication::queue::schedule_blob_drain;
 use crate::staging::page::rows::{
-    MAX_PAGE_ENTRIES, PageGuards, check_guards, guard_reads, page_rows, version_reads,
+    MAX_PAGE_ENTRIES, PageGuards, check_guards, decode_heads, guard_reads, head_range, head_reads,
+    interval_heads, page_rows, version_reads,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
@@ -16,6 +17,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BlobVersion;
+use aruna_core::structs::storage::blob::CurrentVersionPointer;
 use aruna_core::structs::sync_relationship_prefix;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
@@ -83,6 +85,26 @@ impl PageImportOperation {
             limit: 1,
             txn_id: Some(self.txn()?),
         })])
+    }
+
+    /// Takes the page's heads and reads what replicates the bucket's versions.
+    fn take_heads(
+        &mut self,
+        heads: Vec<Option<CurrentVersionPointer>>,
+    ) -> Result<Effects, PageImportError> {
+        let guards = self.guards.as_mut().ok_or(PageImportError::NotFinished)?;
+        guards.heads = heads;
+        // Read in the page transaction, so a fence or record set meanwhile conflicts.
+        let txn_id = self.txn_id;
+        let record =
+            (guards.binding.as_ref()).map(|binding| authority_read(binding.set_id, txn_id));
+        match record {
+            Some(read) => {
+                self.state = PageImportState::ReadRecord;
+                Ok(smallvec![read])
+            }
+            None => self.read_relationships(),
+        }
     }
 
     fn txn(&self) -> Result<TxnId, PageImportError> {
@@ -172,20 +194,35 @@ impl PageImportOperation {
                 PageImportState::ReadGuards,
                 Event::Storage(StorageEvent::BatchReadResult { values }),
             ) => {
-                let guards = check_guards(&self.input, values)?;
-                // Read in the page transaction, so a fence or record set meanwhile conflicts.
-                let txn_id = self.txn_id;
-                let record =
-                    (guards.binding.as_ref()).map(|binding| authority_read(binding.set_id, txn_id));
-                self.guards = Some(guards);
-                match record {
+                self.guards = Some(check_guards(&self.input, values)?);
+                match head_range(&self.input, self.txn()?)? {
                     Some(read) => {
-                        self.state = PageImportState::ReadRecord;
-                        Ok(smallvec![read])
+                        self.state = PageImportState::ReadHeads;
+                        Ok(smallvec![Effect::Storage(read)])
                     }
-                    None => self.read_relationships(),
+                    None => self.take_heads(Vec::new()),
                 }
             }
+            (
+                PageImportState::ReadHeads,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => match next_start_after {
+                Some(_) => {
+                    self.state = PageImportState::ReadHeadKeys;
+                    Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: head_reads(&self.input)?,
+                        txn_id: Some(self.txn()?),
+                    })])
+                }
+                None => self.take_heads(interval_heads(&self.input, values)?),
+            },
+            (
+                PageImportState::ReadHeadKeys,
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+            ) => self.take_heads(decode_heads(values.into_iter().map(|(_, value)| value))?),
             (
                 PageImportState::ReadRecord,
                 event @ Event::Storage(StorageEvent::BatchReadResult { .. }),
@@ -296,7 +333,10 @@ impl PageImportOperation {
 fn expected_event(state: PageImportState) -> &'static str {
     match state {
         PageImportState::StartTransaction => "TransactionStarted",
-        PageImportState::ReadGuards | PageImportState::ReadVersions => "BatchReadResult",
+        PageImportState::ReadGuards
+        | PageImportState::ReadHeadKeys
+        | PageImportState::ReadVersions => "BatchReadResult",
+        PageImportState::ReadHeads => "IterResult",
         PageImportState::ReadSecret => "VaultResult",
         PageImportState::ReadRecord => "ReadResult",
         PageImportState::ReadRelationships => "IterResult",

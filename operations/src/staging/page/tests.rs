@@ -175,8 +175,8 @@ fn value(bytes: Vec<u8>) -> Option<Value> {
     Some(ByteView::from(bytes))
 }
 
-fn guards(fence: Option<Value>, record: &JobRecord, heads: Vec<Option<Value>>) -> Event {
-    let mut values = vec![
+fn guards(fence: Option<Value>, record: &JobRecord) -> Event {
+    let values = vec![
         (Key::from(b"fence".to_vec()), fence),
         (
             Key::from(b"bucket".to_vec()),
@@ -188,12 +188,24 @@ fn guards(fence: Option<Value>, record: &JobRecord, heads: Vec<Option<Value>>) -
         ),
         (Key::from(b"job".to_vec()), claim(record)),
     ];
-    values.extend(
-        heads
-            .into_iter()
-            .map(|head| (Key::from(b"head".to_vec()), head)),
-    );
     Event::Storage(StorageEvent::BatchReadResult { values })
+}
+
+/// Answers the head interval read as holding too many other keys, then the head reads with
+/// `heads` in entry order.
+fn answer_heads(operation: &mut PageImportOperation, heads: Vec<Option<Value>>) -> Effects {
+    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: Some(Key::from(b"other".to_vec())),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == heads.len()
+    ));
+    let values = (heads.into_iter())
+        .map(|head| (Key::from(b"head".to_vec()), head))
+        .collect();
+    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
 }
 
 /// The answer to the relationship read: `count` relationships replicate the bucket.
@@ -262,12 +274,12 @@ fn run_to_writes(
     let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
         txn_id: txn(),
     }));
-    let reads = heads.len() + GUARD_READS;
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { reads: batch, .. })] if batch.len() == reads
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == GUARD_READS
     ));
-    operation.step(guards(None, &record(token()), heads));
+    operation.step(guards(None, &record(token())));
+    answer_heads(operation, heads);
     operation.step(relationships(1));
     let mut effects = operation.step(no_secret());
     if let Some(versions) = versions {
@@ -477,15 +489,11 @@ fn guards_abort_page() {
     };
     let cases = [
         (
-            guards(
-                value(fence.to_bytes().unwrap()),
-                &record(token()),
-                vec![None],
-            ),
+            guards(value(fence.to_bytes().unwrap()), &record(token())),
             PageImportError::Purge(PurgeFenceError::Suspended),
         ),
         (
-            guards(None, &record(Ulid::from_bytes([1; 16])), vec![None]),
+            guards(None, &record(Ulid::from_bytes([1; 16]))),
             PageImportError::ClaimLost,
         ),
     ];
@@ -518,7 +526,8 @@ fn changed_secret_aborts() {
     operation.step(Event::Storage(StorageEvent::TransactionStarted {
         txn_id: txn(),
     }));
-    operation.step(guards(None, &record(token()), vec![None]));
+    operation.step(guards(None, &record(token())));
+    answer_heads(&mut operation, vec![None]);
     operation.step(relationships(1));
 
     assert!(matches!(
@@ -531,6 +540,40 @@ fn changed_secret_aborts() {
     assert_eq!(operation.finalize(), Err(PageImportError::ConnectorChanged));
 }
 
+// The heads of a page are read as one interval of its keys; an empty interval proves every
+// key new without a read per key.
+#[test]
+fn interval_proves_absence() {
+    use aruna_core::effects::{IterEnd, IterStart};
+    use aruna_core::structs::storage::blob::BlobHeadKey;
+    let mut operation = PageImportOperation::new(input(vec![entry("b"), entry("a")]));
+    operation.start();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: txn(),
+    }));
+
+    let effects = operation.step(guards(None, &record(token())));
+
+    let key = |name| Key::from(BlobHeadKey::new("imports", name).to_bytes().unwrap());
+    let [Effect::Storage(StorageEffect::IterRange { start, end, .. })] = effects.as_slice() else {
+        panic!("expected one head interval read, got {effects:?}");
+    };
+    assert_eq!(
+        (start, end),
+        (&IterStart::At(key("a")), &IterEnd::Through(key("b")))
+    );
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    }));
+    operation.step(relationships(1));
+    let effects = operation.step(no_secret());
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the page rows, got {effects:?}");
+    };
+    assert_eq!(rows_in(writes, BLOB_VERSIONS_KEYSPACE), 2);
+}
+
 // A bucket nothing replicates gets no replication obligation per imported file.
 #[test]
 fn obligations_need_downstream() {
@@ -539,7 +582,8 @@ fn obligations_need_downstream() {
     operation.step(Event::Storage(StorageEvent::TransactionStarted {
         txn_id: txn(),
     }));
-    let effects = operation.step(guards(None, &record(token()), vec![None, None]));
+    operation.step(guards(None, &record(token())));
+    let effects = answer_heads(&mut operation, vec![None, None]);
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Iter {
@@ -738,7 +782,6 @@ fn guards_carry_hint() {
             value(connector().to_bytes().unwrap()),
         ),
         (Key::from(b"job".to_vec()), claim(&record(token()))),
-        (Key::from(b"head".to_vec()), None),
     ];
     let input = input(vec![entry("a")]);
     let guards = crate::staging::page::rows::check_guards(&input, values).unwrap();
