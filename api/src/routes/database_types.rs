@@ -168,3 +168,7 @@ impl From<&DatabaseRequest> for DatabaseRequestView {
 pub struct DatabaseRequestList {
     pub requests: Vec<DatabaseRequestView>,
 }
+
+#[cfg(test)]
+#[path = "database_types_tests.rs"]
+mod tests;
