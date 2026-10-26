@@ -34,6 +34,7 @@ use super::{
     sync_progress,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::permission_rules::{PermissionRules, permission_rules};
 use crate::distribution::guard::{GuardError, authority_reads, authority_rows, write_target};
 use crate::driver::drive;
 use crate::jobs::executor::{JobContext, JobRunOutcome};
@@ -656,8 +657,11 @@ async fn import_page(
     };
     let files = own_files(ctx, &bucket, rows.files).await?;
     let mut entries = Vec::with_capacity(files.len());
+    // The submitter's rules are collected once per page and decide every file in memory.
+    let rules = access_rules(ctx, spec).await.map_err(PageFailure::Retry)?;
     for file in files {
-        let observation = match check_access(ctx, spec, &file.source_path, &file.target_key).await {
+        let access = file_access(&rules, spec, &file.source_path, &file.target_key);
+        let observation = match access {
             Ok(()) => match file.observation {
                 Some(observation) => Ok(observation),
                 None => head_observation(ctx, spec, &file.source_path).await,
@@ -816,6 +820,25 @@ pub(super) async fn check_access(
     source_path: &str,
     target_key: &str,
 ) -> Result<(), ItemFailure> {
+    let rules = access_rules(ctx, spec).await.map_err(ItemFailure::System)?;
+    file_access(&rules, spec, source_path, target_key)
+}
+
+/// The submitter's permission rules in the job's group, which holds the source and target paths.
+async fn access_rules(ctx: &JobContext, spec: &StagingJobSpec) -> Result<PermissionRules, String> {
+    let root = source_permission_path(spec, "");
+    permission_rules(&ctx.driver, &spec.auth_context, &root)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// READ on the source file and WRITE on the destination key, decided as a single check would.
+fn file_access(
+    rules: &PermissionRules,
+    spec: &StagingJobSpec,
+    source_path: &str,
+    target_key: &str,
+) -> Result<(), ItemFailure> {
     let source_path = source_permission_path(spec, source_path);
     let target_path = object_permission_path(
         spec.auth_context.realm_id,
@@ -824,25 +847,12 @@ pub(super) async fn check_access(
         &spec.bucket,
         target_key,
     );
-    for (path, required_permission) in [
-        (source_path, Permission::READ),
-        (target_path, Permission::WRITE),
-    ] {
-        let allowed = drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: spec.auth_context.clone(),
-                path,
-                required_permission,
-            }),
-            &ctx.driver,
-        )
-        .await
-        .map_err(|error| ItemFailure::System(error.to_string()))?;
-        if !allowed {
-            return Err(ItemFailure::Denied("permission denied".to_string()));
-        }
+    let allowed = rules.allows(&source_path, &Permission::READ)
+        && rules.allows(&target_path, &Permission::WRITE);
+    match allowed {
+        true => Ok(()),
+        false => Err(ItemFailure::Denied("permission denied".to_string())),
     }
-    Ok(())
 }
 
 enum MappedEntry {
