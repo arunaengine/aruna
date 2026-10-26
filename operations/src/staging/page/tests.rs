@@ -1097,7 +1097,8 @@ async fn count_exchanges(
 }
 
 // Prints the storage exchanges of four 500-key pages into one distributed range, the last ones
-// with a full key sample; a measurement, not a contract. Run with `--nocapture` to read it.
+// with a full key sample, then of two gathered 5,000-key pages; a measurement, not a contract.
+// Run with `--nocapture` to read it.
 #[tokio::test]
 async fn page_exchanges_measured() {
     use crate::distribution::test_store::{install, range};
@@ -1137,5 +1138,23 @@ async fn page_exchanges_measured() {
         let (exchanges, result) = count_exchanges(PageImportOperation::new(input), handle).await;
         assert_eq!(result.unwrap().registered, ENTRIES as u64);
         println!("distributed page {page}: {exchanges} storage exchanges for {ENTRIES} keys");
+    }
+    const GATHERED: usize = 5_000;
+    for page in 0..2 {
+        let first = 4 * ENTRIES + page * GATHERED;
+        let entries = (first..first + GATHERED).map(bakrep_entry);
+        let input = PageImportInput {
+            connector: connector.clone(),
+            bucket: "shared".to_string(),
+            expected_bucket: bound.clone(),
+            ..input(entries.collect())
+        };
+        let started = std::time::Instant::now();
+        let (exchanges, result) = count_exchanges(PageImportOperation::new(input), handle).await;
+        assert_eq!(result.unwrap().registered, GATHERED as u64);
+        let elapsed = started.elapsed().as_millis();
+        println!(
+            "gathered page {page}: {exchanges} storage exchanges, {elapsed} ms for {GATHERED} keys"
+        );
     }
 }
