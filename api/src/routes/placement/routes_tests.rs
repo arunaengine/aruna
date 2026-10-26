@@ -569,3 +569,129 @@ mod runs {
         assert!(reason.contains(&node_id(PEER).to_string()));
     }
 }
+
+mod coverage {
+    use super::super::{CoverageQuery, CoverageResponse, get_placement_coverage};
+    use crate::auth::ValidatedBearer;
+    use crate::error::ServerError;
+    use crate::tests::distributed::{
+        BUCKET, CLOSED_API, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state,
+        publish_api, replicate, write,
+    };
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+    use axum::Extension;
+    use axum::extract::{Path, Query, State};
+    use axum::http::{HeaderMap, StatusCode};
+
+    /// Makes the owner a realm admin, who may read the realm's placement configuration.
+    async fn realm_admin(node: &Node) {
+        let realm_id = node.state.get_realm_id();
+        let mut doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
+        for role in doc.roles.values_mut() {
+            role.assigned_users.insert(node.owner.user_id);
+        }
+        let actor = Actor {
+            node_id: node_id(LOCAL),
+            user_id: node.owner.user_id,
+            realm_id,
+        };
+        let key = realm_id.as_bytes().to_vec();
+        write(
+            &node.state,
+            AUTH_KEYSPACE,
+            key,
+            doc.to_bytes(&actor).unwrap(),
+        )
+        .await;
+    }
+
+    async fn read(node: &Node, cursor: Option<String>) -> Result<CoverageResponse, ServerError> {
+        let query = CoverageQuery {
+            scope: None,
+            cursor,
+            limit: Some(16),
+        };
+        let answer = get_placement_coverage(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+            Path(BUCKET.to_string()),
+            HeaderMap::new(),
+            Query(query),
+        )
+        .await?;
+        Ok(answer.0)
+    }
+
+    #[tokio::test]
+    async fn joins_coordinator_coverage() {
+        let node = node_state().await;
+        realm_admin(&node).await;
+        replicate(&node.state, node.group_id, BUCKET).await;
+        let answer = r#"{"bucket":"routed","scope":"current","generation":2,"target_policies":[],
+            "observed":7,"deleted":1,"gaps":[{"key":"z.md","version_id":"v","attachment":"missing","copy":"absent"}],
+            "registered":4,"quarantined":0,"absent":2,"reference_only":0,"complete":true,
+            "limits":["responder_local","coordinated_ranges","concurrent_writes"]}"#;
+        let peer = mock_peer(StatusCode::OK, answer).await;
+        publish_api(&node.state, node_id(PEER), &peer.url).await;
+
+        let joined = read(&node, None).await.unwrap();
+
+        let paths = peer.paths.lock().unwrap().clone();
+        assert_eq!(
+            paths,
+            vec![format!(
+                "/api/v1/data/buckets/{BUCKET}/placement/coverage?limit=16"
+            )]
+        );
+        assert_eq!(
+            (joined.observed, joined.gaps.len(), joined.registered),
+            (7, 1, 4)
+        );
+        assert_eq!(joined.limits, vec!["concurrent_writes".to_string()]);
+        assert!(joined.complete && joined.cursor.is_none() && joined.unreached.is_empty());
+    }
+
+    #[tokio::test]
+    async fn names_unreached_coordinator() {
+        let node = node_state().await;
+        realm_admin(&node).await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        publish_api(&node.state, node_id(PEER), CLOSED_API).await;
+
+        // This node reports its own range; the peer is named instead of being left out silently.
+        let first = read(&node, None).await.unwrap();
+        assert!(!first.complete);
+        assert_eq!(first.unreached, vec![node_id(PEER).to_string()]);
+        assert!(first.limits.contains(&"bounded_page".to_string()));
+
+        let Err(ServerError::ServiceUnavailableReason(reason)) = read(&node, first.cursor).await
+        else {
+            panic!("a call where no pending coordinator answers does not repeat its cursor");
+        };
+        assert!(reason.contains(&node_id(PEER).to_string()));
+    }
+
+    #[tokio::test]
+    async fn refuses_stranger_first() {
+        // A caller without the read right learns nothing about which buckets exist.
+        let node = node_state().await;
+        let query = CoverageQuery {
+            scope: None,
+            cursor: None,
+            limit: None,
+        };
+        let answer = get_placement_coverage(
+            State(node.state.clone()),
+            Extension(Some(node.stranger.clone())),
+            Extension(None),
+            Path("no-such-bucket".to_string()),
+            HeaderMap::new(),
+            Query(query),
+        )
+        .await;
+        assert!(matches!(answer, Err(ServerError::Forbidden)));
+    }
+}

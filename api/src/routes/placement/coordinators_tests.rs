@@ -96,3 +96,56 @@ fn joins_coordinator_answers() {
     .unwrap();
     assert_eq!(moved.status, "superseded");
 }
+
+fn coverage(observed: usize, cursor: Option<&str>, limits: &[&str]) -> CoverageResponse {
+    CoverageResponse {
+        bucket: "spire".to_string(),
+        scope: "current".to_string(),
+        generation: 4,
+        target_policies: Vec::new(),
+        observed,
+        deleted: 1,
+        gaps: Vec::new(),
+        registered: observed,
+        quarantined: 0,
+        absent: 0,
+        reference_only: 0,
+        cursor: cursor.map(str::to_string),
+        complete: cursor.is_none(),
+        limits: limits.iter().map(|limit| limit.to_string()).collect(),
+        unreached: Vec::new(),
+    }
+}
+
+#[test]
+fn joins_coverage_pages() {
+    let local = [
+        "responder_local",
+        "coordinated_ranges",
+        "historical_excluded",
+    ];
+    let mut cursor = SpreadCursor::default();
+    cursor.next.insert("a".to_string(), "6b0d".to_string());
+    let spread = Spread {
+        answers: vec![coverage(3, Some("6b0d"), &local), coverage(5, None, &local)],
+        cursor,
+        unreached: Vec::new(),
+    };
+    let joined = join_coverage("spire", spread).unwrap();
+    assert_eq!(
+        (joined.observed, joined.deleted, joined.registered),
+        (8, 2, 8)
+    );
+    assert_eq!(joined.limits, vec!["bounded_page", "historical_excluded"]);
+    assert!(!joined.complete && joined.cursor.is_some());
+
+    // Every coordinator done: the report covers the whole bucket, nothing is left open.
+    let spread = Spread {
+        answers: vec![coverage(2, None, &local)],
+        cursor: SpreadCursor::default(),
+        unreached: Vec::new(),
+    };
+    let whole = join_coverage("spire", spread).unwrap();
+    assert_eq!(whole.limits, vec!["historical_excluded"]);
+    assert!(whole.complete && whole.unreached.is_empty());
+}

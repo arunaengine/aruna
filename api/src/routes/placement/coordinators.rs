@@ -1,4 +1,5 @@
-//! Runs a bucket default pass on every coordinator of a distributed bucket and joins the answers.
+//! Asks every coordinator of a distributed bucket for a placement pass or a coverage page and
+//! joins their answers into one for the whole bucket.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -9,11 +10,11 @@ use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_operations::distribution::guard::bound_view;
 use serde::{Deserialize, Serialize};
 
-use super::{BulkRunRequest, BulkRunResponse};
+use super::{BulkRunRequest, BulkRunResponse, CoverageQuery, CoverageResponse};
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
 use crate::routes::storage::distributed::map_guard_error;
-use crate::routes::storage::relay::{RestForward, relay_json};
+use crate::routes::storage::relay::{RestForward, relay_get, relay_json};
 use crate::server::state::ServerState;
 
 /// Where each coordinator's own pass stands; a coordinator in neither field starts from the start.
@@ -69,17 +70,43 @@ async fn coordinators(
     Ok(nodes)
 }
 
-/// Runs one pass on every coordinator whose pass has not ended, this node through `local` and the
-/// others with the caller's bearer token, where each checks the caller again on its own path.
-pub(super) async fn run_spread(
+/// A coordinator's answer, as far as the spread needs it: where its own pass goes on.
+trait Paged {
+    fn next(&self) -> Option<String>;
+}
+
+impl Paged for BulkRunResponse {
+    fn next(&self) -> Option<String> {
+        self.cursor.clone()
+    }
+}
+
+impl Paged for CoverageResponse {
+    fn next(&self) -> Option<String> {
+        self.cursor.clone()
+    }
+}
+
+/// The coordinators one call asks, each with its own position, and the cursor they move on.
+struct Plan {
+    cursor: SpreadCursor,
+    asks: Vec<(RestForward, Option<String>)>,
+}
+
+/// What one call collected: the answers, the cursor after them, and who did not answer.
+struct Spread<T> {
+    answers: Vec<T>,
+    cursor: SpreadCursor,
+    unreached: Vec<String>,
+}
+
+/// Every coordinator whose pass or scan has not ended, from this node's record of the set.
+async fn plan(
     state: &ServerState,
-    bucket: &str,
     binding: &DistributionBinding,
-    bearer: Option<&ValidatedBearer>,
-    request: &BulkRunRequest,
-    local: impl AsyncFnOnce(Option<String>) -> ServerResult<BulkRunResponse>,
-) -> ServerResult<BulkRunResponse> {
-    let mut cursor = SpreadCursor::decode(request.cursor.as_deref())?;
+    cursor: Option<&str>,
+) -> ServerResult<Plan> {
+    let mut cursor = SpreadCursor::decode(cursor)?;
     let nodes = coordinators(state, binding).await?;
     let current: BTreeSet<String> = nodes
         .iter()
@@ -88,30 +115,28 @@ pub(super) async fn run_spread(
     // A node that coordinates nothing anymore is dropped; its keys belong to a current one.
     cursor.next.retain(|node, _| current.contains(node));
     cursor.done.retain(|node| current.contains(node));
-    let here: NodeId = state.get_node_id();
-    let mut local = Some(local);
-    let bucket: String = url::form_urlencoded::byte_serialize(bucket.as_bytes()).collect();
-    let path = format!("/data/buckets/{bucket}/placement/runs");
+    let asks = (nodes.into_iter())
+        .filter(|forward| !cursor.done.contains(&forward.node_id.to_string()))
+        .map(|forward| {
+            let position = cursor.next.get(&forward.node_id.to_string()).cloned();
+            (forward, position)
+        })
+        .collect();
+    Ok(Plan { cursor, asks })
+}
+
+/// Moves the cursor by the answers; fails when no coordinator answered, since the same cursor
+/// again would not move the call on.
+fn collect<T: Paged>(
+    mut cursor: SpreadCursor,
+    results: Vec<(NodeId, ServerResult<T>)>,
+) -> ServerResult<Spread<T>> {
     let (mut answers, mut unreached) = (Vec::new(), Vec::new());
-    for forward in nodes {
-        let node = forward.node_id.to_string();
-        if cursor.done.contains(&node) {
-            continue;
-        }
-        let asked = BulkRunRequest {
-            operation_id: request.operation_id.clone(),
-            limit: request.limit,
-            cursor: cursor.next.get(&node).cloned(),
-        };
-        let answer = match (forward.node_id == here, local.take()) {
-            (true, Some(run)) => run(asked.cursor.clone()).await,
-            _ => relay_json::<BulkRunResponse>(state, &forward, &path, bearer, &asked)
-                .await
-                .map(|(_, answer)| answer),
-        };
-        match answer {
+    for (node, result) in results {
+        let node = node.to_string();
+        match result {
             Ok(answer) => {
-                match answer.cursor.clone() {
+                match answer.next() {
                     Some(next) => {
                         cursor.next.insert(node, next);
                     }
@@ -125,20 +150,152 @@ pub(super) async fn run_spread(
             Err(error) => unreached.push((node, error)),
         }
     }
-    // No pending coordinator answered: the same cursor again would not move the run.
     if answers.is_empty()
         && let Some((node, error)) = unreached.first()
     {
         return Err(ServerError::ServiceUnavailableReason(format!(
-            "coordinator {node} did not run the pass: {error}"
+            "coordinator {node} did not answer: {error}"
         )));
     }
-    join(
-        request,
+    let unreached = unreached.into_iter().map(|(node, _)| node).collect();
+    Ok(Spread {
         answers,
         cursor,
-        unreached.into_iter().map(|(node, _)| node).collect(),
-    )
+        unreached,
+    })
+}
+
+fn bucket_path(bucket: &str, route: &str) -> String {
+    let bucket: String = url::form_urlencoded::byte_serialize(bucket.as_bytes()).collect();
+    format!("/data/buckets/{bucket}/placement/{route}")
+}
+
+/// Runs one pass on every coordinator whose pass has not ended, this node through `local` and the
+/// others with the caller's bearer token, where each checks the caller again on its own path.
+pub(super) async fn run_spread(
+    state: &ServerState,
+    bucket: &str,
+    binding: &DistributionBinding,
+    bearer: Option<&ValidatedBearer>,
+    request: &BulkRunRequest,
+    local: impl AsyncFnOnce(Option<String>) -> ServerResult<BulkRunResponse>,
+) -> ServerResult<BulkRunResponse> {
+    let plan = plan(state, binding, request.cursor.as_deref()).await?;
+    let path = bucket_path(bucket, "runs");
+    let mut local = Some(local);
+    let mut results = Vec::with_capacity(plan.asks.len());
+    for (forward, position) in plan.asks {
+        let here = forward.node_id == state.get_node_id();
+        let answer = match local.take_if(|_| here) {
+            Some(run) => run(position).await,
+            None => {
+                let asked = BulkRunRequest {
+                    operation_id: request.operation_id.clone(),
+                    limit: request.limit,
+                    cursor: position,
+                };
+                relay_json::<BulkRunResponse>(state, &forward, &path, bearer, &asked)
+                    .await
+                    .map(|(_, answer)| answer)
+            }
+        };
+        results.push((forward.node_id, answer));
+    }
+    let spread = collect(plan.cursor, results)?;
+    join(request, spread.answers, spread.cursor, spread.unreached)
+}
+
+/// The coverage route on another node with the caller's query and that node's own position.
+fn coverage_path(base: &str, query: &CoverageQuery, cursor: Option<&str>) -> String {
+    let mut asked = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(scope) = query.scope.as_deref() {
+        asked.append_pair("scope", scope);
+    }
+    if let Some(limit) = query.limit {
+        asked.append_pair("limit", &limit.to_string());
+    }
+    if let Some(cursor) = cursor {
+        asked.append_pair("cursor", cursor);
+    }
+    format!("{base}?{}", asked.finish())
+}
+
+/// Reads one coverage page from every coordinator whose scan has not ended and joins them, so
+/// the report covers the whole bucket and names the coordinators that did not answer.
+pub(super) async fn coverage_spread(
+    state: &ServerState,
+    bucket: &str,
+    binding: &DistributionBinding,
+    bearer: Option<&ValidatedBearer>,
+    query: &CoverageQuery,
+    local: impl AsyncFnOnce(Option<String>) -> ServerResult<CoverageResponse>,
+) -> ServerResult<CoverageResponse> {
+    let plan = plan(state, binding, query.cursor.as_deref()).await?;
+    let base = bucket_path(bucket, "coverage");
+    let mut local = Some(local);
+    let mut results = Vec::with_capacity(plan.asks.len());
+    for (forward, position) in plan.asks {
+        let here = forward.node_id == state.get_node_id();
+        let answer = match local.take_if(|_| here) {
+            Some(read) => read(position).await,
+            None => {
+                let path = coverage_path(&base, query, position.as_deref());
+                match relay_get::<CoverageResponse>(state, &forward, &path, bearer).await {
+                    Ok(Some(answer)) => Ok(answer),
+                    Ok(None) => Err(ServerError::ServiceUnavailableReason(format!(
+                        "node {} is not reachable",
+                        forward.node_id
+                    ))),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        results.push((forward.node_id, answer));
+    }
+    join_coverage(bucket, collect(plan.cursor, results)?)
+}
+
+/// One coverage report for the whole bucket: counts and gaps add up, and the limits drop the
+/// ones each coordinator states about covering only itself.
+fn join_coverage(bucket: &str, spread: Spread<CoverageResponse>) -> ServerResult<CoverageResponse> {
+    let complete = spread.cursor.next.is_empty() && spread.unreached.is_empty();
+    let answers = &spread.answers;
+    let mut limits: BTreeSet<String> = (answers.iter())
+        .flat_map(|answer| answer.limits.iter().cloned())
+        .filter(|limit| {
+            !matches!(
+                limit.as_str(),
+                "responder_local" | "coordinated_ranges" | "bounded_page"
+            )
+        })
+        .collect();
+    if !complete {
+        limits.insert("bounded_page".to_string());
+    }
+    let first = answers.first();
+    let sum = |count: fn(&CoverageResponse) -> usize| answers.iter().map(count).sum::<usize>();
+    Ok(CoverageResponse {
+        bucket: bucket.to_string(),
+        scope: first.map_or_else(|| "current".to_string(), |answer| answer.scope.clone()),
+        generation: first.map_or(0, |answer| answer.generation),
+        target_policies: first
+            .map(|answer| answer.target_policies.clone())
+            .unwrap_or_default(),
+        observed: sum(|answer| answer.observed),
+        deleted: sum(|answer| answer.deleted),
+        gaps: answers
+            .iter()
+            .flat_map(|answer| answer.gaps.clone())
+            .collect(),
+        registered: sum(|answer| answer.registered),
+        quarantined: sum(|answer| answer.quarantined),
+        absent: sum(|answer| answer.absent),
+        reference_only: sum(|answer| answer.reference_only),
+        cursor: (!complete).then(|| spread.cursor.encode()).transpose()?,
+        complete,
+        limits: limits.into_iter().collect(),
+        unreached: spread.unreached,
+    })
 }
 
 /// One answer for the whole bucket: counts add up and the run is complete once every
