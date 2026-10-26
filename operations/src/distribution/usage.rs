@@ -101,6 +101,9 @@ pub struct HeldRange {
     pub range_id: Ulid,
     /// The range's counters are exact: active, not rebuilding, and no node-wide usage rebuild.
     pub complete: bool,
+    /// This member coordinates the range, so its counters include every acknowledged write; a
+    /// copy's counters may lag behind its coordinator's.
+    pub coordinated: bool,
     /// Counter row keys with their values; a split child names its parent's frozen row.
     pub rows: Vec<(Vec<u8>, RangeCounters)>,
 }
@@ -141,6 +144,8 @@ pub async fn held_ranges(
         .map(|(range_id, account)| HeldRange {
             range_id: *range_id,
             complete: confirmed && account.is_complete(),
+            coordinated: (snapshot.config.ranges.iter())
+                .any(|range| range.range_id == *range_id && range.coordinator == binding.member_id),
             rows: charged_rows(set_id, &[(*range_id, account.clone())])
                 .into_iter()
                 .map(|key| {
@@ -285,6 +290,7 @@ mod tests {
         let child = |id: u8, pending| HeldRange {
             range_id: Ulid::from_bytes([id; 16]),
             complete: false,
+            coordinated: true,
             rows: vec![(vec![id], counters(pending)), parent.clone()],
         };
         let total = sum_held(&[child(1, 2), child(2, -1)]).unwrap();
@@ -345,6 +351,7 @@ mod tests {
         assert_eq!(held.len(), 1, "member 1 holds the lower shard only");
         assert_eq!(sum_held(&held).unwrap().objects, 4);
         assert!(held[0].complete);
+        assert!(held[0].coordinated, "member 1 coordinates the lower shard");
     }
 
     #[test]

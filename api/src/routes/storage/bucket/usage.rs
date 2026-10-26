@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::accounting::RangeCounters;
@@ -51,9 +52,18 @@ pub struct BucketUsageResponse {
     pub logical_bytes: u64,
     /// Bytes reachable only through external references.
     pub referenced_bytes: u64,
-    /// False for a distributed bucket while a range is not held here or is being rebuilt, and
-    /// for any bucket while this node rebuilds its usage counters.
+    /// Counter completeness: false for a distributed bucket while a range was not counted or its
+    /// counters are being rebuilt, and for any bucket while this node rebuilds its counters. It
+    /// says nothing about replication; see `current`.
     pub complete: bool,
+    /// Replication freshness of a distributed bucket: true when every range was counted at its
+    /// coordinator, so the totals include every write the coordinators acknowledged. Absent
+    /// when a range was counted from a copy or not at all, whose lag is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<bool>,
+    /// Where each range of a distributed bucket was counted; absent for an ordinary bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_sources: Option<Vec<RangeSourceResponse>>,
     /// Ranges of a distributed bucket; absent for an ordinary bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ranges: Option<usize>,
@@ -71,7 +81,39 @@ pub struct BucketUsageResponse {
 pub struct HeldRangeResponse {
     pub range_id: String,
     pub complete: bool,
+    /// The answering node coordinates the range; otherwise its rows are a copy's.
+    #[serde(default)]
+    pub coordinated: bool,
     pub rows: Vec<CounterRowResponse>,
+}
+
+/// Whose counters a range was counted from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CounterSource {
+    /// The range's coordinator, which every write of the range passes.
+    Coordinator,
+    /// A holder's copy, which may lag behind the coordinator by the replication delay.
+    Copy,
+}
+
+/// Where one range of a distributed bucket was counted, against the answering node's record.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RangeSourceResponse {
+    pub range_id: String,
+    /// The node coordinating the range, and its coordinator epoch.
+    pub coordinator: Option<String>,
+    pub epoch: u64,
+    /// The record revision the answering node holds.
+    pub revision: u64,
+    /// The node whose counter rows were summed; absent when no holder answered.
+    pub counted_by: Option<String>,
+    pub source: Option<CounterSource>,
+    /// Whether the counted rows include every write the coordinator acknowledged: true when
+    /// counted at the coordinator, absent (unknown) for a copy without such evidence.
+    pub current: Option<bool>,
+    /// The counted rows are exact, as `complete` is for the bucket.
+    pub complete: bool,
 }
 
 /// One counter row by its key, so rows two ranges share are added once.
@@ -123,6 +165,7 @@ impl HeldRangeResponse {
         Self {
             range_id: range.range_id.to_string(),
             complete: range.complete,
+            coordinated: range.coordinated,
             rows: (range.rows.iter())
                 .map(|(row, counters)| CounterRowResponse::of(row, counters))
                 .collect(),
@@ -133,6 +176,7 @@ impl HeldRangeResponse {
         Some(HeldRange {
             range_id: Ulid::from_string(&self.range_id).ok()?,
             complete: self.complete,
+            coordinated: self.coordinated,
             rows: self
                 .rows
                 .iter()
@@ -161,6 +205,8 @@ impl BucketUsageResponse {
             logical_bytes: counters.logical_bytes,
             referenced_bytes: counters.referenced_bytes,
             complete,
+            current: None,
+            range_sources: None,
             ranges: None,
             ranges_counted: None,
             held_ranges: None,
@@ -179,6 +225,8 @@ impl BucketUsageResponse {
             logical_bytes: count(counters.logical_bytes),
             referenced_bytes: count(counters.referenced_bytes),
             complete: usage.complete,
+            current: None,
+            range_sources: None,
             ranges: Some(usage.ranges),
             ranges_counted: Some(usage.counted),
             held_ranges: None,
@@ -186,80 +234,154 @@ impl BucketUsageResponse {
     }
 }
 
-/// Holders one usage answer asks at most for the ranges this node does not hold.
+/// Holders one usage answer asks at most for the ranges this node does not coordinate.
 const MAX_HOLDERS_ASKED: usize = 16;
 
-/// The usage of a distributed bucket: the ranges this node holds, then the others from their
-/// holders, each holder asked once and each shared counter row added once.
+/// The counter rows counted for one range and the node that served them.
+struct CountedRange {
+    range: HeldRange,
+    node: NodeId,
+}
+
+/// The usage of a distributed bucket and where each range was counted: the ranges this node
+/// coordinates, the others at their coordinators, and a copy only where one did not answer.
 async fn merged_usage(
     state: &ServerState,
     caller: (&str, Option<&ValidatedBearer>),
     (binding, snapshot): (&DistributionBinding, &DistributionSnapshot),
     held: Vec<HeldRange>,
-) -> ServerResult<RangeUsage> {
+) -> ServerResult<(RangeUsage, Vec<RangeSourceResponse>)> {
     let member = Some(binding.member_id);
     let ranges = holder_ranges(state, caller, (member, snapshot), held).await?;
     let wanted = snapshot.config.ranges.len();
-    let counted: Vec<&HeldRange> = (snapshot.config.ranges.iter())
-        .filter_map(|range| ranges.get(&range.range_id))
-        .collect();
+    let mut sources = Vec::with_capacity(wanted);
+    let mut counted = Vec::with_capacity(wanted);
+    for range in &snapshot.config.ranges {
+        let found = ranges.get(&range.range_id);
+        let coordinator = snapshot.member(range.coordinator);
+        let source = found.map(|found| match found.range.coordinated {
+            true => CounterSource::Coordinator,
+            false => CounterSource::Copy,
+        });
+        sources.push(RangeSourceResponse {
+            range_id: range.range_id.to_string(),
+            coordinator: coordinator.map(|member| member.node_id.to_string()),
+            epoch: range.epoch,
+            revision: snapshot.number,
+            counted_by: found.map(|found| found.node.to_string()),
+            source,
+            current: (source == Some(CounterSource::Coordinator)).then_some(true),
+            complete: found.is_some_and(|found| found.range.complete),
+        });
+        counted.extend(found.map(|found| &found.range));
+    }
     let counters = sum_held(counted.iter().copied())
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    Ok(RangeUsage {
+    let usage = RangeUsage {
         counters,
         ranges: wanted,
         counted: counted.len(),
         complete: counted.len() == wanted && counted.iter().all(|range| range.complete),
-    })
+    };
+    Ok((usage, sources))
 }
 
-/// The counter rows of every range, from `held` and from one holder per other range; a holder
-/// that does not answer leaves its ranges out.
+/// Adds a holder's answer: a coordinator's rows count as they are, a copy's only as fallback.
+fn merge_answer(
+    answer: Option<BucketUsageResponse>,
+    node: NodeId,
+    ranges: &mut BTreeMap<Ulid, CountedRange>,
+    copies: &mut BTreeMap<Ulid, CountedRange>,
+) {
+    let held = answer.and_then(|answer| answer.held_ranges);
+    for range in held
+        .unwrap_or_default()
+        .iter()
+        .filter_map(HeldRangeResponse::held)
+    {
+        let target = match range.coordinated {
+            true => &mut *ranges,
+            false => &mut *copies,
+        };
+        target
+            .entry(range.range_id)
+            .or_insert(CountedRange { range, node });
+    }
+}
+
+/// The counter rows of every range: its coordinator's where it answers, else a copy's. A range
+/// no holder answered for is left out.
 async fn holder_ranges(
     state: &ServerState,
     (bucket, bearer): (&str, Option<&ValidatedBearer>),
     (member, snapshot): (Option<Ulid>, &DistributionSnapshot),
     held: Vec<HeldRange>,
-) -> ServerResult<BTreeMap<Ulid, HeldRange>> {
-    let mut ranges: BTreeMap<Ulid, HeldRange> = held
-        .into_iter()
-        .map(|range| (range.range_id, range))
-        .collect();
+) -> ServerResult<BTreeMap<Ulid, CountedRange>> {
+    let local = state.get_node_id();
+    let (mut ranges, mut copies) = (BTreeMap::new(), BTreeMap::new());
+    for range in held {
+        let target = match range.coordinated {
+            true => &mut ranges,
+            false => &mut copies,
+        };
+        target.insert(range.range_id, CountedRange { range, node: local });
+    }
     let mut asked = BTreeSet::new();
     let path = format!("/data/buckets/{bucket}/usage?held=true");
+    let set_id = snapshot.set_id();
+    // Each range's coordinator first, so a lagging copy is never summed where it can be avoided.
+    for range in &snapshot.config.ranges {
+        let coordinator = snapshot.member(range.coordinator);
+        let Some(coordinator) = coordinator.filter(|c| Some(c.member_id) != member) else {
+            continue;
+        };
+        let node_id = coordinator.node_id;
+        if ranges.contains_key(&range.range_id)
+            || asked.contains(&node_id)
+            || asked.len() >= MAX_HOLDERS_ASKED
+        {
+            continue;
+        }
+        asked.insert(node_id);
+        let range_id = range.range_id;
+        let forward = RestForward {
+            set_id,
+            range_id,
+            node_id,
+        };
+        let answer = relay_get(state, &forward, &path, bearer).await?;
+        merge_answer(answer, node_id, &mut ranges, &mut copies);
+    }
     for range in &snapshot.config.ranges {
         if ranges.contains_key(&range.range_id) {
             continue;
         }
-        let holders = snapshot.record_holders(range).into_iter();
-        let holder = holders
-            .filter(|holder| Some(holder.member_id) != member)
-            .find(|holder| !asked.contains(&holder.node_id));
-        let Some(holder) = holder.filter(|_| asked.len() < MAX_HOLDERS_ASKED) else {
-            continue;
-        };
-        asked.insert(holder.node_id);
-        let forward = RestForward {
-            set_id: snapshot.set_id(),
-            range_id: range.range_id,
-            node_id: holder.node_id,
-        };
-        let answer: Option<BucketUsageResponse> = relay_get(state, &forward, &path, bearer).await?;
-        for other in answer
-            .and_then(|answer| answer.held_ranges)
-            .unwrap_or_default()
-        {
-            if let Some(other) = other.held() {
-                ranges.entry(other.range_id).or_insert(other);
+        if !copies.contains_key(&range.range_id) {
+            let holders = snapshot.record_holders(range).into_iter();
+            let holder = holders
+                .filter(|holder| Some(holder.member_id) != member)
+                .find(|holder| !asked.contains(&holder.node_id));
+            if let Some(holder) = holder.filter(|_| asked.len() < MAX_HOLDERS_ASKED) {
+                asked.insert(holder.node_id);
+                let forward = RestForward {
+                    set_id,
+                    range_id: range.range_id,
+                    node_id: holder.node_id,
+                };
+                let answer = relay_get(state, &forward, &path, bearer).await?;
+                merge_answer(answer, holder.node_id, &mut ranges, &mut copies);
             }
+        }
+        if let Some(copy) = copies.remove(&range.range_id) {
+            ranges.entry(range.range_id).or_insert(copy);
         }
     }
     Ok(ranges)
 }
 
-/// The expected size of each range of the set from its holders' complete counters, for a
-/// member's capacity admission. A range without them is left out, so admission refuses it; a
-/// split child includes its parent's shared row, so sizes may exceed the data.
+/// Each range's expected size from its coordinator's complete counters, for capacity admission.
+/// A copy may lag, so a range whose coordinator did not answer is left out and refused; a split
+/// child includes its parent's shared row, so sizes may exceed the data.
 pub(crate) async fn range_sizes(
     state: &ServerState,
     bearer: Option<&ValidatedBearer>,
@@ -283,9 +405,11 @@ pub(crate) async fn range_sizes(
     let ranges = holder_ranges(state, (bucket, bearer), (member, snapshot), held).await?;
     let count = |value: i128| u64::try_from(value.max(0)).unwrap_or(u64::MAX);
     let mut sizes = Vec::with_capacity(ranges.len());
-    for (range_id, range) in ranges.into_iter().filter(|(_, range)| range.complete) {
-        let counters =
-            sum_held([&range]).map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let counted = (ranges.into_iter())
+        .filter(|(_, counted)| counted.range.complete && counted.range.coordinated);
+    for (range_id, counted) in counted {
+        let counters = sum_held([&counted.range])
+            .map_err(|error| ServerError::InternalError(error.to_string()))?;
         sizes.push(RangeSize {
             range_id,
             bytes: count(counters.logical_bytes),
@@ -315,12 +439,19 @@ objects.
 - `open_multipart_uploads` counts uploads not yet completed or aborted, including one a
   completion or abort is finishing.
 - A distributed bucket answers from the maintained counters of the key ranges: this node reads
-  the ranges it holds and asks one holder of the others, each holder once and at most 16, with
-  the caller's token. `ranges` and `ranges_counted` say how many ranges the set has and how many
-  were summed; `complete` is false while a range had no answering holder or its counters are
-  being rebuilt.
-- `held=true` answers only the counter rows of each range this node holds, in `held_ranges`; it
-  is accepted only on requests another member of the distributed bucket relays.
+  the ranges it coordinates and asks each other range's coordinator, each node once and at most
+  16, with the caller's token. Only where a coordinator does not answer is a copy counted, this
+  node's own or another holder's, which may lag behind by the replication delay. `ranges` and
+  `ranges_counted` say how many ranges the set has and how many were summed; `complete` is false
+  while a range had no answering holder or its counters are being rebuilt.
+- `complete` is counter completeness only. Replication freshness is reported apart:
+  `range_sources` names, per range, the coordinator, its epoch, the record revision, the node
+  whose counters were summed and whether they are the coordinator's (`source`); `current` is
+  true only when every range was counted at its coordinator and is absent, meaning unknown,
+  when a copy was counted.
+- `held=true` answers only the counter rows of each range this node holds, in `held_ranges`,
+  each marked `coordinated` when this node coordinates it; it is accepted only on requests
+  another member of the distributed bucket relays.
 - For an ordinary bucket `complete` is false only while this node rebuilds its usage counters
   after a restart that found them missing or a rebuild interrupted; the numbers are then low."#,
     params(
@@ -394,8 +525,13 @@ pub async fn get_bucket_usage(
         }
         Some((binding, snapshot, ranges)) => {
             let caller = (bucket.as_str(), bearer.as_ref());
-            let usage = merged_usage(&state, caller, (&binding, &snapshot), ranges).await?;
-            Ok(Json(BucketUsageResponse::of_ranges(bucket, usage)))
+            let merged = merged_usage(&state, caller, (&binding, &snapshot), ranges).await?;
+            let (usage, sources) = merged;
+            let current = sources.iter().all(|source| source.current == Some(true));
+            let mut response = BucketUsageResponse::of_ranges(bucket, usage);
+            response.current = current.then_some(true);
+            response.range_sources = Some(sources);
+            Ok(Json(response))
         }
         None => {
             let counters = bucket_counters(&state, &bucket).await?;
@@ -450,6 +586,7 @@ mod tests {
         let range = HeldRange {
             range_id: Ulid::from_bytes([4; 16]),
             complete: true,
+            coordinated: true,
             rows: vec![(vec![1, 2, 255], counters)],
         };
         let back = HeldRangeResponse::of(&range).held().unwrap();

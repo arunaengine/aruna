@@ -7,6 +7,7 @@ use super::*;
 use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
+    replicate,
 };
 use axum::http::StatusCode;
 
@@ -51,6 +52,77 @@ fn peer_answer(snapshot: &DistributionSnapshot) -> String {
         }]
     })
     .to_string()
+}
+
+/// The coordinator's answer for the one range of [`replicate`], with `objects` counted.
+fn coordinator_answer(snapshot: &DistributionSnapshot, objects: u64) -> String {
+    let range_id = snapshot.config.ranges[0].range_id;
+    serde_json::json!({
+        "bucket": BUCKET,
+        "objects": 0, "versions": 0, "delete_markers": 0, "open_multipart_uploads": 0,
+        "logical_bytes": 0, "referenced_bytes": 0, "complete": false,
+        "held_ranges": [{
+            "range_id": range_id.to_string(),
+            "complete": true,
+            "coordinated": true,
+            "rows": [{
+                "row": "0c0d", "objects": objects, "current_bytes": 0, "versions": objects,
+                "delete_markers": 0, "logical_bytes": 0, "referenced_bytes": 70,
+                "open_uploads": 0
+            }]
+        }]
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn copy_asks_coordinator() {
+    // A copy that lags counts its coordinator's rows, and says where each range was counted.
+    let node = node_state().await;
+    let snapshot = replicate(&node.state, node.group_id, BUCKET).await;
+    let peer = mock_peer(StatusCode::OK, &coordinator_answer(&snapshot, 5)).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let answer = usage(&node, &node.owner, HeaderMap::new(), false)
+        .await
+        .unwrap();
+    assert_eq!((answer.objects, answer.referenced_bytes), (5, 70));
+    assert_eq!(answer.current, Some(true));
+    let sources = answer.range_sources.unwrap();
+    assert_eq!(sources[0].source, Some(CounterSource::Coordinator));
+    assert_eq!(sources[0].counted_by, Some(node_id(PEER).to_string()));
+    assert_eq!(sources[0].coordinator, Some(node_id(PEER).to_string()));
+    let bearer = ValidatedBearer::new_for_test("caller-token");
+    let sizes = range_sizes(&node.state, Some(&bearer), snapshot.set_id()).await;
+    let sizes = sizes.unwrap();
+    assert_eq!(sizes.len(), 1);
+    assert_eq!(
+        sizes[0].objects, 5,
+        "capacity sizes the coordinator's counters"
+    );
+}
+
+#[tokio::test]
+async fn silent_coordinator_unknown() {
+    // Without its coordinator the local copy is counted, its freshness unknown, and capacity
+    // does not size the range from it.
+    let node = node_state().await;
+    let snapshot = replicate(&node.state, node.group_id, BUCKET).await;
+    publish_api(&node.state, node_id(PEER), CLOSED_API).await;
+    let answer = usage(&node, &node.owner, HeaderMap::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(answer.ranges_counted, Some(1));
+    assert_eq!(answer.current, None, "a copy's lag is unknown");
+    let sources = answer.range_sources.unwrap();
+    assert_eq!(sources[0].source, Some(CounterSource::Copy));
+    assert_eq!(sources[0].current, None);
+    assert_eq!(
+        sources[0].counted_by,
+        Some(node.state.get_node_id().to_string())
+    );
+    let bearer = ValidatedBearer::new_for_test("caller-token");
+    let sizes = range_sizes(&node.state, Some(&bearer), snapshot.set_id()).await;
+    assert!(sizes.unwrap().is_empty());
 }
 
 #[tokio::test]
