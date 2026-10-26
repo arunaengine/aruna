@@ -22,7 +22,8 @@ use aruna_core::keyspaces::{
     REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
     SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE,
+    USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -237,6 +238,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let wait_rows = db.keyspace(COPY_WAIT_KEYSPACE, KeyspaceCreateOptions::default)?;
     let consent_rows = db.keyspace(PLAINTEXT_COPY_KEYSPACE, KeyspaceCreateOptions::default)?;
     let iri_rows = db.keyspace(IRI_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let stats_rows = db.keyspace(USAGE_STATS_KEYSPACE, KeyspaceCreateOptions::default)?;
     let staging_rows = db.keyspace(STAGING_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let object_rows = db.keyspace(LOCAL_OBJECTS, KeyspaceCreateOptions::default)?;
     let reference_rows =
@@ -343,7 +345,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     relaid_rows.push((&consent_rows, PLAINTEXT_COPY_KEYSPACE, consents.rows));
     let announced = layouts::cleanup_rows(&db, &cleanup_rows)?.rows;
     relaid_rows.push((&cleanup_rows, BLOB_CLEANUP_KEYSPACE, announced));
-    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 6] = [
+    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 7] = [
         (
             &refresh_rows,
             REFRESH_JOB_KEYSPACE,
@@ -362,6 +364,11 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&staging_rows, STAGING_STATE_KEYSPACE, staged.restarted),
         (&wait_rows, COPY_WAIT_KEYSPACE, waits.removed),
         (&consent_rows, PLAINTEXT_COPY_KEYSPACE, consents.removed),
+        (
+            &stats_rows,
+            USAGE_STATS_KEYSPACE,
+            layouts::rebuild_progress(&db, &stats_rows)?,
+        ),
     ];
     let keys = node_secret(&db)?.map(|secret| {
         (

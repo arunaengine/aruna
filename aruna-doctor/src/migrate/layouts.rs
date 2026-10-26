@@ -8,6 +8,7 @@ use super::vault::Moves;
 use super::{Rewrites, decode_error, relaid, rewrite_rows};
 use crate::explorer::ExplorerError;
 use aruna_core::structs::storage::blob::BlobCleanupWork;
+use aruna_core::structs::storage::usage::USAGE_PROGRESS_KEY;
 use aruna_operations::replication::queue::{BlobJobRecord, blob_job_key};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use std::collections::BTreeMap;
@@ -151,6 +152,18 @@ pub(super) fn old_refreshes(
         keys.push(entry.into_inner()?.0.to_vec());
     }
     Ok(keys)
+}
+
+/// The saved position of a cut-off usage rebuild; migrated rows lack the kept values it resumes from.
+pub(super) fn rebuild_progress(
+    db: &OptimisticTxDatabase,
+    keyspace: &OptimisticTxKeyspace,
+) -> Result<Vec<Vec<u8>>, ExplorerError> {
+    let saved = db.read_tx().get(keyspace, USAGE_PROGRESS_KEY)?;
+    Ok(saved
+        .map(|_| USAGE_PROGRESS_KEY.to_vec())
+        .into_iter()
+        .collect())
 }
 
 /// IRI index rows in the old key layout; the index rebuild at startup writes them anew.
@@ -306,5 +319,21 @@ mod tests {
         assert_eq!(output.stale_rows_deleted.values().sum::<usize>(), 5);
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert!(again.relaid_rows.is_empty() && again.stale_rows_deleted.is_empty());
+    }
+
+    #[test]
+    fn restarts_cut_rebuild() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let entries: Vec<(&[u8], Vec<u8>)> = vec![(USAGE_PROGRESS_KEY, vec![1, 2, 3])];
+        write(&path, aruna_core::keyspaces::USAGE_STATS_KEYSPACE, entries);
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(output.stale_rows_deleted["usage_stats"], 1);
+        let rows = read(&path, aruna_core::keyspaces::USAGE_STATS_KEYSPACE);
+        assert!(!rows.contains_key(USAGE_PROGRESS_KEY));
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert!(again.stale_rows_deleted.is_empty());
     }
 }
