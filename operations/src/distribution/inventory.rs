@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -99,10 +99,10 @@ impl InventoryChange {
 enum Phase {
     Pending,
     Locate,
-    Read { range_id: Ulid },
-    SampleCount { range_id: Ulid },
-    SampleProbe { range_id: Ulid },
-    SampleLast { range_id: Ulid },
+    Read,
+    SampleCount,
+    SampleProbe,
+    SampleRead,
     Write,
     Delete,
     Count,
@@ -116,22 +116,69 @@ enum Walk {
     Uploads,
 }
 
-/// Embeddable update of one key's inventory rows. It reads the range index and the range's
-/// account row in the host transaction, so a split or a rebuild page conflicts it.
+/// Most sample rows, and bytes, one range's sample read takes in the transaction.
+const SAMPLE_READ_ROWS: usize = 2 * SAMPLE_SIZE as usize;
+const SAMPLE_READ_BYTES: usize = 1 << 20;
+
+/// A range found in the range index, with its key bounds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Located {
+    set_id: Ulid,
+    range_id: Ulid,
+    lower: String,
+    upper: Option<String>,
+}
+
+impl Located {
+    fn contains(&self, set_id: Ulid, key: &str) -> bool {
+        let below = self.upper.as_deref().is_none_or(|upper| key < upper);
+        self.set_id == set_id && self.lower.as_str() <= key && below
+    }
+}
+
+/// The keys of one range that may enter its sample, in sample order, and the sample's size.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Sampling {
+    set_id: Ulid,
+    range_id: Ulid,
+    candidates: Vec<SampleEntry>,
+    size: i128,
+}
+
+/// What one key's change does, planned from the key's rows read in the transaction.
+#[derive(Clone, Debug, PartialEq)]
+struct KeyPlan {
+    change: InventoryChange,
+    range_id: Ulid,
+    writes: Vec<(String, Key, Value)>,
+    deletes: Vec<(String, Key)>,
+    counters: Vec<(Key, RangeCounters)>,
+    /// A key that gained a head and may enter the sample.
+    candidate: Option<SampleEntry>,
+    /// Sample entries the change removed with the key's head.
+    unsampled: i128,
+}
+
+/// Embeddable update of the inventory rows of one or more keys. It works in rounds of distinct
+/// keys and version ids: a round reads the range index and each range's account row once in the
+/// host transaction, so a split or a rebuild page conflicts it, reads all its keys' rows in one
+/// batch, settles each range's sample once and stages its writes and counter deltas together.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InventoryUpdate {
-    change: InventoryChange,
+    queued: VecDeque<InventoryChange>,
+    unlocated: Vec<InventoryChange>,
+    keys: Vec<KeyPlan>,
+    located: Vec<Located>,
+    /// The round's ranges in read order; their account rows lead the round's read.
+    ranges: Vec<(Ulid, Ulid)>,
+    sampling: VecDeque<Sampling>,
     phase: Phase,
     writes: Vec<(String, Key, Value)>,
     deletes: Vec<(String, Key)>,
     counters: Vec<(Key, RangeCounters)>,
-    /// A key that gained a head and may enter the sample once its size is known.
-    candidate: Option<SampleEntry>,
-    /// Entries earlier updates of the same transaction added to each range's sample, keyed by
-    /// every range they changed; the committed rows do not show them yet.
-    sampled_before: BTreeMap<Ulid, i128>,
-    /// The entries this update adds to or removes from its range's sample.
-    sample_change: Option<(Ulid, i128)>,
+    /// Net entries earlier rounds staged in each range's sample, keyed by every range whose
+    /// sample they changed; the committed rows do not show them yet.
+    sampled: BTreeMap<Ulid, i128>,
 }
 
 fn row(key_space: &str, key: Vec<u8>, value: Vec<u8>) -> (String, Key, Value) {
@@ -141,45 +188,41 @@ fn row(key_space: &str, key: Vec<u8>, value: Vec<u8>) -> (String, Key, Value) {
 impl InventoryUpdate {
     pub fn new(change: InventoryChange) -> Self {
         Self {
-            change,
+            queued: VecDeque::from([change]),
+            unlocated: Vec::new(),
+            keys: Vec::new(),
+            located: Vec::new(),
+            ranges: Vec::new(),
+            sampling: VecDeque::new(),
             phase: Phase::Pending,
             writes: Vec::new(),
             deletes: Vec::new(),
             counters: Vec::new(),
-            candidate: None,
-            sampled_before: BTreeMap::new(),
-            sample_change: None,
+            sampled: BTreeMap::new(),
         }
+    }
+
+    /// Adds the change of another key before the update starts.
+    pub fn push(&mut self, change: InventoryChange) {
+        self.queued.push_back(change);
     }
 
     pub fn is_done(&self) -> bool {
         self.phase == Phase::Done
     }
 
+    #[cfg(test)]
     pub fn change(&self) -> &InventoryChange {
-        &self.change
+        self.queued.front().expect("a queued change")
     }
 
-    /// Counts what earlier updates of the same transaction added to each range's sample.
-    pub fn set_sampled(&mut self, sampled: BTreeMap<Ulid, i128>) {
-        self.sampled_before = sampled;
-    }
-
-    /// The range whose sample this update changed and the net entries it added (or removed).
-    pub fn sample_change(&self) -> Option<(Ulid, i128)> {
-        self.sample_change
+    #[cfg(test)]
+    pub fn change_mut(&mut self) -> &mut InventoryChange {
+        self.queued.front_mut().expect("a queued change")
     }
 
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
-        self.phase = Phase::Locate;
-        let set_id = self.change.set_id;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: RANGE_INDEX_KEYSPACE.to_string(),
-            prefix: Some(set_id.to_bytes().to_vec().into()),
-            start: Some(IterStart::After(slot_seek(set_id, &self.change.key).into())),
-            limit: 1,
-            txn_id: Some(txn_id),
-        })]
+        self.next_round(txn_id).unwrap_or_default()
     }
 
     /// Returns `Ok(Some(effects))` while storage work remains and `Ok(None)` once every row
@@ -191,84 +234,43 @@ impl InventoryUpdate {
         };
         match (&self.phase, event) {
             (Phase::Locate, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                let range_id = self.locate(&values)?;
-                self.phase = Phase::Read { range_id };
-                Ok(Some(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: self.reads(range_id),
-                    txn_id: Some(txn_id),
-                })]))
+                self.locate(&values)?;
+                Ok(Some(self.locate_next(txn_id)))
             }
-            (
-                Phase::Read { range_id },
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => {
-                let range_id = *range_id;
-                self.plan(range_id, values)?;
-                if self.candidate.is_none() {
-                    return Ok(self.next_effect(txn_id));
-                }
-                // The size is read outside the transaction, so inserts below it never conflict.
-                self.phase = Phase::SampleCount { range_id };
-                Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: RANGE_COUNTER_KEYSPACE.to_string(),
-                    key: sample_count_key(self.change.set_id, range_id).into(),
-                    txn_id: None,
-                })]))
+            (Phase::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.plan_keys(values)?;
+                Ok(self.count_samples(txn_id))
             }
-            (
-                Phase::SampleCount { range_id },
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => {
-                let range_id = *range_id;
-                let stored = value
-                    .map(|value| RangeCounters::from_bytes(&value))
-                    .transpose()?;
-                let pending = self
-                    .sampled_before
-                    .get(&range_id)
-                    .copied()
-                    .unwrap_or_default();
-                let size = stored.unwrap_or_default().sampled.saturating_add(pending);
-                if size < i128::from(SAMPLE_SIZE) {
-                    self.admit(range_id, None)?;
-                    return Ok(self.next_effect(txn_id));
-                }
-                // Entries staged earlier in this transaction are visible only inside it.
-                if self.sampled_before.contains_key(&range_id) {
-                    self.phase = Phase::SampleLast { range_id };
-                    return Ok(Some(smallvec![self.read_largest(range_id, Some(txn_id))]));
-                }
-                // A full sample is probed outside the transaction first, so keys that cannot
-                // enter never conflict on its largest entry.
-                self.phase = Phase::SampleProbe { range_id };
-                Ok(Some(smallvec![self.read_largest(range_id, None)]))
+            (Phase::SampleCount, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.size_samples(values)?;
+                Ok(self.next_sample(txn_id, false))
             }
-            (
-                Phase::SampleProbe { range_id },
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => {
-                let range_id = *range_id;
+            (Phase::SampleProbe, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 let last = values.first().and_then(|(key, _)| SampleEntry::decode(key));
-                let enters = (self.candidate.as_ref())
-                    .is_some_and(|entry| last.as_ref().is_none_or(|last| ranks_below(entry, last)));
+                let first = self.sampling.front().and_then(|at| at.candidates.first());
+                let enters =
+                    first.is_some_and(|first| last.is_none_or(|last| ranks_below(first, &last)));
                 if !enters {
-                    self.candidate = None;
-                    return Ok(self.next_effect(txn_id));
+                    self.sampling.pop_front();
+                    return Ok(self.next_sample(txn_id, false));
                 }
-                self.phase = Phase::SampleLast { range_id };
-                Ok(Some(smallvec![self.read_largest(range_id, Some(txn_id))]))
+                Ok(self.next_sample(txn_id, true))
             }
             (
-                Phase::SampleLast { range_id },
-                Event::Storage(StorageEvent::IterResult { values, .. }),
+                Phase::SampleRead,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
             ) => {
-                let range_id = *range_id;
-                let last = values.first().and_then(|(key, _)| SampleEntry::decode(key));
-                match last {
-                    Some(last) => self.admit(range_id, Some(last))?,
-                    None => self.admit(range_id, None)?,
+                // A sample far above its size is not read whole; its candidates stay out.
+                if let (Some(sampling), None) = (self.sampling.pop_front(), next_start_after) {
+                    let existing = values
+                        .iter()
+                        .filter_map(|(key, _)| SampleEntry::decode(key));
+                    self.settle(sampling, existing.collect())?;
                 }
-                Ok(self.next_effect(txn_id))
+                Ok(self.next_sample(txn_id, false))
             }
             (Phase::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
             | (Phase::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. }))
@@ -279,31 +281,340 @@ impl InventoryUpdate {
         }
     }
 
-    fn locate(&self, values: &[(Key, Value)]) -> Result<Ulid, InventoryError> {
-        let missing = || InventoryError::RangeMissing {
-            set_id: self.change.set_id,
-            key: self.change.key.clone(),
+    /// Takes the next round of distinct keys and version ids, or ends the update.
+    fn next_round(&mut self, txn_id: TxnId) -> Option<Effects> {
+        let mut keys = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        while let Some(change) = self.queued.front() {
+            let added = change.added.iter().map(|added| added.version_id);
+            let versions: Vec<Ulid> = added.chain(change.removed.iter().copied()).collect();
+            let key = (change.set_id, change.key.clone());
+            let repeated = keys.contains(&key) || versions.iter().any(|id| ids.contains(id));
+            if repeated && !self.unlocated.is_empty() {
+                break;
+            }
+            keys.insert(key);
+            ids.extend(versions);
+            self.unlocated.extend(self.queued.pop_front());
+        }
+        if self.unlocated.is_empty() {
+            self.phase = Phase::Done;
+            return None;
+        }
+        Some(self.locate_next(txn_id))
+    }
+
+    /// Seeks the range of the first key outside every located range, or reads the round's
+    /// rows once every key has its range.
+    fn locate_next(&mut self, txn_id: TxnId) -> Effects {
+        for change in std::mem::take(&mut self.unlocated) {
+            let range =
+                (self.located.iter()).find(|range| range.contains(change.set_id, &change.key));
+            match range {
+                Some(range) => self.keys.push(KeyPlan::new(change, range.range_id)),
+                None => self.unlocated.push(change),
+            }
+        }
+        let Some(change) = self.unlocated.first() else {
+            return self.read_rows(txn_id);
         };
-        let (_, value) = values.first().ok_or_else(missing)?;
+        self.phase = Phase::Locate;
+        let set_id = change.set_id;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: RANGE_INDEX_KEYSPACE.to_string(),
+            prefix: Some(set_id.to_bytes().to_vec().into()),
+            start: Some(IterStart::After(slot_seek(set_id, &change.key).into())),
+            limit: 1,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// Takes the range index row found for the first unlocated key.
+    fn locate(&mut self, values: &[(Key, Value)]) -> Result<(), InventoryError> {
+        let Some(change) = self.unlocated.first() else {
+            return Ok(());
+        };
+        let missing = || InventoryError::RangeMissing {
+            set_id: change.set_id,
+            key: change.key.clone(),
+        };
+        let (row_key, value) = values.first().ok_or_else(missing)?;
         let slot = RangeSlot::from_bytes(value)?;
-        match slot.lower.as_str() <= self.change.key.as_str() {
-            true => Ok(slot.range_id),
-            false => Err(missing()),
+        // The open end's row key is no UTF-8 text.
+        let upper = (row_key.get(Ulid::nil().to_bytes().len()..))
+            .and_then(|upper| std::str::from_utf8(upper).ok());
+        let located = Located {
+            set_id: change.set_id,
+            range_id: slot.range_id,
+            lower: slot.lower,
+            upper: upper.map(str::to_string),
+        };
+        if !located.contains(change.set_id, &change.key) {
+            return Err(missing());
+        }
+        self.located.push(located);
+        Ok(())
+    }
+
+    fn read_rows(&mut self, txn_id: TxnId) -> Effects {
+        self.phase = Phase::Read;
+        self.ranges.clear();
+        for key in &self.keys {
+            let range = (key.change.set_id, key.range_id);
+            if !self.ranges.contains(&range) {
+                self.ranges.push(range);
+            }
+        }
+        let accounts = (self.ranges.iter()).map(|(set_id, range_id)| {
+            let key = account_key(*set_id, *range_id);
+            (RANGE_ACCOUNT_KEYSPACE.to_string(), key.into())
+        });
+        let mut reads: Vec<(String, Key)> = accounts.collect();
+        for key in &self.keys {
+            reads.extend(key.reads());
+        }
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// Plans every key of the round from the read rows and gathers its staged work.
+    fn plan_keys(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<(), InventoryError> {
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let mut accounts = Vec::with_capacity(self.ranges.len());
+        for _ in &self.ranges {
+            let account = values.next().flatten();
+            accounts.push(
+                account
+                    .map(|value| RangeAccount::from_bytes(&value))
+                    .transpose()?,
+            );
+        }
+        let mut next = || values.next().flatten();
+        let mut candidates: BTreeMap<(Ulid, Ulid), Vec<SampleEntry>> = BTreeMap::new();
+        for mut key in std::mem::take(&mut self.keys) {
+            let range = (key.change.set_id, key.range_id);
+            let at = self.ranges.iter().position(|known| *known == range);
+            let account = at.and_then(|at| accounts.get(at)).and_then(Option::as_ref);
+            let account = account.ok_or_else(|| InventoryError::RangeMissing {
+                set_id: key.change.set_id,
+                key: key.change.key.clone(),
+            })?;
+            key.plan(account, &mut next)?;
+            if let Some(candidate) = key.candidate.take() {
+                candidates.entry(range).or_default().push(candidate);
+            }
+            if key.unsampled != 0 {
+                *self.sampled.entry(key.range_id).or_default() -= key.unsampled;
+            }
+            self.writes.append(&mut key.writes);
+            self.deletes.append(&mut key.deletes);
+            for (row, delta) in key.counters {
+                add_counter(&mut self.counters, row, delta)?;
+            }
+        }
+        self.sampling = (candidates.into_iter())
+            .map(|((set_id, range_id), mut candidates)| {
+                candidates.sort_by(|left, right| rank(left).cmp(&rank(right)));
+                Sampling {
+                    set_id,
+                    range_id,
+                    candidates,
+                    size: 0,
+                }
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// Reads the size of each sample new keys may enter, outside the transaction, so inserts
+    /// below the size never conflict.
+    fn count_samples(&mut self, txn_id: TxnId) -> Option<Effects> {
+        if self.sampling.is_empty() {
+            return self.next_effect(txn_id);
+        }
+        self.phase = Phase::SampleCount;
+        let reads = (self.sampling.iter())
+            .map(|at| sample_count_key(at.set_id, at.range_id))
+            .map(|key| (RANGE_COUNTER_KEYSPACE.to_string(), key.into()));
+        Some(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: reads.collect(),
+            txn_id: None,
+        })])
+    }
+
+    /// Settles the samples all candidates fit into; the others are read before.
+    fn size_samples(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<(), InventoryError> {
+        let queue = std::mem::take(&mut self.sampling);
+        for (mut sampling, (_, value)) in queue.into_iter().zip(values) {
+            let stored = value
+                .map(|value| RangeCounters::from_bytes(&value))
+                .transpose()?;
+            let staged = self
+                .sampled
+                .get(&sampling.range_id)
+                .copied()
+                .unwrap_or_default();
+            sampling.size = stored.unwrap_or_default().sampled.saturating_add(staged);
+            let wanted = sampling
+                .size
+                .saturating_add(sampling.candidates.len() as i128);
+            match wanted <= i128::from(SAMPLE_SIZE) {
+                true => self.settle(sampling, Vec::new())?,
+                false => self.sampling.push_back(sampling),
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the next sample its candidates may enter: a full one is first probed outside the
+    /// transaction, so keys that cannot enter never conflict on its largest entry. In the
+    /// transaction, only the entries from the smallest candidate on are read.
+    fn next_sample(&mut self, txn_id: TxnId, probed: bool) -> Option<Effects> {
+        let Some(sampling) = self.sampling.front() else {
+            return self.next_effect(txn_id);
+        };
+        let (set_id, range_id) = (sampling.set_id, sampling.range_id);
+        let prefix = sample_prefix(set_id, range_id);
+        let full = sampling.size >= i128::from(SAMPLE_SIZE);
+        // Entries staged earlier in this transaction are visible only inside it.
+        if !probed && full && !self.sampled.contains_key(&range_id) {
+            self.phase = Phase::SampleProbe;
+            return Some(smallvec![Effect::Storage(StorageEffect::Last {
+                key_space: KEY_SAMPLE_KEYSPACE.to_string(),
+                prefix: Some(prefix.into()),
+                txn_id: None,
+            })]);
+        }
+        let Some(first) = sampling.candidates.first() else {
+            self.sampling.pop_front();
+            return self.next_sample(txn_id, false);
+        };
+        let start = first.row_key(set_id, range_id);
+        // The tag byte that ends the prefix is below 0xFF, so the next tag bounds the sample.
+        let mut end = prefix;
+        if let Some(tag) = end.last_mut() {
+            *tag += 1;
+        }
+        self.phase = Phase::SampleRead;
+        Some(smallvec![Effect::Storage(StorageEffect::IterRange {
+            key_space: KEY_SAMPLE_KEYSPACE.to_string(),
+            start: IterStart::At(start.into()),
+            end: IterEnd::Before(end.into()),
+            limit: SAMPLE_READ_ROWS,
+            max_bytes: SAMPLE_READ_BYTES,
+            txn_id: Some(txn_id),
+        })])
+    }
+
+    /// Keeps the `SAMPLE_SIZE` smallest of the sample and its candidates: candidates among them
+    /// enter, `existing` entries (those from the smallest candidate on) beyond them leave.
+    fn settle(
+        &mut self,
+        sampling: Sampling,
+        existing: Vec<SampleEntry>,
+    ) -> Result<(), InventoryError> {
+        let Sampling {
+            set_id,
+            range_id,
+            candidates,
+            size,
+        } = sampling;
+        let below = size.saturating_sub(existing.len() as i128).max(0);
+        let room = (i128::from(SAMPLE_SIZE) - below).max(0);
+        let old = existing.into_iter().map(|entry| (entry, false));
+        let mut merged: Vec<_> = old
+            .chain(candidates.into_iter().map(|entry| (entry, true)))
+            .collect();
+        merged.sort_by(|(left, _), (right, _)| rank(left).cmp(&rank(right)));
+        let (mut entries, mut changed) = (0, false);
+        for (index, (entry, new)) in merged.into_iter().enumerate() {
+            let key = entry.row_key(set_id, range_id);
+            match ((index as i128) < room, new) {
+                (true, true) => {
+                    self.writes.push(row(KEY_SAMPLE_KEYSPACE, key, vec![]));
+                    entries += 1;
+                }
+                (false, false) => {
+                    self.deletes.push((KEY_SAMPLE_KEYSPACE.into(), key.into()));
+                    entries -= 1;
+                }
+                _ => continue,
+            }
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+        *self.sampled.entry(range_id).or_default() += entries;
+        if entries != 0 {
+            let delta = RangeCounters {
+                sampled: entries,
+                ..RangeCounters::default()
+            };
+            add_counter(
+                &mut self.counters,
+                sample_count_key(set_id, range_id).into(),
+                delta,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn next_effect(&mut self, txn_id: TxnId) -> Option<Effects> {
+        if !self.writes.is_empty() && self.phase != Phase::Write {
+            self.phase = Phase::Write;
+            let writes = std::mem::take(&mut self.writes);
+            return Some(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(txn_id),
+            })]);
+        }
+        if !self.deletes.is_empty() && !matches!(self.phase, Phase::Delete | Phase::Count) {
+            self.phase = Phase::Delete;
+            let deletes = std::mem::take(&mut self.deletes);
+            return Some(smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes,
+                txn_id: Some(txn_id),
+            })]);
+        }
+        if !self.counters.is_empty() && self.phase != Phase::Count {
+            self.phase = Phase::Count;
+            let deltas = std::mem::take(&mut self.counters);
+            return Some(smallvec![Effect::Storage(StorageEffect::AddCounters {
+                key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+                deltas,
+                txn_id,
+            })]);
+        }
+        self.next_round(txn_id)
+    }
+}
+
+impl KeyPlan {
+    fn new(change: InventoryChange, range_id: Ulid) -> Self {
+        Self {
+            change,
+            range_id,
+            writes: Vec::new(),
+            deletes: Vec::new(),
+            counters: Vec::new(),
+            candidate: None,
+            unsampled: 0,
         }
     }
 
-    fn reads(&self, range_id: Ulid) -> Vec<(String, Key)> {
+    /// The key's own rows, read after the account rows of the round's ranges.
+    fn reads(&self) -> Vec<(String, Key)> {
         let (set_id, key) = (self.change.set_id, &self.change.key);
-        let mut reads = vec![(
-            RANGE_ACCOUNT_KEYSPACE.to_string(),
-            account_key(set_id, range_id).into(),
-        )];
+        let mut reads = Vec::new();
         if self.change.head != HeadChange::Keep {
             reads.push((
                 INVENTORY_KEYSPACE.to_string(),
                 head_position(set_id, key).into(),
             ));
-            let sample = SampleEntry::of_key(key).row_key(set_id, range_id);
+            let sample = SampleEntry::of_key(key).row_key(set_id, self.range_id);
             reads.push((KEY_SAMPLE_KEYSPACE.to_string(), sample.into()));
         }
         if let Some((upload_id, _)) = self.change.upload {
@@ -318,19 +629,13 @@ impl InventoryUpdate {
         reads
     }
 
-    /// Turns the read rows into writes, deletes and per-row counter deltas.
+    /// Turns the key's read rows, taken from `next` in [`Self::reads`] order, into writes,
+    /// deletes and per-row counter deltas.
     fn plan(
         &mut self,
-        range_id: Ulid,
-        values: Vec<(Key, Option<Value>)>,
+        account: &RangeAccount,
+        next: &mut impl FnMut() -> Option<Value>,
     ) -> Result<(), InventoryError> {
-        let mut values = values.into_iter().map(|(_, value)| value);
-        let mut next = || values.next().flatten();
-        let account = next().ok_or_else(|| InventoryError::RangeMissing {
-            set_id: self.change.set_id,
-            key: self.change.key.clone(),
-        })?;
-        let account = RangeAccount::from_bytes(&account)?;
         let (head, sample) = match self.change.head {
             HeadChange::Keep => (None, None),
             _ => (next(), next()),
@@ -352,7 +657,7 @@ impl InventoryUpdate {
                 contributions.push((Walk::Uploads, position, counters));
             }
         }
-        self.plan_versions(&mut next, &mut contributions)?;
+        self.plan_versions(next, &mut contributions)?;
         if let Some(entry) = &self.change.root {
             // A blind write: replays and other versions of the root rewrite the same row.
             let key = root_key(self.change.set_id, &entry.root.digest()?);
@@ -360,8 +665,8 @@ impl InventoryUpdate {
                 .push(row(SOURCE_ROOT_KEYSPACE, key, entry.to_bytes()?));
         }
         self.plan_head(head, &mut contributions)?;
-        self.plan_sample(range_id, had_head, sample.is_some());
-        let routed = route(self.change.set_id, range_id, &account, contributions)?;
+        self.plan_sample(had_head, sample.is_some());
+        let routed = route(self.change.set_id, self.range_id, account, contributions)?;
         self.counters.extend(routed);
         Ok(())
     }
@@ -494,102 +799,48 @@ impl InventoryUpdate {
     }
 
     /// A key that gains a head is a sample candidate; a sampled key whose head goes leaves.
-    fn plan_sample(&mut self, range_id: Ulid, had_head: bool, sampled: bool) {
+    fn plan_sample(&mut self, had_head: bool, sampled: bool) {
         let entry = SampleEntry::of_key(&self.change.key);
         match (&self.change.head, had_head, sampled) {
             (HeadChange::Set(_), false, false) => self.candidate = Some(entry),
             (HeadChange::Remove, _, true) => {
-                let key = entry.row_key(self.change.set_id, range_id);
+                let (set_id, range_id) = (self.change.set_id, self.range_id);
+                let key = entry.row_key(set_id, range_id);
                 self.deletes.push((KEY_SAMPLE_KEYSPACE.into(), key.into()));
-                self.count_sample(range_id, -1);
+                let delta = RangeCounters {
+                    sampled: -1,
+                    ..RangeCounters::default()
+                };
+                let count = sample_count_key(set_id, range_id);
+                self.counters.push((count.into(), delta));
+                self.unsampled += 1;
             }
             _ => {}
         }
     }
-
-    /// The sample's largest entry, read in the transaction only to validate an admission.
-    fn read_largest(&self, range_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-        Effect::Storage(StorageEffect::Last {
-            key_space: KEY_SAMPLE_KEYSPACE.to_string(),
-            prefix: Some(sample_prefix(self.change.set_id, range_id).into()),
-            txn_id,
-        })
-    }
-
-    /// Takes the candidate into a sample below its size, or in place of a larger `last`.
-    fn admit(&mut self, range_id: Ulid, last: Option<SampleEntry>) -> Result<(), InventoryError> {
-        let Some(entry) = self.candidate.take() else {
-            return Ok(());
-        };
-        let set_id = self.change.set_id;
-        match last {
-            Some(last) if !ranks_below(&entry, &last) => return Ok(()),
-            Some(last) => {
-                let evicted = last.row_key(set_id, range_id);
-                self.deletes
-                    .push((KEY_SAMPLE_KEYSPACE.into(), evicted.into()));
-                self.touch_sample(range_id, 0);
-            }
-            None => self.count_sample(range_id, 1),
-        }
-        self.writes.push(row(
-            KEY_SAMPLE_KEYSPACE,
-            entry.row_key(set_id, range_id),
-            vec![],
-        ));
-        Ok(())
-    }
-
-    fn count_sample(&mut self, range_id: Ulid, entries: i128) {
-        let delta = RangeCounters {
-            sampled: entries,
-            ..RangeCounters::default()
-        };
-        let key = sample_count_key(self.change.set_id, range_id);
-        self.counters.push((key.into(), delta));
-        self.touch_sample(range_id, entries);
-    }
-
-    /// Records that this update changed the range's sample, even when its size stays.
-    fn touch_sample(&mut self, range_id: Ulid, entries: i128) {
-        let total = self.sample_change.map_or(0, |(_, total)| total);
-        self.sample_change = Some((range_id, total.saturating_add(entries)));
-    }
-
-    fn next_effect(&mut self, txn_id: TxnId) -> Option<Effects> {
-        if !self.writes.is_empty() && self.phase != Phase::Write {
-            self.phase = Phase::Write;
-            let writes = std::mem::take(&mut self.writes);
-            return Some(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: Some(txn_id),
-            })]);
-        }
-        if !self.deletes.is_empty() && !matches!(self.phase, Phase::Delete | Phase::Count) {
-            self.phase = Phase::Delete;
-            let deletes = std::mem::take(&mut self.deletes);
-            return Some(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            })]);
-        }
-        if !self.counters.is_empty() && self.phase != Phase::Count {
-            self.phase = Phase::Count;
-            let deltas = std::mem::take(&mut self.counters);
-            return Some(smallvec![Effect::Storage(StorageEffect::AddCounters {
-                key_space: RANGE_COUNTER_KEYSPACE.to_string(),
-                deltas,
-                txn_id,
-            })]);
-        }
-        self.phase = Phase::Done;
-        None
-    }
 }
 
-/// Whether `entry` sorts before `other` in the sample order (priority, then key).
+/// The sample order: priority, then key.
+fn rank(entry: &SampleEntry) -> (u64, &str) {
+    (entry.priority, entry.key.as_str())
+}
+
+/// Whether `entry` sorts before `other` in the sample order.
 fn ranks_below(entry: &SampleEntry, other: &SampleEntry) -> bool {
-    (entry.priority, entry.key.as_str()) < (other.priority, other.key.as_str())
+    rank(entry) < rank(other)
+}
+
+/// Adds `delta` to the staged delta of `row`.
+fn add_counter(
+    counters: &mut Vec<(Key, RangeCounters)>,
+    row: Key,
+    delta: RangeCounters,
+) -> Result<(), CounterOverflow> {
+    match counters.iter_mut().find(|(key, _)| *key == row) {
+        Some((_, total)) => *total = total.merge(delta)?,
+        None => counters.push((row, delta)),
+    }
+    Ok(())
 }
 
 /// Routes each contribution to the rows the account names: the active or pending row, and
