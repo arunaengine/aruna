@@ -265,10 +265,9 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<ByteView, PageFailure> {
     Ok(ByteView::from(bytes?))
 }
 
-/// Source keys where the lanes of the prefix at `walk` start after its first. One-key listings
-/// find the occupied starts below the prefix and refine all of them a level further, round by
-/// round, until there are at least `parts` or the probes run out; the starts are then grouped
-/// into at most `parts` lanes. None when the keys cannot be told apart in a few probes.
+/// Source keys where the lanes of the prefix at `walk` start after its first: occupied starts,
+/// refined a level per round by one-key listings until there are `parts` or the probes run out,
+/// grouped into at most `parts` lanes. None when a few probes cannot tell the keys apart.
 async fn split_points(
     ctx: &JobContext,
     spec: &StagingJobSpec,

@@ -162,10 +162,9 @@ struct KeyPlan {
     unsampled: i128,
 }
 
-/// Embeddable update of the inventory rows of one or more keys. It works in rounds of distinct
-/// keys and version ids: a round reads the range index and each range's account row once in the
-/// host transaction, so a split or a rebuild page conflicts it, reads all its keys' rows in one
-/// batch, settles each range's sample once and stages its writes and counter deltas together.
+/// Embeddable update of the inventory rows of keys, in rounds of distinct keys and version ids.
+/// A round reads each range's index and account rows once in the host transaction (a split or a
+/// rebuild page conflicts it), all key rows in one batch, and settles each range's sample once.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InventoryUpdate {
     queued: VecDeque<InventoryChange>,
