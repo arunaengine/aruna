@@ -447,12 +447,34 @@ mod tests {
         assert_eq!(registered, 1040);
     }
 
+    // A file the submitter may not write fails alone; the rest of its page registers.
+    #[tokio::test]
+    async fn denied_file_counted() {
+        use crate::jobs::executor::JobRunOutcome;
+        use aruna_core::structs::execution::job::JobResultPayload;
+        let keys = (0..20).map(|index| format!("a/{index:04}")).collect();
+        let (endpoint, server) = s3_listing(keys).await;
+        let (ctx, spec, _dir) = job_context(endpoint, &[("a", "ta")], Some("ta/0007")).await;
+
+        let outcome = super::super::run_staging_job(&ctx, &spec).await;
+        server.abort();
+
+        let JobRunOutcome::Succeeded(JobResultPayload::Staging {
+            completed_items,
+            failed_items,
+        }) = outcome
+        else {
+            panic!("the import must succeed");
+        };
+        assert_eq!((completed_items, failed_items), (19, 1));
+    }
+
     // The splits of a prefix are the distinct characters after the start its keys share.
     #[tokio::test]
     async fn splits_after_shared_start() {
         let keys = ["p/SAMD1", "p/SAMD2", "p/SAMEA1", "p/SAMN1", "p/SAMN2"];
         let (endpoint, server) = s3_listing(keys.iter().map(|key| key.to_string()).collect()).await;
-        let (ctx, spec, _dir) = job_context(endpoint, &[("p", "t")]).await;
+        let (ctx, spec, _dir) = job_context(endpoint, &[("p", "t")], None).await;
         let walk = StagingWalk {
             source_path: "p/".to_string(),
             target_prefix: "t".to_string(),
@@ -473,6 +495,7 @@ mod tests {
     async fn job_context(
         endpoint: String,
         prefixes: &[(&str, &str)],
+        denied: Option<&str>,
     ) -> (JobContext, StagingJobSpec, tempfile::TempDir) {
         use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
         use crate::driver::drive;
@@ -480,6 +503,7 @@ mod tests {
         use crate::tests::staging::{create_test_bucket, setup_driver_context};
         use aruna_core::structs::execution::job::{JobClaim, JobPayload, JobProgress, JobRecord};
         use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_core::structs::storage::blob::object_permission_path;
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
         use ulid::Ulid;
@@ -510,7 +534,12 @@ mod tests {
             .connector;
         spec.connector_id = connector.connector_id;
         let scope = (spec.auth_context.realm_id, spec.group_id, spec.node_id);
-        spec.auth_context = crate::tests::access::seed_access(&driver, scope, "/none").await;
+        let denied = denied.map(|key| {
+            let (realm, group, node) = scope;
+            object_permission_path(realm, group, node, &spec.bucket, key)
+        });
+        let denied = denied.as_deref().unwrap_or("/none");
+        spec.auth_context = crate::tests::access::seed_access(&driver, scope, denied).await;
         let owner = spec.auth_context.user_id;
         let bucket = create_test_bucket(&driver, spec.group_id, owner, &spec.bucket).await;
         spec.bucket_identity = bucket.identity();
@@ -548,7 +577,7 @@ mod tests {
         use aruna_core::structs::storage::blob::BlobHeadKey;
 
         let (endpoint, server) = s3_listing(keys.clone()).await;
-        let (ctx, spec, _dir) = job_context(endpoint, prefixes).await;
+        let (ctx, spec, _dir) = job_context(endpoint, prefixes, None).await;
 
         let outcome = super::super::run_staging_job(&ctx, &spec).await;
         server.abort();
