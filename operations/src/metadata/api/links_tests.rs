@@ -100,6 +100,7 @@ fn hidden_survives_merge() {
         [
             LinkNodePage {
                 hidden: true,
+                confirmed: true,
                 ..LinkNodePage::default()
             },
             node(vec![document(1, "a")]),
@@ -107,7 +108,7 @@ fn hidden_survives_merge() {
         10,
         0,
     );
-    assert!(page.hidden);
+    assert!(page.hidden && page.confirmed);
     assert_eq!(page.documents.len(), 1);
 }
 

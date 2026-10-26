@@ -152,7 +152,7 @@ async fn version_links(
 }
 
 /// Whether the dataset's live root names the target bucket as a linked part, as the caller
-/// sees it. `Ok(None)` when the answer is incomplete and the dataset was not seen.
+/// sees it; an unreadable dataset is only confirmed. `Ok(None)` when the answer is incomplete.
 pub async fn dataset_links(
     context: &DriverContext,
     realm_id: RealmId,
@@ -163,7 +163,6 @@ pub async fn dataset_links(
     let link = entry.target.root_link(realm_id);
     let mut after = None;
     let mut reliable = true;
-    let mut hidden = false;
     for _ in 0..LINK_PAGES {
         let page = links_distributed(
             context,
@@ -176,6 +175,7 @@ pub async fn dataset_links(
                 parts_only: true,
                 after,
                 limit: 100,
+                confirm: Some(entry.dataset_id),
             },
         )
         .await
@@ -191,13 +191,14 @@ pub async fn dataset_links(
                 document_path: document.document_path.clone(),
             }));
         }
+        if page.confirmed {
+            return Ok(Some(LinkedDataset::Hidden));
+        }
         reliable &= page.nodes_failed == 0
             && page.pending_materializations == 0
             && page.failed_materializations == 0;
-        hidden |= page.hidden;
         match page.next_after {
             Some(next) => after = Some(next),
-            None if reliable && page.complete && hidden => return Ok(Some(LinkedDataset::Hidden)),
             None if reliable && page.complete => return Ok(Some(LinkedDataset::Unlinked)),
             None => return Ok(None),
         }
@@ -213,7 +214,7 @@ pub enum LinkedDataset {
         graph_iri: String,
         document_path: String,
     },
-    /// Every node answered and no readable dataset links the bucket, but an unreadable one may.
+    /// The dataset links the bucket, but the caller may not read it.
     Hidden,
     /// Every node answered and nothing links the bucket: the entry is inactive.
     Unlinked,

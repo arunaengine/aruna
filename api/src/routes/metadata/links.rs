@@ -196,6 +196,7 @@ pub async fn data_links(
         parts_only: params.parts_only,
         after: params.after,
         limit: page_limit(params.limit),
+        confirm: None,
     };
     run(&state, auth, bearer_token, request).await
 }
@@ -288,6 +289,7 @@ pub async fn bucket_links(
         parts_only: params.parts_only,
         after: params.after,
         limit: page_limit(params.limit),
+        confirm: None,
     };
     run(&state, auth, bearer_token, request).await
 }

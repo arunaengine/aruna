@@ -296,3 +296,39 @@ async fn parts_resolve_buckets() {
         Err(ServerError::BadRequestReason(_))
     ));
 }
+
+#[tokio::test]
+async fn confirms_hidden_dataset() {
+    // Only the named dataset a caller may not read is confirmed, by id and without its metadata.
+    use aruna_operations::metadata::api::links_local;
+    let test = setup_state().await;
+    store_bucket(&test, BUCKET).await;
+    let raw = folder(&test, "raw/");
+    let dataset = describe(&test, "datasets/private", false, &raw).await;
+    let request = |confirm| LinkNodeRequest {
+        queries: vec![LinkQuery::Exact(DataLink::parse(&raw).unwrap())],
+        parts_only: true,
+        after: None,
+        limit: 10,
+        confirm,
+    };
+    let context = test.state.get_ctx();
+    let realm_id = test.state.get_realm_id();
+    let other = stranger(&test);
+
+    let named = links_local(&context, realm_id, Some(&other), request(Some(dataset)))
+        .await
+        .unwrap();
+    assert!(named.documents.is_empty());
+    assert!(named.hidden && named.confirmed);
+    let unrelated = Some(Ulid::from_bytes([61; 16]));
+    let page = links_local(&context, realm_id, Some(&other), request(unrelated))
+        .await
+        .unwrap();
+    assert!(page.hidden && !page.confirmed);
+    let reader = links_local(&context, realm_id, Some(&test.auth), request(Some(dataset)))
+        .await
+        .unwrap();
+    assert_eq!(reader.documents.len(), 1);
+    assert!(!reader.confirmed);
+}

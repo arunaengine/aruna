@@ -47,6 +47,8 @@ pub struct LinkNodeRequest {
     /// Documents after this id; documents sort by id on every node.
     pub after: Option<Ulid>,
     pub limit: usize,
+    /// A document whose link is reported by `confirmed` even if the caller may not read it.
+    pub confirm: Option<Ulid>,
 }
 
 /// One link of a document to one of the queried identifiers.
@@ -83,6 +85,8 @@ pub struct LinkNodePage {
     pub failed_materializations: usize,
     /// Documents whose links were cut at the projection limit; any of them may match.
     pub truncated_documents: usize,
+    /// The requested `confirm` document matches but the caller may not read it.
+    pub confirmed: bool,
 }
 
 /// The merged answer of every metadata node.
@@ -97,6 +101,7 @@ pub struct LinkPage {
     pub pending_materializations: usize,
     pub failed_materializations: usize,
     pub truncated_documents: usize,
+    pub confirmed: bool,
 }
 
 /// Answers a link lookup from this node's postings within one shared budget.
@@ -165,7 +170,8 @@ pub async fn links_local(
         Some(end) => matches.into_iter().filter(|(id, _)| *id <= end).collect(),
         None => matches,
     };
-    describe(context, realm_id, auth, documents, &mut page).await?;
+    let confirm = request.confirm;
+    describe(context, (realm_id, auth, confirm), documents, &mut page).await?;
     let (pending, failed) = unsettled_documents(storage, UNSETTLED_CAP)
         .await
         .map_err(internal)?;
@@ -178,11 +184,10 @@ pub async fn links_local(
 }
 
 /// Adds the readable documents of `matches` to `page`: postings of an older document event
-/// are dropped, unreadable documents only set `hidden`.
+/// are dropped, unreadable documents only set `hidden`, and `confirmed` for `confirm`.
 async fn describe(
     context: &DriverContext,
-    realm_id: RealmId,
-    auth: Option<&AuthContext>,
+    (realm_id, auth, confirm): (RealmId, Option<&AuthContext>, Option<Ulid>),
     matches: BTreeMap<Ulid, Vec<(DataLink, LinkPosting)>>,
     page: &mut LinkNodePage,
 ) -> Result<(), MetadataApiError> {
@@ -201,6 +206,7 @@ async fn describe(
         }
         if !can_read_record(context, realm_id, auth, &record).await? {
             page.hidden = true;
+            page.confirmed |= confirm == Some(document_id);
             continue;
         }
         page.documents.push(LinkDocument {
@@ -283,7 +289,7 @@ pub async fn set_preview_local(
         next,
         ..SetPreviewPage::default()
     };
-    describe(context, realm_id, auth, matches, &mut preview.page).await?;
+    describe(context, (realm_id, auth, None), matches, &mut preview.page).await?;
     preview.unverified = unverified_versions(storage, UNSETTLED_CAP)
         .await
         .map_err(internal)?;
@@ -499,6 +505,7 @@ pub fn merge_pages(
         }
         cut |= node.cut;
         page.hidden |= node.hidden;
+        page.confirmed |= node.confirmed;
         page.pending_materializations += node.pending_materializations;
         page.failed_materializations += node.failed_materializations;
         page.truncated_documents += node.truncated_documents;
@@ -664,6 +671,7 @@ pub async fn part_of(
             parts_only: true,
             after: None,
             limit: PART_OF_LIMIT,
+            confirm: None,
         },
     )
     .await?;
