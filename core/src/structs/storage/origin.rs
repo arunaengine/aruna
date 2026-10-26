@@ -34,6 +34,12 @@ impl OriginVersion {
             Self::Node(arn) => arn.to_w3id(),
         }
     }
+
+    /// Whether a dataset may name the version: a global id is opaque, while a node ARN spells
+    /// out the bucket and key of a bucket whose readers are unknown.
+    pub fn publishable(&self) -> bool {
+        matches!(self, Self::Global(_))
+    }
 }
 
 /// How a version's content got into its bucket.
@@ -106,15 +112,20 @@ pub fn project(
         Some(VersionOrigin::Source { .. }) => {
             projection.extend(source_url.map(|id| OriginProjection::BasedOn { id }));
         }
-        Some(VersionOrigin::Copy { from }) => {
+        Some(VersionOrigin::Copy { from }) if from.publishable() => {
             projection.push(OriginProjection::BasedOn { id: from.to_id() })
         }
         Some(VersionOrigin::Job { run_id }) => {
             projection.push(OriginProjection::CreatedBy { run_id: *run_id })
         }
-        Some(VersionOrigin::Upload { .. } | VersionOrigin::Storage { .. }) | None => {}
+        Some(
+            VersionOrigin::Upload { .. }
+            | VersionOrigin::Storage { .. }
+            | VersionOrigin::Copy { .. },
+        )
+        | None => {}
     }
-    if let Some(hop) = hop {
+    if let Some(hop) = hop.filter(|hop| hop.from.publishable()) {
         let id = hop.from.to_id();
         if !projection.contains(&OriginProjection::BasedOn { id: id.clone() }) {
             projection.push(OriginProjection::BasedOn { id });

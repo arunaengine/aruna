@@ -57,6 +57,28 @@ fn derived_name_original() {
 }
 
 #[test]
+fn node_sources_unpublished() {
+    // A node ARN names a bucket and key, so neither a copy nor a hop projects it.
+    let arn = VersionedObjectArn::new(
+        RealmId::from_bytes([1; 32]),
+        node(),
+        "private",
+        "a.txt",
+        Ulid::from_bytes([6; 16]),
+    )
+    .unwrap();
+    let copy = VersionOrigin::Copy {
+        from: OriginVersion::Node(arn.clone()),
+    };
+    let hop = SyncHop {
+        relationship_id: Ulid::nil(),
+        from: OriginVersion::Node(arn),
+    };
+    assert!(project(Some(&copy), None, None).is_empty());
+    assert!(project(None, Some(&hop), None).is_empty());
+}
+
+#[test]
 fn sources_jobs_project() {
     let source = VersionOrigin::Source { database: None };
     let url = "https://s3.example.org/reads/a.fastq".to_string();

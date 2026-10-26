@@ -216,8 +216,9 @@ impl From<OriginView> for OriginResponse {
   adds a hop naming the relationship and the exact source version.
 - Readers of the file see the full record, including the uploader, node and device.
 - `projection` is what datasets receive: `isBasedOn` the source URL, the copied version or
-  the synced source version; `CreateAction` for job results; nothing for uploads and imports
-  in place.
+  the synced source version when it is a version of a distributed bucket (a node ARN names
+  its bucket and key, so it is left out); `CreateAction` for job results; nothing for
+  uploads and imports in place.
 
 **Limits**
 - One version per call; one point read. A member of a distributed bucket that holds no copy
