@@ -471,7 +471,7 @@ mod tests {
 
     // The splits of a prefix are the distinct characters after the start its keys share.
     #[tokio::test]
-    async fn splits_after_shared_start() {
+    async fn splits_shared_start() {
         let keys = ["p/SAMD1", "p/SAMD2", "p/SAMEA1", "p/SAMN1", "p/SAMN2"];
         let (endpoint, server) = s3_listing(keys.iter().map(|key| key.to_string()).collect()).await;
         let (ctx, spec, _dir) = job_context(endpoint, &[("p", "t")], None).await;
