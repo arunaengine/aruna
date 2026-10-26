@@ -6,8 +6,10 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_connector::{
     SourceConnector, SourceConnectorKind, SourceConnectorSecret,
@@ -16,7 +18,10 @@ use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::connectors::repository::source_connector_key;
+use crate::connectors::repository::{
+    LIST_CONNECTOR_SIZE, parse_connector_read, parse_secret_read, read_connector_effect,
+    read_secret_effect, source_connector_key,
+};
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -55,6 +60,11 @@ pub struct SourceConnectorResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SourceConnectorState {
     Init,
+    /// Reads the record a connector with a given id may already have in this group.
+    ReadExisting,
+    ReadSecret,
+    /// Pages through every connector of the node for another group using the same id.
+    ScanIds,
     WriteRecords,
     Finish,
     Error,
@@ -72,6 +82,9 @@ pub enum SourceConnectorError {
     ValidationError(#[from] ValidationError),
     #[error("CreateSourceConnector failed")]
     CreateConnectorFailed,
+    /// The id is in use on this node with another definition, credentials or group.
+    #[error("connector id is already in use on this node")]
+    IdTaken,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
     InvalidStateEvent {
         state: SourceConnectorState,
@@ -86,6 +99,10 @@ pub struct SourceConnectorOperation {
     state: SourceConnectorState,
     connector: Option<SourceConnector>,
     secret: Option<SourceConnectorSecret>,
+    /// The id a connector registered on several nodes keeps; `None` mints a fresh one.
+    chosen_id: Option<ulid::Ulid>,
+    /// An identical record of the chosen id this group already holds.
+    existing: Option<SourceConnector>,
     output: Option<Result<SourceConnectorResult, SourceConnectorError>>,
 }
 
@@ -96,8 +113,96 @@ impl SourceConnectorOperation {
             state: SourceConnectorState::Init,
             connector: None,
             secret: None,
+            chosen_id: None,
+            existing: None,
             output: None,
         }
+    }
+
+    /// Registers the connector under `connector_id`, as the same connector on another node is.
+    /// An identical record without credentials is returned as is; any other use is refused.
+    pub fn with_id(input: SourceConnectorInput, connector_id: ulid::Ulid) -> Self {
+        Self {
+            chosen_id: Some(connector_id),
+            ..Self::new(input)
+        }
+    }
+
+    fn same_record(&self, existing: &SourceConnector) -> bool {
+        existing.name == self.input.name
+            && existing.kind == self.input.kind
+            && existing.public_config == self.input.public_config
+            && existing.namespace.is_none()
+            && self.input.secret_config.is_empty()
+    }
+
+    fn handle_existing(&mut self, event: Event, connector_id: ulid::Ulid) -> Effects {
+        match parse_connector_read(event) {
+            Ok(Some(existing)) if !self.same_record(&existing) => {
+                self.emit_error(SourceConnectorError::IdTaken)
+            }
+            Ok(existing) => {
+                self.existing = existing;
+                self.state = SourceConnectorState::ReadSecret;
+                smallvec![read_secret_effect(connector_id, None)]
+            }
+            Err(error) => self.emit_error(storage_read(error)),
+        }
+    }
+
+    fn handle_secret(&mut self, event: Event, connector_id: ulid::Ulid) -> Effects {
+        match (parse_secret_read(event, connector_id), self.existing.take()) {
+            (Ok(Some(_)), _) => self.emit_error(SourceConnectorError::IdTaken),
+            (Ok(None), Some(existing)) => {
+                self.state = SourceConnectorState::Finish;
+                self.output = Some(Ok(SourceConnectorResult {
+                    connector: existing,
+                    has_secret_config: false,
+                }));
+                smallvec![]
+            }
+            (Ok(None), None) => self.scan_ids(None),
+            (Err(error), _) => self.emit_error(storage_read(error)),
+        }
+    }
+
+    fn scan_ids(&mut self, start_after: Option<aruna_core::types::Key>) -> Effects {
+        self.state = SourceConnectorState::ScanIds;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: SOURCE_INDEX_KEYSPACE.to_string(),
+            prefix: None,
+            start: start_after.map(IterStart::After),
+            limit: LIST_CONNECTOR_SIZE,
+            txn_id: None,
+        })]
+    }
+
+    fn handle_scan(&mut self, event: Event, connector_id: ulid::Ulid) -> Effects {
+        let (values, next) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
+            other => return self.unexpected(other, "IterResult"),
+        };
+        let id = connector_id.to_bytes();
+        if values.iter().any(|(key, _)| key.get(16..) == Some(&id[..])) {
+            return self.emit_error(SourceConnectorError::IdTaken);
+        }
+        match next {
+            Some(next) => self.scan_ids(Some(next)),
+            None => self.write_records(connector_id),
+        }
+    }
+
+    fn unexpected(&mut self, received: Event, expected: &'static str) -> Effects {
+        let state = self.state.clone();
+        self.emit_error(SourceConnectorError::InvalidStateEvent {
+            state,
+            expected,
+            received,
+        })
     }
 
     fn emit_error(&mut self, error: SourceConnectorError) -> Effects {
@@ -116,8 +221,21 @@ impl SourceConnectorOperation {
             return self.emit_error(error.into());
         }
 
+        match self.chosen_id {
+            Some(connector_id) => {
+                self.state = SourceConnectorState::ReadExisting;
+                smallvec![read_connector_effect(
+                    self.input.group_id,
+                    connector_id,
+                    None
+                )]
+            }
+            None => self.write_records(ulid::Ulid::generate()),
+        }
+    }
+
+    fn write_records(&mut self, connector_id: ulid::Ulid) -> Effects {
         let now = SystemTime::now();
-        let connector_id = ulid::Ulid::generate();
         let connector = SourceConnector::new(
             connector_id,
             self.input.group_id,
@@ -176,6 +294,13 @@ impl SourceConnectorOperation {
     }
 }
 
+fn storage_read(error: crate::connectors::repository::StorageReadError) -> SourceConnectorError {
+    match error {
+        crate::connectors::repository::StorageReadError::Storage(error) => error.into(),
+        crate::connectors::repository::StorageReadError::Conversion(error) => error.into(),
+    }
+}
+
 impl Operation for SourceConnectorOperation {
     type Output = SourceConnectorResult;
     type Error = SourceConnectorError;
@@ -185,8 +310,12 @@ impl Operation for SourceConnectorOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        let chosen = self.chosen_id.unwrap_or_default();
         match self.state {
             SourceConnectorState::Init => self.handle_init(),
+            SourceConnectorState::ReadExisting => self.handle_existing(event, chosen),
+            SourceConnectorState::ReadSecret => self.handle_secret(event, chosen),
+            SourceConnectorState::ScanIds => self.handle_scan(event, chosen),
             SourceConnectorState::WriteRecords => self.handle_records_written(event),
             SourceConnectorState::Finish => smallvec![],
             SourceConnectorState::Error => self.abort(),
@@ -274,5 +403,73 @@ mod tests {
             result.connector
         );
         assert!(result.has_secret_config);
+    }
+
+    fn public_input(group_id: ulid::Ulid, bucket: &str) -> SourceConnectorInput {
+        SourceConnectorInput {
+            group_id,
+            created_by: Default::default(),
+            name: "bakrep".to_string(),
+            kind: SourceConnectorKind::S3,
+            public_config: HashMap::from([
+                ("bucket".to_string(), bucket.to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                ("skip_signature".to_string(), "true".to_string()),
+            ]),
+            secret_config: HashMap::new(),
+        }
+    }
+
+    // A connector keeps its id on every node it is registered on; any other use of the id,
+    // by another definition, another group or a connector with credentials, is refused.
+    #[tokio::test]
+    async fn given_id_registered() {
+        let tempdir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let (group, other) = (
+            ulid::Ulid::from_bytes([1; 16]),
+            ulid::Ulid::from_bytes([2; 16]),
+        );
+        let id = ulid::Ulid::from_bytes([3; 16]);
+        let with_id = |input| drive(SourceConnectorOperation::with_id(input, id), &context);
+
+        let first = with_id(public_input(group, "bakrep")).await.unwrap();
+        let again = with_id(public_input(group, "bakrep")).await.unwrap();
+        assert_eq!(
+            (first.connector.connector_id, &again.connector),
+            (id, &first.connector)
+        );
+        let changed = with_id(public_input(group, "other")).await;
+        assert_eq!(changed, Err(SourceConnectorError::IdTaken));
+        let elsewhere = with_id(public_input(other, "bakrep")).await;
+        assert_eq!(elsewhere, Err(SourceConnectorError::IdTaken));
+
+        let mut private = public_input(group, "private");
+        private.public_config.remove("skip_signature");
+        private.secret_config = HashMap::from([
+            ("access_key_id".to_string(), "AKIA".to_string()),
+            ("secret_access_key".to_string(), "secret".to_string()),
+        ]);
+        let private = drive(SourceConnectorOperation::new(private), &context)
+            .await
+            .unwrap();
+        let reuse = drive(
+            SourceConnectorOperation::with_id(
+                public_input(other, "bakrep"),
+                private.connector.connector_id,
+            ),
+            &context,
+        )
+        .await;
+        assert_eq!(reuse, Err(SourceConnectorError::IdTaken));
     }
 }

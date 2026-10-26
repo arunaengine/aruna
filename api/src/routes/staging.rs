@@ -11,7 +11,9 @@ use crate::routes::execution::jobs::{
     decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
 };
 use crate::routes::management_relay::RELAY_HOP_HEADER;
-use crate::routes::storage::connectors::ApiConnectorKind;
+use crate::routes::storage::connectors::{
+    ApiConnectorKind, CreateConnectorRequest, SourceConnectorResponse,
+};
 use crate::routes::storage::relay::{RestForward, relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
@@ -25,6 +27,7 @@ use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_operations::auth::permission_rules::permission_rules;
+use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
 use aruna_operations::distribution::guard::bound_view;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
@@ -635,6 +638,10 @@ Nothing is authorized later while the job runs.
 - In a distributed bucket every coordinator imports only the keys of the ranges it coordinates:
   this node relays the job to the other coordinators with the caller's bearer token and lists their
   jobs in `coordinator_jobs`; it starts no job of its own when it coordinates no range.
+- Every coordinator imports with its own copy of the connector under the same id. A connector
+  without credentials is registered on the other coordinators first; credentials never leave this
+  node, so a connector holding some must be registered on each coordinator by its owner with the
+  same `connector_id`, else that coordinator's entry names the missing connector.
 
 **Limits**
 - At least one item or prefix is required.
@@ -668,7 +675,7 @@ Nothing is authorized later while the job runs.
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path, prefix or checksum manifest name is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on a source path or WRITE on a target key", body = ErrorResponse),
-        (status = 404, description = "The bucket is unknown to this node or belongs to another group, or a connector or source path does not exist", body = ErrorResponse),
+        (status = 404, description = "The bucket is unknown to this node or belongs to another group, a source path does not exist, or the connector is not registered on this node (code `connector_not_found`)", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
         (status = 503, description = "Job placement or the structured id clock is unavailable, or a key range of the distributed bucket is moving away from this node; the response carries `Retry-After` and the identical body may be resubmitted", body = ErrorResponse)
     ),
@@ -769,11 +776,15 @@ pub async fn submit_staging(
     }
 
     crate::routes::storage::relay::relayed_set(&bucket_info, &headers)?;
+    let source = local_connector(&state, group_id, connector_id).await?;
     // A distributed bucket imports by range: every coordinator runs a job for its own keys.
     let fan_out =
         (bucket_info.distribution.as_ref()).filter(|_| !headers.contains_key(RELAY_HOP_HEADER));
     let (local, coordinator_jobs) = match fan_out {
-        Some(binding) => coordinator_jobs(&state, binding, bearer.as_ref(), &relayed).await?,
+        Some(binding) => {
+            let caller = (bearer.as_ref(), &relayed);
+            coordinator_jobs(&state, binding, caller, &source).await?
+        }
         None => (true, Vec::new()),
     };
     if !local {
@@ -1485,13 +1496,62 @@ async fn reference_blob(
     ))
 }
 
+/// The job's connector as this node stores it; a coordinator imports only with its own copy.
+async fn local_connector(
+    state: &ServerState,
+    group_id: aruna_core::types::GroupId,
+    connector_id: ulid::Ulid,
+) -> ServerResult<GetSourceResult> {
+    use aruna_operations::connectors::get_connector::{GetSourceError, GetSourceInput};
+    let input = GetSourceInput {
+        group_id,
+        connector_id,
+    };
+    match drive(GetSourceOperation::new(input), &state.get_ctx()).await {
+        Ok(source) => Ok(source),
+        Err(GetSourceError::NotFound) => Err(ServerError::Refused(
+            StatusCode::NOT_FOUND,
+            "connector_not_found",
+            format!(
+                "connector {connector_id} is not registered on this node; register it here under \
+                 the same connector_id"
+            ),
+        )),
+        Err(error) => Err(ServerError::InternalError(error.to_string())),
+    }
+}
+
+/// Registers a connector without credentials on another coordinator under its own id;
+/// credentials are never sent, so a connector holding some must be registered there by its owner.
+async fn share_connector(
+    state: &ServerState,
+    forward: &RestForward,
+    bearer: Option<&ValidatedBearer>,
+    source: &GetSourceResult,
+) -> ServerResult<()> {
+    if source.has_secret_config {
+        return Ok(());
+    }
+    let connector = &source.connector;
+    let request = CreateConnectorRequest {
+        name: connector.name.clone(),
+        kind: connector.kind.into(),
+        public_config: connector.public_config.clone(),
+        secret_config: Default::default(),
+        connector_id: Some(connector.connector_id.to_string()),
+    };
+    let path = format!("/data/groups/{}/connectors", connector.group_id);
+    relay_json::<SourceConnectorResponse>(state, forward, &path, bearer, &request).await?;
+    Ok(())
+}
+
 /// Starts the job on every other coordinator of a distributed bucket with the caller's bearer;
 /// reports whether this node coordinates a range itself.
 async fn coordinator_jobs(
     state: &ServerState,
     binding: &aruna_core::structs::storage::distribution::DistributionBinding,
-    bearer: Option<&ValidatedBearer>,
-    request: &StageBatchRequest,
+    (bearer, request): (Option<&ValidatedBearer>, &StageBatchRequest),
+    source: &GetSourceResult,
 ) -> ServerResult<(bool, Vec<CoordinatorJobResponse>)> {
     let view = bound_view(state.get_ctx().as_ref(), binding)
         .await
@@ -1525,7 +1585,10 @@ async fn coordinator_jobs(
     let mut jobs = Vec::with_capacity(nodes.len());
     for forward in nodes {
         let path = "/data/staging/jobs";
-        let answer = relay_json::<SubmitStagingResponse>(state, &forward, path, bearer, request);
+        let answer = async {
+            share_connector(state, &forward, bearer, source).await?;
+            relay_json::<SubmitStagingResponse>(state, &forward, path, bearer, request).await
+        };
         let (job_id, error) = match answer.await {
             Ok((_, answer)) => (Some(answer.job_id), None),
             Err(error) => (None, Some(error.to_string())),

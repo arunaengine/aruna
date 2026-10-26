@@ -128,12 +128,16 @@ pub struct CreateConnectorRequest {
     pub public_config: HashMap<String, String>,
     #[serde(default)]
     pub secret_config: HashMap<String, String>,
+    /// Registers the connector under this id, as the same connector on another node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<String>,
 }
 
 /// Shows only the secret keys; the values are live credentials.
 impl std::fmt::Debug for CreateConnectorRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreateConnectorRequest")
+            .field("connector_id", &self.connector_id)
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("public_config", &self.public_config)
@@ -282,6 +286,9 @@ pub struct ListSourceResponse {
   endpoint is reachable; an endpoint the egress guard blocks is only refused at use.
 - The record is written on the node that serves the request and is not replicated to the realm's
   other nodes.
+- `connector_id` registers the connector under a given id, so a distributed bucket's coordinators
+  share it: an identical record without credentials is answered as is, and an id this node already
+  uses otherwise, in any group, is refused with 409.
 
 **Limits** (the accepted keys depend on `kind`)
 - `http` and `webdav` require the public key `endpoint` and also accept `root`, with `username`,
@@ -341,7 +348,8 @@ pub struct ListSourceResponse {
             status = 403,
             description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
             body = ErrorResponse
-        )
+        ),
+        (status = 409, description = "The given `connector_id` is already used on this node by another definition, group or credentials", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -353,21 +361,25 @@ pub async fn create_source_connector(
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
+    let chosen_id = request.connector_id.as_deref().map(parse_connector_id);
+    let chosen_id = chosen_id.transpose()?;
     ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
-    let result = drive(
-        SourceConnectorOperation::new(SourceConnectorInput {
-            group_id,
-            created_by: auth.user_id,
-            name: request.name,
-            kind: request.kind.into(),
-            public_config: request.public_config,
-            secret_config: request.secret_config,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_create_error)?;
+    let input = SourceConnectorInput {
+        group_id,
+        created_by: auth.user_id,
+        name: request.name,
+        kind: request.kind.into(),
+        public_config: request.public_config,
+        secret_config: request.secret_config,
+    };
+    let operation = match chosen_id {
+        Some(connector_id) => SourceConnectorOperation::with_id(input, connector_id),
+        None => SourceConnectorOperation::new(input),
+    };
+    let result = drive(operation, &state.get_ctx())
+        .await
+        .map_err(map_create_error)?;
 
     Ok((
         StatusCode::CREATED,
@@ -1227,6 +1239,7 @@ fn format_system_time(value: std::time::SystemTime) -> String {
 fn map_create_error(error: SourceConnectorError) -> ServerError {
     match error {
         SourceConnectorError::ValidationError(_) => ServerError::BadRequest,
+        SourceConnectorError::IdTaken => ServerError::Conflict(error.to_string()),
         _ => ServerError::InternalError(error.to_string()),
     }
 }
