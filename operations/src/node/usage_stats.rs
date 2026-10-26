@@ -265,6 +265,14 @@ impl UsageCounterUpdate {
         self
     }
 
+    /// Also books `versions` added version rows on the bucket row set by [`Self::in_bucket`].
+    pub fn with_versions(mut self, versions: u64) -> Self {
+        if let Some((_, delta)) = self.bucket.as_mut() {
+            delta.versions = delta.versions.saturating_add(i128::from(versions));
+        }
+        self
+    }
+
     /// Also maintains the inventory of a distributed bucket's key; `None` for ordinary buckets.
     pub fn with_inventory(self, change: Option<InventoryChange>) -> Self {
         self.with_inventories(change)

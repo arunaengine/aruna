@@ -291,13 +291,26 @@ fn page_registers_atomically() {
     assert_eq!(rows_in(&writes, STAGING_STATE_KEYSPACE), 1);
     assert_eq!(rows_in(&writes, REPLICATION_OBLIGATION_KEYSPACE), 2);
     let effects = operation.step(written());
-    let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+    let [
+        Effect::Storage(StorageEffect::AddUsage {
+            deltas, buckets, ..
+        }),
+    ] = effects.as_slice()
+    else {
         panic!("expected one usage update, got {effects:?}");
     };
     assert!(
         deltas
             .iter()
             .all(|(_, delta)| delta.objects == 2 && delta.referenced_bytes == 6)
+    );
+    // The bucket row counts the page like the group does, with one version row per entry.
+    let [(_, bucket)] = buckets.as_slice() else {
+        panic!("expected the bucket row, got {buckets:?}");
+    };
+    assert_eq!(
+        (bucket.objects, bucket.versions, bucket.referenced_bytes),
+        (2, 2, 6)
     );
     operation.step(written());
     assert!(matches!(

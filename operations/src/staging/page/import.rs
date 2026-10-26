@@ -5,7 +5,7 @@
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::distribution::guard::{authority_read, authority_rows, write_epoch};
-use crate::node::usage_stats::{UsageCounterUpdate, schedule_snapshot_publish};
+use crate::node::usage_stats::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::replication::queue::schedule_blob_drain;
 use crate::staging::page::rows::{
     MAX_PAGE_ENTRIES, PageGuards, check_guards, guard_reads, page_rows, version_reads,
@@ -94,7 +94,9 @@ impl PageImportOperation {
         let guards = self.guards.as_ref().ok_or(PageImportError::NotFinished)?;
         let rows = page_rows(&self.input, guards, versions)?;
         if rows.result.registered > 0 {
-            let usage = UsageCounterUpdate::for_group(self.input.group_id, rows.delta);
+            let usage = UsageCounterUpdate::for_group(self.input.group_id, rows.delta)
+                .in_bucket(&self.input.bucket, RowChange::Kept)
+                .with_versions(rows.result.registered);
             self.usage = Some(usage.with_inventories(rows.inventory));
         }
         self.result = Some(rows.result);
