@@ -247,6 +247,8 @@ impl FjallStorage {
         }
         self.take_txn_deletes(txn_id, false);
         self.txn_usage.remove(&txn_id);
+        self.txn_rows.remove(&txn_id);
+        self.usage_views.remove(&txn_id);
         self.config_txns.remove(&txn_id);
         match self.txns.remove(&txn_id) {
             Some(Txn::Write(txn)) => {
@@ -298,10 +300,14 @@ impl FjallStorage {
         }
 
         let config_txn = self.config_txns.remove(&txn_id);
+        self.usage_views.remove(&txn_id);
+        let rows = self.txn_rows.remove(&txn_id).unwrap_or_default();
         match self.txns.remove(&txn_id) {
             Some(Txn::Read(_)) => StorageEvent::TransactionCommitted { txn_id },
             Some(Txn::Write(mut txn)) => {
-                if let Err(error) = self.stage_usage(txn_id, &mut txn) {
+                let rows = rows.iter().map(|(space, key)| (space.as_str(), key));
+                let staged = self.keep_preimages(&mut txn, rows);
+                if let Err(error) = staged.and_then(|()| self.stage_usage(txn_id, &mut txn)) {
                     self.take_txn_deletes(txn_id, false);
                     txn.rollback();
                     return StorageEvent::Error { error };

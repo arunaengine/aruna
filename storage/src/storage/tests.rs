@@ -336,6 +336,8 @@ fn bulk_full_rejects() {
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
         usage_shadow: std::collections::HashSet::new(),
+        usage_views: std::collections::HashSet::new(),
+        txn_rows: std::collections::HashMap::new(),
     };
     let metrics = std::sync::Arc::new(super::StorageMetrics::default());
     let read_effect = || StorageEffect::Read {
@@ -1320,6 +1322,8 @@ fn unknown_commit_runs() {
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
         usage_shadow: std::collections::HashSet::new(),
+        usage_views: std::collections::HashSet::new(),
+        txn_rows: std::collections::HashMap::new(),
     };
 
     let event = storage.commit_transaction(txn_id);
@@ -1370,6 +1374,8 @@ fn unknown_commit_retires() {
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
         usage_shadow: std::collections::HashSet::new(),
+        usage_views: std::collections::HashSet::new(),
+        txn_rows: std::collections::HashMap::new(),
     };
 
     for _ in 0..=super::MAX_CLEANUP_ATTEMPTS {
@@ -1417,6 +1423,8 @@ fn retry_skips_queued() {
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
         usage_shadow: std::collections::HashSet::new(),
+        usage_views: std::collections::HashSet::new(),
+        txn_rows: std::collections::HashMap::new(),
     };
 
     storage.retry_cleanup();

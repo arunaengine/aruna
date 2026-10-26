@@ -6,10 +6,13 @@ use aruna_core::effects::IterStart;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use aruna_core::structs::storage::usage::{
-    ShadowCounters, USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY, USAGE_SHADOW_PREFIX, usage_shadow_key,
+    RebuildProgress, ShadowCounters, USAGE_COMPLETE_KEY, USAGE_PROGRESS_KEY, USAGE_REBUILD_KEY,
+    USAGE_SHADOW_PREFIX, UsageDelta, global_shard_keys, usage_shadow_key,
 };
 use byteview::ByteView;
 use fjall::Readable;
+use tracing::warn;
+use ulid::Ulid;
 
 use super::transactions::{CounterChange, warn_clamped};
 use super::{FjallStorage, iterate_page};
@@ -21,7 +24,7 @@ type PendingChanges = Vec<(String, ByteView, CounterChange)>;
 
 /// True for the rebuild marker and the rebuild rows, which are never copied themselves.
 pub(super) fn is_rebuild_row(key: &[u8]) -> bool {
-    key == USAGE_REBUILD_KEY || key.starts_with(USAGE_SHADOW_PREFIX)
+    key == USAGE_REBUILD_KEY || key == USAGE_PROGRESS_KEY || key.starts_with(USAGE_SHADOW_PREFIX)
 }
 
 /// The new value of a rebuild row after `change`; rebuild rows hold signed sums.
@@ -78,21 +81,27 @@ impl FjallStorage {
         Ok(())
     }
 
+    /// Answers a view that reads source rows as the rebuild began. A rebuild already running,
+    /// also one begun before a restart, resumes with its rows and kept values.
     #[tracing::instrument(name = "storage.begin_usage_rebuild", level = "debug", skip(self))]
     pub(super) fn begin_usage_rebuild(&mut self, key_space: String) -> StorageEvent {
-        if let Err(error) = self.clear_rebuild_rows(&key_space) {
-            return StorageEvent::Error { error };
+        if !self.usage_shadow.contains(&key_space) {
+            let cleared = self.clear_preimages();
+            if let Err(error) = cleared.and_then(|()| self.clear_rebuild_rows(&key_space)) {
+                return StorageEvent::Error { error };
+            }
+            // No commit can land between turning shadowing on and taking the snapshot.
+            self.usage_shadow.insert(key_space.clone());
         }
-        // No commit can land between turning shadowing on and taking the snapshot.
-        self.usage_shadow.insert(key_space.clone());
         let started = self.start_transaction(true);
-        if matches!(started, StorageEvent::Error { .. }) {
-            self.usage_shadow.remove(&key_space);
+        if let StorageEvent::TransactionStarted { txn_id } = &started {
+            self.usage_views.insert(*txn_id);
         }
         started
     }
 
-    /// Deletes old rebuild rows and writes the marker in one commit.
+    /// Deletes old rebuild rows, seeds every global shard row, and writes the marker and the
+    /// progress of a new generation in one commit.
     fn clear_rebuild_rows(&mut self, key_space: &str) -> Result<(), StorageError> {
         let keyspace = self.store.resolve_keyspace(key_space)?;
         let snapshot = self.store.db.read_tx();
@@ -115,6 +124,19 @@ impl FjallStorage {
                 None => break,
             }
         }
+        let seed = ShadowCounters::Usage(UsageDelta::default()).to_bytes();
+        let seed = seed.map_err(|error| StorageError::WriteError(error.to_string()))?;
+        for shard in global_shard_keys() {
+            let row = ByteView::from(usage_shadow_key(&shard));
+            tx.insert(keyspace.clone(), row, ByteView::from(seed.as_slice()));
+        }
+        let progress = RebuildProgress::new(Ulid::generate()).to_bytes();
+        let progress = progress.map_err(|error| StorageError::WriteError(error.to_string()))?;
+        tx.insert(
+            keyspace.clone(),
+            ByteView::from(USAGE_PROGRESS_KEY),
+            ByteView::from(progress),
+        );
         tx.insert(
             keyspace,
             ByteView::from(USAGE_REBUILD_KEY),
@@ -134,6 +156,10 @@ impl FjallStorage {
         match self.replace_counter_rows(&key_space) {
             Ok(entries) => {
                 self.usage_shadow.remove(&key_space);
+                // A fresh rebuild clears what is left.
+                if let Err(error) = self.clear_preimages() {
+                    warn!(%error, "Kept rebuild values stay until the next usage rebuild");
+                }
                 StorageEvent::BatchWriteResult { entries }
             }
             Err(error) => StorageEvent::Error { error },
@@ -158,7 +184,7 @@ impl FjallStorage {
                 if key.as_ref() == USAGE_COMPLETE_KEY {
                     continue;
                 }
-                if key.as_ref() == USAGE_REBUILD_KEY {
+                if key.as_ref() == USAGE_REBUILD_KEY || key.as_ref() == USAGE_PROGRESS_KEY {
                     tx.remove(keyspace.clone(), key);
                 } else if let Some(live) = key.as_ref().strip_prefix(USAGE_SHADOW_PREFIX) {
                     let row = ShadowCounters::from_bytes(value.as_ref())

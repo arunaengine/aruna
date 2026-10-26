@@ -108,6 +108,8 @@ impl FjallStorage {
             txn_usage: HashMap::new(),
             config_txns: HashSet::new(),
             usage_shadow: HashSet::new(),
+            usage_views: HashSet::new(),
+            txn_rows: HashMap::new(),
         }
     }
 }

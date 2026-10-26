@@ -28,6 +28,15 @@ impl FjallStorage {
         }
     }
 
+    /// The snapshot of a usage rebuild's view, which reads rows as the rebuild began.
+    fn view(&self, txn_id: Option<Ulid>) -> Option<&fjall::Snapshot> {
+        let txn_id = txn_id.filter(|txn_id| self.usage_views.contains(txn_id))?;
+        match self.txns.get(&txn_id) {
+            Some(Txn::Read(snapshot)) => Some(snapshot),
+            _ => None,
+        }
+    }
+
     #[tracing::instrument(
         name = "storage.read",
         level = "debug",
@@ -40,6 +49,12 @@ impl FjallStorage {
         key: ByteView,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
+        if let Some(snapshot) = self.view(txn_id) {
+            return match self.view_get(snapshot, &key_space, &key) {
+                Ok(value) => StorageEvent::ReadResult { key, value },
+                Err(error) => StorageEvent::Error { error },
+            };
+        }
         let keyspace = match self.read_keyspace(&key_space, txn_id) {
             Ok(Some(keyspace)) => keyspace,
             Ok(None) => return StorageEvent::ReadResult { key, value: None },
@@ -78,6 +93,16 @@ impl FjallStorage {
         reads: Vec<(String, ByteView)>,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
+        if let Some(snapshot) = self.view(txn_id) {
+            let mut values = Vec::with_capacity(reads.len());
+            for (key_space, key) in reads {
+                match self.view_get(snapshot, &key_space, &key) {
+                    Ok(value) => values.push((key, value)),
+                    Err(error) => return StorageEvent::Error { error },
+                }
+            }
+            return StorageEvent::BatchReadResult { values };
+        }
         if let Some(txn_id) = txn_id {
             return match self.txns.get(&txn_id) {
                 Some(Txn::Read(txn)) => batch_read_with(&self.store, txn, reads, false),
@@ -110,6 +135,7 @@ impl FjallStorage {
         if let Some(txn_id) = txn_id {
             return if let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) {
                 txn.insert(keyspace, key.clone(), value);
+                self.note_rows(txn_id, [(key_space.as_str(), &key)]);
                 StorageEvent::WriteResult { key }
             } else {
                 StorageEvent::Error {
@@ -118,6 +144,7 @@ impl FjallStorage {
             };
         }
         let result = self.buffered_write_tx().and_then(|mut tx| {
+            self.keep_preimages(&mut tx, [(key_space.as_str(), &key)])?;
             tx.insert(keyspace, key.clone(), value);
             self.commit_buffered(tx)?;
             self.persist_journal()
@@ -158,6 +185,10 @@ impl FjallStorage {
                 txn.insert(keyspace, key.clone(), value);
                 entries.push((key_space, key));
             }
+            self.note_rows(
+                txn_id,
+                entries.iter().map(|(space, key)| (space.as_str(), key)),
+            );
         } else {
             let mut tx = match self.buffered_write_tx() {
                 Ok(tx) => tx,
@@ -167,8 +198,10 @@ impl FjallStorage {
                 tx.insert(keyspace, key.clone(), value);
                 entries.push((key_space, key));
             }
+            let rows = entries.iter().map(|(space, key)| (space.as_str(), key));
             if let Err(error) = self
-                .commit_buffered(tx)
+                .keep_preimages(&mut tx, rows)
+                .and_then(|()| self.commit_buffered(tx))
                 .and_then(|()| self.persist_journal())
             {
                 return StorageEvent::Error { error };
@@ -197,6 +230,7 @@ impl FjallStorage {
             return if let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) {
                 txn.remove(keyspace, key.clone());
                 self.hold_txn_delete(txn_id, &key_space);
+                self.note_rows(txn_id, [(key_space.as_str(), &key)]);
                 StorageEvent::DeleteResult { key }
             } else {
                 StorageEvent::Error {
@@ -210,7 +244,8 @@ impl FjallStorage {
         };
         tx.remove(keyspace, key.clone());
         if let Err(error) = self
-            .commit_buffered(tx)
+            .keep_preimages(&mut tx, [(key_space.as_str(), &key)])
+            .and_then(|()| self.commit_buffered(tx))
             .and_then(|()| self.persist_journal())
         {
             return StorageEvent::Error { error };
@@ -252,6 +287,10 @@ impl FjallStorage {
             for (key_space, _) in &entries {
                 self.hold_txn_delete(txn_id, key_space);
             }
+            self.note_rows(
+                txn_id,
+                entries.iter().map(|(space, key)| (space.as_str(), key)),
+            );
         } else {
             let mut tx = match self.buffered_write_tx() {
                 Ok(tx) => tx,
@@ -261,8 +300,10 @@ impl FjallStorage {
                 tx.remove(keyspace, key.clone());
                 entries.push((key_space, key));
             }
+            let rows = entries.iter().map(|(space, key)| (space.as_str(), key));
             if let Err(error) = self
-                .commit_buffered(tx)
+                .keep_preimages(&mut tx, rows)
+                .and_then(|()| self.commit_buffered(tx))
                 .and_then(|()| self.persist_journal())
             {
                 return StorageEvent::Error { error };
@@ -288,6 +329,19 @@ impl FjallStorage {
         limit: usize,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
+        if let Some(snapshot) = self.view(txn_id) {
+            let page = match limit {
+                0 => Ok((Vec::new(), None)),
+                _ => self.view_page(snapshot, &key_space, prefix.as_ref(), start.as_ref(), limit),
+            };
+            return match page {
+                Ok((values, next_start_after)) => StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                },
+                Err(error) => StorageEvent::Error { error },
+            };
+        }
         let keyspace = match self.read_keyspace(&key_space, txn_id) {
             Ok(Some(keyspace)) => keyspace,
             Ok(None) => {
@@ -342,6 +396,11 @@ impl FjallStorage {
         budget: (usize, usize),
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
+        if self.view(txn_id).is_some() {
+            return StorageEvent::Error {
+                error: StorageError::InvalidEffect,
+            };
+        }
         let keyspace = match self.read_keyspace(&key_space, txn_id) {
             Ok(Some(keyspace)) => keyspace,
             Ok(None) => {
@@ -375,6 +434,11 @@ impl FjallStorage {
         prefix: Option<ByteView>,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
+        if self.view(txn_id).is_some() {
+            return StorageEvent::Error {
+                error: StorageError::InvalidEffect,
+            };
+        }
         let keyspace = match self.read_keyspace(&key_space, txn_id) {
             Ok(Some(keyspace)) => keyspace,
             Ok(None) => {

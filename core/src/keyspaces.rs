@@ -491,6 +491,8 @@ pub const SEARCH_FEED_KEYSPACE: &str = "distribution_search_feed";
 pub const SEARCH_INDEX_KEYSPACE: &str = "distribution_search_indexes";
 /// The register version of each database entry this node saw unlinked, by entry id.
 pub const DATABASE_UNLINKED_KEYSPACE: &str = "database_unlinked";
+/// The value each row a running usage rebuild reads had when the rebuild began, kept on change.
+pub const USAGE_PREIMAGE_KEYSPACE: &str = "usage_rebuild_preimages";
 
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
@@ -753,6 +755,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SEARCH_FEED_KEYSPACE,
     SEARCH_INDEX_KEYSPACE,
     DATABASE_UNLINKED_KEYSPACE,
+    USAGE_PREIMAGE_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

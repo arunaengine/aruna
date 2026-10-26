@@ -169,6 +169,10 @@ pub struct FjallStorage {
     pub(super) config_txns: HashSet<Ulid>,
     /// Keyspaces whose committed usage deltas also go to their rebuild rows.
     pub(super) usage_shadow: HashSet<String>,
+    /// Snapshots of usage rebuilds, which read source rows as the rebuild began.
+    pub(super) usage_views: HashSet<Ulid>,
+    /// Source rows each open write transaction changed, for their kept values at commit.
+    pub(super) txn_rows: HashMap<Ulid, Vec<(String, ByteView)>>,
 }
 
 impl FjallStorage {
@@ -200,6 +204,7 @@ impl FjallStorage {
     pub(super) fn retire_fenced_txn(&mut self, txn_id: Ulid) {
         self.take_txn_deletes(txn_id, false);
         self.txn_usage.remove(&txn_id);
+        self.txn_rows.remove(&txn_id);
         self.config_txns.remove(&txn_id);
         if let Some(Txn::Write(txn)) = self.txns.remove(&txn_id) {
             txn.rollback();
@@ -652,6 +657,7 @@ impl FjallStorage {
                 txn_id: None,
             } => {
                 let keyspace = self.store.resolve_keyspace(key_space)?;
+                self.keep_preimages(tx, [(key_space.as_str(), key)])?;
                 tx.insert(keyspace, key.clone(), value.clone());
                 Ok(StorageEvent::WriteResult { key: key.clone() })
             }
@@ -665,6 +671,8 @@ impl FjallStorage {
                     let keyspace = self.store.resolve_keyspace(key_space)?;
                     resolved.push((keyspace, key_space, key, value));
                 }
+                let rows = writes.iter().map(|(space, key, _)| (space.as_str(), key));
+                self.keep_preimages(tx, rows)?;
                 for (keyspace, key_space, key, value) in resolved {
                     tx.insert(keyspace, key.clone(), value.clone());
                     entries.push((key_space.clone(), key.clone()));
@@ -677,6 +685,7 @@ impl FjallStorage {
                 txn_id: None,
             } => {
                 let keyspace = self.store.resolve_keyspace(key_space)?;
+                self.keep_preimages(tx, [(key_space.as_str(), key)])?;
                 tx.remove(keyspace, key.clone());
                 Ok(StorageEvent::DeleteResult { key: key.clone() })
             }
@@ -690,6 +699,8 @@ impl FjallStorage {
                     let keyspace = self.store.resolve_keyspace(key_space)?;
                     resolved.push((keyspace, key_space, key));
                 }
+                let rows = deletes.iter().map(|(space, key)| (space.as_str(), key));
+                self.keep_preimages(tx, rows)?;
                 for (keyspace, key_space, key) in resolved {
                     tx.remove(keyspace, key.clone());
                     entries.push((key_space.clone(), key.clone()));
