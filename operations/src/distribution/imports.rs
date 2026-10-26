@@ -10,7 +10,7 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, JOB_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::structs::execution::job::{
-    JobId, JobPayload, RECORD_KEY_PREFIX, StagingJobCheckpoint, StagingJobSpec, job_record_key,
+    JobId, JobPayload, RECORD_KEY_PREFIX, StagingJobCheckpoint, StagingJobSpec,
 };
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::DistributionView;
@@ -46,6 +46,14 @@ pub struct HandedImport {
     pub resume: Option<StagingJobCheckpoint>,
 }
 
+/// A fenced job as its former coordinator keeps it until the transfer is no longer open: its
+/// spec, so pruning its job record loses nothing, and where it stood before the fence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FencedJob {
+    spec: StagingJobSpec,
+    at: Option<StagingJobCheckpoint>,
+}
+
 /// What a new coordinator keeps of a range's imports: jobs still to fetch from the former
 /// coordinator, and jobs ready to run here with their connector and position.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,11 +63,11 @@ struct Kept {
     ready: Vec<(StagingJobSpec, Option<StagingJobCheckpoint>)>,
 }
 
-/// The open staging jobs of this node that import into `bucket`.
+/// The open staging jobs of this node that import into `bucket`, with their specs.
 pub(crate) async fn open_imports(
     context: &DriverContext,
     bucket: &str,
-) -> Result<Vec<JobId>, String> {
+) -> Result<Vec<(JobId, StagingJobSpec)>, String> {
     let mut start = None;
     let mut jobs = Vec::new();
     loop {
@@ -69,11 +77,11 @@ pub(crate) async fn open_imports(
             let Ok(record) = decode_job_record(&value) else {
                 continue;
             };
-            if let JobPayload::Staging(spec) = &record.payload
+            if let JobPayload::Staging(spec) = record.payload
                 && spec.bucket == bucket
                 && !record.state.is_terminal()
             {
-                jobs.push(record.job_id);
+                jobs.push((record.job_id, spec));
             }
         }
         match next {
@@ -98,16 +106,23 @@ pub(crate) async fn keep_resume(
     bucket: &str,
     transfer_id: Ulid,
 ) -> Result<(), String> {
-    let jobs = open_imports(context, bucket).await?;
-    for job_id in &jobs {
-        let Some(checkpoint) = read_staging_checkpoint(context, *job_id).await? else {
-            continue;
-        };
-        let value = postcard::to_allocvec(&checkpoint).map_err(|error| error.to_string())?;
-        write_row(context, resume_key(transfer_id, *job_id).into(), value).await?;
+    let mut jobs = Vec::new();
+    for (job_id, spec) in open_imports(context, bucket).await? {
+        let at = read_staging_checkpoint(context, job_id).await?;
+        keep_job(context, (transfer_id, job_id), FencedJob { spec, at }).await?;
+        jobs.push(job_id);
     }
     let value = postcard::to_allocvec(&jobs).map_err(|error| error.to_string())?;
     write_row(context, jobs_key(transfer_id).into(), value).await
+}
+
+async fn keep_job(
+    context: &DriverContext,
+    (transfer_id, job_id): (Ulid, JobId),
+    job: FencedJob,
+) -> Result<(), String> {
+    let value = postcard::to_allocvec(&job).map_err(|error| error.to_string())?;
+    write_row(context, resume_key(transfer_id, job_id).into(), value).await
 }
 
 /// The imports of `bucket` to hand over: those open now and those kept before the fence of
@@ -120,8 +135,9 @@ pub(crate) async fn fenced_imports(
     let stored = read_value(context, NODE_STATE_KEYSPACE, jobs_key(transfer_id).into()).await?;
     let kept = stored.as_deref().map(postcard::from_bytes).transpose();
     let mut jobs: Vec<JobId> = kept.map_err(|error| error.to_string())?.unwrap_or_default();
-    for job_id in open_imports(context, bucket).await? {
+    for (job_id, spec) in open_imports(context, bucket).await? {
         if !jobs.contains(&job_id) {
+            keep_job(context, (transfer_id, job_id), FencedJob { spec, at: None }).await?;
             jobs.push(job_id);
         }
     }
@@ -150,14 +166,13 @@ pub(crate) async fn staging_spec(
     (transfer_id, job_id): (Ulid, JobId),
 ) -> Result<HandedImport, MetadataReadError> {
     let unavailable = |_| MetadataReadError::Unavailable;
-    let value = read_value(context, JOB_KEYSPACE, job_record_key(job_id))
+    let key = resume_key(transfer_id, job_id).into();
+    let value = read_value(context, NODE_STATE_KEYSPACE, key)
         .await
         .map_err(unavailable)?
         .ok_or(MetadataReadError::NotFound)?;
-    let record = decode_job_record(&value).map_err(|_| MetadataReadError::Unavailable)?;
-    let JobPayload::Staging(spec) = record.payload else {
-        return Err(MetadataReadError::NotFound);
-    };
+    let FencedJob { spec, at } =
+        postcard::from_bytes(&value).map_err(|_| MetadataReadError::Unavailable)?;
     let bucket = drive(GetBucketOperation::new(spec.bucket.clone()), context)
         .await
         .map_err(|_| MetadataReadError::NotFound)?;
@@ -188,18 +203,6 @@ pub(crate) async fn staging_spec(
         public_config: connector.public_config.into_iter().collect(),
         namespace: connector.namespace,
     };
-    let stored = read_value(
-        context,
-        NODE_STATE_KEYSPACE,
-        resume_key(transfer_id, job_id).into(),
-    )
-    .await
-    .map_err(unavailable)?;
-    let at = (stored
-        .as_deref()
-        .map(postcard::from_bytes::<StagingJobCheckpoint>))
-    .transpose()
-    .map_err(|_| MetadataReadError::Unavailable)?;
     let resume = at.map(|at| handed_checkpoint(&spec, &at));
     Ok(HandedImport { spec, root, resume })
 }
@@ -252,8 +255,10 @@ pub(crate) async fn fetch_imports(
                 };
                 kept.ready.push((spec, handed.resume));
             }
-            // A job whose record is gone meanwhile has nothing left to hand over.
-            Err(MetadataReadError::NotFound) => {}
+            // The former coordinator keeps each handed job while the transfer is open.
+            Err(MetadataReadError::NotFound) => {
+                warn!(%set_id, %job_id, "The former coordinator holds no handed-over import; it is dropped");
+            }
             Err(_) => break,
         }
         kept.pending.remove(0);
@@ -542,6 +547,13 @@ mod tests {
         seed_checkpoint(context, job_id, &at).await.unwrap();
         let transfer_id = Ulid::from_bytes([8; 16]);
         keep_resume(context, "spire", transfer_id).await.unwrap();
+        // The fenced job is kept with its spec, so pruning its record loses nothing.
+        let prune = StorageEffect::Delete {
+            key_space: JOB_KEYSPACE.to_string(),
+            key: aruna_core::structs::execution::job::job_record_key(job_id),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(prune).await;
 
         let member = secret(2).public();
         let handed = staging_spec(context, member, (transfer_id, job_id))
@@ -576,10 +588,10 @@ mod tests {
             Err(MetadataReadError::Forbidden)
         );
 
-        // Once the transfer is no longer open, its kept positions and job list go.
+        // Once the transfer is no longer open, its kept jobs and job list go.
         drop_resume(context, transfer_id).await.unwrap();
         let handed = staging_spec(context, member, (transfer_id, job_id)).await;
-        assert_eq!(handed.unwrap().resume, None);
+        assert_eq!(handed, Err(MetadataReadError::NotFound));
         let jobs = read_value(context, NODE_STATE_KEYSPACE, jobs_key(transfer_id).into()).await;
         assert_eq!(jobs, Ok(None));
     }
@@ -708,6 +720,7 @@ mod tests {
         };
 
         let open = open_imports(&context, "spire").await.unwrap();
+        let open: Vec<JobId> = open.into_iter().map(|(job_id, _)| job_id).collect();
         assert_eq!(open, [JobId::from_bytes([1; 16])]);
     }
 
