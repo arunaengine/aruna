@@ -105,6 +105,8 @@ pub enum PageImportState {
     ReadGuards,
     /// Reads a distributed bucket's record: every entry's key must be coordinated here.
     ReadRecord,
+    /// Reads whether an ordinary bucket has a sync relationship that replicates its versions.
+    ReadRelationships,
     ReadSecret,
     ReadVersions,
     WriteRows,
@@ -172,6 +174,8 @@ pub(crate) struct PageGuards {
     pub binding: Option<DistributionBinding>,
     /// The coordinator epoch of each entry's key in a distributed bucket, in entry order.
     pub epochs: Vec<OriginalEpoch>,
+    /// Whether anything replicates the bucket's versions: set members or sync relationships.
+    pub downstream: bool,
 }
 
 /// The rows of one page, its usage change and its outcome.
@@ -276,6 +280,7 @@ pub(crate) fn check_guards(
         set_hint: binding.as_ref().map(DistributionBinding::hint),
         binding,
         epochs: Vec::new(),
+        downstream: true,
     })
 }
 
@@ -473,6 +478,9 @@ fn register_rows(
         version_id,
         false,
     );
-    rows.push(live_obligation_entry(&obligation)?);
+    // A bucket nothing replicates owes no replication work for the version.
+    if guards.downstream {
+        rows.push(live_obligation_entry(&obligation)?);
+    }
     Ok((rows, change))
 }

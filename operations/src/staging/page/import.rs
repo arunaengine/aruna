@@ -13,8 +13,10 @@ use crate::staging::page::rows::{
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BlobVersion;
+use aruna_core::structs::sync_relationship_prefix;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 
@@ -67,6 +69,20 @@ impl PageImportOperation {
             connector_id,
             Some(self.txn()?)
         )])
+    }
+
+    /// One relationship row is enough; read in the transaction, it conflicts with a
+    /// relationship created before the page commits.
+    fn read_relationships(&mut self) -> Result<Effects, PageImportError> {
+        self.state = PageImportState::ReadRelationships;
+        let prefix = sync_relationship_prefix(&self.input.bucket);
+        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: 1,
+            txn_id: Some(self.txn()?),
+        })])
     }
 
     fn txn(&self) -> Result<TxnId, PageImportError> {
@@ -167,7 +183,7 @@ impl PageImportOperation {
                         self.state = PageImportState::ReadRecord;
                         Ok(smallvec![read])
                     }
-                    None => self.read_secret(),
+                    None => self.read_relationships(),
                 }
             }
             (
@@ -190,6 +206,14 @@ impl PageImportOperation {
                         write_epoch(binding, key, record.as_deref(), fence.as_deref())
                     })
                     .collect::<Result<_, _>>()?;
+                self.read_secret()
+            }
+            (
+                PageImportState::ReadRelationships,
+                Event::Storage(StorageEvent::IterResult { values, .. }),
+            ) => {
+                let guards = self.guards.as_mut().ok_or(PageImportError::NotFinished)?;
+                guards.downstream = !values.is_empty();
                 self.read_secret()
             }
             (
@@ -277,6 +301,7 @@ fn expected_event(state: PageImportState) -> &'static str {
         PageImportState::ReadGuards | PageImportState::ReadVersions => "BatchReadResult",
         PageImportState::ReadSecret => "VaultResult",
         PageImportState::ReadRecord => "ReadResult",
+        PageImportState::ReadRelationships => "IterResult",
         PageImportState::WriteRows | PageImportState::UpdateUsage => "BatchWriteResult",
         PageImportState::DeleteRows => "BatchDeleteResult",
         PageImportState::Commit => "TransactionCommitted",

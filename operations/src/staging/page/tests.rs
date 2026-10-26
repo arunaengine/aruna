@@ -196,6 +196,15 @@ fn guards(fence: Option<Value>, record: &JobRecord, heads: Vec<Option<Value>>) -
     Event::Storage(StorageEvent::BatchReadResult { values })
 }
 
+/// The answer to the relationship read: `count` relationships replicate the bucket.
+fn relationships(count: usize) -> Event {
+    let row = || (Key::from(b"rel".to_vec()), ByteView::from(Vec::new()));
+    Event::Storage(StorageEvent::IterResult {
+        values: (0..count).map(|_| row()).collect(),
+        next_start_after: None,
+    })
+}
+
 fn no_secret() -> Event {
     Event::Storage(StorageEvent::VaultResult {
         entry: SourceConnectorSecret::vault_entry(connector().connector_id),
@@ -259,6 +268,7 @@ fn run_to_writes(
         [Effect::Storage(StorageEffect::BatchRead { reads: batch, .. })] if batch.len() == reads
     ));
     operation.step(guards(None, &record(token()), heads));
+    operation.step(relationships(1));
     let mut effects = operation.step(no_secret());
     if let Some(versions) = versions {
         let values = versions
@@ -509,6 +519,7 @@ fn changed_secret_aborts() {
         txn_id: txn(),
     }));
     operation.step(guards(None, &record(token()), vec![None]));
+    operation.step(relationships(1));
 
     assert!(matches!(
         operation.step(no_secret()).as_slice(),
@@ -518,6 +529,34 @@ fn changed_secret_aborts() {
         txn_id: txn(),
     }));
     assert_eq!(operation.finalize(), Err(PageImportError::ConnectorChanged));
+}
+
+// A bucket nothing replicates gets no replication obligation per imported file.
+#[test]
+fn obligations_need_downstream() {
+    let mut operation = PageImportOperation::new(input(vec![entry("a"), entry("b")]));
+    operation.start();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: txn(),
+    }));
+    let effects = operation.step(guards(None, &record(token()), vec![None, None]));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter {
+            limit: 1,
+            txn_id: Some(_),
+            ..
+        })]
+    ));
+    operation.step(relationships(0));
+
+    let effects = operation.step(no_secret());
+
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the page rows, got {effects:?}");
+    };
+    assert_eq!(rows_in(writes, BLOB_VERSIONS_KEYSPACE), 2);
+    assert_eq!(rows_in(writes, REPLICATION_OBLIGATION_KEYSPACE), 0);
 }
 
 #[test]
@@ -823,4 +862,108 @@ async fn page_needs_coordinator() {
         ))
     ));
     assert!(!has_row(handle, head_position(set_id, "a")).await);
+}
+
+/// Bytes of keys and values per keyspace in `handle`.
+async fn keyspace_bytes(handle: &aruna_storage::StorageHandle) -> HashMap<&'static str, usize> {
+    let mut sizes = HashMap::new();
+    for key_space in aruna_core::keyspaces::KEYSPACE_CATALOG {
+        let iter = StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: None,
+            limit: 1_000_000,
+            txn_id: None,
+        };
+        if let Event::Storage(StorageEvent::IterResult { values, .. }) =
+            handle.send_storage_effect(iter).await
+        {
+            let bytes = values.iter().map(|(key, value)| key.len() + value.len());
+            sizes.insert(*key_space, bytes.sum());
+        }
+    }
+    sizes
+}
+
+/// A public bakrep-like S3 connector stored for the test group.
+async fn bakrep_connector(context: &crate::driver::DriverContext) -> SourceConnector {
+    use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+    let input = SourceConnectorInput {
+        group_id: bucket().group_id,
+        created_by: UserId::default(),
+        name: "bakrep".to_string(),
+        kind: SourceConnectorKind::S3,
+        public_config: HashMap::from([
+            ("bucket".to_string(), "bakrep-v2-data-000".to_string()),
+            (
+                "endpoint".to_string(),
+                "https://s3.bwsfs.uni-freiburg.de".to_string(),
+            ),
+            ("region".to_string(), "us-east-1".to_string()),
+            ("skip_signature".to_string(), "true".to_string()),
+        ]),
+        secret_config: HashMap::new(),
+    };
+    let operation = SourceConnectorOperation::new(input);
+    crate::driver::drive(operation, context)
+        .await
+        .unwrap()
+        .connector
+}
+
+fn bakrep_entry(index: usize) -> PageEntry {
+    let sample = format!("SAMD{:08}", 344 + index);
+    let source_path = format!("{sample}/{sample}.bakta.gff3.gz");
+    PageEntry {
+        target_key: format!("bakrep-v2-data-000/{source_path}"),
+        source_path,
+        observation: SourceMetadata {
+            content_length: 1_234_567,
+            content_type: None,
+            etag: Some("\"9b2cf535f27731c974343645a3985328\"".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            source_version: None,
+            digests: Default::default(),
+        },
+    }
+}
+
+// Prints the stored bytes per entry and row kind of a realistic bakrep page; a measurement
+// for the entry size work, not a size contract. Run with `--nocapture` to read it.
+#[tokio::test]
+async fn entry_sizes_measured() {
+    use crate::driver::drive;
+    use crate::tests::staging::{create_test_bucket, setup_driver_context};
+
+    const ENTRIES: usize = 100;
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let connector = bakrep_connector(context).await;
+    let group_id = bucket().group_id;
+    let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
+    crate::jobs::store::insert_job(handle, &record(token()))
+        .await
+        .unwrap();
+    let before = keyspace_bytes(handle).await;
+    let page = PageImportInput {
+        connector,
+        expected_bucket,
+        ..input((0..ENTRIES).map(bakrep_entry).collect())
+    };
+    drive(PageImportOperation::new(page), context)
+        .await
+        .unwrap();
+
+    let after = keyspace_bytes(handle).await;
+    let mut rows: Vec<_> = (after.iter())
+        .map(|(space, bytes)| (*space, bytes - before.get(space).copied().unwrap_or(0)))
+        .filter(|(_, bytes)| *bytes > 0)
+        .collect();
+    rows.sort();
+    let total: usize = rows.iter().map(|(_, bytes)| bytes / ENTRIES).sum();
+    for (space, bytes) in rows {
+        println!("{space}: {} bytes per entry", bytes / ENTRIES);
+    }
+    println!("total: {total} bytes per entry");
 }
