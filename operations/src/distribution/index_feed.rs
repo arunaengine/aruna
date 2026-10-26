@@ -65,7 +65,7 @@ pub struct FeedLimits {
 impl Default for FeedLimits {
     fn default() -> Self {
         Self {
-            feed_rows: 256,
+            feed_rows: 1_024,
             account_rows: 256,
             state_rows: 64,
             rebuild_rows: 1_000,

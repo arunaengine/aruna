@@ -6,7 +6,7 @@
 // A raw key field serves exact deletes, key order and prefixes; a tokenized name field splits
 // keys at path and name separators.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -29,6 +29,8 @@ const VERSION_FIELD: &str = "version";
 const WRITER_BYTES: usize = 15_000_000;
 /// Open indexes kept for queries and writes; the cache is cleared when it is full.
 const OPEN_INDEXES: usize = 256;
+/// Writers kept open between batches, each with its writer memory; the oldest idle one goes.
+const OPEN_WRITERS: usize = 8;
 /// Index tasks that run at once on the blocking pool.
 const INDEX_PERMITS: usize = 4;
 
@@ -110,6 +112,8 @@ fn fields(schema: &Schema) -> Result<Fields, KeyIndexError> {
 struct OpenIndex {
     index: Index,
     reader: IndexReader,
+    /// Kept between batches, so a batch neither opens a writer nor waits for merges.
+    writer: Arc<Mutex<Option<IndexWriter>>>,
 }
 
 /// The range indexes of this node below one root directory:
@@ -117,6 +121,8 @@ struct OpenIndex {
 pub struct RangeIndexes {
     root: PathBuf,
     open: Mutex<HashMap<PathBuf, OpenIndex>>,
+    /// Directories whose index holds a writer, the most recently used last.
+    writers: Mutex<VecDeque<PathBuf>>,
     permits: Arc<Semaphore>,
 }
 
@@ -134,6 +140,7 @@ impl RangeIndexes {
         Self {
             root: root.into(),
             open: Mutex::new(HashMap::new()),
+            writers: Mutex::new(VecDeque::new()),
             permits: Arc::new(Semaphore::new(INDEX_PERMITS)),
         }
     }
@@ -160,7 +167,7 @@ impl RangeIndexes {
         let dir = self.directory(set_id, range_id, generation);
         self.blocking(move |indexes| {
             let open = indexes.open_index(&dir, true)?;
-            write_changes(&open, &changes)
+            indexes.write_changes(&dir, &open, &changes)
         })
         .await
     }
@@ -269,9 +276,69 @@ impl RangeIndexes {
         if open.len() >= OPEN_INDEXES {
             open.clear();
         }
-        let index = OpenIndex { index, reader };
+        let index = OpenIndex {
+            index,
+            reader,
+            writer: Arc::new(Mutex::new(None)),
+        };
         open.insert(dir.to_path_buf(), index.clone());
         Ok(index)
+    }
+
+    /// Applies `changes` with the index's kept writer and commits them, so they are durable and
+    /// visible to searches when this returns. A failed batch drops the writer.
+    fn write_changes(
+        &self,
+        dir: &Path,
+        open: &OpenIndex,
+        changes: &[KeyChange],
+    ) -> Result<(), KeyIndexError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut slot = (open.writer.lock()).unwrap_or_else(|poison| poison.into_inner());
+        if slot.is_none() {
+            *slot = Some(open.index.writer_with_num_threads(1, WRITER_BYTES)?);
+        }
+        self.keep_writer(dir);
+        let written = match slot.as_mut() {
+            Some(writer) => write_batch(writer, open, changes),
+            None => Ok(()),
+        };
+        if written.is_err() {
+            *slot = None;
+        }
+        written
+    }
+
+    /// Marks the writer of `dir` as the most recently used and drops the oldest idle writers
+    /// beyond [`OPEN_WRITERS`]; a writer in use stays until a later batch.
+    fn keep_writer(&self, dir: &Path) {
+        let mut writers = (self.writers.lock()).unwrap_or_else(|poison| poison.into_inner());
+        writers.retain(|kept| kept != dir);
+        writers.push_back(dir.to_path_buf());
+        let open = self
+            .open
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut kept = writers.len();
+        writers.retain(|candidate| {
+            if kept <= OPEN_WRITERS || candidate == dir {
+                return true;
+            }
+            let Some(index) = open.get(candidate) else {
+                kept -= 1;
+                return false;
+            };
+            match index.writer.try_lock() {
+                Ok(mut writer) => {
+                    *writer = None;
+                    kept -= 1;
+                    false
+                }
+                Err(_) => true,
+            }
+        });
     }
 
     fn forget(&self, dir: &Path) {
@@ -290,12 +357,12 @@ fn ignore_missing(error: std::io::Error) -> std::io::Result<()> {
     }
 }
 
-fn write_changes(open: &OpenIndex, changes: &[KeyChange]) -> Result<(), KeyIndexError> {
-    if changes.is_empty() {
-        return Ok(());
-    }
+fn write_batch(
+    writer: &mut IndexWriter,
+    open: &OpenIndex,
+    changes: &[KeyChange],
+) -> Result<(), KeyIndexError> {
     let fields = fields(&open.index.schema())?;
-    let mut writer: IndexWriter = open.index.writer_with_num_threads(1, WRITER_BYTES)?;
     for change in changes {
         let key = match change {
             KeyChange::Put(entry) => &entry.key,
@@ -313,7 +380,6 @@ fn write_changes(open: &OpenIndex, changes: &[KeyChange]) -> Result<(), KeyIndex
         }
     }
     writer.commit()?;
-    writer.wait_merging_threads()?;
     open.reader.reload()?;
     Ok(())
 }
