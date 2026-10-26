@@ -333,6 +333,7 @@ pub(super) async fn commit_rows(
         .map_err(PageFailure::Retry)?;
     *checkpoint = next;
     sync_progress(ctx, checkpoint);
+    ctx.progress.checkpoint();
     Ok(())
 }
 
@@ -636,6 +637,7 @@ async fn import_page(
         Ok(result) => {
             *checkpoint = result.checkpoint;
             sync_progress(ctx, checkpoint);
+            ctx.progress.checkpoint();
             Ok(())
         }
         Err(error @ (PageImportError::BucketChanged | PageImportError::TooManyBytes(_))) => {

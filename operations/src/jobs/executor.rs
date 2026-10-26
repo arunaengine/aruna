@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +24,8 @@ struct ProgressInner {
     current: AtomicU64,
     total: Mutex<Option<u64>>,
     unit: String,
+    /// Set once this execution committed a resumable checkpoint.
+    checkpointed: AtomicBool,
 }
 
 impl ProgressReporter {
@@ -33,6 +35,7 @@ impl ProgressReporter {
                 current: AtomicU64::new(progress.current),
                 total: Mutex::new(progress.total),
                 unit: progress.unit.clone(),
+                checkpointed: AtomicBool::new(false),
             }),
         }
     }
@@ -47,6 +50,15 @@ impl ProgressReporter {
 
     pub fn advance(&self, delta: u64) {
         self.inner.current.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// Records that a durable checkpoint advanced, so a later transient failure costs no attempt.
+    pub fn checkpoint(&self) {
+        self.inner.checkpointed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn checkpointed(&self) -> bool {
+        self.inner.checkpointed.load(Ordering::Relaxed)
     }
 
     pub fn snapshot(&self) -> JobProgress {

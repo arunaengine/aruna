@@ -131,6 +131,7 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
             if let Err(error) = persist_rows(ctx, &checkpoint, Vec::new(), Vec::new()).await {
                 return retryable_error(error);
             }
+            ctx.progress.checkpoint();
             continue;
         }
 

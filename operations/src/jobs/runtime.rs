@@ -31,8 +31,8 @@ use super::reconcile::ExternalReconciler;
 use super::store::{
     AwaitOutcome, JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job,
     complete_job, defer_job, fail_job, flush_progress, handoff_external_attempt, iter_prefix_page,
-    park_job, read_job_record, release_job, renew_lease, requeue_job, satisfy_key_wait,
-    transition_to_running,
+    park_job, read_job_record, release_job, renew_lease, requeue_job, requeue_progressed,
+    satisfy_key_wait, transition_to_running,
 };
 use super::submit::schedule_drain_effect;
 use super::{
@@ -680,15 +680,7 @@ async fn run_job(
         SuperviseResult::Outcome(JobRunOutcome::Failed(error)) => {
             if error.kind == JobErrorKind::Retryable {
                 // External attempts return before supervision and cannot reach this requeue.
-                if let Err(error) = requeue_job(
-                    storage,
-                    job_id,
-                    Some(token),
-                    unix_timestamp_millis(),
-                    None,
-                    Some(error),
-                )
-                .await
+                if let Err(error) = requeue_failed(storage, job_id, token, error, &progress).await
                     && !matches!(error, JobMutationError::TokenMismatch)
                 {
                     warn!(job_id = %job_id, error = %error, "Failed to requeue job");
@@ -892,6 +884,21 @@ async fn supervise(
         // The heartbeat only returns before the payload when it loses the claim: another
         // execution has taken over, so abandon this one without writing a terminal state.
         _ = &mut heartbeat => SuperviseResult::Zombie,
+    }
+}
+
+/// A transient failure after a durable checkpoint advanced spends no attempt of a long job.
+async fn requeue_failed(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: ulid::Ulid,
+    error: JobError,
+    progress: &ProgressReporter,
+) -> Result<RequeueOutcome, JobMutationError> {
+    let now = unix_timestamp_millis();
+    match progress.checkpointed() {
+        true => requeue_progressed(storage, job_id, token, now, error).await,
+        false => requeue_job(storage, job_id, Some(token), now, None, Some(error)).await,
     }
 }
 
@@ -1483,6 +1490,49 @@ mod tests {
         assert_eq!(record.state, JobState::Queued);
         assert!(record.claim.is_none());
         assert_eq!(record.attempts, 0);
+    }
+
+    // Transient failures after a committed checkpoint never exhaust a long job; failures
+    // without progress still do.
+    #[tokio::test]
+    async fn progress_spares_attempts() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0x16; 16]);
+        insert_job(&storage, &probe_record(job_id, 1, 0, None))
+            .await
+            .unwrap();
+        let failure = JobError::retryable("source timed out");
+
+        for failure_no in 0..(JOB_MAX_ATTEMPTS + 2) {
+            let claimed = reclaim(&storage, job_id).await;
+            let token = claimed.claim.unwrap().claim_token;
+            let progress = ProgressReporter::from_progress(&claimed.progress);
+            progress.checkpoint();
+            let outcome = requeue_failed(&storage, job_id, token, failure.clone(), &progress)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, RequeueOutcome::Requeued(_)),
+                "failure {failure_no}"
+            );
+        }
+
+        for _ in 2..JOB_MAX_ATTEMPTS {
+            let claimed = reclaim(&storage, job_id).await;
+            let token = claimed.claim.unwrap().claim_token;
+            let progress = ProgressReporter::from_progress(&claimed.progress);
+            let outcome = requeue_failed(&storage, job_id, token, failure.clone(), &progress)
+                .await
+                .unwrap();
+            assert!(matches!(outcome, RequeueOutcome::Requeued(_)));
+        }
+        let claimed = reclaim(&storage, job_id).await;
+        let token = claimed.claim.unwrap().claim_token;
+        let progress = ProgressReporter::from_progress(&claimed.progress);
+        let outcome = requeue_failed(&storage, job_id, token, failure, &progress)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RequeueOutcome::Exhausted(_)));
     }
 
     // Rolling restarts must never exhaust JOB_MAX_ATTEMPTS on a job that never failed.
