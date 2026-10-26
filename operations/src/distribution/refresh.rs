@@ -38,8 +38,8 @@ const ROUND_PREFIX: &[u8] = b"refresh_round/";
 
 /// The record after which the next pass continues; a restart begins again at the start.
 static CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-/// The set and range after which the set's next pass goes on, so later ranges get pages too.
-static RANGE_CURSOR: Mutex<Option<(Ulid, Ulid)>> = Mutex::new(None);
+/// The set and the lower key of the range after which the set's sweep goes on in the next pass.
+static RANGE_CURSOR: Mutex<Option<(Ulid, String)>> = Mutex::new(None);
 
 /// One range's refresh round on this coordinator.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -89,6 +89,10 @@ pub(crate) async fn refresh_ranges(context: &DriverContext) -> Result<bool, Stri
     };
     resume(next.map(|next| next.to_vec()));
     let (mut pages, mut busy, mut done) = (0usize, false, after);
+    let mut sweep = RANGE_CURSOR
+        .lock()
+        .ok()
+        .and_then(|mut cursor| cursor.take());
     for (record_key, value) in records {
         let Ok(view) = DistributionView::from_bytes(&value) else {
             continue;
@@ -105,19 +109,21 @@ pub(crate) async fn refresh_ranges(context: &DriverContext) -> Result<bool, Stri
             continue;
         };
         let now_ms = unix_timestamp_millis();
-        let after = (RANGE_CURSOR.lock().ok().and_then(|cursor| *cursor))
+        let after = (sweep.take())
             .filter(|(set_id, _)| *set_id == binding.set_id)
-            .map(|(_, range_id)| range_id);
+            .map(|(_, lower)| lower);
         let mut last = None;
-        for range in after_range(coordinated(context, &binding).await?, after) {
-            // A pass that runs out of pages comes back to this set, after its last paged range.
+        // One sweep visits each range once; once it ends, the next set follows.
+        for range in after_range(coordinated(context, &binding).await?, after.as_deref()) {
+            // A pass that runs out of pages comes back to this set, after its last range.
             if pages >= PAGES_PER_PASS {
                 resume(done);
-                if let (Ok(mut cursor), Some(range_id)) = (RANGE_CURSOR.lock(), last) {
-                    *cursor = Some((binding.set_id, range_id));
+                if let (Ok(mut cursor), Some(lower)) = (RANGE_CURSOR.lock(), last) {
+                    *cursor = Some((binding.set_id, lower));
                 }
                 return Ok(true);
             }
+            last = Some(range.lower.clone());
             let key = round_key(binding.set_id, range.range_id);
             let first = RefreshRound {
                 started_ms: now_ms,
@@ -129,7 +135,6 @@ pub(crate) async fn refresh_ranges(context: &DriverContext) -> Result<bool, Stri
             };
             let walked = walk_page(context, (bucket, &range), round, realm_id).await?;
             pages += 1;
-            last = Some(range.range_id);
             busy |= !walked.finished;
             write_round(context, key, &walked).await?;
         }
@@ -138,12 +143,10 @@ pub(crate) async fn refresh_ranges(context: &DriverContext) -> Result<bool, Stri
     Ok(busy)
 }
 
-/// The ranges in the order a pass visits them: those after `after` first, then the rest.
-fn after_range(mut ranges: Vec<KeyRange>, after: Option<Ulid>) -> Vec<KeyRange> {
-    let position = after.and_then(|after| ranges.iter().position(|r| r.range_id == after));
-    if let Some(position) = position {
-        ranges.rotate_left(position + 1);
-    }
+/// The ranges a sweep still visits, in key order: those whose lower key follows `after`.
+fn after_range(mut ranges: Vec<KeyRange>, after: Option<&str>) -> Vec<KeyRange> {
+    ranges.retain(|range| after.is_none_or(|after| range.lower.as_str() > after));
+    ranges.sort_by(|left, right| left.lower.cmp(&right.lower));
     ranges
 }
 
@@ -313,12 +316,12 @@ async fn page(
 mod tests {
     use super::*;
 
-    // A pass that ran out of pages goes on after its last paged range, then wraps around.
+    // A pass that ran out of pages goes on after its last range and ends with the set's last.
     #[test]
     fn passes_resume_ranges() {
         let range = |seed: u8| KeyRange {
             range_id: Ulid::from_bytes([seed; 16]),
-            lower: String::new(),
+            lower: ["", "g", "p"][usize::from(seed - 1)].to_string(),
             upper: None,
             lineage: None,
             coordinator: Ulid::nil(),
@@ -328,15 +331,14 @@ mod tests {
         let ids = |ranges: Vec<KeyRange>| -> Vec<u8> {
             ranges.iter().map(|r| r.range_id.to_bytes()[0]).collect()
         };
-        let all = vec![range(1), range(2), range(3)];
+        let all = vec![range(3), range(1), range(2)];
         assert_eq!(ids(after_range(all.clone(), None)), [1, 2, 3]);
-        let after = Some(Ulid::from_bytes([2; 16]));
-        assert_eq!(ids(after_range(all.clone(), after)), [3, 1, 2]);
-        let gone = Some(Ulid::from_bytes([9; 16]));
+        assert_eq!(ids(after_range(all.clone(), Some("g"))), [3]);
+        assert_eq!(ids(after_range(all.clone(), Some("p"))), [0u8; 0]);
         assert_eq!(
-            ids(after_range(all, gone)),
-            [1, 2, 3],
-            "a gone range starts over"
+            ids(after_range(all, Some("h"))),
+            [3],
+            "a range split since goes on by key"
         );
     }
 
