@@ -674,11 +674,17 @@ pub(crate) async fn put_job_rows(
             .await
             .map_err(JobMutationError::Storage)?;
         let result = async {
-            let record = read_job_record(storage, job_id, Some(txn_id))
+            // The claim row, not the record a progress flush rewrites, fences the write.
+            let key = job_record_key(job_id);
+            let claim = read_raw(storage, JOB_CLAIM_KEYSPACE, key, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?
-                .ok_or(JobMutationError::NotFound)?;
-            guard_token(&record, token)?;
+                .map(|value| ClaimGuard::from_bytes(value.as_ref()))
+                .transpose()
+                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+            if claim.is_none_or(|claim| claim.claim_token != token) {
+                return Err(JobMutationError::TokenMismatch);
+            }
             batch_write(storage, writes.clone(), Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;
