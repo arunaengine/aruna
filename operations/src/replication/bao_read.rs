@@ -1954,6 +1954,7 @@ mod pure_tests {
                     capabilities: Vec::new(),
                     origin_node_id: None,
                     namespace: None,
+                    root: None,
                 },
                 connector_id: None,
             },
@@ -2670,6 +2671,7 @@ mod pure_tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: None,
         };
@@ -2759,6 +2761,7 @@ mod pure_tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: None,
         };
@@ -2834,6 +2837,7 @@ mod pure_tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: None,
         };

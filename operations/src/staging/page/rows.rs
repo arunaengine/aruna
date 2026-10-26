@@ -12,6 +12,7 @@ use crate::node::usage_stats::UsageUpdateError;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::staging::descriptor::build_source_binding;
+use crate::staging::root_record::{compact_version, root_write};
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::errors::{ConversionError, StorageError};
@@ -33,12 +34,14 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::source_root::SourceRoot;
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use byteview::ByteView;
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
@@ -338,6 +341,7 @@ pub(crate) fn page_rows(
     let mut versions = versions.into_iter();
     let mut writes = Vec::new();
     let mut inventory = Vec::new();
+    let mut roots = BTreeMap::new();
     let mut delta = UsageDelta::default();
     let mut result = PageImportResult {
         registered: 0,
@@ -368,8 +372,10 @@ pub(crate) fn page_rows(
             }
             EntryPlan::Register => {
                 let epoch = guards.epochs.get(index).copied().unwrap_or_default();
-                let (rows, change) = register_rows(input, guards, (entry, epoch), head.as_ref())?;
+                let (rows, change, root) =
+                    register_rows(input, guards, (entry, epoch), head.as_ref())?;
                 writes.extend(rows);
+                roots.extend(root);
                 inventory.extend(change);
                 // An offered directory observation is charged only while it is the head.
                 let released = existing
@@ -384,6 +390,9 @@ pub(crate) fn page_rows(
                 result.registered += 1;
             }
         }
+    }
+    for root in roots.values() {
+        writes.push(root_write(root)?);
     }
     let checkpoint = &mut result.checkpoint;
     checkpoint.items_current = checkpoint
@@ -415,7 +424,11 @@ pub(crate) fn page_rows(
 }
 
 /// The rows that register one entry and its inventory change in a distributed bucket.
-type EntryRows = (Vec<(KeySpace, Key, Value)>, Option<InventoryChange>);
+type EntryRows = (
+    Vec<(KeySpace, Key, Value)>,
+    Option<InventoryChange>,
+    Option<([u8; 32], SourceRoot)>,
+);
 
 fn register_rows(
     input: &PageImportInput,
@@ -455,6 +468,10 @@ fn register_rows(
         entry: entry_of(&version, entry.observation.content_length),
     };
     let change = version_written(guards.binding.as_ref(), &entry.target_key, added, true);
+    // The inventory saw the full binding; the stored one names its root by digest.
+    let (version, root) = compact_version(version)?;
+    let root = root.map(|root| root.digest().map(|digest| (digest, root)));
+    let root = root.transpose()?;
     let head_key = BlobHeadKey::new(&input.bucket, &entry.target_key);
     let mut rows = Vec::with_capacity(4);
     rows.extend(connector_reference_write(&version, &version_key)?);
@@ -482,5 +499,5 @@ fn register_rows(
     if guards.downstream {
         rows.push(live_obligation_entry(&obligation)?);
     }
-    Ok((rows, change))
+    Ok((rows, change, root))
 }

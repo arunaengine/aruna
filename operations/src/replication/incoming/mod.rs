@@ -31,6 +31,7 @@ use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::staging::root_record::{compact_version, root_write};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
@@ -907,7 +908,7 @@ impl IncomingVersionOperation {
         if previous.descriptor.kind
             != aruna_core::structs::execution::source_connector::SourceConnectorKind::ArunaNative
         {
-            return previous == incoming;
+            return RootEntry::normalized(previous) == RootEntry::normalized(incoming);
         }
         let previous_selector = format!("version:{}", advance.predecessor);
         let incoming_selector = format!("version:{version_id}");
@@ -921,7 +922,7 @@ impl IncomingVersionOperation {
         let mut incoming = incoming.clone();
         previous.descriptor.version_selector = None;
         incoming.descriptor.version_selector = None;
-        previous == incoming
+        RootEntry::normalized(&previous) == RootEntry::normalized(&incoming)
     }
 
     fn validate_advance(&self, previous: &BlobVersion) -> Result<(), IncomingVersionError> {
@@ -2102,6 +2103,26 @@ impl IncomingVersionOperation {
         let version = self.stamped(version);
         self.written_identity = logical_identity(&version);
         self.written_pending = matches!(version.state, BlobVersionState::PendingContent { .. });
+        // A member stores the binding compact too, with the root record it names.
+        let (version, root) = match compact_version(version) {
+            Ok(compacted) => compacted,
+            Err(err) => return self.fail(err.into()),
+        };
+        if let Some(root) = root {
+            match root_write(&root) {
+                Ok((key_space, key, value)) => {
+                    let write = StorageEffect::Write {
+                        key_space,
+                        key,
+                        value,
+                        txn_id: self.txn_id,
+                    };
+                    self.pending_version_effects
+                        .push_back(Effect::Storage(write));
+                }
+                Err(err) => return self.fail(err.into()),
+            }
+        }
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),

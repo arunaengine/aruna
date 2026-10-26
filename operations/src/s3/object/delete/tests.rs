@@ -313,6 +313,7 @@ fn reference_counts_content() {
                 capabilities: Vec::new(),
                 origin_node_id: Some(iroh::SecretKey::from_bytes(&[4u8; 32]).public()),
                 namespace: None,
+                root: None,
             },
             connector_id: None,
         },

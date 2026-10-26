@@ -996,6 +996,7 @@ pub(crate) mod test {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(Ulid::generate()),
         };
@@ -1105,6 +1106,7 @@ pub(crate) mod test {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: None,
         };
@@ -1208,6 +1210,7 @@ pub(crate) mod test {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: None,
         };
@@ -1472,6 +1475,7 @@ pub(crate) mod test {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(Ulid::generate()),
         };

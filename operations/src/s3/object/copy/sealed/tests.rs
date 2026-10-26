@@ -188,6 +188,7 @@ async fn copy_releases_observation() {
             capabilities: Vec::new(),
             origin_node_id: None,
             namespace: None,
+            root: None,
         },
         connector_id: None,
     };

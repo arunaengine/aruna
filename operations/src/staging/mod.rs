@@ -11,6 +11,7 @@ pub mod offered_directory;
 pub mod page;
 pub mod read_source;
 pub mod reference;
+pub mod root_record;
 pub mod snapshot;
 
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};

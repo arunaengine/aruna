@@ -42,6 +42,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, TxnId};
@@ -237,7 +238,7 @@ pub async fn write_reference_version(
             if !matches!(
                 &existing.state,
                 BlobVersionState::Reference { source, cached_metadata, .. }
-                    if source == &write.version_source
+                    if RootEntry::same_source(source, &write.version_source)
                         && source_metadata_matches(cached_metadata, &write.metadata)
             ) {
                 return Err(
@@ -281,7 +282,7 @@ pub async fn write_reference_version(
             }),
         ) = (existing_pointer.as_ref(), existing_version.as_ref())
             && write.preassigned_version_id.is_none()
-            && source == &write.version_source
+            && RootEntry::same_source(source, &write.version_source)
             && source_metadata_matches(cached_metadata, &write.metadata)
         {
             match context
@@ -1351,6 +1352,7 @@ mod tests {
                     capabilities: Vec::new(),
                     origin_node_id: None,
                     namespace: None,
+                    root: None,
                 },
                 connector_id: Some(Ulid::generate()),
             },

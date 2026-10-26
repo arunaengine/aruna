@@ -420,6 +420,7 @@ fn make_source_binding() -> VersionSourceBinding {
             capabilities: Vec::new(),
             origin_node_id: None,
             namespace: None,
+            root: None,
         },
         connector_id: Some(Ulid::from_bytes([0x22; 16])),
     }
@@ -2095,7 +2096,19 @@ fn preserves_source_binding() {
         panic!("expected blob version write")
     };
     let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
-    assert_eq!(version.source_binding(), Some(&source));
+    // The binding is stored compact, with its root record written in the same transaction.
+    let stored = version.source_binding().unwrap();
+    assert!(stored.descriptor.root.is_some());
+    assert!(
+        aruna_core::structs::storage::distribution::source_root::RootEntry::same_source(
+            stored, &source
+        )
+    );
+    assert!(op.pending_version_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Storage(StorageEffect::Write { key_space, .. })
+            if key_space == aruna_core::keyspaces::ROOT_RECORD_KEYSPACE
+    )));
     assert_eq!(version.metadata, expected_metadata);
 }
 
