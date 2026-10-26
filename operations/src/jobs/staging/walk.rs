@@ -36,7 +36,9 @@ use super::{
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::{PermissionRules, permission_rules};
-use crate::distribution::guard::{GuardError, authority_reads, authority_rows, write_target};
+use crate::distribution::guard::{
+    GuardError, authority_reads, authority_rows, write_target, write_targets,
+};
 use crate::driver::drive;
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::store::{batch_delete, iter_prefix_page, read_state};
@@ -50,8 +52,12 @@ use crate::staging::page::import::{
 };
 use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 
-/// Entries one reference page lists and registers in one transaction.
-const STAGING_PAGE_SIZE: usize = 500;
+/// Entries one listing request reads.
+const STAGING_PAGE_SIZE: usize = 1000;
+/// Entries a flat reference walk gathers from several listings into one page transaction.
+const COMMIT_ENTRIES: usize = 5000;
+/// Bytes of listed source paths one gathered page holds at most.
+const COMMIT_PATH_BYTES: usize = 4 << 20;
 /// Snapshot pages copy every file before their checkpoint, so they stay smaller.
 const SNAPSHOT_PAGE_SIZE: usize = 100;
 
@@ -367,7 +373,35 @@ async fn listing(
         },
         _ => None,
     };
-    let page = list_page(ctx, spec, walk, (flat, segment.as_ref())).await;
+    let mut page = list_page(ctx, spec, walk, (flat, segment.as_ref())).await;
+    // A flat reference walk is an ordered stream, so its next pages join the same transaction.
+    let gathers = flat && walk.queue_row.is_none() && spec.checksum_manifest.is_none();
+    let gathers = gathers && spec.strategy == StagingStrategy::Reference;
+    while gathers && let Ok(listed) = &mut page {
+        let bytes: usize = (listed.entries.iter()).map(|entry| entry.path.len()).sum();
+        let full = listed.entries.len() + STAGING_PAGE_SIZE > COMMIT_ENTRIES;
+        let Some(cursor) = listed.next_cursor.clone().filter(|_| !full) else {
+            break;
+        };
+        if bytes > COMMIT_PATH_BYTES {
+            break;
+        }
+        let next = StagingWalk {
+            cursor: Some(cursor),
+            ..walk.clone()
+        };
+        // A failed listing ends the gathered page; the walk lists it again from its cursor.
+        let Ok(more) = list_page(ctx, spec, &next, (flat, segment.as_ref())).await else {
+            break;
+        };
+        if (more.connector != listed.connector)
+            || more.secret_fingerprint != listed.secret_fingerprint
+        {
+            break;
+        }
+        listed.entries.extend(more.entries);
+        listed.next_cursor = more.next_cursor;
+    }
     Ok(Listing::Page(segment, page))
 }
 
@@ -495,8 +529,13 @@ pub(super) async fn coordinated(
     let event = ctx.driver.storage_handle.send_storage_effect(read).await;
     let (record, fence) = authority_rows(event).map_err(|error| error.to_string())?;
     let (record, fence) = (record.as_deref(), fence.as_deref());
-    (keys.iter())
-        .map(|key| match write_target(binding, key, record, fence) {
+    let routes = match write_targets(binding, keys.iter().copied(), record, fence) {
+        Ok(routes) => routes,
+        Err(error) if error.moved_away() => return Ok(vec![false; keys.len()]),
+        Err(error) => return Err(error.to_string()),
+    };
+    (routes.into_iter())
+        .map(|route| match route {
             Ok(WriteRoute::Local { .. }) => Ok(true),
             Ok(WriteRoute::Forward { .. }) => Ok(false),
             Err(error) if error.moved_away() => Ok(false),

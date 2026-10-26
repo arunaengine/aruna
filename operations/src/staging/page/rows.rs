@@ -46,10 +46,10 @@ use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Most entries one page registers.
-pub const MAX_PAGE_ENTRIES: usize = 1000;
+/// Most entries one page registers; a lane gathers several listings into one page.
+pub const MAX_PAGE_ENTRIES: usize = 10_000;
 /// Most bytes one page writes, keys and values together.
-pub const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 /// Most per-entry errors a staging checkpoint keeps; the failed counter counts all of them.
 pub const MAX_ERROR_SAMPLE: usize = 100;
 /// Rows read ahead of the heads: purge fence, bucket, connector and job claim.

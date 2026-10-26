@@ -562,6 +562,15 @@ mod tests {
         assert!(splits.iter().any(|split| split.starts_with("p/SAME")));
     }
 
+    // A prefix larger than one gathered page commits in several gathered pages; every file
+    // is registered once.
+    #[tokio::test]
+    async fn gathered_pages_import() {
+        let keys = (0..6_100).map(|index| format!("a/{index:05}")).collect();
+        let registered = import(keys, &[("a", "ta")]).await;
+        assert_eq!(registered, 6_100);
+    }
+
     /// A page of two files of the job's bucket, as the walk builds it.
     async fn page_input(ctx: &JobContext, spec: &StagingJobSpec) -> PageImportInput {
         use crate::connectors::repository::{parse_connector_read, read_connector_effect};

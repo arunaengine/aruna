@@ -172,6 +172,19 @@ fn route_in(
     Ok(route)
 }
 
+/// [`write_target`] of each of `keys`, decoding the record and the fence once.
+pub fn write_targets<'a>(
+    binding: &DistributionBinding,
+    keys: impl IntoIterator<Item = &'a str>,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<Vec<Result<WriteRoute, GuardError>>, GuardError> {
+    let view = bound_record(binding, record)?;
+    let fence = LocalFence::decode(fence)?;
+    let routes = keys.into_iter();
+    Ok((routes.map(|key| route_in(binding, (&view, &fence), key, false))).collect())
+}
+
 /// [`write_epoch`] of each of `keys`, decoding the record and the fence once, and whether the
 /// set keeps a search index.
 pub fn write_epochs<'a>(
