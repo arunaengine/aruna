@@ -1,14 +1,16 @@
-//! Tests usage rebuilds: the snapshot and rebuild rows split commits exactly, finish replaces rows.
+//! Tests usage rebuilds: the snapshot and rebuild rows split commits exactly, finish replaces
+//! rows, and a rebuild resumes after a restart with the rows it began with.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::tests::{commit_transaction, start_write_transaction};
 use super::{FjallStorage, StorageHandle};
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::structs::storage::usage::{
-    BucketCounters, BucketDelta, ShadowCounters, USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY,
-    UsageCounters, UsageDelta, usage_shadow_key,
+    BucketCounters, BucketDelta, RebuildProgress, ShadowCounters, USAGE_COMPLETE_KEY,
+    USAGE_PROGRESS_KEY, USAGE_REBUILD_KEY, UsageCounters, UsageDelta, usage_shadow_key,
 };
 use aruna_core::types::TxnId;
 use byteview::ByteView;
@@ -17,6 +19,8 @@ use tempfile::tempdir;
 const SPACE: &str = "usage_stats";
 const GROUP: &[u8] = b"group/a";
 const BUCKET: &[u8] = b"bucket/a";
+/// A keyspace a usage rebuild reads.
+const SOURCE: &str = S3_BUCKET_KEYSPACE;
 
 fn objects(objects: i128) -> UsageDelta {
     UsageDelta {
@@ -221,4 +225,130 @@ async fn begin_clears_leftovers() {
             .is_none()
     );
     assert!(read(&handle, USAGE_REBUILD_KEY, None).await.is_some());
+}
+
+async fn write_row(handle: &StorageHandle, key: &[u8], value: &[u8], txn_id: Option<TxnId>) {
+    let write = StorageEffect::Write {
+        key_space: SOURCE.to_string(),
+        key: ByteView::from(key),
+        value: ByteView::from(value),
+        txn_id,
+    };
+    let event = handle.send_storage_effect(write).await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+}
+
+async fn source_page(handle: &StorageHandle, view: TxnId) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows = Vec::new();
+    let mut start = None;
+    loop {
+        // One row per page, so pages end inside the rows the view lays over the snapshot.
+        let iter = StorageEffect::Iter {
+            key_space: SOURCE.to_string(),
+            prefix: None,
+            start: start.take(),
+            limit: 1,
+            txn_id: Some(view),
+        };
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = handle.send_storage_effect(iter).await
+        else {
+            panic!("the view did not iterate");
+        };
+        rows.extend(values.iter().map(|(k, v)| (k.to_vec(), v.to_vec())));
+        match next_start_after {
+            Some(after) => start = Some(IterStart::After(after)),
+            None => return rows,
+        }
+    }
+}
+
+fn progress(value: Option<ByteView>) -> RebuildProgress {
+    RebuildProgress::from_bytes(&value.expect("progress row")).unwrap()
+}
+
+/// Rows changed after the begin keep their earlier value; after a restart the rebuild resumes
+/// with its rows and its view still reads the rows as they were when it began.
+#[tokio::test]
+async fn resume_reads_start() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let handle = FjallStorage::open(&path).unwrap();
+    write_row(&handle, b"a", b"a1", None).await;
+    write_row(&handle, b"b", b"b1", None).await;
+    let view = begin(&handle).await;
+    let generation = progress(read(&handle, USAGE_PROGRESS_KEY, None).await).generation;
+    commit_delta(&handle, GROUP, objects(2)).await;
+    write_row(&handle, b"a", b"a2", None).await;
+    write_row(&handle, b"a", b"a3", None).await;
+    let txn_id = start_write_transaction(&handle).await;
+    write_row(&handle, b"c", b"c1", Some(txn_id)).await;
+    let delete = StorageEffect::Delete {
+        key_space: SOURCE.to_string(),
+        key: ByteView::from(&b"b"[..]),
+        txn_id: Some(txn_id),
+    };
+    handle.send_storage_effect(delete).await;
+    commit_transaction(&handle, txn_id).await;
+    let start = vec![
+        (b"a".to_vec(), b"a1".to_vec()),
+        (b"b".to_vec(), b"b1".to_vec()),
+    ];
+    assert_eq!(source_page(&handle, view).await, start);
+    commit_transaction(&handle, view).await;
+    handle.close().await;
+
+    let handle = FjallStorage::open(&path).unwrap();
+    // Storage shadows deltas again before any begin, as the rebuild still runs.
+    commit_delta(&handle, GROUP, objects(1)).await;
+    write_row(&handle, b"d", b"d1", None).await;
+    let view = begin(&handle).await;
+    let resumed = progress(read(&handle, USAGE_PROGRESS_KEY, None).await);
+    assert_eq!(resumed.generation, generation, "the same rebuild resumes");
+    assert_eq!(
+        shadow(read(&handle, &usage_shadow_key(GROUP), None).await),
+        Some(ShadowCounters::Usage(objects(3))),
+        "rebuild rows survive the restart and keep collecting deltas"
+    );
+    assert_eq!(source_page(&handle, view).await, start);
+    let reads = vec![
+        (SOURCE.to_string(), ByteView::from(&b"b"[..])),
+        (SOURCE.to_string(), ByteView::from(&b"c"[..])),
+    ];
+    let event = handle
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(view),
+        })
+        .await;
+    let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+        panic!("the view did not read: {event:?}");
+    };
+    let values: Vec<_> = values
+        .into_iter()
+        .map(|(_, v)| v.map(|v| v.to_vec()))
+        .collect();
+    assert_eq!(values, vec![Some(b"b1".to_vec()), None]);
+    commit_transaction(&handle, view).await;
+    assert!(matches!(
+        finish(&handle).await,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+    assert!(read(&handle, USAGE_PROGRESS_KEY, None).await.is_none());
+
+    // The next rebuild starts over and reads the rows as they are now.
+    let view = begin(&handle).await;
+    let fresh = progress(read(&handle, USAGE_PROGRESS_KEY, None).await);
+    assert_ne!(fresh.generation, generation);
+    let now = vec![
+        (b"a".to_vec(), b"a3".to_vec()),
+        (b"c".to_vec(), b"c1".to_vec()),
+        (b"d".to_vec(), b"d1".to_vec()),
+    ];
+    assert_eq!(source_page(&handle, view).await, now);
 }

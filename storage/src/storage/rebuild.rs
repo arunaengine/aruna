@@ -2,9 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::HashSet;
+
 use aruna_core::effects::IterStart;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
+use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
 use aruna_core::structs::storage::usage::{
     RebuildProgress, ShadowCounters, USAGE_COMPLETE_KEY, USAGE_PROGRESS_KEY, USAGE_REBUILD_KEY,
     USAGE_SHADOW_PREFIX, UsageDelta, global_shard_keys, usage_shadow_key,
@@ -15,12 +18,27 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::transactions::{CounterChange, warn_clamped};
-use super::{FjallStorage, iterate_page};
+use super::{FjallStorage, Store, iterate_page};
 
 /// Rows read per page while a rebuild clears or replaces counter rows.
 const REBUILD_PAGE: usize = 1024;
 
 type PendingChanges = Vec<(String, ByteView, CounterChange)>;
+
+/// The usage keyspace whose rebuild was begun before the last stop and saved its progress.
+pub(super) fn running_rebuild(store: &Store) -> HashSet<String> {
+    let marker = store
+        .existing_keyspace(USAGE_STATS_KEYSPACE)
+        .ok()
+        .flatten()
+        .and_then(|keyspace| store.db.read_tx().get(&keyspace, USAGE_PROGRESS_KEY).ok())
+        .flatten();
+    marker
+        .filter(|value| RebuildProgress::from_bytes(value.as_ref()).is_ok())
+        .map(|_| USAGE_STATS_KEYSPACE.to_string())
+        .into_iter()
+        .collect()
+}
 
 /// True for the rebuild marker and the rebuild rows, which are never copied themselves.
 pub(super) fn is_rebuild_row(key: &[u8]) -> bool {
