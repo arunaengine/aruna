@@ -604,6 +604,13 @@ pub enum MetadataTransportMessage {
     StagingSpecResult {
         result: Result<Box<crate::distribution::imports::HandedImport>, MetadataReadError>,
     },
+    /// Reference records of one range from its coordinator, applied in one transaction.
+    ReferencePage {
+        page: Box<crate::replication::page::ReferencePage>,
+    },
+    ReferencePageAnswer {
+        answer: crate::replication::page::PageAnswer,
+    },
 }
 
 /// One document as a holder serves it to a device.

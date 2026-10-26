@@ -70,6 +70,8 @@ mod sync;
 mod transport;
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a sender waits for a member's answer to a reference page.
+const PAGE_ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 const METADATA_CHUNK_SIZE: usize = 64 * 1024;
 const METADATA_ENVELOPE_BYTES: u64 = 16 * 1024 * 1024;
 const SYNC_MIRROR_TIMEOUT: Duration = RECONCILE_GRACE.saturating_sub(Duration::from_secs(10));

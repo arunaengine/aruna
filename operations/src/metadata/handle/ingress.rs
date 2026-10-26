@@ -1111,6 +1111,16 @@ impl MetadataHandle {
                 let result = spec.await.map(Box::new);
                 (MetadataTransportMessage::StagingSpecResult { result }, None)
             }
+            MetadataTransportMessage::ReferencePage { page } => {
+                let answer = Box::pin(crate::replication::page::deliver::serve_page(
+                    context, peer, *page,
+                ));
+                let answer = answer.await;
+                (
+                    MetadataTransportMessage::ReferencePageAnswer { answer },
+                    None,
+                )
+            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)
