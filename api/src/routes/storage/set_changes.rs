@@ -28,6 +28,7 @@ use super::distributed::{
 use super::routing::ensure_group_admin;
 use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::storage::bucket::usage::range_sizes;
 use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
@@ -135,9 +136,13 @@ async fn admin(
 - A node whose earlier member is leaving joins again as a new member.
 - An existing other bucket of the name on the node fails the admission; retry it through the
   admission route.
+- The member node admits the member only when its storage capacity, the sum of its backend
+  quotas, holds the expected bytes of its ranges and an estimate of their metadata. The sizes
+  come from the ranges' holders; a range whose holders do not answer counts as empty.
 
 **Limits**
-- The node must be a realm infrastructure node. `assigned` coverage needs at least one range."#,
+- The node must be a realm infrastructure node. `assigned` coverage needs at least one range.
+- A node without backend quotas refuses `all` coverage."#,
     params(
         ("group_id" = String, Path, description = "Owner group id"),
         ("set_id" = String, Path, description = "Distributed bucket set id")
@@ -170,7 +175,9 @@ pub async fn join_distributed(
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<JoinRequest>,
 ) -> ServerResult<(StatusCode, Json<AdmissionResponse>)> {
+    let relay = bearer.clone();
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
+    let sizes = range_sizes(&state, relay.as_ref(), set_id).await?;
     let input = JoinInput {
         node_id: node(&request.node_id)?,
         coverage: match request.coverage {
@@ -184,7 +191,7 @@ pub async fn join_distributed(
             .iter()
             .map(|value| id(value))
             .collect::<ServerResult<_>>()?,
-        sizes: Vec::new(),
+        sizes,
     };
     let report = join_member(&state.get_ctx(), (&auth, bearer), set_id, input)
         .await

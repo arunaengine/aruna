@@ -33,6 +33,7 @@ use utoipa_axum::routes;
 use super::routing::ensure_group_admin;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::storage::bucket::usage::range_sizes;
 use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
 
@@ -628,8 +629,9 @@ pub async fn retry_admission(
     let auth = require_realm_auth(&state, auth)?;
     ensure_group_admin(&state, &auth, group_id).await?;
     owned_status(&state, group_id, set_id).await?;
+    let sizes = range_sizes(&state, bearer.as_ref(), set_id).await?;
     let bearer = crate::metadata::forwarded_auth_token(bearer)?;
-    let report = admit_pending(&state.get_ctx(), &auth, bearer, set_id, &[])
+    let report = admit_pending(&state.get_ctx(), &auth, bearer, set_id, &sizes)
         .await
         .map_err(map_create_error)?;
     Ok(Json(admission_response(report)))

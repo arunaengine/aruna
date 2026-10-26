@@ -7,8 +7,10 @@ use std::sync::Arc;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::accounting::RangeCounters;
+use aruna_core::structs::storage::distribution::capacity::RangeSize;
 use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
 use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
+use aruna_operations::distribution::status::read_view;
 use aruna_operations::distribution::usage::{HeldRange, RangeUsage, held_ranges, sum_held};
 use aruna_operations::node::usage_stats::usage_complete;
 use axum::extract::{Path, Query, State};
@@ -191,44 +193,12 @@ const MAX_HOLDERS_ASKED: usize = 16;
 /// holders, each holder asked once and each shared counter row added once.
 async fn merged_usage(
     state: &ServerState,
-    (bucket, bearer): (&str, Option<&ValidatedBearer>),
+    caller: (&str, Option<&ValidatedBearer>),
     (binding, snapshot): (&DistributionBinding, &DistributionSnapshot),
     held: Vec<HeldRange>,
 ) -> ServerResult<RangeUsage> {
-    let mut ranges: BTreeMap<Ulid, HeldRange> = held
-        .into_iter()
-        .map(|range| (range.range_id, range))
-        .collect();
-    let mut asked = BTreeSet::new();
-    let path = format!("/data/buckets/{bucket}/usage?held=true");
-    for range in &snapshot.config.ranges {
-        if ranges.contains_key(&range.range_id) {
-            continue;
-        }
-        let holders = snapshot.record_holders(range).into_iter();
-        let holder = holders
-            .filter(|member| member.member_id != binding.member_id)
-            .find(|member| !asked.contains(&member.node_id));
-        let Some(holder) = holder.filter(|_| asked.len() < MAX_HOLDERS_ASKED) else {
-            continue;
-        };
-        asked.insert(holder.node_id);
-        let forward = RestForward {
-            set_id: binding.set_id,
-            range_id: range.range_id,
-            node_id: holder.node_id,
-        };
-        // A holder that does not answer leaves its ranges uncounted and the answer incomplete.
-        let answer: Option<BucketUsageResponse> = relay_get(state, &forward, &path, bearer).await?;
-        for other in answer
-            .and_then(|answer| answer.held_ranges)
-            .unwrap_or_default()
-        {
-            if let Some(other) = other.held() {
-                ranges.entry(other.range_id).or_insert(other);
-            }
-        }
-    }
+    let member = Some(binding.member_id);
+    let ranges = holder_ranges(state, caller, (member, snapshot), held).await?;
     let wanted = snapshot.config.ranges.len();
     let counted: Vec<&HeldRange> = (snapshot.config.ranges.iter())
         .filter_map(|range| ranges.get(&range.range_id))
@@ -241,6 +211,88 @@ async fn merged_usage(
         counted: counted.len(),
         complete: counted.len() == wanted && counted.iter().all(|range| range.complete),
     })
+}
+
+/// The counter rows of every range, from `held` and from one holder per other range; a holder
+/// that does not answer leaves its ranges out.
+async fn holder_ranges(
+    state: &ServerState,
+    (bucket, bearer): (&str, Option<&ValidatedBearer>),
+    (member, snapshot): (Option<Ulid>, &DistributionSnapshot),
+    held: Vec<HeldRange>,
+) -> ServerResult<BTreeMap<Ulid, HeldRange>> {
+    let mut ranges: BTreeMap<Ulid, HeldRange> = held
+        .into_iter()
+        .map(|range| (range.range_id, range))
+        .collect();
+    let mut asked = BTreeSet::new();
+    let path = format!("/data/buckets/{bucket}/usage?held=true");
+    for range in &snapshot.config.ranges {
+        if ranges.contains_key(&range.range_id) {
+            continue;
+        }
+        let holders = snapshot.record_holders(range).into_iter();
+        let holder = holders
+            .filter(|holder| Some(holder.member_id) != member)
+            .find(|holder| !asked.contains(&holder.node_id));
+        let Some(holder) = holder.filter(|_| asked.len() < MAX_HOLDERS_ASKED) else {
+            continue;
+        };
+        asked.insert(holder.node_id);
+        let forward = RestForward {
+            set_id: snapshot.set_id(),
+            range_id: range.range_id,
+            node_id: holder.node_id,
+        };
+        let answer: Option<BucketUsageResponse> = relay_get(state, &forward, &path, bearer).await?;
+        for other in answer
+            .and_then(|answer| answer.held_ranges)
+            .unwrap_or_default()
+        {
+            if let Some(other) = other.held() {
+                ranges.entry(other.range_id).or_insert(other);
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+/// The expected size of each range of the set from its holders' counters, for a member's
+/// capacity admission. A range whose holders do not answer is left out and counts as empty;
+/// a split child includes its parent's shared row, so sizes may exceed the data.
+pub(crate) async fn range_sizes(
+    state: &ServerState,
+    bearer: Option<&ValidatedBearer>,
+    set_id: Ulid,
+) -> ServerResult<Vec<RangeSize>> {
+    let internal = |error: String| ServerError::InternalError(error);
+    let view = read_view(&state.get_ctx(), set_id).await;
+    let Some(view) = view.map_err(|error| internal(error.to_string()))? else {
+        return Ok(Vec::new());
+    };
+    let snapshot = &view.head.snapshot;
+    let bucket = snapshot.config.bucket.as_str();
+    let local = held_ranges(&state.get_ctx(), bucket).await;
+    let local = local.map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let (member, held) = match local {
+        Some((binding, _, held)) if binding.set_id == snapshot.set_id() => {
+            (Some(binding.member_id), held)
+        }
+        _ => (None, Vec::new()),
+    };
+    let ranges = holder_ranges(state, (bucket, bearer), (member, snapshot), held).await?;
+    let count = |value: i128| u64::try_from(value.max(0)).unwrap_or(u64::MAX);
+    let mut sizes = Vec::with_capacity(ranges.len());
+    for (range_id, range) in ranges {
+        let counters =
+            sum_held([&range]).map_err(|error| ServerError::InternalError(error.to_string()))?;
+        sizes.push(RangeSize {
+            range_id,
+            bytes: count(counters.logical_bytes),
+            objects: count(counters.versions.saturating_add(counters.delete_markers)),
+        });
+    }
+    Ok(sizes)
 }
 
 #[utoipa::path(
