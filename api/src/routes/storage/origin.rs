@@ -429,23 +429,5 @@ pub async fn get_sources(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // A relayed origin read names the same key and version on the holder.
-    #[test]
-    fn relay_path_kept() {
-        let params = OriginParams {
-            key: "raw/a b.txt".to_string(),
-            version_id: Some(Ulid::from_bytes([1; 16])),
-        };
-        let path = origin_path("lab", &params);
-        assert_eq!(
-            path,
-            format!(
-                "/data/buckets/lab/objects/origin?key=raw%2Fa+b.txt&version_id={}",
-                Ulid::from_bytes([1; 16])
-            )
-        );
-    }
-}
+#[path = "origin_tests.rs"]
+mod tests;
