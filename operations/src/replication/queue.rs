@@ -42,6 +42,8 @@ use ulid::Ulid;
 
 use super::bootstrap::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
 use super::members::{MemberTarget, bound_record, member_jobs, member_publication};
+use super::page::PAGE_RECORDS;
+use super::page::deliver::{MetadataSender, PageSender, deliver_pages, pageable};
 use super::parking::{PARKED_DUE, park_job};
 use super::plaintext::{consent_delete, consent_write, job_consent, plaintext_allowed};
 use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
@@ -159,6 +161,8 @@ struct LiveObligationIdentity<'a> {
 
 struct BlobJobScan {
     jobs: Vec<(Vec<u8>, BlobJobRecord)>,
+    /// The generation the scan started in.
+    generation: u64,
     has_more_due: bool,
     next_due_ms: Option<u64>,
     next_cursor: ReplicationScanCursor,
@@ -257,6 +261,15 @@ impl BlobJobRecord {
     pub fn with_member(mut self, target: MemberTarget) -> Self {
         self.distribution = Some(target);
         self
+    }
+
+    /// When the version this job delivers was written, which dates its obligation; the
+    /// enqueue time for other jobs.
+    pub fn owed_since_ms(&self) -> u64 {
+        match &self.input.target {
+            ReplicateScopeTarget::Version { version_id, .. } => version_id.timestamp_ms(),
+            _ => self.enqueued_at_ms,
+        }
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -1233,6 +1246,15 @@ async fn live_obligations_exist(storage: &StorageHandle) -> Result<bool, BlobQue
 pub async fn process_blob_batch(
     context: &DriverContext,
 ) -> Result<BlobDrainResult, BlobQueueError> {
+    drain_batch(context, &MetadataSender(context)).await
+}
+
+/// One drain: obligations become jobs, member jobs of reference records go out in pages, and
+/// a bounded number of other jobs is delivered one by one.
+pub(crate) async fn drain_batch(
+    context: &DriverContext,
+    sender: &impl PageSender,
+) -> Result<BlobDrainResult, BlobQueueError> {
     let batch_started = Instant::now();
     let repair = process_live_obligations(context).await?;
     let bootstrap = process_bootstrap(context).await.unwrap_or_else(|error| {
@@ -1240,22 +1262,40 @@ pub async fn process_blob_batch(
         true
     });
     let now_ms = unix_timestamp_millis();
-    let scan = scan_due_jobs(&context.storage_handle, now_ms, REPLICATION_BATCH_SIZE).await?;
+    let scan = scan_due_jobs(&context.storage_handle, now_ms, PAGE_RECORDS).await?;
     let mut next_due_ms = scan.next_due_ms;
-    let has_more_due = repair.has_more || scan.has_more_due;
+    let mut has_more_due = repair.has_more || scan.has_more_due;
     let scan_elapsed = batch_started.elapsed();
     let job_count = scan.jobs.len();
-    let oldest_lag_ms = scan
-        .jobs
-        .iter()
-        .map(|(_, job)| now_ms.saturating_sub(job.due_at_ms))
+    // Lag counts from the obligation, which a version's id dates, not from a retry's due time.
+    let oldest_lag_ms = (scan.jobs.iter())
+        .map(|(_, job)| now_ms.saturating_sub(job.owed_since_ms()))
+        .chain(repair.oldest_ms.map(|owed| now_ms.saturating_sub(owed)))
         .max()
         .unwrap_or(0);
 
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
-    let mut relationships = read_job_relationships(&context.storage_handle, &scan.jobs).await?;
-    for (job_key, job) in scan.jobs {
+    let (paged, mut singles): (Vec<_>, Vec<_>) =
+        (scan.jobs.into_iter()).partition(|(_, job)| pageable(job));
+    let pages = deliver_pages(context, paged, sender).await?;
+    if let Some(due_at_ms) = pages.next_due_ms {
+        next_due_ms = min_due_at(next_due_ms, due_at_ms);
+    }
+    // A record held back for a later page is still due.
+    has_more_due |= pages.later > 0;
+    singles.extend(pages.single);
+    singles.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut next_cursor = scan.next_cursor;
+    // Jobs past the single bound stay due; the next drain continues after the last one sent.
+    if singles.len() > REPLICATION_BATCH_SIZE {
+        singles.truncate(REPLICATION_BATCH_SIZE);
+        next_cursor.generation = scan.generation;
+        next_cursor.after = singles.last().map(|(key, _)| key.clone());
+        has_more_due = true;
+    }
+    let mut succeeded = pages.delivered;
+    let mut failed = pages.failed;
+    let mut relationships = read_job_relationships(&context.storage_handle, &singles).await?;
+    for (job_key, job) in singles {
         let relationship = job.relationship_id.and_then(|relationship_id| {
             relationships
                 .get(&(job.input.bucket.clone(), relationship_id))
@@ -1294,7 +1334,7 @@ pub async fn process_blob_batch(
         }
     }
 
-    advance_replication_cursor(&context.storage_handle, scan.next_cursor).await?;
+    advance_replication_cursor(&context.storage_handle, next_cursor).await?;
 
     if job_count > 0 || repair.processed > 0 {
         info!(
@@ -2813,7 +2853,7 @@ async fn scan_due_jobs(
             key_space: REPLICATION_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: start_after.map(|key| IterStart::After(ByteView::from(key))),
-            limit: REPLICATION_PAGE_SIZE,
+            limit: PAGE_RECORDS,
             txn_id: None,
         })
         .await;
@@ -2875,6 +2915,7 @@ async fn scan_due_jobs(
                     after: last_key,
                     next_due_ms,
                 },
+                generation: cursor.generation,
                 jobs,
                 has_more_due: true,
                 next_due_ms,
@@ -2889,6 +2930,7 @@ async fn scan_due_jobs(
                 after: Some(next.to_vec()),
                 next_due_ms,
             },
+            generation: cursor.generation,
             jobs,
             has_more_due: true,
             next_due_ms,
@@ -2905,6 +2947,7 @@ async fn scan_due_jobs(
             after: None,
             next_due_ms,
         },
+        generation: cursor.generation,
         jobs,
         has_more_due: false,
         next_due_ms,
@@ -5034,6 +5077,19 @@ mod tests {
         // The next pass wraps to the start.
         repair_live(&storage).await;
         assert!(obligation_keys(&storage).await.is_empty());
+    }
+
+    #[test]
+    fn lag_dates_obligation() {
+        // A retried job's lag counts from when its version was written, not from its due time.
+        let version_id = Ulid::from_parts(1_000, 7);
+        let mut input = on_demand_input();
+        input.target = ReplicateScopeTarget::Version {
+            key: "key".to_string(),
+            version_id,
+        };
+        let job = BlobJobRecord::new(input, Some(false), 9_000);
+        assert_eq!(job.owed_since_ms(), 1_000);
     }
 
     // A large import into a bucket nothing replicates to leaves one obligation per file; they
