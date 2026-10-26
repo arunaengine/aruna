@@ -251,8 +251,12 @@ pub struct BulkRunResponse {
     pub blocked: Vec<BlockedGapBody>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
-    /// True only when this pass exhausted the responder's own iterator.
+    /// True only when this pass exhausted the responder's own iterator; for a distributed bucket,
+    /// once the pass of every coordinator did.
     pub complete: bool,
+    /// Coordinators of a distributed bucket that did not run this pass; the cursor asks them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreached: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -617,6 +621,9 @@ fn map_bulk_error(error: BulkError) -> ServerError {
         BulkError::NoSuchBucket => ServerError::NotFound,
         BulkError::BucketChanged => ServerError::Conflict(error.to_string()),
         BulkError::ForeignPolicy { .. } => foreign_policy(),
+        BulkError::Distribution(error) => {
+            crate::routes::storage::distributed::map_guard_error(error)
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -1363,6 +1370,12 @@ operation.
   policies.
 - `complete` means this node's bounded iterator was exhausted, never that another partition
   converged.
+- In a distributed bucket only the coordinator of a key's range mints its successor. A pass runs
+  on every coordinator: this node relays it to the others with the caller's bearer token, each
+  checks the caller and its own range authority again and mints only the keys of its own ranges,
+  and the answer joins their counts. The cursor holds each coordinator's position; `complete`
+  means every coordinator's pass ended, and `unreached` names coordinators asked again next time.
+  When no pending coordinator answers, the call fails with 503.
 
 **Limits**
 - The default page is 64 heads."#,
@@ -1400,23 +1413,60 @@ operation.
         (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 409, description = "The run was captured against a different bucket record, or the bucket now belongs to another group", body = ErrorResponse),
-        (status = 503, description = "This node advertises no placement subject or is not admitting governed data, so nothing governed can be minted here; the run was not started", body = ErrorResponse)
+        (status = 503, description = "This node advertises no placement subject or is not admitting governed data, so nothing governed can be minted here; the run was not started. For a distributed bucket also: no pending coordinator answered, or this node has no record of the set yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn run_bucket_placement(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<BulkRunRequest>,
 ) -> ServerResult<Json<BulkRunResponse>> {
     let auth = require_realm_auth(&state, auth)?;
     ensure_placement_writer(&state, &auth, &bucket).await?;
-    let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
-    let subject = local_subject(&state, auth.realm_id).await?;
+    crate::routes::storage::relay::relayed_set(&info, &headers)?;
+    Ulid::from_string(&request.operation_id).map_err(|_| ServerError::BadRequest)?;
+    let relayed = headers.contains_key(crate::routes::management_relay::RELAY_HOP_HEADER);
+    let answer = match info.distribution.as_ref().filter(|_| !relayed) {
+        Some(binding) => {
+            let local =
+                async |cursor| run_here(&state, auth, &bucket, &info, &request, cursor).await;
+            coordinators::run_spread(&state, &bucket, binding, bearer.as_ref(), &request, local)
+                .await?
+        }
+        None => {
+            run_here(
+                &state,
+                auth,
+                &bucket,
+                &info,
+                &request,
+                request.cursor.clone(),
+            )
+            .await?
+        }
+    };
+    Ok(Json(answer))
+}
+
+/// One pass over this node's own heads; in a distributed bucket only its own ranges mint.
+async fn run_here(
+    state: &ServerState,
+    auth: AuthContext,
+    bucket: &str,
+    info: &aruna_core::structs::storage::blob::BucketInfo,
+    request: &BulkRunRequest,
+    cursor: Option<String>,
+) -> ServerResult<BulkRunResponse> {
+    let realm_id = auth.realm_id;
+    let subject = local_subject(state, auth.realm_id).await?;
     let operation_id =
         Ulid::from_string(&request.operation_id).map_err(|_| ServerError::BadRequest)?;
+    let bucket = bucket.to_string();
     let report = drive(
         PolicyBulkOperation::new(BulkConfig {
             operation_id,
@@ -1424,7 +1474,7 @@ pub async fn run_bucket_placement(
             group_id: info.group_id,
             auth_context: auth,
             subject,
-            start_after: decode_cursor(request.cursor)?,
+            start_after: decode_cursor(cursor)?,
             limit: request.limit.unwrap_or(BULK_DEFAULT_LIMIT),
             now_ms: now_ms(),
             created_at: SystemTime::now(),
@@ -1433,8 +1483,8 @@ pub async fn run_bucket_placement(
     )
     .await
     .map_err(map_bulk_error)?;
-    let target_policies = named_refs(&state, realm_id, report.target_refs).await?;
-    Ok(Json(BulkRunResponse {
+    let target_policies = named_refs(state, realm_id, report.target_refs).await?;
+    Ok(BulkRunResponse {
         operation_id: report.operation_id.to_string(),
         status: bulk_status(report.status),
         generation: report.generation,
@@ -1453,7 +1503,8 @@ pub async fn run_bucket_placement(
             .collect(),
         cursor: report.cursor.map(hex::encode),
         complete: report.complete,
-    }))
+        unreached: Vec::new(),
+    })
 }
 
 /// Page size a pass uses when the caller names none.
@@ -1865,6 +1916,8 @@ fn quarantine_release(request: &QuarantineResolveRequest) -> ServerResult<Option
 
 #[cfg(test)]
 mod tests;
+
+mod coordinators;
 
 #[cfg(test)]
 #[path = "routes_tests.rs"]

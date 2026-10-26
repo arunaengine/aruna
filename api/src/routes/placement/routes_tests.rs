@@ -472,3 +472,100 @@ mod mint {
         );
     }
 }
+
+mod runs {
+    use super::super::{BulkRunRequest, BulkRunResponse, run_bucket_placement};
+    use crate::auth::ValidatedBearer;
+    use crate::error::ServerError;
+    use crate::tests::distributed::{
+        BUCKET, CLOSED_API, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state,
+        publish_api, replicate, write,
+    };
+    use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
+    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+    use aruna_core::structs::placement::policy::PlacementSubject;
+    use axum::Extension;
+    use axum::Json;
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use ulid::Ulid;
+
+    fn request(cursor: Option<String>) -> BulkRunRequest {
+        BulkRunRequest {
+            operation_id: Ulid::from_bytes([8; 16]).to_string(),
+            limit: Some(16),
+            cursor,
+        }
+    }
+
+    async fn run(node: &Node, request: BulkRunRequest) -> Result<BulkRunResponse, ServerError> {
+        let answer = run_bucket_placement(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+            Path(BUCKET.to_string()),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await?;
+        Ok(answer.0)
+    }
+
+    async fn advertise(node: &Node) {
+        let record = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: node_id(LOCAL),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .unwrap();
+        let (key, value) = (NODE_SUBJECT_KEY.to_vec(), record.to_bytes().unwrap());
+        write(&node.state, NODE_SUBJECT_KEYSPACE, key, value).await;
+    }
+
+    #[tokio::test]
+    async fn relays_coordinator_runs() {
+        let node = node_state().await;
+        replicate(&node.state, node.group_id, BUCKET).await;
+        let answer = r#"{"operation_id":"x","status":"completed","generation":2,"target_policies":[],
+            "observed":5,"covered":3,"minted":2,"replanned":0,"blocked":[],"complete":true}"#;
+        let peer = mock_peer(StatusCode::OK, answer).await;
+        publish_api(&node.state, node_id(PEER), &peer.url).await;
+
+        let joined = run(&node, request(None)).await.unwrap();
+
+        assert_eq!(
+            peer.paths.lock().unwrap().clone(),
+            vec![format!("/api/v1/data/buckets/{BUCKET}/placement/runs")]
+        );
+        assert_eq!((joined.observed, joined.minted, joined.covered), (5, 2, 3));
+        assert_eq!(joined.status, "completed");
+        assert!(joined.complete && joined.cursor.is_none() && joined.unreached.is_empty());
+    }
+
+    #[tokio::test]
+    async fn keeps_unreached_coordinator() {
+        let node = node_state().await;
+        advertise(&node).await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        publish_api(&node.state, node_id(PEER), CLOSED_API).await;
+
+        // This node runs its own ranges; the peer is named and kept for the next call.
+        let first = run(&node, request(None)).await.unwrap();
+        assert!(!first.complete);
+        assert_eq!(first.unreached, vec![node_id(PEER).to_string()]);
+        let cursor = first
+            .cursor
+            .expect("the unreached coordinator keeps the run open");
+
+        // Asked again, only the unreached peer is pending: with no answer the call fails.
+        let Err(ServerError::ServiceUnavailableReason(reason)) =
+            run(&node, request(Some(cursor))).await
+        else {
+            panic!("a call where no pending coordinator answers does not repeat its cursor");
+        };
+        assert!(reason.contains(&node_id(PEER).to_string()));
+    }
+}
