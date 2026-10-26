@@ -193,6 +193,22 @@ fn check_maps_unreachable() {
     assert_eq!(check_error_message(&error), "connector is unreachable");
 }
 
+// A missing setting is named; provider text behind other creation failures stays hidden.
+#[test]
+fn check_names_setting() {
+    use aruna_core::errors::StagingSourceError;
+    use aruna_operations::staging::check_source::CheckSourceError;
+    let missing = CheckSourceError::Staging(StagingSourceError::MissingSetting("region"));
+    let failed = StagingSourceError::OperatorCreationFailed("secret-marker".to_string());
+
+    assert_eq!(
+        check_error_message(&missing),
+        "the connector configuration names no region"
+    );
+    let hidden = check_error_message(&CheckSourceError::Staging(failed));
+    assert_eq!(hidden, "connector configuration is invalid");
+}
+
 #[tokio::test]
 async fn stored_check_resolves() {
     let test = setup_state().await;

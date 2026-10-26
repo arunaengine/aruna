@@ -778,6 +778,8 @@ because the body carries credentials the node then opens a connection with.
 
 **Errors**: a failure `error` comes from a fixed set.
 - `connector configuration is invalid`: the settings cannot be turned into a client.
+- `the connector configuration names no region`: an `s3` source needs `region`, as no default
+  region is configured on this node.
 - `connector is unreachable`: the endpoint refused or denied, or the egress guard blocked its
   address; worth retrying only if the remote is expected to recover.
 - `connector check is unavailable`: this node cannot run source checks at the moment; retry as is.
@@ -878,8 +880,8 @@ unlike the check that takes settings in the body, because the caller supplies no
 - Nothing is written and the record is left untouched whatever the outcome.
 
 **Errors**: `connector check is unavailable` and `connector check timed out` are retryable, while
-`connector configuration is invalid` and `connector kind is not supported` mean the stored record
-must be replaced."#,
+`connector configuration is invalid`, a named missing setting and `connector kind is not supported`
+mean the stored record must be replaced."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
         ("connector_id" = String, Path, description = "Connector to probe, as a 26-character ULID")
@@ -1166,6 +1168,9 @@ fn check_error_message(
     match error {
         CheckSourceError::Staging(StagingSourceError::OperatorCreationFailed(_)) => {
             "connector configuration is invalid".to_string()
+        }
+        CheckSourceError::Staging(error @ StagingSourceError::MissingSetting(_)) => {
+            error.to_string()
         }
         CheckSourceError::Staging(StagingSourceError::UnsupportedKind(_)) => {
             "connector kind is not supported".to_string()

@@ -624,6 +624,9 @@ async fn build_source_operator<'access>(
                     build_service::<services::Http>(config.clone(), Some(guard.context()))
                         .map_err(staging_creation_error)?
                 }
+                SourceConnectorKind::S3 if s3_region(config, environment_variable).is_none() => {
+                    return Err(StagingSourceError::MissingSetting("region"));
+                }
                 SourceConnectorKind::S3 => build_service::<services::S3>(
                     s3_operator_config(config.clone()),
                     Some(guard.context()),

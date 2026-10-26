@@ -148,6 +148,9 @@ pub enum StagingSourceError {
     UnsupportedKind(String),
     #[error("Operator creation failed: {0}")]
     OperatorCreationFailed(String),
+    /// A required connector setting is absent; names the setting, never a value.
+    #[error("the connector configuration names no {0}")]
+    MissingSetting(&'static str),
     #[error("Check error: {0}")]
     CheckError(String),
     #[error("Stat error: {0}")]
