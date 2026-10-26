@@ -164,7 +164,7 @@ pub(crate) async fn node_state() -> Node {
     }
 }
 
-fn bucket_info(group_id: Ulid, distribution: Option<DistributionBinding>) -> BucketInfo {
+pub(crate) fn bucket_info(group_id: Ulid, distribution: Option<DistributionBinding>) -> BucketInfo {
     BucketInfo {
         group_id,
         created_at: std::time::SystemTime::UNIX_EPOCH,

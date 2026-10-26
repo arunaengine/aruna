@@ -423,3 +423,7 @@ pub async fn reject(
     .map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+#[path = "databases_tests.rs"]
+mod tests;
