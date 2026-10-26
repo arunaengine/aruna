@@ -170,7 +170,7 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
         }
         let page = match checkpoint.manifest.is_some() {
             true => read_manifest_chunk(ctx, spec, &mut checkpoint).await,
-            false => walk_page(ctx, spec, None, &mut checkpoint, &mut ahead).await,
+            false => walk_page(ctx, spec, (None, None), &mut checkpoint, &mut ahead).await,
         };
         if let Err(outcome) = page {
             return match outcome {

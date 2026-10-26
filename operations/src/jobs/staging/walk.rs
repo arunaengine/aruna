@@ -198,7 +198,7 @@ struct StagedFile {
 pub(super) async fn walk_page(
     ctx: &JobContext,
     spec: &StagingJobSpec,
-    slot: Option<u64>,
+    (slot, upper): (Option<u64>, Option<&str>),
     checkpoint: &mut StagingJobCheckpoint,
     ahead: &mut Option<Ahead>,
 ) -> Result<(), PageFailure> {
@@ -213,7 +213,7 @@ pub(super) async fn walk_page(
     let mut deletes = Vec::new();
     let listed = match ahead.take().filter(|ahead| ahead.walk == walk) {
         Some(ahead) => ahead.listing,
-        None => listing(ctx, spec, &walk, flat).await?,
+        None => listing(ctx, spec, &walk, (flat, upper)).await?,
     };
     let (segment, listed) = match listed {
         Listing::Done => {
@@ -315,7 +315,7 @@ pub(super) async fn walk_page(
             let following = (next.walk.clone()).filter(|walk| flat && walk.queue_row.is_none());
             let prefetch = async {
                 let walk = following?;
-                let listing = listing(ctx, spec, &walk, flat).await.ok()?;
+                let listing = listing(ctx, spec, &walk, (flat, upper)).await.ok()?;
                 Some(Ahead { walk, listing })
             };
             let import = import_page(ctx, spec, slot, checkpoint, next, rows, page);
@@ -350,10 +350,10 @@ async fn listing(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     walk: &StagingWalk,
-    flat: bool,
+    (flat, upper): (bool, Option<&str>),
 ) -> Result<Listing, PageFailure> {
     let segment = match (flat, walk.queue_row) {
-        (true, None) => match segment_of(ctx, spec, walk).await? {
+        (true, None) => match segment_of(ctx, spec, walk, upper).await? {
             Bounds::Whole => None,
             Bounds::Segment(segment) => Some(segment),
             Bounds::Done => return Ok(Listing::Done),
@@ -574,11 +574,13 @@ fn next_segment(
     Bounds::Done
 }
 
-/// The bounds of the walk's next listing in a distributed destination.
+/// The bounds of the walk's next listing: the key ranges a distributed destination has this node
+/// coordinate, or the whole bucket, cut at a lane's exclusive `upper` target key.
 async fn segment_of(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     walk: &StagingWalk,
+    upper: Option<&str>,
 ) -> Result<Bounds, PageFailure> {
     let bucket = match pinned_bucket(ctx, spec).await {
         Ok(bucket) => bucket,
@@ -590,7 +592,13 @@ async fn segment_of(
         ) => return Err(PageFailure::Permanent(message)),
     };
     let Some(binding) = bucket.distribution.as_ref() else {
-        return Ok(Bounds::Whole);
+        if upper.is_none() && walk.from.is_none() {
+            return Ok(Bounds::Whole);
+        }
+        return Ok(next_segment(
+            walk,
+            clamped(vec![(String::new(), None)], upper),
+        ));
     };
     let read = StorageEffect::BatchRead {
         reads: authority_reads(binding.set_id),
@@ -615,7 +623,61 @@ async fn segment_of(
             Err(error) => return Err(retry(error)),
         }
     }
-    Ok(next_segment(walk, coordinated))
+    Ok(next_segment(walk, clamped(coordinated, upper)))
+}
+
+/// Key ranges cut at a lane's exclusive upper target key; ranges left empty are dropped.
+fn clamped(
+    ranges: Vec<(String, Option<String>)>,
+    upper: Option<&str>,
+) -> Vec<(String, Option<String>)> {
+    let Some(upper) = upper else {
+        return ranges;
+    };
+    (ranges.into_iter())
+        .filter(|(lower, _)| lower.as_str() < upper)
+        .map(|(lower, end)| {
+            let end = match end {
+                Some(end) if end.as_str() < upper => end,
+                _ => upper.to_string(),
+            };
+            (lower, Some(end))
+        })
+        .collect()
+}
+
+/// The first source file at or after `lower` below the walk's path, listed alone.
+pub(super) async fn first_key(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    walk: &StagingWalk,
+    lower: &str,
+) -> Result<Option<String>, PageFailure> {
+    let listed = drive(
+        ListStagingOperation::new(ListStagingInput {
+            group_id: spec.group_id,
+            connector_id: spec.connector_id,
+            source_path: walk.source_path.clone(),
+            request: ListRequest {
+                cursor: None,
+                lower: Some(lower.to_string()),
+                stop: None,
+                limit: 1,
+                recursive: true,
+                files_only: true,
+            },
+        }),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| PageFailure::Retry(error.to_string()))?;
+    Ok(listed.entries.into_iter().next().map(|entry| entry.path))
+}
+
+/// The target key a source key below the walk's path maps to.
+pub(super) fn target_of(walk: &StagingWalk, source_key: &str) -> Option<String> {
+    let relative = relative_entry_path(&walk.source_path, source_key, true).ok()?;
+    Some(join_target_prefix(&walk.target_prefix, &relative))
 }
 
 /// The files of a page this node imports.
