@@ -58,7 +58,10 @@ use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 const REPLICATION_PAGE_SIZE: usize = 512;
 const REPLICATION_BATCH_SIZE: usize = 64;
 const STATS_PAGE_SIZE: usize = 256;
-const OBLIGATION_BATCH_SIZE: usize = 64;
+/// Obligations one pass reads; those without downstream work are retired together.
+const OBLIGATION_BATCH_SIZE: usize = 1024;
+/// Obligations one pass turns into replication jobs.
+const OBLIGATION_WORK_LIMIT: usize = 64;
 const REPLICATION_JOB_LIMIT: usize = 64;
 const REPLICATION_RELATIONSHIP_LIMIT: usize = 1024;
 const REPLICATION_CURSOR_KEY: &[u8] = b"blob_replication_cursor";
@@ -1923,6 +1926,8 @@ async fn process_live_obligations(
         has_more,
         ..Default::default()
     };
+    let mut retired = Vec::new();
+    let mut worked = 0usize;
 
     for (obligation_key, obligation) in obligations {
         let cursor = obligation.continuation.clone().unwrap_or_default();
@@ -1947,6 +1952,18 @@ async fn process_live_obligations(
             }
             _ => Vec::new(),
         };
+        // A version of a bucket nothing replicates to owes no job: such obligations, one per
+        // imported file, are retired in one transaction instead of one each.
+        let idle = relationships.is_none_or(|page| page.values.is_empty() && page.next.is_none());
+        if members.is_empty() && idle && !hop_exhausted {
+            retired.push((obligation_key, obligation.continuation));
+            continue;
+        }
+        if worked == OBLIGATION_WORK_LIMIT {
+            result.has_more = true;
+            continue;
+        }
+        worked += 1;
         let write =
             write_live_jobs(&context.storage_handle, &obligation, relationships, members).await?;
         if !write.progressed {
@@ -1969,8 +1986,82 @@ async fn process_live_obligations(
         result.processed = result.processed.saturating_add(1);
         result.queued = result.queued.saturating_add(write.queued);
     }
+    result.processed = result.processed.saturating_add(retired.len());
+    delete_live_obligations(&context.storage_handle, retired).await?;
 
     Ok(result)
+}
+
+/// Deletes each obligation whose continuation is still the one read, in one transaction.
+async fn delete_live_obligations(
+    storage: &StorageHandle,
+    obligations: Vec<(Vec<u8>, Option<LiveReplicationContinuation>)>,
+) -> Result<(), BlobQueueError> {
+    if obligations.is_empty() {
+        return Ok(());
+    }
+    let unexpected = |other: Event| BlobQueueError::UnexpectedEvent(format!("{other:?}"));
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(unexpected(other)),
+    };
+    let reads = (obligations.iter())
+        .map(|(key, _)| {
+            let key = ByteView::from(key.clone());
+            (REPLICATION_OBLIGATION_KEYSPACE.to_string(), key)
+        })
+        .collect();
+    let read = StorageEffect::BatchRead {
+        reads,
+        txn_id: Some(txn_id),
+    };
+    let values = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(match other {
+                Event::Storage(StorageEvent::Error { error }) => error.into(),
+                other => unexpected(other),
+            });
+        }
+    };
+    let deletes = (obligations.into_iter().zip(values))
+        .filter(|((_, expected), (_, value))| {
+            value
+                .as_deref()
+                .is_some_and(|value| match LiveObligationRecord::from_bytes(value) {
+                    Ok(record) => record.continuation == *expected,
+                    Err(_) => expected.is_none(),
+                })
+        })
+        .map(|((key, _), _)| (REPLICATION_OBLIGATION_KEYSPACE.to_string(), key.into()))
+        .collect();
+    let delete = StorageEffect::BatchDelete {
+        deletes,
+        txn_id: Some(txn_id),
+    };
+    match storage.send_storage_effect(delete).await {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(match other {
+                Event::Storage(StorageEvent::Error { error }) => error.into(),
+                other => unexpected(other),
+            });
+        }
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(unexpected(other)),
+    }
 }
 
 async fn read_live_obligations(
@@ -4769,6 +4860,50 @@ mod tests {
         assert_eq!(second.processed, 2);
         assert_eq!(second.failed, 2);
         assert!(read_obligations(&storage).await.is_empty());
+    }
+
+    // A large import into a bucket nothing replicates to leaves one obligation per file; they
+    // are retired in one pass with a fixed number of requests, not one transaction each.
+    #[tokio::test]
+    async fn idle_obligations_retired() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        write_bucket(&storage, "bucket").await;
+        for index in 0..300u64 {
+            let Effect::Storage(effect) = build_live_obligation(
+                node(1),
+                auth_context(),
+                "bucket".to_string(),
+                format!("key-{index:03}"),
+                Ulid::from_parts(index, 1),
+                false,
+                None,
+            )
+            .expect("obligation effect builds") else {
+                panic!("expected storage effect");
+            };
+            storage.send_storage_effect(effect).await;
+        }
+
+        let before = storage.snapshot_metrics().requests_total;
+        repair_live(&storage).await;
+
+        assert!(storage.snapshot_metrics().requests_total - before < 16);
+        let remaining = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            remaining,
+            Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty()
+        ));
+        assert!(read_jobs(&storage).await.is_empty());
     }
 
     #[tokio::test]
