@@ -119,6 +119,7 @@ mod tests {
             group_id: GroupId::nil(),
             group_name: None,
             created_at: SystemTime::UNIX_EPOCH,
+            set_id: None,
         }
     }
 

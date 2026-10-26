@@ -240,6 +240,10 @@ pub struct BucketHit {
     pub group_id: String,
     pub group_name: Option<String>,
     pub created_at: String,
+    /// The distributed bucket this hit is a member of; absent for an ordinary bucket. Hits of one
+    /// set on several nodes are one bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -351,6 +355,8 @@ to its own buckets, so a bucket the caller may not read never appears.
 - The search fans out over the realm's serving nodes under one shared deadline of about 12 seconds.
 - An empty or missing `q` lists every bucket the caller may read; `group_id` keeps only the
   buckets of that group.
+- A member of a distributed bucket carries its `set_id`; every member node answers its own hit,
+  so hits with one `set_id` are one bucket.
 - Hits are ordered by bucket name, then node id. `next_cursor` continues the listing and is absent
   on the last page. It is opaque, holds a scan position per node and is only valid with the same
   `q` and `group_id`; every page checks authorization again.
@@ -875,6 +881,7 @@ fn map_bucket_section(result: BucketSearchExecution) -> BucketsSection {
                 group_id: hit.group_id.to_string(),
                 group_name: hit.group_name,
                 created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
+                set_id: hit.set_id.map(|set_id| set_id.to_string()),
             })
             .collect(),
         next_cursor: result.next_cursor,
