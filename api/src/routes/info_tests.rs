@@ -1886,3 +1886,20 @@ fn group_omits_stored() {
     assert!(!realm.contains_key("stored_blobs"));
     assert!(!realm.contains_key("stored_bytes"));
 }
+
+#[tokio::test]
+async fn counts_distributed_once() {
+    use crate::tests::distributed::{BUCKET, distribute, node_state};
+    // The set has a member bucket on this node and on the peer: a node total of 5 is 4 buckets.
+    let node = node_state().await;
+    distribute(&node.state, node.group_id, BUCKET).await;
+    assert_eq!(super::distinct_buckets(&node.state, None, 5).await, Some(4));
+    assert_eq!(
+        super::distinct_buckets(&node.state, Some(node.group_id), 5).await,
+        Some(4)
+    );
+    assert_eq!(
+        super::distinct_buckets(&node.state, Some(ulid::Ulid::nil()), 5).await,
+        Some(5)
+    );
+}

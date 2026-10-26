@@ -2008,7 +2008,12 @@ impl GroupQuotaStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct UsageTotals {
+    /// Bucket counters summed over the nodes: a distributed bucket counts once per member node.
     pub buckets: u64,
+    /// `buckets` with each distributed bucket counted once, from this node's records of the sets;
+    /// omitted when they cannot all be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct_buckets: Option<u64>,
     pub objects: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stored_blobs: Option<u64>,
@@ -2022,6 +2027,7 @@ impl From<UsageCounters> for UsageTotals {
     fn from(counters: UsageCounters) -> Self {
         Self {
             buckets: counters.buckets,
+            distinct_buckets: None,
             objects: counters.objects,
             stored_blobs: Some(counters.stored_blobs),
             stored_bytes: Some(counters.stored_bytes),
@@ -2078,6 +2084,23 @@ pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerRes
         .map_err(|error| ServerError::InternalError(error.to_string()))
 }
 
+/// The realm or group bucket total with each distributed bucket once; `None` when this node cannot
+/// read all its set records, so the plain total is not passed off as exact.
+pub(crate) async fn distinct_buckets(
+    state: &ServerState,
+    group: Option<ulid::Ulid>,
+    buckets: u64,
+) -> Option<u64> {
+    match aruna_operations::distribution::counts::set_counts(&state.get_ctx(), group).await {
+        Ok(counts) if counts.complete => Some(counts.distinct(buckets)),
+        Ok(_) => None,
+        Err(error) => {
+            warn!(error = %error, "distributed bucket counts unavailable for usage response");
+            None
+        }
+    }
+}
+
 pub async fn load_realm_usage(
     state: &ServerState,
     scope: RealmUsageScope,
@@ -2109,6 +2132,9 @@ checked, because the figures are realm-wide totals and not per-caller views.
 - `stored_blobs` and `stored_bytes` count physical, content-addressed blob copies. A copy is shared
   by every group referencing it, so it is attributed to this node and its backend, never to a group;
   the group usage endpoint therefore omits both fields.
+- `realm.buckets` sums the nodes' bucket counters, so a distributed bucket counts once per member
+  node; `realm.distinct_buckets` counts it once, from this node's records of the distributed
+  buckets, and is omitted when they cannot all be read.
 - `metadata_documents` counts the realm's live metadata documents, excluding lifecycle-deleted ones,
   and is deliberately unfiltered by what the caller may read. It is omitted, never zeroed, when this
   node has no metadata subsystem or the count cannot be produced, so an absent field means unknown.
@@ -2127,6 +2153,7 @@ checked, because the figures are realm-wide totals and not per-caller views.
                 "referenced_bytes": 2147483648_i64,
                 "realm": {
                     "buckets": 12,
+                    "distinct_buckets": 10,
                     "objects": 512,
                     "stored_blobs": 530,
                     "stored_bytes": 4294967296_i64,
@@ -2149,6 +2176,7 @@ pub async fn get_usage(
     let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
     let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
     let mut response = UsageResponse::new(local, realm);
+    response.realm.distinct_buckets = distinct_buckets(&state, None, response.realm.buckets).await;
     // Best effort: storage counters stay reportable when the metadata
     // subsystem cannot answer, and the omitted field never reads as zero.
     response.metadata_documents =

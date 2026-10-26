@@ -1261,6 +1261,9 @@ Membership is the only permission check, so a realm administrator who is not a m
 - Classification reads each live registry record's root-only RO-Crate summary: a root whose `@type`
   contains `http://www.w3.org/ns/dx/prof/Profile` is a Profile, one with exact `conformsTo`
   `https://w3id.org/ro/wfrun/process/0.5` is a Process Run, and every other root is a Dataset.
+- `realm.distinct_buckets` is `realm.buckets` with each distributed bucket of the group counted
+  once instead of once per member node; it is omitted when this node cannot read all its records
+  of the distributed buckets.
 - `quota` restates the realm quota configuration for this group with a warning flag evaluated
   against the group's realm-wide logical bytes; it is omitted when the realm configuration cannot be
   read.
@@ -1286,6 +1289,7 @@ Membership is the only permission check, so a realm administrator who is not a m
                 "process_run_count": 19,
                 "realm": {
                     "buckets": 5,
+                    "distinct_buckets": 4,
                     "objects": 2048,
                     "logical_bytes": 152882105100_i64,
                     "referenced_bytes": 152882105100_i64
@@ -1339,6 +1343,8 @@ pub(crate) async fn run_group_usage(
     // warning threshold is evaluated against the same counter.
     let group_logical_bytes = realm.logical_bytes;
     let mut response = crate::routes::info::UsageResponse::for_group(local, realm);
+    response.realm.distinct_buckets =
+        crate::routes::info::distinct_buckets(state, Some(group_id), response.realm.buckets).await;
     match count_group_purpose(&state.get_ctx(), state.get_realm_id(), group_id).await {
         Ok(Some(counts)) => {
             response.dataset_count = Some(counts.dataset_count);
