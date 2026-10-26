@@ -118,7 +118,7 @@ pub(crate) async fn job_entry_deletes(
     ))
 }
 
-/// One bounded page of a staging job's queue and manifest rows; `true` while more remain.
+/// One bounded page of a staging job's queue, manifest and lane rows; `true` while more remain.
 pub(crate) async fn staging_row_deletes(
     storage: &StorageHandle,
     job_id: JobId,
@@ -130,6 +130,7 @@ pub(crate) async fn staging_row_deletes(
     for key_space in [
         aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE,
         aruna_core::keyspaces::STAGING_MANIFEST_KEYSPACE,
+        aruna_core::keyspaces::STAGING_STATE_KEYSPACE,
     ] {
         let room = limit.saturating_sub(deletes.len());
         if room == 0 {

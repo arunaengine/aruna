@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod lanes;
 mod manifest;
 mod walk;
 
@@ -33,7 +34,20 @@ use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob}
 use crate::staging::snapshot::{MaterializeSnapshotInput, stage_snapshot_blob};
 use aruna_core::structs::checksum::ExpectedChecksum;
 
+/// The job's progress with its open prefix lanes counted in; a lane's prefix reads as not
+/// started yet, as a job handed over goes on from there.
 pub async fn read_staging_checkpoint(
+    context: &crate::driver::DriverContext,
+    job_id: JobId,
+) -> Result<Option<StagingJobCheckpoint>, String> {
+    let Some(main) = read_main(context, job_id).await? else {
+        return Ok(None);
+    };
+    let open = lanes::read_lanes(context, job_id).await?;
+    Ok(Some(lanes::merged(main, open)))
+}
+
+async fn read_main(
     context: &crate::driver::DriverContext,
     job_id: JobId,
 ) -> Result<Option<StagingJobCheckpoint>, String> {
@@ -50,7 +64,7 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
     if spec.strategy == StagingStrategy::Sync {
         return permanent_error("sync is not a staging job strategy");
     }
-    let mut checkpoint = match read_staging_checkpoint(&ctx.driver, ctx.job_id).await {
+    let mut checkpoint = match read_main(&ctx.driver, ctx.job_id).await {
         Ok(Some(checkpoint)) => checkpoint,
         Ok(None) => initial_checkpoint(spec),
         Err(error) => return retryable_error(error),
@@ -136,6 +150,17 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
             continue;
         }
 
+        if lanes::applies(spec, &checkpoint) {
+            match lanes::run_lanes(ctx, spec, &mut checkpoint).await {
+                // Every prefix is walked, so the walk below finds nothing left.
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(PageFailure::Retry(message)) => return retryable_error(message),
+                Err(PageFailure::Permanent(message)) => {
+                    return finish_failed(ctx, permanent_error(message)).await;
+                }
+            }
+        }
         if checkpoint.manifest.is_none() && checkpoint.walk.is_none() {
             match start_walk(ctx, spec, &mut checkpoint).await {
                 Ok(true) => continue,
