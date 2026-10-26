@@ -153,3 +153,23 @@ async fn approval_rechecks_owner() {
         "{result:?}"
     );
 }
+
+#[test]
+fn approver_accepts_hidden() {
+    // An approver who cannot read a private dataset still approves; an unlinked one never.
+    use crate::realm::database::confirm_link;
+    let dataset = Ulid::from_bytes([83; 16]);
+    assert!(confirm_link(Some(LinkedDataset::Hidden), dataset, true).is_ok());
+    assert!(matches!(
+        confirm_link(Some(LinkedDataset::Hidden), dataset, false),
+        Err(DatabaseServiceError::NotLinked(_))
+    ));
+    assert!(matches!(
+        confirm_link(Some(LinkedDataset::Unlinked), dataset, true),
+        Err(DatabaseServiceError::NotLinked(_))
+    ));
+    assert!(matches!(
+        confirm_link(None, dataset, true),
+        Err(DatabaseServiceError::Unavailable(_))
+    ));
+}

@@ -138,7 +138,7 @@ pub async fn mark_database(
     entry
         .validate()
         .map_err(|error| DatabaseServiceError::BadRequest(error.to_string()))?;
-    require_link(context, realm_id, node_id, caller, &entry).await?;
+    require_link(context, (realm_id, node_id), caller, &entry, false).await?;
     let owner_path = owner_admin_path(realm_id, owner_group);
     if allowed(context, realm_id, auth, &owner_path, Permission::WRITE).await? {
         let actor = Actor {
@@ -171,17 +171,28 @@ pub async fn mark_database(
     Ok(MarkOutcome::Pending(request))
 }
 
-/// Refuses an entry whose dataset does not link the bucket root now.
+/// Refuses an entry whose dataset does not link the bucket root now. An approver may be unable
+/// to read a private dataset: `hidden_ok` accepts that case, which the curator already passed.
 async fn require_link(
     context: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
+    (realm_id, node_id): (RealmId, NodeId),
     caller: &Caller,
     entry: &DatabaseEntry,
+    hidden_ok: bool,
 ) -> Result<(), DatabaseServiceError> {
-    match list::dataset_links(context, realm_id, node_id, caller, entry).await? {
+    let links = list::dataset_links(context, realm_id, node_id, caller, entry).await?;
+    confirm_link(links, entry.dataset_id, hidden_ok)
+}
+
+fn confirm_link(
+    links: Option<list::LinkedDataset>,
+    dataset_id: Ulid,
+    hidden_ok: bool,
+) -> Result<(), DatabaseServiceError> {
+    match links {
         Some(list::LinkedDataset::Linked { .. }) => Ok(()),
-        Some(_) => Err(DatabaseServiceError::NotLinked(entry.dataset_id)),
+        Some(list::LinkedDataset::Hidden) if hidden_ok => Ok(()),
+        Some(_) => Err(DatabaseServiceError::NotLinked(dataset_id)),
         None => Err(DatabaseServiceError::Unavailable(
             "not every metadata node answered; the dataset link cannot be confirmed".to_string(),
         )),
@@ -210,7 +221,7 @@ pub async fn approve_request(
             "the bucket now belongs to group {owner}; mark it again"
         )));
     }
-    require_link(context, realm_id, node_id, caller, &request.entry).await?;
+    require_link(context, (realm_id, node_id), caller, &request.entry, true).await?;
     let net = context
         .net_handle
         .as_ref()
