@@ -435,6 +435,52 @@ async fn batch_rejects_node() {
     assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
 }
 
+// Every job store state reads as itself or its collapsed class; nothing settled reads as running.
+#[test]
+fn job_states_mapped() {
+    use aruna_core::structs::execution::job::{JobId, JobRecord, StagingJobSpec};
+    let realm_id = aruna_core::structs::identity::realm::RealmId([1; 32]);
+    let user_id = UserId::new(Ulid::from_bytes([2; 16]), realm_id);
+    let spec = StagingJobSpec {
+        auth_context: AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        group_id: Ulid::from_bytes([3; 16]),
+        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+        connector_id: Ulid::from_bytes([5; 16]),
+        bucket: "imports".to_string(),
+        bucket_identity: (Ulid::nil(), UNIX_EPOCH, UserId::default()),
+        strategy: StagingStrategy::Reference,
+        items: Vec::new(),
+        prefixes: Vec::new(),
+        checksum_manifest: None,
+    };
+    let node = iroh::SecretKey::from_bytes(&[6; 32]).public();
+    let job_id = JobId::from_bytes([7; 16]);
+    let payload = JobPayload::Staging(spec);
+    let mut record = JobRecord::new(job_id, payload, user_id, node, 1, 1, None);
+    let expected = [
+        (JobState::Queued, "queued"),
+        (JobState::Claimed, "queued"),
+        (JobState::AwaitingKey, "awaiting_key"),
+        (JobState::Preparing, "running"),
+        (JobState::Ready, "running"),
+        (JobState::Running, "running"),
+        (JobState::Cancelling, "cancelling"),
+        (JobState::Indeterminate, "indeterminate"),
+        (JobState::Succeeded, "done"),
+        (JobState::Failed, "failed"),
+        (JobState::Cancelled, "cancelled"),
+    ];
+    for (state, name) in expected {
+        record.state = state;
+        assert_eq!(staging_job_response(&record, None).unwrap().state, name);
+    }
+}
+
 #[tokio::test]
 async fn batch_sync_unimplemented() {
     let test = setup_state().await;

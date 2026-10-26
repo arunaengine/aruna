@@ -935,8 +935,9 @@ pub async fn list_staging_jobs(
 - The job is always answered by the node that owns it: a request landing anywhere else is forwarded
   to that owner, so the same id can be read from any node and the answer is the owner's current
   record rather than a replica.
-- `state` collapses the lifecycle into queued, running, done or failed, while `phase` names the
-  stage the runner last checkpointed, so a job can read as running long before any bytes move.
+- `state` collapses the lifecycle into queued, running, done or failed; `awaiting_key`,
+  `cancelling`, `indeterminate` and `cancelled` are reported as the job store names them. `phase`
+  names the stage the runner last checkpointed, so a job can read as running before bytes move.
 - `progress` and `errors` come from that same checkpoint, so they trail the work; per-object
   failures are listed while the job as a whole may still succeed, and `finished_at` is set only once
   the job has stopped."#,
@@ -1213,6 +1214,20 @@ fn staging_job_visible(record: &JobRecord, auth: &AuthContext) -> bool {
     auth.path_restrictions.is_none() || spec.auth_context == *auth
 }
 
+/// The staging view of a job state; states outside the collapsed four keep their job name.
+fn staging_state(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued | JobState::Claimed => "queued",
+        JobState::Preparing | JobState::Ready | JobState::Running => "running",
+        JobState::Succeeded => "done",
+        JobState::Failed => "failed",
+        JobState::AwaitingKey
+        | JobState::Cancelling
+        | JobState::Indeterminate
+        | JobState::Cancelled => state.name(),
+    }
+}
+
 fn staging_job_response(
     record: &JobRecord,
     checkpoint: Option<&StagingJobCheckpoint>,
@@ -1252,13 +1267,7 @@ fn staging_job_response(
         group_id: spec.group_id.to_string(),
         connector_id: spec.connector_id.to_string(),
         bucket: spec.bucket.clone(),
-        state: match record.state {
-            JobState::Queued | JobState::Claimed => "queued",
-            JobState::Succeeded => "done",
-            JobState::Failed | JobState::Cancelled => "failed",
-            _ => "running",
-        }
-        .to_string(),
+        state: staging_state(record.state).to_string(),
         phase: staging_phase_name(phase).to_string(),
         submitted_at: format_job_time(record.created_at_ms),
         finished_at: record.finished_at_ms.map(format_job_time),
