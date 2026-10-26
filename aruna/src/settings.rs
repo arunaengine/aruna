@@ -19,7 +19,7 @@ use aruna_core::structs::storage::node_info::{
 };
 use aruna_net::IrohRuntimeConfig;
 use aruna_operations::metadata::MetadataSearchStorage;
-use aruna_storage::FjallPersistPolicy;
+use aruna_storage::{CACHE_BYTES, FjallPersistPolicy};
 
 use crate::config::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
 
@@ -62,6 +62,8 @@ pub struct Settings {
     pub metadata_storage_path: String,
     pub metadata_search_storage: MetadataSearchStorage,
     pub fjall_persist_policy: FjallPersistPolicy,
+    /// Block cache of the node database, from `ARUNA_FJALL_CACHE_MIB`.
+    pub fjall_cache_bytes: u64,
     pub sync_storage_path: PathBuf,
     /// Writable disk directory of unnamed temporary spool files.
     pub spool_path: PathBuf,
@@ -138,6 +140,8 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         .unwrap_or_else(|| format!("{storage_path}/craqle"));
     let metadata_search_storage = search_storage_env(env)?;
     let fjall_persist_policy = persist_policy_env(env)?;
+    let fjall_cache_mib = positive_u64_env(env, "ARUNA_FJALL_CACHE_MIB", CACHE_BYTES >> 20)?;
+    let fjall_cache_bytes = fjall_cache_mib.saturating_mul(1 << 20);
     let sync_storage_path = env
         .var("DOCUMENT_SYNC_STORAGE_PATH")
         .map(PathBuf::from)
@@ -309,6 +313,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         metadata_storage_path,
         metadata_search_storage,
         fjall_persist_policy,
+        fjall_cache_bytes,
         sync_storage_path,
         spool_path,
         blob_root,
@@ -1126,6 +1131,16 @@ mod tests {
         assert!(parse(&[("ARUNA_FJALL_PERSIST_MODE", "sync_all")]).is_ok());
         let error = parse(&[("ARUNA_FJALL_PERSIST_MODE", "nonsense")]).unwrap_err();
         assert_eq!(invalid_key(error), "ARUNA_FJALL_PERSIST_MODE");
+    }
+
+    // The cache is set in MiB, defaults to the storage default and refuses zero.
+    #[test]
+    fn cache_size_validation() {
+        assert_eq!(parse(&[]).unwrap().fjall_cache_bytes, CACHE_BYTES);
+        let raised = parse(&[("ARUNA_FJALL_CACHE_MIB", "4096")]).unwrap();
+        assert_eq!(raised.fjall_cache_bytes, 4 << 30);
+        let error = parse(&[("ARUNA_FJALL_CACHE_MIB", "0")]).unwrap_err();
+        assert_eq!(invalid_key(error), "ARUNA_FJALL_CACHE_MIB");
     }
 
     #[test]

@@ -6,4 +6,6 @@ mod compaction;
 pub mod errors;
 pub mod storage;
 
-pub use storage::{FjallPersistPolicy, FjallStorage, SEALED_KEYSPACES, StorageHandle, row_aad};
+pub use storage::{
+    CACHE_BYTES, FjallPersistPolicy, FjallStorage, SEALED_KEYSPACES, StorageHandle, row_aad,
+};

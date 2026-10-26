@@ -32,6 +32,7 @@ mod worker;
 pub use handle::{
     EffectHandle, EffectReceiver, EffectSender, ResponseSender, StorageHandle, StorageReceivers,
 };
+pub use lifecycle::CACHE_BYTES;
 pub use metrics::{InFlightGuard, StorageMetricsSnapshot};
 pub use owner::TransactionOwner;
 pub use persistence::FjallPersistPolicy;

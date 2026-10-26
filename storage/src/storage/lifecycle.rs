@@ -17,7 +17,7 @@ use super::{
 };
 
 /// Block cache of the node database; Fjall's 32 MiB default rereads blocks on large scans.
-const CACHE_BYTES: u64 = 256 << 20;
+pub const CACHE_BYTES: u64 = 256 << 20;
 
 impl FjallStorage {
     #[tracing::instrument(name = "storage.open", level = "debug", fields(path = %path))]
@@ -27,7 +27,7 @@ impl FjallStorage {
 
     #[doc(hidden)]
     pub fn open_test(path: &str) -> Result<StorageHandle, StorageLibError> {
-        Self::open_pools(path, FjallPersistPolicy::default(), 1, 1)
+        Self::open_pools(path, FjallPersistPolicy::default(), CACHE_BYTES, (1, 1))
     }
 
     #[tracing::instrument(
@@ -39,18 +39,32 @@ impl FjallStorage {
         path: &str,
         policy: FjallPersistPolicy,
     ) -> Result<StorageHandle, StorageLibError> {
-        Self::open_pools(path, policy, READ_POOL_THREADS, BULK_POOL_THREADS)
+        Self::open_with_cache(path, policy, CACHE_BYTES)
+    }
+
+    /// Opens the database with a block cache of `cache_bytes`.
+    pub fn open_with_cache(
+        path: &str,
+        policy: FjallPersistPolicy,
+        cache_bytes: u64,
+    ) -> Result<StorageHandle, StorageLibError> {
+        Self::open_pools(
+            path,
+            policy,
+            cache_bytes,
+            (READ_POOL_THREADS, BULK_POOL_THREADS),
+        )
     }
 
     fn open_pools(
         path: &str,
         policy: FjallPersistPolicy,
-        read_threads: usize,
-        bulk_threads: usize,
+        cache_bytes: u64,
+        (read_threads, bulk_threads): (usize, usize),
     ) -> Result<StorageHandle, StorageLibError> {
         let db = OptimisticTxDatabase::builder(path)
             .manual_journal_persist(true)
-            .cache_size(CACHE_BYTES)
+            .cache_size(cache_bytes)
             .open()?;
 
         let (sender, receivers) = StorageHandle::new();
