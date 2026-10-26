@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_core::structs::storage::distribution::accounting::account_key;
+use aruna_core::structs::storage::distribution::accounting::{Charge, RangeAccount, account_key};
 use aruna_core::structs::storage::distribution::fence::{ClearCursor, PurgeCursor};
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, Position, VersionEntry, content_key, head_position, index_key, range_interval,
@@ -509,17 +509,40 @@ async fn clear_range_rows(
     set_id: Ulid,
     range_id: Ulid,
 ) -> Result<(), String> {
-    let prefix = account_key(set_id, range_id);
-    for key_space in [
-        RANGE_COUNTER_KEYSPACE,
-        KEY_SAMPLE_KEYSPACE,
-        RANGE_ACCOUNT_KEYSPACE,
-        SEARCH_INDEX_KEYSPACE,
-        CAPACITY_RESERVATION_KEYSPACE,
-    ] {
-        clear_prefix(context, key_space, prefix.clone()).await?;
+    let own = account_key(set_id, range_id);
+    let stored = read(context, RANGE_ACCOUNT_KEYSPACE, own).await?;
+    let account = (stored.as_deref().map(RangeAccount::from_bytes)).transpose();
+    let charge = account
+        .map_err(|error| error.to_string())?
+        .map(|a| a.charge);
+    let mut ranges = vec![range_id];
+    // A split parent's retired rows go first, with the last of its children held here.
+    if let Some(Charge::Child {
+        parent, sibling, ..
+    }) = charge
+    {
+        let other = account_key(set_id, sibling);
+        if read(context, RANGE_ACCOUNT_KEYSPACE, other)
+            .await?
+            .is_none()
+        {
+            ranges.insert(0, parent);
+        }
     }
-    drop_index(context, set_id, range_id).await
+    for range_id in ranges {
+        let prefix = account_key(set_id, range_id);
+        for key_space in [
+            RANGE_COUNTER_KEYSPACE,
+            KEY_SAMPLE_KEYSPACE,
+            RANGE_ACCOUNT_KEYSPACE,
+            SEARCH_INDEX_KEYSPACE,
+            CAPACITY_RESERVATION_KEYSPACE,
+        ] {
+            clear_prefix(context, key_space, prefix.clone()).await?;
+        }
+        drop_index(context, set_id, range_id).await?;
+    }
+    Ok(())
 }
 
 /// Removes every generation of the range's search index from disk.
@@ -712,7 +735,8 @@ mod tests {
 
     #[tokio::test]
     async fn split_reclaim_releases() {
-        // A split moves the parent's reservation to its children; reclaiming both releases it.
+        // A split moves the parent's reservation to its children; reclaiming both releases it
+        // and the retired parent's rows.
         use crate::distribution::split::{SplitConfig, SplitOperation};
         use crate::distribution::test_store::{apply, install, range, write as update};
         let (_dir, handle) = open();
@@ -750,12 +774,25 @@ mod tests {
             );
         }
         assert_eq!(parts, vec![None, Some(2000), Some(1000)]);
-        for child in &ids[1..] {
-            clear_range_rows(&context, set_id, *child).await.unwrap();
+        clear_range_rows(&context, set_id, ids[1]).await.unwrap();
+        for space in [RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE] {
+            let parent = clear_page(&context, space, &reserved(ids[0]), None).await;
+            assert!(
+                !parent.unwrap().is_empty(),
+                "the parent stays while a child is held"
+            );
         }
+        clear_range_rows(&context, set_id, ids[2]).await.unwrap();
         let prefix = set_id.to_bytes();
-        let left = clear_page(&context, CAPACITY_RESERVATION_KEYSPACE, &prefix, None).await;
-        assert!(left.unwrap().is_empty(), "no charge of the set stays");
+        let spaces = [
+            CAPACITY_RESERVATION_KEYSPACE,
+            RANGE_ACCOUNT_KEYSPACE,
+            RANGE_COUNTER_KEYSPACE,
+        ];
+        for space in spaces {
+            let left = clear_page(&context, space, &prefix, None).await;
+            assert!(left.unwrap().is_empty(), "{space} keeps no row of the set");
+        }
     }
 
     #[tokio::test]
