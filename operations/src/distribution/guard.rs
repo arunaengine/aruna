@@ -150,17 +150,53 @@ fn target_for(
     completion: bool,
 ) -> Result<WriteRoute, GuardError> {
     let view = bound_record(binding, record)?;
+    let fence = LocalFence::decode(fence)?;
+    route_in(binding, (&view, &fence), key, completion)
+}
+
+fn route_in(
+    binding: &DistributionBinding,
+    (view, fence): (&DistributionView, &LocalFence),
+    key: &str,
+    completion: bool,
+) -> Result<WriteRoute, GuardError> {
     let snapshot = view.snapshot();
     let route = snapshot.write_route(binding.member_id, key)?;
     if let WriteRoute::Local { epoch, .. } = &route {
         let range = (snapshot.range_for(key)).ok_or(RouteError::NoRange(binding.set_id))?;
-        let fence = LocalFence::decode(fence)?;
         match completion {
             true => fence.check_completion(snapshot, range, epoch.0)?,
             false => fence.check_write(snapshot, range, epoch.0)?,
         }
     }
     Ok(route)
+}
+
+/// [`write_epoch`] of each of `keys`, decoding the record and the fence once, and whether the
+/// set keeps a search index.
+pub fn write_epochs<'a>(
+    binding: &DistributionBinding,
+    keys: impl IntoIterator<Item = &'a str>,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<(Vec<OriginalEpoch>, bool), GuardError> {
+    let view = bound_record(binding, record)?;
+    let fence = LocalFence::decode(fence)?;
+    let epochs =
+        keys.into_iter().map(
+            |key| match route_in(binding, (&view, &fence), key, false)? {
+                WriteRoute::Local { epoch, .. } => Ok(epoch),
+                WriteRoute::Forward {
+                    range_id, node_id, ..
+                } => Err(GuardError::NotCoordinator {
+                    set_id: binding.set_id,
+                    range_id,
+                    node_id,
+                }),
+            },
+        );
+    let search = view.snapshot().config.settings.search_index;
+    Ok((epochs.collect::<Result<_, _>>()?, search))
 }
 
 /// The authority a write to `key` takes here, or why it may not write here.

@@ -4,7 +4,7 @@
 
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
-use crate::distribution::guard::{authority_read, authority_rows, write_epoch};
+use crate::distribution::guard::{authority_read, authority_rows, write_epochs};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::replication::queue::schedule_blob_drain;
 use crate::staging::page::rows::{
@@ -197,15 +197,13 @@ impl PageImportOperation {
                     .as_ref()
                     .ok_or(PageImportError::NotFinished)?;
                 // Every key of the page must lie in a range this member coordinates.
-                guards.epochs = self
+                let keys = self
                     .input
                     .entries
                     .iter()
-                    .map(|entry| {
-                        let key = &entry.target_key;
-                        write_epoch(binding, key, record.as_deref(), fence.as_deref())
-                    })
-                    .collect::<Result<_, _>>()?;
+                    .map(|entry| entry.target_key.as_str());
+                (guards.epochs, guards.search) =
+                    write_epochs(binding, keys, record.as_deref(), fence.as_deref())?;
                 self.read_secret()
             }
             (

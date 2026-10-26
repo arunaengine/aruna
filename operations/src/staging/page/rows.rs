@@ -179,6 +179,8 @@ pub(crate) struct PageGuards {
     pub epochs: Vec<OriginalEpoch>,
     /// Whether anything replicates the bucket's versions: set members or sync relationships.
     pub downstream: bool,
+    /// Whether a distributed bucket keeps a search index, which the new heads feed.
+    pub search: bool,
 }
 
 /// The rows of one page, its usage change and its outcome.
@@ -284,6 +286,7 @@ pub(crate) fn check_guards(
         binding,
         epochs: Vec::new(),
         downstream: true,
+        search: true,
     })
 }
 
