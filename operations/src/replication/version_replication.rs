@@ -4548,6 +4548,61 @@ mod tests {
     }
 
     #[test]
+    fn page_matches_single() {
+        // A reference page carries exactly the manifest a single delivery of the job sends.
+        use crate::replication::page::build::reference_manifest;
+        use crate::replication::queue::BlobJobRecord;
+        use aruna_core::structs::storage::distribution::OriginalEpoch;
+        let version_id = Ulid::generate();
+        let publication = Publication {
+            set_id: Ulid::from_bytes([4; 16]),
+            range_id: Ulid::from_bytes([5; 16]),
+            revision: 3,
+            epoch: aruna_core::structs::storage::distribution::PublicationEpoch(2),
+            member_id: Ulid::from_bytes([6; 16]),
+            incarnation: 7,
+            bytes: true,
+        };
+        let request = request_with_mode(version_id, ReplicationMode::Live);
+        let input = ReplicateScopeInput {
+            bucket: request.bucket.clone(),
+            target: ReplicateScopeTarget::Version {
+                key: request.key.clone(),
+                version_id,
+            },
+            target_node_id: request.target_node_id,
+            auth_context: request.auth_context.clone(),
+            replicate_delete_markers: true,
+            mode: ReplicationMode::Live,
+        };
+        let local = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let scope = ReplicateScopeOperation::new(input.clone())
+            .with_distribution(publication.clone(), local);
+        let mut sync = scope.sync.clone().expect("a publication");
+        sync.target_prefix = Some(request.key.clone());
+        let version = reference_blob_version()
+            .with_epoch(OriginalEpoch(2))
+            .with_generation(4);
+        let head =
+            CurrentVersionPointer::new_with_generation(version_id, 4).with_epoch(OriginalEpoch(2));
+        let group_id = request.source_group_id;
+        let mut op = ReplicateObjectOperation::new(request).with_sync(sync);
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(version.to_bytes().unwrap().into()),
+        }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![2u8].into(),
+            value: Some(head.to_bytes().unwrap().into()),
+        }));
+        let single = op.manifest.expect("manifest built");
+        let job = BlobJobRecord::new(input, Some(false), 0);
+        let paged = reference_manifest(&job, version, Some(&head), group_id, &publication);
+        assert_eq!(paged, Some(single));
+    }
+
+    #[test]
     fn publication_keeps_key() {
         let mut sync = reference_sync();
         sync.target_prefix = None;
