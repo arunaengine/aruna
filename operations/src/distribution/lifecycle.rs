@@ -36,7 +36,7 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::create::submit;
-use super::imports::{fetch_imports, keep_resume, open_imports};
+use super::imports::{fenced_imports, fetch_imports, keep_resume};
 use super::purge::{
     PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, has_uploads,
     purge_range, purge_rest, read,
@@ -516,8 +516,8 @@ impl SetWork {
         };
         let watermark =
             postcard::to_allocvec(&Watermark::of(&counters)).map_err(|error| error.to_string())?;
-        // Open imports of the bucket go on at the new coordinator; refresh rounds start anew.
-        let jobs = open_imports(context, &snapshot.config.bucket).await?;
+        // Imports open at the fence or since go on at the new coordinator; refresh rounds restart.
+        let jobs = fenced_imports(context, &snapshot.config.bucket, open.transfer_id).await?;
         let import_cursor = match jobs.is_empty() {
             true => None,
             false => Some(postcard::to_allocvec(&jobs).map_err(|error| error.to_string())?),

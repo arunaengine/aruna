@@ -34,6 +34,7 @@ use crate::s3::bucket::get::GetBucketOperation;
 const JOB_PAGE: usize = 256;
 const HANDOVER_PREFIX: &[u8] = b"import_handover/";
 const RESUME_PREFIX: &[u8] = b"import_resume/";
+const JOBS_PREFIX: &[u8] = b"import_jobs/";
 
 /// A staging job a range's former coordinator hands over: its spec, the source root its
 /// connector reads, and where the job stood before the range was fenced.
@@ -85,21 +86,45 @@ fn resume_key(transfer_id: Ulid, job_id: JobId) -> Vec<u8> {
     [RESUME_PREFIX, &transfer_id.to_bytes(), &job_id.to_bytes()].concat()
 }
 
-/// Keeps where each open import of `bucket` stands, before the range of `transfer_id` is
-/// fenced: pages committed after it only repeat work the new coordinator does again.
+fn jobs_key(transfer_id: Ulid) -> Vec<u8> {
+    [JOBS_PREFIX, &transfer_id.to_bytes()].concat()
+}
+
+/// Keeps the open imports of `bucket` and where each stands, before the range of `transfer_id`
+/// is fenced: pages committed after it only repeat work the new coordinator does again.
 pub(crate) async fn keep_resume(
     context: &DriverContext,
     bucket: &str,
     transfer_id: Ulid,
 ) -> Result<(), String> {
-    for job_id in open_imports(context, bucket).await? {
-        let Some(checkpoint) = read_staging_checkpoint(context, job_id).await? else {
+    let jobs = open_imports(context, bucket).await?;
+    for job_id in &jobs {
+        let Some(checkpoint) = read_staging_checkpoint(context, *job_id).await? else {
             continue;
         };
         let value = postcard::to_allocvec(&checkpoint).map_err(|error| error.to_string())?;
-        write_row(context, resume_key(transfer_id, job_id).into(), value).await?;
+        write_row(context, resume_key(transfer_id, *job_id).into(), value).await?;
     }
-    Ok(())
+    let value = postcard::to_allocvec(&jobs).map_err(|error| error.to_string())?;
+    write_row(context, jobs_key(transfer_id).into(), value).await
+}
+
+/// The imports of `bucket` to hand over: those open now and those kept before the fence of
+/// `transfer_id`, finished ones too, since a job may end while it skips the fenced range's keys.
+pub(crate) async fn fenced_imports(
+    context: &DriverContext,
+    bucket: &str,
+    transfer_id: Ulid,
+) -> Result<Vec<JobId>, String> {
+    let stored = read_value(context, NODE_STATE_KEYSPACE, jobs_key(transfer_id).into()).await?;
+    let kept = stored.as_deref().map(postcard::from_bytes).transpose();
+    let mut jobs: Vec<JobId> = kept.map_err(|error| error.to_string())?.unwrap_or_default();
+    for job_id in open_imports(context, bucket).await? {
+        if !jobs.contains(&job_id) {
+            jobs.push(job_id);
+        }
+    }
+    Ok(jobs)
 }
 
 /// A staging job of this node as it hands it over to a member of the set its bucket is bound
@@ -212,7 +237,7 @@ pub(crate) async fn fetch_imports(
                 };
                 kept.ready.push((spec, handed.resume));
             }
-            // A job that finished or is gone meanwhile has nothing left to hand over.
+            // A job whose record is gone meanwhile has nothing left to hand over.
             Err(MetadataReadError::NotFound) => {}
             Err(_) => break,
         }
@@ -569,5 +594,41 @@ mod tests {
 
         let open = open_imports(&context, "spire").await.unwrap();
         assert_eq!(open, [JobId::from_bytes([1; 16])]);
+    }
+
+    // A job open at the fence is handed over even when it ended afterwards, skipping the fenced
+    // range's keys; a transfer that kept nothing hands over only open jobs.
+    #[tokio::test]
+    async fn keeps_fenced_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let job_id = JobId::from_bytes([1; 16]);
+        let payload = JobPayload::Staging(spec("spire"));
+        let mut record = JobRecord::new(job_id, payload, Default::default(), node_id, 1, 1, None);
+        crate::jobs::store::insert_job(&storage, &record)
+            .await
+            .unwrap();
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let transfer_id = Ulid::from_bytes([8; 16]);
+        keep_resume(&context, "spire", transfer_id).await.unwrap();
+        record.state = JobState::Succeeded;
+        crate::jobs::store::insert_job(&context.storage_handle, &record)
+            .await
+            .unwrap();
+
+        assert!(open_imports(&context, "spire").await.unwrap().is_empty());
+        let handed = fenced_imports(&context, "spire", transfer_id).await;
+        assert_eq!(handed.unwrap(), [job_id]);
+        let other = Ulid::from_bytes([9; 16]);
+        let kept = fenced_imports(&context, "spire", other).await;
+        assert!(kept.unwrap().is_empty());
     }
 }
