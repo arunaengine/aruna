@@ -8,7 +8,8 @@ mod walk;
 
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    JobError, JobId, JobResultPayload, StagingJobCheckpoint, StagingJobPhase, StagingJobSpec,
+    JobError, JobId, JobResultPayload, ManifestRead, StagingJobCheckpoint, StagingJobPhase,
+    StagingJobSpec,
 };
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -194,8 +195,8 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
 }
 
 /// Where a job a range's new coordinator takes over goes on: the former job's position without
-/// its counters, errors or directory queue. A flat walk keeps its listing cursor; a manifest read
-/// or a directory walk, whose queue stays behind, starts its prefix again.
+/// its counters, errors or directory queue. A flat walk keeps its listing cursor and reads its
+/// manifest again; a manifest read or a directory walk, whose queue stays behind, starts over.
 pub(crate) fn handed_checkpoint(
     spec: &StagingJobSpec,
     at: &StagingJobCheckpoint,
@@ -216,6 +217,13 @@ pub(crate) fn handed_checkpoint(
         true => {
             next.prefixes_done = at.prefixes_done;
             next.walk = at.walk.clone();
+            // The manifest's rows stay with the former job, so this one reads it before its walk.
+            let manifest = spec.checksum_manifest.as_ref().zip(at.walk.as_ref());
+            next.manifest = manifest.map(|(name, walk)| ManifestRead {
+                source_path: format!("{}{name}", walk.source_path),
+                offset: 0,
+                observation: None,
+            });
         }
         false => next.prefixes_done = at.prefixes_done.saturating_sub(u64::from(open)),
     }
@@ -529,6 +537,34 @@ mod pure_tests {
         let mut finished = at;
         finished.walk = None;
         assert_eq!(handed_checkpoint(&spec, &finished).prefixes_done, 1);
+    }
+
+    // The manifest's checksums stay with the former job's rows, so a flat walk taken over
+    // reads its manifest again from the start before its next page.
+    #[test]
+    fn handed_manifest_rereads() {
+        use aruna_core::structs::execution::job::StagingWalk;
+        let spec = StagingJobSpec {
+            checksum_manifest: Some("SHA256SUMS".to_string()),
+            ..test_spec()
+        };
+        let walk = StagingWalk {
+            source_path: "refseq/".to_string(),
+            target_prefix: String::new(),
+            cursor: None,
+            queue_row: None,
+            from: Some("refseq/k".to_string()),
+        };
+        let mut at = initial_checkpoint(&spec);
+        at.flat = Some(true);
+        at.prefixes_done = 1;
+        at.walk = Some(walk.clone());
+        let handed = handed_checkpoint(&spec, &at);
+        assert_eq!(handed.walk, Some(walk));
+        let manifest = handed.manifest.expect("the manifest is read again");
+        assert_eq!(manifest.source_path, "refseq/SHA256SUMS");
+        assert_eq!((manifest.offset, manifest.observation), (0, None));
+        assert_eq!(handed_checkpoint(&test_spec(), &at).manifest, None);
     }
 
     #[test]
