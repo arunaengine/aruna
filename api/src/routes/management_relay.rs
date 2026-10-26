@@ -101,13 +101,22 @@ pub(crate) async fn relay_middleware(
         .extensions()
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_string());
+    let has_hop = request.headers().contains_key(RELAY_HOP_HEADER);
     let route = relay_route(
         request.method(),
         matched.as_deref(),
         state.is_management_node(),
-        request.headers().contains_key(RELAY_HOP_HEADER),
+        has_hop,
     );
     let Some(route) = route else {
+        // A relayed database request is kept by its owner only, never by a node fallen back to.
+        let pinned = relay_route(request.method(), matched.as_deref(), true, false).is_some();
+        if has_hop && pinned {
+            let (_, owner) = management_targets(&state).await;
+            if owner.is_none_or(|(owner, _)| owner != state.get_node_id()) {
+                return ServerError::NoManagementNode.into_response();
+            }
+        }
         return next.run(request).await;
     };
     let (urls, owner) = management_targets(&state).await;
@@ -118,7 +127,7 @@ pub(crate) async fn relay_middleware(
         return next.run(request).await;
     }
     let targets = match pinned_route(route) {
-        true => pinned_targets(owner, urls, state.is_management_node()),
+        true => pinned_targets(owner, urls, !state.is_user_node()),
         false => urls,
     };
     relay(&state, route, targets, request).await
@@ -144,16 +153,17 @@ fn relay_route(
         .filter(|route| !is_management || pinned_route(route))
 }
 
-/// The target of a pinned route: the request owner, whatever node was asked. A device holds no
-/// node-info document, so without the owner's url it uses its realm's installed urls.
+/// The target of a pinned route: the request owner, whatever node was asked. A realm node
+/// refuses when the owner published no url; a device holds no node-info document, so it uses
+/// its realm's installed urls.
 fn pinned_targets(
     owner: Option<RequestOwner>,
     urls: Vec<String>,
-    is_management: bool,
+    holds_documents: bool,
 ) -> Vec<String> {
     match owner {
         Some((_, Some(url))) => vec![url],
-        _ if is_management => Vec::new(),
+        _ if holds_documents => Vec::new(),
         _ => urls,
     }
 }

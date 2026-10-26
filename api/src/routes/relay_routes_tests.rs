@@ -270,3 +270,24 @@ async fn hop_stays_local() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
 }
+
+#[tokio::test]
+async fn relayed_request_unowned() {
+    // A database request relayed to a node that is not its owner is refused, not kept there.
+    let fixture = setup(vec!["http://127.0.0.1:1".to_string()]).await;
+    let app = Router::new()
+        .route(
+            "/system/realm/databases",
+            axum::routing::post(|| async { StatusCode::IM_A_TEAPOT }),
+        )
+        .layer(from_fn_with_state(fixture.state.clone(), relay_middleware))
+        .with_state(fixture.state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/system/realm/databases")
+        .header(RELAY_HOP_HEADER, "peer")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}

@@ -120,6 +120,7 @@ fn requests_reach_owner() {
         std::slice::from_ref(&url)
     );
     assert_eq!(pinned_targets(known, peers.clone(), false), [url]);
+    // A realm node never falls back to another management node when the owner has no url.
     let unpublished = Some((owner, None));
     assert!(pinned_targets(unpublished.clone(), peers.clone(), true).is_empty());
     assert_eq!(pinned_targets(unpublished, peers.clone(), false), peers);
