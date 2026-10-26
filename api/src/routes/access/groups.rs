@@ -1263,7 +1263,7 @@ Membership is the only permission check, so a realm administrator who is not a m
   `https://w3id.org/ro/wfrun/process/0.5` is a Process Run, and every other root is a Dataset.
 - `realm.distinct_buckets` is `realm.buckets` with each distributed bucket of the group counted
   once instead of once per member node; it is omitted when this node cannot read all its records
-  of the distributed buckets.
+  of the distributed buckets, and while one of the group's distributed buckets is being deleted.
 - `quota` restates the realm quota configuration for this group with a warning flag evaluated
   against the group's realm-wide logical bytes; it is omitted when the realm configuration cannot be
   read.

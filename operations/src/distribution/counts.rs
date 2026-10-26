@@ -16,20 +16,25 @@ use crate::driver::DriverContext;
 pub struct SetCounts {
     pub sets: u64,
     pub members: u64,
+    /// Sets whose deletion is committed; nothing replicated says which members purged already.
+    pub deleting: u64,
     /// False when this node holds more records than one count reads.
     pub complete: bool,
 }
 
 impl SetCounts {
-    /// A total of node bucket counters with each distributed bucket counted once.
-    pub fn distinct(&self, buckets: u64) -> u64 {
-        buckets
-            .saturating_sub(self.members)
-            .saturating_add(self.sets)
+    /// A total of node bucket counters with each distributed bucket counted once; `None` while a
+    /// set of the scope is being deleted, whose member buckets may or may not be purged yet.
+    pub fn distinct(&self, buckets: u64) -> Option<u64> {
+        (self.complete && self.deleting == 0).then(|| {
+            buckets
+                .saturating_sub(self.members)
+                .saturating_add(self.sets)
+        })
     }
 
-    /// Counts the sets that still have member buckets: a failed member never made one, and a
-    /// committed deletion purges them.
+    /// Counts the sets whose member buckets the node totals hold; a failed member never made one.
+    /// A committed deletion is counted apart, since its members purge at their own pace.
     pub fn of<'a>(snapshots: impl IntoIterator<Item = &'a DistributionSnapshot>) -> Self {
         let mut counts = Self {
             complete: true,
@@ -41,7 +46,11 @@ impl SetCounts {
             let members = (snapshot.config.members.iter())
                 .filter(|member| member.state != MemberState::Failed)
                 .count() as u64;
-            if deleted || members == 0 {
+            if members == 0 {
+                continue;
+            }
+            if deleted {
+                counts.deleting += 1;
                 continue;
             }
             counts.sets += 1;

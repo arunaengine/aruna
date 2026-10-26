@@ -2085,15 +2085,14 @@ pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerRes
 }
 
 /// The realm or group bucket total with each distributed bucket once; `None` when this node cannot
-/// read all its set records, so the plain total is not passed off as exact.
+/// read all its set records or a set of the scope is being deleted, so no guess passes as exact.
 pub(crate) async fn distinct_buckets(
     state: &ServerState,
     group: Option<ulid::Ulid>,
     buckets: u64,
 ) -> Option<u64> {
     match aruna_operations::distribution::counts::set_counts(&state.get_ctx(), group).await {
-        Ok(counts) if counts.complete => Some(counts.distinct(buckets)),
-        Ok(_) => None,
+        Ok(counts) => counts.distinct(buckets),
         Err(error) => {
             warn!(error = %error, "distributed bucket counts unavailable for usage response");
             None
@@ -2134,7 +2133,8 @@ checked, because the figures are realm-wide totals and not per-caller views.
   the group usage endpoint therefore omits both fields.
 - `realm.buckets` sums the nodes' bucket counters, so a distributed bucket counts once per member
   node; `realm.distinct_buckets` counts it once, from this node's records of the distributed
-  buckets, and is omitted when they cannot all be read.
+  buckets. It is omitted when they cannot all be read, and while a distributed bucket is being
+  deleted, because its members purge their buckets at their own pace.
 - `metadata_documents` counts the realm's live metadata documents, excluding lifecycle-deleted ones,
   and is deliberately unfiltered by what the caller may read. It is omitted, never zeroed, when this
   node has no metadata subsystem or the count cannot be produced, so an absent field means unknown.
