@@ -58,13 +58,15 @@ use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 const REPLICATION_PAGE_SIZE: usize = 512;
 const REPLICATION_BATCH_SIZE: usize = 64;
 const STATS_PAGE_SIZE: usize = 256;
-/// Obligations one pass reads; those without downstream work are retired together.
-const OBLIGATION_BATCH_SIZE: usize = 1024;
+/// Obligations one pass reads; those without sync work are retired together.
+const OBLIGATION_BATCH_SIZE: usize = super::page::PAGE_RECORDS;
 /// Obligations one pass turns into replication jobs.
 const OBLIGATION_WORK_LIMIT: usize = 64;
 const REPLICATION_JOB_LIMIT: usize = 64;
 const REPLICATION_RELATIONSHIP_LIMIT: usize = 1024;
 const REPLICATION_CURSOR_KEY: &[u8] = b"blob_replication_cursor";
+/// The obligation the next obligation pass continues after, so later ones get their turn.
+const OBLIGATION_CURSOR_KEY: &[u8] = b"live_obligation_cursor";
 
 pub const REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const REPLICATION_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -193,6 +195,8 @@ struct LiveRepairResult {
     processed: usize,
     queued: usize,
     has_more: bool,
+    /// When the oldest obligation read was written.
+    oldest_ms: Option<u64>,
 }
 
 impl BlobJobRecord {
@@ -1869,7 +1873,10 @@ async fn read_job_relationships(
 async fn process_live_obligations(
     context: &DriverContext,
 ) -> Result<LiveRepairResult, BlobQueueError> {
-    let (obligations, has_more) = read_live_obligations(&context.storage_handle).await?;
+    let after = read_obligation_cursor(&context.storage_handle).await?;
+    let (obligations, next) = read_live_obligations(&context.storage_handle, after.clone()).await?;
+    // A pass that started past the first obligation wraps to the start next.
+    let has_more = next.is_some() || after.is_some();
     let mut starts = HashMap::<String, Option<Vec<u8>>>::new();
     for (_, obligation) in &obligations {
         if obligation
@@ -1924,9 +1931,13 @@ async fn process_live_obligations(
     }
     let mut result = LiveRepairResult {
         has_more,
+        oldest_ms: (obligations.iter())
+            .map(|(_, obligation)| obligation.version_id.timestamp_ms())
+            .min(),
         ..Default::default()
     };
     let mut retired = Vec::new();
+    let mut member_work = Vec::new();
     let mut worked = 0usize;
 
     for (obligation_key, obligation) in obligations {
@@ -1955,7 +1966,9 @@ async fn process_live_obligations(
         // A version of a bucket nothing replicates to owes no job: such obligations, one per
         // imported file, are retired in one transaction instead of one each.
         let idle = relationships.is_none_or(|page| page.values.is_empty() && page.next.is_none());
-        if members.is_empty() && idle && !hop_exhausted {
+        // Without sync work an obligation owes only its member jobs, queued in one batch.
+        if idle && !hop_exhausted {
+            member_work.extend(members);
             retired.push((obligation_key, obligation.continuation));
             continue;
         }
@@ -1987,17 +2000,25 @@ async fn process_live_obligations(
         result.queued = result.queued.saturating_add(write.queued);
     }
     result.processed = result.processed.saturating_add(retired.len());
-    delete_live_obligations(&context.storage_handle, retired).await?;
+    result.queued = result.queued.saturating_add(member_work.len());
+    let storage = &context.storage_handle;
+    retire_obligations(storage, retired, member_work, (after, next)).await?;
 
     Ok(result)
 }
 
-/// Deletes each obligation whose continuation is still the one read, in one transaction.
-async fn delete_live_obligations(
+/// Queues `jobs` and deletes each obligation whose continuation is still the one read, with
+/// the obligation cursor moved from `cursor.0` to `cursor.1`, in one transaction.
+async fn retire_obligations(
     storage: &StorageHandle,
     obligations: Vec<(Vec<u8>, Option<LiveReplicationContinuation>)>,
+    jobs: Vec<BlobJobRecord>,
+    cursor: (Option<Vec<u8>>, Option<Vec<u8>>),
 ) -> Result<(), BlobQueueError> {
-    if obligations.is_empty() {
+    if obligations.is_empty() && jobs.is_empty() {
+        if cursor.0 != cursor.1 {
+            write_obligation_cursor(storage, cursor.1).await?;
+        }
         return Ok(());
     }
     let unexpected = |other: Event| BlobQueueError::UnexpectedEvent(format!("{other:?}"));
@@ -2009,17 +2030,20 @@ async fn delete_live_obligations(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => return Err(unexpected(other)),
     };
-    let reads = (obligations.iter())
+    let mut reads: Vec<_> = (obligations.iter())
         .map(|(key, _)| {
             let key = ByteView::from(key.clone());
             (REPLICATION_OBLIGATION_KEYSPACE.to_string(), key)
         })
         .collect();
+    for job in &jobs {
+        reads.push((REPLICATION_JOB_KEYSPACE.to_string(), blob_job_key(job)?));
+    }
     let read = StorageEffect::BatchRead {
         reads,
         txn_id: Some(txn_id),
     };
-    let values = match storage.send_storage_effect(read).await {
+    let mut values = match storage.send_storage_effect(read).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         other => {
             abort_cursor(storage, txn_id).await;
@@ -2029,6 +2053,32 @@ async fn delete_live_obligations(
             });
         }
     };
+    let existing = values.split_off(obligations.len().min(values.len()));
+    let mut writes = Vec::with_capacity(jobs.len() + 1);
+    for (job, (_, value)) in jobs.iter().zip(existing) {
+        let kept = value
+            .as_deref()
+            .and_then(|value| BlobJobRecord::from_bytes(value).ok())
+            .is_some_and(|existing| blob_job_preferred(&existing, job));
+        if !kept {
+            writes.push(blob_job_entry(job)?);
+        }
+    }
+    writes.push(obligation_cursor_entry(cursor.1)?);
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: Some(txn_id),
+    };
+    match storage.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(match other {
+                Event::Storage(StorageEvent::Error { error }) => error.into(),
+                other => unexpected(other),
+            });
+        }
+    }
     let deletes = (obligations.into_iter().zip(values))
         .filter(|((_, expected), (_, value))| {
             value
@@ -2064,14 +2114,17 @@ async fn delete_live_obligations(
     }
 }
 
+/// Obligations after `after`, and the key the next pass continues after; `None` once the
+/// read reached the end.
 async fn read_live_obligations(
     storage: &StorageHandle,
-) -> Result<(Vec<(Vec<u8>, LiveObligationRecord)>, bool), BlobQueueError> {
+    after: Option<Vec<u8>>,
+) -> Result<(Vec<(Vec<u8>, LiveObligationRecord)>, Option<Vec<u8>>), BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             prefix: None,
-            start: None,
+            start: after.map(|key| IterStart::After(key.into())),
             limit: OBLIGATION_BATCH_SIZE,
             txn_id: None,
         })
@@ -2092,7 +2145,7 @@ async fn read_live_obligations(
                     }
                 }
             }
-            Ok((obligations, next_start_after.is_some()))
+            Ok((obligations, next_start_after.map(|key| key.to_vec())))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
@@ -2552,6 +2605,52 @@ async fn delete_live_obligation(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+    }
+}
+
+async fn read_obligation_cursor(
+    storage: &StorageHandle,
+) -> Result<Option<Vec<u8>>, BlobQueueError> {
+    let read = StorageEffect::Read {
+        key_space: NODE_STATE_KEYSPACE.to_string(),
+        key: ByteView::from(OBLIGATION_CURSOR_KEY.to_vec()),
+        txn_id: None,
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_vec())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+    }
+}
+
+/// The cursor row; an empty value starts the next pass at the first obligation.
+fn obligation_cursor_entry(
+    after: Option<Vec<u8>>,
+) -> Result<(String, Key, ByteView), BlobQueueError> {
+    Ok((
+        NODE_STATE_KEYSPACE.to_string(),
+        ByteView::from(OBLIGATION_CURSOR_KEY.to_vec()),
+        ByteView::from(after.unwrap_or_default()),
+    ))
+}
+
+async fn write_obligation_cursor(
+    storage: &StorageHandle,
+    after: Option<Vec<u8>>,
+) -> Result<(), BlobQueueError> {
+    let (key_space, key, value) = obligation_cursor_entry(after)?;
+    let write = StorageEffect::Write {
+        key_space,
+        key,
+        value,
+        txn_id: None,
+    };
+    match storage.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
@@ -4860,6 +4959,81 @@ mod tests {
         assert_eq!(second.processed, 2);
         assert_eq!(second.failed, 2);
         assert!(read_obligations(&storage).await.is_empty());
+    }
+
+    /// Writes one obligation per key of `keys` in one batch.
+    async fn write_obligations(storage: &StorageHandle, keys: impl Iterator<Item = String>) {
+        let writes = keys
+            .enumerate()
+            .map(|(index, key)| {
+                let id = Ulid::from_parts(1_700_000_000_000, index as u128);
+                let obligation = LiveObligationRecord::new(
+                    node(1),
+                    auth_context(),
+                    "bucket".to_string(),
+                    key,
+                    id,
+                    false,
+                );
+                live_obligation_entry(&obligation).expect("obligation encodes")
+            })
+            .collect();
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        let event = storage.send_storage_effect(write).await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+    }
+
+    async fn obligation_keys(storage: &StorageHandle) -> Vec<String> {
+        let iter = StorageEffect::Iter {
+            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 2 * OBLIGATION_BATCH_SIZE,
+            txn_id: None,
+        };
+        let Event::Storage(StorageEvent::IterResult { values, .. }) =
+            storage.send_storage_effect(iter).await
+        else {
+            panic!("obligations are readable");
+        };
+        let records = values
+            .iter()
+            .map(|(_, value)| LiveObligationRecord::from_bytes(value).expect("obligation decodes"));
+        records.map(|obligation| obligation.key).collect()
+    }
+
+    #[tokio::test]
+    async fn obligation_scan_rotates() {
+        // A pass continues after the last obligation the previous one read, so obligations that
+        // sort first and keep arriving never hold back later ones.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        write_bucket(&storage, "bucket").await;
+        let late = (0..=OBLIGATION_BATCH_SIZE).map(|index| format!("z/{index:05}"));
+        write_obligations(&storage, late).await;
+        repair_live(&storage).await;
+        let last = format!("z/{OBLIGATION_BATCH_SIZE:05}");
+        assert_eq!(obligation_keys(&storage).await, vec![last]);
+        let early = (0..OBLIGATION_BATCH_SIZE).map(|index| format!("a/{index:05}"));
+        write_obligations(&storage, early).await;
+        repair_live(&storage).await;
+        let keys = obligation_keys(&storage).await;
+        assert_eq!(
+            keys.len(),
+            OBLIGATION_BATCH_SIZE,
+            "the later one went first"
+        );
+        assert!(keys.iter().all(|key| key.starts_with("a/")));
+        // The next pass wraps to the start.
+        repair_live(&storage).await;
+        assert!(obligation_keys(&storage).await.is_empty());
     }
 
     // A large import into a bucket nothing replicates to leaves one obligation per file; they
