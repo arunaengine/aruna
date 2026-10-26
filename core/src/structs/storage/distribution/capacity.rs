@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::on_use::CACHE_CAPACITY_BYTES;
-use super::{DataStrategy, KeyRange};
+use super::{DataStrategy, DistributionSnapshot, KeyRange};
 use crate::errors::ConversionError;
 
 /// Estimated metadata bytes per object on a member: head and version rows, inventory, version,
@@ -58,21 +58,20 @@ impl MemberNeed {
 }
 
 /// Every object costs metadata; a coordinated range and a range copied by `copy` or
-/// `copy_on_use` also cost its bytes. A range without a known size counts as empty, as a new
-/// range is. Cache-on-use reserves its cache, at most the bytes it could hold.
+/// `copy_on_use` also cost its bytes. Cache-on-use reserves its cache, at most the bytes it
+/// could hold. Every range needs a size, a confirmed empty one included; else its id is the error.
 pub fn member_need(
     member_id: Ulid,
     strategy: DataStrategy,
     ranges: &[KeyRange],
     sizes: &[RangeSize],
-) -> MemberNeed {
+) -> Result<MemberNeed, Ulid> {
     let mut need = MemberNeed::default();
     let mut cached = 0u64;
     for range in ranges {
         let size = (sizes.iter())
             .find(|size| size.range_id == range.range_id)
-            .copied()
-            .unwrap_or_default();
+            .ok_or(range.range_id)?;
         let metadata = size.objects.saturating_mul(OBJECT_METADATA_BYTES);
         let replica = range.replicas.contains(&member_id);
         let bytes = match (range.coordinator == member_id, replica, strategy) {
@@ -87,7 +86,28 @@ pub fn member_need(
             .push((range.range_id, metadata.saturating_add(bytes)));
     }
     need.cache_bytes = cached.min(CACHE_CAPACITY_BYTES);
-    need
+    Ok(need)
+}
+
+/// `sizes` with a confirmed empty size for each range no admitted member holds, since only an
+/// admission opens a range on a node.
+pub fn with_unopened(snapshot: &DistributionSnapshot, sizes: &[RangeSize]) -> Vec<RangeSize> {
+    let admitted = (snapshot.config.members.iter()).filter(|member| member.incarnation.is_some());
+    let opened: Vec<Ulid> = admitted
+        .flat_map(|member| snapshot.held_ranges(member.member_id))
+        .map(|range| range.range_id)
+        .collect();
+    let mut sizes = sizes.to_vec();
+    for range in &snapshot.config.ranges {
+        let known = sizes.iter().any(|size| size.range_id == range.range_id);
+        if !known && !opened.contains(&range.range_id) {
+            sizes.push(RangeSize {
+                range_id: range.range_id,
+                ..RangeSize::default()
+            });
+        }
+    }
+    sizes
 }
 
 #[cfg(test)]
@@ -115,7 +135,7 @@ mod tests {
     }
 
     /// Coordinated and copied ranges cost bytes and metadata, covered ones only metadata, a
-    /// stream replica only metadata, and an unknown range nothing.
+    /// stream replica only metadata, and a confirmed empty range nothing.
     #[test]
     fn need_by_role() {
         let (me, other) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
@@ -125,8 +145,13 @@ mod tests {
             range(3, other, vec![]),
             range(4, other, vec![me]),
         ];
-        let sizes = [size(1, 1000, 1), size(2, 2000, 2), size(3, 3000, 3)];
-        let copy = member_need(me, DataStrategy::Copy, &ranges, &sizes);
+        let sizes = [
+            size(1, 1000, 1),
+            size(2, 2000, 2),
+            size(3, 3000, 3),
+            size(4, 0, 0),
+        ];
+        let copy = member_need(me, DataStrategy::Copy, &ranges, &sizes).unwrap();
         let meta = OBJECT_METADATA_BYTES;
         let expected = vec![
             (ranges[0].range_id, 1000 + meta),
@@ -136,9 +161,9 @@ mod tests {
         ];
         assert_eq!(copy.ranges, expected);
         assert_eq!(copy.cache_bytes, 0);
-        let stream = member_need(me, DataStrategy::Stream, &ranges, &sizes);
+        let stream = member_need(me, DataStrategy::Stream, &ranges, &sizes).unwrap();
         assert_eq!(stream.ranges[1], (ranges[1].range_id, 2 * meta));
-        let cache = member_need(me, DataStrategy::CacheOnUse, &ranges, &sizes);
+        let cache = member_need(me, DataStrategy::CacheOnUse, &ranges, &sizes).unwrap();
         assert_eq!(cache.ranges[1], (ranges[1].range_id, 2 * meta));
         assert_eq!(cache.cache_bytes, 2000);
         assert_eq!(cache.total(), 1000 + meta + 2 * meta + 3 * meta + 2000);
@@ -150,7 +175,70 @@ mod tests {
         let (me, other) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
         let ranges = vec![range(1, other, vec![me])];
         let sizes = [size(1, u64::MAX, 0)];
-        let need = member_need(me, DataStrategy::CacheOnUse, &ranges, &sizes);
+        let need = member_need(me, DataStrategy::CacheOnUse, &ranges, &sizes).unwrap();
         assert_eq!(need.cache_bytes, CACHE_CAPACITY_BYTES);
+    }
+
+    /// A range without a size is unknown, never empty.
+    #[test]
+    fn unknown_size_refused() {
+        let (me, other) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+        let ranges = vec![range(1, me, vec![]), range(2, other, vec![me])];
+        let sizes = [size(1, 1000, 1)];
+        let need = member_need(me, DataStrategy::Stream, &ranges, &sizes);
+        assert_eq!(need, Err(ranges[1].range_id));
+    }
+
+    /// Only a range no admitted member holds counts as confirmed empty.
+    #[test]
+    fn unopened_ranges_empty() {
+        use crate::structs::identity::realm::RealmId;
+        use crate::structs::storage::distribution::presets::shard_layout;
+        use crate::structs::storage::distribution::{
+            DistributionConfig, DistributionRequest, DistributionSettings, SetRoot, Statement,
+            next_snapshot,
+        };
+
+        let secret = |seed: u8| iroh::SecretKey::from_bytes(&[seed; 32]);
+        let (realm, member) = (RealmId::from_bytes([9; 32]), Ulid::from_bytes([1; 16]));
+        let root = SetRoot {
+            publisher: secret(1).public(),
+            owner_group: Ulid::from_bytes([90; 16]),
+            nonce: [7; 16],
+        };
+        let nodes = [
+            (member, secret(1).public()),
+            (Ulid::from_bytes([2; 16]), secret(2).public()),
+        ];
+        let layout = shard_layout(root.set_id(), &nodes, &["m".to_string()], 0).unwrap();
+        let create = DistributionRequest::Create {
+            root: root.clone(),
+            config: DistributionConfig {
+                bucket: "spire".to_string(),
+                owner_group: root.owner_group,
+                node_set: None,
+                members: layout.members,
+                ranges: layout.ranges,
+                settings: DistributionSettings::default(),
+            },
+        };
+        let head = next_snapshot(realm, None, &create).unwrap();
+        let ids: Vec<Ulid> = head.config.ranges.iter().map(|r| r.range_id).collect();
+        let empty = |id: Ulid| RangeSize {
+            range_id: id,
+            ..RangeSize::default()
+        };
+        assert_eq!(
+            with_unopened(&head, &[]),
+            vec![empty(ids[0]), empty(ids[1])]
+        );
+        let intent = head.member(member).unwrap().intent;
+        let statement = Statement::admit(realm, head.set_id(), member, 5, intent);
+        let request = DistributionRequest::Statement(Box::new(statement.sign(&secret(1))));
+        let head = next_snapshot(realm, Some(&head), &request).unwrap();
+        assert_eq!(with_unopened(&head, &[]), vec![empty(ids[1])]);
+        let known = [size(1, 10, 1)];
+        let sizes = with_unopened(&head, &known);
+        assert_eq!(sizes, vec![known[0], empty(ids[1])]);
     }
 }

@@ -138,7 +138,9 @@ async fn admin(
   admission route.
 - The member node admits the member only when its storage capacity, the sum of its backend
   quotas, holds the expected bytes of its ranges and an estimate of their metadata. The sizes
-  come from the ranges' holders; a range whose holders do not answer counts as empty.
+  come from the ranges' complete counters on their holders (at most 16 asked); a range no admitted
+  member holds yet is empty. Without a size for every range it accepts, the admission is refused
+  and can be retried through the admission route.
 
 **Limits**
 - The node must be a realm infrastructure node. `assigned` coverage needs at least one range.

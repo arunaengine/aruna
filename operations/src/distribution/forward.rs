@@ -268,7 +268,8 @@ pub(crate) async fn admit_member(
         .map_err(|error| match error {
             AdmitError::BindingChanged(_)
             | AdmitError::CapacityUnknown
-            | AdmitError::InsufficientCapacity { .. } => SyncRefusal::Invalid(error.to_string()),
+            | AdmitError::InsufficientCapacity { .. }
+            | AdmitError::SizeUnknown(_) => SyncRefusal::Invalid(error.to_string()),
             _ => SyncRefusal::Unavailable,
         })
 }

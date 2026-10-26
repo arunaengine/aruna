@@ -50,7 +50,7 @@ pub struct AdmitConfig {
     pub ranges: Vec<KeyRange>,
     pub strategy: DataStrategy,
     pub coverage: MetadataCoverage,
-    /// Expected sizes of the ranges, from their holders' counters; a missing one is empty.
+    /// Expected sizes of the ranges, from their holders' counters; a missing one is unknown.
     pub sizes: Vec<RangeSize>,
     /// The bytes this node may store, the sum of its backend quotas; `None` without quotas.
     pub capacity: Option<u64>,
@@ -79,6 +79,11 @@ pub enum AdmitError {
     CapacityUnknown,
     #[error("the member needs about {need} bytes, but this node has {free} bytes of capacity left")]
     InsufficientCapacity { need: u64, free: u64 },
+    #[error(
+        "the size of range {0} is not known yet: its holders did not answer, were not asked or \
+         are rebuilding their counters; retry the admission later"
+    )]
+    SizeUnknown(Ulid),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +200,8 @@ impl AdmitOperation {
             return Err(AdmitError::UsageIncomplete);
         }
         let config = &self.config;
-        self.need = member_need(config.member_id, config.strategy, &missing, &config.sizes);
+        self.need = member_need(config.member_id, config.strategy, &missing, &config.sizes)
+            .map_err(AdmitError::SizeUnknown)?;
         self.missing = missing;
         self.pending = Some(claim);
         match config.capacity {

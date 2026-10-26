@@ -257,9 +257,9 @@ async fn holder_ranges(
     Ok(ranges)
 }
 
-/// The expected size of each range of the set from its holders' counters, for a member's
-/// capacity admission. A range whose holders do not answer is left out and counts as empty;
-/// a split child includes its parent's shared row, so sizes may exceed the data.
+/// The expected size of each range of the set from its holders' complete counters, for a
+/// member's capacity admission. A range without them is left out, so admission refuses it; a
+/// split child includes its parent's shared row, so sizes may exceed the data.
 pub(crate) async fn range_sizes(
     state: &ServerState,
     bearer: Option<&ValidatedBearer>,
@@ -283,7 +283,7 @@ pub(crate) async fn range_sizes(
     let ranges = holder_ranges(state, (bucket, bearer), (member, snapshot), held).await?;
     let count = |value: i128| u64::try_from(value.max(0)).unwrap_or(u64::MAX);
     let mut sizes = Vec::with_capacity(ranges.len());
-    for (range_id, range) in ranges {
+    for (range_id, range) in ranges.into_iter().filter(|(_, range)| range.complete) {
         let counters =
             sum_held([&range]).map_err(|error| ServerError::InternalError(error.to_string()))?;
         sizes.push(RangeSize {

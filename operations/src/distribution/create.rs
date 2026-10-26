@@ -11,7 +11,7 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::distribution::capacity::RangeSize;
+use aruna_core::structs::storage::distribution::capacity::{RangeSize, with_unopened};
 use aruna_core::structs::storage::distribution::presets::{
     Layout, add_edges, replica_layout, shard_layout,
 };
@@ -180,7 +180,7 @@ pub async fn create_set(
 
 /// Admits every member the record has not admitted yet and activates the set once every
 /// coordinator and replica is in. A failed member keeps the set pending; nothing is deleted.
-/// Each member checks its node's capacity against the ranges' expected `sizes`.
+/// Each member checks capacity against `sizes`; a range no admitted member holds is empty.
 pub async fn admit_pending(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
@@ -202,6 +202,8 @@ pub async fn admit_pending(
     let signed = view.head;
     let snapshot = &signed.snapshot;
     let publisher = snapshot.root.publisher;
+    let sizes = with_unopened(snapshot, sizes);
+    let sizes = sizes.as_slice();
     let mut admitted = BTreeSet::new();
     let mut members = Vec::with_capacity(snapshot.config.members.len());
     for member in &snapshot.config.members {

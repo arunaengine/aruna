@@ -50,8 +50,15 @@ fn config() -> AdmitConfig {
         ranges: ranges(),
         strategy: DataStrategy::Copy,
         coverage: MetadataCoverage::Assigned,
-        sizes: Vec::new(),
+        sizes: ranges().iter().map(|range| empty(range.range_id)).collect(),
         capacity: None,
+    }
+}
+
+fn empty(range_id: Ulid) -> RangeSize {
+    RangeSize {
+        range_id,
+        ..RangeSize::default()
     }
 }
 
@@ -239,11 +246,11 @@ fn sized(capacity: Option<u64>) -> AdmitConfig {
     for range in &mut config.ranges {
         range.replicas = vec![config.member_id];
     }
-    config.sizes = vec![RangeSize {
+    config.sizes[0] = RangeSize {
         range_id: config.ranges[0].range_id,
         bytes: 1000,
         objects: 1,
-    }];
+    };
     config.capacity = capacity;
     config
 }
@@ -362,6 +369,20 @@ async fn unknown_capacity_all() {
     );
     assert!(!opened(&handle, None).await);
     run_with(&handle, sized(None), true).await.unwrap();
+}
+
+/// A range without a size is unknown, not empty: the admission opens and reserves nothing.
+#[tokio::test]
+async fn unknown_size_refused() {
+    let (_dir, handle) = open();
+    bucket(&handle, member_id(), 42, 42).await;
+    let mut unknown = sized(Some(u64::MAX));
+    unknown.sizes.pop();
+    let range_id = ranges()[1].range_id;
+    let refused = run_with(&handle, unknown, true).await;
+    assert_eq!(refused, Err(AdmitError::SizeUnknown(range_id)));
+    assert!(!opened(&handle, None).await);
+    assert_eq!(reserved(&handle, set_id().to_bytes().to_vec()).await, None);
 }
 
 /// Two admissions that each fit alone but not together cannot both commit: the reservations

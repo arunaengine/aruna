@@ -15,6 +15,7 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo, UserAccess};
+use aruna_core::structs::storage::distribution::capacity::with_unopened;
 use aruna_core::structs::storage::distribution::presets::shard_layout;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionConfig, DistributionRequest, DistributionSettings,
@@ -381,7 +382,7 @@ async fn admitted_set(
                 .collect(),
             strategy: member.strategy,
             coverage: member.coverage,
-            sizes: Vec::new(),
+            sizes: with_unopened(&created, &[]),
             capacity: None,
         };
         let statement = drive(AdmitOperation::new(admit), &node.context)
