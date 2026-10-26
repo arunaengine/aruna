@@ -146,7 +146,8 @@ pub async fn upload_part_token(
 
     // Stored before the bytes land: a lost merge must not let the completed
     // object drop the refs its source carried.
-    store_source_policies(context, input.upload_id, &source.source_policies).await?;
+    let target = (input.dest_bucket.as_str(), input.dest_key.as_str());
+    store_source_policies(context, target, input.upload_id, &source.source_policies).await?;
 
     let content_length = source
         .resolved_range
@@ -177,19 +178,21 @@ pub async fn upload_part_token(
 }
 
 /// Admits this node for the refs a part copied on another member carries and merges them into
-/// the upload before its bytes land, as a part copied here does.
+/// the upload of `target` (bucket and key) before its bytes land, as a part copied here does.
 pub async fn keep_part_policies(
     context: &DriverContext,
     (realm_id, upload_id): (RealmId, Ulid),
+    target: (&str, &str),
     policies: &[PlacementPolicyRef],
 ) -> Result<(), PartCopyError> {
     if policies.is_empty() {
         return Ok(());
     }
     let upload = read_upload(context, upload_id).await?;
+    check_target(&upload, target)?;
     let refs = union_refs(&upload.placement_policies, policies).map_err(UploadPartError::from)?;
     gate_part(context, realm_id, &refs, upload.group_id).await?;
-    store_source_policies(context, upload_id, policies).await
+    store_source_policies(context, target, upload_id, policies).await
 }
 
 /// Evaluates this node against every ref the finished part carries. An
@@ -217,6 +220,7 @@ async fn gate_part(
 /// copy writes nothing, so its behavior is exactly what it was before.
 async fn store_source_policies(
     context: &DriverContext,
+    target: (&str, &str),
     upload_id: Ulid,
     policies: &[PlacementPolicyRef],
 ) -> Result<(), PartCopyError> {
@@ -231,7 +235,7 @@ async fn store_source_policies(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         _ => return Err(UploadPartError::InvalidOperationState.into()),
     };
-    let result = merge_upload_policies(context, upload_id, policies, txn_id).await;
+    let result = merge_upload_policies(context, (target, upload_id), policies, txn_id).await;
     let closing = match result {
         Ok(()) => StorageEffect::CommitTransaction { txn_id },
         Err(_) => StorageEffect::AbortTransaction { txn_id },
@@ -249,7 +253,7 @@ async fn store_source_policies(
 
 async fn merge_upload_policies(
     context: &DriverContext,
-    upload_id: Ulid,
+    (target, upload_id): ((&str, &str), Ulid),
     policies: &[PlacementPolicyRef],
     txn_id: aruna_core::types::TxnId,
 ) -> Result<(), PartCopyError> {
@@ -268,9 +272,7 @@ async fn merge_upload_policies(
         return Err(UploadPartError::NoSuchUpload.into());
     };
     let mut record = MultipartUpload::from_bytes(value.as_ref()).map_err(UploadPartError::from)?;
-    if record.status != MultipartUploadStatus::Open {
-        return Err(UploadPartError::UploadNotOpen.into());
-    }
+    check_target(&record, target)?;
     if !record.merge_policies(policies)? {
         return Ok(());
     }
@@ -300,15 +302,22 @@ async fn validate_destination_upload(
     input: &PartCopyInput,
 ) -> Result<MultipartUpload, PartCopyError> {
     let record = read_upload(context, input.upload_id).await?;
-    if record.bucket != input.dest_bucket || record.key != input.dest_key {
-        return Err(PartCopyError::UploadPart(
-            UploadPartError::UploadTargetMismatch,
-        ));
+    check_target(&record, (&input.dest_bucket, &input.dest_key))?;
+    Ok(record)
+}
+
+/// Refuses an upload of another bucket or key, or one that is no longer open.
+fn check_target(
+    record: &MultipartUpload,
+    (bucket, key): (&str, &str),
+) -> Result<(), PartCopyError> {
+    if record.bucket != bucket || record.key != key {
+        return Err(UploadPartError::UploadTargetMismatch.into());
     }
     if record.status != MultipartUploadStatus::Open {
-        return Err(PartCopyError::UploadPart(UploadPartError::UploadNotOpen));
+        return Err(UploadPartError::UploadNotOpen.into());
     }
-    Ok(record)
+    Ok(())
 }
 
 async fn read_upload(
@@ -792,12 +801,13 @@ mod test {
         let upload_id = Ulid::generate();
         seed_multipart_upload(&context, upload_id, "bucket", "dest.txt", group_id, user_id).await;
 
-        keep_part_policies(&context, (realm_id, upload_id), &[allowed])
+        let target = ("bucket", "dest.txt");
+        keep_part_policies(&context, (realm_id, upload_id), target, &[allowed])
             .await
             .unwrap();
         let record = read_upload(&context, upload_id).await.unwrap();
         assert_eq!(record.placement_policies, vec![allowed]);
-        let error = keep_part_policies(&context, (realm_id, upload_id), &[denied])
+        let error = keep_part_policies(&context, (realm_id, upload_id), target, &[denied])
             .await
             .unwrap_err();
         assert!(matches!(
@@ -805,7 +815,38 @@ mod test {
             PartCopyError::UploadPart(UploadPartError::PolicyGateError(_))
         ));
         let missing = (realm_id, Ulid::generate());
-        assert_eq!(keep_part_policies(&context, missing, &[]).await, Ok(()));
+        assert_eq!(
+            keep_part_policies(&context, missing, target, &[]).await,
+            Ok(())
+        );
+    }
+
+    // An upload id of another bucket or key is refused before its refs change, also inside
+    // the merge transaction itself.
+    #[tokio::test]
+    async fn merge_checks_target() {
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::generate();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let upload_id = Ulid::generate();
+        seed_multipart_upload(&context, upload_id, "bucket", "dest.txt", group_id, user_id).await;
+        let policy = PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([8; 16]),
+            digest: [8; 32],
+        };
+        let mismatch = Err(PartCopyError::UploadPart(
+            UploadPartError::UploadTargetMismatch,
+        ));
+
+        let other = ("bucket", "other.txt");
+        let kept = keep_part_policies(&context, (realm_id, upload_id), other, &[policy]).await;
+        assert_eq!(kept, mismatch);
+        let other = ("other", "dest.txt");
+        let stored = store_source_policies(&context, other, upload_id, &[policy]).await;
+        assert_eq!(stored, mismatch);
+        let record = read_upload(&context, upload_id).await.unwrap();
+        assert!(record.placement_policies.is_empty());
     }
 
     async fn seed_governed_bucket(

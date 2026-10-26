@@ -1455,7 +1455,8 @@ impl S3 for ArunaS3Service {
         // A part copied on another member keeps its source's placement refs, as one copied here.
         if let Some(copied) = forward::copy_context(&req.extensions, &req.headers)? {
             let upload = (self.realm_id, upload_id);
-            keep_part_policies(&self.state, upload, &copied.policies)
+            let target = (req.input.bucket.as_str(), req.input.key.as_str());
+            keep_part_policies(&self.state, upload, target, &copied.policies)
                 .await
                 .map_err(IntoS3Error::into_s3_error)?;
         }
