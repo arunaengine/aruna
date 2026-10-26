@@ -214,6 +214,8 @@ pub async fn complete_job(
         record.updated_at_ms = now_ms;
         record.progress = final_progress.clone();
         record.result = Some(result.clone());
+        // An error of an earlier run is no outcome of the job.
+        record.last_error = None;
         record.claim = None;
         Ok(JobMutation::Persist)
     })
@@ -311,6 +313,7 @@ where
             record.updated_at_ms = now_ms;
             record.progress = final_progress.clone();
             record.result = Some(result.clone());
+            record.last_error = None;
             record.claim = None;
             Ok(JobMutation::Persist)
         },

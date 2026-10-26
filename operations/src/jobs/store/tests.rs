@@ -659,6 +659,48 @@ async fn deferral_keeps_attempt() {
     );
 }
 
+// A run deferred by a storage conflict spends no attempt, and the success after it clears the
+// conflict from the job's error.
+#[tokio::test]
+async fn success_clears_error() {
+    let (_dir, storage) = temp_storage();
+    let job_id = JobId::from_bytes([0x45u8; 16]);
+    insert_job(&storage, &queued_record(job_id)).await.unwrap();
+    let claim = |now| claim_job(&storage, job_id, node_id(3), now);
+    let ClaimOutcome::Claimed(record) = claim(5_000).await.unwrap() else {
+        panic!("job must be claimed")
+    };
+    let token = record.claim.unwrap().claim_token;
+    let conflict = JobError::retryable("Transaction conflict");
+    defer_job(&storage, job_id, token, 6_000, 1_000, conflict)
+        .await
+        .unwrap();
+    let ClaimOutcome::Claimed(record) = claim(7_000).await.unwrap() else {
+        panic!("job must be claimed again")
+    };
+    assert_eq!(record.attempts, 0);
+    let token = record.claim.unwrap().claim_token;
+
+    let progress = JobProgress {
+        current: 1,
+        total: Some(1),
+        unit: "items".to_string(),
+    };
+    let payload = JobResultPayload::Staging {
+        completed_items: 1,
+        failed_items: 0,
+    };
+    transition_to_running(&storage, job_id, token, 7_500)
+        .await
+        .unwrap();
+    let done = complete_job(&storage, job_id, token, payload, progress, 8_000)
+        .await
+        .unwrap();
+
+    assert_eq!(done.state, JobState::Succeeded);
+    assert!(done.last_error.is_none());
+}
+
 // Retried payload work starts over, so persisted progress must start over too.
 #[tokio::test]
 async fn retry_resets_progress() {
