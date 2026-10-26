@@ -7,6 +7,7 @@ use aruna_core::structs::storage::abe::{
     AbeEffect, AbeEvent, AbeParameters, EnvelopePlan, ObjectEnvelope, create_envelope,
     create_parameters,
 };
+use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
@@ -261,7 +262,7 @@ async fn refused_copy_absent() {
     }
 }
 
-fn test_realm_id() -> RealmId {
+pub(super) fn test_realm_id() -> RealmId {
     RealmId::from_bytes([7u8; 32])
 }
 
@@ -335,7 +336,7 @@ fn make_location() -> BackendLocation {
     }
 }
 
-fn make_bucket_info(group_id: Ulid) -> BucketInfo {
+pub(super) fn make_bucket_info(group_id: Ulid) -> BucketInfo {
     BucketInfo {
         group_id,
         created_at: SystemTime::UNIX_EPOCH,
@@ -345,6 +346,7 @@ fn make_bucket_info(group_id: Ulid) -> BucketInfo {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     }
 }
 
@@ -394,6 +396,13 @@ pub(super) fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationMani
         reference_advance: None,
         reference_advance_count: None,
         placement_policies: Vec::new(),
+        original_epoch: Default::default(),
+        version_generation: 0,
+        logical_identity: None,
+        distribution: None,
+        version_origin: None,
+        version_hop: None,
+        sync_source: None,
     }
 }
 
@@ -410,6 +419,7 @@ fn make_source_binding() -> VersionSourceBinding {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: Some(Ulid::from_bytes([0x22; 16])),
     }
@@ -430,6 +440,7 @@ pub(super) fn make_reference_manifest() -> VersionReplicationManifest {
         etag: None,
         last_modified: Some(manifest.created_at),
         source_version: None,
+        digests: Default::default(),
     });
     manifest.reference_advance_count = Some(0);
     manifest
@@ -521,7 +532,7 @@ fn expect_rejected_negotiation(effect: &Effect, expected_reason: &str) {
 }
 
 /// Answers the routing load that follows every destination bucket read.
-fn load_routing(
+pub(super) fn load_routing(
     op: &mut IncomingVersionOperation,
     inputs: GroupRoutingInputs,
 ) -> aruna_core::types::Effects {
@@ -592,7 +603,7 @@ fn no_drift() -> Event {
 }
 
 /// The destination bucket read with no encryption settings row.
-fn bucket_read(bucket: Option<aruna_core::types::Value>) -> Event {
+pub(super) fn bucket_read(bucket: Option<aruna_core::types::Value>) -> Event {
     Event::Storage(StorageEvent::BatchReadResult {
         values: vec![
             (b"bucket".to_vec().into(), bucket),
@@ -871,6 +882,85 @@ fn version_binds_publisher() {
 }
 
 #[test]
+fn epoch_needs_binding() {
+    // An ordinary bucket orders by generation alone, whatever epoch a manifest claims.
+    let stored_epoch = |bound: bool| {
+        let mut manifest = make_reference_manifest();
+        manifest.writer_auth_context = None;
+        manifest.original_epoch = OriginalEpoch(4);
+        let mut op = IncomingVersionOperation::new(
+            Ulid::from_parts(12, 12),
+            iroh::SecretKey::from_bytes(&[70; 32]).public(),
+            test_realm_id(),
+            manifest,
+        )
+        .with_publisher_node(iroh::SecretKey::from_bytes(&[42u8; 32]).public());
+        op.txn_id = Some(Ulid::from_parts(13, 13));
+        op.destination_bound = bound;
+        let effects = op.write_blob_version();
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected reference version write")
+        };
+        BlobVersion::from_bytes(value.as_ref())
+            .unwrap()
+            .original_epoch
+    };
+    assert_eq!(stored_epoch(false), OriginalEpoch(0));
+    assert_eq!(stored_epoch(true), OriginalEpoch(4));
+}
+
+#[test]
+fn history_keeps_generation() {
+    // A historical version keeps the generation it was written as inside a distributed bucket.
+    let stored = |bound: bool| {
+        let mut manifest = make_reference_manifest();
+        manifest.writer_auth_context = None;
+        manifest.current_version = false;
+        manifest.current_version_generation = None;
+        manifest.version_generation = 5;
+        let mut op = IncomingVersionOperation::new(
+            Ulid::from_parts(12, 12),
+            iroh::SecretKey::from_bytes(&[70; 32]).public(),
+            test_realm_id(),
+            manifest,
+        )
+        .with_publisher_node(iroh::SecretKey::from_bytes(&[42u8; 32]).public());
+        op.txn_id = Some(Ulid::from_parts(13, 13));
+        op.destination_bound = bound;
+        let effects = op.write_blob_version();
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected reference version write")
+        };
+        BlobVersion::from_bytes(value.as_ref()).unwrap().generation
+    };
+    assert_eq!((stored(false), stored(true)), (0, 5));
+}
+
+#[test]
+fn keeps_logical_identity() {
+    // The identity the set fixed travels with the version, whatever form its bytes take here.
+    let mut manifest = make_reference_manifest();
+    manifest.writer_auth_context = None;
+    manifest.logical_identity = Some([9; 32]);
+    let mut op = IncomingVersionOperation::new(
+        Ulid::from_parts(12, 12),
+        iroh::SecretKey::from_bytes(&[70; 32]).public(),
+        test_realm_id(),
+        manifest,
+    )
+    .with_publisher_node(iroh::SecretKey::from_bytes(&[42u8; 32]).public());
+    op.txn_id = Some(Ulid::from_parts(13, 13));
+    op.destination_bound = true;
+    let effects = op.write_blob_version();
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected reference version write")
+    };
+    let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+    assert_eq!(version.identity, Some([9; 32]));
+    assert_eq!(op.written_identity, Some([9; 32]));
+}
+
+#[test]
 fn valid_advance() {
     let (manifest, previous, publisher) = advance_fixture();
     let advance = manifest.reference_advance.unwrap();
@@ -934,6 +1024,67 @@ fn valid_advance() {
         panic!("expected successor version write")
     };
     assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
+}
+
+#[test]
+fn advance_retry_matches() {
+    // A retried advance rebuilds the reference exactly as the first apply stored it, epoch,
+    // generation and identity included, so the stored version is not refused.
+    let (mut manifest, _, publisher) = advance_fixture();
+    manifest.original_epoch = OriginalEpoch(3);
+    let mut op = advance_operation(manifest, publisher);
+    op.destination_bound = true;
+    op.txn_id = Some(Ulid::from_parts(13, 13));
+    let rebuilt = op.reference_version().unwrap();
+    let effects = op.write_blob_version();
+    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        panic!("expected reference version write")
+    };
+    let stored = BlobVersion::from_bytes(value.as_ref()).unwrap();
+    assert_eq!(
+        (stored.generation, stored.original_epoch),
+        (8, OriginalEpoch(3))
+    );
+    assert_eq!(rebuilt, stored);
+}
+
+#[test]
+fn refreshed_advance_matches() {
+    // A local refresh after the first apply moves only `last_refresh`, so a retry still matches.
+    let (manifest, _, publisher) = advance_fixture();
+    let op = advance_operation(manifest, publisher);
+    let incoming = op.reference_version().unwrap();
+    let mut refreshed = incoming.clone();
+    let BlobVersionState::Reference { last_refresh, .. } = &mut refreshed.state else {
+        panic!("expected a reference")
+    };
+    *last_refresh += Duration::from_secs(60);
+    assert!(super::same_reference(&refreshed, &incoming));
+    let mut other = refreshed.clone();
+    other
+        .metadata
+        .insert("changed".to_string(), "yes".to_string());
+    assert!(
+        !super::same_reference(&other, &incoming),
+        "other fields still count"
+    );
+}
+
+#[test]
+fn advance_replay_orders() {
+    // A head written at a later epoch already supersedes a replayed advance, whatever its
+    // generation; comparing generations alone would refuse the replay as invalid lineage.
+    let (mut manifest, _, publisher) = advance_fixture();
+    manifest.original_epoch = OriginalEpoch(1);
+    let mut op = advance_operation(manifest, publisher);
+    op.destination_bound = true;
+    op.advance_version_exists = true;
+    let later = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([30u8; 16]), 1)
+        .with_epoch(OriginalEpoch(2));
+    op.write_compared_object(Some(&later.to_bytes().unwrap()));
+    assert_eq!(op.state, IncomingVersionState::WriteLiveObligation);
+    assert_eq!(op.existing_current_pointer, Some(later));
+    assert_eq!(op.pending_head, None);
 }
 
 // One advance mints exactly one successor: a repeated, skipped or overflowing
@@ -1379,6 +1530,36 @@ fn changed_reference_updates() {
     ));
 }
 
+// A sync destination's hop names the sender's bucket and key, never its own.
+#[test]
+fn hop_names_source() {
+    use aruna_core::structs::storage::origin::OriginVersion;
+    let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+    let relationship_id = Ulid::from_parts(22, 22);
+    manifest.origin = Some(SyncOrigin {
+        relationship_id,
+        hop_count: 1,
+    });
+    manifest.sync_source = Some(("source-bucket".to_string(), "raw/a.txt".to_string()));
+    let publisher = iroh::SecretKey::from_bytes(&[75; 32]).public();
+    let op = IncomingVersionOperation::new(
+        Ulid::from_parts(23, 23),
+        publisher,
+        test_realm_id(),
+        manifest,
+    );
+
+    let hop = op.hop().unwrap();
+    assert_eq!(hop.relationship_id, relationship_id);
+    let OriginVersion::Node(arn) = hop.from else {
+        panic!("an ordinary source is named by its node ARN")
+    };
+    assert_eq!(
+        (arn.bucket.as_str(), arn.key.as_str()),
+        ("source-bucket", "raw/a.txt")
+    );
+}
+
 #[test]
 fn hop_limit_rejects() {
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
@@ -1584,6 +1765,11 @@ fn quota_excess_rejects() {
         [Effect::Storage(StorageEffect::Read { txn_id: read_txn_id, .. })]
             if *read_txn_id == Some(txn_id)
     ));
+    // No usage rebuild marker.
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![0u8; 4].into(),
+        value: None,
+    }));
     op.step(Event::Storage(StorageEvent::ReadResult {
         key: vec![0u8; 4].into(),
         value: Some(config_bytes.into()),
@@ -1750,6 +1936,7 @@ fn head_releases_observation() {
         etag: None,
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     };
     let now = fixed_created_at();
     let head = BlobVersion::reference(source, metadata, now, test_user_id(), now);
@@ -4449,5 +4636,47 @@ fn mapped_refuses_replicas() {
     expect_rejected_negotiation(
         &effects[0],
         "A bucket stored 1:1 in a provider bucket cannot receive replicas yet.",
+    );
+}
+
+// A member receiving a pulled marker of a distributed bucket keeps its receipt in the apply.
+#[test]
+fn keeps_pull_receipt() {
+    use aruna_core::keyspaces::SYNC_RECEIPT_KEYSPACE;
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::{ORIGIN_DEVICE_TAG, SYNC_VERSION_TAG, tagged_receipt};
+    let device = iroh::SecretKey::from_bytes(&[9; 32]).public();
+    let pulled = Ulid::from_bytes([2; 16]);
+    let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+    manifest.metadata = HashMap::from([
+        (SYNC_VERSION_TAG.to_string(), pulled.to_string()),
+        (ORIGIN_DEVICE_TAG.to_string(), device.to_string()),
+    ]);
+    let target = (manifest.bucket.clone(), manifest.key.clone());
+    let version_id = manifest.version_id;
+    let local = iroh::SecretKey::from_bytes(&[65; 32]).public();
+    let mut operation =
+        IncomingVersionOperation::new(trace_stream_id(), local, test_realm_id(), manifest);
+    assert_eq!(
+        operation.pull_receipt(),
+        None,
+        "an ordinary bucket keeps none"
+    );
+    operation.txn_id = Some(trace_txn_id());
+    operation.destination_binding = Some(DistributionBinding {
+        set_id: Ulid::from_bytes([3; 16]),
+        member_id: Ulid::from_bytes([4; 16]),
+        incarnation: 5,
+        revision: Default::default(),
+    });
+    let key = tagged_receipt((&target.0, &target.1), &operation.manifest.metadata, true);
+    assert_eq!(
+        operation.pull_receipt(),
+        Some(Effect::Storage(StorageEffect::Write {
+            key_space: SYNC_RECEIPT_KEYSPACE.to_string(),
+            key: key.unwrap().into(),
+            value: version_id.to_bytes().to_vec().into(),
+            txn_id: Some(trace_txn_id()),
+        }))
     );
 }

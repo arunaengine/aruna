@@ -253,6 +253,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         crate::s3::bucket::key::rows::authority_rows(&info, Some(settings), admins)
     }

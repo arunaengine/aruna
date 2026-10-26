@@ -9,7 +9,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
+use aruna_core::keyspaces::{DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -62,6 +62,11 @@ enum RemoveNodeState {
     Init,
     StartTransaction,
     ReadCurrent,
+    /// Checks that the node publishes no distributed bucket.
+    ReadCutoffs {
+        document_value: Option<Value>,
+        reducer_state_value: Option<Value>,
+    },
     WriteDocumentState {
         document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
@@ -91,6 +96,10 @@ pub enum RemoveNodeError {
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("realm config document missing")]
     ConfigMissing,
+    #[error(
+        "the node publishes distributed buckets; moving that role needs the later failover procedure"
+    )]
+    PublisherRemoval,
     #[error("no device {node_id} belongs to this caller")]
     DeviceNotFound { node_id: NodeId },
     #[error("this node is not a realm management node")]
@@ -209,6 +218,8 @@ impl RemoveNodeOperation {
             &self.config.actor,
             AdminDocumentOperation::ConfigNodeRemoved {
                 node_id: self.config.node_id,
+                // A publisher is never removed here, so no set needs a cutoff yet.
+                cutoffs: Vec::new(),
             },
         )?;
         // The stored document is derived from the reducer, exactly as the
@@ -316,15 +327,37 @@ impl Operation for RemoveNodeOperation {
                     if !membership.pending.is_empty() {
                         return self.fail(RemoveNodeError::DeletionPending);
                     }
-                    match self
-                        .emit_removal_writes(document_value.clone(), reducer_state_value.clone())
-                    {
+                    self.state = RemoveNodeState::ReadCutoffs {
+                        document_value: document_value.clone(),
+                        reducer_state_value: reducer_state_value.clone(),
+                    };
+                    smallvec![Effect::Storage(StorageEffect::Iter {
+                        key_space: DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
+                        prefix: Some(self.config.node_id.as_bytes().to_vec().into()),
+                        start: None,
+                        limit: 1,
+                        txn_id: self.txn_id,
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+            },
+            RemoveNodeState::ReadCutoffs {
+                document_value,
+                reducer_state_value,
+            } => match event {
+                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                    // A cached head is no final cutoff, so a publisher stays until failover.
+                    if !values.is_empty() {
+                        return self.fail(RemoveNodeError::PublisherRemoval);
+                    }
+                    match self.emit_removal_writes(document_value, reducer_state_value) {
                         Ok(effects) => effects,
                         Err(error) => self.fail(error),
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("publisher index rows", format!("{other:?}")),
             },
             RemoveNodeState::WriteDocumentState {
                 document,
@@ -609,5 +642,49 @@ mod tests {
         .await
         .expect_err("a server node is refused");
         assert_eq!(error, RemoveNodeError::NotManagementNode);
+    }
+
+    #[tokio::test]
+    async fn removal_refuses_publisher() {
+        // A set's publisher is never removed with a possibly stale cutoff.
+        use aruna_core::structs::storage::distribution::{DistributionRevision, publisher_key};
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let actor = actor(realm_id);
+        seed(
+            &ctx,
+            &actor,
+            &realm_with_device(realm_id, &actor, actor.user_id),
+        )
+        .await;
+        let revision = DistributionRevision {
+            number: 4,
+            digest: [5u8; 32],
+        };
+        ctx.storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: DISTRIBUTION_PUBLISHER_KEYSPACE.to_string(),
+                key: publisher_key(&node(2), Ulid::from_bytes([7u8; 16])).into(),
+                value: postcard::to_allocvec(&revision).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let error = drive(
+            RemoveNodeOperation::new(removal(&actor, DeviceEvictionScope::Owner)),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, RemoveNodeError::PublisherRemoval);
+        let reread = drive(GetConfigOperation::new(realm_id), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            reread
+                .nodes
+                .iter()
+                .any(|entry| entry.node_id == node(2).to_string())
+        );
     }
 }

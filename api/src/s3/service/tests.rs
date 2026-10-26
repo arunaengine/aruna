@@ -184,6 +184,7 @@ fn reference_fields_present() {
         etag: None,
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     };
 
     let fields =
@@ -734,8 +735,15 @@ async fn refresh_failure_hidden() {
         bucket: "bucket".to_string(),
         key: "reference".to_string(),
         version_id: Ulid::generate(),
-        metadata: source_metadata(2, "etag"),
+        metadata: Some(source_metadata(2, "etag")),
         refreshed_at: UNIX_EPOCH.checked_sub(Duration::from_secs(1)).unwrap(),
+        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+        auth_context: aruna_core::structs::identity::auth::AuthContext {
+            user_id: Default::default(),
+            realm_id: aruna_core::structs::identity::realm::RealmId([9u8; 32]),
+            path_restrictions: None,
+            session: None,
+        },
     };
 
     let queue_result = drive(
@@ -803,17 +811,18 @@ async fn newer_refresh_updates() {
     let test = setup_state();
     let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
     let refreshed_at = UNIX_EPOCH + Duration::from_secs(30);
-    let new_metadata = source_metadata(20, "newer");
-    write_reference_version(&test, source_metadata(10, "original"), last_refresh).await;
+    // A confirmed observation moves the refresh time; the version's fields stay as recorded.
+    let original = source_metadata(10, "original");
+    write_reference_version(&test, original.clone(), last_refresh).await;
 
     refresh_reference_metadata(
         test.context.clone(),
-        refresh(&test, new_metadata.clone(), refreshed_at),
+        refresh(&test, original.clone(), refreshed_at),
     )
     .await
     .unwrap();
 
-    assert_reference_state(&test, &new_metadata, refreshed_at).await;
+    assert_reference_state(&test, &original, refreshed_at).await;
 }
 
 fn setup_state() -> TestState {
@@ -982,8 +991,15 @@ fn refresh(
         bucket: test.bucket.clone(),
         key: test.key.clone(),
         version_id: test.version_id,
-        metadata,
+        metadata: Some(metadata),
         refreshed_at,
+        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+        auth_context: aruna_core::structs::identity::auth::AuthContext {
+            user_id: Default::default(),
+            realm_id: aruna_core::structs::identity::realm::RealmId([9u8; 32]),
+            path_restrictions: None,
+            session: None,
+        },
     }
 }
 
@@ -1000,6 +1016,7 @@ fn source_metadata(content_length: u64, etag: &str) -> SourceMetadata {
         etag: Some(etag.to_string()),
         last_modified: Some(UNIX_EPOCH + Duration::from_secs(content_length)),
         source_version: None,
+        digests: Default::default(),
     }
 }
 
@@ -1013,6 +1030,7 @@ fn source_binding() -> VersionSourceBinding {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: None,
     }
@@ -1922,6 +1940,7 @@ fn test_bucket_info(group_id: Ulid, created_by: UserId) -> BucketInfo {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     }
 }
 
@@ -2916,6 +2935,7 @@ async fn reference_returns_metadata() {
         etag: Some("ref-etag-value".to_string()),
         last_modified: Some(UNIX_EPOCH + Duration::from_secs(10)),
         source_version: None,
+        digests: Default::default(),
     };
 
     let version_id = Ulid::generate();
@@ -2996,6 +3016,7 @@ async fn bare_reference_head() {
         etag: None,
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     };
     write_reference_metadata(
         &service.state.storage_handle,

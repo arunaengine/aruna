@@ -7,6 +7,7 @@ use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::encryption::{BucketKeyRef, SealPlan};
+use crate::structs::storage::global_id::GlobalId;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
@@ -270,6 +271,8 @@ impl fmt::Display for VersionedObjectArn {
 pub enum W3idIdentifier {
     ContentHash([u8; 32]),
     VersionedObject(VersionedObjectArn),
+    /// A distributed bucket's version, bucket or prefix, named by realm and never by node.
+    Global(GlobalId),
 }
 
 impl W3idIdentifier {
@@ -290,15 +293,16 @@ impl W3idIdentifier {
         if suffix.starts_with("arn:") {
             return Ok(Self::VersionedObject(VersionedObjectArn::parse(suffix)?));
         }
-        Err(ConversionError::FromStrError(
-            "Aruna data W3ID has an unsupported suffix".to_string(),
-        ))
+        GlobalId::parse_url(input)
+            .map(Self::Global)
+            .map_err(|error| ConversionError::FromStrError(error.to_string()))
     }
 
     pub fn to_w3id(&self) -> String {
         match self {
             Self::ContentHash(hash) => format!("{ARUNA_DATA_PREFIX}{}", hex::encode(hash)),
             Self::VersionedObject(arn) => arn.to_w3id(),
+            Self::Global(id) => id.to_url(),
         }
     }
 }
@@ -568,6 +572,37 @@ mod tests {
             W3idIdentifier::parse(&arn.to_w3id()).unwrap(),
             W3idIdentifier::VersionedObject(arn)
         );
+    }
+
+    #[test]
+    fn classifies_global_ids() {
+        use crate::structs::storage::global_id::GlobalId;
+
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let id = Ulid::from_bytes([2u8; 16]);
+        let forms = [
+            GlobalId::Version {
+                realm_id,
+                version_id: id,
+            },
+            GlobalId::Set {
+                realm_id,
+                set_id: id,
+                prefix: String::new(),
+            },
+            GlobalId::Set {
+                realm_id,
+                set_id: id,
+                prefix: "a/../b@c".to_string(),
+            },
+        ];
+        for global in forms {
+            let parsed = W3idIdentifier::parse(&global.to_url()).unwrap();
+            assert_eq!(parsed.to_w3id(), global.to_url());
+            assert_eq!(parsed, W3idIdentifier::Global(global));
+        }
+        // A bare ULID is one segment and names neither a hash nor a global id.
+        assert!(W3idIdentifier::parse(&format!("{ARUNA_DATA_PREFIX}{id}")).is_err());
     }
 
     #[test]

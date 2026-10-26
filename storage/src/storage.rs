@@ -7,6 +7,8 @@ mod lifecycle;
 mod metrics;
 mod owner;
 mod persistence;
+mod preimage;
+mod rebuild;
 mod records;
 mod sealing;
 mod shutdown;
@@ -16,7 +18,13 @@ mod tests;
 #[cfg(test)]
 mod tests_config;
 #[cfg(test)]
+mod tests_counters;
+#[cfg(test)]
 mod tests_persistence;
+#[cfg(test)]
+mod tests_range;
+#[cfg(test)]
+mod tests_rebuild;
 mod transactions;
 mod vault;
 mod worker;
@@ -35,7 +43,7 @@ pub(in crate::storage) use handle::{
 };
 pub(in crate::storage) use metrics::WorkerLifecycleGuard;
 pub(in crate::storage) use worker::{
-    BULK_POOL_THREADS, READ_POOL_THREADS, Store, Txn, batch_read_with, iterate_page,
+    BULK_POOL_THREADS, READ_POOL_THREADS, Store, Txn, batch_read_with, iterate_page, range_page,
     read_last_with, spawn_read_pool, store_batch_read, store_iterate, store_last, store_read,
 };
 

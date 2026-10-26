@@ -2,6 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::distribution::guard::{
+    GuardError, WriteAuthority, authority_reads, check_authority, record_authority, record_read,
+};
+use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::count_upload;
 use crate::placement::policy::{
@@ -16,7 +20,8 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, UPLOAD_KEYSPACE,
+    ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, S3_BUCKET_KEYSPACE,
+    UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
@@ -45,6 +50,8 @@ pub enum CreateMultipartState {
     ReadGateBucket,
     ReadBucketKey,
     PolicyGate,
+    /// Reads a distributed bucket's record: uploads open only on the key's coordinator.
+    ReadRecord,
     CheckOpenFence,
     ReadPlainOwner,
     StatPlain,
@@ -53,11 +60,15 @@ pub enum CreateMultipartState {
     CreateEnvelope,
     StartTransaction,
     CheckPurgeFence,
+    /// Rereads the binding, record and fence of a distributed bucket in the transaction.
+    CheckAuthority,
     FenceBackend,
     CheckSettings,
     WriteUpload,
     /// Books the new record on the bucket's open upload count.
     CountUpload,
+    /// Opens the upload in the upload inventory of a distributed bucket.
+    CountInventory,
     WritePending,
     CommitTransaction,
     AbortBackendUpload,
@@ -73,6 +84,8 @@ pub enum CreateMultipartError {
     Unmapped,
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
     #[error("Transaction id missing")]
     TransactionMissing,
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
@@ -99,6 +112,8 @@ pub enum CreateMultipartError {
     UnsupportedChecksum(&'static str),
     #[error("operation did not finish")]
     NotFinished,
+    #[error(transparent)]
+    Inventory(#[from] InventoryError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +163,12 @@ pub struct CreateMultipartOperation {
     /// The pending envelope of an encrypted upload, stored beside its record.
     envelope: Option<ObjectEnvelope>,
     pending_error: Option<CreateMultipartError>,
+    /// The inventory update of a distributed bucket, opened with the upload record.
+    inventory: Option<InventoryUpdate>,
+    /// The bucket's distribution binding; only the key's coordinator opens an upload.
+    binding: Option<aruna_core::structs::storage::distribution::DistributionBinding>,
+    /// The coordinator authority read before the transaction, checked again inside it.
+    authority: Option<WriteAuthority>,
     output: Option<Result<CreateMultipartResult, CreateMultipartError>>,
 }
 
@@ -172,6 +193,9 @@ impl CreateMultipartOperation {
             encryption: None,
             envelope: None,
             pending_error: None,
+            inventory: None,
+            binding: None,
+            authority: None,
             output: None,
         }
     }
@@ -220,6 +244,27 @@ impl CreateMultipartOperation {
 
     /// A fenced destination opens no provider upload; the transaction checks the fence again.
     fn check_open_fence(&mut self) -> Effects {
+        if let Some(binding) = self.binding.as_ref() {
+            self.state = CreateMultipartState::ReadRecord;
+            return smallvec![record_read(binding)];
+        }
+        self.read_open_fence()
+    }
+
+    fn record_checked(&mut self, event: Event) -> Effects {
+        let Some(binding) = self.binding.as_ref() else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        match record_authority(binding, &self.input.key, event) {
+            Ok(authority) => {
+                self.authority = Some(authority);
+                self.read_open_fence()
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn read_open_fence(&mut self) -> Effects {
         self.state = CreateMultipartState::CheckOpenFence;
         smallvec![write_fence_read(&self.input.bucket, None)]
     }
@@ -488,6 +533,14 @@ impl CreateMultipartOperation {
 
     fn gate_bucket(&mut self, bucket: Option<BucketInfo>) -> Effects {
         self.stored_policies = GatedBucket::observe(bucket.as_ref()).policies;
+        self.binding = bucket
+            .as_ref()
+            .and_then(|bucket| bucket.distribution.clone());
+        self.inventory = self.binding.as_ref().map(|binding| {
+            let mut change = InventoryChange::new(binding.set_id, self.input.key.clone());
+            change.upload = Some((self.upload_id, true));
+            InventoryUpdate::new(change)
+        });
         let compression = bucket.as_ref().map(|bucket| bucket.compression);
         self.resolved = self
             .resolved
@@ -572,6 +625,55 @@ impl CreateMultipartOperation {
         if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
             return self.emit_error(error.into());
         }
+        if let Some(authority) = self.authority.as_ref() {
+            // A fence, transfer or replaced bucket since the first check conflicts the commit.
+            let bucket = (
+                S3_BUCKET_KEYSPACE.to_string(),
+                self.input.bucket.as_bytes().into(),
+            );
+            let mut reads = vec![bucket];
+            reads.extend(authority_reads(authority.binding.set_id));
+            self.state = CreateMultipartState::CheckAuthority;
+            return smallvec![Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: self.txn_id,
+            })];
+        }
+        self.fence_backend()
+    }
+
+    fn authority_checked(&mut self, event: Event) -> Effects {
+        let Some(authority) = self.authority.as_ref() else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+        };
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let (bucket, record, fence) = (
+            values.next().flatten(),
+            values.next().flatten(),
+            values.next().flatten(),
+        );
+        let bound = (bucket.as_deref())
+            .and_then(|value| BucketInfo::from_bytes(value).ok())
+            .and_then(|info| info.distribution)
+            .is_some_and(|bound| {
+                let wanted = &authority.binding;
+                (bound.set_id, bound.member_id, bound.incarnation)
+                    == (wanted.set_id, wanted.member_id, wanted.incarnation)
+            });
+        if !bound {
+            return self.emit_error(GuardError::Unbound(authority.binding.set_id).into());
+        }
+        let key = &self.input.key;
+        match check_authority(authority, key, record.as_deref(), fence.as_deref()) {
+            Ok(()) => self.fence_backend(),
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn fence_backend(&mut self) -> Effects {
         let Some(resolved) = self.resolved.as_ref() else {
             return self.emit_error(CreateMultipartError::CreateUploadFailed);
         };
@@ -684,7 +786,24 @@ impl CreateMultipartOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(CreateMultipartError::TransactionMissing);
         };
-        self.write_rest(txn_id)
+        match self.inventory.as_mut() {
+            Some(inventory) => {
+                self.state = CreateMultipartState::CountInventory;
+                inventory.start(txn_id)
+            }
+            None => self.write_rest(txn_id),
+        }
+    }
+
+    fn inventory_counted(&mut self, event: Event) -> Effects {
+        let (Some(txn_id), Some(inventory)) = (self.txn_id, self.inventory.as_mut()) else {
+            return self.emit_error(CreateMultipartError::TransactionMissing);
+        };
+        match inventory.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => self.write_rest(txn_id),
+            Err(error) => self.emit_error(error.into()),
+        }
     }
 
     /// Writes the pending envelope, if any, then commits.
@@ -775,6 +894,7 @@ impl Operation for CreateMultipartOperation {
             CreateMultipartState::Init => self.handle_init(),
             CreateMultipartState::ReadGateBucket => self.handle_gate_bucket(event),
             CreateMultipartState::ReadBucketKey => self.handle_bucket_key(event),
+            CreateMultipartState::ReadRecord => self.record_checked(event),
             CreateMultipartState::PolicyGate => self.handle_policy_gate(event),
             CreateMultipartState::CheckOpenFence => self.open_upload(event),
             CreateMultipartState::ReadPlainOwner => self.plain_owner(event),
@@ -784,12 +904,14 @@ impl Operation for CreateMultipartOperation {
             CreateMultipartState::CreateEnvelope => self.envelope_created(event),
             CreateMultipartState::StartTransaction => self.handle_transaction_started(event),
             CreateMultipartState::CheckPurgeFence => self.fence_checked(event),
+            CreateMultipartState::CheckAuthority => self.authority_checked(event),
             CreateMultipartState::FenceBackend => self.handle_backend_fenced(event),
             CreateMultipartState::CheckSettings => self.settings_checked(event),
             CreateMultipartState::WriteUpload | CreateMultipartState::WritePending => {
                 self.handle_record_written(event)
             }
             CreateMultipartState::CountUpload => self.upload_counted(event),
+            CreateMultipartState::CountInventory => self.inventory_counted(event),
             CreateMultipartState::CommitTransaction => self.handle_transaction_committed(event),
             CreateMultipartState::AbortBackendUpload => self.backend_aborted(event),
             CreateMultipartState::Finish => smallvec![],
@@ -1004,6 +1126,7 @@ mod pure_tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Zstd { level: 3 },
+            distribution: None,
         };
         operation.step(bucket_read(Some(bucket.to_bytes().unwrap()), None));
 
@@ -1013,6 +1136,82 @@ mod pure_tests {
             panic!("expected the upload to open, got {effects:?}")
         };
         assert_eq!(resolved.compression, Compression::Zstd { level: 3 });
+    }
+
+    /// Opens an upload of a distributed bucket up to its transactional authority read.
+    fn distributed_until_check(bucket: &[u8], record: &[u8]) -> CreateMultipartOperation {
+        use crate::distribution::test_record::authority_rows;
+        let mut operation = CreateMultipartOperation::new(input(snapshot()));
+        operation.start();
+        operation.step(bucket_read(Some(bucket.to_vec()), None));
+        operation.step(authority_rows(Some(record.to_vec()), None));
+        operation.step(fence_clear());
+        operation.step(opened(None));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::default(),
+        }));
+        let effects = operation.step(fence_clear());
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: Some(_) })]
+                    if reads.len() == 3
+            ),
+            "the transaction rereads bucket, record and fence: {effects:?}"
+        );
+        operation
+    }
+
+    #[test]
+    fn upload_rechecks_fence() {
+        use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
+        let (record, bytes) = crate::distribution::test_record::record(true);
+        let binding = crate::distribution::test_record::binding(&record, 1, 5);
+        let bucket = aruna_core::structs::storage::blob::BucketInfo {
+            group_id: Ulid::from_parts(1, 1),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: Some(binding),
+        };
+        let bucket = bucket.to_bytes().unwrap();
+        let rows = |fence: Option<Vec<u8>>| {
+            Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![
+                    (b"bucket".to_vec().into(), Some(bucket.clone().into())),
+                    (b"record".to_vec().into(), Some(bytes.clone().into())),
+                    (b"fence".to_vec().into(), fence.map(Into::into)),
+                ],
+            })
+        };
+        let mut open = distributed_until_check(&bucket, &bytes);
+        let effects = open.step(rows(None));
+        assert!(open.output.is_none(), "{effects:?}");
+        // A transfer fence set after the first check refuses the upload in its transaction.
+        let fence = LocalFence {
+            ranges: vec![RangeFence {
+                range_id: record.config.ranges[0].range_id,
+                transfer_id: Ulid::from_parts(2, 2),
+                epoch: record.config.ranges[0].epoch,
+                since_ms: 0,
+                uploads_open: true,
+            }],
+            ..LocalFence::default()
+        };
+        let mut fenced = distributed_until_check(&bucket, &bytes);
+        fenced.step(rows(Some(fence.to_bytes().unwrap())));
+        assert!(matches!(
+            fenced.output,
+            Some(Err(CreateMultipartError::Distribution(
+                crate::distribution::guard::GuardError::Route(
+                    aruna_core::structs::storage::distribution::RouteError::Moving(_)
+                )
+            )))
+        ));
     }
 
     fn sealed_settings() -> (BucketEncryption, BucketKeyRecord) {

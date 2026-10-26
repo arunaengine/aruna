@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::structs::storage::data_identity::ObjectLocation;
+use aruna_core::structs::storage::data::identity::ObjectLocation;
 
 pub(super) fn plan_export(
     spec: &ExportRoCrateSpec,

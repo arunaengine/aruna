@@ -14,9 +14,11 @@ use aruna_core::federation::{
     FederationError, Registration, Signed, Withdrawal, valid_federation_url,
 };
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::time::unix_timestamp_secs;
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -34,6 +36,10 @@ const WRITES_PER_MINUTE: u32 = 60;
 const WRITE_BURST: u32 = 20;
 /// Registrations whose descriptor routes are fetched at the same time.
 const VERIFY_SLOTS: usize = 4;
+/// The registry route that resolves Aruna data w3ids.
+const RESOLVE_PREFIX: &str = "/v1/resolve/";
+/// The node route a resolved id goes to, under the realm's API base path.
+const NODE_RESOLVE_ROUTE: &str = "resolve";
 
 pub struct RegistryState {
     pub store: Store,
@@ -128,6 +134,7 @@ pub fn router(state: Arc<RegistryState>) -> Router {
             "/v1/realms/{realm_id}",
             get(get_realm).put(put_realm).delete(delete_realm),
         )
+        .route("/v1/resolve/{*id}", get(resolve_id))
         .with_state(state)
 }
 
@@ -181,6 +188,76 @@ async fn get_realm(
     match state.store.entry(&parse_realm(&realm_id)?, now)? {
         Some(entry) => Ok(public(Listing::new(entry, now))),
         None => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
+}
+
+/// The realm and the re-serialized node route path of a w3id data tail: a global id (version,
+/// bucket or prefix form) or a node ARN. Anything else is refused.
+fn parse_tail(tail: &str) -> Option<(RealmId, String)> {
+    if tail.starts_with("arn:") {
+        let arn = ArunaArn::parse(tail).ok()?;
+        return Some((arn.realm_id, arn.to_string()));
+    }
+    let id = GlobalId::parse(&format!("/{tail}")).ok()?;
+    let path = id.to_string();
+    Some((id.realm_id(), path.trim_start_matches('/').to_string()))
+}
+
+/// The node route for `path` under the realm's API base path; only an `https` API URL without
+/// user info, query or fragment qualifies, and the target never carries one either.
+fn resolve_target(api_url: &url::Url, path: &str) -> Option<String> {
+    let usable = api_url.scheme() == "https"
+        && api_url.host().is_some()
+        && api_url.username().is_empty()
+        && api_url.password().is_none()
+        && api_url.query().is_none()
+        && api_url.fragment().is_none();
+    if !usable {
+        return None;
+    }
+    let base = api_url.as_str().trim_end_matches('/');
+    let target = format!("{base}/{NODE_RESOLVE_ROUTE}/{path}");
+    let parsed = url::Url::parse(&target).ok()?;
+    (parsed.query().is_none() && parsed.fragment().is_none()).then_some(target)
+}
+
+/// A resolve answer; never cached, so withdrawals and endpoint changes apply at once.
+fn uncached(status: StatusCode, location: Option<&str>, message: &'static str) -> Response {
+    let mut response = (status, message).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Some(value) = location.and_then(|location| HeaderValue::from_str(location).ok()) {
+        headers.insert(header::LOCATION, value);
+    }
+    response
+}
+
+/// Sends a w3id data id to its realm: 307 to the realm API's resolve route for a leased,
+/// verified realm, 404 otherwise.
+async fn resolve_id(State(state): State<Arc<RegistryState>>, uri: Uri) -> Response {
+    let tail = uri.path().strip_prefix(RESOLVE_PREFIX).unwrap_or_default();
+    let Some((realm_id, path)) = parse_tail(tail) else {
+        return uncached(StatusCode::NOT_FOUND, None, "not an Aruna data id");
+    };
+    let entry = match state.store.entry(&realm_id, unix_timestamp_secs()) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return uncached(StatusCode::NOT_FOUND, None, "realm not found"),
+        Err(error) => {
+            warn!(error = %error, "Registry storage failed");
+            return uncached(
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+                "registry unavailable",
+            );
+        }
+    };
+    if !entry.verified {
+        return uncached(StatusCode::NOT_FOUND, None, "realm not publicly reachable");
+    }
+    let api_url = &entry.registration.payload.descriptor.payload.api_url;
+    match resolve_target(api_url, &path) {
+        Some(target) => uncached(StatusCode::TEMPORARY_REDIRECT, Some(&target), ""),
+        None => uncached(StatusCode::NOT_FOUND, None, "realm not publicly reachable"),
     }
 }
 
@@ -308,6 +385,94 @@ mod tests {
             check_registration(&realm_id(), &signed),
             Err(RegistryError::Signature(FederationError::BadSignature))
         ));
+    }
+
+    #[test]
+    fn parses_resolve_tails() {
+        let realm = realm_id();
+        let version = format!("{realm}/01JMETADATA0123456789ABCDE");
+        assert_eq!(parse_tail(&version), Some((realm, version.clone())));
+        // Bucket and prefix forms keep their trailing segment.
+        let bucket = format!("{realm}/01JMETADATA0123456789ABCDE/");
+        assert_eq!(parse_tail(&bucket), Some((realm, bucket.clone())));
+        let key = SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let node = aruna_core::NodeId::from_bytes(key.as_bytes()).unwrap();
+        let arn = format!("arn:aruna:{realm}:{node}:s3/reads/a%20b@01JMETADATA0123456789ABCDE");
+        assert_eq!(parse_tail(&arn), Some((realm, arn.clone())));
+        for bad in [
+            "",
+            "abc",
+            "../x",
+            &format!("{realm}/not-a-ulid"),
+            "https://evil.example",
+        ] {
+            assert_eq!(parse_tail(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn https_targets_only() {
+        let url = |value: &str| url::Url::parse(value).unwrap();
+        assert_eq!(
+            resolve_target(&url("https://realm.example.org/api/v1"), "r/v"),
+            Some("https://realm.example.org/api/v1/resolve/r/v".to_string())
+        );
+        assert_eq!(
+            resolve_target(&url("https://realm.example.org/api/v1/"), "r/v"),
+            Some("https://realm.example.org/api/v1/resolve/r/v".to_string())
+        );
+        for refused in [
+            "http://realm.example.org/api/v1",
+            "https://user@realm.example.org/api/v1",
+            "https://realm.example.org/api/v1?x=1",
+            "https://realm.example.org/api/v1#top",
+        ] {
+            assert_eq!(resolve_target(&url(refused), "r/v"), None, "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_verified_realms() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(RegistryState::new(
+            Store::open(dir.path()).unwrap(),
+            EgressGuard::new(aruna_core::egress::EgressPolicy::strict()).unwrap(),
+        ));
+        let now = unix_timestamp_secs();
+        let tail = format!("{}/01JMETADATA0123456789ABCDE", realm_id());
+        let uri: Uri = format!("{RESOLVE_PREFIX}{tail}").parse().unwrap();
+        let missing = resolve_id(State(state.clone()), uri.clone()).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-store");
+        // Each renewal is issued later than the one before.
+        let entry = |verified, issued_at| Entry {
+            registration: registration("https://realm.example.org", issued_at),
+            received_at: now,
+            verified,
+        };
+        let earlier = entry(false, now - 10);
+        state.store.register(&realm_id(), &earlier, now).unwrap();
+        let private = resolve_id(State(state.clone()), uri.clone()).await;
+        assert_eq!(private.status(), StatusCode::NOT_FOUND);
+        state
+            .store
+            .register(&realm_id(), &entry(true, now), now)
+            .unwrap();
+        let found = resolve_id(State(state), uri).await;
+        assert_eq!(found.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(found.headers()[header::CACHE_CONTROL], "no-store");
+        let location = found.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            location.ends_with(&format!("/resolve/{tail}")),
+            "{location}"
+        );
+        assert!(
+            location.starts_with("https://realm.example.org"),
+            "{location}"
+        );
     }
 
     async fn body(response: Response) -> serde_json::Value {

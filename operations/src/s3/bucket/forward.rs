@@ -81,10 +81,7 @@ pub(super) async fn create_remote_bucket(
     )
     .await
     {
-        Ok(info) if info.group_id == group_id => Ok(()),
-        Ok(_) => Err(SyncRefusal::Invalid(format!(
-            "bucket \"{bucket}\" belongs to another group"
-        ))),
+        Ok(info) => accept_existing(&info, group_id, bucket),
         Err(_) => Err(SyncRefusal::Unavailable),
     }
 }
@@ -139,6 +136,7 @@ async fn create_once(
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
+                distribution: None,
             },
         )
         .mapped(),
@@ -229,4 +227,57 @@ async fn bucket_writable(
         "s3.PutObject",
     )
     .await
+}
+
+/// A retried create succeeds only on an ordinary bucket of the same group; a member of a
+/// distributed set is never taken for an ordinary bucket.
+fn accept_existing(info: &BucketInfo, group_id: GroupId, bucket: &str) -> Result<(), SyncRefusal> {
+    if info.distribution.is_some() {
+        return Err(SyncRefusal::Invalid(format!(
+            "bucket \"{bucket}\" belongs to a distributed bucket"
+        )));
+    }
+    if info.group_id != group_id {
+        return Err(SyncRefusal::Invalid(format!(
+            "bucket \"{bucket}\" belongs to another group"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accept_existing;
+    use aruna_core::UserId;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::format::Compression;
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    #[test]
+    fn bound_bucket_refused() {
+        let group_id = Ulid::from_bytes([1; 16]);
+        let mut info = BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: UserId::local(Ulid::from_bytes([2; 16]), RealmId::from_bytes([3; 32])),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        assert!(accept_existing(&info, group_id, "b").is_ok());
+        assert!(accept_existing(&info, Ulid::from_bytes([9; 16]), "b").is_err());
+        info.distribution = Some(DistributionBinding {
+            set_id: Ulid::from_bytes([4; 16]),
+            member_id: Ulid::from_bytes([5; 16]),
+            incarnation: 6,
+            revision: Default::default(),
+        });
+        assert!(accept_existing(&info, group_id, "b").is_err());
+    }
 }

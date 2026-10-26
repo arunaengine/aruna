@@ -389,6 +389,7 @@ mod envelopes {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         }
         .to_bytes()
         .unwrap()
@@ -709,8 +710,9 @@ mod envelopes {
         }
     }
 
-    /// Answers the quota gate's realm config, local counter and remote scan reads.
+    /// Answers the quota gate's rebuild marker, realm config, local counter and remote scan reads.
     fn gated(operation: &mut RewriteVersionOperation) -> Effects {
+        operation.step(read_result(None));
         operation.step(read_result(None));
         operation.step(read_result(None));
         operation.step(Event::Storage(StorageEvent::IterResult {

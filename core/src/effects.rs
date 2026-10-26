@@ -17,7 +17,7 @@ use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::WriteGuard;
 use crate::structs::execution::job::{JobRecordEnvelope, JobRecordKind, SubmissionId};
-use crate::structs::execution::source_access::ResolvedSourceAccess;
+use crate::structs::execution::source_access::{ListRequest, ResolvedSourceAccess, SourceMetadata};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
@@ -26,6 +26,7 @@ use crate::structs::storage::backend_import::PlainPath;
 use crate::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, HiddenBlobKey, ResolvedBackend,
 };
+use crate::structs::storage::distribution::accounting::RangeCounters;
 use crate::structs::storage::encryption::{BucketKeyRef, CopyTarget, KeyTicket, ReadLease};
 use crate::structs::storage::format::Compression;
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
@@ -134,6 +135,15 @@ pub enum BlobEffect {
         deadline: Option<Instant>,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
+    /// Spools `blob` to an unnamed local temporary file and answers its hashes with a stream
+    /// of `range` (all of it by default); the file is gone once that stream ends or drops.
+    SpoolLocal {
+        /// The exact length: a longer or shorter stream fails the spool.
+        size: u64,
+        deadline: Option<Instant>,
+        range: Option<Range<u64>>,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
     ReadHiddenRange {
         location: BackendLocation,
         range: Range<u64>,
@@ -178,6 +188,8 @@ pub enum BlobEffect {
         stream_id: Ulid,
         location: BackendLocation,
         expected_blake3: [u8; 32],
+        /// Serves only the chunks of this byte range, each verifiable against the root.
+        range: Option<Range<u64>>,
     },
     /// Serves one version this node never copied into its blob store: a device
     /// streams the owner's own file. The file is refused unless it still
@@ -189,10 +201,13 @@ pub enum BlobEffect {
         expected_blake3: [u8; 32],
         fingerprint: String,
     },
+    /// Receives a verified bao read of a `size` byte object; with `range`, only those bytes,
+    /// each chunk checked against `expected_blake3`.
     ReceiveRead {
         stream_id: Ulid,
         size: u64,
         expected_blake3: [u8; 32],
+        range: Option<Range<u64>>,
     },
     /// Create-time reachability proof for a tenant backend: build the guarded
     /// operator and round-trip a sentinel object.
@@ -312,6 +327,7 @@ pub enum BlobEffect {
         location: BackendLocation,
         expected_blake3: [u8; 32],
         lease: Box<ReadLease>,
+        range: Option<Range<u64>>,
     },
     /// Reserves the working set of composing at most `content` bytes, before the piece records
     /// are loaded. Answers `ComposeReserved`.
@@ -431,14 +447,14 @@ pub enum StagingSourceEffect {
     },
     List {
         access: ResolvedSourceAccess,
-        offset: usize,
-        limit: usize,
-        recursive: bool,
-        files_only: bool,
+        request: ListRequest,
     },
     Read {
         access: ResolvedSourceAccess,
         range: Option<Range<u64>>,
+        /// The registered observation the read must stay bound to: its ETag is sent as
+        /// `If-Match` without a fresh HEAD, and a failed condition is `ConditionFailed`.
+        expected: Option<SourceMetadata>,
     },
 }
 
@@ -567,6 +583,13 @@ pub enum StorageEffect {
         buckets: Vec<(Key, BucketDelta)>,
         txn_id: TxnId,
     },
+    /// Adds range counter deltas to the latest stored rows when the write transaction commits,
+    /// like `AddUsage`; the rows never join its read set. Answers `BatchWriteResult`.
+    AddCounters {
+        key_space: KeySpace,
+        deltas: Vec<(Key, RangeCounters)>,
+        txn_id: TxnId,
+    },
     Delete {
         key_space: KeySpace,
         key: Key,
@@ -590,6 +613,17 @@ pub enum StorageEffect {
         limit: usize,
         txn_id: Option<TxnId>,
     },
+    /// Reads rows from `start` to `end` in key order: at most `limit` rows and, after the first,
+    /// at most `max_bytes` of keys and values. Only this interval joins a transaction's read set.
+    /// Answers `IterResult`; `next_start_after` names the last returned key while rows remain.
+    IterRange {
+        key_space: KeySpace,
+        start: IterStart,
+        end: IterEnd,
+        limit: usize,
+        max_bytes: usize,
+        txn_id: Option<TxnId>,
+    },
     /// Read the lexicographically last entry in a keyspace, optionally by prefix.
     Last {
         key_space: KeySpace,
@@ -611,6 +645,18 @@ pub enum StorageEffect {
     VaultDelete {
         entry: VaultEntry,
         txn_id: Option<TxnId>,
+    },
+    /// Between two commits: clears old rebuild rows, writes the rebuild marker and from now on
+    /// adds each committed usage delta to its rebuild row too. Answers `TransactionStarted`
+    /// with a read snapshot taken at that point.
+    BeginUsageRebuild {
+        key_space: KeySpace,
+    },
+    /// In one commit: every live counter row becomes its rebuild row (or is deleted without
+    /// one), rebuild rows and the marker go. Answers `BatchWriteResult`; fails unless this
+    /// running storage began the rebuild.
+    FinishUsageRebuild {
+        key_space: KeySpace,
     },
 }
 
@@ -640,6 +686,23 @@ impl IterStart {
     }
 }
 
+/// Upper bound of a [`StorageEffect::IterRange`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IterEnd {
+    /// Exclusive: the read stops before this key.
+    Before(Key),
+    /// Inclusive: the read ends with this key if it exists.
+    Through(Key),
+}
+
+impl IterEnd {
+    pub fn key(&self) -> &Key {
+        match self {
+            IterEnd::Before(key) | IterEnd::Through(key) => key,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
     Dht(DhtEffect),
@@ -656,6 +719,10 @@ pub enum NetEffect {
     VaultFetch(Box<VaultFetchEffect>),
     /// Signs vault or key records with this node's key; each must name this node.
     VaultSign(Box<crate::structs::identity::user::vault::VaultRecords>),
+    /// Signs a distribution snapshot; only a snapshot naming this node as publisher.
+    SnapshotSign(Box<crate::structs::storage::distribution::snapshot::SnapshotClaim>),
+    /// Signs a member statement; only a claim naming this node as signer.
+    StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

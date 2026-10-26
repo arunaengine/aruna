@@ -108,6 +108,12 @@ pub enum BlobError {
     /// The backend key would be longer than group storages accept.
     #[error("The path is too long for this storage: keys are at most 1024 bytes")]
     KeyTooLong,
+    /// Local spools together would exceed their disk budget or file count; a retry may fit.
+    #[error("Local spools would exceed their {limit} byte budget or their file count")]
+    SpoolBudgetExhausted { limit: u64 },
+    /// One local spool would need more than the whole spool budget; no retry can fit it.
+    #[error("A local spool cannot hold more than {limit} bytes")]
+    SpoolTooLarge { limit: u64 },
 }
 
 impl BlobError {
@@ -154,6 +160,11 @@ pub enum StagingSourceError {
     /// representation. Retryable, and never an identity.
     #[error("Source changed during the read")]
     SourceUnstable,
+    #[error("Invalid listing request: {0}")]
+    InvalidListing(String),
+    /// The source no longer holds the representation the read was bound to.
+    #[error("Source changed since its observation was recorded")]
+    ConditionFailed,
     #[error(transparent)]
     EgressDenied(#[from] crate::egress::EgressError),
 }

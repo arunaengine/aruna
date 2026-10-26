@@ -23,6 +23,7 @@ pub fn build_source_descriptor(
         version_selector: source_version_selector(metadata),
         capabilities: source_capabilities(metadata),
         origin_node_id,
+        namespace: connector.namespace.clone(),
     }
 }
 
@@ -101,6 +102,7 @@ mod pure_tests {
             etag: Some("etag-1".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         }
     }
 

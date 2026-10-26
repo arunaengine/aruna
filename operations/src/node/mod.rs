@@ -4,7 +4,10 @@
 
 pub mod dashboard;
 pub mod heartbeat;
+pub mod holder_choice;
 pub mod node_info;
+mod rebuild_counts;
 pub mod startup;
 pub mod status;
+mod usage_rebuild;
 pub mod usage_stats;

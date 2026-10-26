@@ -303,6 +303,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let row = |value: Option<Vec<u8>>| (Key::from(b"bucket".to_vec()), value.map(Value::from));
         let read = |settings| vec![row(Some(info.to_bytes().unwrap())), row(settings)];
@@ -340,6 +341,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let rows = authority_rows(&info, None, &[user(2)]);
         let state = parse_authority(rows, realm_id, group_id).unwrap();

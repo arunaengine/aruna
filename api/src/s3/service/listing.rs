@@ -155,6 +155,7 @@ impl ArunaS3Service {
         owner: Option<Owner>,
         url_encoded: bool,
         scope: Option<&SubpathScope>,
+        bounds: Option<(String, Option<String>)>,
     ) -> S3Result<ObjectListingPage> {
         let mut remaining_pages = 100;
         if scope.is_some() {
@@ -167,7 +168,13 @@ impl ArunaS3Service {
         }
         let result = loop {
             consume_scope_page(&mut remaining_pages)?;
-            let mut result = drive(ListBucketOperation::new(input.clone()), &self.state)
+            let operation = match bounds.clone() {
+                Some((lower, upper)) => {
+                    ListBucketOperation::new(input.clone()).with_bounds(lower, upper)
+                }
+                None => ListBucketOperation::new(input.clone()),
+            };
+            let mut result = drive(operation, &self.state)
                 .await
                 .map_err(IntoS3Error::into_s3_error)?;
 

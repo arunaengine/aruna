@@ -439,6 +439,9 @@ pub struct StoredObject {
     pub sha256: String,
     /// Lets any holder with a copy serve these bytes when the original node is gone.
     pub blake3: [u8; 32],
+    /// The version's global id when it lives in a distributed bucket; every member of the set
+    /// holds the same version, so a pin survives the recorded node.
+    pub global: Option<crate::structs::storage::global_id::GlobalId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,6 +799,7 @@ mod tests {
                 size: 1,
                 sha256: "b".repeat(64),
                 blake3: [0; 32],
+                global: None,
             };
             lfs.extend(std::iter::repeat_n(object, 5000));
         }

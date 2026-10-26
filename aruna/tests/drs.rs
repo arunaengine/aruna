@@ -130,6 +130,73 @@ async fn content_hash_missing() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn crowded_hash_conflicts() -> TestResult<()> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
+    use aruna_operations::blob::permission_paths::MAX_HASH_ALIASES;
+
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let bearer_token = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let hash = *blake3::hash(b"one hash in many buckets").as_bytes();
+        let node_id = seed.net.node_id();
+        let mut writes = Vec::new();
+        for index in 0..=MAX_HASH_ALIASES {
+            let row = HashIndex::new(
+                hash,
+                Ulid::generate(),
+                seed.realm_id,
+                Ulid::generate(),
+                node_id,
+                "crowded",
+                format!("copy/{index}"),
+            );
+            let key = row.to_bytes()?;
+            writes.push((
+                PATHS_INDEX_KEYSPACE.to_string(),
+                key.into(),
+                Vec::new().into(),
+            ));
+        }
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        seed.context.storage_handle.send_storage_effect(write).await;
+        let object_id = format!(
+            "arn:aruna:{}:{}:ch/{}",
+            seed.realm_id,
+            node_id,
+            hex::encode(hash)
+        );
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{}/api/v1/ga4gh/drs/v1/objects/{}",
+                seed.base_url, object_id
+            ))
+            .bearer_auth(&bearer_token)
+            .send()
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "an oversized alias set is ambiguous, never an internal error"
+        );
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn historical_hash_resolves() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
     let onboarding_secret =

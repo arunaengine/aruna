@@ -4,13 +4,15 @@
 
 pub mod sealed;
 
+use crate::distribution::pull::record_only;
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
+use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
 use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, TokenRead, read_local, reference_archive,
+    GetObjectError, GetObjectInput, GetObjectResult, TokenRead, read_source, reference_archive,
 };
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
@@ -35,6 +37,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::resolve_backend;
 use aruna_core::types::GroupId;
 use futures_util::StreamExt;
@@ -124,7 +129,10 @@ fn sealed_error(error: SealedCopyError) -> CopyObjectError {
         SealedCopyError::QuotaExceeded { limit, usage } => {
             put(PutObjectError::QuotaExceeded { limit, usage })
         }
+        SealedCopyError::UsageRebuilding => put(PutObjectError::UsageRebuilding),
         SealedCopyError::PolicyGate(error) => put(PutObjectError::PolicyGate(error)),
+        SealedCopyError::Distribution(error) => put(PutObjectError::Distribution(error)),
+        SealedCopyError::Usage(error) => put(PutObjectError::UsageUpdateError(error)),
         SealedCopyError::NoSuchVersion => CopyObjectError::Get(GetObjectError::NoSuchVersion),
         SealedCopyError::Blob(error) => put(PutObjectError::BlobWriteFailed(error)),
         error => put(PutObjectError::WriteFailed(error.to_string())),
@@ -225,6 +233,27 @@ pub async fn copy_object_tracked(
 }
 
 /// `copy_object` where `token` admits the source read while its bucket key is locked.
+/// Reads a copy source a member streams to the destination's coordinator; the conditions are
+/// checked before any byte moves.
+pub async fn read_copy_source(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    conditions: &CopySourceConditions,
+    token: Option<&TokenRead>,
+) -> Result<GetObjectResult, CopyObjectError> {
+    let source = read_source(context, input, restrictions, token).await?;
+    let last_modified = (source.info.version_created_at)
+        .or_else(|| source.location.as_ref().map(|location| location.created_at))
+        .or_else(|| (source.source_metadata.as_ref()).and_then(|metadata| metadata.last_modified));
+    let etag = (source.location.as_ref())
+        .and_then(|location| location.hashes.get(HASH_MD5))
+        .map(hex::encode)
+        .or_else(|| (source.source_metadata.as_ref()).and_then(|metadata| metadata.etag.clone()));
+    evaluate_source_conditions(conditions, etag.as_deref(), last_modified, true)?;
+    Ok(source)
+}
+
 pub async fn copy_object_token(
     context: &DriverContext,
     input: CopyObjectInput,
@@ -278,7 +307,9 @@ async fn copy_inner(
         source_last_modified,
         true,
     )?;
-    if head.location.is_none() && input.references == CopyReferences::Preserve {
+    // A record-only version of a distributed bucket is read through a holder, never kept.
+    let record_only = (head.source_binding.as_ref()).is_some_and(record_only);
+    if head.location.is_none() && input.references == CopyReferences::Preserve && !record_only {
         // Another bucket reads the reference without the source's lock, so admit it here.
         if input.source_bucket != input.dest_bucket {
             admit_source(context, &input).await?;
@@ -292,6 +323,7 @@ async fn copy_inner(
         return sealed_copy(context, input, head, location, source_last_modified).await;
     }
 
+    let source_names = (input.source_bucket.clone(), input.source_key.clone());
     let source_input = GetObjectInput {
         bucket: input.source_bucket,
         key: input.source_key,
@@ -303,7 +335,7 @@ async fn copy_inner(
         node_id: input.node_id,
     };
     let restrictions = input.source_auth_context.path_restrictions.clone();
-    let source = read_local(context, source_input, restrictions, token).await?;
+    let source = read_source(context, source_input, restrictions, token).await?;
 
     let source_version_id = source.version_id;
     let materialized = source.location.is_some();
@@ -345,7 +377,20 @@ async fn copy_inner(
         (false, None) => Some(source.blob),
     };
 
+    // Materialized source bytes are kept only when they match every recorded full-object digest.
+    let expected_checksums = source
+        .source_metadata
+        .as_ref()
+        .map(SourceMetadata::enforced_checksums)
+        .unwrap_or_default();
     let gate = gate_context(context, input.realm_id, now_ms()).await?;
+    let origin = copy_origin(
+        context,
+        (input.realm_id, input.node_id),
+        (&source_names.0, &source_names.1),
+        source_version_id,
+    )
+    .await;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: input.user_id,
         group_id: input.group_id,
@@ -357,7 +402,7 @@ async fn copy_inner(
             content_length,
             body,
         },
-        expected_checksums: Vec::new(),
+        expected_checksums,
         checksum_type: None,
         exists: false,
         version_source,
@@ -367,6 +412,7 @@ async fn copy_inner(
     })
     .without_envelope()
     .with_metadata(metadata)
+    .with_version_origin(origin)
     .with_inherited_policies(source.source_policies.clone())
     .with_restrictions(input.restrictions.clone());
     if let Some(location) = adopt {
@@ -389,6 +435,40 @@ async fn copy_inner(
         source_version_id,
         source_last_modified,
     })
+}
+
+/// A copy's origin: its exact source version, by global id in a distributed bucket.
+async fn copy_origin(
+    context: &DriverContext,
+    (realm_id, node_id): (RealmId, NodeId),
+    (bucket, key): (&str, &str),
+    version_id: Option<Ulid>,
+) -> Option<VersionOrigin> {
+    let version_id = version_id?;
+    let source = drive(GetBucketOperation::new(bucket.to_string()), context)
+        .await
+        .ok()?;
+    let distributed = source.distribution.is_some();
+    source_origin((realm_id, node_id), (bucket, key), version_id, distributed)
+}
+
+/// The origin of a copy of `version_id`: its global id in a distributed bucket, else its ARN.
+pub fn source_origin(
+    (realm_id, node_id): (RealmId, NodeId),
+    (bucket, key): (&str, &str),
+    version_id: Ulid,
+    distributed: bool,
+) -> Option<VersionOrigin> {
+    let from = match distributed {
+        true => OriginVersion::Global(GlobalId::Version {
+            realm_id,
+            version_id,
+        }),
+        false => OriginVersion::Node(
+            VersionedObjectArn::new(realm_id, node_id, bucket, key, version_id).ok()?,
+        ),
+    };
+    Some(VersionOrigin::Copy { from })
 }
 
 /// Publishes the destination as a new version of the source's archive and grants.
@@ -505,6 +585,7 @@ async fn preserve_reference(
             metadata: metadata.clone(),
             inherited_policies: head.source_policies,
             connector_guard: None,
+            restrictions: input.restrictions,
         },
     )
     .await?;
@@ -745,6 +826,7 @@ pub(crate) mod test {
             placement_policies: policies,
             placement_policy_generation: 1,
             compression: Compression::Off,
+            distribution: None,
         };
         let _ = context
             .storage_handle
@@ -913,6 +995,7 @@ pub(crate) mod test {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::generate()),
         };
@@ -928,6 +1011,7 @@ pub(crate) mod test {
                     etag: Some("etag-1".to_string()),
                     last_modified: Some(SystemTime::UNIX_EPOCH),
                     source_version: None,
+                    digests: Default::default(),
                 },
                 SystemTime::UNIX_EPOCH,
                 UserId::local(Ulid::generate(), realm_id),
@@ -1020,6 +1104,7 @@ pub(crate) mod test {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: None,
         };
@@ -1035,6 +1120,7 @@ pub(crate) mod test {
                     etag: Some("etag-1".to_string()),
                     last_modified: Some(SystemTime::UNIX_EPOCH),
                     source_version: None,
+                    digests: Default::default(),
                 },
                 SystemTime::UNIX_EPOCH,
                 user_id,
@@ -1121,6 +1207,7 @@ pub(crate) mod test {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: None,
         };
@@ -1130,6 +1217,7 @@ pub(crate) mod test {
             etag: Some("etag-1".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         };
         let version = BlobVersion::reference(
             source,
@@ -1312,6 +1400,7 @@ pub(crate) mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 1,
             compression: Compression::Zstd { level: 3 },
+            distribution: None,
         };
         let _ = context
             .storage_handle
@@ -1382,6 +1471,7 @@ pub(crate) mod test {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::generate()),
         };
@@ -1397,6 +1487,7 @@ pub(crate) mod test {
                     etag: Some("stale-etag".to_string()),
                     last_modified: Some(SystemTime::UNIX_EPOCH),
                     source_version: None,
+                    digests: Default::default(),
                 },
                 SystemTime::UNIX_EPOCH,
                 UserId::local(Ulid::generate(), realm_id),

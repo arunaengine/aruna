@@ -16,7 +16,7 @@ use aruna_core::structs::execution::job::{
     JobId, JobPayload, JobResultPayload, OutputObject, RunCrateStatus, run_crate_key,
 };
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::data_identity::parse_hash;
+use aruna_core::structs::storage::data::identity::parse_hash;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{RemoteBinding, SyncPull, SyncRefusal};
 use serde::{Deserialize, Serialize};

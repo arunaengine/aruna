@@ -89,6 +89,7 @@ async fn fixture() -> Fixture {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
     let state = Arc::new(test_state(context, realm_id, node_id, capabilities).await);

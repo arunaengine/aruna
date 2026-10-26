@@ -9,7 +9,7 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_core::structs::storage::data_identity::{DataIdentity, text_values};
+use aruna_core::structs::storage::data::identity::{DataIdentity, text_values};
 use aruna_core::types::GroupId;
 use serde_json::Value as JsonValue;
 
@@ -389,6 +389,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let alias = HashIndex::new(hash, version_id, realm_id, group_id, node_id, BUCKET, KEY);
         let writes = vec![

@@ -92,6 +92,15 @@ pub(super) fn record_effect_fields(span: &Span, effect: &StorageEffect) {
             span.record("batch_len", (deltas.len() + buckets.len()) as u64);
             span.record("txn_id", field::display(txn_id));
         }
+        StorageEffect::AddCounters {
+            key_space,
+            deltas,
+            txn_id,
+        } => {
+            span.record("key_space", field::display(key_space));
+            span.record("batch_len", deltas.len() as u64);
+            span.record("txn_id", field::display(txn_id));
+        }
         StorageEffect::BatchDelete { deletes, txn_id } => {
             span.record("batch_len", deletes.len() as u64);
             if let Some(txn_id) = txn_id {
@@ -112,6 +121,20 @@ pub(super) fn record_effect_fields(span: &Span, effect: &StorageEffect) {
             if let Some(start) = start {
                 span.record("cursor_len", start.key().as_ref().len() as u64);
             }
+            span.record("limit", *limit as u64);
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
+        StorageEffect::IterRange {
+            key_space,
+            start,
+            limit,
+            txn_id,
+            ..
+        } => {
+            span.record("key_space", field::display(key_space));
+            span.record("cursor_len", start.key().as_ref().len() as u64);
             span.record("limit", *limit as u64);
             if let Some(txn_id) = txn_id {
                 span.record("txn_id", field::display(txn_id));
@@ -138,6 +161,10 @@ pub(super) fn record_effect_fields(span: &Span, effect: &StorageEffect) {
             }
         }
         StorageEffect::SyncAll => {}
+        StorageEffect::BeginUsageRebuild { key_space }
+        | StorageEffect::FinishUsageRebuild { key_space } => {
+            span.record("key_space", field::display(key_space));
+        }
     }
 }
 
@@ -150,15 +177,19 @@ pub(super) fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
         StorageEffect::Write { .. } => "write",
         StorageEffect::BatchWrite { .. } => "batch_write",
         StorageEffect::AddUsage { .. } => "add_usage",
+        StorageEffect::AddCounters { .. } => "add_counters",
         StorageEffect::Delete { .. } => "delete",
         StorageEffect::BatchDelete { .. } => "batch_delete",
         StorageEffect::AbortTransaction { .. } => "abort_transaction",
         StorageEffect::SyncAll => "sync_all",
         StorageEffect::Iter { .. } => "iter",
+        StorageEffect::IterRange { .. } => "iter_range",
         StorageEffect::Last { .. } => "last",
         StorageEffect::VaultWrite { .. } => "vault_write",
         StorageEffect::VaultRead { .. } => "vault_read",
         StorageEffect::VaultDelete { .. } => "vault_delete",
+        StorageEffect::BeginUsageRebuild { .. } => "begin_usage_rebuild",
+        StorageEffect::FinishUsageRebuild { .. } => "finish_usage_rebuild",
     }
 }
 

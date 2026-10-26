@@ -93,6 +93,13 @@ async fn run_fenced_purge(
     )
     .await
     {
+        // A member bucket of a distributed bucket is purged only by deleting its set.
+        Ok(info) if info.distribution.is_some() => {
+            return Err(JobError::permanent(
+                "purge bucket is a member of a distributed bucket; delete the distributed bucket",
+            )
+            .into());
+        }
         Ok(info) if info.group_id == spec.group_id => {
             let storage = &ctx.driver.storage_handle;
             incarnation = read_incarnation(storage, spec.scope.bucket(), None)
@@ -765,7 +772,8 @@ fn fence_error(error: PurgeFenceError) -> JobError {
         PurgeFenceError::Suspended
         | PurgeFenceError::Busy
         | PurgeFenceError::Storage(_)
-        | PurgeFenceError::Unexpected(_) => JobError::retryable(error.to_string()),
+        | PurgeFenceError::Unexpected(_)
+        | PurgeFenceError::Distribution(_) => JobError::retryable(error.to_string()),
     }
 }
 

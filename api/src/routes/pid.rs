@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::metadata::document_holder::choose_holder;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -71,10 +72,12 @@ fn rocrate_location(document_id: Ulid) -> String {
 **Authentication**: none; public route, no bearer token is read.
 
 **Behavior**: a Profile resolves under `/profile/{document_id}`, so this path answers 404 for a
-Profile and never acts as a duplicate PID."#,
+Profile and never acts as a duplicate PID. A public document redirects to the RO-Crate route of
+one of its holders: two random holders with a fresh heartbeat, the one with more free download
+slots wins, and the chosen holder serves its own copy. Without a fresh holder the redirect stays on this node."#,
     params(("document_id" = String, Path, description = "Document ULID carried by the w3id PID, for example 01JMETADATA0123456789ABCDE")),
     responses(
-        (status = 302, description = "Active public identifier; the Location header points at the document's RO-Crate read route, which applies its own authorization"),
+        (status = 302, description = "Active public identifier; the Location header points at the document's RO-Crate read route, which applies its own authorization: on one holder chosen by fresh heartbeat and free download slots (absolute URL with `here=true`), or on this node"),
         (status = 404, description = "Unknown, malformed, private or Profile identifier, or a mapping still in `requested`, `processing` or `failed`"),
         (
             status = 410,
@@ -105,7 +108,27 @@ async fn resolve_pid(
         MetadataRegistryRecord::graph_iri_for(document_id),
     )
     .await;
+    if matches!(resolved, Ok(PersistentIdResolution::Redirect))
+        && let Some(holder) =
+            choose_holder(ctx.as_ref(), state.get_node_id(), document_id, now_ms()).await
+    {
+        let api = holder.urls.api.as_deref().unwrap_or_default();
+        return redirect(&rocrate_url(api, document_id));
+    }
     landing_response(document_id, resolved)
+}
+
+/// The pinned RO-Crate read of `document_id` on a holder's published api base, which may
+/// already carry the `/api/v1` nest.
+fn rocrate_url(api: &str, document_id: Ulid) -> String {
+    let path = format!("/metadata/{document_id}/rocrate?here=true");
+    crate::routes::storage::relay::relay_url(api, &path)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 #[utoipa::path(
@@ -665,6 +688,14 @@ async fn withdraw_pid(
 mod tests {
     use super::*;
 
+    #[test]
+    fn holder_redirect_nested() {
+        let id = Ulid::from_bytes([1; 16]);
+        let pinned = format!("https://b.example/api/v1/metadata/{id}/rocrate?here=true");
+        assert_eq!(rocrate_url("https://b.example/", id), pinned);
+        assert_eq!(rocrate_url("https://b.example/api/v1", id), pinned);
+    }
+
     // the RO-Crate Location header targets the read route
     #[test]
     fn location_targets_read() {
@@ -749,5 +780,100 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// An active public PID redirects to the RO-Crate read; with no holder chosen, on this node.
+    #[tokio::test]
+    async fn redirects_public_pid() {
+        use crate::tests::routes::{
+            seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state,
+            test_storage, write_doc,
+        };
+        use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, ID_MAPPING_KEYSPACE};
+        use aruna_core::storage_entries::metadata_document_key;
+        use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+        use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::persistent_id_key;
+        use aruna_core::structs::placement::record::PlacementRef;
+
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let node_id = iroh::SecretKey::from_bytes(&[8; 32]).public();
+        let user_id = aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id,
+            realm_id,
+        };
+        let context = Arc::new(test_context(storage));
+        seed_realm_config(&context, realm_id, &actor).await;
+        seed_realm_auth(&context, realm_id, &actor).await;
+        let document_id = Ulid::from_bytes([10; 16]);
+        let group_id = Ulid::from_bytes([11; 16]);
+        seed_group_docs(&context, realm_id, &actor, group_id, "public", user_id).await;
+        let revision = aruna_core::structs::PersistentIdRevision {
+            event_id: Ulid::from_bytes([7; 16]),
+            actor: node_id,
+            occurred_at_ms: 9,
+        };
+        let path = "datasets/public".to_string();
+        let mut mapping = PersistentIdMapping::requested(
+            document_id,
+            false,
+            user_id,
+            aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
+            true,
+            path.clone(),
+            revision,
+        );
+        assert!(mapping.activate(user_id, revision));
+        let record = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: path.clone(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                &path,
+                document_id,
+            ),
+            placement: PlacementRef::NIL,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            establishing_event_id: Ulid::from_bytes([8; 16]),
+            last_event_id: Ulid::from_bytes([9; 16]),
+        };
+        let mapping_row = mapping.to_bytes().unwrap();
+        let key = persistent_id_key(document_id);
+        write_doc(
+            &context,
+            ID_MAPPING_KEYSPACE,
+            key.into(),
+            mapping_row.into(),
+        )
+        .await;
+        let record_row = postcard::to_allocvec(&record).unwrap();
+        let key = metadata_document_key(document_id);
+        write_doc(&context, DOCUMENT_INDEX_KEYSPACE, key, record_row.into()).await;
+        let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
+        let state = Arc::new(test_state(context, realm_id, node_id, capabilities).await);
+
+        let response = resolve_pid(State(state.clone()), Path(document_id.to_string())).await;
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let location = response.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap();
+        assert_eq!(location, rocrate_location(document_id));
+        let malformed = resolve_pid(State(state), Path("not-a-ulid".to_string())).await;
+        assert_eq!(malformed.status(), StatusCode::NOT_FOUND);
     }
 }

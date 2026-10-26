@@ -6,7 +6,7 @@ use super::{ArunaS3Service, reference_etag};
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, encode_checksums,
 };
-use crate::s3::util::{map_checksum_type, sse_header, stored_encrypted};
+use crate::s3::util::{checksum_response_hashes, map_checksum_type, sse_header, stored_encrypted};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -20,7 +20,7 @@ use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRef
 use aruna_operations::s3::object::put::PutObjectResult;
 use s3s::dto::{
     CompleteMultipartUploadOutput, DeleteObjectOutput, DeleteObjectsOutput, DeletedObject, ETag,
-    Error as S3DeleteError, LastModified, PutObjectOutput,
+    Error as S3DeleteError, GetObjectOutput, LastModified, PutObjectOutput,
 };
 use s3s::{S3Response, S3Result, s3_error};
 use std::str::FromStr;
@@ -52,6 +52,8 @@ pub(super) fn reference_metadata_refresh(
     bucket: String,
     key: String,
     result: &GetObjectResult,
+    node_id: aruna_core::NodeId,
+    auth_context: aruna_core::structs::identity::auth::AuthContext,
 ) -> Option<ReferenceRefresh> {
     if result.location.is_some() {
         return None;
@@ -61,9 +63,24 @@ pub(super) fn reference_metadata_refresh(
         bucket,
         key,
         version_id: result.resolved_version_id.or(result.version_id)?,
-        metadata: result.source_metadata.clone()?,
+        metadata: Some(result.source_metadata.clone()?),
         refreshed_at: result.last_refresh?,
+        node_id,
+        auth_context,
     })
+}
+
+/// Adds the stored full-object checksums to a GET answer; a ranged answer gets none, as in S3.
+pub(super) fn full_object_checksums(output: &mut GetObjectOutput, info: &ObjectInfo) {
+    if output.content_range.is_some() {
+        return;
+    }
+    output.apply_checksums(encode_checksums(
+        checksum_response_hashes(info.checksum_type, &info.hashes, &info.composite_hashes),
+        ChecksumSelection::AllStored,
+        map_checksum_type(info.checksum_type),
+        info.part_count,
+    ));
 }
 
 pub(super) fn attach_reference_refresh<T: 'static>(
@@ -214,10 +231,10 @@ impl ArunaS3Service {
         quiet: bool,
         bucket: String,
         replication_auth: AuthContext,
-        prior_errors: Vec<S3DeleteError>,
+        (forwarded, prior_errors): (Vec<DeletedObject>, Vec<S3DeleteError>),
         outcomes: Vec<BulkDeleteOutcome>,
     ) -> S3Response<DeleteObjectsOutput> {
-        let mut deleted = Vec::new();
+        let mut deleted = forwarded;
         let mut errors = prior_errors;
         for outcome in outcomes {
             match outcome.result {
@@ -488,7 +505,7 @@ mod tests {
                 true,
                 "bucket".to_string(),
                 AuthContext::anonymous(RealmId([7u8; 32])),
-                vec![],
+                (vec![], vec![]),
                 outcomes,
             )
             .await;
@@ -508,7 +525,7 @@ mod tests {
                 false,
                 "bucket".to_string(),
                 AuthContext::anonymous(RealmId([7u8; 32])),
-                vec![],
+                (vec![], vec![]),
                 outcomes,
             )
             .await;
@@ -539,7 +556,7 @@ mod tests {
                 false,
                 "bucket".to_string(),
                 AuthContext::anonymous(RealmId([7u8; 32])),
-                prior,
+                (vec![], prior),
                 vec![missing("after")],
             )
             .await;
@@ -549,5 +566,58 @@ mod tests {
             .filter_map(|error| error.key.as_deref())
             .collect();
         assert_eq!(keys, vec!["denied", "after"]);
+    }
+
+    #[tokio::test]
+    async fn forwarded_deletes_listed() {
+        let (_dir, service) = test_service().await;
+        let forwarded = vec![DeletedObject {
+            key: Some("remote".to_string()),
+            delete_marker: Some(true),
+            delete_marker_version_id: Some("v1".to_string()),
+            ..Default::default()
+        }];
+        let response = service
+            .delete_objects_response(
+                false,
+                "bucket".to_string(),
+                AuthContext::anonymous(RealmId([7u8; 32])),
+                (forwarded, vec![]),
+                vec![success("local")],
+            )
+            .await;
+        let keys: Vec<String> = response
+            .output
+            .deleted
+            .expect("deleted list")
+            .into_iter()
+            .filter_map(|object| object.key)
+            .collect();
+        assert_eq!(keys, vec!["remote".to_string(), "local".to_string()]);
+    }
+
+    #[test]
+    fn ranged_get_unchecksummed() {
+        use aruna_core::structs::checksum::HASH_SHA256;
+        use aruna_core::structs::storage::multipart::MultipartChecksumType;
+        let info = ObjectInfo {
+            size: 10,
+            version_created_at: None,
+            etag: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            hashes: std::collections::HashMap::from([(HASH_SHA256.to_string(), vec![7; 32])]),
+            composite_hashes: std::collections::HashMap::new(),
+            part_count: None,
+        };
+        let mut full = GetObjectOutput::default();
+        full_object_checksums(&mut full, &info);
+        assert!(full.checksum_sha256.is_some());
+        let mut ranged = GetObjectOutput {
+            content_range: Some("bytes 0-2/10".to_string()),
+            ..Default::default()
+        };
+        full_object_checksums(&mut ranged, &info);
+        assert!(ranged.checksum_sha256.is_none());
+        assert!(ranged.checksum_type.is_none());
     }
 }

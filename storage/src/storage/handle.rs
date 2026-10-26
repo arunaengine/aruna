@@ -648,15 +648,19 @@ pub(super) fn storage_effect_mutates(effect: &StorageEffect) -> bool {
         StorageEffect::Write { .. }
         | StorageEffect::BatchWrite { .. }
         | StorageEffect::AddUsage { .. }
+        | StorageEffect::AddCounters { .. }
         | StorageEffect::Delete { .. }
         | StorageEffect::BatchDelete { .. }
         | StorageEffect::VaultWrite { .. }
         | StorageEffect::VaultDelete { .. }
-        | StorageEffect::CommitTransaction { .. } => true,
+        | StorageEffect::CommitTransaction { .. }
+        | StorageEffect::BeginUsageRebuild { .. }
+        | StorageEffect::FinishUsageRebuild { .. } => true,
         StorageEffect::StartTransaction { read } => !read,
         StorageEffect::Read { .. }
         | StorageEffect::BatchRead { .. }
         | StorageEffect::Iter { .. }
+        | StorageEffect::IterRange { .. }
         | StorageEffect::Last { .. }
         | StorageEffect::VaultRead { .. }
         | StorageEffect::AbortTransaction { .. }
@@ -694,6 +698,10 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
             txn_id: Some(txn_id),
             ..
         }
+        | StorageEffect::IterRange {
+            txn_id: Some(txn_id),
+            ..
+        }
         | StorageEffect::Last {
             txn_id: Some(txn_id),
             ..
@@ -711,6 +719,7 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
             ..
         }
         | StorageEffect::AddUsage { txn_id, .. }
+        | StorageEffect::AddCounters { txn_id, .. }
         | StorageEffect::CommitTransaction { txn_id }
         | StorageEffect::AbortTransaction { txn_id } => Some(*txn_id),
         StorageEffect::StartTransaction { .. }
@@ -722,10 +731,13 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
         | StorageEffect::Delete { txn_id: None, .. }
         | StorageEffect::BatchDelete { txn_id: None, .. }
         | StorageEffect::Iter { txn_id: None, .. }
+        | StorageEffect::IterRange { txn_id: None, .. }
         | StorageEffect::Last { txn_id: None, .. }
         | StorageEffect::VaultWrite { txn_id: None, .. }
         | StorageEffect::VaultRead { txn_id: None, .. }
-        | StorageEffect::VaultDelete { txn_id: None, .. } => None,
+        | StorageEffect::VaultDelete { txn_id: None, .. }
+        | StorageEffect::BeginUsageRebuild { .. }
+        | StorageEffect::FinishUsageRebuild { .. } => None,
     }
 }
 
@@ -934,7 +946,9 @@ impl ResponseToken {
 
     pub(super) fn new(handle: &StorageHandle, effect: &StorageEffect) -> Self {
         let cleanup = match effect {
-            StorageEffect::StartTransaction { .. } => Some(ResponseCleanup::Start(None)),
+            StorageEffect::StartTransaction { .. } | StorageEffect::BeginUsageRebuild { .. } => {
+                Some(ResponseCleanup::Start(None))
+            }
             StorageEffect::CommitTransaction { txn_id } => Some(ResponseCleanup::Commit(*txn_id)),
             StorageEffect::AbortTransaction { txn_id } => {
                 Some(ResponseCleanup::Abort(*txn_id, true))

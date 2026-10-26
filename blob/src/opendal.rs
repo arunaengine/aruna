@@ -5,12 +5,14 @@
 use crate::egress::EgressGuard;
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+use aruna_core::structs::execution::source_access::{
+    ListCursor, ListRequest, ResolvedSourceAccess, SourceEntry, SourceEntryKind, SourceMetadata,
+};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::storage::blob::Backend;
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use opendal::layers::{LoggingLayer, RetryLayer};
 use opendal::{Builder, EntryMode, OperationContext, Operator, services};
 use std::collections::HashMap;
@@ -153,6 +155,7 @@ pub(crate) async fn head_staging_source(
         etag: metadata.etag().map(ToOwned::to_owned),
         last_modified: metadata.last_modified().map(Into::into),
         source_version: metadata.version().map(ToOwned::to_owned),
+        digests: Default::default(),
     })
 }
 
@@ -160,6 +163,7 @@ pub(crate) async fn read_staging_source(
     guard: &EgressGuard,
     access: &ResolvedSourceAccess,
     range: Option<std::ops::Range<u64>>,
+    expected: Option<&SourceMetadata>,
 ) -> Result<
     (
         SourceMetadata,
@@ -174,19 +178,21 @@ pub(crate) async fn read_staging_source(
         return crate::invenio::read_reference(guard, access, range).await;
     }
     let (operator, path, version) = build_source_operator(guard, access).await?;
-    let metadata = head_staging_source(guard, access).await?;
     let capability = operator.info().capability();
+    if let Some(expected) = expected
+        && let Some(etag) = strong_etag(expected.etag.as_deref())
+        && capability.read_with_if_match
+    {
+        return read_bound(&operator, path, version, range, expected, etag).await;
+    }
+    let metadata = head_staging_source(guard, access).await?;
     let mut reader = operator.reader_with(path);
     // Pinning is preferred, not required: an unpinnable source reads unpinned
     // with a warning so any source stays integrateable (user decision 2026-08-10).
     let pinned_version = version
         .or(metadata.source_version.as_deref())
         .filter(|version| !version.is_empty());
-    let strong_etag = metadata
-        .etag
-        .as_deref()
-        .map(str::trim)
-        .filter(|etag| !etag.is_empty() && !etag.starts_with("W/"));
+    let strong_etag = strong_etag(metadata.etag.as_deref());
     if let Some(version) = pinned_version.filter(|_| capability.read_with_version) {
         reader = reader.version(version);
     } else if let Some(etag) = strong_etag.filter(|_| capability.read_with_if_match) {
@@ -216,96 +222,389 @@ pub(crate) async fn read_staging_source(
     Ok((metadata, BackendStream::new(stream)))
 }
 
-pub(crate) async fn list_staging_source(
-    guard: &EgressGuard,
-    access: &ResolvedSourceAccess,
-    offset: usize,
-    limit: usize,
-    recursive: bool,
-    files_only: bool,
+fn strong_etag(etag: Option<&str>) -> Option<&str> {
+    etag.map(str::trim)
+        .filter(|etag| !etag.is_empty() && !etag.starts_with("W/"))
+}
+
+/// Reads with the recorded ETag as `If-Match` and no HEAD first, so the bytes are the
+/// registered representation or the read fails with `ConditionFailed`.
+async fn read_bound(
+    operator: &Operator,
+    path: &str,
+    version: Option<&str>,
+    range: Option<std::ops::Range<u64>>,
+    expected: &SourceMetadata,
+    etag: &str,
 ) -> Result<
     (
-        Vec<aruna_core::structs::execution::source_access::SourceEntry>,
-        bool,
+        SourceMetadata,
+        BackendStream<Result<Bytes, aruna_core::stream::StreamError>>,
     ),
     StagingSourceError,
 > {
+    let mut reader = operator.reader_with(path).if_match(etag);
+    if let Some(version) = version.filter(|_| operator.info().capability().read_with_version) {
+        reader = reader.version(version);
+    }
+    let reader = reader.await.map_err(|error| bound_read_error(&error))?;
+    let stream = match range {
+        Some(range) => reader.into_bytes_stream(range).await,
+        None => reader.into_bytes_stream(..).await,
+    }
+    .map_err(|error| bound_read_error(&error))?;
+    // The first chunk carries the provider's answer to the condition.
+    let mut stream = Box::pin(stream);
+    let first = stream.try_next().await.map_err(|error| {
+        match error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<opendal::Error>())
+        {
+            Some(inner) => bound_read_error(inner),
+            None => StagingSourceError::ReadError(error.to_string()),
+        }
+    })?;
+    let stream = futures::stream::iter(first.map(Ok)).chain(stream);
+    Ok((expected.clone(), BackendStream::new(stream)))
+}
+
+fn bound_read_error(error: &opendal::Error) -> StagingSourceError {
+    match error.kind() {
+        opendal::ErrorKind::ConditionNotMatch => StagingSourceError::ConditionFailed,
+        opendal::ErrorKind::NotFound => StagingSourceError::NotFound,
+        _ => StagingSourceError::ReadError(error.to_string()),
+    }
+}
+
+pub(crate) async fn list_staging_source(
+    guard: &EgressGuard,
+    access: &ResolvedSourceAccess,
+    request: &ListRequest,
+) -> Result<(Vec<SourceEntry>, Option<ListCursor>), StagingSourceError> {
     if crate::fs_source::is_local_access(access) {
-        return crate::fs_source::list_local(access, offset, limit, recursive, files_only).await;
+        let offset = fallback_offset(request, FALLBACK_SKIP_LIMIT)?;
+        let (entries, truncated) = crate::fs_source::list_local(
+            access,
+            offset,
+            request.limit,
+            request.recursive,
+            request.files_only,
+        )
+        .await?;
+        return Ok(offset_page(entries, truncated, offset));
     }
     let ResolvedSourceAccess::OpenDal {
         kind, config, path, ..
     } = access;
     if *kind == SourceConnectorKind::Http {
         // opendal's Http service cannot list; walk autoindex pages instead.
-        return crate::autoindex::list_http_autoindex(
-            guard, config, path, offset, limit, recursive, files_only,
+        let offset = fallback_offset(request, FALLBACK_SKIP_LIMIT)?;
+        let (entries, truncated) = crate::autoindex::list_http_autoindex(
+            guard,
+            config,
+            path,
+            offset,
+            request.limit,
+            request.recursive,
+            request.files_only,
         )
-        .await;
+        .await?;
+        return Ok(offset_page(entries, truncated, offset));
     }
     let (operator, path, ..) = build_source_operator(guard, access).await?;
-    list_operator(&operator, path, offset, limit, recursive, files_only).await
+    list_operator(&operator, path, request).await
+}
+
+/// Entries a source without a provider cursor may skip per page: each page re-lists from the
+/// start, so deeper pages are refused rather than growing without bound.
+const FALLBACK_SKIP_LIMIT: usize = 100_000;
+/// Entries, directories included, a fallback page may read before it fails: a re-listed tree
+/// is walked from its start for every page.
+const MAX_FALLBACK_EXAMINED: usize = 250_000;
+/// Largest page a provider answers in one request, so a page never needs a second request.
+const PROVIDER_PAGE_LIMIT: usize = 1000;
+
+fn fallback_offset(request: &ListRequest, skip_limit: usize) -> Result<usize, StagingSourceError> {
+    if request.lower.is_some() || request.stop.is_some() {
+        return Err(StagingSourceError::InvalidListing(
+            "key bounds need a source with a provider cursor".to_string(),
+        ));
+    }
+    let offset = match &request.cursor {
+        None => 0,
+        Some(ListCursor::Offset(offset)) => usize::try_from(*offset).unwrap_or(usize::MAX),
+        Some(ListCursor::After(_) | ListCursor::At(_)) => {
+            return Err(StagingSourceError::InvalidListing(
+                "this source continues by offset, not by key".to_string(),
+            ));
+        }
+    };
+    if offset > skip_limit {
+        return Err(StagingSourceError::InvalidListing(format!(
+            "this source cannot continue a listing past {skip_limit} entries; list a narrower path"
+        )));
+    }
+    Ok(offset)
+}
+
+fn offset_page(
+    entries: Vec<SourceEntry>,
+    truncated: bool,
+    offset: usize,
+) -> (Vec<SourceEntry>, Option<ListCursor>) {
+    let next = truncated.then(|| ListCursor::Offset((offset + entries.len()) as u64));
+    (entries, next)
 }
 
 async fn list_operator(
     operator: &Operator,
     path: &str,
-    offset: usize,
-    limit: usize,
-    recursive: bool,
-    files_only: bool,
-) -> Result<
-    (
-        Vec<aruna_core::structs::execution::source_access::SourceEntry>,
-        bool,
-    ),
-    StagingSourceError,
-> {
+    request: &ListRequest,
+) -> Result<(Vec<SourceEntry>, Option<ListCursor>), StagingSourceError> {
+    let capability = operator.info().capability();
+    if !(capability.list_with_start_after && capability.list_with_recursive) {
+        let offset = fallback_offset(request, FALLBACK_SKIP_LIMIT)?;
+        let bounds = (offset, MAX_FALLBACK_EXAMINED);
+        let (entries, truncated) = list_skipping(operator, path, request, bounds).await?;
+        return Ok(offset_page(entries, truncated, offset));
+    }
+    if !request.recursive && (request.lower.is_some() || request.stop.is_some()) {
+        return Err(StagingSourceError::InvalidListing(
+            "key bounds need a recursive listing".to_string(),
+        ));
+    }
+    let floor = match &request.cursor {
+        Some(ListCursor::After(key) | ListCursor::At(key)) => Some(key.clone()),
+        Some(ListCursor::Offset(_)) => {
+            return Err(StagingSourceError::InvalidListing(
+                "this source continues by key, not by offset".to_string(),
+            ));
+        }
+        None => request.lower.clone(),
+    };
+    let limit = request.limit.clamp(1, PROVIDER_PAGE_LIMIT);
+    let mut entries = Vec::with_capacity(limit);
+    let inclusive = match &request.cursor {
+        None => request.lower.as_deref(),
+        Some(ListCursor::At(key)) => Some(key.as_str()),
+        Some(_) => None,
+    };
+    if let Some(lower) = inclusive
+        && let Some(entry) = probe_lower(operator, path, lower, request).await?
+    {
+        entries.push(entry);
+        // The probe takes one entry of the page budget.
+        if limit == 1 {
+            return Ok((entries, Some(ListCursor::After(lower.to_string()))));
+        }
+    }
+    // One level is listed as flat keys rolled up into directories, so the cursor is always a key
+    // of one sorted listing and never depends on how a provider orders a page. After a new
+    // directory the listing seeks to the first key after its subtree instead of reading its keys.
+    let budget = limit - entries.len();
+    let mut start = floor.clone();
+    let mut highest = floor.clone();
+    // A directory the previous page already listed, from the key the cursor names.
+    let mut last_directory = floor.as_deref().and_then(|key| child_directory(path, key));
+    let mut consumed = 0usize;
+    let mut seeks = 0usize;
+    'listing: loop {
+        let mut lister = operator
+            .lister_with(path)
+            .recursive(true)
+            .limit(budget - consumed);
+        if let Some(start) = start.as_deref() {
+            lister = lister.start_after(start);
+        }
+        let mut lister = lister.await.map_err(list_error)?;
+        // A provider page holds the remaining budget, so stopping there never reads ahead.
+        while consumed < budget {
+            let Some(entry) = lister.try_next().await.map_err(list_error)? else {
+                return Ok((entries, None));
+            };
+            consumed += 1;
+            let entry_path = entry.path();
+            if request
+                .stop
+                .as_deref()
+                .is_some_and(|stop| entry_path >= stop)
+            {
+                return Ok((entries, None));
+            }
+            // A provider may repeat the key a listing started after; it was served.
+            if start.as_deref().is_some_and(|start| entry_path <= start) {
+                continue;
+            }
+            if highest
+                .as_deref()
+                .is_none_or(|highest| entry_path > highest)
+            {
+                highest = Some(entry_path.to_string());
+            }
+            let directory = (!request.recursive)
+                .then(|| child_directory(path, entry_path))
+                .flatten();
+            let Some(directory) = directory else {
+                if let Some(entry) =
+                    source_entry(entry_path, entry.metadata(), path, request.files_only)
+                {
+                    entries.push(entry);
+                }
+                continue;
+            };
+            if last_directory.as_deref() == Some(directory.as_str()) {
+                continue;
+            }
+            if !request.files_only {
+                entries.push(directory_entry(&directory));
+            }
+            // `start_after` skips the successor itself, so it is read on its own; a full page
+            // leaves it to the next page, which starts at it.
+            let successor = subtree_successor(&directory);
+            if consumed >= budget {
+                return Ok((entries, Some(ListCursor::At(successor))));
+            }
+            if let Some(entry) = probe_lower(operator, path, &successor, request).await? {
+                entries.push(entry);
+                consumed += 1;
+            }
+            last_directory = Some(directory);
+            highest = Some(successor.clone());
+            start = Some(successor);
+            seeks += 1;
+            if seeks < MAX_PAGE_SEEKS && consumed < budget {
+                continue 'listing;
+            }
+            break;
+        }
+        return Ok((entries, highest.map(ListCursor::After)));
+    }
+}
+
+/// Provider requests one browse page may spend seeking past directories.
+const MAX_PAGE_SEEKS: usize = 32;
+
+/// The smallest key after every descendant of `directory`: its trailing `/` becomes `0`.
+fn subtree_successor(directory: &str) -> String {
+    let parent = directory.strip_suffix('/').unwrap_or(directory);
+    format!("{parent}0")
+}
+
+/// The direct child directory of `path` that `key` lies in, with a trailing slash.
+fn child_directory(path: &str, key: &str) -> Option<String> {
+    let relative = key.strip_prefix(path)?;
+    let end = relative.find('/')?;
+    Some(format!("{path}{}", &relative[..=end]))
+}
+
+fn directory_entry(directory: &str) -> SourceEntry {
+    let trimmed = directory.trim_end_matches('/');
+    SourceEntry {
+        name: trimmed.rsplit('/').next().unwrap_or(trimmed).to_string(),
+        path: trimmed.to_string(),
+        kind: SourceEntryKind::Directory,
+        size: None,
+        modified: None,
+        etag: None,
+        stat: None,
+    }
+}
+
+/// Reads the inclusive lower key itself, since `start_after` skips it.
+async fn probe_lower(
+    operator: &Operator,
+    path: &str,
+    lower: &str,
+    request: &ListRequest,
+) -> Result<Option<SourceEntry>, StagingSourceError> {
+    if lower.ends_with('/') || !lower.starts_with(path.trim_start_matches('/')) {
+        return Ok(None);
+    }
+    if request.stop.as_deref().is_some_and(|stop| lower >= stop) {
+        return Ok(None);
+    }
+    let metadata = match operator.stat(lower).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == opendal::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(list_error(error)),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    Ok(source_entry(lower, &metadata, path, request.files_only))
+}
+
+/// The fallback for a provider without `start_after`: it re-lists and skips `offset` entries,
+/// reading at most `max_examined` listed entries before it fails.
+async fn list_skipping(
+    operator: &Operator,
+    path: &str,
+    request: &ListRequest,
+    (offset, max_examined): (usize, usize),
+) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
     let mut lister = operator
         .lister_with(path)
-        .recursive(recursive)
+        .recursive(request.recursive)
         .await
-        .map_err(|error| StagingSourceError::ListError(error.to_string()))?;
-    let mut entries = Vec::with_capacity(limit);
+        .map_err(list_error)?;
+    let mut entries = Vec::with_capacity(request.limit);
     let mut skipped = 0usize;
-
-    while let Some(entry) = lister
-        .try_next()
-        .await
-        .map_err(|error| StagingSourceError::ListError(error.to_string()))?
-    {
-        if entry.metadata().is_dir()
-            && entry.path().trim_end_matches('/') == path.trim_end_matches('/')
-        {
-            continue;
+    let mut examined = 0usize;
+    while let Some(entry) = lister.try_next().await.map_err(list_error)? {
+        examined += 1;
+        if examined > max_examined {
+            return Err(StagingSourceError::InvalidListing(format!(
+                "this source lists more than {max_examined} entries for one page; list a \
+                 narrower path"
+            )));
         }
-        let kind = match entry.metadata().mode() {
-            EntryMode::FILE => aruna_core::structs::execution::source_access::SourceEntryKind::File,
-            EntryMode::DIR if !files_only => {
-                aruna_core::structs::execution::source_access::SourceEntryKind::Directory
-            }
-            EntryMode::DIR | EntryMode::Unknown => continue,
+        let Some(entry) = source_entry(entry.path(), entry.metadata(), path, request.files_only)
+        else {
+            continue;
         };
         if skipped < offset {
             skipped += 1;
             continue;
         }
-        if entries.len() == limit {
+        if entries.len() == request.limit {
             return Ok((entries, true));
         }
-
-        entries.push(aruna_core::structs::execution::source_access::SourceEntry {
-            name: entry.name().trim_end_matches('/').to_string(),
-            path: entry.path().trim_end_matches('/').to_string(),
-            kind,
-            size: (kind == aruna_core::structs::execution::source_access::SourceEntryKind::File)
-                .then(|| entry.metadata().content_length()),
-            modified: entry.metadata().last_modified().map(Into::into),
-            stat: None,
-        });
+        entries.push(entry);
     }
-
     Ok((entries, false))
+}
+
+/// The listed entry as a source entry; `None` for the listed directory itself and for kinds
+/// the request leaves out.
+fn source_entry(
+    entry_path: &str,
+    metadata: &opendal::Metadata,
+    path: &str,
+    files_only: bool,
+) -> Option<SourceEntry> {
+    let trimmed = entry_path.trim_end_matches('/');
+    if metadata.is_dir() && trimmed == path.trim_end_matches('/') {
+        return None;
+    }
+    let kind = match metadata.mode() {
+        EntryMode::FILE => SourceEntryKind::File,
+        EntryMode::DIR if !files_only => SourceEntryKind::Directory,
+        EntryMode::DIR | EntryMode::Unknown => return None,
+    };
+    let file = kind == SourceEntryKind::File;
+    Some(SourceEntry {
+        name: trimmed.rsplit('/').next().unwrap_or(trimmed).to_string(),
+        path: trimmed.to_string(),
+        kind,
+        size: file.then(|| metadata.content_length()),
+        modified: metadata.last_modified().map(Into::into),
+        etag: metadata.etag().filter(|_| file).map(ToOwned::to_owned),
+        stat: None,
+    })
+}
+
+fn list_error(error: opendal::Error) -> StagingSourceError {
+    StagingSourceError::ListError(error.to_string())
 }
 
 /// Builds the guarded opendal operator for one resolved staging source.

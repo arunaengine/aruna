@@ -191,6 +191,7 @@ async fn public_routes_work() {
             limit: None,
             offset: None,
             after: None,
+            here: false,
         }),
     )
     .await;
@@ -263,6 +264,7 @@ async fn public_routes_work() {
             limit: None,
             offset: None,
             after: None,
+            here: false,
         }),
     )
     .await
@@ -315,6 +317,7 @@ async fn public_routes_work() {
             limit: None,
             offset: None,
             after: None,
+            here: false,
         }),
     )
     .await
@@ -341,6 +344,7 @@ async fn public_routes_work() {
             limit: None,
             offset: None,
             after: None,
+            here: false,
         }),
     )
     .await
@@ -378,6 +382,7 @@ async fn public_routes_work() {
             limit: None,
             offset: None,
             after: None,
+            here: false,
         }),
     )
     .await
@@ -398,6 +403,7 @@ async fn public_routes_work() {
             limit: Some(2),
             offset: Some(0),
             after: None,
+            here: false,
         }),
     )
     .await
@@ -703,6 +709,43 @@ async fn rocrate_routes_work() {
     assert!(json.contains("Created From RO-Crate"));
     assert!(json.contains("Ada Lovelace"));
     assert!(json.contains("run-42.raw"));
+}
+
+#[tokio::test]
+async fn export_here_copy() {
+    let test = setup_state().await;
+    let document_id = create_linking_doc(
+        &test,
+        test.auth.clone(),
+        test.group_id,
+        "datasets/here",
+        "Held here",
+        true,
+        &[],
+    )
+    .await;
+    drain_metadata_background(test.state.as_ref()).await;
+    let export = |id: String, here: bool| {
+        let state = test.state.clone();
+        async move {
+            export_metadata_rocrate(
+                State(state),
+                Extension(None),
+                Extension(None),
+                Path(id),
+                Query(RoCrateExportParams {
+                    here,
+                    ..Default::default()
+                }),
+            )
+            .await
+        }
+    };
+    let (_, Json(own)) = export(document_id.clone(), true).await.unwrap();
+    assert!(projected(own).rocrate.to_string().contains("Held here"));
+    // This node holds no copy of an unknown document and asks nobody else.
+    let missing = export(Ulid::from_bytes([77; 16]).to_string(), true).await;
+    assert!(matches!(missing, Err(ServerError::NotFound)));
 }
 
 #[tokio::test]
@@ -1150,6 +1193,7 @@ async fn seed_preview_object(test: &TestState) -> Value {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     write_doc(
         &ctx,
@@ -3180,6 +3224,7 @@ async fn references_route(
             predicate: predicate.map(str::to_string),
             limit,
             resolve,
+            after: None,
         }),
     )
     .await
@@ -3758,6 +3803,7 @@ async fn preflight_finds_ids() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     write_doc(
         &ctx,

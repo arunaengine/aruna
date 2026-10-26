@@ -11,6 +11,8 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
+use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
+use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, version_written};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
@@ -22,7 +24,9 @@ use crate::placement::policy::{
 };
 use crate::replication::dht_registration::dht_registration_effect;
 use crate::replication::queue::build_live_obligation;
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::purge_fence::{
+    PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,
+};
 use crate::s3::row_fence::{FenceError, RowFence};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
 use aruna_core::UserId;
@@ -47,10 +51,14 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ManagedCopyKey, VersionKey,
     WriteOwner,
 };
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::inventory::VersionEntry;
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key, Value};
@@ -79,6 +87,8 @@ pub enum PutObjectState {
     ReadPreassignedCopy,
     ReadGateBucket,
     PolicyGate,
+    /// Reads a distributed bucket's record: only the key's coordinator writes, at its epoch.
+    ReadRecord,
     CheckPurgeWrite,
     /// Reads the bucket's encryption settings, then its active key, to capture the seal plan.
     ReadSealSettings,
@@ -201,6 +211,8 @@ pub enum PutObjectError {
     #[error(transparent)]
     PolicyGate(#[from] PolicyGateError),
     #[error(transparent)]
+    Distribution(#[from] GuardError),
+    #[error(transparent)]
     PurgeFence(#[from] PurgeFenceError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
@@ -216,6 +228,8 @@ pub enum PutObjectError {
     HistoryDeleted,
     #[error("a guarded row changed before the version committed")]
     FenceTaken,
+    #[error("usage counters are being rebuilt; retry later")]
+    UsageRebuilding,
 }
 
 #[derive(Debug, PartialEq)]
@@ -292,6 +306,8 @@ pub struct PutObjectOperation {
     /// observed after streaming cannot commit a stale ref set.
     bucket_policies: Vec<PlacementPolicyRef>,
     inherited_policies: Vec<PlacementPolicyRef>,
+    /// The origin a caller names, such as a copy's source; an upload by default.
+    version_origin: Option<VersionOrigin>,
     /// Destination details of this node. Absent means no governed byte may be
     /// materialized here at all.
     gate_context: Option<GateContext>,
@@ -336,6 +352,15 @@ pub struct PutObjectOperation {
     /// Set when the preassigned version already existed and the put only handed it back.
     replayed: bool,
     row_fence: Option<RowFence>,
+    /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
+    pub(super) set_hint: Option<SetHint>,
+    /// The bucket's distribution binding, whose inventory the version transaction maintains.
+    binding: Option<DistributionBinding>,
+    /// The coordinator authority the write was routed under; the version transaction rechecks it.
+    authority: Option<WriteAuthority>,
+    /// The head this write installs and the epoch of its version, for the inventory.
+    head_pointer: Option<CurrentVersionPointer>,
+    version_epoch: OriginalEpoch,
 }
 
 impl PutObjectOperation {
@@ -368,6 +393,7 @@ impl PutObjectOperation {
             stored_policies: Vec::new(),
             bucket_policies: Vec::new(),
             inherited_policies: Vec::new(),
+            version_origin: None,
             gate_context: None,
             gate: None,
             gated_bucket: None,
@@ -395,6 +421,11 @@ impl PutObjectOperation {
             dedup_checked: false,
             replayed: false,
             row_fence: None,
+            set_hint: None,
+            binding: None,
+            authority: None,
+            head_pointer: None,
+            version_epoch: OriginalEpoch::default(),
         }
     }
 
@@ -446,6 +477,12 @@ impl PutObjectOperation {
     /// constrained as what it was copied from.
     pub fn with_inherited_policies(mut self, policies: Vec<PlacementPolicyRef>) -> Self {
         self.inherited_policies = policies;
+        self
+    }
+
+    /// The origin the new version records instead of an upload.
+    pub fn with_version_origin(mut self, origin: Option<VersionOrigin>) -> Self {
+        self.version_origin = origin;
         self
     }
 
@@ -650,6 +687,16 @@ impl PutObjectOperation {
             GatedBucket::observe(bucket.as_ref())
                 .stored_under(self.gate_context.as_ref(), !refs.is_empty()),
         );
+        self.binding = bucket
+            .as_ref()
+            .and_then(|bucket| bucket.distribution.clone());
+        self.set_hint = self.binding.as_ref().map(DistributionBinding::hint);
+        // A planned id is minted before the write; inside a set it must already carry the hint.
+        if let (Some(hint), Some(id)) = (self.set_hint, self.config.preassigned_version_id)
+            && SetHint::of_version(id) != hint
+        {
+            return self.emit_error(PutObjectError::InvalidPreassignedVersion);
+        }
         let group_id = bucket
             .as_ref()
             .map_or(self.config.group_id, |bucket| bucket.group_id);
@@ -695,6 +742,28 @@ impl PutObjectOperation {
     }
 
     fn check_write_fence(&mut self) -> Effects {
+        if let Some(binding) = self.binding.as_ref() {
+            self.state = PutObjectState::ReadRecord;
+            return smallvec![record_read(binding)];
+        }
+        self.read_write_fence()
+    }
+
+    fn record_checked(&mut self, event: Event) -> Effects {
+        let Some(binding) = self.binding.as_ref() else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+        match record_authority(binding, &self.config.request.key, event) {
+            Ok(authority) => {
+                self.version_epoch = authority.epoch;
+                self.authority = Some(authority);
+                self.read_write_fence()
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn read_write_fence(&mut self) -> Effects {
         self.state = PutObjectState::CheckPurgeWrite;
         smallvec![write_fence_read(&self.config.request.bucket, None)]
     }
@@ -923,16 +992,25 @@ impl PutObjectOperation {
         if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
             self.txn_id = Some(txn_id);
             self.state = PutObjectState::CheckPurgeFence;
-            smallvec![write_fence_read(&self.config.request.bucket, self.txn_id)]
+            let authority = self.authority.as_ref();
+            smallvec![publication_read(
+                &self.config.request.bucket,
+                authority,
+                self.txn_id
+            )]
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
     }
 
     fn fence_checked(&mut self, event: Event) -> Effects {
-        if let Err(error) =
-            check_write_fence(event, &self.config.request.bucket, &self.config.request.key)
-        {
+        let request = &self.config.request;
+        if let Err(error) = check_publication(
+            event,
+            &request.bucket,
+            &request.key,
+            self.authority.as_ref(),
+        ) {
             return self.cleanup_failed_write(error.into());
         }
         // Read unconditionally: the version snapshots the default this
@@ -1213,7 +1291,10 @@ impl PutObjectOperation {
     }
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
-        let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
+        let set_hint = self.set_hint;
+        let version_id = *self
+            .version_id
+            .get_or_insert_with(|| mint_version(set_hint));
         // An import may register a listed write's version before the write commits it.
         if self.keep_head || self.listed_write() {
             return self.read_history(version_id);
@@ -1227,9 +1308,10 @@ impl PutObjectOperation {
         version_id: Ulid,
     ) -> Effects {
         let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
-            Ok(pointer) => pointer,
+            Ok(pointer) => stamp_head(pointer, self.binding.as_ref(), self.version_epoch),
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
+        self.head_pointer = Some(pointer.clone());
         let effect = match write_head_effect(&self.alias_context(), pointer, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -1373,7 +1455,16 @@ impl PutObjectOperation {
                 created_by,
                 self.config.version_source.clone(),
             )
-            .with_metadata(self.metadata.clone());
+            .with_metadata(self.metadata.clone())
+            .with_origin(Some(self.version_origin.clone().unwrap_or(
+                match self.config.version_source {
+                    Some(_) => VersionOrigin::Source { database: None },
+                    None => VersionOrigin::Upload {
+                        node_id: self.config.node_id,
+                        device: None,
+                    },
+                },
+            )));
             let version = match version.with_policies(self.effective_policies()) {
                 Ok(version) => version,
                 Err(err) => return self.emit_error(err.into()),
@@ -1383,7 +1474,15 @@ impl PutObjectOperation {
                 self.config.request.key.clone(),
                 version_id,
             );
+            let generation = self.head_pointer.as_ref().map_or(0, |head| head.generation);
+            let version = stamp_version(
+                version,
+                self.binding.as_ref(),
+                generation,
+                self.version_epoch,
+            );
             self.stored_policies = version.placement_policies.clone();
+            self.version_epoch = version.original_epoch;
             let effect = match write_version_effect(&version_key, &version, self.txn_id) {
                 Ok(effect) => effect,
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
@@ -1532,9 +1631,28 @@ impl PutObjectOperation {
         let Some(stored) = StoredDelta::for_location(&location, self.new_blob) else {
             return self.emit_error(PutObjectError::MissingHash("blake3".to_string()));
         };
+        let added = self.version_id.map(|version_id| AddedVersion {
+            version_id,
+            epoch: self.version_epoch,
+            generation: self.head_pointer.as_ref().map_or(0, |head| head.generation),
+            entry: VersionEntry {
+                marker: false,
+                size: location.blob_size,
+                referenced: false,
+                identity: location
+                    .get_blake3()
+                    .and_then(|hash| <[u8; 32]>::try_from(hash).ok()),
+                pending: false,
+            },
+        });
+        let head = self.head_pointer.is_some();
+        let key = &self.config.request.key;
+        let inventory =
+            added.and_then(|added| version_written(self.binding.as_ref(), key, added, head));
         self.usage_update = Some(
             UsageCounterUpdate::with_stored(self.config.group_id, group_delta, stored)
-                .in_bucket(&self.config.request.bucket, RowChange::AddedVersion),
+                .in_bucket(&self.config.request.bucket, RowChange::AddedVersion)
+                .with_inventory(inventory),
         );
 
         // Enforce the hard quota before counters commit; only a
@@ -1577,7 +1695,10 @@ impl PutObjectOperation {
         match gate.step(event, txn_id) {
             Ok(Some(effects)) => effects,
             Ok(None) => {
-                if gate.is_exceeded() {
+                if gate.is_rebuilding() {
+                    self.cleanup.set_error(PutObjectError::UsageRebuilding);
+                    self.reject_over_quota()
+                } else if gate.is_exceeded() {
                     self.cleanup.set_error(PutObjectError::QuotaExceeded {
                         limit: gate.ceiling(),
                         usage: gate.projected_usage(),
@@ -1821,6 +1942,7 @@ impl PutObjectOperation {
                 blake3,
                 realm_id: self.config.realm_id,
                 ttl_ms: self.rocrate_limits.holder_ttl_ms,
+                announce: self.binding.is_none(),
             },
         })
     }
@@ -1832,6 +1954,10 @@ impl PutObjectOperation {
         let Some(blake3_hash) = location.get_blake3() else {
             return self.continue_after_registration();
         };
+        // Distributed buckets are found through their content indexes, not the DHT.
+        if self.binding.is_some() {
+            return self.continue_after_registration();
+        }
         self.state = PutObjectState::RegisterBlobDht;
         match dht_registration_effect(blake3_hash, self.config.realm_id, &self.rocrate_limits) {
             Ok(effect) => smallvec![effect],
@@ -2024,6 +2150,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadPreassignedCopy => self.handle_preassigned_copy(event),
             PutObjectState::ReadGateBucket => self.handle_gate_bucket(event),
             PutObjectState::PolicyGate => self.handle_policy_gate(event),
+            PutObjectState::ReadRecord => self.record_checked(event),
             PutObjectState::CheckPurgeWrite => self.write_fence_checked(event),
             PutObjectState::ReadSealSettings => self.seal_settings_read(event),
             PutObjectState::ReadSealKey => self.seal_key_read(event),
@@ -2535,6 +2662,7 @@ mod decision_tests {
             placement_policies: refs,
             placement_policy_generation: generation,
             compression: Compression::Off,
+            distribution: None,
         };
         ByteView::from(info.to_bytes().expect("bucket encodes"))
     }
@@ -2647,6 +2775,37 @@ mod decision_tests {
             config.finalize(),
             Err(PutObjectError::PolicyGate(PolicyGateError::NoSubject))
         ));
+    }
+
+    #[test]
+    fn planned_needs_hint() {
+        // A planned id in a distributed bucket must already carry the set hint.
+        use aruna_core::structs::storage::distribution::hint::with_hint;
+        use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+        let set_id = Ulid::from_bytes([5u8; 16]);
+        let planned = |id: Ulid| {
+            let mut operation = operation("eu-west");
+            operation.config.preassigned_version_id = Some(id);
+            operation.start();
+            operation.step(read(None));
+            let mut info = BucketInfo::from_bytes(&bucket(Vec::new(), 0)).unwrap();
+            info.distribution = Some(DistributionBinding {
+                set_id,
+                member_id: Ulid::from_bytes([6u8; 16]),
+                incarnation: 1,
+                revision: Default::default(),
+            });
+            operation.step(read(Some(ByteView::from(info.to_bytes().unwrap()))));
+            operation
+        };
+        let hint = SetHint::of_set(set_id);
+        let plain = Ulid::from_parts(1, 0);
+        assert_ne!(SetHint::of_version(plain), hint);
+        assert!(matches!(
+            planned(plain).finalize(),
+            Err(PutObjectError::InvalidPreassignedVersion)
+        ));
+        assert!(!planned(with_hint(plain, hint)).is_complete());
     }
 
     #[test]

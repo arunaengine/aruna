@@ -16,7 +16,7 @@ pub const SEALED_KEYSPACES: [&str; 1] = [CONNECTOR_SECRET_KEYSPACE];
 pub(super) enum Opening {
     /// The keyspace of each requested row of a `Read` or `BatchRead`.
     Rows(Vec<String>),
-    /// The keyspace of an `Iter` or `Last`.
+    /// The keyspace of an `Iter`, `IterRange` or `Last`.
     Scan(String),
 }
 
@@ -87,7 +87,9 @@ pub(super) fn seal_effect(
                     .collect(),
             ))
         }
-        StorageEffect::Iter { key_space, .. } | StorageEffect::Last { key_space, .. }
+        StorageEffect::Iter { key_space, .. }
+        | StorageEffect::IterRange { key_space, .. }
+        | StorageEffect::Last { key_space, .. }
             if is_sealed(key_space) =>
         {
             Some(Opening::Scan(key_space.clone()))

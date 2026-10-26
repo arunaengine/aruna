@@ -83,6 +83,12 @@ pub(crate) async fn dispatch_effect_until(
         Effect::Net(NetEffect::VaultSign(records)) => Event::Net(NetEvent::VaultSign(
             crate::users::vault_route::sign_records(context, *records),
         )),
+        Effect::Net(NetEffect::SnapshotSign(claim)) => Event::Net(NetEvent::SnapshotSign(
+            crate::distribution::sign_snapshot(context, *claim),
+        )),
+        Effect::Net(NetEffect::StatementSign(claim)) => Event::Net(NetEvent::StatementSign(
+            crate::distribution::sign_statement(context, *claim),
+        )),
         // Job-record replication and launch offers resolve their holders in the
         // operation and run only the holder round-trips here.
         Effect::Net(NetEffect::JobRecord(record)) => Event::Net(NetEvent::JobRecord(

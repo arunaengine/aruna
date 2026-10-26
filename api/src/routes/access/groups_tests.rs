@@ -730,6 +730,7 @@ async fn seed_bucket(state: &ServerState, bucket: &str, group_id: Ulid) {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     store_bytes(
         state,
@@ -813,6 +814,7 @@ async fn folds_group_buckets() {
     let (status, Json(body)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
     )
@@ -856,6 +858,7 @@ async fn bucket_folds_objects() {
     let (status, Json(body)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
     )
@@ -909,6 +912,7 @@ async fn round_trips_bucket() {
     let (_status, Json(listing)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
     )
@@ -923,6 +927,7 @@ async fn round_trips_bucket() {
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(bucket_path.clone()))),
     )
@@ -967,6 +972,7 @@ async fn paginates_object_pages() {
         let (_status, Json(body)) = list_data_paths(
             State(state.clone()),
             Extension(Some(member_auth(owner))),
+            Extension(None),
             Path(group_id.to_string()),
             Query(DataPathsQuery {
                 prefix: Some(prefix.clone()),
@@ -1009,6 +1015,7 @@ async fn path_matches_helper() {
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
     )
@@ -1041,6 +1048,7 @@ async fn hides_foreign_bucket() {
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
         Extension(Some(member_auth(owner))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
     )
@@ -1060,6 +1068,7 @@ async fn non_member_forbidden() {
     let result = list_data_paths(
         State(state),
         Extension(Some(outsider)),
+        Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
     )
@@ -1103,6 +1112,7 @@ async fn empty_role_forbidden() {
     let result = list_data_paths(
         State(state),
         Extension(Some(member_auth(limited))),
+        Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
     )
@@ -1115,6 +1125,7 @@ async fn rejects_anonymous_caller() {
     let (state, _tempdir) = setup_state().await;
     let result = list_data_paths(
         State(state),
+        Extension(None),
         Extension(None),
         Path(Ulid::generate().to_string()),
         Query(DataPathsQuery::default()),
@@ -1201,4 +1212,118 @@ async fn policy_denies_role() {
     };
     let stored = GroupAuthorizationDocument::from_bytes(&value).unwrap();
     assert_eq!(stored.roles.len(), auth_doc.roles.len());
+}
+
+#[tokio::test]
+async fn prefix_hides_keys() {
+    use crate::routes::storage::objects::{ObjectListQuery, list_objects};
+    let (state, _tempdir) = setup_state().await;
+    let owner = UserId::local(Ulid::generate(), state.get_realm_id());
+    let group_id = seed_group(&state, owner).await;
+    seed_bucket(&state, "data", group_id).await;
+    for (index, key) in ["imag", "imaging/scan.tif"].iter().enumerate() {
+        seed_object(&state, "data", key, owner, index as u8 + 1).await;
+    }
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    // READ on the literal key `imag` must not reveal `imaging/scan.tif`.
+    let mut auth = member_auth(owner);
+    auth.path_restrictions = Some(vec![PathRestriction {
+        pattern: object_permission_path(realm_id, group_id, node_id, "data", "imag"),
+        permission: Permission::READ,
+    }]);
+    let Json(page) = list_objects(
+        State(state.clone()),
+        Extension(Some(auth)),
+        Extension(None),
+        axum::http::HeaderMap::new(),
+        Path("data".to_string()),
+        Query(ObjectListQuery {
+            prefix: Some("imag".to_string()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let keys: Vec<_> = page
+        .objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["imag"]);
+}
+
+mod distributed {
+    use super::{DataPathKind, DataPathsQuery, list_data_paths};
+    use crate::auth::ValidatedBearer;
+    use crate::mcp::data::{WriteObjectInput, store_text};
+    use crate::routes::storage::deletion::bucket_info;
+    use crate::tests::distributed::{
+        BUCKET, PEER, distribute, mock_peer, node_id, node_state, publish_api,
+    };
+    use aruna_core::structs::storage::blob::group_permission_path;
+    use axum::Extension;
+    use axum::Json;
+    use axum::extract::{Path, Query, State};
+    use axum::http::StatusCode;
+
+    /// Browsing a distributed bucket lists its own range here and the peer's range there.
+    #[tokio::test]
+    async fn browses_distributed_bucket() {
+        let node = node_state().await;
+        let info = bucket_info(&node.state, BUCKET).await.unwrap();
+        for key in ["a.md", "dir/b.md"] {
+            let input = WriteObjectInput {
+                bucket: BUCKET.to_string(),
+                key: key.to_string(),
+                text: "x".to_string(),
+                content_type: None,
+            };
+            store_text(&node.state, &node.owner, &info, input)
+                .await
+                .unwrap();
+        }
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+            "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+            "prefixes":[],"next_cursor":"more"}"#;
+        let peer = mock_peer(StatusCode::OK, answer).await;
+        publish_api(&node.state, node_id(PEER), &peer.url).await;
+        let state = &node.state;
+        let root = group_permission_path(state.get_realm_id(), node.group_id, state.get_node_id());
+
+        let (status, Json(paths)) = list_data_paths(
+            State(state.clone()),
+            Extension(Some(node.owner.clone())),
+            Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+            Path(node.group_id.to_string()),
+            Query(DataPathsQuery {
+                prefix: Some(format!("{root}/{BUCKET}")),
+                delimiter: Some("/".to_string()),
+                continuation_token: None,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        let entries: Vec<_> = (paths.entries.iter())
+            .map(|entry| {
+                (
+                    entry.permission_path.rsplit('/').next().unwrap(),
+                    entry.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("", DataPathKind::Folder),
+                ("a.md", DataPathKind::Object),
+                ("x.md", DataPathKind::Object),
+            ]
+        );
+        assert!(paths.entries[0].permission_path.ends_with("/dir/"));
+        assert_eq!(paths.continuation_token.as_deref(), Some("more"));
+    }
 }

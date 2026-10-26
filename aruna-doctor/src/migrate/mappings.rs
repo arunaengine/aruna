@@ -3,9 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::removals::outbox_record;
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
-use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::structs::{PersistentIdMapping, secondary_index_entries};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use std::collections::BTreeMap;
@@ -31,8 +32,7 @@ pub(super) fn outbox_rows(
     for entry in db.read_tx().iter(keyspace) {
         let (key, value) = entry.into_inner()?;
         scanned += 1;
-        let mut record: DocumentOutboxRecord =
-            postcard::from_bytes(&value).map_err(|error| decode_error(name, &key, error))?;
+        let mut record = outbox_record(&value).map_err(|error| decode_error(name, &key, error))?;
         let DocumentOutboxEvent::Upsert { bytes, .. } = &mut record.event else {
             continue;
         };

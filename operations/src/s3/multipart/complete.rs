@@ -8,6 +8,10 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
     write_location_effect, write_version_effect,
 };
+use crate::distribution::guard::{GuardError, WriteAuthority, record_completion, record_read};
+use crate::distribution::inventory::{
+    AddedVersion, InventoryChange, InventoryUpdate, stamp_head, stamp_version, version_written,
+};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
@@ -21,7 +25,9 @@ use crate::replication::queue::build_live_obligation;
 use crate::s3::multipart::create::storage_current;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::purge_fence::{
+    PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,
+};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
 use aruna_blob::hash::{Hasher, combine_crcs};
 use aruna_core::UserId;
@@ -47,6 +53,9 @@ use aruna_core::structs::storage::blob::{
     BlobVersion, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
     VersionKey, WriteOwner,
 };
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::inventory::VersionEntry;
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use aruna_core::structs::storage::multipart::{
@@ -54,6 +63,7 @@ use aruna_core::structs::storage::multipart::{
     MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload,
     MultipartUploadStatus, WorkingShare,
 };
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::{PlainTarget, RoutingSnapshot};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -83,6 +93,8 @@ pub enum CompleteUploadState {
     ReserveCompose,
     ReadUploadParts,
     ReadGateBucket,
+    /// Reads a distributed bucket's record: only the key's coordinator completes, at its epoch.
+    ReadRecord,
     PolicyGate,
     ComposeBlob,
     StartFinalizeTransaction,
@@ -138,6 +150,8 @@ pub enum CompleteUploadState {
     WriteReplicationObligation,
     EnforceQuota,
     UpdateUsage,
+    /// Closes the upload in the inventory of a distributed bucket before a registered commit.
+    CloseInventory,
     CommitFinalizeTransaction,
     AbortFinalizeTransaction,
     ResetUploadTransaction,
@@ -161,6 +175,8 @@ pub enum CompleteUploadError {
     Unmapped,
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
     #[error(transparent)]
     BlobError(#[from] BlobError),
     #[error(transparent)]
@@ -225,6 +241,8 @@ pub enum CompleteUploadError {
     NotFinished,
     #[error(transparent)]
     BucketKey(#[from] BucketKeyError),
+    #[error("usage counters are being rebuilt; retry later")]
+    UsageRebuilding,
 }
 
 impl From<UploadTargetError> for CompleteUploadError {
@@ -318,6 +336,17 @@ pub struct CompleteUploadOperation {
     gated_bucket: Option<GatedBucket>,
     /// The bucket's compression when the gate read it; the composed object uses it.
     compression: Compression,
+    /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
+    set_hint: Option<SetHint>,
+    /// The bucket's distribution binding, whose inventory the finalize transaction maintains.
+    binding: Option<DistributionBinding>,
+    /// The head the finalize installs and the epoch of its version, for the inventory.
+    head_pointer: Option<CurrentVersionPointer>,
+    version_epoch: OriginalEpoch,
+    /// The coordinator authority the completion was routed under; finalize rechecks it.
+    authority: Option<WriteAuthority>,
+    /// The close-only inventory update of a completion that adopts a registered version.
+    close: Option<InventoryUpdate>,
     /// The reset that returns the record to `Open` has already been taken, so
     /// no later cleanup step may take it a second time.
     reset_done: bool,
@@ -394,6 +423,12 @@ impl CompleteUploadOperation {
             gate: None,
             gated_bucket: None,
             compression: Compression::Off,
+            set_hint: None,
+            binding: None,
+            head_pointer: None,
+            version_epoch: OriginalEpoch::default(),
+            authority: None,
+            close: None,
             reset_done: false,
             compose_share: None,
             selected_parts: HashMap::new(),
@@ -530,6 +565,8 @@ impl CompleteUploadOperation {
             return self.queue_cleanup_work(BlobCleanupWork::ReconcileReservation { location });
         };
         let (realm_id, ttl_ms) = (self.input.realm_id, self.rocrate_limits.holder_ttl_ms);
+        // Distributed buckets are found through their content indexes, not the DHT.
+        let announce = self.binding.is_none();
         // An in-place object is the only copy of its parts: a commit that did not land must
         // leave it to the upload, one that did to its version.
         let owner = match self.in_place_target(&location) {
@@ -538,11 +575,13 @@ impl CompleteUploadOperation {
                 blake3,
                 realm_id,
                 ttl_ms,
+                announce,
             },
             false => WriteOwner::Blob {
                 blake3,
                 realm_id,
                 ttl_ms,
+                announce,
             },
         };
         self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite { location, owner })
@@ -1014,6 +1053,10 @@ impl CompleteUploadOperation {
             .as_ref()
             .map(|bucket| bucket.compression)
             .unwrap_or_default();
+        self.binding = bucket
+            .as_ref()
+            .and_then(|bucket| bucket.distribution.clone());
+        self.set_hint = self.binding.as_ref().map(DistributionBinding::hint);
         let inherited = self
             .upload_record
             .as_ref()
@@ -1073,6 +1116,31 @@ impl CompleteUploadOperation {
     }
 
     fn compose_blob(&mut self) -> Effects {
+        match self.binding.as_ref() {
+            Some(binding) => {
+                self.state = CompleteUploadState::ReadRecord;
+                smallvec![record_read(binding)]
+            }
+            None => self.compose_upload(),
+        }
+    }
+
+    fn record_checked(&mut self, event: Event) -> Effects {
+        let Some(binding) = self.binding.as_ref() else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        // An upload opened before its range was fenced may still complete during the grace.
+        match record_completion(binding, &self.input.key, event) {
+            Ok(authority) => {
+                self.version_epoch = authority.epoch;
+                self.authority = Some(authority);
+                self.compose_upload()
+            }
+            Err(error) => self.schedule_error(error.into()),
+        }
+    }
+
+    fn compose_upload(&mut self) -> Effects {
         let Some(upload) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
@@ -1232,11 +1300,13 @@ impl CompleteUploadOperation {
         self.txn_id = Some(txn_id);
         (self.dedup, self.dedup_checked) = (None, false);
         self.state = CompleteUploadState::CheckPurgeFinalize;
-        smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
+        let authority = self.authority.as_ref();
+        smallvec![publication_read(&self.input.bucket, authority, self.txn_id)]
     }
 
     fn finalize_fence_checked(&mut self, event: Event) -> Effects {
-        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
+        let (bucket, key) = (&self.input.bucket, &self.input.key);
+        if let Err(error) = check_publication(event, bucket, key, self.authority.as_ref()) {
             return self.schedule_error(error.into());
         }
         // The version snapshots the default this transaction observes, not one
@@ -1554,7 +1624,10 @@ impl CompleteUploadOperation {
     }
 
     fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
-        let version_id = *self.version_id.get_or_insert_with(Ulid::generate);
+        let set_hint = self.set_hint;
+        let version_id = *self
+            .version_id
+            .get_or_insert_with(|| mint_version(set_hint));
         // An import may register a listed object's version before the finalize commits it; an
         // upload opened at a provider path stays one after its rule was removed.
         if self.plain.as_ref().is_some_and(|target| target.listed) || self.plain_upload().is_some()
@@ -1570,13 +1643,14 @@ impl CompleteUploadOperation {
         version_id: Ulid,
     ) -> Effects {
         let pointer = match CurrentVersionPointer::next_for(existing, version_id) {
-            Ok(pointer) => pointer,
+            Ok(pointer) => stamp_head(pointer, self.binding.as_ref(), self.version_epoch),
             Err(err) => return self.schedule_error(err.into()),
         };
         let alias_context = match self.alias_context() {
             Ok(context) => context,
             Err(err) => return self.schedule_error(err),
         };
+        self.head_pointer = Some(pointer.clone());
         let effect = match write_head_effect(&alias_context, pointer, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
@@ -1670,7 +1744,11 @@ impl CompleteUploadOperation {
                 None,
             ),
         }
-        .with_metadata(upload_record.metadata.clone());
+        .with_metadata(upload_record.metadata.clone())
+        .with_origin(Some(VersionOrigin::Upload {
+            node_id: self.input.node_id,
+            device: None,
+        }));
         // Union with what part copies inherited: a part-wise copy of a governed
         // source can only add refs to the composed object.
         let mut policies = self.bucket_policies.clone();
@@ -1680,7 +1758,15 @@ impl CompleteUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        let generation = self.head_pointer.as_ref().map_or(0, |head| head.generation);
+        let version = stamp_version(
+            version,
+            self.binding.as_ref(),
+            generation,
+            self.version_epoch,
+        );
         self.stored_policies = version.placement_policies.clone();
+        self.version_epoch = version.original_epoch;
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
@@ -1922,6 +2008,7 @@ impl CompleteUploadOperation {
                         blake3,
                         realm_id: self.input.realm_id,
                         ttl_ms: self.rocrate_limits.holder_ttl_ms,
+                        announce: self.binding.is_none(),
                     },
                 });
             }
@@ -1931,6 +2018,7 @@ impl CompleteUploadOperation {
             .as_ref()
             .and_then(|location| location.get_blake3())
             && self.composed_location.as_ref() != self.final_location.as_ref()
+            && self.binding.is_none()
             && let Ok(blake3) = blake3.try_into()
         {
             works.push(BlobCleanupWork::RegisterDht {
@@ -1986,11 +2074,33 @@ impl CompleteUploadOperation {
         self.write_obligation()
     }
 
+    fn commit_registered(&mut self, txn_id: TxnId) -> Effects {
+        self.state = CompleteUploadState::CommitFinalizeTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn handle_inventory_closed(&mut self, event: Event) -> Effects {
+        let (Some(txn_id), Some(close)) = (self.txn_id, self.close.as_mut()) else {
+            return self.schedule_error(CompleteUploadError::InvalidOperationState);
+        };
+        match close.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => self.commit_registered(txn_id),
+            Err(error) => self.schedule_error(UsageUpdateError::from(error).into()),
+        }
+    }
+
     fn write_obligation(&mut self) -> Effects {
         // A registered version keeps its obligation and charges; only the upload is cleared.
         if let (true, Some(txn_id)) = (self.registered, self.txn_id) {
-            self.state = CompleteUploadState::CommitFinalizeTransaction;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+            if let Some(binding) = self.binding.as_ref() {
+                let mut change = InventoryChange::new(binding.set_id, self.input.key.clone());
+                change.upload = Some((self.input.upload_id, false));
+                let close = self.close.insert(InventoryUpdate::new(change));
+                self.state = CompleteUploadState::CloseInventory;
+                return close.start(txn_id);
+            }
+            return self.commit_registered(txn_id);
         }
         let Some(version_id) = self.version_id else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
@@ -2014,6 +2124,32 @@ impl CompleteUploadOperation {
         };
         self.state = CompleteUploadState::WriteReplicationObligation;
         smallvec![effect]
+    }
+
+    /// The composed version, the head it becomes and the upload it closes.
+    fn inventory_change(&self, size: i128) -> Option<InventoryChange> {
+        // Without a hash the composed version is pending content.
+        let identity = self
+            .final_location
+            .as_ref()
+            .and_then(|location| location.get_blake3())
+            .and_then(|hash| <[u8; 32]>::try_from(hash).ok());
+        let added = AddedVersion {
+            version_id: self.version_id?,
+            epoch: self.version_epoch,
+            generation: self.head_pointer.as_ref().map_or(0, |head| head.generation),
+            entry: VersionEntry {
+                marker: false,
+                size: u64::try_from(size).unwrap_or_default(),
+                referenced: false,
+                identity,
+                pending: identity.is_none(),
+            },
+        };
+        let head = self.head_pointer.is_some();
+        let mut change = version_written(self.binding.as_ref(), &self.input.key, added, head)?;
+        change.upload = Some((self.input.upload_id, false));
+        Some(change)
     }
 
     fn obligation_written(&mut self, event: Event) -> Effects {
@@ -2047,9 +2183,11 @@ impl CompleteUploadOperation {
         let Some(stored) = stored else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
+        let inventory = self.inventory_change(size);
         self.usage_update = Some(
             UsageCounterUpdate::with_stored(group_id, group_delta, stored)
-                .in_bucket(&self.input.bucket, RowChange::AddedVersion),
+                .in_bucket(&self.input.bucket, RowChange::AddedVersion)
+                .with_inventory(inventory),
         );
 
         // Enforce the hard group quota before the counters commit. Only a positive
@@ -2096,7 +2234,9 @@ impl CompleteUploadOperation {
         match gate.step(event, txn_id) {
             Ok(Some(effects)) => effects,
             Ok(None) => {
-                if gate.is_exceeded() {
+                if gate.is_rebuilding() {
+                    self.schedule_error(CompleteUploadError::UsageRebuilding)
+                } else if gate.is_exceeded() {
                     let limit = gate.ceiling();
                     let usage = gate.projected_usage();
                     // schedule_error resets the upload back to Open and cleans up
@@ -2416,6 +2556,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::ReserveCompose => self.compose_reserved(event),
             CompleteUploadState::ReadUploadParts => self.upload_parts_read(event),
             CompleteUploadState::ReadGateBucket => self.handle_gate_bucket(event),
+            CompleteUploadState::ReadRecord => self.record_checked(event),
             CompleteUploadState::PolicyGate => self.handle_policy_gate(event),
             CompleteUploadState::ComposeBlob => self.handle_blob_composed(event),
             CompleteUploadState::StartFinalizeTransaction => self.finalize_started(event),
@@ -2460,6 +2601,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::WriteReplicationObligation => self.obligation_written(event),
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(event),
             CompleteUploadState::UpdateUsage => self.handle_usage_update(event),
+            CompleteUploadState::CloseInventory => self.handle_inventory_closed(event),
             CompleteUploadState::CommitFinalizeTransaction => self.handle_finalize_committed(event),
             CompleteUploadState::AbortFinalizeTransaction => self.abort_finalize(event),
             CompleteUploadState::ResetUploadTransaction => self.reset_started(event),
@@ -2741,6 +2883,7 @@ mod decision_tests {
             placement_policies: refs,
             placement_policy_generation: generation,
             compression: Compression::Off,
+            distribution: None,
         };
         info.to_bytes().expect("bucket encodes").into()
     }

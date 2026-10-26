@@ -191,7 +191,7 @@ impl Drop for SourceListener {
 async fn source_read_drift() {
     let source = SourceListener::bind(Some("\"v1\""), true).await;
 
-    let (_, mut stream) = read_staging_source(&test_guard(), &source.access(), None)
+    let (_, mut stream) = read_staging_source(&test_guard(), &source.access(), None, None)
         .await
         .unwrap();
 
@@ -208,7 +208,7 @@ async fn source_read_unpinned() {
     for etag in [None, Some("W/\"v1\"")] {
         let source = SourceListener::bind(etag, false).await;
 
-        let (_, stream) = read_staging_source(&test_guard(), &source.access(), None)
+        let (_, stream) = read_staging_source(&test_guard(), &source.access(), None, None)
             .await
             .unwrap();
         let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
@@ -224,7 +224,7 @@ async fn source_read_unpinned() {
 async fn source_read_range() {
     let source = SourceListener::bind(Some("\"v1\""), false).await;
 
-    let (_, stream) = read_staging_source(&test_guard(), &source.access(), Some(1..4))
+    let (_, stream) = read_staging_source(&test_guard(), &source.access(), Some(1..4), None)
         .await
         .unwrap();
     let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
@@ -233,6 +233,51 @@ async fn source_read_range() {
     let requests = source.requests.lock().await;
     assert!(requests[1].contains("if-match: \"v1\""));
     assert!(requests[1].contains("range: bytes=1-3"));
+}
+
+fn recorded(etag: &str) -> SourceMetadata {
+    SourceMetadata {
+        content_length: 5,
+        content_type: None,
+        etag: Some(etag.to_string()),
+        last_modified: None,
+        source_version: None,
+        digests: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn bound_read_direct() {
+    let source = SourceListener::bind(Some("\"v2\""), false).await;
+    let expected = recorded("\"v1\"");
+
+    let (metadata, stream) =
+        read_staging_source(&test_guard(), &source.access(), Some(1..4), Some(&expected))
+            .await
+            .unwrap();
+    let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
+
+    assert_eq!(chunks.concat(), b"ell");
+    assert_eq!(metadata, expected);
+    let requests = source.requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("get "));
+    assert!(requests[0].contains("if-match: \"v1\""));
+}
+
+#[tokio::test]
+async fn bound_read_changed() {
+    let source = SourceListener::bind(Some("\"v2\""), true).await;
+
+    let result = read_staging_source(
+        &test_guard(),
+        &source.access(),
+        None,
+        Some(&recorded("\"v1\"")),
+    )
+    .await;
+
+    assert!(matches!(result, Err(StagingSourceError::ConditionFailed)));
 }
 
 #[tokio::test]
@@ -671,19 +716,24 @@ async fn list_applies_limit() {
     )
     .unwrap();
 
-    let (entries, truncated) = list_operator(&operator, "prefix/", 0, 1, false, false)
-        .await
-        .unwrap();
+    let mut request = list_request(1, false, false);
+    let (entries, cursor) = list_operator(&operator, "prefix/", &request).await.unwrap();
 
     assert_eq!(entries.len(), 1);
     assert!(entries[0].path.starts_with("prefix/"));
-    assert!(truncated);
+    assert_eq!(cursor, Some(ListCursor::Offset(1)));
 
-    let (entries, truncated) = list_operator(&operator, "prefix/", 1, 1, false, false)
-        .await
-        .unwrap();
+    request.cursor = cursor;
+    let (entries, cursor) = list_operator(&operator, "prefix/", &request).await.unwrap();
     assert_eq!(entries.len(), 1);
-    assert!(!truncated);
+    assert_eq!(cursor, None);
+
+    request.cursor = Some(ListCursor::After("prefix/a.txt".to_string()));
+    let refused = list_operator(&operator, "prefix/", &request).await;
+    assert!(matches!(
+        refused,
+        Err(StagingSourceError::InvalidListing(_))
+    ));
 }
 
 #[tokio::test]
@@ -701,13 +751,13 @@ async fn list_filters_directories() {
     )
     .unwrap();
 
-    let (entries, truncated) = list_operator(&operator, "prefix/", 0, 10, true, true)
+    let (entries, cursor) = list_operator(&operator, "prefix/", &list_request(10, true, true))
         .await
         .unwrap();
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path, "prefix/nested/file.txt");
-    assert!(!truncated);
+    assert_eq!(cursor, None);
 }
 
 #[tokio::test]
@@ -728,7 +778,7 @@ async fn recursive_list_truncates() {
     )
     .unwrap();
 
-    let (entries, truncated) = list_operator(&operator, "prefix/", 0, 1, true, true)
+    let (entries, cursor) = list_operator(&operator, "prefix/", &list_request(1, true, true))
         .await
         .unwrap();
 
@@ -738,7 +788,346 @@ async fn recursive_list_truncates() {
         entries[0].kind,
         aruna_core::structs::execution::source_access::SourceEntryKind::File
     );
-    assert!(truncated);
+    assert_eq!(cursor, Some(ListCursor::Offset(1)));
+}
+
+// A source without a provider cursor is walked from its start, so a page that reads too many
+// entries, directories included, fails instead of walking on.
+#[tokio::test]
+async fn fallback_walk_bounded() {
+    let dir = tempdir().unwrap();
+    for nested in ["prefix/a/b/c", "prefix/d/e"] {
+        tokio::fs::create_dir_all(dir.path().join(nested))
+            .await
+            .unwrap();
+    }
+    tokio::fs::write(dir.path().join("prefix/z.txt"), b"z")
+        .await
+        .unwrap();
+    let operator = build_service::<services::Fs>(
+        HashMap::from([("root".to_string(), dir.path().to_str().unwrap().to_string())]),
+        None,
+    )
+    .unwrap();
+    let request = list_request(1, true, true);
+
+    let refused = list_skipping(&operator, "prefix/", &request, (0, 3)).await;
+    assert!(matches!(
+        refused,
+        Err(StagingSourceError::InvalidListing(_))
+    ));
+    let (entries, _) = list_skipping(&operator, "prefix/", &request, (0, 100))
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "prefix/z.txt");
+}
+
+fn list_request(limit: usize, recursive: bool, files_only: bool) -> ListRequest {
+    ListRequest {
+        limit,
+        recursive,
+        files_only,
+        ..Default::default()
+    }
+}
+
+/// A ListObjectsV2 endpoint over fixed keys that counts its list requests.
+struct ListingServer {
+    endpoint: String,
+    lists: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ListingServer {
+    async fn bind(keys: &'static [&'static str]) -> Self {
+        Self::bind_with(keys, false).await
+    }
+
+    /// `short` answers one entry less than asked for on every truncated page.
+    async fn bind_with(keys: &'static [&'static str], short: bool) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let lists = Arc::new(AtomicUsize::new(0));
+        let counted = lists.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                let target = request.split(' ').nth(1).unwrap_or("/").to_string();
+                let url = reqwest::Url::parse(&format!("http://local{target}")).unwrap();
+                let response = if request.starts_with("HEAD ") {
+                    let key = url.path().trim_start_matches("/bucket/");
+                    match keys.contains(&key) {
+                        true => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"{}\"\r\nConnection: close\r\n\r\n",
+                            key_etag(key)
+                        ),
+                        false => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    }
+                } else {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let body = list_body(keys, &url, short);
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        Self {
+            endpoint,
+            lists,
+            task,
+        }
+    }
+
+    fn operator(&self) -> Operator {
+        build_service::<services::S3>(
+            s3_operator_config(HashMap::from([
+                ("bucket".to_string(), "bucket".to_string()),
+                ("endpoint".to_string(), self.endpoint.clone()),
+                ("region".to_string(), "us-east-1".to_string()),
+                ("skip_signature".to_string(), "true".to_string()),
+            ])),
+            None,
+        )
+        .unwrap()
+    }
+}
+
+impl Drop for ListingServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn key_etag(key: &str) -> String {
+    format!("{:x}", md5::compute(key))
+}
+
+fn list_body(keys: &[&str], url: &reqwest::Url, short: bool) -> String {
+    let query = |name: &str| {
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.to_string())
+            .unwrap_or_default()
+    };
+    let (prefix, after) = (query("prefix"), query("start-after"));
+    let (token, delimiter) = (query("continuation-token"), query("delimiter"));
+    let max_keys = query("max-keys").parse::<usize>().unwrap_or(1000);
+    let floor = after.max(token);
+    // Keys below a delimiter roll up into one common prefix, as S3 does.
+    let mut items: Vec<(String, bool)> = Vec::new();
+    for key in keys.iter().filter(|key| key.starts_with(&prefix)) {
+        let rest = &key[prefix.len()..];
+        let item = match rest
+            .find(delimiter.as_str())
+            .filter(|_| !delimiter.is_empty())
+        {
+            Some(end) => (format!("{prefix}{}", &rest[..=end]), true),
+            None => (key.to_string(), false),
+        };
+        if item.0 > floor && items.last() != Some(&item) {
+            items.push(item);
+        }
+    }
+    let size = match (items.len() > max_keys, short) {
+        (true, true) => max_keys - 1,
+        _ => max_keys.min(items.len()),
+    };
+    let page = &items[..size];
+    let truncated = size < items.len();
+    let mut body = format!("<ListBucketResult><IsTruncated>{truncated}</IsTruncated>");
+    if truncated && let Some((last, _)) = page.last() {
+        body.push_str(&format!(
+            "<NextContinuationToken>{last}</NextContinuationToken>"
+        ));
+    }
+    for (item, _) in page.iter().filter(|(_, rolled)| *rolled) {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{item}</Prefix></CommonPrefixes>"
+        ));
+    }
+    for (key, _) in page.iter().filter(|(_, rolled)| !*rolled) {
+        body.push_str(&format!(
+            "<Contents><Key>{key}</Key><LastModified>2026-01-02T03:04:05.678Z</LastModified>\
+             <ETag>&quot;{}&quot;</ETag><Size>3</Size></Contents>",
+            key_etag(key)
+        ));
+    }
+    body.push_str("</ListBucketResult>");
+    body
+}
+
+/// Every page of a listing, as entry paths.
+async fn all_pages(operator: &Operator, path: &str, mut request: ListRequest) -> Vec<Vec<String>> {
+    let mut pages = Vec::new();
+    loop {
+        let (entries, cursor) = list_operator(operator, path, &request).await.unwrap();
+        pages.push(entries.into_iter().map(|entry| entry.path).collect());
+        match cursor {
+            Some(cursor) => request.cursor = Some(cursor),
+            None => return pages,
+        }
+    }
+}
+
+// One level is read as flat keys, so short provider pages cannot hide files behind directories
+// and a directory spanning pages is listed once.
+#[tokio::test]
+async fn browse_keeps_files() {
+    const KEYS: &[&str] = &["d/a.txt", "d/b/1", "d/c.txt", "d/f.txt", "d/x/1"];
+    let server = ListingServer::bind_with(KEYS, true).await;
+
+    let pages = all_pages(&server.operator(), "d/", list_request(4, false, false)).await;
+
+    assert_eq!(
+        pages,
+        [vec!["d/a.txt", "d/b", "d/c.txt", "d/f.txt"], vec!["d/x"]]
+    );
+
+    const NESTED: &[&str] = &["d/b/1", "d/b/2", "d/b/3"];
+    let server = ListingServer::bind_with(NESTED, true).await;
+    let pages = all_pages(&server.operator(), "d/", list_request(2, false, false)).await;
+    assert_eq!(pages, [vec!["d/b"]]);
+}
+
+// A directory's subtree is skipped with one seek, so the files after it come at once.
+#[tokio::test]
+async fn browse_skips_subtrees() {
+    const KEYS: &[&str] = &[
+        "d/a/1", "d/a/2", "d/a/3", "d/a/4", "d/a/5", "d/a/6", "d/b.txt", "d/c/1", "d/z.txt",
+    ];
+    let server = ListingServer::bind(KEYS).await;
+
+    let pages = all_pages(&server.operator(), "d/", list_request(3, false, false)).await;
+
+    assert_eq!(pages, [vec!["d/a", "d/b.txt", "d/c"], vec!["d/z.txt"]]);
+    // The first request, one seek past `a/` and the second page; `c/` ends the first page.
+    assert_eq!(server.lists.load(Ordering::SeqCst), 3);
+}
+
+// A seek lands on the first key after the subtree: keys sorting after any sentinel stay
+// skipped, and a sibling named like the successor itself is still listed.
+#[tokio::test]
+async fn browse_seeks_successor() {
+    const KEYS: &[&str] = &["d/a/1", "d/a/\u{10FFFF}0001", "d/a0", "d/a1/x", "d/b"];
+    let server = ListingServer::bind(KEYS).await;
+
+    let pages = all_pages(&server.operator(), "d/", list_request(2, false, false)).await;
+
+    assert_eq!(
+        pages,
+        [vec!["d/a", "d/a0"], vec!["d/a1", "d/b"], Vec::<&str>::new()]
+    );
+    assert_eq!(subtree_successor("d/a/"), "d/a0");
+}
+
+// A full page defers the successor probe after a directory to the next page, which starts at
+// the successor, so a page never exceeds its limit and the successor is not lost.
+#[tokio::test]
+async fn deferred_successor_probe() {
+    const KEYS: &[&str] = &["d/a/1", "d/a0", "d/b"];
+    let server = ListingServer::bind(KEYS).await;
+
+    let pages = all_pages(&server.operator(), "d/", list_request(1, false, false)).await;
+
+    assert_eq!(pages, [vec!["d/a"], vec!["d/a0"], vec!["d/b"], vec![]]);
+    let (_, cursor) = list_operator(&server.operator(), "d/", &list_request(1, false, false))
+        .await
+        .unwrap();
+    assert_eq!(cursor, Some(ListCursor::At("d/a0".to_string())));
+}
+
+// The probed lower key takes one entry of the page, so a page never exceeds its limit.
+#[tokio::test]
+async fn probe_counts_once() {
+    let server = ListingServer::bind(LISTED_KEYS).await;
+    let lower = ListRequest {
+        lower: Some("a/2".to_string()),
+        ..list_request(2, true, true)
+    };
+
+    let pages = all_pages(&server.operator(), "a/", lower.clone()).await;
+    assert_eq!(pages, [vec!["a/2", "a/3"], vec!["a/4", "a/5"], vec![]]);
+    let (entries, cursor) =
+        list_operator(&server.operator(), "a/", &ListRequest { limit: 1, ..lower })
+            .await
+            .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(cursor, Some(ListCursor::After("a/2".to_string())));
+}
+
+const LISTED_KEYS: &[&str] = &["a/1", "a/2", "a/3", "a/4", "a/5", "b/1"];
+
+#[tokio::test]
+async fn list_resumes_after() {
+    let server = ListingServer::bind(LISTED_KEYS).await;
+    let operator = server.operator();
+    let mut request = list_request(2, true, true);
+    let mut pages = Vec::new();
+    loop {
+        let (entries, cursor) = list_operator(&operator, "a/", &request).await.unwrap();
+        pages.push(
+            entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+        );
+        if let Some(entry) = entries.first() {
+            assert_eq!(
+                entry.etag.as_deref(),
+                Some(format!("\"{}\"", key_etag(&entry.path)).as_str())
+            );
+            assert_eq!(entry.size, Some(3));
+        }
+        match cursor {
+            Some(cursor) => request.cursor = Some(cursor),
+            None => break,
+        }
+    }
+
+    assert_eq!(pages, [vec!["a/1", "a/2"], vec!["a/3", "a/4"], vec!["a/5"]]);
+    // One provider request per page: a full page never fetches the next one ahead.
+    assert_eq!(server.lists.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn list_keeps_bounds() {
+    let server = ListingServer::bind(LISTED_KEYS).await;
+    let request = ListRequest {
+        lower: Some("a/2".to_string()),
+        stop: Some("a/4".to_string()),
+        ..list_request(10, true, true)
+    };
+
+    let (entries, cursor) = list_operator(&server.operator(), "a/", &request)
+        .await
+        .unwrap();
+
+    let paths: Vec<_> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    assert_eq!(paths, ["a/2", "a/3"]);
+    assert_eq!(cursor, None);
+
+    let flat = ListRequest {
+        recursive: false,
+        ..request
+    };
+    let refused = list_operator(&server.operator(), "a/", &flat).await;
+    assert!(matches!(
+        refused,
+        Err(StagingSourceError::InvalidListing(_))
+    ));
 }
 
 #[test]
@@ -771,4 +1160,35 @@ fn native_signs_alike() {
         native.region().as_deref(),
         config.get("region").map(String::as_str)
     );
+}
+
+// Local listings re-walk from the start as well, so they are capped like remote ones.
+#[tokio::test]
+async fn local_skip_capped() {
+    use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_ROOT;
+    let dir = tempdir().unwrap();
+    tokio::fs::write(dir.path().join("a.txt"), b"a")
+        .await
+        .unwrap();
+    let access = ResolvedSourceAccess::OpenDal {
+        kind: SourceConnectorKind::LocalDirectory,
+        config: HashMap::from([(
+            OFFERED_DIRECTORY_ROOT.to_string(),
+            dir.path().to_str().unwrap().to_string(),
+        )]),
+        path: String::new(),
+        version: None,
+    };
+    let mut request = list_request(10, true, true);
+
+    let (entries, _) = list_staging_source(&test_guard(), &access, &request)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    request.cursor = Some(ListCursor::Offset(FALLBACK_SKIP_LIMIT as u64 + 1));
+    let refused = list_staging_source(&test_guard(), &access, &request).await;
+    assert!(matches!(
+        refused,
+        Err(StagingSourceError::InvalidListing(_))
+    ));
 }

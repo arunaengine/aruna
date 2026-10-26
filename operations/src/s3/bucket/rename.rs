@@ -395,8 +395,15 @@ impl RenameKeysOperation {
             return self.conflict(JOB_CHANGED);
         }
         match bucket.as_deref().map(BucketInfo::from_bytes).transpose() {
-            Ok(Some(info)) if info.group_id == self.input.group_id => {}
-            Ok(_) => return self.fail(RenameError::NotFound),
+            Ok(Some(info)) if info.group_id != self.input.group_id => {
+                return self.fail(RenameError::NotFound);
+            }
+            // Its inventory and replicas name every key, so keys move only as new writes.
+            Ok(Some(info)) if info.distribution.is_some() => {
+                return self.conflict("keys of a distributed bucket cannot be renamed in place");
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return self.fail(RenameError::NotFound),
             Err(error) => return self.fail(error.into()),
         }
         if encryption.is_some() {

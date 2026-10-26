@@ -14,6 +14,8 @@ use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 pub mod access;
 pub mod assistant;
 pub mod audit;
+pub mod database_types;
+pub mod databases;
 pub mod device;
 pub mod drs;
 pub mod execution;
@@ -66,13 +68,18 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::encryption::router())
         .merge(storage::abe::router())
         .merge(storage::bucket::keys::router())
+        .merge(databases::router())
         .merge(drs::router())
         .merge(staging::router())
         .merge(storage::deletion::router())
         .merge(storage::group_backends::router())
         .merge(storage::imports::router())
         .merge(storage::discovery::router())
+        .merge(storage::distributed::router())
+        .merge(storage::text::router())
+        .merge(storage::objects::router())
         .merge(storage::organize::router())
+        .merge(storage::origin::router())
         .merge(storage::routing::router())
         .merge(sync::router())
         .merge(sync::quarantine::router())
@@ -259,6 +266,21 @@ pub(crate) mod tests {
         ("GET", "/data/blobs/envelope"),
         ("GET", "/data/blobs/content"),
         ("GET", "/data/blobs/locations"),
+        ("GET", "/data/buckets/{bucket}/distribution"),
+        ("GET", "/data/buckets/{bucket}/links"),
+        ("GET", "/data/buckets/{bucket}/objects"),
+        ("GET", "/data/buckets/{bucket}/objects/origin"),
+        ("GET", "/data/buckets/{bucket}/objects/part-of"),
+        ("GET", "/data/buckets/{bucket}/sources"),
+        ("GET", "/data/databases"),
+        ("POST", "/system/realm/databases"),
+        ("DELETE", "/system/realm/databases/{entry_id}"),
+        ("GET", "/system/realm/databases/requests"),
+        (
+            "POST",
+            "/system/realm/databases/requests/{request_id}/approve",
+        ),
+        ("DELETE", "/system/realm/databases/requests/{request_id}"),
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),
@@ -288,6 +310,7 @@ pub(crate) mod tests {
         ("GET", "/ga4gh/drs/v1/download"),
         ("GET", "/ga4gh/drs/v1/objects/{*object_id}"),
         ("GET", "/ga4gh/drs/v1/service-info"),
+        ("GET", "/resolve/{*id}"),
         ("GET", "/ga4gh/tes/v1/service-info"),
         ("GET", "/ga4gh/tes/v1/tasks"),
         ("GET", "/ga4gh/tes/v1/tasks/{id}"),
@@ -334,6 +357,10 @@ pub(crate) mod tests {
             "/data/groups/{group_id}/storage/backends/{backend_id}/buckets/{bucket}",
         ),
         ("GET", "/data/groups/{group_id}/storage/buckets"),
+        (
+            "GET",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}",
+        ),
         ("GET", "/data/groups/{group_id}/storage/routing"),
         ("GET", "/data/groups/{group_id}/storage/imports"),
         ("GET", "/data/groups/{group_id}/storage/imports/{import_id}"),
@@ -378,6 +405,8 @@ pub(crate) mod tests {
         ("GET", "/compute/jobs/{job_id}/session/scratch"),
         ("GET", "/compute/jobs/{job_id}/session/scratch/read"),
         ("GET", "/metadata"),
+        ("GET", "/metadata/links"),
+        ("GET", "/metadata/links/target"),
         ("GET", "/metadata/profile/validation/capabilities"),
         ("GET", "/metadata/references"),
         ("GET", "/metadata/search"),
@@ -434,6 +463,7 @@ pub(crate) mod tests {
         ("POST", "/data/sync/quarantine/{record_id}/acknowledge"),
         ("POST", "/data/blobs/replicate"),
         ("POST", "/data/buckets/{bucket}/placement/objects"),
+        ("POST", "/data/buckets/{bucket}/objects/text"),
         ("POST", "/data/buckets/{bucket}/placement/runs"),
         ("POST", "/data/sync/relationships"),
         ("POST", "/data/sync/relationships/{id}/run"),
@@ -455,6 +485,11 @@ pub(crate) mod tests {
         ("POST", "/access/groups"),
         ("POST", "/data/groups/{group_id}/connectors"),
         ("POST", "/data/groups/{group_id}/connectors/check"),
+        ("POST", "/data/groups/{group_id}/distributed-buckets"),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/admission",
+        ),
         (
             "POST",
             "/data/groups/{group_id}/connectors/{connector_id}/check",
@@ -638,6 +673,26 @@ pub(crate) mod tests {
         ),
         ("PUT", "/access/policies/group/{group_id}"),
         ("PUT", "/access/policies/realm"),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/members",
+        ),
+        (
+            "DELETE",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/members/{member_id}",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/transfers",
+        ),
+        (
+            "PUT",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/settings",
+        ),
+        (
+            "DELETE",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}",
+        ),
     ];
 
     /// Documented path to the runtime template that serves it. Catch-all ids
@@ -647,6 +702,7 @@ pub(crate) mod tests {
             "/ga4gh/drs/v1/objects/{object_id}",
             "/ga4gh/drs/v1/objects/{*object_id}",
         ),
+        ("/resolve/{id}", "/resolve/{*id}"),
         (
             "/ga4gh/tes/v1/tasks/{id}:cancel",
             "/ga4gh/tes/v1/tasks/{id}",

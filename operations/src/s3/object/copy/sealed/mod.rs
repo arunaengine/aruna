@@ -9,6 +9,10 @@ use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_eff
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
 };
+use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
+use crate::distribution::inventory::{
+    AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
+};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
@@ -17,7 +21,7 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::purge_fence::{PurgeFenceError, check_publication, publication_read};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -38,7 +42,12 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
     CopyOrigin, CopyOwner, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::hint::with_hint;
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -68,6 +77,8 @@ pub enum SealedCopyError {
     #[error(transparent)]
     PolicyGate(#[from] PolicyGateError),
     #[error(transparent)]
+    Distribution(#[from] GuardError),
+    #[error(transparent)]
     ManagedCopy(#[from] ManagedCopyError),
     #[error(transparent)]
     Policy(#[from] PlacementPolicyError),
@@ -77,6 +88,8 @@ pub enum SealedCopyError {
     InvalidState,
     #[error("operation did not finish")]
     NotFinished,
+    #[error("usage counters are being rebuilt; retry later")]
+    UsageRebuilding,
 }
 
 /// One same-bucket copy of a sealed version, described by what HEAD returned for it.
@@ -111,6 +124,7 @@ enum Step {
     Init,
     ReadBucket,
     Gate,
+    Record,
     ReadAbe,
     ReadEnvelope,
     CreateEnvelope,
@@ -150,6 +164,13 @@ pub struct SealedCopyOperation {
     version_id: Ulid,
     version: Option<BlobVersion>,
     existing: Option<CurrentVersionPointer>,
+    /// The bucket's distribution binding and the head the copy installs, for the inventory.
+    binding: Option<DistributionBinding>,
+    /// The coordinator epoch the copy's version carries in a distributed bucket.
+    epoch: aruna_core::structs::storage::distribution::OriginalEpoch,
+    /// The coordinator authority the copy was routed under; its transaction rechecks it.
+    authority: Option<WriteAuthority>,
+    head: Option<CurrentVersionPointer>,
     was_live: bool,
     /// Offered directory bytes the replaced head stops charging.
     released_bytes: u64,
@@ -178,6 +199,10 @@ impl SealedCopyOperation {
             version_id: Ulid::generate(),
             version: None,
             existing: None,
+            binding: None,
+            epoch: Default::default(),
+            authority: None,
+            head: None,
             was_live: false,
             released_bytes: 0,
             quota: None,
@@ -208,6 +233,12 @@ impl SealedCopyOperation {
         let bucket = value
             .map(|value| BucketInfo::from_bytes(value.as_ref()))
             .transpose()?;
+        self.binding = bucket
+            .as_ref()
+            .and_then(|bucket| bucket.distribution.clone());
+        if let Some(binding) = self.binding.as_ref() {
+            self.version_id = with_hint(self.version_id, binding.hint());
+        }
         let observed = GatedBucket::observe(bucket.as_ref());
         self.refs = union_refs(&observed.policies, &self.input.source_policies)?;
         let governed = !self.refs.is_empty();
@@ -244,6 +275,27 @@ impl SealedCopyOperation {
         self.read_abe()
     }
 
+    /// The copy names its exact source version: by global id in a distributed bucket.
+    fn copy_origin(&self) -> Option<VersionOrigin> {
+        let from = match self.binding {
+            Some(_) => OriginVersion::Global(GlobalId::Version {
+                realm_id: self.input.realm_id,
+                version_id: self.input.source_version_id,
+            }),
+            None => OriginVersion::Node(
+                VersionedObjectArn::new(
+                    self.input.realm_id,
+                    self.input.node_id,
+                    &self.input.bucket,
+                    &self.input.source_key,
+                    self.input.source_version_id,
+                )
+                .ok()?,
+            ),
+        };
+        Some(VersionOrigin::Copy { from })
+    }
+
     fn source_version(&self) -> VersionKey {
         VersionKey::new(
             &self.input.bucket,
@@ -253,7 +305,26 @@ impl SealedCopyOperation {
     }
 
     /// Reads the source's envelope or pending copy row and the admitted parameters and epoch.
+    /// Only the coordinator of the destination key's range writes the copy.
     fn read_abe(&mut self) -> Result<Effects, SealedCopyError> {
+        match self.binding.as_ref() {
+            Some(binding) => {
+                self.step = Step::Record;
+                Ok(smallvec![record_read(binding)])
+            }
+            None => self.read_abe_rows(),
+        }
+    }
+
+    fn record_checked(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
+        let binding = self.binding.as_ref().ok_or(SealedCopyError::InvalidState)?;
+        let authority = record_authority(binding, &self.input.dest_key, event)?;
+        self.epoch = authority.epoch;
+        self.authority = Some(authority);
+        self.read_abe_rows()
+    }
+
+    fn read_abe_rows(&mut self) -> Result<Effects, SealedCopyError> {
         let Some(key) = self.input.location.format.bucket_key() else {
             return Ok(self.begin());
         };
@@ -467,6 +538,7 @@ impl SealedCopyOperation {
         self.version = Some(
             version
                 .with_metadata(metadata)
+                .with_origin(self.copy_origin())
                 .with_policies(self.refs.clone())?,
         );
         self.existing = head
@@ -500,6 +572,8 @@ impl SealedCopyOperation {
 
     fn write_head(&mut self) -> Result<Effects, SealedCopyError> {
         let pointer = CurrentVersionPointer::next_for(self.existing.as_ref(), self.version_id)?;
+        let pointer = stamp_head(pointer, self.binding.as_ref(), self.epoch);
+        self.head = Some(pointer.clone());
         self.step = Step::WriteHead;
         Ok(smallvec![write_head_effect(
             &self.alias_context(),
@@ -525,8 +599,11 @@ impl SealedCopyOperation {
     }
 
     fn write_version(&mut self) -> Result<Effects, SealedCopyError> {
-        let version = self.version.as_ref().ok_or(SealedCopyError::InvalidState)?;
-        let effect = write_version_effect(&self.dest_version(), version, self.txn_id)?;
+        let version = self.version.take().ok_or(SealedCopyError::InvalidState)?;
+        let generation = self.head.as_ref().map_or(0, |head| head.generation);
+        let version = stamp_version(version, self.binding.as_ref(), generation, self.epoch);
+        let effect = write_version_effect(&self.dest_version(), &version, self.txn_id)?;
+        self.version = Some(version);
         self.step = Step::WriteVersion;
         Ok(smallvec![effect])
     }
@@ -663,7 +740,8 @@ impl SealedCopyOperation {
             ..Default::default()
         };
         let usage = UsageCounterUpdate::for_group(self.input.group_id, delta);
-        self.usage = Some(usage.in_bucket(&self.input.bucket, RowChange::AddedVersion));
+        let usage = usage.in_bucket(&self.input.bucket, RowChange::AddedVersion);
+        self.usage = Some(usage.with_inventory(self.inventory_change()));
         match self.input.quota_ceiling.filter(|_| added > 0) {
             Some(ceiling) => {
                 let mut gate = QuotaGate::new_for_realm(
@@ -682,11 +760,26 @@ impl SealedCopyOperation {
         }
     }
 
+    /// The copied version and the head it becomes in a distributed bucket.
+    fn inventory_change(&self) -> Option<InventoryChange> {
+        let (version, head) = (self.version.as_ref()?, self.head.as_ref()?);
+        let added = AddedVersion {
+            version_id: self.version_id,
+            epoch: version.original_epoch,
+            generation: head.generation,
+            entry: entry_of(version, self.input.size),
+        };
+        version_written(self.binding.as_ref(), &self.input.dest_key, added, true)
+    }
+
     fn quota_step(&mut self, event: Event) -> Result<Effects, SealedCopyError> {
         let txn_id = self.txn()?;
         let gate = self.quota.as_mut().ok_or(SealedCopyError::InvalidState)?;
         if let Some(effects) = gate.step(event, txn_id)? {
             return Ok(effects);
+        }
+        if gate.is_rebuilding() {
+            return Err(SealedCopyError::UsageRebuilding);
         }
         if gate.is_exceeded() {
             let (limit, usage) = (gate.ceiling(), gate.projected_usage());
@@ -728,15 +821,22 @@ impl SealedCopyOperation {
             (Step::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
                 self.txn_id = Some(txn_id);
                 self.step = Step::Fence;
-                Ok(smallvec![write_fence_read(&self.input.bucket, self.txn_id)])
+                let authority = self.authority.as_ref();
+                Ok(smallvec![publication_read(
+                    &self.input.bucket,
+                    authority,
+                    self.txn_id
+                )])
             }
             (Step::ReadBucket, event) => self.bucket_read(event),
             (Step::Gate, event) => self.gate_step(event),
+            (Step::Record, event) => self.record_checked(event),
             (Step::ReadAbe, event) => self.abe_read(event),
             (Step::ReadEnvelope, event) => self.envelope_read(event),
             (Step::CreateEnvelope, event) => self.envelope_created(event),
             (Step::Fence, event) => {
-                check_write_fence(event, &self.input.bucket, &self.input.dest_key)?;
+                let (bucket, key) = (&self.input.bucket, &self.input.dest_key);
+                check_publication(event, bucket, key, self.authority.as_ref())?;
                 self.step = Step::Drift;
                 Ok(smallvec![drift_reads(&self.input.bucket, self.txn_id)])
             }

@@ -2,15 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::node::usage_stats::count_upload;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::write_cleanup::{WriteCleanup, delete_records_effect};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_CLEANUP_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+};
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::blob::BlobCleanupWork;
+use aruna_core::structs::storage::blob::{BlobCleanupWork, BucketInfo};
 use aruna_core::structs::storage::multipart::{
     MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
 };
@@ -31,7 +34,10 @@ pub enum AbortUploadState {
     StartDeleteTransaction,
     /// Reads the record in the delete transaction, so only the delete that finds it counts.
     ReadUploadRecord,
+    /// Reads the bucket's distribution binding, whose upload inventory the delete closes.
+    ReadBinding,
     CountUpload,
+    CountInventory,
     DeleteUploadRecords,
     WriteCleanupRecords,
     CommitDeleteTransaction,
@@ -68,6 +74,8 @@ pub enum AbortUploadError {
     BlobError(#[from] BlobError),
     #[error("operation did not finish")]
     NotFinished,
+    #[error(transparent)]
+    Inventory(#[from] InventoryError),
 }
 
 impl From<UploadTargetError> for AbortUploadError {
@@ -100,6 +108,7 @@ pub struct AbortUploadOperation {
     skip_status_check: bool,
     resume_abort: bool,
     cleanup: WriteCleanup<AbortUploadError>,
+    inventory: Option<InventoryUpdate>,
     output: Option<Result<(), AbortUploadError>>,
 }
 
@@ -115,6 +124,7 @@ impl AbortUploadOperation {
             skip_status_check: false,
             resume_abort: false,
             cleanup: WriteCleanup::default(),
+            inventory: None,
             output: None,
         }
     }
@@ -337,15 +347,70 @@ impl AbortUploadOperation {
         if value.is_none() {
             return self.delete_records();
         }
+        self.state = AbortUploadState::ReadBinding;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.input.bucket.as_bytes().into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn binding_read(&mut self, event: Event) -> Effects {
+        let value = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            Event::Storage(StorageEvent::Error { error }) => {
+                return self.schedule_error(error.into());
+            }
+            _ => return self.schedule_error(AbortUploadError::InvalidOperationState),
+        };
+        let Some(txn_id) = self.txn_id else {
+            return self.schedule_error(AbortUploadError::NoTransactionFound);
+        };
+        let bucket = match value
+            .map(|value| BucketInfo::from_bytes(&value))
+            .transpose()
+        {
+            Ok(bucket) => bucket,
+            Err(error) => return self.schedule_error(error.into()),
+        };
+        self.inventory = bucket
+            .and_then(|bucket| bucket.distribution)
+            .map(|binding| {
+                let mut change = InventoryChange::new(binding.set_id, self.input.key.clone());
+                change.upload = Some((self.input.upload_id, false));
+                InventoryUpdate::new(change)
+            });
         self.state = AbortUploadState::CountUpload;
         smallvec![count_upload(&self.input.bucket, -1, txn_id)]
     }
 
     fn upload_counted(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.schedule_error(AbortUploadError::NoTransactionFound);
+        };
         match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.delete_records(),
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                match self.inventory.as_mut() {
+                    Some(inventory) => {
+                        self.state = AbortUploadState::CountInventory;
+                        inventory.start(txn_id)
+                    }
+                    None => self.delete_records(),
+                }
+            }
             Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
             _ => self.schedule_error(AbortUploadError::InvalidOperationState),
+        }
+    }
+
+    fn inventory_counted(&mut self, event: Event) -> Effects {
+        let (Some(txn_id), Some(inventory)) = (self.txn_id, self.inventory.as_mut()) else {
+            return self.schedule_error(AbortUploadError::InvalidOperationState);
+        };
+        match inventory.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => self.delete_records(),
+            Err(error) => self.schedule_error(error.into()),
         }
     }
 
@@ -520,7 +585,9 @@ impl Operation for AbortUploadOperation {
             AbortUploadState::ReadUploadParts => self.upload_parts_read(event),
             AbortUploadState::StartDeleteTransaction => self.delete_started(event),
             AbortUploadState::ReadUploadRecord => self.upload_record_read(event),
+            AbortUploadState::ReadBinding => self.binding_read(event),
             AbortUploadState::CountUpload => self.upload_counted(event),
+            AbortUploadState::CountInventory => self.inventory_counted(event),
             AbortUploadState::DeleteUploadRecords => self.records_deleted(event),
             AbortUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
             AbortUploadState::CommitDeleteTransaction => self.handle_delete_committed(event),
@@ -797,6 +864,15 @@ mod pure_tests {
                 value,
             }));
             if found {
+                let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
+                else {
+                    panic!("expected the binding read, got {effects:?}")
+                };
+                assert_eq!(key_space, S3_BUCKET_KEYSPACE);
+                effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+                    key: Vec::new().into(),
+                    value: None,
+                }));
                 let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice()
                 else {
                     panic!("expected the upload count, got {effects:?}")

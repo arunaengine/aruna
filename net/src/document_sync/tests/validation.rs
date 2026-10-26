@@ -215,6 +215,8 @@ fn stale_advertisement_skipped() {
             documents_held: None,
             load_permille: None,
             heartbeat_at_ms: 5,
+            download_slots: None,
+            storage_capacity_bytes: None,
         },
         updated_at_ms: 5,
         epoch: AdvertisementEpoch {
@@ -863,6 +865,8 @@ fn node_owner_validation() {
             documents_held: None,
             load_permille: None,
             heartbeat_at_ms: 5,
+            download_slots: None,
+            storage_capacity_bytes: None,
         },
         updated_at_ms: 5,
         epoch: AdvertisementEpoch {

@@ -25,12 +25,15 @@ pub const PULL_POLL_AFTER: Duration = Duration::from_secs(1);
 /// stalled.
 pub const STALL_POLLS: u32 = 10;
 
+/// Times a pull follows a refusal that names the coordinator of its key before it gives up.
+const MAX_MOVES: u32 = 2;
+
 /// Asks `node_id` to pull one device version, then polls until the pull is done or refused.
 /// `progress` hears every new byte count. A pull that keeps receiving bytes runs as long as it
 /// needs; one that stops, or a node that cannot be reached, ends as `Unavailable`.
 pub(crate) async fn forward_pull<F, Fut>(
     context: &DriverContext,
-    node_id: NodeId,
+    mut node_id: NodeId,
     auth_token: AuthToken,
     pull: SyncPull,
     mut progress: F,
@@ -50,9 +53,25 @@ where
             SyncRefusal::Unavailable
         })?;
     let mut watch = Progress::default();
+    let mut moves = 0;
     loop {
         let (bytes_done, total, ask_again) = match status {
             SyncPullStatus::Done(ack) => return Ok(ack),
+            // A distributed bucket's coordinator writes the key; the pull moves there.
+            SyncPullStatus::Refused(SyncRefusal::Coordinator(coordinator))
+                if moves < MAX_MOVES && coordinator != node_id =>
+            {
+                moves += 1;
+                node_id = coordinator;
+                watch = Progress::default();
+                status = exchange(context, node_id, request())
+                    .await
+                    .map_err(|reason| {
+                        warn!(node = %node_id, reason = %reason, "Could not ask the coordinator for a pull");
+                        SyncRefusal::Unavailable
+                    })?;
+                continue;
+            }
             SyncPullStatus::Refused(refusal) => return Err(refusal),
             SyncPullStatus::Pending { bytes_done, total } => (bytes_done, total, false),
             // The node lost the pull, as after a restart; it is asked again.

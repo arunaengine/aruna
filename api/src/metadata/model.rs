@@ -390,6 +390,9 @@ pub struct RoCrateExportParams {
     pub offset: Option<usize>,
     #[serde(default)]
     pub after: Option<String>,
+    /// Serve this node's own copy without asking other holders; w3id redirects set it.
+    #[serde(default)]
+    pub here: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -511,13 +514,17 @@ pub struct MetadataReferencesParams {
     /// Optional exact predicate IRI filter, such as http://schema.org/conformsTo.
     #[serde(default)]
     pub predicate: Option<String>,
-    /// Page size (default 25, silently clamped to a maximum of 100).
+    /// Documents per page (default 25, silently clamped to a maximum of 100).
     #[serde(default)]
     pub limit: Option<usize>,
     /// Resolve `iri` as a document graph IRI and return that document's summary
-    /// as a single predicate-less entry, skipping the backlink scan.
+    /// as a single predicate-less entry, skipping the backlink lookup.
     #[serde(default)]
     pub resolve: bool,
+    /// The `next_after` of the previous page.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub after: Option<ulid::Ulid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -542,6 +549,9 @@ pub struct MetadataReferenceItem {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataReferencesResponse {
     pub references: Vec<MetadataReferenceItem>,
+    /// Pass as `after` for the next page; absent on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -608,6 +618,8 @@ pub struct PreflightTargetResponse {
     pub content_w3id: String,
     pub targeted_versions: Vec<PreflightLocationResponse>,
     pub visible_references: Vec<PreflightVisibleResponse>,
+    /// A document the caller may not read references the target, among the documents each
+    /// node read for this page.
     pub hidden_references_exist: bool,
     #[serde(rename = "would_remove_last_resolvable_aruna_location")]
     pub would_remove_location: bool,
@@ -625,7 +637,10 @@ pub struct ExcludedFormResponse {
 #[schema(as = MetadataPreflightNodeFreshnessResponse)]
 pub struct PreflightFreshnessResponse {
     pub node_id: String,
+    /// Materialization state of the referencing documents the node read for this page;
+    /// `pending` also while accepted documents of the realm wait for projection.
     pub index_state: String,
+    /// Oldest materialization status update among the documents the node read for this page.
     #[serde(rename = "oldest_status_updated_at_ms")]
     pub oldest_status_updated: Option<u64>,
 }

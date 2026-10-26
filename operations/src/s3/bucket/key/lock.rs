@@ -471,6 +471,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         // Mode off with retained keys: a decrypting change may still hold source generations.
         let settings = BucketEncryption {

@@ -482,6 +482,15 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardedVaultChange { .. } => "forwarded_vault_change",
         MetadataTransportMessage::FetchVaultRecords { .. } => "fetch_vault_records",
         MetadataTransportMessage::FetchedVaultRecords { .. } => "fetched_vault_records",
+        MetadataTransportMessage::ForwardAdmitMember { .. } => "forward_admit_member",
+        MetadataTransportMessage::AdmittedMember { .. } => "admitted_member",
+        MetadataTransportMessage::ForwardDistributionRequest { .. } => {
+            "forward_distribution_request"
+        }
+        MetadataTransportMessage::SubmitDistributionStatement { .. } => {
+            "submit_distribution_statement"
+        }
+        MetadataTransportMessage::DistributionAccepted { .. } => "distribution_accepted",
         MetadataTransportMessage::ForwardSyncPull { .. } => "forward_sync_pull",
         MetadataTransportMessage::ForwardedSyncPull { .. } => "forwarded_sync_pull",
         MetadataTransportMessage::ForwardPullStatus { .. } => "forward_pull_status",
@@ -500,6 +509,14 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ForwardApplyBatch { .. } => "forward_apply_batch",
         MetadataTransportMessage::ForwardedApplyBatch { .. } => "forwarded_apply_batch",
         MetadataTransportMessage::GroupCreateConflict { .. } => "forwarded_group_create_conflict",
+        MetadataTransportMessage::DataLinks { .. } => "data_links",
+        MetadataTransportMessage::DataLinkResults { .. } => "data_link_results",
+        MetadataTransportMessage::BucketOwner { .. } => "bucket_owner",
+        MetadataTransportMessage::BucketOwnerResult { .. } => "bucket_owner_result",
+        MetadataTransportMessage::SetPreview { .. } => "set_preview",
+        MetadataTransportMessage::SetPreviewResults { .. } => "set_preview_results",
+        MetadataTransportMessage::StagingSpec { .. } => "staging_spec",
+        MetadataTransportMessage::StagingSpecResult { .. } => "staging_spec_result",
     }
 }
 
@@ -623,6 +640,88 @@ impl MetadataHandle {
     }
 
     /// Asks one node which readable documents its reverse index lists for the identifier.
+    pub async fn request_data_links(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<AuthToken>,
+        request: crate::metadata::api::LinkNodeRequest,
+    ) -> Result<crate::metadata::api::LinkNodePage, MetadataReadError> {
+        match send_remote_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::DataLinks {
+                auth_token,
+                request: Box::new(request),
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::DataLinkResults { result } => result.map(|page| *page),
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    pub async fn request_set_preview(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<AuthToken>,
+        (set_id, limit): (Ulid, usize),
+    ) -> Result<crate::metadata::api::SetPreviewPage, MetadataReadError> {
+        let request = MetadataTransportMessage::SetPreview {
+            auth_token,
+            set_id,
+            limit,
+        };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::SetPreviewResults { result } => result.map(|page| *page),
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    pub async fn request_staging_spec(
+        &self,
+        node_id: NodeId,
+        transfer_id: Ulid,
+        job_id: aruna_core::structs::execution::job::JobId,
+    ) -> Result<crate::distribution::imports::HandedImport, MetadataReadError> {
+        let request = MetadataTransportMessage::StagingSpec {
+            transfer_id,
+            job_id,
+        };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::StagingSpecResult { result } => result.map(|spec| *spec),
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    pub async fn request_bucket_owner(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<AuthToken>,
+        bucket: String,
+    ) -> Result<aruna_core::types::GroupId, MetadataReadError> {
+        match send_remote_request(
+            &self.inner,
+            &Span::current(),
+            node_id,
+            MetadataTransportMessage::BucketOwner { auth_token, bucket },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::BucketOwnerResult { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
     pub async fn request_identifier_lookup(
         &self,
         node_id: NodeId,

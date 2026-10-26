@@ -205,6 +205,8 @@ pub struct ObjectCoverage {
     pub nodes_failed: usize,
     pub failed_partitions: Vec<String>,
     pub omitted_partitions: usize,
+    /// Distributed bucket ranges this page could not search; `complete` is false when any.
+    pub incomplete_ranges: usize,
     pub complete: bool,
     pub truncated: bool,
     pub partitions: Vec<ObjectPartitionCoverage>,
@@ -450,7 +452,18 @@ restrictions and request policies before it can be returned.
 - The cursor is bound to the query, bucket, match type and mode; it composes per-node keyset
   positions and an as-of watermark so newly created versions do not enter a cursor chain.
 - `coverage` names the live-head source, observation times, failed partitions, completeness and
-  truncation."#,
+  truncation.
+- A bucket-scoped search of a distributed bucket reads only the key indexes of the ranges each
+  member coordinates and examines a bounded number of candidates per page; a page that reaches
+  that bound returns a cursor even without hits. Substring queries match whole name parts of
+  the key, split at `/`, `.`, `-`, `_` and other separators. `coverage.incomplete_ranges` counts
+  ranges whose index is missing or still being built (and, in `local` mode, ranges another
+  member coordinates); they are never scanned, and `complete` is false while any remain.
+  `distributed_strict` answers 503 while any remain.
+- A search without `bucket` skips distributed buckets, which only their key indexes cover;
+  each skipped bucket counts in `coverage.incomplete_ranges`.
+- A cursor that continues after keys the caller may not see carries them sealed; a restart of
+  the node that sealed it makes such a cursor invalid."#,
     params(
         ("q" = String, Query, description = "Case-sensitive key substring or prefix; trimmed, minimum 2 characters"),
         ("bucket" = Option<String>, Query, description = "Optional exact bucket name"),
@@ -495,6 +508,7 @@ restrictions and request policies before it can be returned.
                     "nodes_failed": 0,
                     "failed_partitions": [],
                     "omitted_partitions": 0,
+                    "incomplete_ranges": 0,
                     "complete": true,
                     "truncated": false,
                     "partitions": [
@@ -620,6 +634,7 @@ fn map_search_response(result: ObjectExecution, mode: ObjectMode) -> ObjectRespo
             nodes_failed: result.fanout_stats.nodes_failed,
             failed_partitions,
             omitted_partitions: result.omitted_partitions,
+            incomplete_ranges: result.incomplete_ranges,
             complete: result.complete,
             truncated,
             partitions: result

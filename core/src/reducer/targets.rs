@@ -55,6 +55,17 @@ impl AdminDocumentState {
 }
 
 impl AdminDocumentState {
+    /// The cutoffs a node's removal recorded, if the realm config removed it.
+    pub fn publisher_cutoffs(&self, node_id: &NodeId) -> Option<Vec<PublisherCutoff>> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+        self.user_subject_ids
+            .get(&publisher_cutoffs_path(node_id))
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| serde_json::from_str(value).ok())
+    }
+
     pub fn materialized_group_name(&self) -> Option<String> {
         if !matches!(&self.target, AdminDocumentTarget::Group { .. }) {
             return None;
@@ -288,6 +299,43 @@ impl AdminDocumentState {
             .get(CONFIG_PORTAL_PATH)
             .and_then(|version| version.value.as_deref())
             .and_then(|value| serde_json::from_str(value).ok())
+    }
+
+    /// Every database entry the events agree on, in entry id order; one in conflict is left out.
+    pub fn database_entries(&self) -> Vec<crate::structs::identity::database::DatabaseEntry> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return Vec::new();
+        }
+        self.user_subject_ids
+            .range(DATABASES_PREFIX.to_string()..)
+            .take_while(|(path, _)| path.starts_with(DATABASES_PREFIX))
+            .filter(|(path, _)| !self.conflicts.contains_key(*path))
+            .filter_map(|(_, version)| version.value.as_deref())
+            .filter_map(|value| serde_json::from_str(value).ok())
+            .collect()
+    }
+
+    /// The database list: the first entries in id order within the count and byte bounds, so
+    /// concurrent marks that each passed their node's check still converge to a bounded list.
+    pub fn materialized_databases(&self) -> Vec<crate::structs::identity::database::DatabaseEntry> {
+        use crate::structs::identity::database::{MAX_DATABASE_BYTES, MAX_DATABASES};
+        // The list's length prefix takes at most this many bytes.
+        let mut bytes = 4;
+        let mut entries = self.database_entries();
+        let fits = entries.iter().take(MAX_DATABASES).take_while(|entry| {
+            bytes += postcard::to_allocvec(entry).map_or(MAX_DATABASE_BYTES, |value| value.len());
+            bytes <= MAX_DATABASE_BYTES
+        });
+        let kept = fits.count();
+        entries.truncate(kept);
+        entries
+    }
+
+    /// The register version of a database entry, which a consent names as its predecessor.
+    pub fn database_version(&self, entry_id: Ulid) -> Option<AdminDocumentDot> {
+        self.user_subject_ids
+            .get(&database_path(entry_id))
+            .map(|version| version.dot)
     }
 
     pub fn materialized_realm_quota(&self) -> Option<QuotaConfig> {
@@ -531,6 +579,24 @@ impl AdminDocumentState {
             CONFIG_DISCOVERY_PATH,
             realm_discovery_value(discovery),
         );
+    }
+
+    /// Sets or clears one register path of the realm config.
+    pub(super) fn apply_register(
+        &mut self,
+        event: &AdminDocumentEvent,
+        path: &str,
+        value: Option<String>,
+    ) {
+        let current = self.user_subject_ids.get(path).cloned();
+        match self.reduce_value(event, path, current, value) {
+            Some(version) => {
+                self.user_subject_ids.insert(path.to_string(), version);
+            }
+            None => {
+                self.user_subject_ids.remove(path);
+            }
+        }
     }
 
     pub(super) fn apply_config_setting(

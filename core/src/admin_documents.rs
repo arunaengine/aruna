@@ -64,10 +64,23 @@ pub struct AdminDocumentDot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminDocumentTarget {
-    Group { group_id: GroupId },
-    Realm { realm_id: RealmId },
-    User { user_id: UserId },
-    RealmConfig { realm_id: RealmId },
+    Group {
+        group_id: GroupId,
+    },
+    Realm {
+        realm_id: RealmId,
+    },
+    User {
+        user_id: UserId,
+    },
+    RealmConfig {
+        realm_id: RealmId,
+    },
+    /// One distributed bucket's record; it rides the realm config topic to every realm node.
+    Distribution {
+        realm_id: RealmId,
+        set_id: Ulid,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,6 +349,9 @@ pub enum AdminDocumentOperation {
     #[serde(rename = "RealmConfigNodeRemoved")]
     ConfigNodeRemoved {
         node_id: NodeId,
+        /// The last revision of each set the node published, as the remover held them;
+        /// relays of the node's snapshots stop there.
+        cutoffs: Vec<crate::structs::storage::distribution::PublisherCutoff>,
     },
     /// Renames a group after creation. Only the label changes; the group id and
     /// every permission path stay as they are (postcard append-only: new
@@ -374,6 +390,24 @@ pub enum AdminDocumentOperation {
     #[serde(rename = "RealmConfigPortalFeaturesSet")]
     ConfigPortalSet {
         features: BTreeMap<String, bool>,
+    },
+    /// The publisher's signed full snapshot of one distributed bucket's revision.
+    DistributionPublished {
+        snapshot: Box<crate::structs::storage::distribution::SignedSnapshot>,
+    },
+    /// Marks a bucket as a database or retargets an entry. Without a consent the actor must
+    /// also administer the owning group; with one, its approver must.
+    #[serde(rename = "RealmConfigDatabaseSet")]
+    DatabaseSet {
+        entry: crate::structs::identity::database::DatabaseEntry,
+        /// The register version this publication replaces, which the consent names.
+        predecessor: Option<AdminDocumentDot>,
+        consent: Option<Box<crate::structs::identity::database::DatabaseConsent>>,
+    },
+    /// Removes a database entry; the bucket and the dataset stay as they are.
+    #[serde(rename = "RealmConfigDatabaseRemoved")]
+    DatabaseRemoved {
+        entry_id: Ulid,
     },
 }
 
@@ -539,7 +573,10 @@ mod tests {
                 node_id: node(1),
                 kind: RealmNodeKind::Management,
             },
-            AdminDocumentOperation::ConfigNodeRemoved { node_id: node(1) },
+            AdminDocumentOperation::ConfigNodeRemoved {
+                node_id: node(1),
+                cutoffs: Vec::new(),
+            },
             AdminDocumentOperation::OidcProviderUpserted {
                 provider: oidc_provider("default"),
             },
@@ -693,6 +730,10 @@ mod tests {
                 user_id: user_id(2),
             },
             AdminDocumentTarget::RealmConfig { realm_id },
+            AdminDocumentTarget::Distribution {
+                realm_id,
+                set_id: Ulid::from_bytes([5; 16]),
+            },
         ];
 
         for target in targets {

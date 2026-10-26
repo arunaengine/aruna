@@ -143,6 +143,7 @@ async fn create_bucket(harness: &Harness, bucket: &str) {
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
+                distribution: None,
             },
         ),
         &harness.driver,
@@ -491,9 +492,14 @@ async fn replay_reuses_version() {
     let job_id = record.job_id;
     let destinations = vec![(harness.node_id, BUCKET.to_string(), KEY.to_string())];
 
-    let reserved = reserve_output_commits(&harness.driver.storage_handle, job_id, &destinations)
-        .await
-        .unwrap();
+    let reserved = reserve_output_commits(
+        &harness.driver.storage_handle,
+        job_id,
+        &destinations,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     assert!(!reserved.execution_id.is_nil());
     assert_eq!(reserved.execution_id, control.execution_id);
     let version_id = reserved.output_commits[0].version_id;
@@ -502,9 +508,14 @@ async fn replay_reuses_version() {
     let first = put_version(&harness, b"result", Some(version_id)).await;
 
     // Replay after a crash: the reservation is re-read, never minted again.
-    let replayed = reserve_output_commits(&harness.driver.storage_handle, job_id, &destinations)
-        .await
-        .unwrap();
+    let replayed = reserve_output_commits(
+        &harness.driver.storage_handle,
+        job_id,
+        &destinations,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(replayed.output_commits, reserved.output_commits);
     let second = put_version(&harness, b"result", Some(version_id)).await;
 
@@ -522,12 +533,22 @@ async fn executions_keep_versions() {
     let (second, _) = seed_execution(&harness, execution_spec(harness.group_id)).await;
     let (first_job, second_job) = (first.job_id, second.job_id);
 
-    let first = reserve_output_commits(&harness.driver.storage_handle, first_job, &destinations)
-        .await
-        .unwrap();
-    let second = reserve_output_commits(&harness.driver.storage_handle, second_job, &destinations)
-        .await
-        .unwrap();
+    let first = reserve_output_commits(
+        &harness.driver.storage_handle,
+        first_job,
+        &destinations,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    let second = reserve_output_commits(
+        &harness.driver.storage_handle,
+        second_job,
+        &destinations,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     assert_ne!(first.execution_id, second.execution_id);
     let first_version = first.output_commits[0].version_id;
     let second_version = second.output_commits[0].version_id;
@@ -567,9 +588,14 @@ async fn exact_version_survives() {
     let job_id = record.job_id;
     let destinations = vec![(harness.node_id, BUCKET.to_string(), KEY.to_string())];
 
-    let reserved = reserve_output_commits(&harness.driver.storage_handle, job_id, &destinations)
-        .await
-        .unwrap();
+    let reserved = reserve_output_commits(
+        &harness.driver.storage_handle,
+        job_id,
+        &destinations,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     let version_id = reserved.output_commits[0].version_id;
     put_version(&harness, b"job-output", Some(version_id)).await;
 

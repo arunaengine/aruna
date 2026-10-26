@@ -108,7 +108,10 @@ fn transaction_effect(effect: &Effect) -> Option<TransactionEffect> {
         return None;
     };
     match storage_effect {
-        StorageEffect::StartTransaction { .. } => Some(TransactionEffect::Start),
+        // A usage rebuild's begin answers the snapshot it opened.
+        StorageEffect::StartTransaction { .. } | StorageEffect::BeginUsageRebuild { .. } => {
+            Some(TransactionEffect::Start)
+        }
         StorageEffect::CommitTransaction { txn_id } => Some(TransactionEffect::Commit(*txn_id)),
         StorageEffect::AbortTransaction { txn_id } => Some(TransactionEffect::Abort(*txn_id)),
         _ => None,

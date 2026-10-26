@@ -6,15 +6,16 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::reference_scan::{ScanStep, parse_scan_page};
+use crate::connectors::reference_prune::schedule_prune;
+use crate::connectors::reference_scan::{ReferenceScan, ScanStep};
 use crate::connectors::repository::{
     StorageReadError, delete_secret_effect, parse_connector_read, parse_secret_read,
-    read_connector_effect, read_secret_effect, reference_scan_effect, source_connector_key,
+    read_connector_effect, read_secret_effect, source_connector_key,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +34,9 @@ pub enum DeleteSourceState {
     ReadSecret,
     StartTransaction,
     ScanReferenceVersions,
+    /// More reference rows follow than one request checks; their pruning is being queued.
+    CommitDeferred,
+    ScheduleDeferred,
     DeleteRecords,
     DeleteSecret,
     CommitTransaction,
@@ -51,6 +55,8 @@ pub enum DeleteSourceError {
     NotFound,
     #[error("Connector credentials are referenced by object versions")]
     ReferencedObjectVersion,
+    #[error("Connector references are still being checked; retry later")]
+    ReferencesPending,
     #[error("DeleteSourceConnector failed")]
     DeleteConnectorFailed,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
@@ -76,6 +82,7 @@ pub struct DeleteSourceOperation {
     state: DeleteSourceState,
     txn_id: Option<TxnId>,
     has_secret: bool,
+    scan: Option<ReferenceScan>,
     output: Option<Result<DeleteSourceResult, DeleteSourceError>>,
 }
 
@@ -86,6 +93,7 @@ impl DeleteSourceOperation {
             state: DeleteSourceState::Init,
             txn_id: None,
             has_secret: false,
+            scan: None,
             output: None,
         }
     }
@@ -129,7 +137,7 @@ impl DeleteSourceOperation {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                 self.txn_id = Some(txn_id);
                 if self.has_secret {
-                    self.scan_reference_versions(None)
+                    self.scan_reference_versions()
                 } else {
                     self.delete_records()
                 }
@@ -167,23 +175,50 @@ impl DeleteSourceOperation {
         }
     }
 
-    fn scan_reference_versions(&mut self, start_after: Option<Key>) -> Effects {
+    fn scan_reference_versions(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(StorageError::TransactionNotFound.into());
         };
 
         self.state = DeleteSourceState::ScanReferenceVersions;
-        smallvec![reference_scan_effect(start_after, Some(txn_id),)]
+        let mut scan = ReferenceScan::new(self.input.connector_id);
+        let effects = scan.start(txn_id);
+        self.scan = Some(scan);
+        effects
     }
 
     fn handle_scan_page(&mut self, event: Event) -> Effects {
-        match parse_scan_page(event, self.input.connector_id) {
+        let (Some(scan), Some(txn_id)) = (self.scan.as_mut(), self.txn_id) else {
+            return self.abort_with_error(StorageError::TransactionNotFound.into());
+        };
+        match scan.step(event, txn_id) {
             Ok(ScanStep::Referenced) => {
                 self.abort_with_error(DeleteSourceError::ReferencedObjectVersion)
             }
-            Ok(ScanStep::NextPage(start_after)) => self.scan_reference_versions(Some(start_after)),
+            Ok(ScanStep::Next(effects)) => effects,
+            Ok(ScanStep::Deferred) => {
+                // The stale page and the pruning queue row commit; the caller retries later.
+                self.state = DeleteSourceState::CommitDeferred;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
             Ok(ScanStep::Complete) => self.delete_records(),
             Err(error) => self.abort_with_error(error.into()),
+        }
+    }
+
+    fn handle_deferred_commit(&mut self, event: Event) -> Effects {
+        self.txn_id = None;
+        match event {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                self.state = DeleteSourceState::ScheduleDeferred;
+                smallvec![schedule_prune()]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
+            received => self.emit_error(DeleteSourceError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
+                received,
+            }),
         }
     }
 
@@ -295,6 +330,15 @@ impl Operation for DeleteSourceOperation {
             DeleteSourceState::ReadSecret => self.handle_secret_read(event),
             DeleteSourceState::StartTransaction => self.handle_transaction_started(event),
             DeleteSourceState::ScanReferenceVersions => self.handle_scan_page(event),
+            DeleteSourceState::CommitDeferred => self.handle_deferred_commit(event),
+            DeleteSourceState::ScheduleDeferred => match event {
+                Event::Task(_) => self.emit_error(DeleteSourceError::ReferencesPending),
+                received => self.emit_error(DeleteSourceError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::Task",
+                    received,
+                }),
+            },
             DeleteSourceState::DeleteRecords => self.handle_records_deleted(event),
             DeleteSourceState::DeleteSecret => self.handle_secret_deleted(event),
             DeleteSourceState::CommitTransaction => self.handle_transaction_committed(event),
@@ -337,19 +381,23 @@ mod tests {
     use super::*;
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     use crate::connectors::replace_connector::{ReplaceSourceInput, ReplaceSourceOperation};
-    use crate::connectors::repository::{parse_secret_read, read_secret_effect};
+    use crate::connectors::repository::{
+        connector_reference_key, connector_reference_write, parse_secret_read, read_secret_effect,
+    };
     use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
     use crate::driver::{DriverContext, drive};
     use crate::staging::descriptor::build_source_binding;
-    use aruna_core::effects::IterStart;
     use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+    use aruna_core::keyspaces::{
+        BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
+    };
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
     use aruna_core::structs::execution::source_connector::{
         SourceConnector, SourceConnectorKind, SourceConnectorSecret,
     };
     use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
     use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
+    use aruna_core::types::Key;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -377,6 +425,7 @@ mod tests {
             etag: None,
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         }
     }
 
@@ -427,32 +476,31 @@ mod tests {
     }
 
     async fn write_reference_version(context: &DriverContext, source: VersionSourceBinding) {
-        let version_id = ulid::Ulid::generate();
-        let key = VersionKey::new("bucket", "key", version_id)
-            .to_bytes()
-            .unwrap();
-        let value = BlobVersion::reference(
+        let version_key = VersionKey::new("bucket", "key", ulid::Ulid::generate());
+        let version = BlobVersion::reference(
             source,
             source_metadata(),
             SystemTime::UNIX_EPOCH,
             Default::default(),
             SystemTime::UNIX_EPOCH,
-        )
-        .to_bytes()
-        .unwrap();
+        );
+        let mut writes = vec![(
+            BLOB_VERSIONS_KEYSPACE.to_string(),
+            version_key.to_bytes().unwrap().into(),
+            version.to_bytes().unwrap().into(),
+        )];
+        writes.extend(connector_reference_write(&version, &version_key).unwrap());
 
         let event = context
             .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: key.into(),
-                value: value.into(),
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
                 txn_id: None,
             })
             .await;
         assert!(matches!(
             event,
-            Event::Storage(StorageEvent::WriteResult { .. })
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
         ));
     }
 
@@ -552,27 +600,56 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn reference_aborts_delete() {
-        let connector_id = Ulid::from_bytes([2u8; 16]);
-        let txn_id = Ulid::from_bytes([3u8; 16]);
+    /// An operation inside its transaction with the reference scan started.
+    fn scanning(connector_id: Ulid, txn_id: Ulid) -> DeleteSourceOperation {
         let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id: Ulid::from_bytes([1u8; 16]),
             connector_id,
         });
-        operation.state = DeleteSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
+        operation.state = DeleteSourceState::StartTransaction;
+        operation.has_secret = true;
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation
+    }
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+    fn reference_rows(connector_id: Ulid, next: Option<Key>) -> Event {
+        let version_key = VersionKey::new("bucket", "key", Ulid::nil());
+        Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                connector_reference_key(connector_id, &version_key).unwrap(),
+                Vec::new().into(),
+            )],
+            next_start_after: next,
+        })
+    }
+
+    fn version_read(version: Option<BlobVersion>) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
             values: vec![(
                 vec![1].into(),
-                reference_blob_version(connector_id)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
+                version.map(|version| version.to_bytes().unwrap().into()),
             )],
-            next_start_after: None,
-        }));
+        })
+    }
+
+    fn pruned() -> Event {
+        Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn reference_aborts_delete() {
+        let connector_id = Ulid::from_bytes([2u8; 16]);
+        let txn_id = Ulid::from_bytes([3u8; 16]);
+        let mut operation = scanning(connector_id, txn_id);
+
+        assert!(matches!(
+            operation.step(reference_rows(connector_id, None)).as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { txn_id: Some(read_txn), .. })]
+                if *read_txn == txn_id
+        ));
+        let effects = operation.step(version_read(Some(reference_blob_version(connector_id))));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
@@ -586,98 +663,52 @@ mod tests {
         );
     }
 
+    // A stale page with more rows behind it commits its pruning and the queued background work,
+    // then asks the caller to retry instead of scanning on.
     #[test]
-    fn scans_multiple_pages() {
+    fn pending_defers_check() {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let next_key: Key = vec![9u8].into();
-        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id,
-        });
-        operation.state = DeleteSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
+        let mut operation = scanning(connector_id, txn_id);
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![],
-            next_start_after: Some(next_key.clone()),
+        operation.step(reference_rows(connector_id, Some(vec![9u8].into())));
+        assert!(matches!(
+            operation.step(version_read(None)).as_slice(),
+            [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })]
+                if deletes[0].0 == CONNECTOR_REFERENCE_KEYSPACE
+        ));
+        assert!(matches!(
+            operation.step(pruned()).as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == CONNECTOR_PRUNE_KEYSPACE
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![].into(),
         }));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(key)),
-                txn_id: Some(scan_txn),
-                ..
-            })] if *scan_txn == txn_id && key.as_ref() == next_key.as_ref()
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
+                if *commit_txn == txn_id
         ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![],
-            next_start_after: None,
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
         }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchDelete { txn_id: Some(delete_txn), .. })]
-                if *delete_txn == txn_id
-        ));
-    }
-
-    #[test]
-    fn later_page_aborts() {
-        let connector_id = Ulid::from_bytes([2u8; 16]);
-        let txn_id = Ulid::from_bytes([3u8; 16]);
-        let next_key: Key = vec![9u8].into();
-        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id,
-        });
-        operation.state = DeleteSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
-
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![],
-            next_start_after: Some(next_key.clone()),
+        assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
+        operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
+            key: aruna_core::task::TaskKey::PruneConnectorReferences,
+            after: std::time::Duration::ZERO,
         }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(key)),
-                ..
-            })] if key.as_ref() == next_key.as_ref()
-        ));
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                vec![1].into(),
-                reference_blob_version(connector_id)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            )],
-            next_start_after: None,
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
-                if *abort_txn == txn_id
-        ));
-
-        operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(
             operation.finalize(),
-            Err(DeleteSourceError::ReferencedObjectVersion)
+            Err(DeleteSourceError::ReferencesPending)
         );
     }
 
     #[test]
     fn scan_failure_aborts() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id: Ulid::from_bytes([2u8; 16]),
-        });
-        operation.state = DeleteSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
+        let mut operation = scanning(Ulid::from_bytes([2u8; 16]), txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
             key: vec![].into(),
@@ -689,12 +720,10 @@ mod tests {
         ));
 
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-        assert_eq!(
+        assert!(matches!(
             operation.finalize(),
-            Err(DeleteSourceError::StorageError(StorageError::ReadError(
-                "unexpected event".to_string()
-            )))
-        );
+            Err(DeleteSourceError::StorageError(StorageError::ReadError(_)))
+        ));
     }
 
     #[test]
@@ -793,7 +822,10 @@ mod tests {
         assert_eq!(result, Err(DeleteSourceError::ReferencedObjectVersion));
 
         let access = drive(
-            ResolveBindingOperation::new(ResolveBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput {
+                source,
+                group_id: None,
+            }),
             &context,
         )
         .await
@@ -827,7 +859,10 @@ mod tests {
         .unwrap();
 
         let access = drive(
-            ResolveBindingOperation::new(ResolveBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput {
+                source,
+                group_id: None,
+            }),
             &context,
         )
         .await

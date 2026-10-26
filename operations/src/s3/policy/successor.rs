@@ -8,6 +8,11 @@ use crate::blob::managed_copy::{
     register_entry, scan_effect, validate_registration, version_scope,
 };
 use crate::blob::records::HeadAliasContext;
+use crate::connectors::repository::connector_reference_write;
+use crate::distribution::guard::{GuardError, authority_read, record_epoch};
+use crate::distribution::inventory::{
+    AddedVersion, entry_of, stamp_head, stamp_version, version_written,
+};
 use crate::node::usage_stats::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
@@ -36,6 +41,8 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobVersion, BlobVersionState, BucketIdentity, CurrentVersionPointer,
     ManagedCopyKey, ManagedCopyRecord, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -134,6 +141,8 @@ pub enum SuccessorError {
     #[error(transparent)]
     Gate(#[from] PolicyGateError),
     #[error(transparent)]
+    Distribution(#[from] GuardError),
+    #[error(transparent)]
     ManagedCopy(#[from] ManagedCopyError),
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -187,6 +196,8 @@ enum MintState {
     ReadIntent,
     ReadHead,
     ReadBucket,
+    /// Reads a distributed bucket's record: only the key's coordinator writes the successor.
+    ReadRecord,
     ReadVersion,
     ReadSuccessor,
     ScanCopies,
@@ -208,6 +219,10 @@ pub struct SuccessorMint {
     outcome: Option<SuccessorOutcome>,
     /// Owner read from the bucket record inside this transaction.
     group_id: Option<GroupId>,
+    /// The bucket's distribution binding, whose inventory the mint maintains.
+    binding: Option<DistributionBinding>,
+    /// The coordinator epoch the successor carries in a distributed bucket.
+    epoch: aruna_core::structs::storage::distribution::OriginalEpoch,
     /// The successor's counter change, committed with its records.
     usage: Option<UsageCounterUpdate>,
     /// New logical bytes the successor books; only these need the quota gate.
@@ -226,6 +241,8 @@ impl SuccessorMint {
             effective_refs: Vec::new(),
             outcome: None,
             group_id: None,
+            binding: None,
+            epoch: Default::default(),
             usage: None,
             quota_bytes: 0,
             quota_gate: None,
@@ -265,6 +282,7 @@ impl SuccessorMint {
             MintState::ReadIntent => self.handle_intent(event, txn_id),
             MintState::ReadHead => self.handle_head(event, txn_id),
             MintState::ReadBucket => self.handle_bucket(event, txn_id),
+            MintState::ReadRecord => self.handle_record(event, txn_id),
             MintState::ReadVersion => self.handle_version(event, txn_id),
             MintState::ReadSuccessor => self.handle_successor(event, txn_id),
             MintState::ScanCopies => self.handle_copies(event, txn_id),
@@ -384,7 +402,14 @@ impl SuccessorMint {
         if bucket.identity() != self.plan.bucket_identity {
             return Err(SuccessorError::BucketChanged);
         }
+        // A successor in a distributed bucket must carry the set hint it was planned with.
+        if let Some(binding) = bucket.distribution.as_ref()
+            && SetHint::of_version(self.plan.successor_version_id) != binding.hint()
+        {
+            return Err(SuccessorError::BucketChanged);
+        }
         self.group_id = Some(bucket.group_id);
+        self.binding = bucket.distribution.clone();
         let admitted = subject.is_some_and(|record| {
             record.subject.generation == self.plan.subject.generation
                 && !record.serving_blocked
@@ -401,6 +426,25 @@ impl SuccessorMint {
                 current: bucket.placement_policy_generation,
             });
         }
+        if let Some(binding) = self.binding.as_ref() {
+            // Read inside the commit boundary, so a fence or record set meanwhile conflicts.
+            self.state = MintState::ReadRecord;
+            return Ok(Some(smallvec![authority_read(binding.set_id, txn_id)]));
+        }
+        self.read_version(txn_id)
+    }
+
+    fn handle_record(
+        &mut self,
+        event: Event,
+        txn_id: Option<TxnId>,
+    ) -> Result<Option<Effects>, SuccessorError> {
+        let binding = self.binding.as_ref().ok_or(SuccessorError::InvalidEvent)?;
+        self.epoch = record_epoch(binding, &self.plan.context.key, event)?;
+        self.read_version(txn_id)
+    }
+
+    fn read_version(&mut self, txn_id: Option<TxnId>) -> Result<Option<Effects>, SuccessorError> {
         self.state = MintState::ReadVersion;
         Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
@@ -568,19 +612,27 @@ impl SuccessorMint {
             self.plan.auth_context.user_id,
         )
         .with_policies(self.effective_refs.clone())?;
-        let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(6);
+        let next = CurrentVersionPointer::next_for(Some(&self.plan.expected_head), version_id)?;
+        let next = stamp_head(next, self.binding.as_ref(), self.epoch);
+        let successor = stamp_version(
+            successor,
+            self.binding.as_ref(),
+            next.generation,
+            self.epoch,
+        );
+        let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(7);
+        let version_key = self.plan.version_key(version_id);
+        writes.extend(connector_reference_write(&successor, &version_key)?);
         writes.push((
             BLOB_VERSIONS_KEYSPACE.to_string(),
-            self.plan.version_key(version_id).to_bytes()?.into(),
+            version_key.to_bytes()?.into(),
             successor.to_bytes()?.into(),
         ));
         // The expected pointer makes this transaction advance exactly one generation.
         writes.push((
             BLOB_HEAD_KEYSPACE.to_string(),
             self.plan.context.head_key().to_bytes()?.into(),
-            CurrentVersionPointer::next_for(Some(&self.plan.expected_head), version_id)?
-                .to_bytes()?
-                .into(),
+            next.to_bytes()?.into(),
         ));
         writes.push((
             POLICY_MUTATION_KEYSPACE.to_string(),
@@ -650,12 +702,22 @@ impl SuccessorMint {
             return Err(SuccessorError::BucketChanged);
         };
         let mut delta = successor_usage(&successor, location.as_ref());
+        let size = u64::try_from(delta.logical_bytes + delta.referenced_bytes).unwrap_or_default();
         // An offered directory observation is charged only while it is the head.
         let released = predecessor.offered_size(&self.plan.context.bucket, &self.plan.context.key);
         delta.referenced_bytes -= i128::from(released.unwrap_or(0));
         self.quota_bytes = u64::try_from(delta.logical_bytes).unwrap_or_default();
+        let added = AddedVersion {
+            version_id,
+            epoch: successor.original_epoch,
+            generation: next.generation,
+            entry: entry_of(&successor, size),
+        };
+        let key = &self.plan.context.key;
+        let inventory = version_written(self.binding.as_ref(), key, added, true);
         let usage = UsageCounterUpdate::for_group(group_id, delta);
-        self.usage = Some(usage.in_bucket(&self.plan.context.bucket, RowChange::AddedVersion));
+        let usage = usage.in_bucket(&self.plan.context.bucket, RowChange::AddedVersion);
+        self.usage = Some(usage.with_inventory(inventory));
         self.outcome = Some(SuccessorOutcome::Minted {
             version_id,
             refs: self.effective_refs.clone(),
@@ -1077,6 +1139,7 @@ mod pure_tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 3,
             compression: Compression::Off,
+            distribution: None,
         }
     }
 
@@ -1421,6 +1484,27 @@ mod pure_tests {
                 drift(Some(recreated.to_bytes().unwrap()), advertised()),
                 None
             ),
+            Err(SuccessorError::BucketChanged)
+        );
+    }
+
+    #[test]
+    fn needs_set_hint() {
+        // A successor id planned without the set hint is refused in a distributed bucket.
+        let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Replace));
+        mint.start(None).expect("start builds");
+        mint.step(read(None), None).expect("mutation absent");
+        mint.step(read(Some(head().to_bytes().unwrap())), None)
+            .expect("head matches");
+        let mut bound = bucket();
+        bound.distribution = Some(super::DistributionBinding {
+            set_id: Ulid::from_bytes([5; 16]),
+            member_id: Ulid::from_bytes([6; 16]),
+            incarnation: 1,
+            revision: Default::default(),
+        });
+        assert_eq!(
+            mint.step(drift(Some(bound.to_bytes().unwrap()), advertised()), None),
             Err(SuccessorError::BucketChanged)
         );
     }
@@ -1827,6 +1911,8 @@ mod pure_tests {
         )
         .expect("the gate starts");
         mint.step(read(None), Some(txn_id))
+            .expect("no usage rebuild runs");
+        mint.step(read(None), Some(txn_id))
             .expect("the gate reads its own realm config");
         mint.step(read(None), Some(txn_id))
             .expect("the group holds no counters yet");
@@ -1882,6 +1968,7 @@ mod pure_tests {
                     version_selector: None,
                     capabilities: Vec::new(),
                     origin_node_id: None,
+                    namespace: None,
                 },
                 connector_id: None,
             },
@@ -1891,6 +1978,7 @@ mod pure_tests {
                 etag: None,
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             },
             UNIX_EPOCH,
             user_id(),

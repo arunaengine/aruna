@@ -17,7 +17,7 @@ use aruna_core::repo_layout::{Layout, StoredFile};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::data_identity::ObjectLocation;
+use aruna_core::structs::storage::data::identity::ObjectLocation;
 use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;

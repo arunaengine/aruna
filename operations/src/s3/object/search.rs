@@ -26,6 +26,12 @@ use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
 use crate::driver::{DriverContext, drive};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+
+#[path = "index_search.rs"]
+mod index_search;
+
+pub use index_search::sealed_position;
 
 const HEAD_SCAN_BATCH: usize = 1_000;
 pub const SEARCH_MAX_LIMIT: usize = 100;
@@ -87,6 +93,15 @@ pub struct SearchNodePage {
     pub hits: Vec<SearchNodeHit>,
     pub next_start_after: Option<Vec<u8>>,
     pub observed_at: SystemTime,
+    /// Ranges of a distributed bucket this node coordinates whose index is missing or still
+    /// being built, and distributed buckets a realm-wide scan skipped; the page does not
+    /// cover their keys.
+    #[serde(default)]
+    pub incomplete_ranges: usize,
+    /// Ranges of a distributed bucket another member coordinates; their keys come from
+    /// that member's page.
+    #[serde(default)]
+    pub remote_ranges: usize,
 }
 
 #[derive(Debug, Error)]
@@ -99,6 +114,8 @@ pub enum SearchObjectsError {
     Storage(String),
     #[error("object inventory scan budget exhausted")]
     Unavailable,
+    #[error("the search position is no longer valid")]
+    Position,
 }
 
 #[derive(Debug)]
@@ -118,7 +135,7 @@ struct HeadCandidate {
 #[derive(Debug)]
 struct CandidateBatch {
     candidates: Vec<SearchNodeHit>,
-    next_start_after: Option<Vec<u8>>,
+    next_start: Option<IterStart>,
 }
 
 /// Searches one node's current object heads. Every candidate is authorized on
@@ -128,97 +145,156 @@ pub async fn search_local_objects(
     context: &DriverContext,
     input: SearchObjectsInput,
 ) -> Result<SearchNodePage, SearchObjectsError> {
+    if let Some(bucket) = input.bucket.as_deref() {
+        let binding = match drive(GetBucketOperation::new(bucket.to_string()), context).await {
+            Ok(info) => info.distribution,
+            Err(GetBucketError::NotFound) => None,
+            Err(error) => return Err(SearchObjectsError::Storage(error.to_string())),
+        };
+        if let Some(binding) = binding {
+            let indexes = context
+                .metadata_handle
+                .as_ref()
+                .map(|handle| handle.range_indexes());
+            let search = index_search::RangeSearch {
+                binding,
+                indexes,
+                budget: index_search::EXAMINE_BUDGET,
+            };
+            return index_search::search_ranges(context, &input, search).await;
+        }
+    }
     let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
-    let mut start_after = input.start_after.clone();
+    let mut start = (input.start_after.clone()).map(|key| IterStart::After(key.into()));
     let mut visible = Vec::with_capacity(limit + 1);
     let mut evaluators: HashMap<(RealmId, GroupId), PolicyEvaluator> = HashMap::new();
+    let mut distributed = HashMap::new();
 
     loop {
-        let batch =
-            scan_candidate_batch(context, &input, start_after.clone(), HEAD_SCAN_BATCH).await?;
+        let batch = scan_candidate_batch(
+            context,
+            &input,
+            start.clone(),
+            HEAD_SCAN_BATCH,
+            &mut distributed,
+        )
+        .await?;
 
         for candidate in batch.candidates {
-            let path = object_permission_path(
-                input.realm_id,
-                candidate.hit.group_id,
-                input.node_id,
-                &candidate.hit.bucket,
-                &candidate.hit.key,
-            );
-            let allowed = drive(
-                CheckPermissionsOperation::new(CheckPermissionsConfig {
-                    auth_context: input.auth.clone(),
-                    path: path.clone(),
-                    required_permission: Permission::READ,
-                }),
-                context,
-            )
-            .await
-            .unwrap_or(false);
-            if !allowed {
+            if !authorize(context, &input, &mut evaluators, &candidate).await? {
                 continue;
             }
-            let policy_scope = (input.realm_id, candidate.hit.group_id);
-            if !evaluators.contains_key(&policy_scope) {
-                evaluators.extend(PolicyEvaluator::load_bulk(context, vec![policy_scope]).await?);
-            }
-            let request = policy_request_with(
-                &path,
-                &Permission::READ,
-                Some(&input.auth),
-                PolicyRequestExtras::rest(),
-            );
-            match evaluators
-                .get(&policy_scope)
-                .ok_or(SearchObjectsError::Unavailable)?
-                .evaluate(&request)
-            {
-                Ok(()) => visible.push(candidate),
-                Err(PolicyEnforcementError::Denied { .. }) => continue,
-                Err(error) => return Err(error.into()),
-            }
+            visible.push(candidate);
             if visible.len() > limit {
                 let next_start_after = visible
                     .get(limit - 1)
                     .map(|candidate| candidate.cursor_key.clone());
                 visible.truncate(limit);
-                return Ok(SearchNodePage {
-                    hits: visible,
-                    next_start_after,
-                    observed_at: SystemTime::now(),
-                });
+                return Ok(node_page(visible, next_start_after, &distributed));
             }
         }
 
-        match batch.next_start_after {
-            Some(next) => start_after = Some(next),
-            None => {
-                return Ok(SearchNodePage {
-                    hits: visible,
-                    next_start_after: None,
-                    observed_at: SystemTime::now(),
-                });
-            }
+        match batch.next_start {
+            Some(next) => start = Some(next),
+            None => return Ok(node_page(visible, None, &distributed)),
         }
+    }
+}
+
+/// A page of a scan; the distributed buckets it skipped count as unsearched, since only their
+/// range indexes cover them.
+fn node_page(
+    hits: Vec<SearchNodeHit>,
+    next_start_after: Option<Vec<u8>>,
+    distributed: &HashMap<String, bool>,
+) -> SearchNodePage {
+    SearchNodePage {
+        hits,
+        next_start_after,
+        observed_at: SystemTime::now(),
+        incomplete_ranges: distributed.values().filter(|bound| **bound).count(),
+        remote_ranges: 0,
+    }
+}
+
+/// Whether the caller may read the hit: group READ on its full object path, token path
+/// restrictions and the request policies of its group.
+async fn authorize(
+    context: &DriverContext,
+    input: &SearchObjectsInput,
+    evaluators: &mut HashMap<(RealmId, GroupId), PolicyEvaluator>,
+    candidate: &SearchNodeHit,
+) -> Result<bool, SearchObjectsError> {
+    let path = object_permission_path(
+        input.realm_id,
+        candidate.hit.group_id,
+        input.node_id,
+        &candidate.hit.bucket,
+        &candidate.hit.key,
+    );
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: input.auth.clone(),
+            path: path.clone(),
+            required_permission: Permission::READ,
+        }),
+        context,
+    )
+    .await
+    .unwrap_or(false);
+    if !allowed {
+        return Ok(false);
+    }
+    let policy_scope = (input.realm_id, candidate.hit.group_id);
+    if !evaluators.contains_key(&policy_scope) {
+        evaluators.extend(PolicyEvaluator::load_bulk(context, vec![policy_scope]).await?);
+    }
+    let request = policy_request_with(
+        &path,
+        &Permission::READ,
+        Some(&input.auth),
+        PolicyRequestExtras::rest(),
+    );
+    match evaluators
+        .get(&policy_scope)
+        .ok_or(SearchObjectsError::Unavailable)?
+        .evaluate(&request)
+    {
+        Ok(()) => Ok(true),
+        Err(PolicyEnforcementError::Denied { .. }) => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
 async fn scan_candidate_batch(
     context: &DriverContext,
     input: &SearchObjectsInput,
-    start_after: Option<Vec<u8>>,
+    start: Option<IterStart>,
     scan_limit: usize,
+    distributed: &mut HashMap<String, bool>,
 ) -> Result<CandidateBatch, SearchObjectsError> {
-    let txn_id = match context
+    let txn_id = start_read(context).await?;
+    let result = scan_candidates(context, input, start, scan_limit, txn_id, distributed).await;
+    finish_read(context, txn_id, result).await
+}
+
+async fn start_read(context: &DriverContext) -> Result<TxnId, SearchObjectsError> {
+    match context
         .storage_handle
         .send_storage_effect(StorageEffect::StartTransaction { read: true })
         .await
     {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        event => return Err(storage_event_error(event)),
-    };
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
+        event => Err(storage_event_error(event)),
+    }
+}
 
-    let result = scan_candidates(context, input, start_after, scan_limit, txn_id).await;
+/// Commits the read transaction after `result`, or aborts it after an error.
+async fn finish_read<T>(
+    context: &DriverContext,
+    txn_id: TxnId,
+    result: Result<T, SearchObjectsError>,
+) -> Result<T, SearchObjectsError> {
     let completion = if result.is_ok() {
         StorageEffect::CommitTransaction { txn_id }
     } else {
@@ -238,39 +314,43 @@ async fn scan_candidate_batch(
 async fn scan_candidates(
     context: &DriverContext,
     input: &SearchObjectsInput,
-    start_after: Option<Vec<u8>>,
+    start: Option<IterStart>,
     scan_limit: usize,
     txn_id: TxnId,
+    distributed: &mut HashMap<String, bool>,
 ) -> Result<CandidateBatch, SearchObjectsError> {
-    let (heads, next_start_after) =
-        scan_heads(context, input, start_after, scan_limit, txn_id).await?;
+    let (heads, next_start) =
+        scan_heads(context, input, start, scan_limit, txn_id, distributed).await?;
     let live = load_live(context, input, heads, txn_id).await?;
     let candidates = build_hits(context, input, live, txn_id).await?;
 
     Ok(CandidateBatch {
         candidates,
-        next_start_after,
+        next_start,
     })
 }
 
 async fn scan_heads(
     context: &DriverContext,
     input: &SearchObjectsInput,
-    start_after: Option<Vec<u8>>,
+    start: Option<IterStart>,
     scan_limit: usize,
     txn_id: TxnId,
-) -> Result<(Vec<HeadCandidate>, Option<Vec<u8>>), SearchObjectsError> {
-    let prefix = input
-        .bucket
-        .as_deref()
-        .map(BlobHeadKey::bucket_prefix)
-        .transpose()?;
+    distributed: &mut HashMap<String, bool>,
+) -> Result<(Vec<HeadCandidate>, Option<IterStart>), SearchObjectsError> {
+    let prefix = match (input.bucket.as_deref(), input.key_match) {
+        (Some(bucket), ObjectKeyMatch::Prefix) => {
+            Some(BlobHeadKey::object_prefix(bucket, &input.query)?)
+        }
+        (Some(bucket), ObjectKeyMatch::Substring) => Some(BlobHeadKey::bucket_prefix(bucket)?),
+        (None, _) => None,
+    };
     let event = context
         .storage_handle
         .send_storage_effect(StorageEffect::Iter {
             key_space: aruna_core::keyspaces::BLOB_HEAD_KEYSPACE.to_string(),
             prefix: prefix.map(Into::into),
-            start: start_after.map(|key| IterStart::After(key.into())),
+            start,
             limit: scan_limit,
             txn_id: Some(txn_id),
         })
@@ -282,9 +362,19 @@ async fn scan_heads(
     else {
         return Err(storage_event_error(event));
     };
+    let mut next_start = next_start_after.map(IterStart::After);
+    if input.bucket.is_none() {
+        learn_buckets(context, &values, txn_id, distributed).await?;
+    }
     let mut heads = Vec::new();
     for (key, value) in values {
         let head = BlobHeadKey::from_bytes(key.as_ref())?;
+        if distributed.get(&head.bucket) == Some(&true) {
+            // "{bucket}0" is the first head key after every key of the bucket.
+            let after_bucket = format!("{}0", head.bucket).into_bytes();
+            next_start = Some(IterStart::At(after_bucket.into()));
+            break;
+        }
         if !input.key_match.matches(&head.key, &input.query) {
             continue;
         }
@@ -295,7 +385,41 @@ async fn scan_heads(
             cursor_key: key.to_vec(),
         });
     }
-    Ok((heads, next_start_after.map(|key| key.to_vec())))
+    Ok((heads, next_start))
+}
+
+/// Records which buckets of a realm-wide batch are distributed. Their keys are searched only
+/// through their range indexes, so a realm-wide scan skips them.
+async fn learn_buckets(
+    context: &DriverContext,
+    values: &[(Key, aruna_core::types::Value)],
+    txn_id: TxnId,
+    distributed: &mut HashMap<String, bool>,
+) -> Result<(), SearchObjectsError> {
+    let mut names = Vec::new();
+    for (key, _) in values {
+        let head = BlobHeadKey::from_bytes(key.as_ref())?;
+        if !distributed.contains_key(&head.bucket) && !names.contains(&head.bucket) {
+            names.push(head.bucket);
+        }
+    }
+    let reads = (names.iter())
+        .map(|name| {
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                Key::from(name.as_bytes().to_vec()),
+            )
+        })
+        .collect();
+    let buckets = batch_read(context, reads, txn_id).await?;
+    for (name, (_, bucket)) in names.into_iter().zip(buckets) {
+        let bucket = bucket
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()?;
+        let bound = bucket.is_some_and(|bucket| bucket.distribution.is_some());
+        distributed.insert(name, bound);
+    }
+    Ok(())
 }
 
 async fn load_live(
@@ -509,18 +633,23 @@ mod tests {
     use tempfile::TempDir;
     use ulid::Ulid;
 
-    struct Fixture {
+    pub(super) struct Fixture {
         _directory: TempDir,
-        context: DriverContext,
-        realm_id: RealmId,
-        node_id: NodeId,
-        owner: UserId,
-        caller: UserId,
-        visible_group: GroupId,
+        pub(super) context: DriverContext,
+        pub(super) realm_id: RealmId,
+        pub(super) node_id: NodeId,
+        pub(super) owner: UserId,
+        pub(super) caller: UserId,
+        pub(super) visible_group: GroupId,
         hidden_group: GroupId,
     }
 
-    async fn write_value(context: &DriverContext, keyspace: &str, key: Vec<u8>, value: Vec<u8>) {
+    pub(super) async fn write_value(
+        context: &DriverContext,
+        keyspace: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -536,7 +665,7 @@ mod tests {
         ));
     }
 
-    async fn setup() -> Fixture {
+    pub(super) async fn setup() -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
@@ -633,6 +762,7 @@ mod tests {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 }
                 .to_bytes()
                 .unwrap(),
@@ -652,7 +782,7 @@ mod tests {
         }
     }
 
-    async fn seed_materialized(
+    pub(super) async fn seed_materialized(
         fixture: &Fixture,
         bucket: &str,
         key: &str,
@@ -729,7 +859,7 @@ mod tests {
         .await;
     }
 
-    fn input(
+    pub(super) fn input(
         fixture: &Fixture,
         auth: AuthContext,
         query: &str,

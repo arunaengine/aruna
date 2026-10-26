@@ -17,17 +17,19 @@ use aruna_blob::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
-use aruna_core::errors::ConversionError;
+use aruna_core::errors::{BlobError, ConversionError, StagingSourceError};
 use aruna_core::events::SubOperationEvent;
-use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    REPLICATION_OBLIGATION_KEYSPACE,
+    CONNECTOR_REFERENCE_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::checksum::{HASH_MD5, HASH_SHA256};
-use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
+use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_MD5, HASH_SHA256};
+use aruna_core::structs::execution::source_access::{
+    DigestOrigin, DigestScope, ResolvedSourceAccess, SourceDigest, SourceMetadata,
+};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
@@ -425,7 +427,7 @@ fn reference_range_reads() {
     });
     let txn_id = Ulid::generate();
     let access = ResolvedSourceAccess::OpenDal {
-        kind: SourceConnectorKind::Http,
+        kind: SourceConnectorKind::S3,
         config: HashMap::new(),
         path: "folder/file.txt".to_string(),
         version: None,
@@ -457,11 +459,12 @@ fn reference_range_reads() {
     let metadata = SourceMetadata {
         content_length: 10,
         content_type: Some("text/plain".to_string()),
-        etag: None,
+        etag: Some("\"v1\"".to_string()),
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     };
-    // Baseline matches the live head, so this undrifted read serves directly.
+    // Baseline matches the live head, so this undrifted read serves directly, bound to it.
     operation.reference_cached = Some(metadata.clone());
     let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
         metadata: metadata.clone(),
@@ -469,8 +472,13 @@ fn reference_range_reads() {
 
     assert!(matches!(
         effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read { access: emitted_access, range })]
+        [Effect::StagingSource(StagingSourceEffect::Read {
+            access: emitted_access,
+            range,
+            expected,
+        })]
             if emitted_access == &access && range == &Some(6..10)
+                && expected.as_ref() == Some(&metadata)
     ));
 
     let effects = operation.step(Event::StagingSource(StagingSourceEvent::ReadResult {
@@ -505,6 +513,7 @@ fn range_drift_restarts() {
         etag: None,
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     });
     operation.resolved_range = Some(
         ObjectRangeRequest::StartEnd { start: 1, end: 3 }
@@ -520,6 +529,7 @@ fn range_drift_restarts() {
             etag: None,
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         },
         stream: aruna_core::stream::BackendStream::new(stream::iter(vec![
             Ok::<_, std::io::Error>(Bytes::from_static(b"bad")),
@@ -993,12 +1003,14 @@ async fn bound_connector_used() {
     let key = "test.txt".to_string();
     let version_id = Ulid::generate();
     let connector_id = Ulid::generate();
+    // The test source sends no Last-Modified, so the recorded observation has none either.
     let cached_metadata = SourceMetadata {
         content_length: 15,
         content_type: Some("text/plain".to_string()),
         etag: Some("etag-123".to_string()),
-        last_modified: Some(SystemTime::UNIX_EPOCH),
+        last_modified: None,
         source_version: None,
+        digests: Default::default(),
     };
     let source = VersionSourceBinding {
         strategy: StagingStrategy::Reference,
@@ -1009,6 +1021,7 @@ async fn bound_connector_used() {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: Some(connector_id),
     };
@@ -1176,6 +1189,7 @@ async fn drift_creates_successor() {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: Some(Ulid::generate()),
     };
@@ -1216,6 +1230,7 @@ async fn drift_creates_successor() {
                     etag: Some("stale-etag".to_string()),
                     last_modified: None,
                     source_version: None,
+                    digests: Default::default(),
                 },
                 SystemTime::UNIX_EPOCH,
                 Default::default(),
@@ -1347,6 +1362,7 @@ fn observation(content_length: u64) -> SourceMetadata {
         etag: Some(format!("etag-{content_length}")),
         last_modified: None,
         source_version: None,
+        digests: Default::default(),
     }
 }
 
@@ -1360,6 +1376,7 @@ fn reference_source() -> VersionSourceBinding {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: Some(Ulid::generate()),
     }
@@ -1460,6 +1477,54 @@ fn source_read(metadata: SourceMetadata) -> Event {
     })
 }
 
+// A distributed bucket records source changes only through the coordinated refresh, so a
+// drifted read there releases its transaction, queues a refresh and fails.
+#[test]
+fn bound_never_advances() {
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::format::Compression;
+
+    let mut operation = drifted_operation();
+    let txn_id = Ulid::generate();
+    operation.txn_id = Some(txn_id);
+    operation.state = GetObjectState::ReadBucketAdvance;
+    let bucket = BucketInfo {
+        group_id: Ulid::from_bytes([2; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(DistributionBinding {
+            set_id: Ulid::from_bytes([5; 16]),
+            member_id: Ulid::from_bytes([6; 16]),
+            incarnation: 1,
+            revision: Default::default(),
+        }),
+    };
+    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: Some(bucket.to_bytes().unwrap().into()),
+    }));
+    assert_eq!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    );
+    let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
+    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    assert_eq!(operation.state, GetObjectState::QueueChangedRefresh);
+    operation.step(Event::SubOperation(SubOperationEvent::RefreshQueued {
+        result: Ok(()),
+    }));
+    assert!(matches!(
+        operation.finalize(),
+        Err(GetObjectError::ReferenceSourceChanged)
+    ));
+}
+
 // CAS: only the reader whose head still matches may write the successor;
 // a concurrent winner makes this read abort and restart.
 #[test]
@@ -1504,10 +1569,12 @@ fn advance_writes_obligation() {
         (_, _, version_value),
         (_, _, head_value),
         (key_space, _, obligation_value),
+        (reference_space, ..),
     ] = writes.as_slice()
     else {
-        panic!("expected version, head and obligation writes, got {writes:?}")
+        panic!("expected version, head, obligation and reference writes, got {writes:?}")
     };
+    assert_eq!(reference_space, CONNECTOR_REFERENCE_KEYSPACE);
     let successor = BlobVersion::from_bytes(version_value.as_ref()).unwrap();
     assert_eq!(successor.created_by, creator);
     assert_ne!(successor.created_by, operation.input.user_identity);
@@ -1736,7 +1803,7 @@ fn historical_read_fails() {
     let mut operation = drifted_operation();
     let headed = observation(9);
     let mut read = headed.clone();
-    read.content_type = Some("changed/type".to_string());
+    read.etag = Some("changed-etag".to_string());
     operation.advance_observation = None;
     operation.reference_explicit = true;
     operation.source_metadata = Some(headed);
@@ -1748,6 +1815,207 @@ fn historical_read_fails() {
     assert_eq!(
         operation.finalize(),
         Err(GetObjectError::HistoricalReferenceUnavailable)
+    );
+}
+
+/// A version observation whose digest is a recorded sha256 of `digest`.
+fn digested(content_length: u64, digest: u8) -> SourceMetadata {
+    let mut metadata = observation(content_length);
+    metadata.digests.insert(
+        ChecksumAlgorithm::Sha256,
+        SourceDigest {
+            digest: vec![digest; 32],
+            scope: DigestScope::FullObject,
+            origin: DigestOrigin::Manifest,
+        },
+    );
+    metadata
+}
+
+fn spooled(sha256: u8) -> Event {
+    Event::Blob(BlobEvent::LocalSpooled {
+        hashes: HashMap::from([(HASH_SHA256.to_string(), vec![sha256; 32])]),
+        size: 9,
+        blob: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(
+            Bytes::from_static(b"body"),
+        )])),
+    })
+}
+
+// An unknown observation is checked against the version's recorded digests on the whole spooled
+// bytes before anything is served, and the result keeps those digests.
+#[test]
+fn unknown_keeps_digests() {
+    let mut operation = drifted_operation();
+    let stored = digested(9, 7);
+    let mut fresh = observation(9);
+    fresh.etag = None;
+    operation.reference_cached = Some(stored.clone());
+    operation.state = GetObjectState::HeadReferenceSource;
+
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: fresh.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read {
+            expected: None,
+            ..
+        })]
+    ));
+    assert!(matches!(
+        operation.step(source_read(fresh)).as_slice(),
+        [Effect::Blob(BlobEffect::SpoolLocal {
+            size: 9,
+            range: None,
+            ..
+        })]
+    ));
+    assert!(operation.step(spooled(7)).is_empty());
+
+    let result = operation.finalize().unwrap();
+    assert_eq!(result.source_metadata.unwrap().digests, stored.digests);
+    assert_eq!(result.last_refresh, None);
+}
+
+// Bytes that miss the recorded digests are never served: the spool stream is dropped, the read
+// fails.
+#[test]
+fn pinned_unknown_verified() {
+    let mut operation = drifted_operation();
+    let mut stored = digested(9, 7);
+    stored.etag = None;
+    operation.reference_cached = Some(stored);
+    operation.reference_explicit = true;
+    operation.state = GetObjectState::HeadReferenceSource;
+
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(9),
+    }));
+    operation.step(source_read(observation(9)));
+    assert!(operation.step(spooled(8)).is_empty());
+
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::ReferenceSourceChanged)
+    );
+}
+
+// Equal length and a second-rounded date call changed bytes the same, so a pin without a strong
+// ETag is checked against its digests even when the observation compares as the same.
+#[test]
+fn same_still_verified() {
+    let mut operation = drifted_operation();
+    let mut stored = digested(9, 7);
+    stored.etag = None;
+    stored.last_modified = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(5));
+    operation.reference_cached = Some(stored.clone());
+    operation.state = GetObjectState::HeadReferenceSource;
+
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: stored.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read {
+            expected: None,
+            ..
+        })]
+    ));
+    assert!(matches!(
+        operation.step(source_read(stored)).as_slice(),
+        [Effect::Blob(BlobEffect::SpoolLocal { .. })]
+    ));
+}
+
+// A spool that does not fit the node's spool budget fails the read as retryable.
+#[test]
+fn spool_budget_refused() {
+    let mut operation = drifted_operation();
+    let mut stored = digested(9, 7);
+    stored.etag = None;
+    operation.reference_cached = Some(stored.clone());
+    operation.state = GetObjectState::HeadReferenceSource;
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: stored.clone(),
+    }));
+    assert!(matches!(
+        operation.step(source_read(stored)).as_slice(),
+        [Effect::Blob(BlobEffect::SpoolLocal { size: 9, .. })]
+    ));
+
+    operation.step(Event::Blob(BlobEvent::Error(
+        BlobError::SpoolBudgetExhausted { limit: 1 },
+    )));
+
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::SpoolBudgetExhausted)
+    );
+}
+
+// A spool larger than the whole budget fails the read for good, naming the limit.
+#[test]
+fn oversized_spool_refused() {
+    let mut operation = drifted_operation();
+    let mut stored = digested(9, 7);
+    stored.etag = None;
+    operation.reference_cached = Some(stored.clone());
+    operation.state = GetObjectState::HeadReferenceSource;
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: stored.clone(),
+    }));
+    operation.step(source_read(stored));
+
+    operation.step(Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge {
+        limit: 4,
+    })));
+
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::ReferenceTooLarge { limit: 4 })
+    );
+}
+
+// An HTTP server may ignore `If-Match`, so a pinned version it serves needs recorded digests:
+// without them it is refused even when the observation compares as the same.
+#[test]
+fn unbound_pin_refused() {
+    let mut operation = drifted_operation();
+    let stored = observation(9);
+    operation.reference_cached = Some(stored.clone());
+    operation.reference_explicit = true;
+    operation.state = GetObjectState::HeadReferenceSource;
+
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: stored,
+    }));
+
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::HistoricalReferenceUnavailable)
+    );
+}
+
+// A bound read whose condition fails queues a request to observe the source, which the refresh
+// worker retries until it records the change; the read itself fails as changed.
+#[test]
+fn failed_condition_refreshes() {
+    let mut operation = drifted_operation();
+    operation.source_metadata = Some(observation(9));
+    operation.state = GetObjectState::ReadReferenceSource;
+
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
+        error: StagingSourceError::ConditionFailed,
+    }));
+    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    operation.step(Event::SubOperation(SubOperationEvent::RefreshQueued {
+        result: Ok(()),
+    }));
+
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::ReferenceSourceChanged)
     );
 }
 
@@ -1930,6 +2198,7 @@ async fn historical_drift_fails() {
             version_selector: None,
             capabilities: Vec::new(),
             origin_node_id: None,
+            namespace: None,
         },
         connector_id: Some(Ulid::generate()),
     };
@@ -1955,6 +2224,7 @@ async fn historical_drift_fails() {
                     etag: Some("stale-etag".to_string()),
                     last_modified: None,
                     source_version: None,
+                    digests: Default::default(),
                 },
                 SystemTime::UNIX_EPOCH,
                 Default::default(),
@@ -2399,4 +2669,182 @@ async fn slices_routed_range() {
     assert_eq!(read(6..8).await, b"gh");
     let suffix = ObjectRangeRequest::Suffix { length: 3 }.resolve(8).unwrap();
     assert_eq!(read(suffix.range).await, b"fgh");
+}
+
+fn distributed_operation() -> GetObjectOperation {
+    let mut operation = GetObjectOperation::new(GetObjectInput {
+        bucket: "spire".to_string(),
+        key: "a.txt".to_string(),
+        version_id: None,
+        range: None,
+        group_id: Ulid::from_parts(5, 5),
+        user_identity: UserId::local(Ulid::from_parts(2, 2), RealmId([0u8; 32])),
+        realm_id: RealmId([0u8; 32]),
+        node_id: test_node_id(),
+    });
+    operation.txn_id = Some(Ulid::from_parts(9, 9));
+    operation
+}
+
+// A version this member holds only the record of looks for a kept copy, then hands the read to
+// the holders of its range with the facts the record gives.
+#[test]
+fn held_version_pulls() {
+    use aruna_core::structs::storage::distribution::on_use::attachment_key;
+    let mut operation = distributed_operation();
+    let set_id = Ulid::from_parts(7, 7);
+    let mut source = reference_source();
+    source.descriptor.kind = SourceConnectorKind::ArunaNative;
+    source.descriptor.public_config = HashMap::from([("set_id".to_string(), set_id.to_string())]);
+    let version = BlobVersion::reference(
+        source,
+        observation(4),
+        SystemTime::UNIX_EPOCH,
+        UserId::local(Ulid::from_parts(1, 1), RealmId([0u8; 32])),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_identity(Some([3; 32]));
+    let version_id = Ulid::from_parts(4, 4);
+
+    let effects = operation.read_version(version_id, version, false);
+
+    let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+        panic!("expected the kept copy reads")
+    };
+    assert_eq!(reads[0].1.to_vec(), attachment_key(set_id, version_id));
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(Vec::new().into(), None), (Vec::new().into(), None)],
+    }));
+    let Err(GetObjectError::HeldElsewhere(held)) = operation.finalize() else {
+        panic!("expected a read through holders")
+    };
+    assert_eq!(
+        (held.set_id, held.identity, held.size),
+        (set_id, [3; 32], 4)
+    );
+    assert_eq!(
+        held.blake3,
+        Some([3; 32]),
+        "a native record names its bytes"
+    );
+}
+
+// A member serves its kept copy of an external reference without asking the source.
+#[test]
+fn kept_reference_served() {
+    use aruna_core::structs::storage::distribution::on_use::Attachment;
+    use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
+    let mut operation = distributed_operation();
+    let version = BlobVersion::reference(
+        reference_source(),
+        observation(4),
+        SystemTime::UNIX_EPOCH,
+        UserId::local(Ulid::from_parts(1, 1), RealmId([0u8; 32])),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_identity(Some([6; 32]));
+    let effects = operation.read_version(Ulid::from_parts(4, 4), version, false);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })]
+            if key_space == aruna_core::keyspaces::S3_BUCKET_KEYSPACE
+    ));
+    let bucket = aruna_core::structs::storage::blob::BucketInfo {
+        group_id: Ulid::from_parts(5, 5),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: aruna_core::structs::storage::format::Compression::Off,
+        distribution: Some(DistributionBinding {
+            set_id: Ulid::from_parts(7, 7),
+            member_id: Ulid::from_parts(8, 8),
+            incarnation: 5,
+            revision: DistributionRevision::default(),
+        }),
+    };
+    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: Vec::<u8>::new().into(),
+        value: Some(bucket.to_bytes().unwrap().into()),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 2
+    ));
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/tmp".to_string(),
+        storage_bucket: "aruna_test".to_string(),
+        backend_path: "_jobs/kept".to_string(),
+        ulid: Ulid::nil(),
+        format: StoredFormat::default(),
+        created_by: Default::default(),
+        created_at: SystemTime::UNIX_EPOCH,
+        staging: false,
+        partial: false,
+        blob_size: 4,
+        hashes: HashMap::from([("blake3".to_string(), vec![2; 32])]),
+    };
+    let attached = Attachment {
+        blake3: [2; 32],
+        location,
+    };
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![
+            (Vec::new().into(), Some(attached.to_bytes().unwrap().into())),
+            (Vec::new().into(), None),
+        ],
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })]
+            if key_space == aruna_core::keyspaces::OBJECT_METADATA_KEYSPACE
+    ));
+    assert_eq!(operation.state, GetObjectState::ReadMultipartSummary);
+}
+
+// An external reference whose source fails reads through holders by its identity, without
+// claiming that the identity digest is the BLAKE3 of its bytes.
+#[test]
+fn failed_source_identity() {
+    use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
+    let mut operation = distributed_operation();
+    let version = BlobVersion::reference(
+        reference_source(),
+        observation(4),
+        SystemTime::UNIX_EPOCH,
+        UserId::local(Ulid::from_parts(1, 1), RealmId([0u8; 32])),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_identity(Some([6; 32]));
+    operation.read_version(Ulid::from_parts(4, 4), version, false);
+    let bucket = aruna_core::structs::storage::blob::BucketInfo {
+        group_id: Ulid::from_parts(5, 5),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: aruna_core::structs::storage::format::Compression::Off,
+        distribution: Some(DistributionBinding {
+            set_id: Ulid::from_parts(7, 7),
+            member_id: Ulid::from_parts(8, 8),
+            incarnation: 5,
+            revision: DistributionRevision::default(),
+        }),
+    };
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: Vec::<u8>::new().into(),
+        value: Some(bucket.to_bytes().unwrap().into()),
+    }));
+    operation.source_failed(GetObjectError::GetObjectFailed);
+    let Err(GetObjectError::HeldElsewhere(held)) = operation.finalize() else {
+        panic!("expected a read through holders")
+    };
+    assert_eq!((held.identity, held.blake3), ([6; 32], None));
+    assert!(!held.info().hashes.contains_key("blake3"));
 }

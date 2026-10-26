@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::global_id::GlobalId;
 use crate::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
@@ -43,11 +44,13 @@ pub struct DataIdentity {
     /// The realm a content hash ARN names; `None` for a content hash W3ID.
     pub hash_realm: Option<RealmId>,
     pub location: Option<ObjectLocation>,
+    /// A distributed bucket's version, bucket or prefix URL; it names no node or key.
+    pub global: Option<GlobalId>,
 }
 
 impl DataIdentity {
-    /// Reads every supported form: versioned ARN or its W3ID, content hash W3ID or ARN,
-    /// and `s3://` URLs. The first location found wins.
+    /// Reads every supported form: versioned ARN or its W3ID, content hash W3ID or ARN, global
+    /// id URLs and `s3://` URLs. The first location found wins.
     pub fn read(entity_id: &str, content_urls: &[String]) -> Self {
         let mut identity = Self::default();
         for value in std::iter::once(entity_id).chain(content_urls.iter().map(String::as_str)) {
@@ -55,6 +58,7 @@ impl DataIdentity {
                 match identifier {
                     W3idIdentifier::ContentHash(hash) => identity.hash = Some(hash),
                     W3idIdentifier::VersionedObject(exact) => identity.exact = Some(exact),
+                    W3idIdentifier::Global(global) => identity.global = Some(global),
                 }
             } else if let Ok(exact) = VersionedObjectArn::parse(value) {
                 identity.exact = Some(exact);
@@ -73,7 +77,10 @@ impl DataIdentity {
 
     /// Whether any value names an Aruna object.
     pub fn is_aruna(&self) -> bool {
-        self.exact.is_some() || self.hash.is_some() || self.location.is_some()
+        self.exact.is_some()
+            || self.hash.is_some()
+            || self.location.is_some()
+            || self.global.is_some()
     }
 }
 
@@ -244,6 +251,16 @@ mod tests {
         );
         let relative = DataIdentity::read("data/a.csv", &[]);
         assert!(!relative.is_aruna());
+        let global = GlobalId::Version {
+            realm_id: realm(),
+            version_id: Ulid::from(2),
+        };
+        let by_global = DataIdentity::read(&global.to_url(), &[content_id(hash)]);
+        assert_eq!(
+            (by_global.global, by_global.hash),
+            (Some(global.clone()), Some(hash))
+        );
+        assert!(!DataIdentity::read(&global.to_string(), &[]).is_aruna());
         assert_eq!(ObjectLocation::parse("s3://b/"), None);
         assert_eq!(ObjectLocation::parse("s3:///k"), None);
     }

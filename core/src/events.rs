@@ -13,7 +13,7 @@ use crate::metadata::MetadataEvent;
 use crate::node_vault::VaultEntry;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::execution::source_access::{
-    ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
+    ListCursor, ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
 };
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::VaultRecords;
@@ -88,6 +88,9 @@ pub enum SubOperationEvent {
     LiveReplicationQueued {
         result: Result<(), String>,
     },
+    RefreshQueued {
+        result: Result<(), String>,
+    },
     BucketCreated {
         result: Result<(), String>,
     },
@@ -153,6 +156,12 @@ pub enum BlobEvent {
     HiddenRead {
         blob: BackendStream<Result<Bytes, BackendStreamError>>,
         stream_size: u64,
+    },
+    /// The hashes of all spooled bytes and a stream of the requested range of them.
+    LocalSpooled {
+        hashes: std::collections::HashMap<String, Vec<u8>>,
+        size: u64,
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
     },
     HiddenDeleted,
     HiddenListed {
@@ -300,7 +309,8 @@ pub enum StagingSourceEvent {
     },
     ListResult {
         entries: Vec<SourceEntry>,
-        truncated: bool,
+        /// `None` once the listing is exhausted or reached its stop key.
+        next_cursor: Option<ListCursor>,
     },
     ReadResult {
         metadata: SourceMetadata,
@@ -417,6 +427,8 @@ pub enum NetEvent {
     PolicySign(PolicySignEvent),
     VaultFetch(VaultFetchEvent),
     VaultSign(VaultSignEvent),
+    SnapshotSign(SnapshotSignEvent),
+    StatementSign(StatementSignEvent),
     Error(NetError),
 }
 
@@ -448,6 +460,22 @@ pub enum PolicyFetchEvent {
 #[derive(Debug, PartialEq)]
 pub enum VaultSignEvent {
     Signed(Box<VaultRecords>),
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::SnapshotSign`]. The adapter signs only a snapshot
+/// whose set names this node as publisher.
+#[derive(Debug, PartialEq)]
+pub enum SnapshotSignEvent {
+    Signed(Box<crate::structs::storage::distribution::SignedSnapshot>),
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::StatementSign`]. The adapter signs only a claim
+/// that names this node as signer.
+#[derive(Debug, PartialEq)]
+pub enum StatementSignEvent {
+    Signed(Box<crate::structs::storage::distribution::SignedStatement>),
     Unavailable(String),
 }
 

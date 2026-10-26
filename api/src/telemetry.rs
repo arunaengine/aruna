@@ -116,14 +116,7 @@ pub async fn request_tracing_middleware(
 
     {
         let _guard = span.enter();
-        trace!(
-            event = "request.received",
-            protocol = "http",
-            method = %method,
-            path = %path,
-            query = query.as_deref().unwrap_or(""),
-            "Received HTTP request"
-        );
+        trace_received(&method, &path, query.as_deref());
     }
 
     let stages = RequestStages::default();
@@ -168,6 +161,52 @@ pub async fn request_tracing_middleware(
         );
     }
     response
+}
+
+/// Query names whose values are credentials: download tickets, tokens and S3 presign values.
+const SECRET_QUERY_NAMES: &[&str] = &[
+    "ticket",
+    "token",
+    "signature",
+    "credential",
+    "secret",
+    "password",
+    "session",
+];
+
+/// The query with every credential value replaced, so tickets and tokens never reach a log,
+/// malformed or not. A name matches case-insensitively, also inside a longer name.
+pub fn redact_query(query: &str) -> String {
+    query
+        .split('&')
+        .map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let decoded: String = url::form_urlencoded::parse(name.as_bytes())
+                .map(|(name, _)| name.into_owned())
+                .collect();
+            let decoded = decoded.to_ascii_lowercase();
+            let secret = decoded == "code"
+                || SECRET_QUERY_NAMES
+                    .iter()
+                    .any(|secret| decoded.contains(secret));
+            match secret && !value.is_empty() {
+                true => format!("{name}=[redacted]"),
+                false => pair.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn trace_received(method: &Method, path: &str, query: Option<&str>) {
+    trace!(
+        event = "request.received",
+        protocol = "http",
+        method = %method,
+        path = %path,
+        query = %query.map(redact_query).unwrap_or_default(),
+        "Received HTTP request"
+    );
 }
 
 pub fn make_request_span(
@@ -276,6 +315,93 @@ pub fn emit_request_completed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_credential_values() {
+        let redacted = redact_query("object_id=a%2Fb&ticket=t1&X-Amz-Signature=s&code=c&%74oken=x");
+        assert_eq!(
+            redacted,
+            "object_id=a%2Fb&ticket=[redacted]&X-Amz-Signature=[redacted]&code=[redacted]\
+             &%74oken=[redacted]"
+        );
+        // A pair without `=` keeps no value to leak.
+        assert_eq!(redact_query("ticket&here=true"), "ticket&here=true");
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An encoded, signed download ticket whose object id carries `marker`.
+    fn canary_ticket(marker: &str) -> String {
+        use aruna_core::structs::identity::realm::RealmId;
+        use aruna_core::structs::storage::backend_import::TokenGrant;
+        use aruna_core::structs::storage::distribution::ticket::{SignedTicket, Ticket};
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let issuer = iroh::SecretKey::from_bytes(&[2; 32]);
+        let ticket = Ticket {
+            realm_id,
+            issuer: issuer.public(),
+            target: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            user_id: aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            grant: TokenGrant {
+                token_hash: marker.to_string(),
+                issuer: realm_id,
+                issued_at_secs: 1,
+                expires_at_secs: 20,
+                via: None,
+            },
+            restrictions: None,
+            session: None,
+            object_id: marker.to_string(),
+            nonce: [5; 16],
+            issued_at: 10,
+            expires_at: 20,
+        };
+        let signature = issuer.sign(&ticket.signing_bytes().unwrap());
+        SignedTicket { ticket, signature }.encode().unwrap()
+    }
+
+    #[test]
+    fn ticket_canary_unlogged() {
+        // An issued ticket with a known marker must not appear in any log line.
+        let marker = canary_ticket("CANARY0TICKET0MARKER");
+        let marker = marker.as_str();
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let query = format!("object_id=x&ticket={marker}&here=true");
+            trace_received(&Method::GET, "/api/v1/ga4gh/drs/v1/download", Some(&query));
+            trace_received(
+                &Method::GET,
+                "/api/v1/data/x",
+                Some(&format!("ticket={marker}")),
+            );
+        });
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("here=true"),
+            "the log line was written: {output}"
+        );
+        assert!(
+            !output.contains(marker),
+            "the ticket leaked into the log: {output}"
+        );
+    }
 
     #[test]
     fn slow_threshold_defaults() {

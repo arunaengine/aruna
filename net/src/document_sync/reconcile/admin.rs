@@ -27,8 +27,16 @@ pub(crate) async fn apply_admin_operation(
         (DocumentTarget::RealmAuthorization { .. }, AdminDocumentTarget::Realm { .. }) => {
             apply_realm_authorization(storage, document_target, event).await
         }
-        (DocumentTarget::RealmConfig { .. }, AdminDocumentTarget::RealmConfig { .. }) => {
-            apply_realm_config(storage, document_target, event).await
+        (DocumentTarget::RealmConfig { realm_id }, AdminDocumentTarget::RealmConfig { .. }) => {
+            let realm_id = *realm_id;
+            apply_realm_config(storage, document_target, event).await?;
+            // A membership change may give parked snapshots their publisher.
+            retry_parked(storage, realm_id).await
+        }
+        (DocumentTarget::RealmConfig { .. }, AdminDocumentTarget::Distribution { .. }) => {
+            apply_distribution_operation(storage, document_target, event)
+                .await
+                .map(|_| ())
         }
         _ => Err(NetError::Bootstrap(
             "admin document operation target does not match document sync target".to_string(),
@@ -815,6 +823,8 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::ConfigComputeSet { .. }
             | AdminDocumentOperation::ConfigFederationSet { .. }
             | AdminDocumentOperation::ConfigPortalSet { .. }
+            | AdminDocumentOperation::DatabaseSet { .. }
+            | AdminDocumentOperation::DatabaseRemoved { .. }
             | AdminDocumentOperation::ConfigTokenRevoked { .. }
     )
 }
@@ -1408,7 +1418,7 @@ async fn apply_realm_config(
     let realm_id = validate_config_target(&document_target, &event)?;
     if !config_mutation_allowed(&event.op) {
         return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, federation updates, and token revocations"
+            "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, federation updates, portal updates, database updates, and token revocations"
                 .to_string(),
         ));
     }

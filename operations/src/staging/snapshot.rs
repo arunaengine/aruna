@@ -6,6 +6,7 @@ use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
+use crate::s3::object::origin::database_entry;
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
@@ -15,6 +16,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
@@ -23,6 +25,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
@@ -41,6 +44,8 @@ pub struct MaterializeSnapshotInput {
     pub retry_key: Option<String>,
     pub expected_bucket: BucketInfo,
     pub restrictions: Option<Vec<PathRestriction>>,
+    /// Digests the read bytes must match before they are kept, such as manifest digests.
+    pub expected_checksums: Vec<ExpectedChecksum>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -80,6 +85,7 @@ pub async fn stage_snapshot_blob(
             connector_id: input.connector_id,
             source_path: input.source_path.clone(),
             range: None,
+            expected: None,
         }),
         context,
     )
@@ -121,6 +127,9 @@ pub async fn stage_snapshot_blob(
     // The staging source is external, so it carries no refs of its own: only
     // the destination default governs the snapshot.
     let gate = gate_context(context, input.realm_id, now_ms()).await?;
+    let set_id = (input.expected_bucket.distribution.as_ref()).map(|binding| binding.set_id);
+    let scope = (input.realm_id, input.node_id);
+    let database = database_entry(context, scope, &input.bucket, set_id).await;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: input.user_id,
         group_id: input.group_id,
@@ -132,7 +141,7 @@ pub async fn stage_snapshot_blob(
             content_length: Some(read_result.metadata.content_length),
             body: Some(read_result.stream),
         },
-        expected_checksums: Vec::new(),
+        expected_checksums: input.expected_checksums,
         checksum_type: None,
         exists: false,
         version_source: Some(version_source.clone()),
@@ -141,7 +150,8 @@ pub async fn stage_snapshot_blob(
         routing,
     })
     .with_bucket_guard(input.expected_bucket)
-    .with_restrictions(input.restrictions.clone());
+    .with_restrictions(input.restrictions.clone())
+    .with_version_origin(Some(VersionOrigin::Source { database }));
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
@@ -271,6 +281,7 @@ mod tests {
             retry_key: Some("job-1".to_string()),
             expected_bucket,
             restrictions: None,
+            expected_checksums: Vec::new(),
         };
 
         let first = stage_snapshot_blob(context, input.clone()).await.unwrap();

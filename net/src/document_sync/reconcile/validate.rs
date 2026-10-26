@@ -898,6 +898,117 @@ pub(in crate::document_sync) async fn validate_group_authority(
     })
 }
 
+/// Database entries need more than a management origin: the actor's current WRITE on the
+/// databases path, and admin WRITE on the owning group from the actor or the consent's
+/// approver. A removal needs either right (P1 pattern, plan r39 section 20).
+async fn validate_database_actors(
+    storage: &StorageHandle,
+    event: &AdminDocumentEvent,
+    config: Option<&RealmConfigDocument>,
+) -> Result<AdminEventValidation> {
+    use aruna_core::structs::identity::database::{database_admin_path, owner_admin_path};
+    let (group, consent) = match &event.op {
+        AdminDocumentOperation::DatabaseSet { entry, consent, .. } => {
+            (Some(entry.owner_group), consent.as_deref())
+        }
+        AdminDocumentOperation::DatabaseRemoved { entry_id } => (
+            config
+                .and_then(|config| {
+                    config
+                        .databases
+                        .iter()
+                        .find(|entry| entry.entry_id == *entry_id)
+                })
+                .map(|entry| entry.owner_group),
+            None,
+        ),
+        _ => return Ok(AdminEventValidation::Accepted),
+    };
+    if let AdminDocumentOperation::DatabaseSet { entry, .. } = &event.op
+        && !owner_matches(storage, entry).await?
+    {
+        return Ok(AdminEventValidation::Rejected(
+            "the entry names another owner group than its distributed bucket".to_string(),
+        ));
+    }
+    let realm_id = event.actor.realm_id;
+    let Some(realm_auth) = read_realm_authorization(storage, realm_id).await? else {
+        return Ok(AdminEventValidation::Deferred {
+            dependency: Some(DocumentSyncDependency::RealmAuthorization(realm_id)),
+            reason: "realm authorization state is unavailable".to_string(),
+        });
+    };
+    let group_auth = match group {
+        Some(group_id) => {
+            let target = DocumentTarget::GroupAuthorization { group_id };
+            storage_read_from(
+                storage,
+                target.storage_keyspace().to_string(),
+                target.storage_key(),
+            )
+            .await?
+            .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
+            .transpose()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+        }
+        None => None,
+    };
+    let roles = || {
+        realm_auth
+            .roles
+            .values()
+            .chain(group_auth.iter().flat_map(|auth| auth.roles.values()))
+    };
+    let curator =
+        has_write_permission(event.actor.user_id, &database_admin_path(realm_id), roles());
+    let owner = |user_id| {
+        group.is_some_and(|group_id| {
+            has_write_permission(user_id, &owner_admin_path(realm_id, group_id), roles())
+        })
+    };
+    let allowed = match (&event.op, consent) {
+        (AdminDocumentOperation::DatabaseSet { .. }, None) => curator && owner(event.actor.user_id),
+        (AdminDocumentOperation::DatabaseSet { .. }, Some(consent)) => {
+            curator
+                && owner(consent.claim.approver)
+                && config.is_some_and(|config| origin_may_publish(config, &consent.signer))
+        }
+        _ => curator || owner(event.actor.user_id),
+    };
+    if let Some(group_id) = group.filter(|_| !allowed && group_auth.is_none()) {
+        return Ok(AdminEventValidation::Deferred {
+            dependency: Some(DocumentSyncDependency::GroupAuthorization(group_id)),
+            reason: "the owning group's authorization state is unavailable".to_string(),
+        });
+    }
+    Ok(if allowed {
+        AdminEventValidation::Accepted
+    } else {
+        AdminEventValidation::Rejected(
+            "actor or consent approver lacks current database authority".to_string(),
+        )
+    })
+}
+
+/// Whether a distributed bucket's entry names the set's owner group; a set fixes its group,
+/// and a set this node does not hold yet passes.
+async fn owner_matches(
+    storage: &StorageHandle,
+    entry: &aruna_core::structs::identity::database::DatabaseEntry,
+) -> Result<bool> {
+    use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+    use aruna_core::structs::identity::database::DatabaseTarget;
+    use aruna_core::structs::storage::distribution::DistributionView;
+    let DatabaseTarget::Distributed { set_id } = &entry.target else {
+        return Ok(true);
+    };
+    let key = set_id.to_bytes().to_vec().into();
+    let view = storage_read_from(storage, DISTRIBUTION_KEYSPACE.to_string(), key).await?;
+    Ok(view
+        .and_then(|bytes| DistributionView::from_bytes(&bytes).ok())
+        .is_none_or(|view| view.snapshot().root.owner_group == entry.owner_group))
+}
+
 pub(in crate::document_sync) fn has_write_permission<'a>(
     user_id: UserId,
     path: &str,
@@ -1288,13 +1399,19 @@ async fn validate_admin_envelope(
 }
 
 /// A federated user acts through the reconciled realm only on group events, which the group
-/// authority check still decides, and to revoke its own token.
+/// authority check still decides, to revoke its own token, and through a set's publisher.
 fn foreign_actor_allowed(event: &AdminDocumentEvent, realm_id: RealmId) -> bool {
     event.actor.realm_id == realm_id
         && !event.actor.user_id.is_nil()
         && match &event.op {
             AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. } => {
                 *token_owner == event.actor.user_id
+            }
+            // The publisher accepted a federated admin's request; signature, realm and set
+            // are still checked by the distribution shape rules.
+            AdminDocumentOperation::DistributionPublished { snapshot } => {
+                matches!(event.target, AdminDocumentTarget::Distribution { .. })
+                    && snapshot.snapshot.root.publisher == event.origin_node_id
             }
             _ => matches!(event.target, AdminDocumentTarget::Group { .. }),
         }
@@ -1335,6 +1452,13 @@ fn family_matches_targets(
             DocumentTarget::RealmConfig { realm_id },
             AdminDocumentTarget::RealmConfig { realm_id: event_realm_id }
         ) if realm_id == event_realm_id
+    ) || matches!(
+        (family, target, event_target),
+        (
+            AdminOperationFamily::Distribution,
+            DocumentTarget::RealmConfig { realm_id },
+            AdminDocumentTarget::Distribution { realm_id: event_realm_id, .. }
+        ) if realm_id == event_realm_id
     )
 }
 
@@ -1342,9 +1466,9 @@ fn family_matches_targets(
 /// with the event actor's realm.
 fn validate_event_scope(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
     let target_realm = match &event.target {
-        AdminDocumentTarget::Realm { realm_id } | AdminDocumentTarget::RealmConfig { realm_id } => {
-            Some(*realm_id)
-        }
+        AdminDocumentTarget::Realm { realm_id }
+        | AdminDocumentTarget::RealmConfig { realm_id }
+        | AdminDocumentTarget::Distribution { realm_id, .. } => Some(*realm_id),
         AdminDocumentTarget::User { user_id } => Some(user_id.realm_id),
         AdminDocumentTarget::Group { .. } => None,
     };
@@ -1465,6 +1589,20 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 aruna_core::structs::identity::realm::validate_portal_features(features)
             {
                 return Err(format!("realm portal features rejected: {error}"));
+            }
+        }
+        AdminDocumentOperation::DatabaseSet {
+            entry,
+            predecessor,
+            consent,
+        } => {
+            entry
+                .validate()
+                .map_err(|error| format!("database entry rejected: {error}"))?;
+            if let Some(consent) = consent {
+                consent
+                    .verify(event.actor.realm_id, entry, predecessor.as_ref())
+                    .map_err(|error| format!("database consent rejected: {error}"))?;
             }
         }
         AdminDocumentOperation::CandidateMapPublished { map } => {
@@ -1684,7 +1822,10 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::ConfigComputeSet { .. }
         | AdminDocumentOperation::ConfigFederationSet { .. }
         | AdminDocumentOperation::ConfigPortalSet { .. }
+        | AdminDocumentOperation::DatabaseSet { .. }
+        | AdminDocumentOperation::DatabaseRemoved { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
+        AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };
 
     if !family_matches_targets(family, target, &event.target) {
@@ -1699,6 +1840,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         AdminOperationFamily::RealmAuthorization => validate_role_assignment(event),
         AdminOperationFamily::RealmConfig => validate_config_shape(event),
         AdminOperationFamily::User => Ok(()),
+        AdminOperationFamily::Distribution => validate_distribution_shape(event),
     };
     if let Err(reason) = shape {
         return reject(&reason);
@@ -1717,6 +1859,10 @@ pub(in crate::document_sync) async fn validate_admin_event(
             if !matches!(authorized, AdminEventValidation::Accepted) {
                 return Ok(authorized);
             }
+            let actors = validate_database_actors(storage, event, current_config).await?;
+            if !matches!(actors, AdminEventValidation::Accepted) {
+                return Ok(actors);
+            }
             cached_state.cloned()
         }
         family => {
@@ -1727,6 +1873,9 @@ pub(in crate::document_sync) async fn validate_admin_event(
                 }
                 AdminOperationFamily::Group => {
                     validate_group_authority(storage, event, previous_state.as_ref()).await?
+                }
+                AdminOperationFamily::Distribution => {
+                    validate_distribution_authority(storage, event).await?
                 }
                 _ => validate_user_authority(storage, event, previous_state.as_ref()).await?,
             };

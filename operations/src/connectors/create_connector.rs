@@ -127,7 +127,8 @@ impl SourceConnectorOperation {
             now,
             now,
             self.input.created_by,
-        );
+        )
+        .with_namespace(&self.input.secret_config);
         let secret =
             SourceConnectorSecret::new(connector_id, self.input.secret_config.clone(), now);
 

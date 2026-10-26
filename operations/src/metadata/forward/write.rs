@@ -488,6 +488,9 @@ pub(super) fn batch_refusal(refusal: SyncRefusal) -> MetadataWriteError {
         SyncRefusal::Unavailable => {
             MetadataWriteError::Undeliverable("no holder could apply the device edit".to_string())
         }
+        SyncRefusal::Coordinator(node) => {
+            MetadataWriteError::Undeliverable(format!("node {node} coordinates this key"))
+        }
     }
 }
 

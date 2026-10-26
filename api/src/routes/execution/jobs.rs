@@ -956,6 +956,9 @@ pub(crate) fn map_submit_error(
         }
         SubmitJobError::QuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
         SubmitJobError::AuthorityDenied => ServerError::Forbidden,
+        moving @ SubmitJobError::RangeMoving(_) => {
+            ServerError::ServiceUnavailableReason(moving.to_string())
+        }
         SubmitJobError::Upload(error) => {
             use aruna_operations::jobs::import::UploadClaimError;
             match error {

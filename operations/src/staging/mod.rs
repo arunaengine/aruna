@@ -8,6 +8,7 @@ pub mod head_source;
 pub mod list_source;
 pub mod native_source;
 pub mod offered_directory;
+pub mod page;
 pub mod read_source;
 pub mod reference;
 pub mod snapshot;
@@ -56,6 +57,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             }
             SubOperationEvent::LiveReplicationQueued { .. } => {
                 "Event::SubOperation(SubOperationEvent::LiveReplicationQueued)".to_string()
+            }
+            SubOperationEvent::RefreshQueued { .. } => {
+                "Event::SubOperation(SubOperationEvent::RefreshQueued)".to_string()
             }
             SubOperationEvent::SourceConnectorResolved { .. } => {
                 "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)".to_string()

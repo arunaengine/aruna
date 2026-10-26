@@ -183,6 +183,7 @@ pub(crate) async fn setup() -> (tempfile::TempDir, DriverContext) {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let name = BUCKET.as_bytes().to_vec();
     put(
@@ -602,6 +603,36 @@ async fn waits_for_migrations() {
     record.finished_at_ms = Some(2);
     put(&context, space, name, record.to_bytes().unwrap()).await;
     assert_eq!(preview(&context).await.unwrap().items.len(), 1);
+}
+
+#[tokio::test]
+async fn refuses_distributed_buckets() {
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+
+    let (_directory, context) = setup().await;
+    object(&context, "a/x", &[Ulid::from_parts(10, 1)], false).await;
+    let name = BUCKET.as_bytes().to_vec();
+    let stored = get(&context, S3_BUCKET_KEYSPACE, name.clone())
+        .await
+        .unwrap();
+    let mut bucket = BucketInfo::from_bytes(&stored).unwrap();
+    bucket.distribution = Some(DistributionBinding {
+        set_id: Ulid::from_bytes([5; 16]),
+        member_id: Ulid::from_bytes([6; 16]),
+        incarnation: 1,
+        revision: Default::default(),
+    });
+    put(
+        &context,
+        S3_BUCKET_KEYSPACE,
+        name,
+        bucket.to_bytes().unwrap(),
+    )
+    .await;
+    assert!(matches!(
+        preview(&context).await,
+        Err(RenameError::Conflict(_))
+    ));
 }
 
 #[tokio::test]

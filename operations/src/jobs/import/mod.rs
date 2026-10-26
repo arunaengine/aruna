@@ -41,7 +41,8 @@ use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdenti
 use aruna_core::structs::storage::blob::{
     BackendLocation, BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, object_permission_path,
 };
-use aruna_core::structs::storage::data_identity::{ObjectLocation, normalized_id};
+use aruna_core::structs::storage::data::identity::{ObjectLocation, normalized_id};
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use bytes::Bytes;
@@ -509,6 +510,7 @@ async fn acquire_source(
                     connector_id: *connector_id,
                     source_path: path.clone(),
                     range: None,
+                    expected: None,
                 }),
                 &ctx.driver,
             )
@@ -674,7 +676,7 @@ async fn validate_source(
     spec: &ImportRoCrateSpec,
     checkpoint: &mut ImportCheckpoint,
 ) -> Result<ImportPlan, ImportFailure> {
-    ensure_targets(ctx, spec).await?;
+    let set_hint = ensure_targets(ctx, spec).await?;
     ensure_valid_path(spec)?;
     let inspection = checkpoint
         .inspection
@@ -730,7 +732,7 @@ async fn validate_source(
                 ReasonCode::Unlisted
             },
             described_id,
-            version_id: Ulid::generate(),
+            version_id: mint_version(set_hint),
             data_offset: entry.data_offset,
             compressed_size: entry.compressed_size,
             uncompressed_size: entry.uncompressed_size,
@@ -1419,7 +1421,11 @@ async fn rollback_writes(
     Ok(removed)
 }
 
-async fn ensure_targets(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
+/// Checks the target and returns its set hint, which planned version ids carry.
+async fn ensure_targets(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+) -> Result<Option<SetHint>, ImportFailure> {
     let bucket = load_bucket(ctx, &spec.target.bucket).await?;
     ensure_permission(
         ctx,
@@ -1434,7 +1440,8 @@ async fn ensure_targets(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<()
     )
     .await?;
     ensure_metadata_permission(ctx, spec).await?;
-    ensure_federated(ctx, spec).await
+    ensure_federated(ctx, spec).await?;
+    Ok(bucket.distribution.as_ref().map(|binding| binding.hint()))
 }
 
 /// An import of another realm's artifact starts or resumes only after its source confirms the

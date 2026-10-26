@@ -5,20 +5,20 @@
 use super::{
     AuthContext, AuthToken, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
     DISTRIBUTED_QUERY_DEADLINE, DOCUMENT_LIFECYCLE_KEYSPACE, DriverContext, Event,
-    GRAPH_LIFECYCLE_KEYSPACE, GraphLifecycleRecord, GroupId, HashMap, ListGroupOperation,
-    MetadataApiError, MetadataFanoutScope, MetadataFanoutStats, MetadataLifecycleRecord,
-    MetadataQueryResults, MetadataReadError, MetadataRegistryRecord, NodeId, Permission,
-    REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect,
-    StorageEvent, StorageHandle, StorageReadError, TxnId, Ulid, check_policy_limit,
-    document_lifecycle_key, drive, graph_lifecycle_key, load_document_record, load_group_records,
-    load_pending_records, load_realm_config, map_internal_error, map_query_error,
-    merge_pending_records, parse_registry_read, query_fingerprint, read_document_registry,
-    record_materialized_read, reference_document_title, replica_query_nodes,
-    resolve_graph_reference, warn,
+    GRAPH_LIFECYCLE_KEYSPACE, GraphLifecycleRecord, GroupId, ListGroupOperation, MetadataApiError,
+    MetadataFanoutScope, MetadataFanoutStats, MetadataLifecycleRecord, MetadataQueryResults,
+    MetadataReadError, MetadataRegistryRecord, NodeId, Permission, REFERENCES_LIMIT,
+    REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect, StorageEvent,
+    StorageHandle, StorageReadError, TxnId, Ulid, check_policy_limit, document_lifecycle_key,
+    drive, graph_lifecycle_key, load_document_record, load_group_records, load_pending_records,
+    load_realm_config, map_query_error, merge_pending_records, parse_registry_read,
+    query_fingerprint, read_document_registry, record_materialized_read, reference_document_title,
+    replica_query_nodes, resolve_graph_reference, warn,
 };
 
 use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;
+use crate::metadata::data_links::LinkBudget;
 use aruna_core::handle::Handle;
 
 pub async fn query_metadata_document(
@@ -171,9 +171,15 @@ pub async fn query_metadata(
     })
 }
 
-/// Backlink lookup: scans the local IRI reference index for documents naming
-/// `iri` as an object, joins and filters by read access. Empty scans for known
-/// graph IRIs or `resolve` return one predicate-less summary. Local-node-only in v1.
+/// Postings one references page may read, so a page never scans the index.
+const REFERENCE_BUDGET: LinkBudget = LinkBudget {
+    seeks: 1100,
+    rows: 4096,
+};
+
+/// Reads one local page of the documents naming `iri` as an object, by document id after
+/// `after`; each must be live at the posting's cursor and readable. An empty first page for a
+/// known graph IRI, or `resolve`, returns one predicate-less summary.
 pub async fn references_metadata(
     context: &DriverContext,
     realm_id: RealmId,
@@ -194,86 +200,87 @@ pub async fn references_metadata(
         .unwrap_or(REFERENCES_LIMIT)
         .clamp(1, REFERENCES_MAX_LIMIT);
 
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    let registry = handle
-        .list_cached_records()
-        .await
-        .map_err(map_internal_error)?;
-    let registry = filter_live_records(&context.storage_handle, registry.as_ref()).await?;
-
     if request.resolve {
-        let entry = resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?;
+        let registry = graph_record(context, &request.iri).await?;
+        let entry =
+            resolve_graph_reference(context, realm_id, &request, registry.as_slice()).await?;
         return Ok(MetadataReferencesExecution {
             references: entry.into_iter().collect(),
+            next_after: None,
         });
     }
 
-    let backlinks = crate::metadata::iri_index::lookup_iri_backlinks(
+    let mut budget = REFERENCE_BUDGET;
+    let page = crate::metadata::iri_index::read_backlinks(
         &context.storage_handle,
-        registry.as_ref(),
         &request.iri,
         request.predicate.as_deref(),
+        request.after,
+        limit,
+        &mut budget,
     )
     .await
     .map_err(|_| MetadataApiError::ServiceUnavailable)?;
 
-    let registry_by_id: HashMap<Ulid, &MetadataRegistryRecord> = registry
-        .iter()
-        .map(|record| (record.document_id, record))
-        .collect();
-
     let mut references = Vec::new();
-    let mut authorized: HashMap<Ulid, bool> = HashMap::new();
-    let mut titles: HashMap<Ulid, Option<String>> = HashMap::new();
-    for backlink in backlinks {
-        let Some(record) = registry_by_id.get(&backlink.document_id) else {
-            continue;
+    for (document_id, postings) in page.documents {
+        let record = match load_live_record(context, document_id).await {
+            Ok(record) => record,
+            Err(MetadataApiError::NotFound) => continue,
+            Err(error) => return Err(error),
         };
-        let allowed = match authorized.get(&backlink.document_id) {
-            Some(allowed) => *allowed,
-            None => {
-                let allowed =
-                    can_read_record(context, realm_id, request.auth.as_ref(), record).await?;
-                authorized.insert(backlink.document_id, allowed);
-                allowed
-            }
-        };
-        if !allowed {
+        let current: Vec<_> = postings
+            .into_iter()
+            .filter(|posting| posting.document_cursor == record.last_event_id)
+            .collect();
+        if current.is_empty()
+            || !can_read_record(context, realm_id, request.auth.as_ref(), &record).await?
+        {
             continue;
         }
-        let title = match titles.get(&backlink.document_id) {
-            Some(title) => title.clone(),
-            None => {
-                let title = reference_document_title(context, record).await;
-                titles.insert(backlink.document_id, title.clone());
-                title
-            }
-        };
-        references.push(MetadataReferenceEntry {
-            document_id: record.document_id.to_string(),
-            group_id: record.group_id.to_string(),
-            document_path: record.document_path.clone(),
-            graph_iri: record.graph_iri.clone(),
-            predicate: Some(backlink.predicate_iri),
-            subject_iris: backlink.subject_iris,
-            title,
-        });
-        if references.len() >= limit {
-            break;
+        let title = reference_document_title(context, &record).await;
+        for posting in current {
+            references.push(MetadataReferenceEntry {
+                document_id: record.document_id.to_string(),
+                group_id: record.group_id.to_string(),
+                document_path: record.document_path.clone(),
+                graph_iri: record.graph_iri.clone(),
+                predicate: Some(posting.predicate_iri),
+                subject_iris: posting.subject_iris,
+                title: title.clone(),
+            });
         }
     }
 
-    if references.is_empty()
-        && let Some(entry) =
-            resolve_graph_reference(context, realm_id, &request, registry.as_ref()).await?
-    {
-        references.push(entry);
+    if references.is_empty() && request.after.is_none() && page.next.is_none() {
+        let registry = graph_record(context, &request.iri).await?;
+        if let Some(entry) =
+            resolve_graph_reference(context, realm_id, &request, registry.as_slice()).await?
+        {
+            references.push(entry);
+        }
     }
 
-    Ok(MetadataReferencesExecution { references })
+    Ok(MetadataReferencesExecution {
+        references,
+        next_after: page.next,
+    })
+}
+
+/// The live record whose graph IRI is `iri`, by one point read of the document it names; never
+/// a walk over the registry.
+async fn graph_record(
+    context: &DriverContext,
+    iri: &str,
+) -> Result<Option<MetadataRegistryRecord>, MetadataApiError> {
+    let Some(document_id) = MetadataRegistryRecord::graph_document(iri) else {
+        return Ok(None);
+    };
+    match load_live_record(context, document_id).await {
+        Ok(record) => Ok((record.graph_iri == iri).then_some(record)),
+        Err(MetadataApiError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) async fn filter_live_records(
@@ -799,6 +806,8 @@ pub struct MetadataReferencesRequest {
     pub predicate: Option<String>,
     pub limit: Option<usize>,
     pub resolve: bool,
+    /// Documents after this id; pass the previous page's `next_after`.
+    pub after: Option<Ulid>,
 }
 
 #[derive(Debug, Clone)]
@@ -815,4 +824,6 @@ pub struct MetadataReferenceEntry {
 #[derive(Debug, Clone)]
 pub struct MetadataReferencesExecution {
     pub references: Vec<MetadataReferenceEntry>,
+    /// The last document read when more may follow; `None` on the last page.
+    pub next_after: Option<Ulid>,
 }

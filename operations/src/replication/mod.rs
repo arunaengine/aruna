@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod bao_read;
+pub mod bootstrap;
 pub(crate) mod dht_registration;
 mod error;
 pub mod incoming;
 pub mod locations;
+pub mod members;
 pub mod parking;
 pub mod plaintext;
 pub mod protocol;

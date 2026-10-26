@@ -115,6 +115,7 @@ mod bucket_page;
 mod distributed;
 mod export;
 mod fanout;
+mod links;
 mod list;
 mod path;
 mod preflight;
@@ -128,6 +129,12 @@ pub use self::export::{
 use self::fanout::MetadataFanoutScope;
 pub use self::fanout::MetadataFanoutStats;
 pub(crate) use self::fanout::RealmNodeDiscovery;
+pub use self::links::{
+    LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,
+    PART_OF_LIMIT, PartOf, PartTarget, SetPreview, SetPreviewPage, file_queries, links_distributed,
+    links_local, merge_pages, merge_previews, part_of, resolve_part, set_preview_distributed,
+    set_preview_local,
+};
 pub use self::list::{
     ListVisibleRequest, ListVisibleResult, ListedMetadataDocument, MetadataListOrder,
     list_visible_documents,
@@ -210,10 +217,6 @@ fn map_read_error(error: MetadataReadError) -> MetadataApiError {
             MetadataApiError::ServiceUnavailable
         }
     }
-}
-
-fn map_internal_error(error: MetadataError) -> MetadataApiError {
-    MetadataApiError::Internal(error.to_string())
 }
 
 #[cfg(test)]

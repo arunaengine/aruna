@@ -122,6 +122,7 @@ async fn seed_bucket(state: &ServerState, actor: &Actor, bucket: &str, group_id:
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         }
         .to_bytes()
         .unwrap(),
@@ -961,6 +962,7 @@ fn search_maps_partiality() {
             discovery_failed: false,
         },
         omitted_partitions: 0,
+        incomplete_ranges: 0,
         complete: false,
     };
 

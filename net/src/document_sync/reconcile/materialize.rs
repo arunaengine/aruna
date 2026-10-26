@@ -284,6 +284,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
     {
         config.portal_features = features;
     }
+    config.databases = reducer_state.materialized_databases();
 
     config.revocation_floor = config.revocation_floor.max(reducer_state.revocation_floor);
     // Without an index, the existing set remains fail-closed until each entry's expiry.
@@ -378,6 +379,7 @@ pub(in crate::document_sync) fn materialized_realm_config(
         revocation_floor: reducer_state.revocation_floor,
         federation: None,
         portal_features: Default::default(),
+        databases: Default::default(),
     };
     overlay_realm_config(&mut config, reducer_state, now, now_ms, revocation_index);
     Some(config)

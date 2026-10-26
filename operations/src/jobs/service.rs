@@ -291,6 +291,41 @@ pub async fn submit_staging_job(
     .await
 }
 
+/// Queues a staging job a range's former coordinator handed over, starting from `resume`.
+pub(crate) async fn submit_handed_job(
+    context: &DriverContext,
+    spec: StagingJobSpec,
+    resume: Option<&StagingJobCheckpoint>,
+    owner_node_id: NodeId,
+    retention_ms: u64,
+) -> Result<SubmitJobResult, String> {
+    let created_by = spec.auth_context.user_id;
+    let realm_id = spec.auth_context.realm_id;
+    let job_id = mint_local_job(context, realm_id, owner_node_id, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(resume) = resume {
+        super::staging::seed_checkpoint(context, job_id, resume).await?;
+    }
+    submit_local_job(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::Staging(spec),
+            created_by,
+            owner_node_id,
+            dedup_key: None,
+            now_ms: unix_timestamp_millis(),
+            retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+            active_cap: None,
+        },
+        job_id,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 /// Queues one background object copy on this node for the caller in `spec`.
 pub async fn submit_copy_job(
     context: &DriverContext,

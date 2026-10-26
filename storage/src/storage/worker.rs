@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aruna_core::effects::{IterStart, StorageEffect, StoragePriority};
+use aruna_core::effects::{IterEnd, IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::{NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, prefix_upper_bound};
@@ -59,6 +59,7 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         | StorageEffect::Write { key_space, .. }
         | StorageEffect::Delete { key_space, .. }
         | StorageEffect::Iter { key_space, .. }
+        | StorageEffect::IterRange { key_space, .. }
         | StorageEffect::Last { key_space, .. } => Some(key_space),
         StorageEffect::VaultWrite { .. }
         | StorageEffect::VaultRead { .. }
@@ -69,7 +70,10 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         StorageEffect::BatchWrite { writes, .. } => {
             writes.first().map(|(key_space, _, _)| key_space.as_str())
         }
-        StorageEffect::AddUsage { key_space, .. } => Some(key_space),
+        StorageEffect::AddUsage { key_space, .. }
+        | StorageEffect::AddCounters { key_space, .. }
+        | StorageEffect::BeginUsageRebuild { key_space }
+        | StorageEffect::FinishUsageRebuild { key_space } => Some(key_space),
         StorageEffect::BatchDelete { deletes, .. } => {
             deletes.first().map(|(key_space, _)| key_space.as_str())
         }
@@ -163,6 +167,12 @@ pub struct FjallStorage {
     pub(super) txn_usage: HashMap<Ulid, Vec<(String, ByteView, CounterChange)>>,
     /// Open write transactions that wrote or deleted realm config rows.
     pub(super) config_txns: HashSet<Ulid>,
+    /// Keyspaces whose committed usage deltas also go to their rebuild rows.
+    pub(super) usage_shadow: HashSet<String>,
+    /// Snapshots of usage rebuilds, which read source rows as the rebuild began.
+    pub(super) usage_views: HashSet<Ulid>,
+    /// Source rows each open write transaction changed, for their kept values at commit.
+    pub(super) txn_rows: HashMap<Ulid, Vec<(String, ByteView)>>,
 }
 
 impl FjallStorage {
@@ -194,6 +204,7 @@ impl FjallStorage {
     pub(super) fn retire_fenced_txn(&mut self, txn_id: Ulid) {
         self.take_txn_deletes(txn_id, false);
         self.txn_usage.remove(&txn_id);
+        self.txn_rows.remove(&txn_id);
         self.config_txns.remove(&txn_id);
         if let Some(Txn::Write(txn)) = self.txns.remove(&txn_id) {
             txn.rollback();
@@ -236,6 +247,11 @@ impl FjallStorage {
                 buckets,
                 txn_id,
             } => self.add_usage(key_space, deltas, buckets, txn_id),
+            StorageEffect::AddCounters {
+                key_space,
+                deltas,
+                txn_id,
+            } => self.add_counters(key_space, deltas, txn_id),
             StorageEffect::CommitTransaction { txn_id } => self.commit_transaction(txn_id),
             StorageEffect::Delete {
                 key_space,
@@ -250,6 +266,14 @@ impl FjallStorage {
                 limit,
                 txn_id,
             } => self.iterate(key_space, prefix, start, limit, txn_id),
+            StorageEffect::IterRange {
+                key_space,
+                start,
+                end,
+                limit,
+                max_bytes,
+                txn_id,
+            } => self.iterate_range(key_space, start, end, (limit, max_bytes), txn_id),
             StorageEffect::Last {
                 key_space,
                 prefix,
@@ -261,6 +285,8 @@ impl FjallStorage {
             | StorageEffect::VaultDelete { .. } => StorageEvent::Error {
                 error: StorageError::InvalidEffect,
             },
+            StorageEffect::BeginUsageRebuild { key_space } => self.begin_usage_rebuild(key_space),
+            StorageEffect::FinishUsageRebuild { key_space } => self.finish_usage_rebuild(key_space),
         };
         match config_txn {
             Some(Some(txn_id)) if self.txns.contains_key(&txn_id) => {
@@ -631,6 +657,7 @@ impl FjallStorage {
                 txn_id: None,
             } => {
                 let keyspace = self.store.resolve_keyspace(key_space)?;
+                self.keep_preimages(tx, [(key_space.as_str(), key)])?;
                 tx.insert(keyspace, key.clone(), value.clone());
                 Ok(StorageEvent::WriteResult { key: key.clone() })
             }
@@ -644,6 +671,8 @@ impl FjallStorage {
                     let keyspace = self.store.resolve_keyspace(key_space)?;
                     resolved.push((keyspace, key_space, key, value));
                 }
+                let rows = writes.iter().map(|(space, key, _)| (space.as_str(), key));
+                self.keep_preimages(tx, rows)?;
                 for (keyspace, key_space, key, value) in resolved {
                     tx.insert(keyspace, key.clone(), value.clone());
                     entries.push((key_space.clone(), key.clone()));
@@ -656,6 +685,7 @@ impl FjallStorage {
                 txn_id: None,
             } => {
                 let keyspace = self.store.resolve_keyspace(key_space)?;
+                self.keep_preimages(tx, [(key_space.as_str(), key)])?;
                 tx.remove(keyspace, key.clone());
                 Ok(StorageEvent::DeleteResult { key: key.clone() })
             }
@@ -669,6 +699,8 @@ impl FjallStorage {
                     let keyspace = self.store.resolve_keyspace(key_space)?;
                     resolved.push((keyspace, key_space, key));
                 }
+                let rows = deletes.iter().map(|(space, key)| (space.as_str(), key));
+                self.keep_preimages(tx, rows)?;
                 for (keyspace, key_space, key) in resolved {
                     tx.remove(keyspace, key.clone());
                     entries.push((key_space.clone(), key.clone()));
@@ -1270,6 +1302,51 @@ pub(super) fn iterate_page<R: Readable>(
     };
 
     collect_page(iter, limit)
+}
+
+/// Reads one bounded page of `[start, end]`; only this interval joins a transaction's read set.
+pub(super) fn range_page<R: Readable>(
+    reader: &R,
+    keyspace: &OptimisticTxKeyspace,
+    start: &IterStart,
+    end: &IterEnd,
+    (limit, max_bytes): (usize, usize),
+) -> Result<PageResult, StorageError> {
+    let (from, to) = (start.key().as_ref(), end.key().as_ref());
+    let empty = match (start, end) {
+        (IterStart::At(_), IterEnd::Through(_)) => from > to,
+        _ => from >= to,
+    };
+    if empty || limit == 0 {
+        return Ok((Vec::new(), None));
+    }
+    let lower = match start {
+        IterStart::After(key) => Excluded(key.as_ref().to_vec()),
+        IterStart::At(key) => Included(key.as_ref().to_vec()),
+    };
+    let upper = match end {
+        IterEnd::Before(key) => Excluded(key.as_ref().to_vec()),
+        IterEnd::Through(key) => Included(key.as_ref().to_vec()),
+    };
+    let mut iter = reader.range(keyspace, (lower, upper)).peekable();
+    let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit.min(1024));
+    let mut bytes = 0usize;
+    while let Some(guard) = iter.next() {
+        let (key, value) = guard
+            .into_inner()
+            .map_err(|error| StorageError::ReadError(error.to_string()))?;
+        bytes = bytes.saturating_add(key.len() + value.len());
+        if !values.is_empty() && bytes > max_bytes {
+            let last = values.last().map(|(key, _)| key.clone());
+            return Ok((values, last));
+        }
+        values.push((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())));
+        if values.len() == limit || bytes >= max_bytes {
+            let last = iter.peek().and(values.last().map(|(key, _)| key.clone()));
+            return Ok((values, last));
+        }
+    }
+    Ok((values, None))
 }
 
 pub(super) fn collect_page(iter: fjall::Iter, limit: usize) -> Result<PageResult, StorageError> {

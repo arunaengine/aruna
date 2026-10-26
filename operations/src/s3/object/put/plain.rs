@@ -13,6 +13,7 @@ use aruna_core::structs::storage::backend_import::{
     version_key,
 };
 use aruna_core::structs::storage::blob::ResolvedBackend;
+use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::structs::storage::routing::PlainTarget;
 use aruna_core::types::{Key, Value};
 
@@ -43,7 +44,9 @@ impl PutObjectOperation {
     /// for raw bytes; an encrypting bucket keeps Aruna's own layout.
     pub(super) fn plain_target(&mut self, resolved: &ResolvedBackend) -> Option<PlainTarget> {
         let request = &self.config.request;
-        let id = self.version_id.unwrap_or_else(Ulid::generate);
+        let id = self
+            .version_id
+            .unwrap_or_else(|| mint_version(self.set_hint));
         let target = self
             .config
             .routing

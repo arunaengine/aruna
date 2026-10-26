@@ -17,6 +17,7 @@ use crate::structs::execution::staging::VersionSourceBinding;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
+use crate::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use crate::structs::storage::encryption::SealPlan;
 use crate::structs::storage::format::{Compression, EncodingClass, StoredFormat, StoredLayout};
 use crate::structs::storage::group_backend::GroupBackendKind;
@@ -382,6 +383,8 @@ pub enum WriteOwner {
         blake3: [u8; 32],
         realm_id: RealmId,
         ttl_ms: u64,
+        /// Registers the copy in the DHT once owned; distributed buckets use content indexes.
+        announce: bool,
     },
     UploadPart {
         upload_id: Ulid,
@@ -398,6 +401,7 @@ pub enum WriteOwner {
         blake3: [u8; 32],
         realm_id: RealmId,
         ttl_ms: u64,
+        announce: bool,
     },
     /// An encrypted archive published before its content hash is known: kept while its
     /// `pending_locations` row names it.
@@ -745,6 +749,8 @@ pub struct BucketInfo {
     pub placement_policy_generation: u64,
     /// Compression of new writes; each node also re-encodes its own copies to match.
     pub compression: Compression,
+    /// Membership in a distributed set; `None` keeps the bucket ordinary.
+    pub distribution: Option<DistributionBinding>,
 }
 
 /// The incarnation of a bucket from its creation row, which tells one bucket of a name from
@@ -1106,40 +1112,53 @@ pub(crate) fn checked_refs(refs: &[PlacementPolicyRef]) -> Result<(), Conversion
 pub struct CurrentVersionPointer {
     pub version_id: Ulid,
     pub generation: u64,
+    /// The head version's original epoch; always 0 in an ordinary bucket.
+    pub epoch: OriginalEpoch,
 }
 
 impl CurrentVersionPointer {
     pub fn new(version_id: Ulid) -> Self {
-        Self {
-            version_id,
-            generation: 1,
-        }
+        Self::new_with_generation(version_id, 1)
     }
 
     pub fn new_with_generation(version_id: Ulid, generation: u64) -> Self {
         Self {
             version_id,
             generation,
+            epoch: OriginalEpoch::default(),
         }
     }
 
-    /// Checked local advancement. Saturating would stop producing a later
-    /// generation, so an exhausted counter fails the mutation instead.
-    pub fn next_for(existing: Option<&Self>, version_id: Ulid) -> Result<Self, ConversionError> {
-        let generation = match existing {
-            Some(pointer) => pointer
-                .generation
-                .checked_add(1)
-                .ok_or(ConversionError::HeadGenerationExhausted)?,
-            None => 1,
-        };
-        Ok(Self::new_with_generation(version_id, generation))
+    pub fn with_epoch(mut self, epoch: OriginalEpoch) -> Self {
+        self.epoch = epoch;
+        self
     }
 
-    /// True for an identical replay or a later generation. Different versions
-    /// of one generation cannot occur for a node-local head.
+    /// The one head comparator: original epoch first, then the per-key generation.
+    pub fn order(&self) -> (OriginalEpoch, u64) {
+        (self.epoch, self.generation)
+    }
+
+    /// Checked local advancement at the existing epoch, so a successor always supersedes.
+    /// Saturating would stop producing a later generation, so exhaustion fails instead.
+    pub fn next_for(existing: Option<&Self>, version_id: Ulid) -> Result<Self, ConversionError> {
+        let (epoch, generation) = match existing {
+            Some(pointer) => (
+                pointer.epoch,
+                pointer
+                    .generation
+                    .checked_add(1)
+                    .ok_or(ConversionError::HeadGenerationExhausted)?,
+            ),
+            None => (OriginalEpoch::default(), 1),
+        };
+        Ok(Self::new_with_generation(version_id, generation).with_epoch(epoch))
+    }
+
+    /// True for an identical replay or a later (original epoch, generation). Different versions
+    /// of one order cannot occur: one coordinator writes each epoch of a key.
     pub fn supersedes(&self, current: Option<&Self>) -> bool {
-        current.is_none_or(|current| self == current || self.generation > current.generation)
+        current.is_none_or(|current| self == current || self.order() > current.order())
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -1164,6 +1183,18 @@ pub struct BlobVersion {
     /// Effective refs stored when this version was minted, canonically sorted.
     /// Empty means unrestricted; a later attachment mints a successor instead.
     pub placement_policies: Vec<PlacementPolicyRef>,
+    /// The coordinator epoch this version was written under; 0 in an ordinary bucket.
+    pub original_epoch: OriginalEpoch,
+    /// The key's head generation this version was written as in a distributed bucket, so
+    /// history keeps its order on every member; 0 in an ordinary bucket.
+    pub generation: u64,
+    /// The logical content identity a distributed bucket fixed when it minted the version; it
+    /// stays when the bytes change form, as a reference materialized on another member.
+    pub identity: Option<[u8; 32]>,
+    /// Where the content came from, set by the server when the version is minted.
+    pub origin: Option<crate::structs::storage::origin::VersionOrigin>,
+    /// The last sync that delivered this version here; the origin stays the source's.
+    pub hop: Option<crate::structs::storage::origin::SyncHop>,
 }
 
 impl BlobVersion {
@@ -1187,6 +1218,11 @@ impl BlobVersion {
             metadata: HashMap::new(),
             published_by: None,
             placement_policies: Vec::new(),
+            original_epoch: OriginalEpoch::default(),
+            generation: 0,
+            identity: None,
+            origin: None,
+            hop: None,
         }
     }
 
@@ -1203,6 +1239,11 @@ impl BlobVersion {
             metadata: HashMap::new(),
             published_by: None,
             placement_policies: Vec::new(),
+            original_epoch: OriginalEpoch::default(),
+            generation: 0,
+            identity: None,
+            origin: None,
+            hop: None,
         }
     }
 
@@ -1214,6 +1255,11 @@ impl BlobVersion {
             metadata: HashMap::new(),
             published_by: None,
             placement_policies: Vec::new(),
+            original_epoch: OriginalEpoch::default(),
+            generation: 0,
+            identity: None,
+            origin: None,
+            hop: None,
         }
     }
 
@@ -1236,6 +1282,11 @@ impl BlobVersion {
             metadata: HashMap::new(),
             published_by: None,
             placement_policies: Vec::new(),
+            original_epoch: OriginalEpoch::default(),
+            generation: 0,
+            identity: None,
+            origin: None,
+            hop: None,
         }
     }
 
@@ -1255,6 +1306,34 @@ impl BlobVersion {
 
     pub fn with_publisher(mut self, node_id: NodeId) -> Self {
         self.published_by = Some(node_id);
+        self
+    }
+
+    pub fn with_epoch(mut self, epoch: OriginalEpoch) -> Self {
+        self.original_epoch = epoch;
+        self
+    }
+
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
+    }
+
+    pub fn with_identity(mut self, identity: Option<[u8; 32]>) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    pub fn with_origin(
+        mut self,
+        origin: Option<crate::structs::storage::origin::VersionOrigin>,
+    ) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    pub fn with_hop(mut self, hop: Option<crate::structs::storage::origin::SyncHop>) -> Self {
+        self.hop = hop;
         self
     }
 
@@ -1587,6 +1666,7 @@ mod tests {
     use crate::structs::placement::policy::{
         MAX_POLICY_REFS, PlacementPolicyError, PlacementPolicyRef,
     };
+    use crate::structs::storage::distribution::OriginalEpoch;
     use crate::structs::storage::format::Compression;
     use crate::structs::storage::format::EncodingClass;
     use crate::structs::storage::format::StoredFormat;
@@ -1634,6 +1714,7 @@ mod tests {
                     version_selector: None,
                     capabilities: Vec::new(),
                     origin_node_id: None,
+                    namespace: None,
                 },
                 connector_id,
             };
@@ -1643,6 +1724,7 @@ mod tests {
                 etag: None,
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             };
             let now = SystemTime::UNIX_EPOCH;
             BlobVersion::reference(source, metadata, now, UserId::default(), now)
@@ -1666,6 +1748,30 @@ mod tests {
         assert!(head.supersedes(None));
         assert!(!pointer(5, 4).supersedes(Some(&head)));
         assert!(pointer(6, 1).supersedes(Some(&head)));
+    }
+
+    #[test]
+    fn epoch_orders_first() {
+        let head = pointer(5, 3).with_epoch(OriginalEpoch(2));
+        assert!(
+            pointer(1, 4)
+                .with_epoch(OriginalEpoch(3))
+                .supersedes(Some(&head))
+        );
+        assert!(
+            !pointer(9, 4)
+                .with_epoch(OriginalEpoch(1))
+                .supersedes(Some(&head))
+        );
+        assert!(!pointer(9, 4).supersedes(Some(&head)));
+        assert!(
+            pointer(6, 4)
+                .with_epoch(OriginalEpoch(2))
+                .supersedes(Some(&head))
+        );
+        let next = CurrentVersionPointer::next_for(Some(&head), Ulid::from_bytes([5; 16])).unwrap();
+        assert_eq!(next.order(), (OriginalEpoch(2), 6));
+        assert!(next.supersedes(Some(&head)));
     }
 
     #[test]
@@ -1908,6 +2014,7 @@ mod tests {
                 version_selector: Some("v1".to_string()),
                 capabilities: vec!["versioned".to_string()],
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };
@@ -1917,6 +2024,7 @@ mod tests {
             etag: Some("etag".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         };
 
         let versions = vec![
@@ -2142,6 +2250,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 7,
             compression: Compression::Off,
+            distribution: None,
         }
     }
 

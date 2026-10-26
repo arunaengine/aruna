@@ -18,6 +18,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 use ulid::Ulid;
 
+/// Entries one page of a backend without ordered listing may read before the import is refused.
+const UNORDERED_ENTRIES: usize = 100_000;
+
 fn list_error(error: impl ToString) -> BlobError {
     BlobError::ListError(error.to_string())
 }
@@ -36,19 +39,28 @@ impl BlobHandler {
         start_after: Option<String>,
         limit: usize,
     ) -> BlobEvent {
-        self.external_page(backend, prefix, start_after.as_deref(), limit.max(1))
-            .await
-            .unwrap_or_else(BlobEvent::Error)
+        let start_after = start_after.as_deref();
+        self.external_page(
+            backend,
+            prefix,
+            start_after,
+            limit.max(1),
+            UNORDERED_ENTRIES,
+        )
+        .await
+        .unwrap_or_else(BlobEvent::Error)
     }
 
-    /// A backend that skips to `start_after` itself lists in key order. Any other is
-    /// read in full and only the smallest keys after `start_after` are kept.
-    async fn external_page(
+    /// A backend that skips to `start_after` itself lists in key order. Any other is read
+    /// in full and only the smallest keys after `start_after` are kept; past `unordered`
+    /// entries such a listing is refused instead of rescanned page by page.
+    pub(super) async fn external_page(
         &self,
         backend: &BackendRef,
         prefix: &str,
         start_after: Option<&str>,
         limit: usize,
+        unordered: usize,
     ) -> Result<BlobEvent, BlobError> {
         // A storage without a bucket lists one bucket; its keys keep the bucket in front.
         let (bucket, prefix) = match self.registry.splits(backend) {
@@ -76,11 +88,19 @@ impl BlobHandler {
             .map_err(|_| list_error("timed out opening the listing"))?
             .map_err(list_error)?;
         let mut page = BTreeMap::new();
+        let mut examined = 0usize;
         while let Some(entry) = timeout(self.io_timeout(), lister.next())
             .await
             .map_err(|_| list_error("timed out reading the listing"))?
         {
             let entry = entry.map_err(list_error)?;
+            examined += 1;
+            if !ordered && examined > unordered {
+                return Err(list_error(format!(
+                    "the backend lists without order; folders with more than {unordered} \
+                     entries cannot be imported from it"
+                )));
+            }
             let metadata = entry.metadata();
             if !metadata.is_file() || start_after.is_some_and(|after| entry.path() <= after) {
                 continue;

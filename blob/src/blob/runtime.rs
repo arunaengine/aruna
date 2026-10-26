@@ -43,6 +43,8 @@ pub(super) const READ_SLOTS: usize = 256;
 // Spools take their own pool because their input stream may issue nested
 // transfer and read effects; sharing a pool with those would deadlock.
 pub(super) const SPOOL_SLOTS: usize = 64;
+// Disk that local spools may hold together, in MiB permits.
+pub(super) const SPOOL_BUDGET_MIB: usize = 32 * 1024;
 const QUEUE_WAIT_WARN: Duration = Duration::from_millis(100);
 const SLOW_LOCAL_EFFECT: Duration = Duration::from_secs(1);
 const SLOW_CONTROL_EFFECT: Duration = Duration::from_secs(120);
@@ -82,6 +84,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::CompleteUpload { .. } => (EffectClass::Transfer, "complete_upload"),
         BlobEffect::AbortUpload { .. } => (EffectClass::Control, "abort_upload"),
         BlobEffect::SpoolHidden { .. } => (EffectClass::Spool, "spool_hidden"),
+        BlobEffect::SpoolLocal { .. } => (EffectClass::Spool, "spool_local"),
         BlobEffect::Replicate { .. } => (EffectClass::Transfer, "replicate"),
         BlobEffect::HandleReplication { .. } => (EffectClass::Transfer, "handle_replication"),
         BlobEffect::ServeRead { .. } => (EffectClass::Transfer, "serve_read"),
@@ -295,7 +298,9 @@ impl BlobHandle {
             None
         };
         let deadline = match &effect {
-            BlobEffect::SpoolHidden { deadline, .. } => *deadline,
+            BlobEffect::SpoolHidden { deadline, .. } | BlobEffect::SpoolLocal { deadline, .. } => {
+                *deadline
+            }
             _ => None,
         };
         // A composition runs on the transfer slot its reservation already holds.
@@ -449,19 +454,17 @@ impl BlobHandle {
                 self.handler.check_staging_source(access).await
             }
             StagingSourceEffect::Head { access } => self.handler.head_staging_source(access).await,
-            StagingSourceEffect::List {
+            StagingSourceEffect::List { access, request } => {
+                self.handler.list_staging_source(access, request).await
+            }
+            StagingSourceEffect::Read {
                 access,
-                offset,
-                limit,
-                recursive,
-                files_only,
+                range,
+                expected,
             } => {
                 self.handler
-                    .list_staging_source(access, offset, limit, recursive, files_only)
+                    .read_staging_source(access, range, expected)
                     .await
-            }
-            StagingSourceEffect::Read { access, range } => {
-                self.handler.read_staging_source(access, range).await
             }
         };
 
@@ -580,16 +583,22 @@ impl BlobHandler {
         net: NetHandle,
         policy: EgressPolicy,
     ) -> Result<BlobHandle, BlobLibError> {
-        Self::with_registry(BackendRegistry::single(config), storage, net, policy).await
+        Self::with_registry(BackendRegistry::single(config), storage, net, policy, None).await
     }
 
+    /// Builds the handler; `spool_dir` must be a writable disk directory, created when missing.
+    /// Without one, every local spool fails.
     #[allow(clippy::new_ret_no_self)]
     pub async fn with_registry(
         registry: BackendRegistry,
         storage: StorageHandle,
         net: NetHandle,
         policy: EgressPolicy,
+        spool_dir: Option<std::path::PathBuf>,
     ) -> Result<BlobHandle, BlobLibError> {
+        if let Some(dir) = spool_dir.as_deref() {
+            super::local_spool::prepare_dir(dir)?;
+        }
         let blob_handler = BlobHandler {
             registry,
             egress: EgressGuard::new(policy)?,
@@ -616,8 +625,14 @@ impl BlobHandler {
                 super::unlock::UNLOCKED_BUCKETS,
             ))),
             pithos_budget: Arc::new(Semaphore::new(super::pithos::budget_permits())),
+            spool_dir: spool_dir.map(Arc::new),
+            spool_files: Arc::new(Semaphore::new(super::local_spool::SPOOL_FILES)),
+            spool_budget: Arc::new(Semaphore::new(SPOOL_BUDGET_MIB)),
         };
         blob_handler.ensure_multipart_bucket().await?;
+        if let Err(error) = blob_handler.backfill_free_index().await {
+            tracing::warn!(%error, "Could not add provider buckets to the free index");
+        }
         blob_handler.probe_all_backends().await;
         let status_handler = blob_handler.clone();
         let monitor_cancel = blob_handler.monitor_cancel.clone();
@@ -818,11 +833,16 @@ impl BlobHandler {
                 deadline,
                 blob,
             } => {
-                Box::pin(
-                    self.spool_hidden_blob(namespace, &name, created_by, max_bytes, deadline, blob),
-                )
-                .await
+                let spool =
+                    self.spool_hidden_blob(namespace, &name, created_by, max_bytes, deadline, blob);
+                Box::pin(spool).await
             }
+            BlobEffect::SpoolLocal {
+                size,
+                deadline,
+                range,
+                blob,
+            } => Box::pin(self.spool_local(size, deadline, range, blob)).await,
             BlobEffect::ReadHiddenRange { location, range } => {
                 Box::pin(self.read_hidden_range(location, range)).await
             }
@@ -995,9 +1015,10 @@ impl BlobHandler {
                 location,
                 expected_blake3,
                 lease,
+                range,
             } => {
-                let serve = self.serve_sealed_read(stream_id, location, expected_blake3, *lease);
-                Box::pin(serve).await
+                let target = (location, expected_blake3, range);
+                Box::pin(self.serve_sealed_read(stream_id, target, *lease)).await
             }
             BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
             BlobEffect::SendMessage { stream_id, payload } => {
@@ -1032,7 +1053,8 @@ impl BlobHandler {
                 stream_id,
                 location,
                 expected_blake3,
-            } => Box::pin(self.serve_read(stream_id, location, expected_blake3)).await,
+                range,
+            } => Box::pin(self.serve_read(stream_id, (location, expected_blake3, range))).await,
             BlobEffect::ServeSourceRead {
                 stream_id,
                 access,
@@ -1053,7 +1075,8 @@ impl BlobHandler {
                 stream_id,
                 size,
                 expected_blake3,
-            } => Box::pin(self.receive_read(stream_id, size, expected_blake3)).await,
+                range,
+            } => Box::pin(self.receive_read(stream_id, size, expected_blake3, range)).await,
             BlobEffect::ReplicateLeased {
                 replication_id,
                 stream_id,

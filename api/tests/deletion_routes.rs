@@ -148,6 +148,7 @@ async fn setup() -> Fixture {
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
+                distribution: None,
             }
             .to_bytes()
             .unwrap(),
@@ -251,6 +252,7 @@ async fn preflight_counts_versions() {
     let (status, Json(file)) = deletion_preflight(
         State(fixture.state.clone()),
         Extension(Some(fixture.auth.clone())),
+        Extension(None),
         Json(DeletionPreflightRequest {
             scope: PurgeScopeRequest::File {
                 bucket: "data".to_string(),
@@ -277,6 +279,7 @@ async fn preflight_counts_versions() {
     let (_, Json(bucket)) = deletion_preflight(
         State(fixture.state.clone()),
         Extension(Some(fixture.auth.clone())),
+        Extension(None),
         Json(DeletionPreflightRequest {
             scope: PurgeScopeRequest::Bucket {
                 bucket: "data".to_string(),

@@ -199,6 +199,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let rows = crate::s3::bucket::key::rows::authority_rows(&info, None, &[admin]);
         let documents = [realm_id.as_bytes().to_vec(), group_id.to_bytes().to_vec()];

@@ -217,6 +217,8 @@ pub struct RealmConfigDocument {
     pub federation: Option<crate::federation::FederationSettings>,
     /// Realm default on/off state of optional portal features; a missing name means on.
     pub portal_features: BTreeMap<String, bool>,
+    /// Buckets marked as databases, each with the dataset that describes it.
+    pub databases: Vec<crate::structs::identity::database::DatabaseEntry>,
 }
 
 pub const MAX_PORTAL_FEATURES: usize = 64;
@@ -502,9 +504,10 @@ impl RealmConfigDocument {
         // Exclude request policies because they do not route requests; each receiver enforces its local set,
         // and nodes without a realm-config bucket may never observe them.
         canonical.request_policies.clear();
-        // Exclude federation settings and portal features: they never route requests.
+        // Exclude federation settings, portal features and databases: they never route requests.
         canonical.federation = None;
         canonical.portal_features.clear();
+        canonical.databases.clear();
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -543,6 +546,7 @@ impl RealmConfigDocument {
             compute: crate::structs::placement::compute_config::RealmComputeConfig::default(),
             federation: None,
             portal_features: BTreeMap::new(),
+            databases: Vec::new(),
         }
     }
 
@@ -1240,6 +1244,7 @@ mod test {
             placement_transitions: Vec::new(),
             federation: None,
             portal_features: BTreeMap::new(),
+            databases: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -1267,7 +1272,7 @@ mod test {
     fn config_bytes_canonical() {
         // Pins the canonical wire form. Postcard is positional, so the field
         // occupies a fixed slot that a shorter encoding cannot satisfy.
-        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d0000";
+        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d000000";
         let mut config = RealmConfigDocument::new(RealmId([1u8; 32]), Vec::new(), 3);
         config.family_strategy_id = Ulid::from_bytes([2u8; 16]);
 
@@ -1800,6 +1805,7 @@ mod test {
             placement_transitions: Vec::new(),
             federation: None,
             portal_features: BTreeMap::new(),
+            databases: Vec::new(),
         };
 
         assert_eq!(document.replication_factor_for(other_group_id, None), 3);
@@ -2200,9 +2206,13 @@ mod test {
         };
         let config = RealmConfigDocument::new(RealmId([7u8; 32]), Vec::new(), 2);
         let encoded = config.to_bytes(&actor).expect("config encodes");
-        let tail =
-            postcard::to_allocvec(&(&config.compute, &config.federation, &config.portal_features))
-                .expect("tail encodes");
+        let tail = postcard::to_allocvec(&(
+            &config.compute,
+            &config.federation,
+            &config.portal_features,
+            &config.databases,
+        ))
+        .expect("tail encodes");
         assert!(encoded.ends_with(&tail));
 
         let truncated = &encoded[..encoded.len() - tail.len()];

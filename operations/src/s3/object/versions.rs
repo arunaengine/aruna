@@ -1200,6 +1200,7 @@ mod test {
             etag: Some("ref-etag".to_string()),
             last_modified: Some(UNIX_EPOCH + Duration::from_secs(10)),
             source_version: None,
+            digests: Default::default(),
         };
         seed_version(
             &storage_handle,
@@ -1215,6 +1216,7 @@ mod test {
                         version_selector: None,
                         capabilities: Vec::new(),
                         origin_node_id: None,
+                        namespace: None,
                     },
                     connector_id: None,
                 },

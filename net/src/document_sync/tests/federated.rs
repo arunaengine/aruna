@@ -65,7 +65,8 @@ fn document_target(event: &AdminDocumentEvent) -> DocumentTarget {
         AdminDocumentTarget::Realm { realm_id } => DocumentTarget::RealmAuthorization {
             realm_id: *realm_id,
         },
-        AdminDocumentTarget::RealmConfig { realm_id } => DocumentTarget::RealmConfig {
+        AdminDocumentTarget::RealmConfig { realm_id }
+        | AdminDocumentTarget::Distribution { realm_id, .. } => DocumentTarget::RealmConfig {
             realm_id: *realm_id,
         },
         AdminDocumentTarget::User { user_id } => DocumentTarget::User { user_id: *user_id },

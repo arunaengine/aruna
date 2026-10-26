@@ -5,10 +5,10 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
-use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, SOURCE_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{CONNECTOR_REFERENCE_KEYSPACE, SOURCE_INDEX_KEYSPACE};
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
-use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState};
-use aruna_core::types::{GroupId, Key, TxnId};
+use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
+use aruna_core::types::{GroupId, Key, TxnId, Value};
 use byteview::ByteView;
 use ulid::Ulid;
 
@@ -25,6 +25,34 @@ pub fn source_connector_key(group_id: GroupId, connector_id: Ulid) -> Key {
     bytes.extend_from_slice(&group_id.to_bytes());
     bytes.extend_from_slice(&connector_id.to_bytes());
     ByteView::from(bytes)
+}
+
+/// The reference row of one version bound to `connector_id`; rows of a connector share a prefix.
+pub fn connector_reference_key(
+    connector_id: Ulid,
+    version_key: &VersionKey,
+) -> Result<Key, ConversionError> {
+    let mut bytes = connector_id.to_bytes().to_vec();
+    bytes.extend_from_slice(&version_key.to_bytes()?);
+    Ok(ByteView::from(bytes))
+}
+
+/// The row a write adds beside a reference version bound to a connector.
+pub fn connector_reference_write(
+    version: &BlobVersion,
+    version_key: &VersionKey,
+) -> Result<Option<(String, Key, Value)>, ConversionError> {
+    let BlobVersionState::Reference { source, .. } = &version.state else {
+        return Ok(None);
+    };
+    let Some(connector_id) = source.connector_id else {
+        return Ok(None);
+    };
+    Ok(Some((
+        CONNECTOR_REFERENCE_KEYSPACE.to_string(),
+        connector_reference_key(connector_id, version_key)?,
+        ByteView::from(Vec::new()),
+    )))
 }
 
 pub fn source_connector_prefix(group_id: GroupId) -> Key {
@@ -85,16 +113,6 @@ pub fn iter_connectors_effect(
     })
 }
 
-pub fn reference_scan_effect(start_after: Option<Key>, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-        prefix: None,
-        start: start_after.map(IterStart::After),
-        limit: REFERENCE_PAGE_SIZE,
-        txn_id,
-    })
-}
-
 pub fn parse_connector_read(event: Event) -> Result<Option<SourceConnector>, StorageReadError> {
     parse_storage_read(event, SourceConnector::from_bytes)
 }
@@ -114,12 +132,6 @@ pub fn parse_connector_iter(
     event: Event,
 ) -> Result<(Vec<SourceConnector>, Option<Key>), StorageReadError> {
     parse_storage_iter(event, SourceConnector::from_bytes)
-}
-
-pub fn parse_version_iter(
-    event: Event,
-) -> Result<(Vec<BlobVersion>, Option<Key>), StorageReadError> {
-    parse_storage_iter(event, BlobVersion::from_bytes)
 }
 
 pub fn references_connector(version: &BlobVersion, connector_id: Ulid) -> bool {

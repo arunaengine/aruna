@@ -5,8 +5,8 @@
 use super::{
     DATA_PREFIX, DrsBulkBody, GetObjectError, MAX_OBJECT_IDS, RequestedObjectId, ResolveOutcome,
     ResolvedObject, build_object_response, download_error, drs_denied_error, encode_component,
-    get_authorizations, get_object, owner_origin, parse_object_id, post_objects, resolve_object,
-    routed_deadline,
+    get_authorizations, get_object, owner_origin, parse_object_id, post_objects, raw_id,
+    resolve_object, routed_deadline,
 };
 use crate::openapi::ApiDoc;
 use crate::server::state::ServerState;
@@ -157,6 +157,7 @@ async fn seed_version(state: &ServerState) -> (AuthContext, AuthContext, Version
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     write_fixture(
         state,
@@ -235,6 +236,7 @@ fn parses_w3id() {
         RequestedObjectId::CanonicalW3id(hash) => assert_eq!(hash, expected_hash),
         RequestedObjectId::ContentHashArn { .. } => panic!("expected canonical w3id id"),
         RequestedObjectId::VersionedObject(_) => panic!("expected canonical w3id id"),
+        RequestedObjectId::GlobalVersion { .. } => panic!("expected canonical w3id id"),
     }
 }
 
@@ -267,6 +269,7 @@ fn parses_content_arn() {
         }
         RequestedObjectId::CanonicalW3id(_) => panic!("expected content-hash arn"),
         RequestedObjectId::VersionedObject(_) => panic!("expected content-hash arn"),
+        RequestedObjectId::GlobalVersion { .. } => panic!("expected content-hash arn"),
     }
 }
 
@@ -354,6 +357,7 @@ async fn rejects_nonlocal_version() {
         let response = get_object(
             State(state.clone()),
             Extension(Some(auth.clone())),
+            Extension(None),
             ConnectInfo("127.0.0.1:1".parse().unwrap()),
             HeaderMap::new(),
             Path(arn.to_string()),
@@ -395,6 +399,7 @@ async fn returns_missing_version() {
     let response = get_object(
         State(state),
         Extension(Some(auth)),
+        Extension(None),
         ConnectInfo("127.0.0.1:1".parse().unwrap()),
         HeaderMap::new(),
         Path(missing.to_string()),
@@ -443,12 +448,16 @@ fn canonical_response_complete() {
         hashes: materialized_location(blake3).hashes.into_iter().collect(),
         location: Some(materialized_location(blake3)),
         origin: None,
+        holders: Vec::new(),
+        pinned: None,
+        answered_by: None,
         source_metadata: Some(SourceMetadata {
             content_length: 42,
             content_type: Some("application/octet-stream".to_string()),
             etag: Some("etag-from-materialized".to_string()),
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         }),
     };
 
@@ -498,12 +507,16 @@ fn content_response_aliases() {
         hashes: materialized_location(blake3).hashes.into_iter().collect(),
         location: Some(materialized_location(blake3)),
         origin: None,
+        holders: Vec::new(),
+        pinned: None,
+        answered_by: None,
         source_metadata: Some(SourceMetadata {
             content_length: 42,
             content_type: Some("application/octet-stream".to_string()),
             etag: Some("etag-from-materialized".to_string()),
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         }),
     };
 
@@ -545,6 +558,8 @@ async fn routed_uses_origin() {
             documents_held: None,
             load_permille: None,
             heartbeat_at_ms: 1_700_000_000_000,
+            download_slots: None,
+            storage_capacity_bytes: None,
         },
         updated_at_ms: 1_700_000_000_500,
         epoch: AdvertisementEpoch {
@@ -587,6 +602,9 @@ async fn routed_uses_origin() {
         source_metadata: None,
         location: None,
         origin,
+        holders: Vec::new(),
+        pinned: None,
+        answered_by: None,
     };
     let response = build_object_response("https://local.example", &resolved);
     assert_eq!(response.access_methods.len(), 1);
@@ -626,6 +644,89 @@ fn maps_reference_errors() {
     }
 }
 
+#[test]
+fn parses_global_versions() {
+    // The URL form and the short path form name the same version.
+    let id = aruna_core::structs::storage::global_id::GlobalId::Version {
+        realm_id: test_realm_id(),
+        version_id: Ulid::from_bytes([5u8; 16]),
+    };
+    for form in [id.to_url(), id.to_string()] {
+        match parse_object_id(&form).unwrap() {
+            RequestedObjectId::GlobalVersion {
+                realm_id,
+                version_id,
+            } => assert_eq!(
+                (realm_id, version_id),
+                (test_realm_id(), Ulid::from_bytes([5; 16]))
+            ),
+            _ => panic!("expected a global version id"),
+        }
+    }
+    let bucket = format!("/{}/{}/", test_realm_id(), Ulid::from_bytes([6u8; 16]));
+    let error = parse_object_id(&bucket).err().unwrap();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn pinned_holder_url() {
+    // A chosen holder's access URL serves there and never chooses again.
+    let resolved = ResolvedObject {
+        bucket: "spire".to_string(),
+        key: "a.fa".to_string(),
+        group_id: Ulid::from_bytes([4u8; 16]),
+        version_id: Ulid::from_bytes([5u8; 16]),
+        canonical_w3id: "https://w3id.org/aruna/data/x".to_string(),
+        requested_id: "/realm/version".to_string(),
+        size: 42,
+        hashes: Default::default(),
+        source_metadata: None,
+        location: None,
+        origin: Some("https://answered.example".to_string()),
+        holders: vec![test_node_id()],
+        pinned: Some("https://holder.example".to_string()),
+        answered_by: None,
+    };
+    let response = build_object_response("https://local.example", &resolved);
+    assert_eq!(
+        response.access_methods[0].access_url.as_ref().unwrap().url,
+        format!(
+            "https://holder.example/api/v1/ga4gh/drs/v1/download?object_id={}&here=true",
+            encode_component("/realm/version")
+        )
+    );
+}
+
+#[test]
+fn local_holder_pinned() {
+    // A holder that chose itself pins its own URL, so the download never chooses again.
+    let blake3 = [0x22u8; 32];
+    let resolved = ResolvedObject {
+        bucket: "spire".to_string(),
+        key: "a.fa".to_string(),
+        group_id: Ulid::from_bytes([4u8; 16]),
+        version_id: Ulid::from_bytes([5u8; 16]),
+        canonical_w3id: "https://w3id.org/aruna/data/x".to_string(),
+        requested_id: "/realm/version".to_string(),
+        size: 42,
+        hashes: Default::default(),
+        source_metadata: None,
+        location: Some(materialized_location(blake3)),
+        origin: None,
+        holders: vec![test_node_id()],
+        pinned: None,
+        answered_by: None,
+    };
+    let response = build_object_response("https://local.example", &resolved);
+    assert_eq!(
+        response.access_methods[0].access_url.as_ref().unwrap().url,
+        format!(
+            "https://local.example/api/v1/ga4gh/drs/v1/download?object_id={}&here=true",
+            encode_component("/realm/version")
+        )
+    );
+}
+
 // Operators reading the spec must see the reference statuses the route can
 // actually return.
 #[test]
@@ -641,7 +742,7 @@ fn download_declares_statuses() {
         .expect("download operation")
         .responses
         .responses;
-    for status in ["404", "409", "503"] {
+    for status in ["307", "404", "409", "503"] {
         assert!(responses.contains_key(status), "missing {status}");
     }
 }
@@ -664,4 +765,373 @@ fn openapi_has_drs() {
     );
     assert!(openapi.paths.paths.contains_key("/ga4gh/drs/v1/download"));
     let _ = DATA_PREFIX;
+}
+
+#[test]
+fn keeps_encoded_keys() {
+    let realm_id = RealmId::from_bytes([3; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let version = Ulid::from_bytes([7; 16]);
+    let arn = VersionedObjectArn::new(realm_id, node_id, "b", "a b", version).unwrap();
+    let w3id = arn.to_w3id();
+    let id = w3id.strip_prefix(DATA_PREFIX).unwrap();
+    // A decoded path would no longer be the canonical ARN and be refused.
+    let uri: http::Uri = format!("/resolve/{id}").parse().unwrap();
+    let raw = raw_id(&uri).unwrap();
+    assert_eq!(raw, id);
+    assert!(matches!(
+        parse_object_id(&format!("{DATA_PREFIX}{raw}")),
+        Ok(RequestedObjectId::VersionedObject(_))
+    ));
+}
+
+mod global {
+    use super::super::*;
+    use crate::auth::ValidatedBearer;
+    use crate::mcp::data::{WriteObjectInput, store_text};
+    use crate::routes::storage::deletion::bucket_info;
+    use crate::tests::distributed::{
+        BUCKET, Node, PEER, distribute, mirror, node_id, node_state, peer_heartbeat, publish_api,
+        unsigned_token,
+    };
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::global_id::GlobalId;
+    use axum::body::to_bytes;
+
+    const PEER_API: &str = "https://peer.example";
+
+    /// Stores `a.md` in the bucket and returns its global id.
+    async fn stored(node: &Node) -> String {
+        let info = bucket_info(&node.state, BUCKET).await.unwrap();
+        let input = WriteObjectInput {
+            bucket: BUCKET.to_string(),
+            key: "a.md".to_string(),
+            text: "bytes".to_string(),
+            content_type: None,
+        };
+        let output = store_text(&node.state, &node.owner, &info, input)
+            .await
+            .unwrap();
+        let version_id = output.version_id.parse().unwrap();
+        GlobalId::Version {
+            realm_id: node.state.get_realm_id(),
+            version_id,
+        }
+        .to_url()
+    }
+
+    async fn resolve(
+        node: &Node,
+        (auth, bearer): (Option<&AuthContext>, Option<&str>),
+        id: &str,
+        (here, ticket): (bool, Option<String>),
+    ) -> Response {
+        let path = id.strip_prefix(DATA_PREFIX).unwrap();
+        resolve_data(
+            State(node.state.clone()),
+            Extension(auth.cloned()),
+            Extension(bearer.map(ValidatedBearer::new_for_test)),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            format!("/api/v1/resolve/{path}").parse().unwrap(),
+            Query(ResolveQuery { here, ticket }),
+        )
+        .await
+    }
+
+    async fn body(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn object(node: &Node, id: &str) -> serde_json::Value {
+        let response = get_object(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            Path(id.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_str(&body(response).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn serves_global_version() {
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let owner = Some(&node.owner);
+
+        let served = resolve(&node, (owner, None), &id, (false, None)).await;
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(served.headers()[http::header::CONTENT_LENGTH], "5");
+        assert_eq!(body(served).await, "bytes");
+        assert_eq!(object(&node, &id).await["size"], 5);
+
+        let anonymous = resolve(&node, (None, None), &id, (false, None)).await;
+        assert_eq!(anonymous.status(), StatusCode::NOT_FOUND);
+        let stranger = resolve(&node, (Some(&node.stranger), None), &id, (false, None)).await;
+        assert_eq!(stranger.status(), StatusCode::FORBIDDEN);
+        let version_id = id.rsplit('/').next().unwrap().parse().unwrap();
+        let foreign = GlobalId::Version {
+            realm_id: RealmId([9; 32]),
+            version_id,
+        };
+        let elsewhere = resolve(&node, (owner, None), &foreign.to_url(), (false, None)).await;
+        assert_eq!(elsewhere.status(), StatusCode::NOT_FOUND);
+        let unnamed = resolve_data(
+            State(node.state.clone()),
+            Extension(None),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            "/api/v1/objects".parse().unwrap(),
+            Query(ResolveQuery {
+                here: false,
+                ticket: None,
+            }),
+        )
+        .await;
+        assert_eq!(unnamed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn redirects_to_holder() {
+        let node = node_state().await;
+        mirror(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        publish_api(&node.state, node_id(PEER), PEER_API).await;
+        peer_heartbeat(&node.state).await;
+        let owner = Some(&node.owner);
+        let token = unsigned_token(&node.owner);
+
+        // A caller whose token a ticket can name is sent to the chosen holder.
+        let redirect = resolve(&node, (owner, Some(&token)), &id, (false, None)).await;
+        assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        let headers = redirect.headers();
+        assert_eq!(headers[http::header::CACHE_CONTROL], "no-store");
+        let location = headers[http::header::LOCATION].to_str().unwrap();
+        let pinned = format!("{PEER_API}/api/v1/ga4gh/drs/v1/download?object_id=");
+        assert!(location.starts_with(&pinned));
+        assert!(location.contains("&here=true&ticket="));
+
+        // A credential no ticket can carry is served here, where the bytes are.
+        let opaque = resolve(&node, (owner, Some("opaque")), &id, (false, None)).await;
+        assert_eq!(opaque.status(), StatusCode::OK);
+
+        // A pinned url is served here.
+        let here = resolve(&node, (owner, Some(&token)), &id, (true, None)).await;
+        assert_eq!(here.status(), StatusCode::OK);
+
+        let access = object(&node, &id).await["access_methods"][0]["access_url"]["url"].clone();
+        assert!(access.as_str().unwrap().starts_with(PEER_API));
+        let bulk = post_objects(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            Json(DrsBulkBody {
+                object_ids: vec![id.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(bulk.status(), StatusCode::OK);
+        assert!(body(bulk).await.contains(PEER_API));
+    }
+
+    #[tokio::test]
+    async fn refuses_foreign_tickets() {
+        let node = node_state().await;
+        mirror(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let garbage = resolve(
+            &node,
+            (None, None),
+            &id,
+            (false, Some("not-a-ticket".into())),
+        );
+        assert_eq!(garbage.await.status(), StatusCode::FORBIDDEN);
+
+        // The ticket of a redirect names the peer; this node refuses to redeem it.
+        publish_api(&node.state, node_id(PEER), PEER_API).await;
+        peer_heartbeat(&node.state).await;
+        let token = unsigned_token(&node.owner);
+        let redirect = resolve(&node, (Some(&node.owner), Some(&token)), &id, (false, None)).await;
+        let location = redirect.headers()[http::header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let ticket = location.split("&ticket=").nth(1).unwrap().to_string();
+        let foreign = resolve(&node, (None, None), &id, (false, Some(ticket))).await;
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    }
+
+    async fn download(
+        node: &Node,
+        auth: Option<&AuthContext>,
+        id: &str,
+        ticket: Option<String>,
+    ) -> Response {
+        download_object(
+            State(node.state.clone()),
+            Extension(auth.cloned()),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            Query(DownloadQuery {
+                object_id: id.to_string(),
+                here: false,
+                ticket,
+            }),
+        )
+        .await
+    }
+
+    async fn object_status(node: &Node, auth: &AuthContext, id: &str) -> StatusCode {
+        get_object(
+            State(node.state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            Path(id.to_string()),
+        )
+        .await
+        .status()
+    }
+
+    #[tokio::test]
+    async fn downloads_by_query() {
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let served = download(&node, Some(&node.owner), &id, None).await;
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(body(served).await, "bytes");
+        // A set id names no object.
+        let set = GlobalId::Set {
+            realm_id: node.state.get_realm_id(),
+            set_id: ulid::Ulid::from_bytes([3; 16]),
+            prefix: String::new(),
+        };
+        let named = download(&node, Some(&node.owner), &set.to_url(), None).await;
+        assert_eq!(named.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn member_arns_resolve() {
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let version_id = id.rsplit('/').next().unwrap().parse().unwrap();
+        let arn = |version_id| {
+            VersionedObjectArn::new(
+                node.state.get_realm_id(),
+                node.state.get_node_id(),
+                BUCKET,
+                "a.md",
+                version_id,
+            )
+            .unwrap()
+            .to_string()
+        };
+        // A member bucket's object answers under its global id.
+        let found = get_object(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Extension(None),
+            ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            HeaderMap::new(),
+            Path(arn(version_id)),
+        )
+        .await;
+        assert_eq!(found.status(), StatusCode::OK);
+        let found: serde_json::Value = serde_json::from_str(&body(found).await).unwrap();
+        assert_eq!(found["aliases"], serde_json::json!([id]));
+        // A node ARN proves no absence in a distributed bucket.
+        let missing = arn(ulid::Ulid::from_bytes([4; 16]));
+        assert_eq!(
+            object_status(&node, &node.owner, &missing).await,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn content_hashes_searched() {
+        let node = node_state().await;
+        mirror(&node.state, node.group_id, BUCKET).await;
+        stored(&node).await;
+        // A hash nothing holds is searched in the distributed indexes and stays absent.
+        let unknown = format!("{DATA_PREFIX}{}", hex::encode([7u8; 32]));
+        assert_eq!(
+            object_status(&node, &node.owner, &unknown).await,
+            StatusCode::NOT_FOUND
+        );
+        // A caller who may not read the local copy is refused the distributed one too.
+        let known = format!("{DATA_PREFIX}{}", blake3::hash(b"bytes").to_hex());
+        assert_eq!(
+            object_status(&node, &node.stranger, &known).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            object_status(&node, &node.owner, &known).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_bytes_unavailable() {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+        use aruna_core::structs::storage::blob::VersionKey;
+        let node = node_state().await;
+        mirror(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let version_id = id.rsplit('/').next().unwrap().parse().unwrap();
+        let key = VersionKey::new(BUCKET, "a.md", version_id)
+            .to_bytes()
+            .unwrap();
+        let delete = StorageEffect::Delete {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: None,
+        };
+        node.state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(delete)
+            .await;
+        // The index names the version, but no holder answered for the missing bytes.
+        assert_eq!(
+            object_status(&node, &node.owner, &id).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn redeems_own_tickets() {
+        use aruna_operations::auth::bearer_token::token_grant;
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let id = stored(&node).await;
+        let input = TicketInput {
+            target: node.state.get_node_id(),
+            user_id: node.owner.user_id,
+            grant: token_grant(&unsigned_token(&node.owner)).unwrap(),
+            restrictions: None,
+            session: None,
+            object_id: id.clone(),
+        };
+        let now = now_millis() / 1000;
+        let ticket = issue_ticket(&node.state.get_ctx(), input, now).unwrap();
+        let ticket = ticket.encode().unwrap();
+        let first = download(&node, None, &id, Some(ticket.clone())).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        // A ticket is spent by its first download.
+        let again = download(&node, None, &id, Some(ticket)).await;
+        assert_eq!(again.status(), StatusCode::FORBIDDEN);
+    }
 }

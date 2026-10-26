@@ -300,8 +300,8 @@ pub async fn process_graph_tombstones(
         }
     }
 
-    // A deleted document is absent from the registry, so its IRI index rows are
-    // pruned here rather than left to leak into the predicate-less backlink scan.
+    // A deleted document is absent from the registry, so its IRI index rows are pruned here,
+    // read through the document's own rows.
     if let Err(error) = prune_deleted_index(context, &deleted_documents).await {
         warn!(error = ?error, "Failed to prune IRI index rows for deleted documents");
     }
@@ -316,7 +316,8 @@ async fn prune_deleted_index(
         return Ok(());
     }
     let keys = super::iri_index::document_iri_keys(&context.storage_handle, document_ids).await?;
-    super::iri_index::delete_keys(&context.storage_handle, keys).await
+    super::iri_index::delete_keys(&context.storage_handle, keys).await?;
+    Ok(super::data_links::delete_documents(&context.storage_handle, document_ids).await?)
 }
 
 fn group_prune_jobs(
@@ -950,15 +951,23 @@ mod tests {
             "https://schema.org/conformsTo",
             "https://example.test/profile",
             record.document_id,
-            Ulid::from_parts(3, 1),
         );
+        let document_row =
+            aruna_core::structs::storage::data::link::document_key(record.document_id, &index_key);
         write_entries(
             &storage,
-            vec![(
-                aruna_core::keyspaces::IRI_INDEX_KEYSPACE.to_string(),
-                index_key.clone(),
-                ByteView::from(vec![1u8]),
-            )],
+            vec![
+                (
+                    aruna_core::keyspaces::IRI_INDEX_KEYSPACE.to_string(),
+                    index_key.clone(),
+                    ByteView::from(vec![1u8]),
+                ),
+                (
+                    aruna_core::keyspaces::DOCUMENT_IRI_KEYSPACE.to_string(),
+                    ByteView::from(document_row),
+                    ByteView::from(Vec::new()),
+                ),
+            ],
         )
         .await;
         let tombstone = GraphLifecycleRecord::deleted(

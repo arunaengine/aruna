@@ -29,6 +29,18 @@ pub enum SourceConnectorKind {
 }
 
 impl SourceConnectorKind {
+    /// Whether a read sent with `If-Match` fails when the source no longer holds that ETag:
+    /// S3 does, while HTTP servers may ignore the condition and other sources have none.
+    pub const fn enforces_if_match(self) -> bool {
+        matches!(self, Self::S3)
+    }
+
+    /// Whether the source lists a whole prefix flat and resumes after a key, so an import walks
+    /// it with one provider cursor instead of a directory queue.
+    pub const fn lists_flat(self) -> bool {
+        matches!(self, Self::S3)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Http => "http",
@@ -58,6 +70,32 @@ pub struct SourceConnector {
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     pub created_by: UserId,
+    /// The [`source_namespace`] of the stored credentials, copied into every reference.
+    pub namespace: Option<String>,
+}
+
+const NAMESPACE_DOMAIN: &[u8] = b"aruna-source-namespace-v1";
+
+/// A portable digest of the principal a connector logs in as, for kinds where the login
+/// selects the namespace that paths resolve in. `None` without a principal.
+pub fn source_namespace(
+    kind: SourceConnectorKind,
+    secret_config: &HashMap<String, String>,
+) -> Option<String> {
+    let field = match kind {
+        SourceConnectorKind::Http | SourceConnectorKind::Webdav => "username",
+        SourceConnectorKind::Ftp => "user",
+        SourceConnectorKind::S3 => "access_key_id",
+        SourceConnectorKind::ArunaNative => "access_key",
+        SourceConnectorKind::LocalDirectory | SourceConnectorKind::Invenio => return None,
+    };
+    let principal = secret_config.get(field).filter(|value| !value.is_empty())?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(NAMESPACE_DOMAIN);
+    hasher.update(kind.as_str().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(principal.as_bytes());
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 impl SourceConnector {
@@ -81,7 +119,14 @@ impl SourceConnector {
             created_at,
             updated_at,
             created_by,
+            namespace: None,
         }
+    }
+
+    /// Records the namespace the stored credentials select.
+    pub fn with_namespace(mut self, secret_config: &HashMap<String, String>) -> Self {
+        self.namespace = source_namespace(self.kind, secret_config);
+        self
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -241,6 +286,28 @@ mod tests {
             secret_bytes
                 .windows("super-secret".len())
                 .any(|window| window == b"super-secret")
+        );
+    }
+
+    #[test]
+    fn namespace_follows_principal() {
+        let login = |user: &str, password: &str| {
+            let secret = HashMap::from([
+                ("user".to_string(), user.to_string()),
+                ("password".to_string(), password.to_string()),
+            ]);
+            source_namespace(SourceConnectorKind::Ftp, &secret)
+        };
+        assert_eq!(
+            login("alice", "one"),
+            login("alice", "two"),
+            "a new password"
+        );
+        assert_ne!(login("alice", "one"), login("bob", "one"));
+        assert!(!login("alice", "one").unwrap().contains("alice"));
+        assert_eq!(
+            source_namespace(SourceConnectorKind::S3, &HashMap::new()),
+            None
         );
     }
 }

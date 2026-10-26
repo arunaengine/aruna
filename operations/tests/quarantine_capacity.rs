@@ -129,6 +129,8 @@ fn node_info_bytes(node_id: aruna_core::NodeId) -> Vec<u8> {
             documents_held: None,
             load_permille: None,
             heartbeat_at_ms: 5,
+            download_slots: None,
+            storage_capacity_bytes: None,
         },
         updated_at_ms: 5,
         epoch: aruna_core::structs::storage::node_info::AdvertisementEpoch {

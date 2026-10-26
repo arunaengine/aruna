@@ -746,6 +746,7 @@ mod tests {
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Default::default(),
+                distribution: None,
             };
             info.to_bytes().unwrap().into()
         };

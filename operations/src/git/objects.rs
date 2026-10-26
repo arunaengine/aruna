@@ -69,6 +69,7 @@ pub async fn bucket(
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     match drive(CreateBucketOperation::new(name.clone(), info), context).await {
         Ok(_) | Err(CreateBucketError::BucketAlreadyExists) => {}
@@ -209,6 +210,7 @@ pub async fn described(
         size: location.blob_size,
         sha256: hex::encode(sha256),
         blake3,
+        global: None,
     }))
 }
 
@@ -317,6 +319,7 @@ pub async fn open(
             metadata_only: false,
             destination: None,
             known_refs: Vec::new(),
+            range: None,
         };
         if let Ok(BaoReadOutput::Stream { blob, size, .. }) =
             managed_read(context, source, request).await

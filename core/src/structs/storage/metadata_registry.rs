@@ -37,6 +37,12 @@ impl MetadataRegistryRecord {
         format!("https://w3id.org/aruna/{document_id}")
     }
 
+    /// The document whose graph IRI [`Self::graph_iri_for`] gives `iri`.
+    pub fn graph_document(iri: &str) -> Option<Ulid> {
+        let id = iri.strip_prefix("https://w3id.org/aruna/")?;
+        Ulid::from_string(id).ok()
+    }
+
     pub fn normalize_document_path(path: &str) -> String {
         path.trim().trim_matches('/').to_string()
     }
@@ -78,4 +84,27 @@ pub struct MetadataAuditRecord {
     pub operation: MetadataAuditOperation,
     pub occurred_at_ms: u64,
     pub details: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_names_document() {
+        let document_id = Ulid::from_bytes([3; 16]);
+        let iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        assert_eq!(
+            MetadataRegistryRecord::graph_document(&iri),
+            Some(document_id)
+        );
+        assert_eq!(
+            MetadataRegistryRecord::graph_document("https://w3id.org/aruna/data/abc"),
+            None
+        );
+        assert_eq!(
+            MetadataRegistryRecord::graph_document("https://example.org/x"),
+            None
+        );
+    }
 }

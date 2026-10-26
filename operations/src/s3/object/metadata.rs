@@ -5,13 +5,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REFRESH_JOB_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, REFRESH_DUE_KEYSPACE, REFRESH_JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -27,10 +27,20 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::driver::drive;
+use crate::node::usage_stats::schedule_snapshot_publish;
+use crate::replication::queue::schedule_blob_drain;
+use crate::s3::object::refresh_mint::{MintError, MintSuccessorOperation};
+use crate::s3::object::refresh_observe::ObserveSourceOperation;
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
+use crate::tasks::task_persistence::persist_task_effect;
+use aruna_core::id::NodeId;
+use aruna_core::structs::identity::auth::AuthContext;
 
 const REFRESH_SCAN_PAGE: usize = 512;
 const REFRESH_BATCH_SIZE: usize = 64;
+// Queue writes that lose to a racing drain or request reread the job, up to this often.
+const QUEUE_CONFLICT_RETRIES: u32 = 8;
 
 pub const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(1);
 
@@ -39,8 +49,12 @@ pub struct ReferenceRefresh {
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
-    pub metadata: SourceMetadata,
+    /// `None` asks the worker to observe the source first.
+    pub metadata: Option<SourceMetadata>,
     pub refreshed_at: SystemTime,
+    /// The node and caller a confirmed change is recorded and replicated for.
+    pub node_id: NodeId,
+    pub auth_context: AuthContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +97,6 @@ struct ReferenceRefreshIdentity<'a> {
     bucket: &'a str,
     key: &'a str,
     version_id: Ulid,
-    refreshed_at: SystemTime,
 }
 
 struct ReferenceRefreshScan {
@@ -103,28 +116,47 @@ impl ReferenceRefreshRecord {
     }
 }
 
+/// One job per version: a newer request replaces the payload of the queued one.
 pub fn job_key(refresh: &ReferenceRefresh) -> Result<Key, ConversionError> {
     let identity = ReferenceRefreshIdentity {
         bucket: &refresh.bucket,
         key: &refresh.key,
         version_id: refresh.version_id,
-        refreshed_at: refresh.refreshed_at,
     };
-    let mut key = b"v1".to_vec();
+    let mut key = b"v2".to_vec();
     key.extend(postcard::to_allocvec(&identity)?);
     Ok(ByteView::from(key))
 }
 
-fn job_entry(record: &ReferenceRefreshRecord) -> Result<(String, Key, ByteView), ConversionError> {
-    Ok((
-        REFRESH_JOB_KEYSPACE.to_string(),
-        job_key(&record.refresh)?,
-        ByteView::from(postcard::to_allocvec(record)?),
-    ))
+/// Big-endian due milliseconds, then the job key, so the due index sorts by due time.
+fn due_key(due_at_ms: u64, job_key: &[u8]) -> Key {
+    let mut key = due_at_ms.to_be_bytes().to_vec();
+    key.extend_from_slice(job_key);
+    ByteView::from(key)
 }
 
-fn job_preferred(candidate: &ReferenceRefreshRecord, current: &ReferenceRefreshRecord) -> bool {
-    (candidate.attempts, candidate.due_at_ms) > (current.attempts, current.due_at_ms)
+fn split_due(row: &[u8]) -> Option<(u64, &[u8])> {
+    let (due, job_key) = row.split_first_chunk::<8>()?;
+    Some((u64::from_be_bytes(*due), job_key))
+}
+
+/// The job row and its due index row.
+fn job_entries(
+    record: &ReferenceRefreshRecord,
+) -> Result<Vec<(String, Key, ByteView)>, ConversionError> {
+    let key = job_key(&record.refresh)?;
+    Ok(vec![
+        (
+            REFRESH_DUE_KEYSPACE.to_string(),
+            due_key(record.due_at_ms, &key),
+            ByteView::from(Vec::new()),
+        ),
+        (
+            REFRESH_JOB_KEYSPACE.to_string(),
+            key,
+            ByteView::from(postcard::to_allocvec(record)?),
+        ),
+    ])
 }
 
 pub fn schedule_drain() -> Effect {
@@ -137,8 +169,10 @@ pub fn schedule_drain() -> Effect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueRefreshState {
     Init,
+    StartTransaction,
     ReadExisting,
     WriteJob,
+    Commit,
     ScheduleDrain,
     Finish,
     Error,
@@ -147,6 +181,8 @@ enum QueueRefreshState {
 #[derive(Debug, PartialEq)]
 pub struct QueueRefreshOperation {
     refresh: ReferenceRefresh,
+    txn_id: Option<Ulid>,
+    conflicts: u32,
     state: QueueRefreshState,
     output: Option<Result<QueueRefreshResult, ReferenceRefreshError>>,
 }
@@ -155,6 +191,8 @@ impl QueueRefreshOperation {
     pub fn new(refresh: ReferenceRefresh) -> Self {
         Self {
             refresh,
+            txn_id: None,
+            conflicts: 0,
             state: QueueRefreshState::Init,
             output: None,
         }
@@ -166,35 +204,64 @@ impl QueueRefreshOperation {
         smallvec![]
     }
 
-    fn read_existing(&mut self) -> Effects {
+    fn start_transaction(&mut self) -> Effects {
+        self.state = QueueRefreshState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn read_existing(&mut self, txn_id: Ulid) -> Effects {
         let key = match job_key(&self.refresh) {
             Ok(key) => key,
             Err(error) => return self.fail(error.into()),
         };
+        self.txn_id = Some(txn_id);
         self.state = QueueRefreshState::ReadExisting;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: REFRESH_JOB_KEYSPACE.to_string(),
             key,
-            txn_id: None,
+            txn_id: Some(txn_id),
         })]
     }
 
-    fn write_job(&mut self) -> Effects {
-        let record = ReferenceRefreshRecord::new(self.refresh.clone(), unix_timestamp_millis());
-        let (key_space, key, value) = match job_entry(&record) {
-            Ok(entry) => entry,
+    /// A queued job keeps its due time and attempts; only a newer request replaces its payload.
+    fn merge_job(&mut self, existing: Option<&[u8]>) -> Effects {
+        let record = match existing.map(postcard::from_bytes::<ReferenceRefreshRecord>) {
+            Some(Ok(existing)) if existing.refresh.refreshed_at >= self.refresh.refreshed_at => {
+                return self.commit();
+            }
+            Some(Ok(existing)) => ReferenceRefreshRecord {
+                refresh: self.refresh.clone(),
+                ..existing
+            },
+            Some(Err(_)) | None => {
+                ReferenceRefreshRecord::new(self.refresh.clone(), unix_timestamp_millis())
+            }
+        };
+        let writes = match job_entries(&record) {
+            Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
         self.state = QueueRefreshState::WriteJob;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: None,
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: self.txn_id,
         })]
     }
 
+    fn commit(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.fail(ReferenceRefreshError::UnexpectedEvent(
+                "refresh queue transaction is missing".to_string(),
+            ));
+        };
+        self.state = QueueRefreshState::Commit;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
     fn schedule_drain(&mut self) -> Effects {
+        self.txn_id = None;
         self.state = QueueRefreshState::ScheduleDrain;
         smallvec![schedule_drain()]
     }
@@ -211,42 +278,51 @@ impl Operation for QueueRefreshOperation {
     type Error = ReferenceRefreshError;
 
     fn start(&mut self) -> Effects {
-        self.read_existing()
+        self.start_transaction()
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            QueueRefreshState::Init => self.read_existing(),
-            QueueRefreshState::ReadExisting => match event {
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => {
-                    let record =
-                        ReferenceRefreshRecord::new(self.refresh.clone(), unix_timestamp_millis());
-                    match postcard::from_bytes::<ReferenceRefreshRecord>(&value) {
-                        Ok(existing) if job_preferred(&existing, &record) => self.schedule_drain(),
-                        Ok(_) | Err(_) => self.write_job(),
+        let event = match (&self.state, event) {
+            (QueueRefreshState::Finish | QueueRefreshState::Error, _) => return smallvec![],
+            (QueueRefreshState::Init, _) => return self.start_transaction(),
+            (QueueRefreshState::ScheduleDrain, event) => {
+                return match event {
+                    Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(true, true),
+                    Event::Task(TaskEvent::Error { .. }) => self.finish(true, false),
+                    other => {
+                        warn!(event = ?other, "Reference metadata refresh job persisted but drain scheduling returned an unexpected event");
+                        self.finish(true, false)
                     }
-                }
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_job(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
-            },
-            QueueRefreshState::WriteJob => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.schedule_drain(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
-            },
-            QueueRefreshState::ScheduleDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(true, true),
-                Event::Task(TaskEvent::Error { .. }) => self.finish(true, false),
-                other => {
-                    warn!(event = ?other, "Reference metadata refresh job persisted but drain scheduling returned an unexpected event");
-                    self.finish(true, false)
-                }
-            },
-            QueueRefreshState::Finish => smallvec![],
-            QueueRefreshState::Error => smallvec![],
+                };
+            }
+            (
+                QueueRefreshState::Commit,
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }),
+            ) if self.conflicts < QUEUE_CONFLICT_RETRIES => {
+                self.txn_id = None;
+                self.conflicts += 1;
+                return self.start_transaction();
+            }
+            (_, Event::Storage(StorageEvent::Error { error })) => return self.fail(error.into()),
+            (_, Event::Storage(event)) => event,
+            (_, other) => {
+                return self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}")));
+            }
+        };
+        match (&self.state, event) {
+            (QueueRefreshState::StartTransaction, StorageEvent::TransactionStarted { txn_id }) => {
+                self.read_existing(txn_id)
+            }
+            (QueueRefreshState::ReadExisting, StorageEvent::ReadResult { value, .. }) => {
+                self.merge_job(value.as_deref())
+            }
+            (QueueRefreshState::WriteJob, StorageEvent::BatchWriteResult { .. }) => self.commit(),
+            (QueueRefreshState::Commit, StorageEvent::TransactionCommitted { .. }) => {
+                self.schedule_drain()
+            }
+            (_, other) => self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
         }
     }
 
@@ -268,7 +344,10 @@ impl Operation for QueueRefreshOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        smallvec![]
+        match self.txn_id.take() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
     }
 }
 
@@ -296,6 +375,7 @@ pub async fn refresh_with_context(
         other => return Err(format!("unexpected start transaction event: {other:?}")),
     };
 
+    let mut minted = false;
     let refreshed_value = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -315,6 +395,7 @@ pub async fn refresh_with_context(
                     return Err(err.to_string());
                 }
             };
+            let predecessor = version.clone();
             let BlobVersion {
                 created_at,
                 created_by,
@@ -322,29 +403,64 @@ pub async fn refresh_with_context(
                 metadata,
                 published_by,
                 placement_policies,
+                original_epoch,
+                generation,
+                identity,
+                origin,
+                hop,
             } = version;
             let BlobVersionState::Reference {
                 source,
+                cached_metadata,
                 last_refresh,
                 advance_count,
-                ..
             } = state
             else {
                 abort_reference_refresh(context, txn_id).await;
                 return Ok(());
             };
-            if refresh.refreshed_at <= last_refresh {
+            // Only a confirmed observation counts as a refresh; fields under the version id never
+            // change, so a confirmed change becomes a successor and an unknown one is dropped.
+            let Some(observation) = refresh.metadata.clone() else {
+                abort_reference_refresh(context, txn_id).await;
+                return Err("the refresh carries no observation".to_string());
+            };
+            let comparison = cached_metadata.compare(&observation);
+            if refresh.refreshed_at > last_refresh && comparison == ObservationMatch::Changed {
+                let mint = MintSuccessorOperation::new(
+                    txn_id,
+                    refresh.clone(),
+                    observation.clone(),
+                    predecessor,
+                );
+                match drive(mint, context).await {
+                    Ok(written) => minted = written,
+                    // The key's range moved to another coordinator, which refreshes it there.
+                    Err(MintError::Distribution(error)) if error.moved_away() => {
+                        abort_reference_refresh(context, txn_id).await;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        abort_reference_refresh(context, txn_id).await;
+                        return Err(error.to_string());
+                    }
+                }
+            }
+            if refresh.refreshed_at <= last_refresh || comparison != ObservationMatch::Same {
                 None
             } else {
-                // referenced_bytes usage on a size-changing refresh is accounted
-                // by the verified-reference arc that wires this path; no delta here.
                 Some(
                     match (BlobVersion {
                         published_by,
                         placement_policies,
+                        original_epoch,
+                        generation,
+                        identity,
+                        origin,
+                        hop,
                         ..BlobVersion::reference(
                             source,
-                            refresh.metadata,
+                            cached_metadata,
                             created_at,
                             created_by,
                             refresh.refreshed_at,
@@ -405,7 +521,17 @@ pub async fn refresh_with_context(
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+            if minted {
+                // The dirty markers and the obligation committed above are the durable work.
+                for effect in [schedule_snapshot_publish(), schedule_blob_drain()] {
+                    if let Effect::Task(effect) = effect {
+                        schedule_task(context, effect).await;
+                    }
+                }
+            }
+            Ok(())
+        }
         Event::Storage(StorageEvent::Error { error }) => {
             abort_reference_refresh(context, txn_id).await;
             Err(error.to_string())
@@ -414,6 +540,38 @@ pub async fn refresh_with_context(
             abort_reference_refresh(context, txn_id).await;
             Err(format!("unexpected commit event: {other:?}"))
         }
+    }
+}
+
+/// Observes the source first when the refresh carries no observation; a failed observation
+/// fails the job, which the queue retries later.
+async fn observe_and_refresh(
+    context: &DriverContext,
+    mut refresh: ReferenceRefresh,
+) -> Result<(), String> {
+    if refresh.metadata.is_none() {
+        let version_key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id);
+        let observed = match drive(ObserveSourceOperation::new(version_key), context).await {
+            Ok(observed) => observed,
+            // Work for a version that is gone or no longer resolvable is finished, not retried.
+            Err(error) if error.is_obsolete() => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        refresh.metadata = Some(observed);
+        refresh.refreshed_at = SystemTime::now().max(refresh.refreshed_at);
+    }
+    refresh_with_context(context, refresh).await
+}
+
+async fn schedule_task(context: &DriverContext, effect: TaskEffect) {
+    if persist_task_effect(&context.storage_handle, &effect)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if let Some(task_handle) = &context.task_handle {
+        let _ = task_handle.send_effect(Effect::Task(effect)).await;
     }
 }
 
@@ -443,34 +601,17 @@ pub async fn restore_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
 }
 
 pub async fn jobs_exist(storage: &StorageHandle) -> Result<bool, ReferenceRefreshError> {
-    match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: REFRESH_JOB_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
-    }
+    Ok(!first_due(storage, 1).await?.0.is_empty())
 }
 
 pub async fn next_timer(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, ReferenceRefreshError> {
-    let now_ms = unix_timestamp_millis();
-    let scan = scan_due_jobs(storage, now_ms, 1).await?;
-    if !scan.jobs.is_empty() || scan.has_more_due {
-        return Ok(Some(Duration::ZERO));
-    }
-
-    Ok(scan
-        .next_due_ms
-        .map(|due_at_ms| due_after(now_ms, due_at_ms)))
+    let (rows, _) = first_due(storage, 1).await?;
+    Ok(rows
+        .first()
+        .and_then(|(row, _)| split_due(row))
+        .map(|(due_at_ms, _)| due_after(unix_timestamp_millis(), due_at_ms)))
 }
 
 pub async fn process_batch(
@@ -493,14 +634,14 @@ pub async fn process_batch(
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     for (job_key, job) in scan.jobs {
-        match refresh_with_context(context, job.refresh.clone()).await {
+        match observe_and_refresh(context, job.refresh.clone()).await {
             Ok(()) => {
-                delete_job(&context.storage_handle, job_key).await?;
+                settle_job(&context.storage_handle, &job_key, &job, None).await?;
                 succeeded = succeeded.saturating_add(1);
             }
             Err(error) => {
                 let retry_due_at =
-                    reschedule_job(&context.storage_handle, job_key, &job, error).await?;
+                    reschedule_job(&context.storage_handle, &job_key, &job, error).await?;
                 next_due_ms = min_due_at(next_due_ms, retry_due_at);
                 failed = failed.saturating_add(1);
             }
@@ -534,239 +675,169 @@ pub async fn process_batch(
     })
 }
 
+/// The first `limit` due index rows and whether more follow.
+async fn first_due(
+    storage: &StorageHandle,
+    limit: usize,
+) -> Result<(Vec<(Key, ByteView)>, bool), ReferenceRefreshError> {
+    let event = send(
+        storage,
+        StorageEffect::Iter {
+            key_space: REFRESH_DUE_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit,
+            txn_id: None,
+        },
+    )
+    .await?;
+    match event {
+        StorageEvent::IterResult {
+            values,
+            next_start_after,
+        } => Ok((values, next_start_after.is_some())),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+    }
+}
+
+/// Walks one page of the due index in due order, with a point read per due row.
 async fn scan_due_jobs(
     storage: &StorageHandle,
     now_ms: u64,
     limit: usize,
 ) -> Result<ReferenceRefreshScan, ReferenceRefreshError> {
-    let mut start_after = None;
+    let (rows, more_rows) = first_due(storage, REFRESH_SCAN_PAGE).await?;
     let mut jobs = Vec::new();
-    let mut next_due_ms = None;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: REFRESH_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: REFRESH_SCAN_PAGE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}")));
-            }
+    for (row, _) in rows {
+        let Some((due_at_ms, key)) = split_due(&row) else {
+            delete_rows(storage, vec![(REFRESH_DUE_KEYSPACE.to_string(), row)], None).await?;
+            continue;
         };
-
-        for (key, value) in values {
-            let mut key = key.to_vec();
-            let job = match postcard::from_bytes::<ReferenceRefreshRecord>(&value) {
-                Ok(job) => job,
-                Err(error) => {
-                    warn!(error = %error, key = ?key, "Deleting malformed reference metadata refresh job");
-                    delete_job(storage, key).await?;
-                    continue;
-                }
-            };
-            let canonical_key = job_key(&job.refresh)?.to_vec();
-            if canonical_key.as_slice() != key.as_slice() {
-                warn!(key = ?key, "Repairing reference metadata refresh job stored under non-canonical key");
-                if let Some(existing) = read_job(storage, &canonical_key).await?
-                    && job_preferred(&existing, &job)
-                {
-                    delete_job(storage, key).await?;
-                    if existing.due_at_ms > now_ms {
-                        next_due_ms = min_due_at(next_due_ms, existing.due_at_ms);
-                        continue;
-                    }
-                    jobs.push((canonical_key, existing));
-                    if jobs.len() >= limit {
-                        return Ok(ReferenceRefreshScan {
-                            jobs,
-                            has_more_due: true,
-                            next_due_ms,
-                        });
-                    }
-                    continue;
-                }
-                write_job(storage, &job).await?;
-                delete_job(storage, key).await?;
-                key = canonical_key;
-            }
-            if let Some((existing_key, existing)) =
-                find_duplicate(storage, &job, Some(key.as_slice())).await?
-                && job_preferred(&existing, &job)
-            {
-                let existing_canonical_key = job_key(&existing.refresh)?.to_vec();
-                write_job(storage, &existing).await?;
-                if existing_key.as_slice() != existing_canonical_key.as_slice() {
-                    delete_job(storage, existing_key).await?;
-                }
-                if key.as_slice() != existing_canonical_key.as_slice() {
-                    delete_job(storage, key).await?;
-                }
-                if existing.due_at_ms > now_ms {
-                    next_due_ms = min_due_at(next_due_ms, existing.due_at_ms);
-                    continue;
-                }
-                jobs.push((existing_canonical_key, existing));
-                if jobs.len() >= limit {
-                    return Ok(ReferenceRefreshScan {
-                        jobs,
-                        has_more_due: true,
-                        next_due_ms,
-                    });
-                }
+        if due_at_ms > now_ms {
+            return Ok(ReferenceRefreshScan {
+                jobs,
+                has_more_due: false,
+                next_due_ms: Some(due_at_ms),
+            });
+        }
+        if jobs.len() >= limit {
+            return Ok(ReferenceRefreshScan {
+                jobs,
+                has_more_due: true,
+                next_due_ms: None,
+            });
+        }
+        let mut stale = vec![(REFRESH_DUE_KEYSPACE.to_string(), row.clone())];
+        match read_job(storage, key, None).await? {
+            Some(Ok(job)) if job.due_at_ms == due_at_ms => {
+                jobs.push((key.to_vec(), job));
                 continue;
             }
-            if job.due_at_ms > now_ms {
-                next_due_ms = min_due_at(next_due_ms, job.due_at_ms);
-                continue;
-            }
-            jobs.push((key, job));
-            if jobs.len() >= limit {
-                return Ok(ReferenceRefreshScan {
-                    jobs,
-                    has_more_due: true,
-                    next_due_ms,
-                });
+            Some(Ok(_)) | None => {}
+            Some(Err(error)) => {
+                warn!(error = %error, key = ?key, "Deleting malformed reference metadata refresh job");
+                let key = ByteView::from(key.to_vec());
+                stale.push((REFRESH_JOB_KEYSPACE.to_string(), key));
             }
         }
-
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => {
-                return Ok(ReferenceRefreshScan {
-                    jobs,
-                    has_more_due: false,
-                    next_due_ms,
-                });
-            }
-        }
+        delete_rows(storage, stale, None).await?;
     }
+    Ok(ReferenceRefreshScan {
+        jobs,
+        has_more_due: more_rows,
+        next_due_ms: None,
+    })
 }
 
-async fn find_duplicate(
+async fn send(
     storage: &StorageHandle,
-    job: &ReferenceRefreshRecord,
-    skip_key: Option<&[u8]>,
-) -> Result<Option<(Vec<u8>, ReferenceRefreshRecord)>, ReferenceRefreshError> {
-    let canonical_key = job_key(&job.refresh)?.to_vec();
-    let mut selected = None;
-    let mut start_after = None;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: REFRESH_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: REFRESH_SCAN_PAGE,
-                txn_id: None,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}")));
-            }
-        };
-
-        for (key, value) in values {
-            if skip_key.is_some_and(|skip_key| key.as_ref() == skip_key) {
-                continue;
-            }
-            let Ok(candidate) = postcard::from_bytes::<ReferenceRefreshRecord>(&value) else {
-                continue;
-            };
-            if job_key(&candidate.refresh)?.as_ref() != canonical_key.as_slice() {
-                continue;
-            }
-            match selected.as_mut() {
-                Some((_, selected_job)) if job_preferred(&candidate, selected_job) => {
-                    selected = Some((key.to_vec(), candidate));
-                }
-                Some(_) => {}
-                None => selected = Some((key.to_vec(), candidate)),
-            }
-        }
-
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => return Ok(selected),
-        }
+    effect: StorageEffect,
+) -> Result<StorageEvent, ReferenceRefreshError> {
+    match storage.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        Event::Storage(event) => Ok(event),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 async fn read_job(
     storage: &StorageHandle,
     key: &[u8],
-) -> Result<Option<ReferenceRefreshRecord>, ReferenceRefreshError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REFRESH_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(key.to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => Ok(Some(
-            postcard::from_bytes(&value).map_err(ConversionError::from)?,
-        )),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+    txn_id: Option<Ulid>,
+) -> Result<Option<Result<ReferenceRefreshRecord, postcard::Error>>, ReferenceRefreshError> {
+    let effect = StorageEffect::Read {
+        key_space: REFRESH_JOB_KEYSPACE.to_string(),
+        key: ByteView::from(key.to_vec()),
+        txn_id,
+    };
+    match send(storage, effect).await? {
+        StorageEvent::ReadResult { value, .. } => {
+            Ok(value.map(|value| postcard::from_bytes(&value)))
+        }
         other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
-async fn write_job(
+async fn delete_rows(
     storage: &StorageHandle,
-    job: &ReferenceRefreshRecord,
+    deletes: Vec<(String, Key)>,
+    txn_id: Option<Ulid>,
 ) -> Result<(), ReferenceRefreshError> {
-    let (key_space, key, value) = job_entry(job)?;
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+    match send(storage, StorageEffect::BatchDelete { deletes, txn_id }).await? {
+        StorageEvent::BatchDeleteResult { .. } => Ok(()),
         other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
-async fn delete_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), ReferenceRefreshError> {
-    match storage
-        .send_storage_effect(StorageEffect::Delete {
-            key_space: REFRESH_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+/// Removes a finished job, or replaces it with `next`, unless a newer request replaced it.
+async fn settle_job(
+    storage: &StorageHandle,
+    key: &[u8],
+    job: &ReferenceRefreshRecord,
+    next: Option<&ReferenceRefreshRecord>,
+) -> Result<(), ReferenceRefreshError> {
+    let txn_id = match send(storage, StorageEffect::StartTransaction { read: false }).await? {
+        StorageEvent::TransactionStarted { txn_id } => txn_id,
+        other => return Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+    };
+    let result = async {
+        if !matches!(read_job(storage, key, Some(txn_id)).await?, Some(Ok(stored)) if stored == *job)
+        {
+            return Ok(());
+        }
+        let mut deletes = vec![(
+            REFRESH_DUE_KEYSPACE.to_string(),
+            due_key(job.due_at_ms, key),
+        )];
+        let Some(next) = next else {
+            let key = ByteView::from(key.to_vec());
+            deletes.push((REFRESH_JOB_KEYSPACE.to_string(), key));
+            return delete_rows(storage, deletes, Some(txn_id)).await;
+        };
+        delete_rows(storage, deletes, Some(txn_id)).await?;
+        let writes = job_entries(next)?;
+        match send(storage, StorageEffect::BatchWrite { writes, txn_id: Some(txn_id) }).await? {
+            StorageEvent::BatchWriteResult { .. } => Ok(()),
+            other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+        }
+    }
+    .await;
+    let effect = match result {
+        Ok(()) => StorageEffect::CommitTransaction { txn_id },
+        Err(error) => {
+            let _ = send(storage, StorageEffect::AbortTransaction { txn_id }).await;
+            return Err(error);
+        }
+    };
+    match send(storage, effect).await? {
+        StorageEvent::TransactionCommitted { .. } => Ok(()),
         other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
 async fn reschedule_job(
     storage: &StorageHandle,
-    key: Vec<u8>,
+    key: &[u8],
     job: &ReferenceRefreshRecord,
     error: String,
 ) -> Result<u64, ReferenceRefreshError> {
@@ -778,19 +849,8 @@ async fn reschedule_job(
         attempts,
         last_error: Some(error),
     };
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: REFRESH_JOB_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            value: ByteView::from(postcard::to_allocvec(&next_job).map_err(ConversionError::from)?),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(due_at_ms),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
-    }
+    settle_job(storage, key, job, Some(&next_job)).await?;
+    Ok(due_at_ms)
 }
 
 #[cfg(test)]
@@ -846,6 +906,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: None,
         }
@@ -858,6 +919,7 @@ mod tests {
             etag: Some(etag.to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(content_length)),
             source_version: None,
+            digests: Default::default(),
         }
     }
 
@@ -870,8 +932,15 @@ mod tests {
             bucket: test.bucket.clone(),
             key: test.key.clone(),
             version_id: test.version_id,
-            metadata,
+            metadata: Some(metadata),
             refreshed_at,
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            auth_context: aruna_core::structs::identity::auth::AuthContext {
+                user_id: Default::default(),
+                realm_id: aruna_core::structs::identity::realm::RealmId([9u8; 32]),
+                path_restrictions: None,
+                session: None,
+            },
         }
     }
 
@@ -974,19 +1043,33 @@ mod tests {
         }
     }
 
-    async fn write_corrupt_job(storage: &StorageHandle, key: &str) {
+    async fn write_rows(storage: &StorageHandle, writes: Vec<(String, Key, ByteView)>) {
         match storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space: REFRESH_JOB_KEYSPACE.to_string(),
-                key: ByteView::from(key.as_bytes().to_vec()),
-                value: ByteView::from(Vec::new()),
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
                 txn_id: None,
             })
             .await
         {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected corrupt refresh job write event: {other:?}"),
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected refresh job write event: {other:?}"),
         }
+    }
+
+    async fn write_corrupt_job(storage: &StorageHandle, key: &str) {
+        let writes = vec![
+            (
+                REFRESH_DUE_KEYSPACE.to_string(),
+                due_key(0, key.as_bytes()),
+                ByteView::from(Vec::new()),
+            ),
+            (
+                REFRESH_JOB_KEYSPACE.to_string(),
+                ByteView::from(key.as_bytes().to_vec()),
+                ByteView::from(Vec::new()),
+            ),
+        ];
+        write_rows(storage, writes).await;
     }
 
     #[tokio::test]
@@ -1013,23 +1096,139 @@ mod tests {
         assert_reference_state(&test, &original_metadata, last_refresh).await;
     }
 
+    // Fields under a version id never change: a changed observation is no refresh.
     #[tokio::test]
-    async fn newer_cache_updated() {
+    async fn changed_refresh_ignored() {
         let test = setup_state();
         let last_refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
         let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
-        let new_metadata = source_metadata(20, "newer");
-        write_reference_version(&test, source_metadata(10, "original"), last_refresh, 0).await;
+        let original = source_metadata(10, "original");
+        write_reference_version(&test, original.clone(), last_refresh, 0).await;
 
         crate::driver::drive(
-            QueueRefreshOperation::new(refresh(&test, new_metadata.clone(), refreshed_at)),
+            QueueRefreshOperation::new(refresh(&test, source_metadata(20, "newer"), refreshed_at)),
             &test.context,
         )
         .await
         .expect("queue succeeds");
         process_batch(&test.context).await.expect("drain succeeds");
 
-        assert_reference_state(&test, &new_metadata, refreshed_at).await;
+        assert_reference_state(&test, &original, last_refresh).await;
+    }
+
+    // A confirmed change of the current version is recorded as a successor that becomes the
+    // head; the refreshed version keeps its fields.
+    #[tokio::test]
+    async fn change_mints_successor() {
+        use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, S3_BUCKET_KEYSPACE};
+        use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, CurrentVersionPointer};
+        let test = setup_state();
+        let original = source_metadata(10, "original");
+        write_reference_version(&test, original.clone(), SystemTime::UNIX_EPOCH, 0).await;
+        let bucket = BucketInfo {
+            group_id: Ulid::from_bytes([1; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: test.created_by,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: None,
+        };
+        let head_key = BlobHeadKey::new(&test.bucket, &test.key)
+            .to_bytes()
+            .unwrap();
+        let writes = vec![
+            (
+                BLOB_HEAD_KEYSPACE.to_string(),
+                head_key.clone().into(),
+                CurrentVersionPointer::new(test.version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                test.bucket.as_bytes().to_vec().into(),
+                bucket.to_bytes().unwrap().into(),
+            ),
+        ];
+        test.context
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+        let changed = source_metadata(20, "changed");
+        let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+
+        refresh_with_context(&test.context, refresh(&test, changed.clone(), refreshed_at))
+            .await
+            .unwrap();
+
+        assert_reference_state(&test, &original, SystemTime::UNIX_EPOCH).await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(head), ..
+        }) = test
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: head_key.into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("the head must exist");
+        };
+        let head = CurrentVersionPointer::from_bytes(&head).unwrap();
+        assert_ne!(head.version_id, test.version_id);
+        assert_eq!(head.generation, 2);
+    }
+
+    // A request for a version that no longer exists is finished instead of retried forever.
+    #[tokio::test]
+    async fn obsolete_request_finished() {
+        let test = setup_state();
+        let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let mut request = refresh(&test, source_metadata(1, "unused"), refreshed_at);
+        request.metadata = None;
+        crate::driver::drive(QueueRefreshOperation::new(request), &test.context)
+            .await
+            .expect("queue succeeds");
+
+        let result = process_batch(&test.context).await.expect("drain runs");
+
+        assert_eq!((result.succeeded, result.failed), (1, 0));
+        assert!(read_jobs(&test.context.storage_handle).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_refresh_advances() {
+        let test = setup_state();
+        let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let original = source_metadata(10, "original");
+        write_reference_version(&test, original.clone(), SystemTime::UNIX_EPOCH, 0).await;
+        let mut unknown = original.clone();
+        unknown.etag = None;
+        let mut listed = original.clone();
+        listed.content_type = None;
+
+        for (observation, expected_refresh) in
+            [(unknown, SystemTime::UNIX_EPOCH), (listed, refreshed_at)]
+        {
+            crate::driver::drive(
+                QueueRefreshOperation::new(refresh(&test, observation, refreshed_at)),
+                &test.context,
+            )
+            .await
+            .expect("queue succeeds");
+            process_batch(&test.context).await.expect("drain succeeds");
+
+            assert_reference_state(&test, &original, expected_refresh).await;
+        }
     }
 
     // A metadata refresh is not a rebind, so it must not hand the binding a fresh
@@ -1038,24 +1237,18 @@ mod tests {
     async fn refresh_keeps_count() {
         let test = setup_state();
         let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
-        let new_metadata = source_metadata(20, "newer");
-        write_reference_version(
-            &test,
-            source_metadata(10, "original"),
-            SystemTime::UNIX_EPOCH,
-            7,
-        )
-        .await;
+        let original = source_metadata(10, "original");
+        write_reference_version(&test, original.clone(), SystemTime::UNIX_EPOCH, 7).await;
 
         crate::driver::drive(
-            QueueRefreshOperation::new(refresh(&test, new_metadata.clone(), refreshed_at)),
+            QueueRefreshOperation::new(refresh(&test, original.clone(), refreshed_at)),
             &test.context,
         )
         .await
         .expect("queue succeeds");
         process_batch(&test.context).await.expect("drain succeeds");
 
-        assert_reference_state(&test, &new_metadata, refreshed_at).await;
+        assert_reference_state(&test, &original, refreshed_at).await;
         assert_eq!(read_reference(&test).await.advance_count(), Some(7));
     }
 
@@ -1065,28 +1258,103 @@ mod tests {
         let last_refresh = SystemTime::UNIX_EPOCH;
         let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let new_metadata = source_metadata(30, "newer");
-        write_reference_version(&test, source_metadata(1, "original"), last_refresh, 0).await;
+        let original = source_metadata(1, "original");
+        write_reference_version(&test, original.clone(), last_refresh, 0).await;
 
         crate::driver::drive(
-            QueueRefreshOperation::new(refresh(&test, new_metadata.clone(), newer)),
+            QueueRefreshOperation::new(refresh(&test, original.clone(), newer)),
             &test.context,
         )
         .await
         .expect("newer queue succeeds");
         crate::driver::drive(
-            QueueRefreshOperation::new(refresh(&test, source_metadata(10, "older"), older)),
+            QueueRefreshOperation::new(refresh(&test, original.clone(), older)),
             &test.context,
         )
         .await
         .expect("older queue succeeds");
 
         let jobs = read_jobs(&test.context.storage_handle).await;
-        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].refresh.refreshed_at, newer);
 
         let result = process_batch(&test.context).await.expect("drain succeeds");
-        assert_eq!(result.succeeded, 2);
-        assert_reference_state(&test, &new_metadata, newer).await;
+        assert_eq!(result.succeeded, 1);
+        assert_reference_state(&test, &original, newer).await;
+    }
+
+    // A queue write that loses to a racing commit rereads the job instead of dropping the request.
+    #[tokio::test]
+    async fn queue_conflict_retried() {
+        let test = setup_state();
+        let mut operation = QueueRefreshOperation::new(refresh(
+            &test,
+            source_metadata(1, "original"),
+            SystemTime::UNIX_EPOCH,
+        ));
+        let conflict = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            })
+        };
+        operation.start();
+        for _ in 0..=QUEUE_CONFLICT_RETRIES {
+            let txn_id = Ulid::generate();
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: ByteView::from(Vec::new()),
+                value: None,
+            }));
+            operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            }));
+            assert_eq!(operation.state, QueueRefreshState::Commit);
+            let effects = operation.step(conflict());
+            let retried = matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::StartTransaction {
+                    read: false
+                })]
+            );
+            assert_eq!(retried, !operation.is_complete());
+        }
+
+        assert_eq!(
+            operation.finalize(),
+            Err(ReferenceRefreshError::Storage(
+                StorageError::TransactionConflict
+            ))
+        );
+    }
+
+    // A drain that finishes a request a newer one replaced keeps the newer job queued.
+    #[tokio::test]
+    async fn replaced_job_kept() {
+        let test = setup_state();
+        let original = source_metadata(1, "original");
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        for refreshed_at in [older, newer] {
+            crate::driver::drive(
+                QueueRefreshOperation::new(refresh(&test, original.clone(), refreshed_at)),
+                &test.context,
+            )
+            .await
+            .expect("queue succeeds");
+        }
+        let storage = &test.context.storage_handle;
+        let queued = read_jobs(storage).await;
+        let older_job = ReferenceRefreshRecord {
+            refresh: refresh(&test, original, older),
+            ..queued[0].clone()
+        };
+        let key = job_key(&older_job.refresh).unwrap();
+
+        settle_job(storage, &key, &older_job, None).await.unwrap();
+
+        assert_eq!(read_jobs(storage).await, queued);
+        assert_eq!(queued[0].refresh.refreshed_at, newer);
+        assert!(jobs_exist(storage).await.unwrap());
     }
 
     #[tokio::test]
@@ -1100,21 +1368,8 @@ mod tests {
             attempts: 1,
             last_error: Some("transient".to_string()),
         };
-        let (key_space, key, value) = job_entry(&future_job).expect("future job serializes");
-        match test
-            .context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected future refresh job write event: {other:?}"),
-        }
+        let writes = job_entries(&future_job).expect("future job serializes");
+        write_rows(&test.context.storage_handle, writes).await;
 
         crate::driver::drive(QueueRefreshOperation::new(refresh), &test.context)
             .await
@@ -1138,21 +1393,7 @@ mod tests {
             ),
             due_at_ms,
         );
-        let (key_space, key, value) = job_entry(&record).unwrap();
-        match test
-            .context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected job write event: {other:?}"),
-        }
+        write_rows(&test.context.storage_handle, job_entries(&record).unwrap()).await;
 
         let result = process_batch(&test.context)
             .await

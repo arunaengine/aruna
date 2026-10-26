@@ -34,6 +34,11 @@ async fn durable_rearm_loop(
         ticks = ticks.saturating_add(1);
         restore_blob_timer(&context.storage_handle, &task_handle).await;
         crate::s3::object::metadata::restore_timer(&context.storage_handle, &task_handle).await;
+        crate::connectors::reference_prune::restore_prune_timer(
+            &context.storage_handle,
+            &task_handle,
+        )
+        .await;
         restore_outbox_timers(&context.storage_handle, &task_handle).await;
         restore_publish_timer(&context.storage_handle, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
@@ -297,6 +302,10 @@ impl TaskQueues {
             // The run computes every rule's next due time and re-arms itself.
             handler
                 .reschedule_timer(TaskKey::RunBackendImports, Duration::ZERO)
+                .await;
+            // Each pass re-arms itself; a node without distributed buckets finds no accounts.
+            handler
+                .reschedule_timer(TaskKey::MaintainRanges, Duration::ZERO)
                 .await;
         }
         if refresh_holders {

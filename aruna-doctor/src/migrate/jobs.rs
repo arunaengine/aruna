@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::staging::{self, LegacyStaging};
 use super::{Rewrites, decode_error, session_refs};
 use crate::explorer::ExplorerError;
 use aruna_core::repository::{ExportIdentity, LinkFailure, RepositoryRecord};
@@ -12,11 +13,11 @@ use aruna_core::structs::execution::job::{
     ArtifactRef, AttemptIntent, CapturedInput, CopyJobSpec, ExecutionSpec, ExportOmissionCounts,
     ExportRoCrateResult, ExportRoCrateSpec, ImportRoCrateResult, ImportRoCrateSpec, JobClaim,
     JobError, JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload,
-    JobState, OutputObject, RoCrateLimits, StagingJobSpec, WorkspaceMode, encode_dedup_value,
-    parse_dedup_value,
+    JobState, OutputObject, RoCrateLimits, WorkspaceMode, encode_dedup_value, parse_dedup_value,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
+use aruna_core::structs::storage::blob::BucketIdentity;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeResult, StoragePurgeSpec};
 use aruna_core::{NodeId, UserId};
 use aruna_operations::jobs::export::ExportCheckpoint;
@@ -26,12 +27,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use ulid::Ulid;
 
-/// Job records in an older layout. A record rewritten for its session references gets the plan
-/// digest of its rewritten payload, so a retry with the same idempotency key still matches.
+/// Job records in an older layout. A record rewritten for its session references or its staging
+/// spec gets the plan digest of its rewritten payload, so a retry with the same idempotency key
+/// still matches. A staging spec takes the identity of the local bucket of its name.
 pub(super) fn job_rows(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
     name: &str,
+    buckets: &BTreeMap<String, BucketIdentity>,
 ) -> Result<Rewrites, ExplorerError> {
     let mut scanned = 0;
     let mut rows = Vec::new();
@@ -41,7 +44,12 @@ pub(super) fn job_rows(
         if round_trips::<JobRecord>(&value) {
             continue;
         }
-        let record = upgraded(&value).ok_or_else(|| decode_error(name, &key, "unknown shape"))?;
+        let mut record =
+            upgraded(&value).ok_or_else(|| decode_error(name, &key, "unknown shape"))?;
+        if let JobPayload::Staging(spec) = &mut record.payload {
+            staging::bucket_identity(spec, buckets);
+            record.plan_digest = record.plan_digest.map(|_| record.payload.plan_digest());
+        }
         let bytes = record
             .to_bytes()
             .map_err(|error| decode_error(name, &key, error))?;
@@ -50,16 +58,21 @@ pub(super) fn job_rows(
     Ok(Rewrites { scanned, rows })
 }
 
+/// A record in the current shape except for its staging spec.
+type StagingJob = LegacyJob<ExportRoCrateSpec, ExportRoCrateResult>;
+
 /// The current record of an older row; every byte of the row must be used.
 fn upgraded(value: &[u8]) -> Option<JobRecord> {
-    const CURRENT: usize = 4;
-    if let Ok(legacy) = session_refs::decode::<LegacyJob>(value, CURRENT) {
+    if let Ok(legacy) = session_refs::decode::<LegacyJob>(value, &[]) {
         return Some(legacy.into());
     }
-    // Session references with three fields lack the linked login, with two also the name.
-    for fields in [3, 2] {
-        let record = session_refs::decode::<JobRecord>(value, fields)
-            .or_else(|_| session_refs::decode::<LegacyJob>(value, fields).map(Into::into));
+    if let Ok(staging) = session_refs::decode::<StagingJob>(value, &[]) {
+        return Some(staging.into());
+    }
+    for layout in [session_refs::NO_LOGIN, session_refs::NO_NAME] {
+        let record = session_refs::decode::<JobRecord>(value, layout)
+            .or_else(|_| session_refs::decode::<StagingJob>(value, layout).map(Into::into))
+            .or_else(|_| session_refs::decode::<LegacyJob>(value, layout).map(Into::into));
         if let Ok(mut record) = record {
             record.plan_digest = record.plan_digest.map(|_| record.payload.plan_digest());
             return Some(record);
@@ -213,10 +226,10 @@ pub(super) struct LegacyExportResult {
     pub(super) report_digest: [u8; 32],
 }
 
-/// Previous shape of `JobPayload`: only the export variant differs.
+/// Previous shape of `JobPayload`: the staging and export variants differ.
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
-pub(super) enum LegacyPayload {
+pub(super) enum LegacyPayload<E> {
     Probe {
         steps: u32,
         step_sleep_ms: u64,
@@ -233,9 +246,9 @@ pub(super) enum LegacyPayload {
         attempt: Option<AttemptIntent>,
         access_key: String,
     },
-    Staging(StagingJobSpec),
+    Staging(LegacyStaging),
     ImportRoCrate(ImportRoCrateSpec),
-    ExportRoCrate(LegacyExportSpec),
+    ExportRoCrate(E),
     Harvest(HarvestJobSpec),
     MintPersistentId(MintPersistentSpec),
     StoragePurge(StoragePurgeSpec),
@@ -245,7 +258,7 @@ pub(super) enum LegacyPayload {
 /// Previous shape of `JobResultPayload`: only the export variant differs.
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
-pub(super) enum LegacyResult {
+pub(super) enum LegacyResult<R> {
     Probe {
         completed_steps: u32,
     },
@@ -266,7 +279,7 @@ pub(super) enum LegacyResult {
         failed_items: u64,
     },
     ImportRoCrate(ImportRoCrateResult),
-    ExportRoCrate(LegacyExportResult),
+    ExportRoCrate(R),
     Harvest {
         minted: u64,
         updated: u64,
@@ -285,11 +298,12 @@ pub(super) enum LegacyResult {
     },
 }
 
-/// Previous shape of `JobRecord`.
+/// Previous shape of `JobRecord`; with the current export shapes, the one before the staging
+/// bucket identity.
 #[derive(Serialize, Deserialize)]
-pub(super) struct LegacyJob {
+pub(super) struct LegacyJob<E = LegacyExportSpec, R = LegacyExportResult> {
     pub(super) job_id: JobId,
-    pub(super) payload: LegacyPayload,
+    pub(super) payload: LegacyPayload<E>,
     pub(super) state: JobState,
     pub(super) created_by: UserId,
     pub(super) owner_node_id: NodeId,
@@ -306,7 +320,7 @@ pub(super) struct LegacyJob {
     pub(super) cancel_requested: bool,
     pub(super) claim: Option<JobClaim>,
     pub(super) dedup_key: Option<Vec<u8>>,
-    pub(super) result: Option<LegacyResult>,
+    pub(super) result: Option<LegacyResult<R>>,
     pub(super) execution_class: JobExecutionClass,
     pub(super) plan_digest: Option<[u8; 32]>,
     pub(super) attempt_intent: Option<AttemptIntent>,
@@ -342,8 +356,8 @@ impl From<LegacyExportResult> for ExportRoCrateResult {
     }
 }
 
-impl From<LegacyPayload> for JobPayload {
-    fn from(legacy: LegacyPayload) -> Self {
+impl<E: Into<ExportRoCrateSpec>> From<LegacyPayload<E>> for JobPayload {
+    fn from(legacy: LegacyPayload<E>) -> Self {
         match legacy {
             LegacyPayload::Probe {
                 steps,
@@ -369,7 +383,7 @@ impl From<LegacyPayload> for JobPayload {
                 attempt,
                 access_key,
             },
-            LegacyPayload::Staging(spec) => Self::Staging(spec),
+            LegacyPayload::Staging(spec) => Self::Staging(spec.into()),
             LegacyPayload::ImportRoCrate(spec) => Self::ImportRoCrate(spec),
             LegacyPayload::ExportRoCrate(spec) => Self::ExportRoCrate(spec.into()),
             LegacyPayload::Harvest(spec) => Self::Harvest(spec),
@@ -380,8 +394,8 @@ impl From<LegacyPayload> for JobPayload {
     }
 }
 
-impl From<LegacyResult> for JobResultPayload {
-    fn from(legacy: LegacyResult) -> Self {
+impl<R: Into<ExportRoCrateResult>> From<LegacyResult<R>> for JobResultPayload {
+    fn from(legacy: LegacyResult<R>) -> Self {
         match legacy {
             LegacyResult::Probe { completed_steps } => Self::Probe { completed_steps },
             LegacyResult::Execution {
@@ -438,8 +452,12 @@ impl From<LegacyResult> for JobResultPayload {
     }
 }
 
-impl From<LegacyJob> for JobRecord {
-    fn from(legacy: LegacyJob) -> Self {
+impl<E, R> From<LegacyJob<E, R>> for JobRecord
+where
+    E: Into<ExportRoCrateSpec>,
+    R: Into<ExportRoCrateResult>,
+{
+    fn from(legacy: LegacyJob<E, R>) -> Self {
         Self {
             job_id: legacy.job_id,
             payload: legacy.payload.into(),

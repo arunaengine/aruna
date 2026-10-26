@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub(crate) mod documents;
+pub(crate) mod links;
 pub(crate) mod query;
 pub(crate) mod references;
 pub(crate) mod repositories;
@@ -45,6 +46,10 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(query::search_metadata))
         .routes(routes!(references::metadata_references))
         .routes(routes!(references::metadata_reference_preflight))
+        .routes(routes!(links::data_links))
+        .routes(routes!(links::bucket_links))
+        .routes(routes!(links::file_part_of))
+        .routes(routes!(links::part_target))
         .routes(routes!(query::query_all_metadata))
         .routes(routes!(documents::list_metadata_documents))
         .routes(routes!(documents::get_metadata_path))

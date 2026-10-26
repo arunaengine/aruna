@@ -28,7 +28,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,
     ensure_confined_path, object_permission_path,
 };
-use aruna_core::structs::storage::data_identity::{DataIdentity, content_id};
+use aruna_core::structs::storage::data::identity::{DataIdentity, content_id};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
@@ -2231,6 +2231,9 @@ async fn open_remote(
             version_id: arn.version,
         },
         BaoReadTarget::Blake3(blake3) => WaitTarget::Content { blake3: *blake3 },
+        BaoReadTarget::Version { .. } => WaitTarget::Content {
+            blake3: expected_blake3.unwrap_or_default(),
+        },
     };
     // The challenge loop fills in this node's advertised subject and the refs
     // it learns, so a governed copy can be staged instead of dead-ending.
@@ -2245,6 +2248,7 @@ async fn open_remote(
             metadata_only,
             destination: None,
             known_refs: Vec::new(),
+            range: None,
         },
     )
     .await

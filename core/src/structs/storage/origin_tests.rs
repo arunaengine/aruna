@@ -1,0 +1,164 @@
+//! Tests version origins: what a dataset may name, bounds and public source URLs.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use crate::structs::identity::realm::RealmId;
+
+fn global(seed: u8) -> OriginVersion {
+    OriginVersion::Global(GlobalId::Version {
+        realm_id: RealmId::from_bytes([1; 32]),
+        version_id: Ulid::from_bytes([seed; 16]),
+    })
+}
+
+fn node() -> NodeId {
+    iroh::SecretKey::from_bytes(&[2; 32]).public()
+}
+
+#[test]
+fn uploads_imports_private() {
+    // Uploader, device and storage paths are never projected into datasets.
+    let upload = VersionOrigin::Upload {
+        node_id: node(),
+        device: Some("laptop".to_string()),
+    };
+    assert!(project(Some(&upload), None, None).is_empty());
+    let storage = VersionOrigin::Storage {
+        backend_id: Ulid::nil(),
+        key: "share/a.txt".to_string(),
+    };
+    assert!(project(Some(&storage), None, None).is_empty());
+}
+
+#[test]
+fn derived_name_original() {
+    let copy = VersionOrigin::Copy { from: global(3) };
+    assert_eq!(
+        project(Some(&copy), None, None),
+        vec![OriginProjection::BasedOn {
+            id: global(3).to_id()
+        }]
+    );
+    let hop = SyncHop {
+        relationship_id: Ulid::nil(),
+        from: global(4),
+    };
+    let upload = VersionOrigin::Upload {
+        node_id: node(),
+        device: None,
+    };
+    assert_eq!(
+        project(Some(&upload), Some(&hop), None),
+        vec![OriginProjection::BasedOn {
+            id: global(4).to_id()
+        }]
+    );
+}
+
+#[test]
+fn node_sources_unpublished() {
+    // A node ARN names a bucket and key, so neither a copy nor a hop projects it.
+    let arn = VersionedObjectArn::new(
+        RealmId::from_bytes([1; 32]),
+        node(),
+        "private",
+        "a.txt",
+        Ulid::from_bytes([6; 16]),
+    )
+    .unwrap();
+    let copy = VersionOrigin::Copy {
+        from: OriginVersion::Node(arn.clone()),
+    };
+    let hop = SyncHop {
+        relationship_id: Ulid::nil(),
+        from: OriginVersion::Node(arn),
+    };
+    assert!(project(Some(&copy), None, None).is_empty());
+    assert!(project(None, Some(&hop), None).is_empty());
+}
+
+#[test]
+fn sources_jobs_project() {
+    let source = VersionOrigin::Source { database: None };
+    let url = "https://s3.example.org/reads/a.fastq".to_string();
+    assert_eq!(
+        project(Some(&source), None, Some(url.clone())),
+        vec![OriginProjection::BasedOn { id: url }]
+    );
+    let job = VersionOrigin::Job {
+        run_id: Ulid::from_bytes([5; 16]),
+    };
+    assert_eq!(
+        project(Some(&job), None, None),
+        vec![OriginProjection::CreatedBy {
+            run_id: Ulid::from_bytes([5; 16])
+        }]
+    );
+}
+
+#[test]
+fn oversized_device_unbounded() {
+    let upload = VersionOrigin::Upload {
+        node_id: node(),
+        device: Some("d".repeat(MAX_DEVICE_BYTES + 1)),
+    };
+    assert!(!upload.bounded());
+}
+
+#[test]
+fn source_url_joins() {
+    use crate::structs::execution::source_connector::SourceConnectorKind;
+    use std::collections::HashMap;
+    let descriptor = PortableSourceDescriptor {
+        kind: SourceConnectorKind::S3,
+        public_config: HashMap::from([
+            (
+                "endpoint".to_string(),
+                "https://s3.gi.denbi.de/".to_string(),
+            ),
+            ("bucket".to_string(), "bakrep-v2-data-007".to_string()),
+        ]),
+        source_path: "/genomes/a.gbff".to_string(),
+        version_selector: None,
+        namespace: None,
+        capabilities: Vec::new(),
+        origin_node_id: None,
+    };
+    assert_eq!(
+        public_source_url(&descriptor).as_deref(),
+        Some("https://s3.gi.denbi.de/bakrep-v2-data-007/genomes/a.gbff")
+    );
+    let device = PortableSourceDescriptor {
+        kind: SourceConnectorKind::LocalDirectory,
+        ..descriptor
+    };
+    assert_eq!(public_source_url(&device), None);
+}
+
+// Only a source read without credentials may be named in a dataset.
+#[test]
+fn signed_source_unpublished() {
+    use crate::structs::execution::source_connector::SourceConnectorKind;
+    use std::collections::HashMap;
+    let mut descriptor = PortableSourceDescriptor {
+        kind: SourceConnectorKind::S3,
+        public_config: HashMap::from([
+            ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ("bucket".to_string(), "lab".to_string()),
+        ]),
+        source_path: "a.txt".to_string(),
+        version_selector: None,
+        namespace: None,
+        capabilities: Vec::new(),
+        origin_node_id: None,
+    };
+    assert!(!publishable(&descriptor));
+    (descriptor.public_config).insert("skip_signature".to_string(), "true".to_string());
+    assert!(publishable(&descriptor));
+    descriptor.namespace = Some("login".to_string());
+    assert!(!publishable(&descriptor));
+    descriptor.namespace = None;
+    descriptor.kind = SourceConnectorKind::Http;
+    assert!(!publishable(&descriptor));
+}

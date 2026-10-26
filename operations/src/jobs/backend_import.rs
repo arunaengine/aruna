@@ -29,6 +29,7 @@ use aruna_core::structs::storage::delete_audit::BlobAuditRecord;
 use aruna_core::structs::storage::discovery::{
     DiscoveryRule, FileIdentity, IdentityError, file_identity,
 };
+use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::structs::storage::format::{EncodingClass, StoredLayout};
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
@@ -484,9 +485,9 @@ async fn import_object(
     // The committed row stays until the new version replaces it in one transaction. A new
     // row records its key, so later rule changes never move the object. A new file is dated
     // by its modification time, as a second file of its key would be.
-    let version_id = match (&row, object.modified_ms) {
-        (None, Some(at)) => dated(at),
-        _ => Ulid::generate(),
+    let version_id = match &row {
+        None => import_version(run, object.modified_ms),
+        Some(_) => import_version(run, None),
     };
     let committed = ImportedObject {
         key: match row.as_ref() {
@@ -543,6 +544,7 @@ async fn import_object(
         Err(PutObjectError::HeadChanged | PutObjectError::HistoryDeleted) => {
             return Ok(Outcome::Skipped);
         }
+        Err(error) if moved_away(&error) => return Ok(Outcome::Ignored),
         Err(error) => return Err(put_failure(error)),
     }
     // As for any put, a failed queue write after the commit leaves the obligation for repair.
@@ -944,6 +946,7 @@ async fn recover(
                 Err(PutObjectError::HeadChanged | PutObjectError::VersionExists) => {
                     return Ok(Some(Outcome::Skipped));
                 }
+                Err(error) if moved_away(&error) => return Ok(Some(Outcome::Ignored)),
                 Err(error) => return Err(put_failure(error)),
             }
             if !keep_head {
@@ -1318,6 +1321,16 @@ fn dated(at: u64) -> Ulid {
     Ulid::from_parts(at, Ulid::generate().random())
 }
 
+/// A version id dated `at`, or now; a distributed bucket always dates by mint time and adds
+/// its set hint, and the source time stays in the import row.
+fn import_version(run: &ImportRun, at: Option<u64>) -> Ulid {
+    match (run.bucket.distribution.as_ref(), at) {
+        (Some(binding), _) => mint_version(Some(binding.hint())),
+        (None, Some(at)) => dated(at),
+        (None, None) => Ulid::generate(),
+    }
+}
+
 /// A file with other bytes than every version of its key is another version of it, dated by
 /// its modification time: the newest version becomes current, an older one joins the history.
 async fn add_version(
@@ -1329,7 +1342,7 @@ async fn add_version(
     file: (BackendLocation, Option<String>),
 ) -> Result<Outcome, ItemError> {
     let rule = &run.rule;
-    let version_id = dated(object.modified_ms.unwrap_or_else(now_ms));
+    let version_id = import_version(run, Some(object.modified_ms.unwrap_or_else(now_ms)));
     let committed = ImportedObject {
         key: Some(key.to_string()),
         ..ImportedObject::new(version_id, object)
@@ -1354,6 +1367,7 @@ async fn add_version(
             | PutObjectError::VersionExists
             | PutObjectError::HistoryDeleted,
         ) => return Ok(Outcome::Skipped),
+        Err(error) if moved_away(&error) => return Ok(Outcome::Ignored),
         Err(error) => return Err(put_failure(error)),
     }
     if !keep_head {
@@ -1727,6 +1741,12 @@ async fn put_version(
         routing: run.routing.clone(),
     })
     .without_envelope()
+    .with_version_origin(Some(
+        aruna_core::structs::storage::origin::VersionOrigin::Storage {
+            backend_id: run.rule.backend_id,
+            key: location.backend_path.clone(),
+        },
+    ))
     .with_adopted(discovered_copy(&run.rule, location))
     .with_bucket_guard(run.bucket.clone())
     .with_restrictions(spec.auth_context.path_restrictions.clone())
@@ -1747,6 +1767,16 @@ async fn put_version(
         operation = operation.with_gate(gate);
     }
     drive(operation, &ctx.driver).await.map(|_| ())
+}
+
+/// Whether the key's range of a distributed bucket is another coordinator's, or moves there;
+/// that coordinator's run imports it.
+fn moved_away(error: &PutObjectError) -> bool {
+    match error {
+        PutObjectError::Distribution(error)
+        | PutObjectError::PurgeFence(PurgeFenceError::Distribution(error)) => error.moved_away(),
+        _ => false,
+    }
 }
 
 /// Only a refusal of this one object fails it and lets the run go on; storage and other

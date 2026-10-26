@@ -233,6 +233,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::generate()),
         };
@@ -244,6 +245,7 @@ mod tests {
                 etag: Some("etag-1".to_string()),
                 last_modified: Some(SystemTime::UNIX_EPOCH),
                 source_version: None,
+                digests: Default::default(),
             },
             SystemTime::UNIX_EPOCH,
             user_id,

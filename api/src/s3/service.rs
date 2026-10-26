@@ -8,7 +8,17 @@ mod attributes;
 mod bucket;
 mod copy;
 mod encryption;
+mod forward;
 mod listing;
+mod payload;
+
+pub(crate) use forward::forwarded_digest;
+
+use crate::s3::auth::DelegatedRequest;
+use aruna_core::structs::storage::distribution::delegation::{
+    COPY_CONTEXT_HEADER, Payload, body_digest,
+};
+use aruna_core::structs::storage::distribution::upload::UploadTag;
 mod multipart;
 mod object;
 mod response;
@@ -17,10 +27,14 @@ use self::attributes::{
     RequestedAttributes, attributes_checksum, attributes_output, attributes_parts, parse_max_parts,
     parse_part_marker,
 };
-use self::response::{attach_reference_refresh, object_metadata, reference_metadata_refresh};
+use self::response::{
+    attach_reference_refresh, full_object_checksums, object_metadata, reference_metadata_refresh,
+};
 use aruna_core::structs::storage::format::Compression;
 
 use self::copy::{copy_object_response, copy_part_response, copy_source_conditions};
+use self::forward::copy::{CopyPath, CopySource};
+use self::forward::list::{Resume, decode_bound, encode_bound};
 use self::listing::{
     ObjectListingPage, list_parts_output, list_uploads_output, marker_continuation_token,
     next_marker_for,
@@ -48,8 +62,7 @@ use crate::s3::util::{
     check_sse, checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
     location_sse, map_checksum_type, parse_checksum_hint, parse_checksum_type,
     parse_completed_part, parse_copy_source, parse_part_number, parse_source_range,
-    parse_upload_id, parse_version_id, reject_sse, sse_header, stored_encrypted,
-    validate_object_key,
+    parse_version_id, reject_sse, sse_header, stored_encrypted, validate_object_key,
 };
 use aruna_compute::session::TouchedObject;
 use aruna_core::NodeId;
@@ -84,7 +97,7 @@ use aruna_operations::s3::multipart::create::{
     CreateMultipartInput as CMPI, CreateMultipartOperation,
 };
 use aruna_operations::s3::multipart::part_copy::{
-    PartCopyInput as UploadPartCopyData, upload_part_token,
+    PartCopyInput as UploadPartCopyData, keep_part_policies, upload_part_token,
 };
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput as UPI, UploadPartOperation};
 use aruna_operations::s3::multipart::parts::{ListPartsInput as LPI, ListPartsOperation};
@@ -241,26 +254,43 @@ impl ArunaS3Service {
         bucket: &str,
         prefix: &str,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        // A delegated request is never sent on, and an index would list other ranges.
+        if extensions.get::<DelegatedRequest>().is_some() {
+            return Err(s3_error!(
+                AccessDenied,
+                "Delegation refused: no folder index"
+            ));
+        }
         let extras = extensions
             .get::<PolicyRequestExtras>()
             .cloned()
             .ok_or_else(|| s3_error!(InternalError, "Missing policy context"))?;
-        let page = self
-            .run_object_listing(
-                LOV2I {
-                    bucket: bucket.to_owned(),
-                    group_id,
-                    continuation_token: None,
-                    max_keys: Some(ListBucketOperation::DEFAULT_MAX_KEYS),
-                    prefix: Some(prefix.to_owned()),
-                    delimiter: Some("/".to_owned()),
-                    start_after: None,
-                },
-                None,
-                false,
-                None,
-            )
-            .await?;
+        let input = LOV2I {
+            bucket: bucket.to_owned(),
+            group_id,
+            continuation_token: None,
+            max_keys: Some(ListBucketOperation::DEFAULT_MAX_KEYS),
+            prefix: Some(prefix.to_owned()),
+            delimiter: Some("/".to_owned()),
+            start_after: None,
+        };
+        let distributed = (extensions.get::<BucketInfo>())
+            .and_then(|info| info.distribution.clone())
+            .zip(extensions.get::<UserAccess>());
+        // A distributed bucket's folder spans its key ranges, as its S3 listing does.
+        let page = match distributed {
+            Some((binding, user)) => {
+                let user = forward::reads::anonymous_window(user);
+                let shape = (None, false, None);
+                self.merged_objects(&user, &binding, input, shape, (None, true))
+                    .await?
+                    .0
+            }
+            None => {
+                self.run_object_listing(input, None, false, None, None)
+                    .await?
+            }
+        };
         let truncated = page.continuation_token.is_some();
         let folders = page
             .common_prefixes
@@ -347,6 +377,7 @@ impl S3 for ArunaS3Service {
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
+                distribution: None,
             },
         )
         .mapped();
@@ -626,8 +657,24 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let bounds = self
+            .delegated_listing(&req.extensions, bucket_info.as_ref(), req.uri.query())
+            .await?;
+        // A distributed bucket merges every range under the prefix into one page.
+        let merged = (bucket_info.as_ref())
+            .and_then(|bucket_info| bucket_info.distribution.clone())
+            .filter(|_| bounds.is_none());
         let requested_continuation_token = req.input.continuation_token.clone();
-        let continuation_token = Self::decode_list_token(requested_continuation_token.as_deref())?;
+        let query = (req.input.prefix.as_deref(), req.input.delimiter.as_deref());
+        let requested = requested_continuation_token.as_deref();
+        let (continuation_token, from) = match &merged {
+            Some(binding) => match decode_bound(binding.set_id, query, requested)? {
+                Some(Resume::After(token)) => (Some(token), None),
+                Some(Resume::From(key)) => (None, Some(key)),
+                None => (None, None),
+            },
+            None => (Self::decode_list_token(requested)?, None),
+        };
         let max_keys = match req.input.max_keys {
             None => ListBucketOperation::DEFAULT_MAX_KEYS,
             Some(max_keys) => usize::try_from(max_keys)
@@ -674,22 +721,28 @@ impl S3 for ArunaS3Service {
             }
         };
 
-        let page = self
-            .run_object_listing(
-                LOV2I {
-                    bucket: bucket.clone(),
-                    group_id,
-                    continuation_token,
-                    max_keys: Some(max_keys),
-                    prefix: prefix.clone(),
-                    delimiter: delimiter.clone(),
-                    start_after: start_after.clone(),
-                },
-                owner,
-                url_encoded,
-                scope.as_ref(),
-            )
-            .await?;
+        let input = LOV2I {
+            bucket: bucket.clone(),
+            group_id,
+            continuation_token,
+            max_keys: Some(max_keys),
+            prefix: prefix.clone(),
+            delimiter: delimiter.clone(),
+            start_after: start_after.clone(),
+        };
+        let (page, next_from) = match &merged {
+            Some(binding) => {
+                let shape = (owner, url_encoded, scope.as_ref());
+                self.merged_objects(&user_access, binding, input, shape, (from, true))
+                    .await?
+            }
+            None => {
+                let page = self
+                    .run_object_listing(input, owner, url_encoded, scope.as_ref(), bounds)
+                    .await?;
+                (page, None)
+            }
+        };
 
         let ObjectListingPage {
             contents,
@@ -697,7 +750,14 @@ impl S3 for ArunaS3Service {
             continuation_token: result_token,
         } = page;
         let key_count = contents.len() + common_prefixes.len();
-        let next_continuation_token = Self::encode_list_token(result_token.as_ref())?;
+        let next_continuation_token = match &merged {
+            Some(binding) => {
+                let query = (prefix.as_deref(), delimiter.as_deref());
+                let resume = (result_token.map(Resume::After)).or(next_from.map(Resume::From));
+                encode_bound(binding.set_id, query, resume.as_ref())?
+            }
+            None => Self::encode_list_token(result_token.as_ref())?,
+        };
         let is_truncated = next_continuation_token.is_some();
 
         Ok(S3Response::new(ListObjectsV2Output {
@@ -745,6 +805,8 @@ impl S3 for ArunaS3Service {
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
         let marker = req.input.marker.clone();
+        let merged =
+            (bucket_info.as_ref()).and_then(|bucket_info| bucket_info.distribution.clone());
 
         let group_id = bucket_info
             .as_ref()
@@ -792,22 +854,28 @@ impl S3 for ArunaS3Service {
             }
         };
 
-        let page = self
-            .run_object_listing(
-                LOV2I {
-                    bucket: bucket.clone(),
-                    group_id,
-                    continuation_token,
-                    max_keys: Some(max_keys),
-                    prefix: prefix.clone(),
-                    delimiter: delimiter.clone(),
-                    start_after,
-                },
-                owner,
-                url_encoded,
-                scope.as_ref(),
-            )
-            .await?;
+        let input = LOV2I {
+            bucket: bucket.clone(),
+            group_id,
+            continuation_token,
+            max_keys: Some(max_keys),
+            prefix: prefix.clone(),
+            delimiter: delimiter.clone(),
+            start_after,
+        };
+        let page = match &merged {
+            // A marker cannot name a range start, so a legacy listing visits every range.
+            Some(binding) => {
+                let shape = (owner, url_encoded, scope.as_ref());
+                self.merged_objects(&user_access, binding, input, shape, (None, false))
+                    .await?
+                    .0
+            }
+            None => {
+                self.run_object_listing(input, owner, url_encoded, scope.as_ref(), None)
+                    .await?
+            }
+        };
 
         let ObjectListingPage {
             contents,
@@ -867,11 +935,16 @@ impl S3 for ArunaS3Service {
         )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
-        let trailer_algorithm = declared_trailer_algorithm(
-            &req.headers,
-            req.trailing_headers.is_some(),
-            req.input.checksum_algorithm.as_ref(),
-        )?;
+        // A forwarded body carries the client's trailing checksum in its signed trailer.
+        let delegated_trailer = forward::delegated_trailer(&req.extensions)?;
+        let trailer_algorithm = match delegated_trailer {
+            Some(algorithm) => Some(algorithm),
+            None => declared_trailer_algorithm(
+                &req.headers,
+                req.trailing_headers.is_some(),
+                req.input.checksum_algorithm.as_ref(),
+            )?,
+        };
         let checksum_request = parse_upload_checksum(&req.headers, trailer_algorithm)?;
         let trailing_headers = req.trailing_headers.clone();
         let replication_auth = AuthContext {
@@ -898,10 +971,50 @@ impl S3 for ArunaS3Service {
                 move || headers.read(Clone::clone),
             ));
         }
+        // A member that does not coordinate the key's range forwards the write.
+        if let Some(forward) = self
+            .forward_target(&req.extensions, bucket_info.as_ref(), &req.input.key)
+            .await?
+        {
+            let request = forward::ForwardRequest {
+                method: http::Method::PUT,
+                operation: "PutObject",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: forward::passed_headers(&req.headers, req.input.content_length),
+                body: match req.input.body.take() {
+                    Some(body) => forward::ForwardBody::Stream(
+                        body,
+                        forward::trailer_checksum(trailer_algorithm, trailing_headers.clone()),
+                    ),
+                    None => forward::ForwardBody::Empty,
+                },
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Ok(Self::forwarded_put(&response));
+        }
+        // A forwarded body must end with the issuer's signed trailer.
+        if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
+            let composite = checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE;
+            let check = payload::BodyCheck {
+                issuer: delegated.issuer,
+                nonce: delegated.nonce,
+                checksum: delegated_trailer.map(|algorithm| (algorithm, composite)),
+            };
+            req.input.body = req
+                .input
+                .body
+                .take()
+                .map(|body| payload::unframe_body(body, check));
+            req.input.content_length = payload::unframed_length(req.input.content_length)?;
+        }
         let metadata = object_metadata(
             req.input.metadata.clone().unwrap_or_default(),
             req.input.content_type.as_deref(),
         );
+        // A forwarded copy keeps its source's placement refs and origin, as a local copy does.
+        let copied = forward::copy_context(&req.extensions, &req.headers)?;
         let routing = match bucket_info.as_ref() {
             Some(info) => bucket_snapshot(&self.state, info).await,
             None => routing_snapshot(&self.state, group_id, &replication_bucket).await,
@@ -928,6 +1041,11 @@ impl S3 for ArunaS3Service {
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_metadata(metadata)
         .with_restrictions(replication_auth.path_restrictions.clone());
+        if let Some(copied) = copied {
+            operation = operation
+                .with_inherited_policies(copied.policies)
+                .with_version_origin(copied.origin);
+        }
         if let Some(gate) = gate {
             operation = operation.with_gate(gate);
         }
@@ -935,8 +1053,9 @@ impl S3 for ArunaS3Service {
         let result = drive(operation, &self.state)
             .await
             .map_err(IntoS3Error::into_s3_error)?;
+        // The unframed stream already checked a forwarded trailing checksum.
         validate_trailing_checksum(
-            trailer_algorithm,
+            trailer_algorithm.filter(|_| delegated_trailer.is_none()),
             &checksum_request.checksum_type,
             trailing_headers.as_ref(),
             &result.location.hashes,
@@ -1031,6 +1150,83 @@ impl S3 for ArunaS3Service {
             ));
         }
 
+        let conditions = copy_source_conditions(
+            req.input.copy_source_if_match.as_ref(),
+            req.input.copy_source_if_none_match.as_ref(),
+            req.input.copy_source_if_modified_since.as_ref(),
+            req.input.copy_source_if_unmodified_since.as_ref(),
+        )?;
+        let token = self.token_read(&req.extensions);
+        // A destination another member coordinates takes the copy there.
+        if let Some(forward) = self
+            .forward_target(&req.extensions, dest_bucket_info.as_ref(), &dest_key)
+            .await?
+        {
+            return match self
+                .copy_path(&source_bucket_info, &source_key, &forward)
+                .await?
+            {
+                CopyPath::Stream => {
+                    let source = CopySource {
+                        bucket: &source_bucket_info,
+                        name: source_bucket,
+                        key: source_key,
+                        version_id: source_version_id,
+                        range: None,
+                        auth: &source_auth_context,
+                        conditions: &conditions,
+                    };
+                    let metadata = metadata_replace.then(|| {
+                        object_metadata(
+                            req.input.metadata.clone().unwrap_or_default(),
+                            req.input.content_type.as_deref(),
+                        )
+                    });
+                    let target = (dest_bucket, dest_key);
+                    self.stream_copy(
+                        &user_access,
+                        &forward,
+                        target,
+                        source,
+                        metadata,
+                        token.as_ref(),
+                    )
+                    .await
+                }
+                CopyPath::Relay(holder) => {
+                    let source = (
+                        source_bucket.as_str(),
+                        source_key.as_str(),
+                        source_version_id,
+                    );
+                    let read =
+                        (self.read_through(&user_access, &holder, source, &req.headers)).await?;
+                    let metadata = metadata_replace.then(|| {
+                        object_metadata(
+                            req.input.metadata.clone().unwrap_or_default(),
+                            req.input.content_type.as_deref(),
+                        )
+                    });
+                    let target = (dest_bucket, dest_key);
+                    self.relay_copy(&user_access, &forward, target, read, metadata)
+                        .await
+                }
+                CopyPath::Delegate => {
+                    let request = forward::ForwardRequest {
+                        method: http::Method::PUT,
+                        operation: "CopyObject",
+                        bucket: dest_bucket,
+                        key: dest_key,
+                        query: forward::passed_query(req.uri.query()),
+                        headers: forward::passed_headers(&req.headers, None),
+                        body: forward::ForwardBody::Empty,
+                    };
+                    let response = self.forward_write(&user_access, &forward, request).await?;
+                    Self::delegated_copy(response).await
+                }
+            };
+        }
+        self.ensure_source(&source_bucket_info, &source_key).await?;
         let dest_group_id = dest_bucket_info
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
@@ -1042,14 +1238,7 @@ impl S3 for ArunaS3Service {
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         };
-        let conditions = copy_source_conditions(
-            req.input.copy_source_if_match.as_ref(),
-            req.input.copy_source_if_none_match.as_ref(),
-            req.input.copy_source_if_modified_since.as_ref(),
-            req.input.copy_source_if_unmodified_since.as_ref(),
-        )?;
 
-        let token = self.token_read(&req.extensions);
         let result = copy_object_token(
             &self.state,
             CopyObjectData {
@@ -1121,6 +1310,23 @@ impl S3 for ArunaS3Service {
         )?;
         validate_object_key(&req.input.key)?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        // Uploads run on the coordinator of the key's range.
+        if let Some(forward) = self
+            .forward_target(&req.extensions, bucket_info.as_ref(), &req.input.key)
+            .await?
+        {
+            let request = forward::ForwardRequest {
+                method: http::Method::POST,
+                operation: "CreateMultipartUpload",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: forward::passed_headers(&req.headers, None),
+                body: forward::ForwardBody::Empty,
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Self::forwarded_create(response, req.input.bucket, req.input.key).await;
+        }
         let checksum_hint = parse_checksum_hint(&req.input)?;
 
         let group_id = bucket_info
@@ -1155,10 +1361,17 @@ impl S3 for ArunaS3Service {
             .await
             .map_err(IntoS3Error::into_s3_error)?;
 
+        let upload_id = self
+            .shown_upload(
+                bucket_info.as_ref(),
+                &req.input.key,
+                result.record.upload_id,
+            )
+            .await?;
         Ok(S3Response::new(CreateMultipartUploadOutput {
             bucket: Some(req.input.bucket),
             key: Some(req.input.key),
-            upload_id: Some(result.record.upload_id.to_string()),
+            upload_id: Some(upload_id),
             checksum_algorithm: req.input.checksum_algorithm,
             checksum_type: checksum_hint.map(|hint| map_checksum_type(hint.checksum_type)),
             server_side_encryption: sse_header(encrypted),
@@ -1190,14 +1403,77 @@ impl S3 for ArunaS3Service {
                 || req.input.sse_customer_key_md5.is_some(),
         )?;
         validate_object_key(&req.input.key)?;
-        let trailer_algorithm = declared_trailer_algorithm(
-            &req.headers,
-            req.trailing_headers.is_some(),
-            req.input.checksum_algorithm.as_ref(),
-        )?;
+        let delegated_trailer = forward::delegated_trailer(&req.extensions)?;
+        let trailer_algorithm = match delegated_trailer {
+            Some(algorithm) => Some(algorithm),
+            None => declared_trailer_algorithm(
+                &req.headers,
+                req.trailing_headers.is_some(),
+                req.input.checksum_algorithm.as_ref(),
+            )?,
+        };
         let checksum_request = parse_upload_checksum(&req.headers, trailer_algorithm)?;
         let trailing_headers = req.trailing_headers.clone();
-        let upload_id = parse_upload_id(&req.input.upload_id)?;
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let bucket_info = bucket_info.as_ref();
+        if let Some(forward) = self
+            .forward_upload(&req.extensions, bucket_info, &req.input.key)
+            .await?
+        {
+            let body = req.input.body.take().map(|body| {
+                match (trailer_algorithm, trailing_headers.clone()) {
+                    (Some(algorithm), Some(headers)) => verify_trailer_stream(
+                        body,
+                        algorithm,
+                        checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE,
+                        move || headers.read(Clone::clone),
+                    ),
+                    _ => body,
+                }
+            });
+            let request = forward::ForwardRequest {
+                method: http::Method::PUT,
+                operation: "UploadPart",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: forward::passed_headers(&req.headers, req.input.content_length),
+                body: match body {
+                    Some(body) => forward::ForwardBody::Stream(
+                        body,
+                        forward::trailer_checksum(trailer_algorithm, trailing_headers.clone()),
+                    ),
+                    None => forward::ForwardBody::Empty,
+                },
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Ok(Self::forwarded_part(&response));
+        }
+        let upload_id = self
+            .upload_id(bucket_info, &req.input.key, &req.input.upload_id)
+            .await?;
+        // A part copied on another member keeps its source's placement refs, as one copied here.
+        if let Some(copied) = forward::copy_context(&req.extensions, &req.headers)? {
+            let upload = (self.realm_id, upload_id);
+            let target = (req.input.bucket.as_str(), req.input.key.as_str());
+            keep_part_policies(&self.state, upload, target, &copied.policies)
+                .await
+                .map_err(IntoS3Error::into_s3_error)?;
+        }
+        if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
+            let composite = checksum_request.checksum_type.as_str() == ChecksumType::COMPOSITE;
+            let check = payload::BodyCheck {
+                issuer: delegated.issuer,
+                nonce: delegated.nonce,
+                checksum: delegated_trailer.map(|algorithm| (algorithm, composite)),
+            };
+            req.input.body = req
+                .input
+                .body
+                .take()
+                .map(|body| payload::unframe_body(body, check));
+            req.input.content_length = payload::unframed_length(req.input.content_length)?;
+        }
         let body = req
             .input
             .body
@@ -1228,8 +1504,9 @@ impl S3 for ArunaS3Service {
         let result = drive(operation, &self.state)
             .await
             .map_err(IntoS3Error::into_s3_error)?;
+        // The unframed stream already checked a forwarded trailing checksum.
         validate_trailing_checksum(
-            trailer_algorithm,
+            trailer_algorithm.filter(|_| delegated_trailer.is_none()),
             &checksum_request.checksum_type,
             trailing_headers.as_ref(),
             &result.location.hashes,
@@ -1281,7 +1558,6 @@ impl S3 for ArunaS3Service {
         )?;
         validate_object_key(&req.input.key)?;
 
-        let upload_id = parse_upload_id(&req.input.upload_id)?;
         let part_number = parse_part_number(req.input.part_number, S3ErrorCode::InvalidArgument)?;
         let range = parse_source_range(req.input.copy_source_range.as_deref())?;
         let conditions = copy_source_conditions(
@@ -1311,6 +1587,63 @@ impl S3 for ArunaS3Service {
             .await?;
 
         let token = self.token_read(&req.extensions);
+        // The upload belongs to the coordinator of its key's range.
+        let dest_info = req.extensions.get::<BucketInfo>().cloned();
+        if let Some(forward) = self
+            .forward_upload(&req.extensions, dest_info.as_ref(), &req.input.key)
+            .await?
+        {
+            let upload: String =
+                url::form_urlencoded::byte_serialize(req.input.upload_id.as_bytes()).collect();
+            let query = format!("partNumber={}&uploadId={upload}", req.input.part_number);
+            return match self
+                .copy_path(&source_bucket_info, &source_key, &forward)
+                .await?
+            {
+                CopyPath::Stream => {
+                    let source = CopySource {
+                        bucket: &source_bucket_info,
+                        name: source_bucket,
+                        key: source_key,
+                        version_id: source_version_id,
+                        range,
+                        auth: &source_auth_context,
+                        conditions: &conditions,
+                    };
+                    let target = (req.input.bucket, req.input.key, query);
+                    self.stream_part(&user_access, &forward, target, source, token.as_ref())
+                        .await
+                }
+                CopyPath::Relay(holder) => {
+                    let source = (
+                        source_bucket.as_str(),
+                        source_key.as_str(),
+                        source_version_id,
+                    );
+                    let read =
+                        (self.read_through(&user_access, &holder, source, &req.headers)).await?;
+                    let target = (req.input.bucket, req.input.key, query);
+                    self.relay_part(&user_access, &forward, target, read).await
+                }
+                CopyPath::Delegate => {
+                    let request = forward::ForwardRequest {
+                        method: http::Method::PUT,
+                        operation: "UploadPartCopy",
+                        bucket: req.input.bucket,
+                        key: req.input.key,
+                        query: forward::passed_query(req.uri.query()),
+                        headers: forward::passed_headers(&req.headers, None),
+                        body: forward::ForwardBody::Empty,
+                    };
+                    let response = self.forward_write(&user_access, &forward, request).await?;
+                    Self::delegated_part(response).await
+                }
+            };
+        }
+        self.ensure_source(&source_bucket_info, &source_key).await?;
+        let upload_id = self
+            .upload_id(dest_info.as_ref(), &req.input.key, &req.input.upload_id)
+            .await?;
         let result = upload_part_token(
             &self.state,
             UploadPartCopyData {
@@ -1363,9 +1696,40 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
+        if let Some(forward) = self
+            .forward_upload(&req.extensions, bucket_info.as_ref(), &req.input.key)
+            .await?
+        {
+            let body = forward::parts::completion_body(req.input.multipart_upload.as_ref());
+            let mut headers = forward::passed_headers(&req.headers, Some(body.len() as i64));
+            headers.retain(|(name, _)| name != "content-type");
+            headers.push(("content-type".to_string(), "application/xml".to_string()));
+            let request = forward::ForwardRequest {
+                method: http::Method::POST,
+                operation: "CompleteMultipartUpload",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers,
+                body: forward::ForwardBody::Known(bytes::Bytes::from(body)),
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Self::forwarded_complete(response).await;
+        }
+        // A forwarded completion lists exactly the parts the issuer bound.
+        if let Some(delegated) = req.extensions.get::<DelegatedRequest>() {
+            let body = forward::parts::completion_body(req.input.multipart_upload.as_ref());
+            let bound = matches!(delegated.payload, Payload::Digest(digest)
+                if digest == body_digest(body.as_bytes()));
+            if !bound {
+                return Err(s3_error!(AccessDenied, "Delegation refused: other parts"));
+            }
+        }
         let quota_ceiling = self.resolve_quota_ceiling(group_id).await?;
         let checksum_request = parse_completion_checksum(&req.headers)?;
-        let upload_id = parse_upload_id(&req.input.upload_id)?;
+        let upload_id = self
+            .upload_id(bucket_info.as_ref(), &req.input.key, &req.input.upload_id)
+            .await?;
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
             realm_id: self.realm_id,
@@ -1488,11 +1852,30 @@ impl S3 for ArunaS3Service {
             "Received ABORT MULTIPART Request"
         );
 
-        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-        let upload_id = parse_upload_id(&req.input.upload_id)?;
+        let bucket_info = req.extensions.get::<BucketInfo>();
+        if let Some(forward) = self
+            .forward_upload(&req.extensions, bucket_info, &req.input.key)
+            .await?
+        {
+            let request = forward::ForwardRequest {
+                method: http::Method::DELETE,
+                operation: "AbortMultipartUpload",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: Vec::new(),
+                body: forward::ForwardBody::Empty,
+            };
+            self.forward_write(&user_access, &forward, request).await?;
+            return Ok(S3Response::new(AbortMultipartUploadOutput::default()));
+        }
+        let upload_id = self
+            .upload_id(bucket_info, &req.input.key, &req.input.upload_id)
+            .await?;
         let operation = AbortUploadOperation::new(AMUI {
             bucket: req.input.bucket,
             key: req.input.key,
@@ -1547,6 +1930,24 @@ impl S3 for ArunaS3Service {
         let key = req.input.key;
         let response_bucket = bucket.clone();
         let response_key = key.clone();
+        if let Some(holder) = self
+            .read_holder(&req.extensions, bucket_info.as_ref(), &key)
+            .await?
+        {
+            let request = || {
+                forward::reads::read_request(
+                    http::Method::GET,
+                    "GetObject",
+                    &bucket,
+                    &key,
+                    req.uri.query(),
+                    &req.headers,
+                )
+            };
+            let response = self.read_object(&user_access, &holder, request).await?;
+            return Ok(forward::reads::forwarded_get(response));
+        }
+        let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
 
         let range_request = requested_range.map(object_range_request);
 
@@ -1575,7 +1976,8 @@ impl S3 for ArunaS3Service {
             }
             _ => get_object_token(&self.state, input, restrictions, token).await,
         }
-        .map_err(IntoS3Error::into_s3_error)?;
+        .map_err(IntoS3Error::into_s3_error)
+        .map_err(|error| forward::catch_up_miss(error, catching_up, bucket_info.as_ref()))?;
         self.record_touch(
             &user_access.access_key,
             &response_bucket,
@@ -1585,7 +1987,19 @@ impl S3 for ArunaS3Service {
 
         let version_id = result.version_id;
         let resolved_range = result.resolved_range.clone();
-        let reference_refresh = reference_metadata_refresh(response_bucket, response_key, &result);
+        let reader = aruna_core::structs::identity::auth::AuthContext {
+            user_id: user_access.user_identity,
+            realm_id: self.realm_id,
+            path_restrictions: user_access.path_restrictions.clone(),
+            session: None,
+        };
+        let reference_refresh = reference_metadata_refresh(
+            response_bucket,
+            response_key,
+            &result,
+            self.node_id,
+            reader,
+        );
         let response_fields = self.build_response_fields(
             result.location.as_ref(),
             Some(&result.info),
@@ -1619,23 +2033,18 @@ impl S3 for ArunaS3Service {
             ..Default::default()
         };
         if checksum_mode_enabled(&req.headers) {
-            output.apply_checksums(encode_checksums(
-                checksum_response_hashes(
-                    result.info.checksum_type,
-                    &result.info.hashes,
-                    &result.info.composite_hashes,
-                ),
-                ChecksumSelection::AllStored,
-                map_checksum_type(result.info.checksum_type),
-                result.info.part_count,
-            ));
+            full_object_checksums(&mut output, &result.info);
         }
 
-        Ok(if resolved_range.is_some() {
-            S3Response::with_status(output, http::StatusCode::PARTIAL_CONTENT)
-        } else {
-            S3Response::new(output)
-        })
+        let mut response = match resolved_range.is_some() {
+            true => S3Response::with_status(output, http::StatusCode::PARTIAL_CONTENT),
+            false => S3Response::new(output),
+        };
+        // A member copying this version through here keeps its placement refs.
+        if let Some(value) = forward::copy_policies(&req.extensions, &result.source_policies) {
+            (response.headers).insert(COPY_CONTEXT_HEADER, value);
+        }
+        Ok(response)
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1767,11 +2176,29 @@ impl S3 for ArunaS3Service {
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        let group_id = req
-            .extensions
-            .get::<BucketInfo>()
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let group_id = bucket_info
+            .as_ref()
             .map(|info| info.group_id)
             .unwrap_or(user_access.group_id);
+        if let Some(holder) = self
+            .read_holder(&req.extensions, bucket_info.as_ref(), &key)
+            .await?
+        {
+            let request = || {
+                forward::reads::read_request(
+                    http::Method::HEAD,
+                    "HeadObject",
+                    &bucket,
+                    &key,
+                    req.uri.query(),
+                    &req.headers,
+                )
+            };
+            let response = self.read_object(&user_access, &holder, request).await?;
+            return Ok(forward::reads::forwarded_head(&response));
+        }
+        let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
         let operation = HeadObjectOperation::new(HOI {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -1780,7 +2207,8 @@ impl S3 for ArunaS3Service {
 
         let result = drive(operation, &self.state)
             .await
-            .map_err(IntoS3Error::into_s3_error)?;
+            .map_err(IntoS3Error::into_s3_error)
+            .map_err(|error| forward::catch_up_miss(error, catching_up, bucket_info.as_ref()))?;
 
         // A reference answers from its source observation without opening a source read.
         let remote_info = if result.location.is_none() && result.source_metadata.is_none() {
@@ -1864,7 +2292,7 @@ impl S3 for ArunaS3Service {
             "Received LIST PARTS Request"
         );
 
-        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
@@ -1873,7 +2301,27 @@ impl S3 for ArunaS3Service {
                 || req.input.sse_customer_key.is_some()
                 || req.input.sse_customer_key_md5.is_some(),
         )?;
-        let upload_id = parse_upload_id(&req.input.upload_id)?;
+        // Uploads live on the coordinator of the key's range, so their parts are listed there.
+        let bucket_info = req.extensions.get::<BucketInfo>();
+        if let Some(forward) = self
+            .forward_upload(&req.extensions, bucket_info, &req.input.key)
+            .await?
+        {
+            let request = forward::ForwardRequest {
+                method: http::Method::GET,
+                operation: "ListParts",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: Vec::new(),
+                body: forward::ForwardBody::Empty,
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Self::forwarded_list(response, req.input.bucket, req.input.key).await;
+        }
+        let upload_id = self
+            .upload_id(bucket_info, &req.input.key, &req.input.upload_id)
+            .await?;
         let part_number_marker = match req.input.part_number_marker {
             None => None,
             Some(marker) if marker < 0 => {
@@ -1915,7 +2363,7 @@ impl S3 for ArunaS3Service {
             "Received LIST MULTIPART UPLOADS Request"
         );
 
-        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
@@ -1923,7 +2371,16 @@ impl S3 for ArunaS3Service {
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
         let key_marker = req.input.key_marker.clone();
-        let requested_upload_marker = req.input.upload_id_marker.clone();
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let bounds = self
+            .delegated_listing(&req.extensions, bucket_info.as_ref(), req.uri.query())
+            .await?;
+        // A distributed bucket shows tagged upload ids; the marker names the stored one.
+        let requested_upload_marker = req.input.upload_id_marker.as_deref().map(|marker| {
+            UploadTag::parse(marker)
+                .map(|tag| tag.upload_id.to_string())
+                .unwrap_or_else(|| marker.to_string())
+        });
         let upload_id_marker =
             parse_upload_marker(key_marker.as_deref(), requested_upload_marker.as_deref())?;
         let max_uploads = match req.input.max_uploads {
@@ -1932,6 +2389,20 @@ impl S3 for ArunaS3Service {
                 .map_err(|_| s3_error!(InvalidArgument, "max-uploads must be non-negative"))?
                 .min(ListUploadsOperation::DEFAULT_MAX_UPLOADS),
         };
+        // A distributed bucket's uploads live on the coordinator of each key's range.
+        if let Some(binding) = (bucket_info.as_ref()).and_then(|info| info.distribution.clone()) {
+            let shape = (upload_id_marker, max_uploads);
+            return match bounds {
+                Some(bounds) => self.range_uploads(&binding, req.input, bounds, shape).await,
+                None => {
+                    let group_id =
+                        (bucket_info.as_ref()).map_or(user_access.group_id, |info| info.group_id);
+                    let shape = (group_id, upload_id_marker, max_uploads);
+                    self.merged_uploads(&user_access, &binding, req.input, shape)
+                        .await
+                }
+            };
+        }
 
         let result = drive(
             ListUploadsOperation::new(LMUI {
@@ -1946,8 +2417,22 @@ impl S3 for ArunaS3Service {
         )
         .await
         .map_err(IntoS3Error::into_s3_error)?;
-
-        Ok(list_uploads_output(req.input, max_uploads, result))
+        let listed: Vec<(String, ulid::Ulid)> = (result.uploads.iter())
+            .map(|record| (record.key.clone(), record.upload_id))
+            .collect();
+        let shown = self.shown_uploads(bucket_info.as_ref(), &listed).await?;
+        let mut response = list_uploads_output(req.input, max_uploads, result);
+        let output = &mut response.output;
+        let uploads = output.uploads.iter_mut().flatten();
+        let ids = uploads
+            .map(|upload| &mut upload.upload_id)
+            .chain([&mut output.next_upload_id_marker]);
+        for id in ids.flatten() {
+            if let Some(tagged) = shown.get(id.as_str()) {
+                *id = tagged.clone();
+            }
+        }
+        Ok(response)
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1971,6 +2456,9 @@ impl S3 for ArunaS3Service {
         let delimiter = req.input.delimiter.clone();
         let key_marker = req.input.key_marker.clone();
         let requested_version_marker = req.input.version_id_marker.clone();
+        let bounds = self
+            .delegated_listing(&req.extensions, bucket_info.as_ref(), req.uri.query())
+            .await?;
         let version_id_marker = match requested_version_marker.as_deref() {
             None => None,
             Some(marker) => Some(
@@ -1988,6 +2476,21 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
+        // A distributed bucket seeks in its ordered inventory, range by range.
+        if let Some(binding) = bucket_info.and_then(|bucket_info| bucket_info.distribution) {
+            let output = match bounds {
+                Some(bounds) => {
+                    let shape = (group_id, max_keys, version_id_marker);
+                    self.range_versions(&binding, req.input, bounds, shape)
+                        .await?
+                }
+                None => {
+                    self.merged_versions(&user_access, &binding, req.input, (group_id, max_keys))
+                        .await?
+                }
+            };
+            return Ok(S3Response::new(output));
+        }
 
         let result = drive(
             ListVersionsOperation::new(LOVI {
@@ -2022,6 +2525,25 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let version_id = parse_version_id(req.input.version_id)?;
+        // A delete marker for a key another member coordinates is forwarded there.
+        let bucket_info = req.extensions.get::<BucketInfo>();
+        if version_id.is_none()
+            && let Some(forward) = self
+                .forward_target(&req.extensions, bucket_info, &req.input.key)
+                .await?
+        {
+            let request = forward::ForwardRequest {
+                method: http::Method::DELETE,
+                operation: "DeleteObject",
+                bucket: req.input.bucket.clone(),
+                key: req.input.key.clone(),
+                query: forward::passed_query(req.uri.query()),
+                headers: Vec::new(),
+                body: forward::ForwardBody::Empty,
+            };
+            let response = self.forward_write(&user_access, &forward, request).await?;
+            return Ok(Self::forwarded_delete(&response));
+        }
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
             realm_id: self.realm_id,
@@ -2104,6 +2626,7 @@ impl S3 for ArunaS3Service {
         }
 
         let quiet = req.input.delete.quiet.unwrap_or(false);
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let replication_auth = AuthContext {
             user_id: user_access.user_identity,
             realm_id: self.realm_id,
@@ -2176,6 +2699,16 @@ impl S3 for ArunaS3Service {
                 version_id,
             });
         }
+        // Delete markers for keys another member coordinates are forwarded there one by one.
+        let (entries, forwarded, forward_errors) = self
+            .forward_deletes(
+                &req.extensions,
+                (&bucket, bucket_info.as_ref()),
+                &user_access,
+                entries,
+            )
+            .await;
+        errors.extend(forward_errors);
 
         let outcomes = delete_objects(
             &self.state,
@@ -2192,7 +2725,13 @@ impl S3 for ArunaS3Service {
         .await;
 
         Ok(self
-            .delete_objects_response(quiet, bucket, replication_auth, errors, outcomes)
+            .delete_objects_response(
+                quiet,
+                bucket,
+                replication_auth,
+                (forwarded, errors),
+                outcomes,
+            )
             .await)
     }
 

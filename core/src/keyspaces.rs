@@ -10,6 +10,10 @@ pub const REALM_CONFIG_KEYSPACE: &str = "realm_config";
 pub const METADATA_INDEX_KEYSPACE: &str = "metadata_index";
 pub const DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const IRI_INDEX_KEYSPACE: &str = "metadata_iri_reference_index";
+/// Data link postings by identifier, then document: what a materialized document links to.
+pub const DATA_LINK_KEYSPACE: &str = "metadata_data_links";
+/// The same postings by document first, so a materialization replaces exactly its own rows.
+pub const DOCUMENT_LINK_KEYSPACE: &str = "metadata_document_links";
 pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
 /// Time-ordered index of registry records by `updated_at_ms`, for OAI-PMH
 /// datestamp enumeration (#320). Written atomically with each registry record.
@@ -50,6 +54,48 @@ pub const DOCUMENT_JOB_KEYSPACE: &str = "metadata_materialization_document_jobs"
 pub const DEAD_LETTER_KEYSPACE: &str = "metadata_materialization_dead_letters";
 pub const MATERIALIZATION_PRUNE_KEYSPACE: &str = "metadata_materialization_prunes";
 pub const DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
+/// Database marks waiting for owner consent on this management node, by request id.
+pub const DATABASE_REQUEST_KEYSPACE: &str = "database_requests";
+/// Reduced distribution records by set id, materialized from their admin reducer state.
+pub const DISTRIBUTION_KEYSPACE: &str = "distribution_records";
+/// Requests a set's publisher accepted, by set id and request id, with the revision they made.
+pub const DISTRIBUTION_ACCEPT_KEYSPACE: &str = "distribution_accepted";
+/// The installed head revision of each set by publisher then set id, for removal cutoffs.
+pub const DISTRIBUTION_PUBLISHER_KEYSPACE: &str = "distribution_publishers";
+/// Snapshots whose publisher the realm config does not know yet, by publisher and set id.
+pub const DISTRIBUTION_PARKED_KEYSPACE: &str = "distribution_parked";
+/// The revision number of each parked snapshot, so the bound is counted without the bodies.
+pub const PARKED_INDEX_KEYSPACE: &str = "distribution_parked_index";
+/// Ordered inventory of each distributed bucket: head and version rows by set id and position.
+pub const INVENTORY_KEYSPACE: &str = "distribution_inventory";
+/// Open multipart uploads of each distributed bucket by set id, key and upload id.
+pub const UPLOAD_INVENTORY_KEYSPACE: &str = "distribution_uploads";
+/// Version id to inventory position, by set id and version id.
+pub const VERSION_INDEX_KEYSPACE: &str = "distribution_version_index";
+/// Versions of a distributed bucket by content identity: set id, identity, version id.
+pub const CONTENT_INDEX_KEYSPACE: &str = "distribution_content_index";
+/// The installed key ranges of each set by set id and exclusive upper bound.
+pub const RANGE_INDEX_KEYSPACE: &str = "distribution_ranges";
+/// The accounting row of each range: active generation, rebuild cursors and split state.
+pub const RANGE_ACCOUNT_KEYSPACE: &str = "distribution_range_accounts";
+/// Delta-merged counter rows of each range by generation, and pending split rows.
+pub const RANGE_COUNTER_KEYSPACE: &str = "distribution_range_counters";
+/// The bounded key sample of each range and its refill cursor.
+pub const KEY_SAMPLE_KEYSPACE: &str = "distribution_key_samples";
+/// Spent delegation nonces by expiry second then nonce, kept until they cannot verify anymore.
+pub const DELEGATION_NONCE_KEYSPACE: &str = "distribution_delegation_nonces";
+/// Sets whose record names a catching-up member, by set id, until their bootstrap is settled.
+pub const CATCH_UP_KEYSPACE: &str = "distribution_catch_up";
+/// Bootstrap cursors of catching-up members by set id, member id and range id.
+pub const BOOTSTRAP_KEYSPACE: &str = "distribution_bootstrap";
+/// Copy-on-use attachments by set id and version id: a verified local copy a GET reads.
+pub const ATTACHMENT_KEYSPACE: &str = "distribution_attachments";
+/// Cache-on-use entries by the logical identity of their version, and the cache totals row.
+pub const CACHE_ENTRY_KEYSPACE: &str = "distribution_cache_entries";
+/// Cache entries in admission order, by entry ULID, so eviction starts at the oldest.
+pub const CACHE_ORDER_KEYSPACE: &str = "distribution_cache_order";
+/// Claims on filling one kept copy, so concurrent reads fetch it once.
+pub const FILL_CLAIM_KEYSPACE: &str = "distribution_fill_claims";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
@@ -223,6 +269,8 @@ pub const PURGE_FILES_KEYSPACE: &str = "s3_purge_files";
 pub const REPLICATION_JOB_KEYSPACE: &str = "blob_replication_jobs";
 pub const REPLICATION_OBLIGATION_KEYSPACE: &str = "blob_live_replication_obligations";
 pub const REFRESH_JOB_KEYSPACE: &str = "reference_metadata_refresh_jobs";
+/// Due-time index of reference refresh jobs: big-endian due milliseconds, then the job key.
+pub const REFRESH_DUE_KEYSPACE: &str = "reference_metadata_refresh_due";
 pub const USAGE_STATS_KEYSPACE: &str = "usage_stats";
 pub const NODE_STATS_KEYSPACE: &str = "usage_node_stats";
 pub const NODE_INFO_KEYSPACE: &str = "node_info";
@@ -329,6 +377,10 @@ pub const SYNC_ORIGIN_KEYSPACE: &str = "sync_local_origins";
 
 pub const SOURCE_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_SECRET_KEYSPACE: &str = "source_connector_secret";
+/// One row per reference version bound to a connector, keyed by connector id first.
+pub const CONNECTOR_REFERENCE_KEYSPACE: &str = "source_connector_references";
+/// Connectors whose stale reference rows a background task prunes, with its position.
+pub const CONNECTOR_PRUNE_KEYSPACE: &str = "source_connector_prune_queue";
 
 // Repository interop: metadata harvest framework (#442).
 pub const CONNECTOR_INDEX_KEYSPACE: &str = "repository_connector_index";
@@ -400,8 +452,14 @@ pub const JOB_STATE_KEYSPACE: &str = "rocrate_job_state";
 pub const ROCRATE_UPLOAD_KEYSPACE: &str = "rocrate_uploads";
 pub const UPLOAD_CLEANUP_KEYSPACE: &str = "rocrate_upload_cleanups";
 pub const STAGING_STATE_KEYSPACE: &str = "staging_job_state";
+/// Directories a staging job still has to list, keyed by job id and queue position.
+pub const STAGING_QUEUE_KEYSPACE: &str = "staging_directory_queue";
+/// Digests a staging job read from checksum manifests, keyed by job id and source path.
+pub const STAGING_MANIFEST_KEYSPACE: &str = "staging_manifest_digests";
 
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
+/// Provider buckets below their object limit, keyed by backend, load and bucket name.
+pub const BUCKET_FREE_INDEX: &str = "bucket_free_index";
 
 pub const API_STATE_KEYSPACE: &str = "api_state";
 pub const NODE_STATE_KEYSPACE: &str = "node_state";
@@ -417,6 +475,27 @@ pub const CRAQLE_TERMS_KEYSPACE: &str = "terms";
 pub const CRAQLE_QUADS_KEYSPACE: &str = "quads";
 pub const CRAQLE_GRAPHS_KEYSPACE: &str = "graphs";
 pub const CRAQLE_LOG_KEYSPACE: &str = "log";
+/// The local fence row of each distributed bucket set by set id; publication transactions read it.
+pub const DISTRIBUTION_FENCE_KEYSPACE: &str = "distribution_fences";
+/// Sets whose record holds open lifecycle work for this node, by set id, until it is settled.
+pub const DISTRIBUTION_LIFECYCLE_KEYSPACE: &str = "distribution_lifecycle";
+/// Streaming purge cursors of distributed bucket ranges by set id and range id.
+pub const DISTRIBUTION_PURGE_KEYSPACE: &str = "distribution_purge";
+/// Source roots of a set's external references by set id and root digest, with check markers.
+pub const SOURCE_ROOT_KEYSPACE: &str = "distribution_source_roots";
+/// IRI index postings by document first, so a materialization replaces exactly its own rows.
+pub const DOCUMENT_IRI_KEYSPACE: &str = "metadata_document_iris";
+/// Head changes of distributed buckets waiting for the range search indexes, by head position.
+pub const SEARCH_FEED_KEYSPACE: &str = "distribution_search_feed";
+/// The search index state of each range on this member, by set id and range id.
+pub const SEARCH_INDEX_KEYSPACE: &str = "distribution_search_indexes";
+/// The register version of each database entry this node saw unlinked, by entry id.
+pub const DATABASE_UNLINKED_KEYSPACE: &str = "database_unlinked";
+/// The value each row a running usage rebuild reads had when the rebuild began, kept on change.
+pub const USAGE_PREIMAGE_KEYSPACE: &str = "usage_rebuild_preimages";
+/// Bytes this node admitted for distributed bucket members: a member row by set id with its
+/// bucket and cache budget, and a row per held range by set and range id.
+pub const CAPACITY_RESERVATION_KEYSPACE: &str = "distribution_capacity_reservations";
 
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
@@ -429,6 +508,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     METADATA_INDEX_KEYSPACE,
     DOCUMENT_INDEX_KEYSPACE,
     IRI_INDEX_KEYSPACE,
+    DATA_LINK_KEYSPACE,
+    DOCUMENT_LINK_KEYSPACE,
     METADATA_HOLDERS_KEYSPACE,
     UPDATED_INDEX_KEYSPACE,
     VISIBILITY_INDEX_KEYSPACE,
@@ -455,6 +536,26 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DEAD_LETTER_KEYSPACE,
     MATERIALIZATION_PRUNE_KEYSPACE,
     DOCUMENT_STATE_KEYSPACE,
+    DATABASE_REQUEST_KEYSPACE,
+    DISTRIBUTION_KEYSPACE,
+    DISTRIBUTION_ACCEPT_KEYSPACE,
+    DISTRIBUTION_PUBLISHER_KEYSPACE,
+    DISTRIBUTION_PARKED_KEYSPACE,
+    PARKED_INDEX_KEYSPACE,
+    INVENTORY_KEYSPACE,
+    UPLOAD_INVENTORY_KEYSPACE,
+    VERSION_INDEX_KEYSPACE,
+    RANGE_INDEX_KEYSPACE,
+    RANGE_ACCOUNT_KEYSPACE,
+    RANGE_COUNTER_KEYSPACE,
+    KEY_SAMPLE_KEYSPACE,
+    DELEGATION_NONCE_KEYSPACE,
+    CATCH_UP_KEYSPACE,
+    BOOTSTRAP_KEYSPACE,
+    ATTACHMENT_KEYSPACE,
+    CACHE_ENTRY_KEYSPACE,
+    CACHE_ORDER_KEYSPACE,
+    FILL_CLAIM_KEYSPACE,
     DOCUMENT_CONFLICT_KEYSPACE,
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,
@@ -543,6 +644,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     REPLICATION_JOB_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE,
     REFRESH_JOB_KEYSPACE,
+    REFRESH_DUE_KEYSPACE,
     USAGE_STATS_KEYSPACE,
     NODE_STATS_KEYSPACE,
     NODE_INFO_KEYSPACE,
@@ -580,6 +682,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SYNC_ORIGIN_KEYSPACE,
     SOURCE_INDEX_KEYSPACE,
     SOURCE_SECRET_KEYSPACE,
+    CONNECTOR_REFERENCE_KEYSPACE,
+    CONNECTOR_PRUNE_KEYSPACE,
     CONNECTOR_INDEX_KEYSPACE,
     CONNECTOR_SECRET_KEYSPACE,
     HARVEST_SOURCE_KEYSPACE,
@@ -617,6 +721,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ROCRATE_UPLOAD_KEYSPACE,
     UPLOAD_CLEANUP_KEYSPACE,
     STAGING_STATE_KEYSPACE,
+    STAGING_QUEUE_KEYSPACE,
+    STAGING_MANIFEST_KEYSPACE,
     BUCKET_STATS_DB,
     API_STATE_KEYSPACE,
     NODE_STATE_KEYSPACE,
@@ -642,6 +748,18 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ABE_DUE_KEYSPACE,
     ABE_REISSUE_KEYSPACE,
     ABE_REKEY_KEYSPACE,
+    DISTRIBUTION_FENCE_KEYSPACE,
+    DISTRIBUTION_LIFECYCLE_KEYSPACE,
+    DISTRIBUTION_PURGE_KEYSPACE,
+    SOURCE_ROOT_KEYSPACE,
+    BUCKET_FREE_INDEX,
+    CONTENT_INDEX_KEYSPACE,
+    DOCUMENT_IRI_KEYSPACE,
+    SEARCH_FEED_KEYSPACE,
+    SEARCH_INDEX_KEYSPACE,
+    DATABASE_UNLINKED_KEYSPACE,
+    USAGE_PREIMAGE_KEYSPACE,
+    CAPACITY_RESERVATION_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

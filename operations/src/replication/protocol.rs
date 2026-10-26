@@ -13,6 +13,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{MAX_REF_INPUT, PlacementPolicyRef, PlacementSubject};
 use aruna_core::structs::storage::blob::{BackendLocation, CopyOrigin};
+use aruna_core::structs::storage::distribution::{OriginalEpoch, Publication};
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectPart, MultipartObjectSummary,
 };
@@ -70,6 +71,21 @@ pub struct VersionReplicationManifest {
     /// Refs stored on the replicated version. The target reconstructs the same
     /// governed version, so replication never relaxes an attachment.
     pub placement_policies: Vec<PlacementPolicyRef>,
+    /// The version's original epoch; it orders heads and never changes in transit.
+    pub original_epoch: OriginalEpoch,
+    /// The generation the version was written as in a distributed bucket, current or not.
+    pub version_generation: u64,
+    /// The logical identity the set fixed for the version, whatever form its bytes take.
+    pub logical_identity: Option<[u8; 32]>,
+    /// A coordinator's publication to a member of a distributed bucket; the member admits it
+    /// against its own record instead of a relationship or a writer's permissions.
+    pub distribution: Option<Publication>,
+    /// Where the version's content came from; every copy keeps it unchanged.
+    pub version_origin: Option<aruna_core::structs::storage::origin::VersionOrigin>,
+    /// The sync hop the sender's version carries; a sync destination records its own.
+    pub version_hop: Option<aruna_core::structs::storage::origin::SyncHop>,
+    /// The sender's own bucket and key of a sync delivery, which the destination's hop names.
+    pub sync_source: Option<(String, String)>,
 }
 
 impl VersionReplicationManifest {
@@ -89,6 +105,19 @@ impl VersionReplicationManifest {
         }
         check_text(&mut budget, &self.bucket, MAX_VALUE_BYTES)?;
         check_text(&mut budget, &self.key, MAX_VALUE_BYTES)?;
+        if let Some((bucket, key)) = &self.sync_source {
+            check_text(&mut budget, bucket, MAX_VALUE_BYTES)?;
+            check_text(&mut budget, key, MAX_VALUE_BYTES)?;
+        }
+        if self
+            .version_origin
+            .as_ref()
+            .is_some_and(|origin| !origin.bounded())
+        {
+            return Err(ConversionError::FromStrError(
+                "replication manifest origin exceeds its size budget".to_string(),
+            ));
+        }
         check_map(&mut budget, &self.metadata)?;
 
         if self.upstream_sources.len() > MAX_REPLICATION_SOURCES {
@@ -187,6 +216,18 @@ impl VersionReplicationManifest {
             ));
         }
 
+        // A publication carries the coordinator's own version: no hop, advance or upstream.
+        if let Some(publication) = &self.distribution
+            && (self.origin.is_some()
+                || self.reference_advance.is_some()
+                || !self.upstream_sources.is_empty()
+                || (!publication.bytes && self.blob.is_some()))
+        {
+            return Err(ConversionError::FromStrError(
+                "replication manifest publication is invalid".to_string(),
+            ));
+        }
+
         let count_valid = match self.reference_advance_count {
             Some(count) => self.is_reference() && count <= MAX_AUTO_ADVANCES,
             None => !self.is_reference(),
@@ -218,6 +259,13 @@ pub struct MaterializedBlobInfo {
 pub enum BaoReadTarget {
     ExactVersion(VersionedObjectArn),
     Blake3([u8; 32]),
+    /// One version of a distributed bucket by its logical identity: the holder finds it in its
+    /// own member bucket. `expected_blake3` names its content, unless an external reference's
+    /// record names none; the holder's verified copy then binds the stream.
+    Version {
+        set_id: Ulid,
+        version_id: Ulid,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -233,6 +281,8 @@ pub struct BaoReadRequest {
     /// Refs the requester has already resolved. Echoing one is never authority:
     /// the source evaluates the destination independently.
     pub known_refs: Vec<PlacementPolicyRef>,
+    /// Reads only these bytes; bao verifies each chunk against the object's BLAKE3 root.
+    pub range: Option<std::ops::Range<u64>>,
 }
 
 impl BaoReadRequest {
@@ -263,6 +313,12 @@ pub enum BaoReadRefusal {
     BackendFailure,
     /// The copy is sealed with a key of this bucket that is locked on the serving node.
     BucketLocked(Ulid),
+    /// This node keeps only the record of the distributed version; `holder` keeps its bytes
+    /// and serves it as a version of set `set_id`.
+    HeldBy {
+        holder: NodeId,
+        set_id: Ulid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -470,6 +526,27 @@ pub enum VersionReplicationMessage {
     /// The source evaluated the authenticated destination and refused it.
     PlacementPolicyDenied {
         policy_ids: Vec<Ulid>,
+    },
+    /// Asks a member of a distributed bucket for the key of one version by its version id
+    /// index. Infrastructure peers only; the reader is checked by the summary that follows.
+    VersionKeyRequest {
+        realm_id: RealmId,
+        set_id: Ulid,
+        version_id: Ulid,
+    },
+    /// The key the member's index holds, `None` when it holds no such version.
+    VersionKeyResponse(Option<String>),
+    /// Asks a member for the versions of one content identity in a set by its content index.
+    /// Infrastructure peers only, like `VersionKeyRequest`.
+    ContentRequest {
+        realm_id: RealmId,
+        set_id: Ulid,
+        identity: [u8; 32],
+    },
+    /// Version ids and keys of the identity the member holds; `more` when the page was cut.
+    ContentResponse {
+        versions: Vec<(Ulid, String)>,
+        more: bool,
     },
 }
 
@@ -703,6 +780,13 @@ mod pure_tests {
             reference_advance: None,
             reference_advance_count: None,
             placement_policies: Vec::new(),
+            original_epoch: Default::default(),
+            version_generation: 0,
+            logical_identity: None,
+            distribution: None,
+            version_origin: None,
+            version_hop: None,
+            sync_source: None,
         }
     }
 
@@ -719,6 +803,7 @@ mod pure_tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::from_parts(3, 3)),
         });
@@ -729,6 +814,7 @@ mod pure_tests {
             etag: None,
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         });
         manifest.origin = Some(SyncOrigin {
             relationship_id: Ulid::from_parts(4, 4),
@@ -780,6 +866,7 @@ mod pure_tests {
             metadata_only: false,
             destination: None,
             known_refs: Vec::new(),
+            range: None,
         });
         let accepted = VersionReplicationMessage::BaoReadAccepted {
             size: 42,
@@ -819,6 +906,7 @@ mod pure_tests {
                 etag: Some("etag-1".to_string()),
                 last_modified: Some(SystemTime::UNIX_EPOCH),
                 source_version: None,
+                digests: Default::default(),
             },
         );
         manifest

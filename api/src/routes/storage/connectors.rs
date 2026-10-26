@@ -10,7 +10,9 @@ use crate::auth::{parse_group_id, require_realm_auth, require_unrestricted_auth}
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::SourceResolutionError;
-use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceEntryKind};
+use aruna_core::structs::execution::source_access::{
+    ListCursor, ListRequest, ResolvedSourceAccess, SourceEntryKind,
+};
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::connectors::create_connector::{
@@ -40,6 +42,7 @@ use aruna_operations::staging::list_source::{
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::time::timeout;
@@ -215,6 +218,7 @@ pub struct ConnectorEntriesQuery {
     #[serde(default)]
     pub path: String,
     pub limit: Option<usize>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -239,6 +243,8 @@ pub struct ConnectorEntryResponse {
 pub struct ConnectorEntriesResponse {
     pub entries: Vec<ConnectorEntryResponse>,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -619,6 +625,11 @@ pub async fn get_source_connector(
             status = 409,
             description = "The credentials are still referenced by a stored object version, and stay so until those versions are gone",
             body = ErrorResponse
+        ),
+        (
+            status = 503,
+            description = "More reference records exist than one request checks; they are checked in the background and the request may be retried",
+            body = ErrorResponse
         )
     ),
     security(("bearer_auth" = []))
@@ -700,6 +711,11 @@ pub async fn replace_source_connector(
         (
             status = 409,
             description = "The credentials are still referenced by a stored object version, and stay so until those versions are gone",
+            body = ErrorResponse
+        ),
+        (
+            status = 503,
+            description = "More reference records exist than one request checks; they are checked in the background and the request may be retried",
             body = ErrorResponse
         )
     ),
@@ -943,8 +959,11 @@ path.
   directory index and a server that serves none fails with 502.
 
 **Limits**
-- There is no cursor: `truncated` only says the source held more entries than the limit allowed, and
-  the only way to see more is a larger `limit`, up to the cap, or a narrower `path`."#,
+- `truncated` says more entries may follow; `next_cursor` is then set and passed back as `cursor`
+  with the same `path` to read the next page. A page can be short or even empty while more follow.
+- S3 sources read a level as the keys below it and continue after the last key read, so a page
+  passing through a large subdirectory can hold few entries. Sources without a provider cursor (`http`,
+  `webdav`) re-list from the start and skip, and refuse to continue past 100000 entries with 400."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
         ("connector_id" = String, Path, description = "Connector to browse, as a 26-character ULID"),
@@ -957,6 +976,11 @@ path.
             "limit" = Option<usize>,
             Query,
             description = "Maximum number of entries to return; defaults to 200, must be greater than zero and is capped at 1000"
+        ),
+        (
+            "cursor" = Option<String>,
+            Query,
+            description = "Opaque `next_cursor` of the previous page; absent for the first page"
         )
     ),
     responses(
@@ -979,12 +1003,13 @@ path.
                         "modified_ms": 1775744591123_i64
                     }
                 ],
-                "truncated": false
+                "truncated": true,
+                "next_cursor": "a2RhdGFzZXRzL21hbmlmZXN0LnRzdg"
             })
         ),
         (
             status = 400,
-            description = "An id is not a ULID, the path escapes the connector root, or the limit is zero",
+            description = "An id is not a ULID, the path escapes the connector root, the limit is zero, or the cursor is invalid or past what the source can continue",
             body = ErrorResponse
         ),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -1024,15 +1049,17 @@ pub async fn list_connector_entries(
         ));
     }
 
+    let cursor = query.cursor.as_deref().map(decode_cursor).transpose()?;
     let result = drive(
         ListStagingOperation::new(ListStagingInput {
             group_id,
             connector_id,
             source_path,
-            offset: 0,
-            limit: limit.min(MAX_ENTRY_LIMIT),
-            recursive: false,
-            files_only: false,
+            request: ListRequest {
+                cursor,
+                limit: limit.min(MAX_ENTRY_LIMIT),
+                ..Default::default()
+            },
         }),
         &state.get_ctx(),
     )
@@ -1059,8 +1086,37 @@ pub async fn list_connector_entries(
                 }),
             })
             .collect(),
-        truncated: result.truncated,
+        truncated: result.next_cursor.is_some(),
+        next_cursor: result.next_cursor.as_ref().map(encode_cursor),
     }))
+}
+
+/// Cursors are opaque to clients: a tagged key or offset in URL-safe base64.
+fn encode_cursor(cursor: &ListCursor) -> String {
+    let raw = match cursor {
+        ListCursor::After(key) => format!("k{key}"),
+        ListCursor::At(key) => format!("a{key}"),
+        ListCursor::Offset(offset) => format!("o{offset}"),
+    };
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+fn decode_cursor(cursor: &str) -> ServerResult<ListCursor> {
+    let invalid = || ServerError::BadRequestReason("cursor is invalid".to_string());
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid)?;
+    match raw.split_at_checked(1) {
+        Some(("k", key)) if !key.is_empty() => Ok(ListCursor::After(key.to_string())),
+        Some(("a", key)) if !key.is_empty() => Ok(ListCursor::At(key.to_string())),
+        Some(("o", offset)) => offset
+            .parse()
+            .map(ListCursor::Offset)
+            .map_err(|_| invalid()),
+        _ => Err(invalid()),
+    }
 }
 
 async fn run_connector_check(
@@ -1195,6 +1251,9 @@ fn map_replace_error(error: ReplaceSourceError) -> ServerError {
         ReplaceSourceError::ValidationError(_) => ServerError::BadRequest,
         ReplaceSourceError::NotFound => ServerError::NotFound,
         ReplaceSourceError::ReferencedObjectVersion => ServerError::Conflict(error.to_string()),
+        ReplaceSourceError::ReferencesPending => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
         _ => ServerError::InternalError(error.to_string()),
     }
 }
@@ -1203,6 +1262,9 @@ fn map_delete_error(error: DeleteSourceError) -> ServerError {
     match error {
         DeleteSourceError::NotFound => ServerError::NotFound,
         DeleteSourceError::ReferencedObjectVersion => ServerError::Conflict(error.to_string()),
+        DeleteSourceError::ReferencesPending => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
         _ => ServerError::InternalError(error.to_string()),
     }
 }
@@ -1222,6 +1284,9 @@ fn map_list_error(error: ListStagingError) -> ServerError {
         ListStagingError::Staging(aruna_core::errors::StagingSourceError::NotFound) => {
             ServerError::NotFound
         }
+        ListStagingError::Staging(aruna_core::errors::StagingSourceError::InvalidListing(
+            reason,
+        )) => ServerError::BadRequestReason(reason),
         ListStagingError::Staging(error) => ServerError::BadGatewayReason(error.to_string()),
         _ => ServerError::InternalError(error.to_string()),
     }

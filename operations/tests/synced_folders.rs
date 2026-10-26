@@ -15,6 +15,7 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::{
@@ -39,6 +40,7 @@ use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::object::origin::read_origin;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::staging::offered_directory::{
@@ -108,6 +110,7 @@ async fn create_bucket(
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
+                distribution: None,
             },
         ),
         context,
@@ -500,6 +503,22 @@ async fn records_pull_origin() -> TestResult<()> {
         .resolved_version_id
         .or(head.version_id)
         .ok_or("the head names its version")?;
+    let recorded = read_origin(
+        &server.context,
+        (realm.realm_id, server.node_id()),
+        REMOTE_BUCKET,
+        "note.txt",
+        Some(version_id),
+    )
+    .await?;
+    assert_eq!(
+        recorded.origin,
+        Some(VersionOrigin::Upload {
+            node_id: server.node_id(),
+            device: Some(device_id.clone()),
+        }),
+        "the version's origin names the device"
+    );
     let origin = local_origin(&device.context, version_id)
         .await?
         .ok_or("the device keeps the origin of what it published")?;

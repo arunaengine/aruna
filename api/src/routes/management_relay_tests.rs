@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, relay_route, relay_targets,
-    relay_url, relayed_headers,
+    API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, pinned_route, pinned_targets,
+    relay_route, relay_targets, relay_url, relayed_headers,
 };
 use crate::error::{ErrorResponse, ServerError};
 use axum::body::to_bytes;
@@ -103,6 +103,30 @@ fn management_answers_itself() {
 }
 
 #[test]
+fn requests_reach_owner() {
+    // A database request asked of any management node is relayed to the request owner.
+    let route = Some("/api/v1/system/realm/databases/requests/{request_id}/approve");
+    assert_eq!(
+        relay_route(&Method::POST, route, true, false),
+        Some("/system/realm/databases/requests/{request_id}/approve")
+    );
+    assert_eq!(relay_route(&Method::POST, route, true, true), None);
+    let owner = iroh::SecretKey::from_bytes(&[1; 32]).public();
+    let url = "https://owner.example.test".to_string();
+    let peers = vec!["https://peer.example.test".to_string()];
+    let known = Some((owner, Some(url.clone())));
+    assert_eq!(
+        pinned_targets(known.clone(), peers.clone(), true),
+        std::slice::from_ref(&url)
+    );
+    assert_eq!(pinned_targets(known, peers.clone(), false), [url]);
+    // A realm node never falls back to another management node when the owner has no url.
+    let unpublished = Some((owner, None));
+    assert!(pinned_targets(unpublished.clone(), peers.clone(), true).is_empty());
+    assert_eq!(pinned_targets(unpublished, peers.clone(), false), peers);
+}
+
+#[test]
 fn builds_target_url() {
     // Node info documents publish `API_PUBLIC_URL` as a bare origin.
     let uri: Uri = "/api/v1/access/onboarding/secrets?limit=5".parse().unwrap();
@@ -132,6 +156,18 @@ fn uses_installed_urls() {
         "a resolved peer is never displaced by an installed copy"
     );
     assert!(relay_targets(Vec::new(), Vec::new()).is_empty());
+}
+
+#[test]
+fn requests_stay_pinned() {
+    // Pending database requests live on one management node, so no fallback target is tried.
+    assert!(pinned_route("/system/realm/databases"));
+    assert!(pinned_route("/system/realm/databases/requests"));
+    assert!(pinned_route(
+        "/system/realm/databases/requests/{request_id}/approve"
+    ));
+    assert!(!pinned_route("/system/realm/databases/{entry_id}"));
+    assert!(!pinned_route("/system/realm/quota"));
 }
 
 #[test]

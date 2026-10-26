@@ -133,6 +133,8 @@ mod tests {
                 documents_held: Some(1),
                 load_permille: Some(250),
                 heartbeat_at_ms: 1_000,
+                download_slots: None,
+                storage_capacity_bytes: None,
             },
             availability: vec![("docker".into(), availability())],
             reservation: ComputeReservationSnapshot {

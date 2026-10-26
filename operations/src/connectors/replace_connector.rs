@@ -12,16 +12,16 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_connector::{
     SourceConnector, SourceConnectorKind, SourceConnectorSecret,
 };
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::reference_scan::{ScanStep, parse_scan_page};
+use crate::connectors::reference_prune::schedule_prune;
+use crate::connectors::reference_scan::{ReferenceScan, ScanStep};
 use crate::connectors::repository::{
     StorageReadError, delete_secret_effect, parse_connector_read, parse_secret_read,
-    read_connector_effect, read_secret_effect, reference_scan_effect, source_connector_key,
-    write_secret_effect,
+    read_connector_effect, read_secret_effect, source_connector_key, write_secret_effect,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
@@ -65,6 +65,9 @@ pub enum ReplaceSourceState {
     ReadSecret,
     StartTransaction,
     ScanReferenceVersions,
+    /// More reference rows follow than one request checks; their pruning is being queued.
+    CommitDeferred,
+    ScheduleDeferred,
     WriteRecords,
     WriteSecret,
     CommitTransaction,
@@ -85,6 +88,8 @@ pub enum ReplaceSourceError {
     NotFound,
     #[error("Connector credentials are referenced by object versions")]
     ReferencedObjectVersion,
+    #[error("Connector references are still being checked; retry later")]
+    ReferencesPending,
     #[error("ReplaceSourceConnector failed")]
     ReplaceConnectorFailed,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
@@ -111,6 +116,7 @@ pub struct ReplaceSourceOperation {
     replacement: Option<SourceConnector>,
     replacement_secret: Option<SourceConnectorSecret>,
     txn_id: Option<TxnId>,
+    scan: Option<ReferenceScan>,
     output: Option<Result<ReplaceSourceResult, ReplaceSourceError>>,
 }
 
@@ -122,6 +128,7 @@ impl ReplaceSourceOperation {
             replacement: None,
             replacement_secret: None,
             txn_id: None,
+            scan: None,
             output: None,
         }
     }
@@ -156,16 +163,19 @@ impl ReplaceSourceOperation {
 
     fn prepare_replacement(&mut self, existing: SourceConnector) {
         let now = SystemTime::now();
-        self.replacement = Some(SourceConnector::new(
-            existing.connector_id,
-            existing.group_id,
-            self.input.name.clone(),
-            self.input.kind,
-            self.input.public_config.clone(),
-            existing.created_at,
-            now,
-            existing.created_by,
-        ));
+        self.replacement = Some(
+            SourceConnector::new(
+                existing.connector_id,
+                existing.group_id,
+                self.input.name.clone(),
+                self.input.kind,
+                self.input.public_config.clone(),
+                existing.created_at,
+                now,
+                existing.created_by,
+            )
+            .with_namespace(&self.input.secret_config),
+        );
         self.replacement_secret = SourceConnectorSecret::new(
             existing.connector_id,
             self.input.secret_config.clone(),
@@ -180,7 +190,7 @@ impl ReplaceSourceOperation {
         };
 
         if secret_config_changed(current_secret.as_ref(), self.replacement_secret.as_ref()) {
-            return self.scan_reference_versions(None);
+            return self.scan_reference_versions();
         }
 
         self.write_records()
@@ -230,23 +240,50 @@ impl ReplaceSourceOperation {
         }
     }
 
-    fn scan_reference_versions(&mut self, start_after: Option<Key>) -> Effects {
+    fn scan_reference_versions(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(StorageError::TransactionNotFound.into());
         };
 
         self.state = ReplaceSourceState::ScanReferenceVersions;
-        smallvec![reference_scan_effect(start_after, Some(txn_id),)]
+        let mut scan = ReferenceScan::new(self.input.connector_id);
+        let effects = scan.start(txn_id);
+        self.scan = Some(scan);
+        effects
     }
 
     fn handle_scan_page(&mut self, event: Event) -> Effects {
-        match parse_scan_page(event, self.input.connector_id) {
+        let (Some(scan), Some(txn_id)) = (self.scan.as_mut(), self.txn_id) else {
+            return self.abort_with_error(StorageError::TransactionNotFound.into());
+        };
+        match scan.step(event, txn_id) {
             Ok(ScanStep::Referenced) => {
                 self.abort_with_error(ReplaceSourceError::ReferencedObjectVersion)
             }
-            Ok(ScanStep::NextPage(start_after)) => self.scan_reference_versions(Some(start_after)),
+            Ok(ScanStep::Next(effects)) => effects,
+            Ok(ScanStep::Deferred) => {
+                // The stale page and the pruning queue row commit; the caller retries later.
+                self.state = ReplaceSourceState::CommitDeferred;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
             Ok(ScanStep::Complete) => self.write_records(),
             Err(error) => self.abort_with_error(error.into()),
+        }
+    }
+
+    fn handle_deferred_commit(&mut self, event: Event) -> Effects {
+        self.txn_id = None;
+        match event {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                self.state = ReplaceSourceState::ScheduleDeferred;
+                smallvec![schedule_prune()]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
+            received => self.emit_error(ReplaceSourceError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
+                received,
+            }),
         }
     }
 
@@ -396,6 +433,15 @@ impl Operation for ReplaceSourceOperation {
             ReplaceSourceState::ReadSecret => self.handle_secret_read(event),
             ReplaceSourceState::StartTransaction => self.handle_transaction_started(event),
             ReplaceSourceState::ScanReferenceVersions => self.handle_scan_page(event),
+            ReplaceSourceState::CommitDeferred => self.handle_deferred_commit(event),
+            ReplaceSourceState::ScheduleDeferred => match event {
+                Event::Task(_) => self.emit_error(ReplaceSourceError::ReferencesPending),
+                received => self.emit_error(ReplaceSourceError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::Task",
+                    received,
+                }),
+            },
             ReplaceSourceState::WriteRecords => self.handle_records_written(event),
             ReplaceSourceState::WriteSecret => self.handle_secret_written(event),
             ReplaceSourceState::CommitTransaction => self.handle_transaction_committed(event),
@@ -437,14 +483,17 @@ impl Operation for ReplaceSourceOperation {
 mod tests {
     use super::*;
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+    use crate::connectors::repository::{connector_reference_key, connector_reference_write};
     use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
     use crate::driver::{DriverContext, drive};
     use crate::staging::descriptor::build_source_binding;
-    use aruna_core::effects::IterStart;
-    use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+    use aruna_core::keyspaces::{
+        BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
+    };
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
     use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
     use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
+    use aruna_core::types::Key;
     use aruna_storage::storage;
     use tempfile::{TempDir, tempdir};
 
@@ -470,6 +519,7 @@ mod tests {
             etag: None,
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         }
     }
 
@@ -500,32 +550,31 @@ mod tests {
     }
 
     async fn write_reference_version(context: &DriverContext, source: VersionSourceBinding) {
-        let version_id = ulid::Ulid::generate();
-        let key = VersionKey::new("bucket", "key", version_id)
-            .to_bytes()
-            .unwrap();
-        let value = BlobVersion::reference(
+        let version_key = VersionKey::new("bucket", "key", ulid::Ulid::generate());
+        let version = BlobVersion::reference(
             source,
             source_metadata(),
             SystemTime::UNIX_EPOCH,
             Default::default(),
             SystemTime::UNIX_EPOCH,
-        )
-        .to_bytes()
-        .unwrap();
+        );
+        let mut writes = vec![(
+            BLOB_VERSIONS_KEYSPACE.to_string(),
+            version_key.to_bytes().unwrap().into(),
+            version.to_bytes().unwrap().into(),
+        )];
+        writes.extend(connector_reference_write(&version, &version_key).unwrap());
 
         let event = context
             .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: key.into(),
-                value: value.into(),
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
                 txn_id: None,
             })
             .await;
         assert!(matches!(
             event,
-            Event::Storage(StorageEvent::WriteResult { .. })
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
         ));
     }
 
@@ -636,52 +685,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn reference_aborts_replace() {
-        let connector_id = Ulid::from_bytes([2u8; 16]);
-        let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id,
-            name: "new".to_string(),
-            kind: SourceConnectorKind::Webdav,
-            public_config: HashMap::new(),
-            secret_config: HashMap::new(),
-        });
-        operation.state = ReplaceSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
-        operation.replacement = Some(replacement_connector(Ulid::generate(), connector_id));
-        operation.replacement_secret = Some(connector_secret(connector_id, "bob"));
-
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                vec![1].into(),
-                reference_blob_version(connector_id)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            )],
-            next_start_after: None,
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
-                if *abort_txn == txn_id
-        ));
-
-        operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-        assert_eq!(
-            operation.finalize(),
-            Err(ReplaceSourceError::ReferencedObjectVersion)
-        );
-    }
-
-    #[test]
-    fn scans_multiple_pages() {
+    /// An operation inside its transaction with the reference scan started.
+    fn scanning(connector_id: Ulid, txn_id: Ulid) -> ReplaceSourceOperation {
         let group_id = Ulid::from_bytes([1u8; 16]);
-        let connector_id = Ulid::from_bytes([2u8; 16]);
-        let txn_id = Ulid::from_bytes([3u8; 16]);
-        let next_key: Key = vec![9u8].into();
         let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id,
             connector_id,
@@ -690,72 +696,55 @@ mod tests {
             public_config: HashMap::new(),
             secret_config: HashMap::new(),
         });
-        operation.state = ReplaceSourceState::ScanReferenceVersions;
+        operation.state = ReplaceSourceState::ReadSecret;
         operation.txn_id = Some(txn_id);
         operation.replacement = Some(replacement_connector(group_id, connector_id));
-
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![],
-            next_start_after: Some(next_key.clone()),
+        operation.replacement_secret = Some(connector_secret(connector_id, "bob"));
+        operation.step(Event::Storage(StorageEvent::VaultResult {
+            entry: SourceConnectorSecret::vault_entry(connector_id),
+            secret: Some(connector_secret(connector_id, "alice").to_secret().unwrap()),
         }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(key)),
-                txn_id: Some(scan_txn),
-                ..
-            })] if *scan_txn == txn_id && key.as_ref() == next_key.as_ref()
-        ));
+        operation
+    }
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![],
-            next_start_after: None,
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Write { txn_id: Some(write_txn), .. })]
-                if *write_txn == txn_id
-        ));
+    fn reference_rows(connector_id: Ulid, next: Option<Key>) -> Event {
+        let version_key = VersionKey::new("bucket", "key", Ulid::nil());
+        Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                connector_reference_key(connector_id, &version_key).unwrap(),
+                Vec::new().into(),
+            )],
+            next_start_after: next,
+        })
+    }
+
+    fn version_read(version: Option<BlobVersion>) -> Event {
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(
+                vec![1].into(),
+                version.map(|version| version.to_bytes().unwrap().into()),
+            )],
+        })
+    }
+
+    fn pruned() -> Event {
+        Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        })
     }
 
     #[test]
-    fn later_page_aborts() {
+    fn reference_aborts_replace() {
         let connector_id = Ulid::from_bytes([2u8; 16]);
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let next_key: Key = vec![9u8].into();
-        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id,
-            name: "new".to_string(),
-            kind: SourceConnectorKind::Webdav,
-            public_config: HashMap::new(),
-            secret_config: HashMap::new(),
-        });
-        operation.state = ReplaceSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
+        let mut operation = scanning(connector_id, txn_id);
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![],
-            next_start_after: Some(next_key.clone()),
-        }));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(key)),
-                ..
-            })] if key.as_ref() == next_key.as_ref()
+            operation.step(reference_rows(connector_id, None)).as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { txn_id: Some(read_txn), .. })]
+                if *read_txn == txn_id
         ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                vec![1].into(),
-                reference_blob_version(connector_id)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            )],
-            next_start_after: None,
-        }));
+        let effects = operation.step(version_read(Some(reference_blob_version(connector_id))));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
@@ -769,19 +758,52 @@ mod tests {
         );
     }
 
+    // A stale page with more rows behind it commits its pruning and the queued background work,
+    // then asks the caller to retry instead of scanning on.
+    #[test]
+    fn pending_defers_check() {
+        let connector_id = Ulid::from_bytes([2u8; 16]);
+        let txn_id = Ulid::from_bytes([3u8; 16]);
+        let mut operation = scanning(connector_id, txn_id);
+
+        operation.step(reference_rows(connector_id, Some(vec![9u8].into())));
+        assert!(matches!(
+            operation.step(version_read(None)).as_slice(),
+            [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })]
+                if deletes[0].0 == CONNECTOR_REFERENCE_KEYSPACE
+        ));
+        assert!(matches!(
+            operation.step(pruned()).as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == CONNECTOR_PRUNE_KEYSPACE
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![].into(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
+                if *commit_txn == txn_id
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
+        operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
+            key: aruna_core::task::TaskKey::PruneConnectorReferences,
+            after: std::time::Duration::ZERO,
+        }));
+
+        assert_eq!(
+            operation.finalize(),
+            Err(ReplaceSourceError::ReferencesPending)
+        );
+    }
+
     #[test]
     fn scan_failure_aborts() {
         let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id: Ulid::from_bytes([2u8; 16]),
-            name: "new".to_string(),
-            kind: SourceConnectorKind::Webdav,
-            public_config: HashMap::new(),
-            secret_config: HashMap::new(),
-        });
-        operation.state = ReplaceSourceState::ScanReferenceVersions;
-        operation.txn_id = Some(txn_id);
+        let mut operation = scanning(Ulid::from_bytes([2u8; 16]), txn_id);
 
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
             key: vec![].into(),
@@ -793,12 +815,10 @@ mod tests {
         ));
 
         operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-        assert_eq!(
+        assert!(matches!(
             operation.finalize(),
-            Err(ReplaceSourceError::StorageError(StorageError::ReadError(
-                "unexpected event".to_string()
-            )))
-        );
+            Err(ReplaceSourceError::StorageError(StorageError::ReadError(_)))
+        ));
     }
 
     #[test]
@@ -1008,7 +1028,10 @@ mod tests {
         assert_eq!(replaced.connector.name, "new");
 
         let access = drive(
-            ResolveBindingOperation::new(ResolveBindingInput { source }),
+            ResolveBindingOperation::new(ResolveBindingInput {
+                source,
+                group_id: None,
+            }),
             &context,
         )
         .await

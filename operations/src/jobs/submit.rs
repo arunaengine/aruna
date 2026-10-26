@@ -11,8 +11,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    ACTIVE_USER_KEYSPACE, BACKEND_IMPORT_KEYSPACE, DEDUP_INDEX_KEYSPACE, JOB_KEYSPACE,
-    ROCRATE_UPLOAD_KEYSPACE,
+    ACTIVE_USER_KEYSPACE, BACKEND_IMPORT_KEYSPACE, DEDUP_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE,
+    JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
@@ -20,6 +20,8 @@ use aruna_core::structs::execution::job::{
     RoCrateUploadRecord, WorkspaceMode, job_active_prefix, job_record_key, parse_dedup_value,
 };
 use aruna_core::structs::storage::backend_import::{BackendImport, import_key};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structured_id::{
     BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredIdGenerator,
 };
@@ -117,6 +119,8 @@ pub enum SubmitJobError {
     ImportRunning,
     #[error("unexpected event while submitting job: {0}")]
     UnexpectedEvent(String),
+    #[error("a key range of distributed bucket {0} is moving away from this node; retry later")]
+    RangeMoving(ulid::Ulid),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,6 +151,15 @@ enum SubmitState {
     CheckImportRun {
         txn_id: TxnId,
     },
+    /// Reads the destination of a staging job, then the record of its distributed set.
+    ReadBucket {
+        txn_id: TxnId,
+    },
+    ReadRecord {
+        txn_id: TxnId,
+        set_id: ulid::Ulid,
+        member_id: ulid::Ulid,
+    },
     WriteJob {
         txn_id: Option<TxnId>,
     },
@@ -172,6 +185,7 @@ pub struct SubmitJobOperation {
     import_rule: Option<BackendImport>,
     /// The rule of a backend import run with this job as its last run, written with the job.
     import_claim: Option<(String, Key, Value)>,
+    staging_checked: bool,
     active_cap: Option<u32>,
     state: SubmitState,
     output: Option<Result<SubmitJobResult, SubmitJobError>>,
@@ -214,6 +228,7 @@ impl SubmitJobOperation {
             import_checked: false,
             import_rule: None,
             import_claim: None,
+            staging_checked: false,
             active_cap,
             state: SubmitState::Init,
             output: None,
@@ -229,6 +244,8 @@ impl SubmitJobOperation {
             | SubmitState::ClaimUpload { txn_id }
             | SubmitState::ReadImport { txn_id }
             | SubmitState::CheckImportRun { txn_id }
+            | SubmitState::ReadBucket { txn_id }
+            | SubmitState::ReadRecord { txn_id, .. }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
             SubmitState::WriteJob { txn_id } => txn_id,
             _ => None,
@@ -247,6 +264,7 @@ impl SubmitJobOperation {
         self.import_checked = false;
         self.import_rule = None;
         self.import_claim = None;
+        self.staging_checked = false;
         self.state = SubmitState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
@@ -356,6 +374,21 @@ impl SubmitJobOperation {
                 txn_id: Some(txn_id),
             })];
         }
+        // A staging job waits while a range of its distributed destination moves away.
+        if !self.staging_checked
+            && let JobPayload::Staging(spec) = &self.record.payload
+        {
+            let Some(txn_id) = txn_id else {
+                return self.start_transaction();
+            };
+            let key = spec.bucket.as_bytes().into();
+            self.state = SubmitState::ReadBucket { txn_id };
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key,
+                txn_id: Some(txn_id),
+            })];
+        }
         let mut writes = match job_insert_entries(&self.record) {
             Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
@@ -450,6 +483,48 @@ impl SubmitJobOperation {
             }
             Err(error) => self.fail(error.into()),
         }
+    }
+
+    /// A destination that is gone or not distributed needs no record.
+    fn bucket_read(&mut self, txn_id: TxnId, value: Option<&[u8]>) -> Effects {
+        let binding = match value.map(BucketInfo::from_bytes).transpose() {
+            Ok(bucket) => bucket.and_then(|bucket| bucket.distribution),
+            Err(error) => return self.fail(error.into()),
+        };
+        let Some(binding) = binding else {
+            self.staging_checked = true;
+            return self.write_job(Some(txn_id));
+        };
+        self.state = SubmitState::ReadRecord {
+            txn_id,
+            set_id: binding.set_id,
+            member_id: binding.member_id,
+        };
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: DISTRIBUTION_KEYSPACE.to_string(),
+            key: binding.set_id.to_bytes().to_vec().into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// Refuses the job while the record lists a transfer away from this member: the transfer
+    /// hands over only jobs admitted before it opened.
+    fn record_read(
+        &mut self,
+        txn_id: TxnId,
+        (set_id, member_id): (ulid::Ulid, ulid::Ulid),
+        value: Option<&[u8]>,
+    ) -> Effects {
+        let view = match value.map(DistributionView::from_bytes).transpose() {
+            Ok(view) => view,
+            Err(error) => return self.fail(error.into()),
+        };
+        let transfers = (view.as_ref()).map(|view| &view.snapshot().lifecycle.transfers);
+        if transfers.is_some_and(|open| open.iter().any(|transfer| transfer.from == member_id)) {
+            return self.fail(SubmitJobError::RangeMoving(set_id));
+        }
+        self.staging_checked = true;
+        self.write_job(Some(txn_id))
     }
 
     fn schedule_drain(&mut self) -> Effects {
@@ -618,6 +693,24 @@ impl Operation for SubmitJobOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
             },
+            SubmitState::ReadBucket { txn_id } => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.bucket_read(txn_id, value.as_deref())
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
+            SubmitState::ReadRecord {
+                txn_id,
+                set_id,
+                member_id,
+            } => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.record_read(txn_id, (set_id, member_id), value.as_deref())
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
             SubmitState::WriteJob { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => match txn_id {
                     Some(txn_id) => {
@@ -673,6 +766,8 @@ impl Operation for SubmitJobOperation {
             | SubmitState::ClaimUpload { txn_id }
             | SubmitState::ReadImport { txn_id }
             | SubmitState::CheckImportRun { txn_id }
+            | SubmitState::ReadBucket { txn_id }
+            | SubmitState::ReadRecord { txn_id, .. }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
             SubmitState::WriteJob { txn_id } => txn_id,
             _ => None,

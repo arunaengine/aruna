@@ -9,7 +9,7 @@ use crate::metadata::{
     MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, commit_message,
     crate_entities, ensure_readable_files, forwarded_auth_token, local_write_record, map_api_error,
     map_write_error, parse_document_id, run_create_metadata, run_document_list,
-    serialize_jsonld_object,
+    serialize_jsonld_object, with_global_ids,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -177,7 +177,7 @@ pub async fn create_metadata_document(
             request.path,
             request.public,
             CreateDocumentPayload::RoCrate {
-                jsonld: serialize_jsonld_object(&request.rocrate)?,
+                jsonld: serialize_jsonld_object(&with_global_ids(&state, &request.rocrate).await?)?,
             },
         ),
     };

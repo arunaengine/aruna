@@ -8,6 +8,10 @@ use crate::blob::records::{
     delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,
     write_version_effect,
 };
+use crate::distribution::guard::{GuardError, authority_read, record_epoch};
+use crate::distribution::inventory::{
+    AddedVersion, InventoryChange, stamp_head, stamp_version, version_written,
+};
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
@@ -21,19 +25,22 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE,
-    DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE,
+    DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CopyOwner, CurrentVersionPointer, VersionKey, incarnation,
+    BucketInfo, CopyOwner, CurrentVersionPointer, VersionKey, incarnation,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::delete_audit::{
     BlobAuditKind, BlobAuditRecord, delete_audit_key, trail_key,
 };
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::inventory::VersionEntry;
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::usage::UsageDelta;
@@ -52,6 +59,12 @@ pub enum DeleteObjectState {
     Init,
     StartTransaction,
     CheckPurgeFence,
+    /// Reads the bucket record for the set hint a new delete marker carries.
+    ReadBucketBinding,
+    /// Reads a distributed bucket's record: only the key's coordinator adds a delete marker.
+    ReadRecord,
+    /// Reads the bucket record before a single version is deleted.
+    ReadVersionBucket,
     ReadTargetVersion,
     ReadTargetLocation,
     ReadAllVersions,
@@ -145,6 +158,12 @@ pub enum DeleteObjectError {
     ManagedCopyError(#[from] ManagedCopyError),
     #[error(transparent)]
     PurgeFence(#[from] PurgeFenceError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
+    #[error(
+        "single versions of a distributed bucket cannot be deleted; delete the key for a delete marker"
+    )]
+    DistributedVersion,
     #[error("DeleteObject failed")]
     DeleteObjectFailed,
     #[error("The version changed since it was read.")]
@@ -209,6 +228,16 @@ pub struct DeleteObjectOperation {
     /// The bucket incarnation the delete is made in, read in its transaction for the trail.
     incarnation: Option<u128>,
     row_fence: Option<RowFence>,
+    /// The set hint of a distributed bucket; ordinary buckets mint plain ULIDs.
+    set_hint: Option<SetHint>,
+    /// The bucket's distribution binding, read with the marker write for its inventory.
+    binding: Option<DistributionBinding>,
+    /// The marker's head and version epoch, for the inventory.
+    marker_head: Option<CurrentVersionPointer>,
+    marker_epoch: OriginalEpoch,
+    /// The member binding a set deletion or range reclaim purges under; only then may a
+    /// version of a distributed bucket be deleted.
+    purge: Option<DistributionBinding>,
 }
 
 impl DeleteObjectOperation {
@@ -244,7 +273,19 @@ impl DeleteObjectOperation {
             expected_head: None,
             incarnation: None,
             row_fence: None,
+            set_hint: None,
+            binding: None,
+            marker_head: None,
+            marker_epoch: OriginalEpoch::default(),
+            purge: None,
         }
+    }
+
+    /// Lets a purge delete a version of the member bucket bound by `binding`; the bucket is
+    /// read in the delete transaction and must still carry that set, member and incarnation.
+    pub fn purging(mut self, binding: DistributionBinding) -> Self {
+        self.purge = Some(binding);
+        self
     }
 
     /// Writes the delete marker only while `version_id` is the head, read in its transaction.
@@ -352,8 +393,13 @@ impl DeleteObjectOperation {
         };
 
         self.txn_id = Some(txn_id);
-        if let Some(version_id) = self.input.version_id {
-            self.read_target_version(version_id)
+        if self.input.version_id.is_some() {
+            self.state = DeleteObjectState::ReadVersionBucket;
+            smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: self.input.bucket.as_bytes().into(),
+                txn_id: self.txn_id,
+            })]
         } else {
             self.state = DeleteObjectState::CheckPurgeFence;
             smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
@@ -362,8 +408,79 @@ impl DeleteObjectOperation {
 
     fn fence_checked(&mut self, event: Event) -> Effects {
         match check_write_fence(event, &self.input.bucket, &self.input.key) {
-            Ok(()) => self.write_tombstone(),
+            Ok(()) => {
+                self.state = DeleteObjectState::ReadBucketBinding;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: S3_BUCKET_KEYSPACE.to_string(),
+                    key: self.input.bucket.as_bytes().into(),
+                    txn_id: self.txn_id,
+                })]
+            }
             Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn binding_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let bucket = match value
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(bucket) => bucket,
+            Err(error) => return self.emit_error(error.into()),
+        };
+        self.binding = bucket.and_then(|bucket| bucket.distribution);
+        self.set_hint = self.binding.as_ref().map(DistributionBinding::hint);
+        match self.binding.as_ref() {
+            Some(binding) => {
+                // Read in the marker transaction, so a fence or record set meanwhile conflicts.
+                self.state = DeleteObjectState::ReadRecord;
+                smallvec![authority_read(binding.set_id, self.txn_id)]
+            }
+            None => self.write_tombstone(),
+        }
+    }
+
+    fn record_checked(&mut self, event: Event) -> Effects {
+        let Some(binding) = self.binding.as_ref() else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        match record_epoch(binding, &self.input.key, event) {
+            Ok(epoch) => {
+                self.marker_epoch = epoch;
+                self.write_tombstone()
+            }
+            Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    /// A single version may hold the current head on one member only, so a distributed
+    /// bucket refuses to delete it.
+    fn version_bucket_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let binding = match value
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(bucket) => bucket.and_then(|bucket| bucket.distribution),
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let purged = match (&binding, &self.purge) {
+            (Some(bound), Some(purge)) => same_member(bound, purge),
+            _ => false,
+        };
+        if self.purge.is_some() && !purged {
+            // The member bucket the purge was for is gone or replaced; nothing is deleted.
+            return self.emit_error(DeleteObjectError::NoSuchVersion);
+        }
+        match (binding.is_some() && !purged, self.input.version_id) {
+            (true, _) => self.emit_error(DeleteObjectError::DistributedVersion),
+            (false, Some(version_id)) => self.read_target_version(version_id),
+            (false, None) => self.emit_error(DeleteObjectError::InvalidOperationState),
         }
     }
 
@@ -443,6 +560,13 @@ impl DeleteObjectOperation {
     }
 
     fn read_all_versions(&mut self) -> Effects {
+        // A purge removes the whole key, so its head needs no older replacement.
+        if self.purge.is_some() {
+            let Some(version_id) = self.input.version_id else {
+                return self.emit_error(DeleteObjectError::InvalidOperationState);
+            };
+            return self.read_current_lookup(version_id);
+        }
         self.state = DeleteObjectState::ReadAllVersions;
         let prefix = match VersionKey::object_prefix(&self.input.bucket, &self.input.key) {
             Ok(prefix) => prefix.into(),
@@ -895,7 +1019,8 @@ impl DeleteObjectOperation {
             (Some(_), None) => RowChange::Kept,
         };
         let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta)
-            .in_bucket(&self.input.bucket, row);
+            .in_bucket(&self.input.bucket, row)
+            .with_inventory(self.marker_inventory());
         if update.is_noop() {
             return self.write_delete_audit();
         }
@@ -903,6 +1028,30 @@ impl DeleteObjectOperation {
         let effects = update.start(txn_id);
         self.usage_update = Some(update);
         effects
+    }
+
+    /// A delete marker of a distributed bucket becomes a version row and the key's head.
+    fn marker_inventory(&self) -> Option<InventoryChange> {
+        let (None, Some(version_id), Some(head)) = (
+            self.input.version_id,
+            self.version_id,
+            self.marker_head.as_ref(),
+        ) else {
+            return None;
+        };
+        let added = AddedVersion {
+            version_id,
+            epoch: self.marker_epoch,
+            generation: head.generation,
+            entry: VersionEntry {
+                marker: true,
+                size: 0,
+                referenced: false,
+                identity: None,
+                pending: false,
+            },
+        };
+        version_written(self.binding.as_ref(), &self.input.key, added, true)
     }
 
     fn handle_usage_update(&mut self, event: Event) -> Effects {
@@ -1043,7 +1192,7 @@ impl DeleteObjectOperation {
     }
 
     fn write_tombstone(&mut self) -> Effects {
-        let version_id = Ulid::generate();
+        let version_id = mint_version(self.set_hint);
         self.version_id = Some(version_id);
         self.deleted_version_created = Some(SystemTime::now());
         self.read_current_lookup(version_id)
@@ -1055,7 +1204,11 @@ impl DeleteObjectOperation {
         existing: Option<&CurrentVersionPointer>,
     ) -> Effects {
         match CurrentVersionPointer::next_for(existing, version_id) {
-            Ok(pointer) => self.pending_new_pointer = Some(pointer),
+            Ok(pointer) => {
+                let pointer = stamp_head(pointer, self.binding.as_ref(), self.marker_epoch);
+                self.marker_head = Some(pointer.clone());
+                self.pending_new_pointer = Some(pointer);
+            }
             Err(err) => return self.emit_error(err.into()),
         }
         self.prepare_head_transition(HeadTransitionContinuation::WriteDeletedVersion)
@@ -1071,6 +1224,14 @@ impl DeleteObjectOperation {
             .to_owned();
         let mut version = BlobVersion::deleted(created_at, self.input.deleted_by);
         version.metadata = self.metadata.clone();
+        let generation = self.marker_head.as_ref().map_or(0, |head| head.generation);
+        let version = stamp_version(
+            version,
+            self.binding.as_ref(),
+            generation,
+            self.marker_epoch,
+        );
+        self.marker_epoch = version.original_epoch;
         let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
@@ -1172,6 +1333,9 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::Init => self.handle_init(),
             DeleteObjectState::StartTransaction => self.handle_transaction_started(event),
             DeleteObjectState::CheckPurgeFence => self.fence_checked(event),
+            DeleteObjectState::ReadBucketBinding => self.binding_read(event),
+            DeleteObjectState::ReadRecord => self.record_checked(event),
+            DeleteObjectState::ReadVersionBucket => self.version_bucket_read(event),
             DeleteObjectState::ReadTargetVersion => self.target_version_read(event),
             DeleteObjectState::ReadTargetLocation => self.target_location_read(event),
             DeleteObjectState::ReadAllVersions => self.versions_read(event),
@@ -1224,6 +1388,12 @@ impl Operation for DeleteObjectOperation {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             })
     }
+}
+
+/// Whether two bindings name the same member bucket: set, member and incarnation.
+fn same_member(left: &DistributionBinding, right: &DistributionBinding) -> bool {
+    (left.set_id, left.member_id, left.incarnation)
+        == (right.set_id, right.member_id, right.incarnation)
 }
 
 #[cfg(test)]

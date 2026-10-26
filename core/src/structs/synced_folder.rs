@@ -591,14 +591,41 @@ pub struct SyncPull {
 impl SyncPull {
     /// Key of the receipt a realm node keeps once this device version committed.
     pub fn receipt_key(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&(
-            &self.target_bucket,
-            &self.target_key,
-            self.source.node_id.as_bytes(),
+        receipt_key_of(
+            (&self.target_bucket, &self.target_key),
+            &self.source.node_id,
             self.source.version,
             self.deleted,
-        ))?)
+        )
     }
+}
+
+/// Key of the receipt of one device version committed as `bucket`/`key`.
+fn receipt_key_of(
+    (bucket, key): (&str, &str),
+    device: &NodeId,
+    version: Ulid,
+    deleted: bool,
+) -> Result<Vec<u8>, ConversionError> {
+    Ok(postcard::to_allocvec(&(
+        bucket,
+        key,
+        device.as_bytes(),
+        version,
+        deleted,
+    ))?)
+}
+
+/// The receipt key a pulled version or marker names in its tags, so a member that receives it
+/// answers a replayed pull too; `None` for a version no pull wrote.
+pub fn tagged_receipt(
+    (bucket, key): (&str, &str),
+    metadata: &std::collections::HashMap<String, String>,
+    deleted: bool,
+) -> Option<Vec<u8>> {
+    let version = Ulid::from_string(metadata.get(SYNC_VERSION_TAG)?).ok()?;
+    let device: NodeId = metadata.get(ORIGIN_DEVICE_TAG)?.parse().ok()?;
+    receipt_key_of((bucket, key), &device, version, deleted).ok()
 }
 
 /// The local file one realm version this device published came from. Device-local only: the
@@ -637,6 +664,9 @@ pub enum SyncRefusal {
     NotFound,
     Invalid(String),
     Unavailable,
+    /// The target key belongs to a range of a distributed bucket that this node does not
+    /// coordinate; the named coordinator node takes the pull.
+    Coordinator(crate::NodeId),
 }
 
 /// Where a realm node stands with one sync pull. A pull is accepted at once and polled until
@@ -748,6 +778,39 @@ impl TryFrom<usize> for SyncPageLimit {
 mod tests {
     use super::*;
     use crate::structs::identity::realm::RealmId;
+
+    // A member reads the receipt of a pulled version from its tags, as the coordinator keyed it.
+    #[test]
+    fn tags_name_receipt() {
+        let device = iroh::SecretKey::from_bytes(&[9; 32]).public();
+        let source = VersionedObjectArn::new(
+            RealmId::from_bytes([4; 32]),
+            device,
+            "folder".to_string(),
+            "note.txt".to_string(),
+            Ulid::from_bytes([2; 16]),
+        )
+        .unwrap();
+        let pull = |deleted| SyncPull {
+            source: source.clone(),
+            blake3: None,
+            size: 4,
+            target_bucket: "lab".to_string(),
+            target_key: "a/note.txt".to_string(),
+            deleted,
+        };
+        let tags = std::collections::HashMap::from([
+            (SYNC_VERSION_TAG.to_string(), source.version.to_string()),
+            (ORIGIN_DEVICE_TAG.to_string(), device.to_string()),
+        ]);
+        let target = ("lab", "a/note.txt");
+        for deleted in [false, true] {
+            let expected = pull(deleted).receipt_key().unwrap();
+            assert_eq!(tagged_receipt(target, &tags, deleted), Some(expected));
+        }
+        let untagged = std::collections::HashMap::new();
+        assert_eq!(tagged_receipt(target, &untagged, false), None);
+    }
 
     fn base(fingerprint: &str, hash: u8, remote: Option<Ulid>) -> SyncBase {
         SyncBase {

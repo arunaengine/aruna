@@ -10,16 +10,20 @@ use aruna_core::NodeId;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
 use aruna_core::document::DocumentTarget;
 use aruna_core::federation::FederationSettings;
-use aruna_core::git::GitRecord;
+use aruna_core::git::{GitRecord, LOCAL_OBJECTS, StoredObject};
 use aruna_core::keyspaces::{
-    APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
-    DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
-    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_STATE_KEY,
-    NODE_STATE_KEYSPACE, NODE_VAULT_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BROKEN_VERSION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
+    COPY_WAIT_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
+    FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE,
+    JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
+    NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
-    SESSION_OWNER_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE, USER_SESSION_KEYSPACE,
+    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE,
+    USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -29,15 +33,26 @@ use aruna_core::structs::execution::job::{
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
+use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::identity::database::DatabaseEntry;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
-use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo};
+use aruna_core::structs::placement::policy::attachment::{
+    BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyIntent, PolicyMutationRecord,
+};
+use aruna_core::structs::storage::blob::{BlobVersion, BucketInfo, CurrentVersionPointer};
+use aruna_core::structs::storage::broken::BrokenVersion;
+use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
+use aruna_operations::replication::queue::LiveObligationRecord;
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
+use layouts::{CONNECTOR, HEAD, NODE_INFO, OBLIGATION, padded};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use session_refs::Layout;
 use std::collections::BTreeMap;
 use std::path::Path;
 use ulid::Ulid;
@@ -46,10 +61,14 @@ mod buckets;
 mod git;
 mod info_topics;
 mod jobs;
+mod layouts;
 mod mappings;
+mod removals;
 mod session_refs;
 mod sessions;
 mod sizes;
+mod staging;
+mod sync_ops;
 mod uploads;
 mod user_sessions;
 mod vault;
@@ -94,10 +113,13 @@ pub struct MigrateOutput {
     /// Checkpoints of RO-Crate import and export jobs.
     pub checkpoints_scanned: usize,
     pub checkpoints_rewritten: usize,
-    /// Git records from before packs moved into Fjall, stored and queued for publishing.
+    /// Git records from before packs moved into Fjall or objects named a global id, stored and
+    /// queued for publishing.
     pub git_records_scanned: usize,
     pub git_records_rewritten: usize,
     pub git_outbox_rewritten: usize,
+    /// Queued realm config node removals of this node from before the publisher cutoffs.
+    pub outbox_removals_rewritten: usize,
     /// Size rows written for logged metadata events that had none.
     pub event_sizes_written: usize,
     /// S3 sessions in an older format are deleted; their holders mint new ones.
@@ -109,10 +131,13 @@ pub struct MigrateOutput {
     pub upload_parts_deleted: usize,
     /// Stored blobs of deleted parts, queued for the cleanup drain.
     pub upload_blobs_queued: usize,
-    /// Blob versions from before materialized versions named their encoding class.
+    /// Blob versions from before materialized versions named their encoding class, or before
+    /// versions carried their distributed bucket fields and source digests.
     pub versions_scanned: usize,
     pub versions_rewritten: usize,
-    /// Bucket records from before buckets carried a compression setting.
+    /// Index rows written for reference versions bound to a connector that had none.
+    pub connector_references_written: usize,
+    /// Bucket records from before buckets carried a compression setting or a distribution.
     pub buckets_scanned: usize,
     pub buckets_rewritten: usize,
     /// Ops of the former node info topics, which held a heartbeat every minute.
@@ -125,6 +150,25 @@ pub struct MigrateOutput {
     /// Login sessions from before a session named the linked login it came through.
     pub user_sessions_scanned: usize,
     pub user_sessions_rewritten: usize,
+    /// Finished staging checkpoints from before the directory queue; unfinished ones are
+    /// deleted, so their job walks its source again, and count as `staging_job_state` below.
+    pub staging_checkpoints_rewritten: usize,
+    /// Rows rewritten by keyspace whose shape gained trailing fields with distributed buckets,
+    /// or that moved with their replication job.
+    pub relaid_rows: BTreeMap<&'static str, usize>,
+    /// Rows deleted by keyspace: refresh jobs and IRI index rows in a replaced key layout,
+    /// replication jobs moved to their new key with their key waits and plaintext requests,
+    /// and unfinished staging checkpoints.
+    pub stale_rows_deleted: BTreeMap<&'static str, usize>,
+}
+
+/// Non-zero counts by keyspace; a keyspace listed twice adds up.
+fn counts(rows: impl Iterator<Item = (&'static str, usize)>) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    for (name, count) in rows.filter(|(_, count)| *count > 0) {
+        *counts.entry(name).or_default() += count;
+    }
+    counts
 }
 
 pub async fn migrate(database_path: String, sync_path: Option<String>) -> Result<(), CliError> {
@@ -179,7 +223,28 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let usage_rows = db.keyspace(QUARANTINE_USAGE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let login_rows = db.keyspace(USER_SESSION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let dedup_rows = db.keyspace(DEDUP_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let head_rows = db.keyspace(BLOB_HEAD_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let mutation_rows = db.keyspace(POLICY_MUTATION_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let intent_rows = db.keyspace(BULK_INTENT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let node_rows = db.keyspace(NODE_INFO_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let connector_rows = db.keyspace(SOURCE_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let obligation_rows = db.keyspace(
+        REPLICATION_OBLIGATION_KEYSPACE,
+        KeyspaceCreateOptions::default,
+    )?;
+    let broken_rows = db.keyspace(BROKEN_VERSION_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let replication_rows = db.keyspace(REPLICATION_JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let refresh_rows = db.keyspace(REFRESH_JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let wait_rows = db.keyspace(COPY_WAIT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let consent_rows = db.keyspace(PLAINTEXT_COPY_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let iri_rows = db.keyspace(IRI_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let stats_rows = db.keyspace(USAGE_STATS_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let staging_rows = db.keyspace(STAGING_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let object_rows = db.keyspace(LOCAL_OBJECTS, KeyspaceCreateOptions::default)?;
+    let reference_rows =
+        db.keyspace(CONNECTOR_REFERENCE_KEYSPACE, KeyspaceCreateOptions::default)?;
 
+    sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
     let pending =
@@ -198,18 +263,24 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         SYNC_OUTBOX_KEYSPACE,
         (mapping, rewritten::<PersistentIdMapping, LegacyMapping>),
     )?;
-    let git_records =
-        rewrites::<GitRecord, git::LegacyRecord>(&db, &git_rows, GIT_RECORD_KEYSPACE)?;
+    let removals = removals::removal_rows(&db, &outbox_rows, SYNC_OUTBOX_KEYSPACE)?;
+    let git_records = rewrite_rows(&db, &git_rows, GIT_RECORD_KEYSPACE, git_record)?;
     let sizes = sizes::missing_sizes(&db, &event_rows, &size_rows)?;
     let stale = sessions::stale_sessions(&db, &session_rows, &expiry_rows, &owner_rows)?;
     let old_uploads = uploads::stale_uploads(&db, &upload_rows, &part_rows)?;
-    let versions = rewrites::<BlobVersion, versions::LegacyVersion>(
+    let versions = rewrite_rows(&db, &version_rows, BLOB_VERSIONS_KEYSPACE, |value| {
+        relaid::<BlobVersion, versions::LegacyVersion>(value, versions::LAYOUT)
+    })?;
+    let references = versions::reference_rows(
         &db,
         &version_rows,
+        &versions.rows,
+        &reference_rows,
         BLOB_VERSIONS_KEYSPACE,
     )?;
-    let buckets =
-        rewrites::<BucketInfo, buckets::LegacyBucket>(&db, &bucket_rows, S3_BUCKET_KEYSPACE)?;
+    let buckets = rewrite_rows(&db, &bucket_rows, S3_BUCKET_KEYSPACE, |value| {
+        relaid::<BucketInfo, buckets::LegacyBucket>(value, buckets::LAYOUT)
+    })?;
     let info = info_topics::info_cleanup(
         &db,
         sync_path,
@@ -230,7 +301,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         &db,
         &outbox_rows,
         SYNC_OUTBOX_KEYSPACE,
-        (record, rewritten::<GitRecord, git::LegacyRecord>),
+        (record, git_record),
     )?;
     let index = mappings::index_rebuild(
         &db,
@@ -239,10 +310,66 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         &index_rows,
         ID_MAPPING_KEYSPACE,
     )?;
-    let jobs = jobs::job_rows(&db, &job_rows, JOB_KEYSPACE)?;
+    let identities = staging::identities(&db, &bucket_rows, &buckets.rows, S3_BUCKET_KEYSPACE)?;
+    let jobs = jobs::job_rows(&db, &job_rows, JOB_KEYSPACE, &identities)?;
     let dedup = jobs::dedup_rows(&db, &dedup_rows, &jobs.rows, DEDUP_INDEX_KEYSPACE)?;
     let kinds = jobs::checkpoint_kinds(&db, &job_rows, &jobs.rows, JOB_KEYSPACE)?;
     let checkpoints = jobs::checkpoint_rows(&db, &state_rows, &kinds, JOB_STATE_KEYSPACE)?;
+    let staged = staging::checkpoint_rows(&db, &staging_rows, STAGING_STATE_KEYSPACE)?;
+    let mut relaid_rows = vec![
+        padded::<CurrentVersionPointer>(&db, &head_rows, BLOB_HEAD_KEYSPACE, HEAD)?,
+        padded::<PolicyMutationRecord>(&db, &mutation_rows, POLICY_MUTATION_KEYSPACE, HEAD)?,
+        padded::<PolicyIntent>(&db, &intent_rows, BULK_INTENT_KEYSPACE, HEAD)?,
+        padded::<NodeInfoDocument>(&db, &node_rows, NODE_INFO_KEYSPACE, NODE_INFO)?,
+        padded::<SourceConnector>(&db, &connector_rows, SOURCE_INDEX_KEYSPACE, CONNECTOR)?,
+        padded::<LiveObligationRecord>(
+            &db,
+            &obligation_rows,
+            REPLICATION_OBLIGATION_KEYSPACE,
+            OBLIGATION,
+        )?,
+        padded::<BrokenVersion>(&db, &broken_rows, BROKEN_VERSION_KEYSPACE, versions::LAYOUT)?,
+        padded::<StoredObject>(&db, &object_rows, LOCAL_OBJECTS, git::LAYOUT)?,
+    ];
+    let (replication, renamed) =
+        layouts::replication_jobs(&db, &replication_rows, REPLICATION_JOB_KEYSPACE)?;
+    relaid_rows.push((
+        &replication_rows,
+        REPLICATION_JOB_KEYSPACE,
+        replication.rows,
+    ));
+    // Key waits and plaintext requests name their job by key, so they move in the same commit.
+    let waits = layouts::job_rows(&db, &wait_rows, layouts::WAITS, &renamed)?;
+    let consents = layouts::job_rows(&db, &consent_rows, layouts::CONSENTS, &renamed)?;
+    relaid_rows.push((&wait_rows, COPY_WAIT_KEYSPACE, waits.rows));
+    relaid_rows.push((&consent_rows, PLAINTEXT_COPY_KEYSPACE, consents.rows));
+    let announced = layouts::cleanup_rows(&db, &cleanup_rows)?.rows;
+    relaid_rows.push((&cleanup_rows, BLOB_CLEANUP_KEYSPACE, announced));
+    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 7] = [
+        (
+            &refresh_rows,
+            REFRESH_JOB_KEYSPACE,
+            layouts::old_refreshes(&db, &refresh_rows)?,
+        ),
+        (
+            &iri_rows,
+            IRI_INDEX_KEYSPACE,
+            layouts::old_iri_rows(&db, &iri_rows)?,
+        ),
+        (
+            &replication_rows,
+            REPLICATION_JOB_KEYSPACE,
+            replication.removed,
+        ),
+        (&staging_rows, STAGING_STATE_KEYSPACE, staged.restarted),
+        (&wait_rows, COPY_WAIT_KEYSPACE, waits.removed),
+        (&consent_rows, PLAINTEXT_COPY_KEYSPACE, consents.removed),
+        (
+            &stats_rows,
+            USAGE_STATS_KEYSPACE,
+            layouts::rebuild_progress(&db, &stats_rows)?,
+        ),
+    ];
     let keys = node_secret(&db)?.map(|secret| {
         (
             CredentialEncryptionKey::derive(&secret),
@@ -274,15 +401,18 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&mapping_rows, &mappings.rows),
         (&outbox_rows, &outbox.rows),
         (&outbox_rows, &git_outbox.rows),
+        (&outbox_rows, &removals.rows),
         (&git_rows, &git_records.rows),
         (&size_rows, &sizes.rows),
         (&version_rows, &versions.rows),
+        (&reference_rows, &references.rows),
         (&bucket_rows, &buckets.rows),
         (&login_rows, &logins.rows),
         (&index_rows, &index.writes),
         (&job_rows, &jobs.rows),
         (&dedup_rows, &dedup.rows),
         (&state_rows, &checkpoints.rows),
+        (&staging_rows, &staged.rewrites.rows),
         (&owner_rows, &stale.owner_writes),
         (&cleanup_rows, &old_uploads.blob_deletes),
     ]
@@ -293,7 +423,11 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             .map(|(keyspace, sealed)| (keyspace, &sealed.rows)),
     )
     .chain(moves.iter().map(|(_, moved)| (&vault_rows, &moved.rows)))
-    {
+    .chain(
+        relaid_rows
+            .iter()
+            .map(|(keyspace, _, rows)| (*keyspace, rows)),
+    ) {
         for (key, value) in rows {
             txn.insert(keyspace.clone(), key.clone(), value.clone());
         }
@@ -321,6 +455,11 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     for (keyspace, moved) in &moves {
         for key in &moved.removed {
             txn.remove(keyspace.clone(), key.clone());
+        }
+    }
+    for (keyspace, _, keys) in &stale_rows {
+        for key in keys {
+            txn.remove((*keyspace).clone(), key.clone());
         }
     }
     if let Some(usage) = &info.usage {
@@ -363,6 +502,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         git_records_scanned: git_records.scanned,
         git_records_rewritten: git_records.rows.len(),
         git_outbox_rewritten: git_outbox.rows.len(),
+        outbox_removals_rewritten: removals.rows.len(),
         event_sizes_written: sizes.rows.len(),
         sessions_scanned: stale.scanned,
         sessions_deleted: stale.sessions.len(),
@@ -372,6 +512,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         upload_blobs_queued: old_uploads.blob_deletes.len(),
         versions_scanned: versions.scanned,
         versions_rewritten: versions.rows.len(),
+        connector_references_written: references.rows.len(),
         buckets_scanned: buckets.scanned,
         buckets_rewritten: buckets.rows.len(),
         info_ops_deleted: info_ops,
@@ -380,6 +521,13 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         info_cursors_deleted: info.cursors.len() + fanout_cursors,
         user_sessions_scanned: logins.scanned,
         user_sessions_rewritten: logins.rows.len(),
+        staging_checkpoints_rewritten: staged.rewrites.rows.len(),
+        relaid_rows: counts(
+            relaid_rows
+                .iter()
+                .map(|(_, name, rows)| (*name, rows.len())),
+        ),
+        stale_rows_deleted: counts(stale_rows.iter().map(|(_, name, keys)| (*name, keys.len()))),
     })
 }
 
@@ -446,12 +594,22 @@ where
     Current: Serialize + for<'a> Deserialize<'a> + From<Legacy>,
     Legacy: for<'a> Deserialize<'a>,
 {
+    rewrite_rows(db, keyspace, name, rewritten::<Current, Legacy>)
+}
+
+/// Rows of one keyspace that `rewrite` re-encodes; a row it cannot read stops the migration.
+fn rewrite_rows(
+    db: &OptimisticTxDatabase,
+    keyspace: &OptimisticTxKeyspace,
+    name: &str,
+    rewrite: impl Fn(&[u8]) -> Result<Option<Vec<u8>>, postcard::Error>,
+) -> Result<Rewrites, ExplorerError> {
     let mut scanned = 0;
     let mut rows = Vec::new();
     for entry in db.read_tx().iter(keyspace) {
         let (key, value) = entry.into_inner()?;
         scanned += 1;
-        match rewritten::<Current, Legacy>(value.as_ref()) {
+        match rewrite(value.as_ref()) {
             Ok(Some(bytes)) => rows.push((key.to_vec(), bytes)),
             Ok(None) => {}
             Err(error) => return Err(decode_error(name, &key, error)),
@@ -460,9 +618,9 @@ where
     Ok(Rewrites { scanned, rows })
 }
 
-/// Realm configuration documents gained the catch-up wait, the session idle
-/// timeout, federation settings and portal features as their last values. Postcard is positional, so appending the
-/// defaults an older row lacks re-encodes it.
+/// Realm configuration documents gained the catch-up wait, the session idle timeout, federation
+/// settings, portal features and the database list as their last values. Postcard is positional,
+/// so appending the defaults an older row lacks re-encodes it.
 fn realm_configs(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
@@ -485,14 +643,16 @@ fn realm_configs(
 /// Appends the trailing defaults an older row lacks, shortest suffix first, so
 /// a row missing only the newest value keeps the one it already has.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
+    let databases = postcard::to_allocvec(&Vec::<DatabaseEntry>::new()).ok()?;
     let features = postcard::to_allocvec(&BTreeMap::<String, bool>::new()).ok()?;
     let federation = postcard::to_allocvec(&None::<FederationSettings>).ok()?;
     let idle = postcard::to_allocvec(&IDLE_AFTER_MS).ok()?;
     let catch_up = postcard::to_allocvec(&CATCH_UP_MS).ok()?;
-    let federation_on = [federation.as_slice(), &features].concat();
+    let features_on = [features.as_slice(), &databases].concat();
+    let federation_on = [federation.as_slice(), &features_on].concat();
     let idle_on = [idle.as_slice(), &federation_on].concat();
     let both = [catch_up.as_slice(), &idle_on].concat();
-    for suffix in [features, federation_on, idle_on, both] {
+    for suffix in [databases, features_on, federation_on, idle_on, both] {
         let mut bytes = value.to_vec();
         bytes.extend_from_slice(&suffix);
         if RealmConfigDocument::from_bytes(&bytes).is_ok() {
@@ -527,6 +687,28 @@ where
     }
     let legacy: Legacy = postcard::from_bytes(value)?;
     Ok(Some(postcard::to_allocvec(&Current::from(legacy))?))
+}
+
+/// Rewrites a row stored before the structs `layout` names gained their later fields, in the
+/// current or the `Legacy` shape. `None` means every byte reads as the current shape; maps
+/// re-encode in another order, so a round trip cannot tell.
+fn relaid<Current, Legacy>(value: &[u8], layout: Layout) -> Result<Option<Vec<u8>>, postcard::Error>
+where
+    Current: Serialize + DeserializeOwned + From<Legacy>,
+    Legacy: DeserializeOwned,
+{
+    if session_refs::decode::<Current>(value, &[]).is_ok() {
+        return Ok(None);
+    }
+    let current = match session_refs::decode::<Current>(value, layout) {
+        Ok(current) => current,
+        Err(_) => session_refs::decode::<Legacy>(value, layout)?.into(),
+    };
+    Ok(Some(postcard::to_allocvec(&current)?))
+}
+
+fn git_record(value: &[u8]) -> Result<Option<Vec<u8>>, postcard::Error> {
+    relaid::<GitRecord, git::LegacyRecord>(value, git::LAYOUT)
 }
 
 fn decode_error(name: &str, key: &[u8], error: impl std::fmt::Display) -> ExplorerError {
@@ -692,6 +874,7 @@ mod tests {
         ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
     };
+    use aruna_core::structs::identity::database::DatabaseEntry;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
@@ -752,6 +935,19 @@ mod tests {
             txn.insert(keyspace.clone(), key, value);
         }
         txn.commit().unwrap().unwrap();
+    }
+
+    /// `bytes` with every copy of `current` cut by its last `removed` bytes: a nested value in
+    /// a layout that lacked its trailing fields.
+    pub(super) fn strip(bytes: &[u8], current: &[u8], removed: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while let Some(at) = rest.windows(current.len()).position(|part| part == current) {
+            out.extend_from_slice(&rest[..at + current.len() - removed]);
+            rest = &rest[at + current.len()..];
+        }
+        out.extend_from_slice(rest);
+        out
     }
 
     pub(super) fn read(path: &Path, keyspace: &str) -> BTreeMap<Vec<u8>, Vec<u8>> {
@@ -862,8 +1058,8 @@ mod tests {
 
     #[test]
     fn rewrites_realm_configs() {
-        // Legacy documents decode with default timeouts, no federation settings and no portal
-        // features. Current documents remain byte-identical.
+        // Legacy documents decode with default timeouts, no federation settings, no portal
+        // features and no databases. Current documents remain byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
@@ -873,7 +1069,9 @@ mod tests {
         let federation = postcard::to_allocvec(&None::<super::FederationSettings>).unwrap();
         let idle = postcard::to_allocvec(&IDLE_AFTER_MS).unwrap();
         let catch_up = postcard::to_allocvec(&CATCH_UP_MS).unwrap();
-        let featureless = current[..current.len() - features.len()].to_vec();
+        let databases = postcard::to_allocvec(&Vec::<DatabaseEntry>::new()).unwrap();
+        let listless = current[..current.len() - databases.len()].to_vec();
+        let featureless = listless[..listless.len() - features.len()].to_vec();
         let unfederated = featureless[..featureless.len() - federation.len()].to_vec();
         let one_missing = unfederated[..unfederated.len() - idle.len()].to_vec();
         let both_missing = one_missing[..one_missing.len() - catch_up.len()].to_vec();
@@ -885,6 +1083,7 @@ mod tests {
                 (b"newer", one_missing),
                 (b"main", unfederated),
                 (b"prior", featureless),
+                (b"latest", listless),
                 (b"new", current.clone()),
             ],
         );
@@ -893,12 +1092,13 @@ mod tests {
 
         assert_eq!(
             (output.realm_configs_scanned, output.realm_configs_rewritten),
-            (5, 4)
+            (6, 5)
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
         assert_eq!(rows[b"main".as_slice()], current);
         assert_eq!(rows[b"prior".as_slice()], current);
+        assert_eq!(rows[b"latest".as_slice()], current);
         let migrated = RealmConfigDocument::from_bytes(&rows[b"old".as_slice()]).unwrap();
         assert_eq!(migrated.compute.catch_up_ms, CATCH_UP_MS);
         assert_eq!(migrated.compute.session_idle_ms, IDLE_AFTER_MS);

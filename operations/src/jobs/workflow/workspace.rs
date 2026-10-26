@@ -27,6 +27,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BucketInfo, CONTENT_TYPE_KEY, HashIndex, UserAccess, bucket_permission_path,
     ensure_confined_path, group_permission_path, key_content_type, object_permission_path,
 };
+use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::replication::{ReplicationFailure, VersionedObjectArn};
 use futures_util::StreamExt;
@@ -644,6 +645,37 @@ async fn local_copy_source(
     None
 }
 
+/// The set hints of this node's distributed destination buckets. A remote destination has
+/// no hint here, so a write of its reserved id into a distributed bucket is refused.
+async fn local_hints(
+    context: &DriverContext,
+    node_id: NodeId,
+    destinations: &[(NodeId, String, String)],
+) -> Result<BTreeMap<(NodeId, String), SetHint>, JobError> {
+    let mut hints = BTreeMap::new();
+    let local: BTreeSet<&String> = destinations
+        .iter()
+        .filter(|(node, ..)| *node == node_id)
+        .map(|(_, bucket, _)| bucket)
+        .collect();
+    for bucket in local {
+        match Box::pin(drive(GetBucketOperation::new(bucket.clone()), context)).await {
+            Ok(info) => {
+                if let Some(binding) = info.distribution {
+                    hints.insert((node_id, bucket.clone()), binding.hint());
+                }
+            }
+            Err(GetBucketError::NotFound) => {}
+            Err(error) => {
+                return Err(JobError::retryable(format!(
+                    "output bucket {bucket} could not be read: {error}"
+                )));
+            }
+        }
+    }
+    Ok(hints)
+}
+
 /// Export every declared file output under one write-ahead commit reservation, so
 /// an interrupted capture replays into the same versions instead of new ones.
 pub async fn capture_outputs(
@@ -668,11 +700,15 @@ pub async fn capture_outputs(
         .iter()
         .map(destination_of)
         .collect::<Result<_, _>>()?;
-    let control = reserve_output_commits(&context.storage_handle, record.job_id, &destinations)
-        .await
-        .map_err(|error| {
-            JobError::retryable(format!("output commit reservation failed: {error}"))
-        })?;
+    let hints = local_hints(context, node_id, &destinations).await?;
+    let control = reserve_output_commits(
+        &context.storage_handle,
+        record.job_id,
+        &destinations,
+        &hints,
+    )
+    .await
+    .map_err(|error| JobError::retryable(format!("output commit reservation failed: {error}")))?;
     if control.attempt_epoch != fence.attempt_epoch {
         return Err(JobError::retryable(
             "attempt fence moved during output capture",
@@ -973,7 +1009,12 @@ async fn put_file_output(
         routing,
     })
     .with_inherited_policies(inherited.to_vec())
-    .with_metadata(output_metadata(key));
+    .with_metadata(output_metadata(key))
+    .with_version_origin(Some(
+        aruna_core::structs::storage::origin::VersionOrigin::Job {
+            run_id: ulid::Ulid::from_bytes(record.job_id.to_bytes()),
+        },
+    ));
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
@@ -1057,6 +1098,7 @@ async fn ensure_output_stage(
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     match Box::pin(drive(
         CreateBucketOperation::new(bucket.to_string(), info),
@@ -1328,6 +1370,7 @@ async fn device_source(
         // owner-bound device read, which refuses governed content outright.
         destination: None,
         known_refs: Vec::new(),
+        range: None,
     };
     match managed_read(context, source, request).await {
         Ok(BaoReadOutput::Stream { blob, size, .. }) => Ok(StagedSource {
@@ -1923,8 +1966,8 @@ mod tests {
         let mut first = control(Vec::new());
         let mut second = control(Vec::new());
         second.execution_id = Ulid::from_bytes([10; 16]);
-        first.reserve_outputs(&destinations, Ulid::generate);
-        second.reserve_outputs(&destinations, Ulid::generate);
+        first.reserve_outputs(&destinations, |_| Ulid::generate());
+        second.reserve_outputs(&destinations, |_| Ulid::generate());
 
         let left = reserved_version(&first, node_id, "workspace", "reports/a.txt").unwrap();
         let right = reserved_version(&second, node_id, "workspace", "reports/a.txt").unwrap();

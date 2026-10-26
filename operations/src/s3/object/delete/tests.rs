@@ -312,6 +312,7 @@ fn reference_counts_content() {
                 version_selector: Some(format!("version:{version_id}")),
                 capabilities: Vec::new(),
                 origin_node_id: Some(iroh::SecretKey::from_bytes(&[4u8; 32]).public()),
+                namespace: None,
             },
             connector_id: None,
         },
@@ -321,6 +322,7 @@ fn reference_counts_content() {
             etag: None,
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         },
         SystemTime::UNIX_EPOCH,
         Default::default(),
@@ -511,6 +513,16 @@ fn delete_until_lookup(
     assert!(matches!(
         effects.as_slice(),
         [Effect::Storage(StorageEffect::Read { key_space, .. })]
+            if key_space == S3_BUCKET_KEYSPACE
+    ));
+    // An ordinary bucket goes on to the version.
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: None,
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })]
             if key_space == BLOB_VERSIONS_KEYSPACE
     ));
 
@@ -617,6 +629,70 @@ fn removes_final_pointer() {
         [Effect::Storage(StorageEffect::Delete { key_space, .. })]
             if key_space == BLOB_HEAD_KEYSPACE
     ));
+}
+
+#[test]
+fn purge_skips_history() {
+    // A purge reads the head directly instead of every version of the key.
+    let user_id = test_user_id();
+    let version_id = Ulid::from_bytes([1u8; 16]);
+    let binding = DistributionBinding {
+        set_id: Ulid::from_bytes([3u8; 16]),
+        member_id: Ulid::from_bytes([4u8; 16]),
+        incarnation: 5,
+        revision: Default::default(),
+    };
+    let mut op = DeleteObjectOperation::new(DeleteObjectInput {
+        bucket: "bucket".to_string(),
+        key: "key".to_string(),
+        version_id: Some(version_id),
+        group_id: Ulid::generate(),
+        realm_id: RealmId::from_bytes([1u8; 32]),
+        node_id: test_node_id(),
+        deleted_by: user_id,
+    })
+    .purging(binding.clone());
+    op.start();
+    op.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: Ulid::generate(),
+    }));
+    let info = BucketInfo {
+        group_id: Ulid::generate(),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Default::default(),
+        distribution: Some(binding),
+    };
+    op.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: Some(info.to_bytes().unwrap().into()),
+    }));
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![1u8].into(),
+        value: Some(deleted_version_value(user_id)),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })]
+            if key_space == BLOB_HEAD_KEYSPACE
+    ));
+    let pointer = CurrentVersionPointer::new_with_generation(version_id, 20);
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: vec![2u8].into(),
+        value: Some(pointer.to_bytes().unwrap().into()),
+    }));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
+                if key_space == BLOB_HEAD_KEYSPACE
+        ),
+        "the purged head is removed, not moved to an older version"
+    );
 }
 
 #[tokio::test]
@@ -1688,6 +1764,7 @@ async fn bucket_rows_sum() {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         drive(
             CreateBucketOperation::new(bucket.to_string(), info),
@@ -1778,4 +1855,150 @@ async fn bucket_rows_sum() {
         read_counters(&context, usage_group_key(group_id)).await,
         group
     );
+}
+
+#[test]
+fn marker_carries_hint() {
+    use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+    use aruna_core::structs::storage::format::Compression;
+
+    let marker = |binding: Option<DistributionBinding>, record: Option<Vec<u8>>| {
+        let mut operation = audit_op(None);
+        operation.state = DeleteObjectState::CheckPurgeFence;
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == S3_BUCKET_KEYSPACE
+        ));
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: test_user_id(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: binding,
+        };
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(info.to_bytes().unwrap().into()),
+        }));
+        if let Some(record) = record {
+            assert_eq!(operation.state, DeleteObjectState::ReadRecord);
+            let answer = crate::distribution::test_record::authority_rows(Some(record), None);
+            operation.step(answer);
+        }
+        assert_ne!(operation.state, DeleteObjectState::Error);
+        (
+            operation.version_id.expect("marker id minted"),
+            operation.set_hint,
+        )
+    };
+    let (snapshot, bytes) = crate::distribution::test_record::record(true);
+    let set_id = snapshot.set_id();
+    // "reports/a.csv" lies above "m", in the range member 2 coordinates.
+    let binding = crate::distribution::test_record::binding(&snapshot, 2, 5);
+    let (hinted, hint) = marker(Some(binding), Some(bytes));
+    assert_eq!(hint, Some(SetHint::of_set(set_id)));
+    assert_eq!(SetHint::of_version(hinted), SetHint::of_set(set_id));
+    assert_eq!(marker(None, None).1, None);
+}
+
+#[test]
+fn member_marker_refused() {
+    let (snapshot, bytes) = crate::distribution::test_record::record(true);
+    let mut operation = audit_op(None);
+    operation.binding = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
+    operation.state = DeleteObjectState::ReadRecord;
+    operation.step(crate::distribution::test_record::authority_rows(
+        Some(bytes),
+        None,
+    ));
+    assert!(matches!(
+        operation.finalize(),
+        Err(DeleteObjectError::Distribution(
+            crate::distribution::guard::GuardError::NotCoordinator { .. }
+        ))
+    ));
+}
+
+#[test]
+fn distributed_version_refused() {
+    use aruna_core::structs::storage::format::Compression;
+    let (snapshot, _) = crate::distribution::test_record::record(true);
+    let mut operation = audit_op(Some(Ulid::from_bytes([3u8; 16])));
+    operation.state = DeleteObjectState::StartTransaction;
+    let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: Ulid::from_bytes([4u8; 16]),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == S3_BUCKET_KEYSPACE
+    ));
+    let info = BucketInfo {
+        group_id: Ulid::from_bytes([2u8; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: test_user_id(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(crate::distribution::test_record::binding(&snapshot, 1, 5)),
+    };
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: Some(info.to_bytes().unwrap().into()),
+    }));
+    assert_eq!(
+        operation.finalize(),
+        Err(DeleteObjectError::DistributedVersion)
+    );
+}
+
+#[test]
+fn purge_bound_only() {
+    use aruna_core::structs::storage::format::Compression;
+    let (snapshot, _) = crate::distribution::test_record::record(true);
+    let bound = crate::distribution::test_record::binding(&snapshot, 1, 5);
+    let info = BucketInfo {
+        group_id: Ulid::from_bytes([2u8; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: test_user_id(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(bound.clone()),
+    };
+    let run = |purge: DistributionBinding| {
+        let mut operation = audit_op(Some(Ulid::from_bytes([3u8; 16]))).purging(purge);
+        operation.state = DeleteObjectState::StartTransaction;
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([4u8; 16]),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(info.to_bytes().unwrap().into()),
+        }));
+        (operation, effects)
+    };
+    // The purge of the bound member deletes the version like in an ordinary bucket.
+    let (operation, effects) = run(bound.clone());
+    assert_eq!(operation.state, DeleteObjectState::ReadTargetVersion);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BLOB_VERSIONS_KEYSPACE
+    ));
+    // A purge recorded for an earlier incarnation of the name deletes nothing.
+    let replaced = crate::distribution::test_record::binding(&snapshot, 1, 6);
+    let (operation, _) = run(replaced);
+    assert_eq!(operation.finalize(), Err(DeleteObjectError::NoSuchVersion));
 }

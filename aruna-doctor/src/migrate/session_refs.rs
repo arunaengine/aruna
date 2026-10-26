@@ -1,25 +1,34 @@
-//! Decodes stored values whose nested session references predate the display name or the
-//! linked login. The missing trailing fields decode as `None`; everything else is unchanged.
+//! Decodes stored values whose nested structs predate their later fields, as session references
+//! before the display name or the linked login. A missing field decodes as its zero value.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use serde::de::value::UnitDeserializer;
+use serde::de::value::{MapDeserializer, SeqDeserializer};
 use serde::de::{
     DeserializeOwned, DeserializeSeed, Deserializer, EnumAccess, MapAccess, SeqAccess,
     VariantAccess, Visitor,
 };
 use std::fmt;
+use std::marker::PhantomData;
 
 /// The serde name of `SessionRef`, whose older layouts lack trailing fields.
 const SESSION_REF: &str = "SessionRef";
 
-/// Decodes `bytes` as `T` with every session reference stored with only its first `fields`
-/// fields: 2 before the display name, 3 before the linked login. All bytes must be used.
-pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8], fields: usize) -> postcard::Result<T> {
+/// Stored field counts by serde struct name, or by the comma-joined field names of a struct
+/// variant, which has no serde name; a listed struct lacks its later fields.
+pub(super) type Layout = &'static [(&'static str, usize)];
+
+/// Session references before the linked login, and before the display name too.
+pub(super) const NO_LOGIN: Layout = &[(SESSION_REF, 3)];
+pub(super) const NO_NAME: Layout = &[(SESSION_REF, 2)];
+
+/// Decodes `bytes` as `T` with every struct `layout` names stored with only its first fields.
+/// All bytes must be used.
+pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8], layout: Layout) -> postcard::Result<T> {
     let mut inner = postcard::Deserializer::from_bytes(bytes);
     let value = T::deserialize(Legacy {
         inner: &mut inner,
-        fields,
+        layout,
     })?;
     if !inner.finalize()?.is_empty() {
         return Err(postcard::Error::DeserializeBadEncoding);
@@ -30,14 +39,14 @@ pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8], fields: usize) -> postca
 /// Forwards to `inner` and keeps the layout for every nested value.
 struct Legacy<D> {
     inner: D,
-    fields: usize,
+    layout: Layout,
 }
 
 macro_rules! forward {
     ($($method:ident($($arg:ident: $ty:ty),*)),* $(,)?) => {$(
         fn $method<V: Visitor<'de>>(self, $($arg: $ty,)* visitor: V) -> Result<V::Value, D::Error> {
-            let fields = self.fields;
-            self.inner.$method($($arg,)* Wrap { visitor, fields })
+            let layout = self.layout;
+            self.inner.$method($($arg,)* Wrap { visitor, layout })
         }
     )*};
 }
@@ -84,14 +93,16 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for Legacy<D> {
         names: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, D::Error> {
-        let fields = self.fields;
-        if name != SESSION_REF || fields >= names.len() {
+        let layout = self.layout;
+        let stored = layout.iter().find(|(known, _)| *known == name);
+        let Some(&(_, fields)) = stored.filter(|(_, fields)| *fields < names.len()) else {
             return self
                 .inner
-                .deserialize_struct(name, names, Wrap { visitor, fields });
-        }
+                .deserialize_struct(name, names, Wrap { visitor, layout });
+        };
         let padded = Padded {
             visitor,
+            layout,
             fields,
             total: names.len(),
         };
@@ -103,9 +114,10 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for Legacy<D> {
     }
 }
 
-/// Reads the stored fields of a session reference and fills the rest with `None`.
+/// Reads the stored fields of a struct and fills the rest with their zero values.
 struct Padded<V> {
     visitor: V,
+    layout: Layout,
     fields: usize,
     total: usize,
 }
@@ -120,6 +132,7 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Padded<V> {
     fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<V::Value, A::Error> {
         self.visitor.visit_seq(PaddedSeq {
             seq,
+            layout: self.layout,
             fields: self.fields,
             total: self.total,
             index: 0,
@@ -129,6 +142,7 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Padded<V> {
 
 struct PaddedSeq<A> {
     seq: A,
+    layout: Layout,
     fields: usize,
     total: usize,
     index: usize,
@@ -143,20 +157,64 @@ impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for PaddedSeq<A> {
     ) -> Result<Option<T::Value>, A::Error> {
         self.index += 1;
         if self.index <= self.fields {
-            let fields = self.fields;
-            return self.seq.next_element_seed(Seed { seed, fields });
+            let layout = self.layout;
+            return self.seq.next_element_seed(Seed { seed, layout });
         }
         if self.index <= self.total {
-            return seed.deserialize(UnitDeserializer::new()).map(Some);
+            return seed.deserialize(Zero(PhantomData)).map(Some);
         }
         Ok(None)
+    }
+}
+
+/// The value of a field an older layout lacks: none, false, zero or empty.
+struct Zero<E>(PhantomData<E>);
+
+impl<'de, E: serde::de::Error> Deserializer<'de> for Zero<E> {
+    type Error = E;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_unit()
+    }
+
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_none()
+    }
+
+    fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_bool(false)
+    }
+
+    fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_u64(0)
+    }
+
+    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_seq(SeqDeserializer::new(std::iter::empty::<()>()))
+    }
+
+    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_map(MapDeserializer::new(std::iter::empty::<((), ())>()))
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, E> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    serde::forward_to_deserialize_any! {
+        i8 i16 i32 i64 i128 u8 u16 u32 u128 f32 f64 char str string bytes byte_buf unit
+        unit_struct tuple tuple_struct struct enum identifier ignored_any
     }
 }
 
 /// A visitor whose nested deserializers keep the layout.
 struct Wrap<V> {
     visitor: V,
-    fields: usize,
+    layout: Layout,
 }
 
 macro_rules! visit {
@@ -206,30 +264,30 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Wrap<V> {
     }
 
     fn visit_some<D: Deserializer<'de>>(self, inner: D) -> Result<V::Value, D::Error> {
-        let fields = self.fields;
-        self.visitor.visit_some(Legacy { inner, fields })
+        let layout = self.layout;
+        self.visitor.visit_some(Legacy { inner, layout })
     }
 
     fn visit_newtype_struct<D: Deserializer<'de>>(self, inner: D) -> Result<V::Value, D::Error> {
-        let fields = self.fields;
-        self.visitor.visit_newtype_struct(Legacy { inner, fields })
+        let layout = self.layout;
+        self.visitor.visit_newtype_struct(Legacy { inner, layout })
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<V::Value, A::Error> {
-        let fields = self.fields;
-        self.visitor.visit_seq(Access { inner: seq, fields })
+        let layout = self.layout;
+        self.visitor.visit_seq(Access { inner: seq, layout })
     }
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<V::Value, A::Error> {
-        let fields = self.fields;
-        self.visitor.visit_map(Access { inner: map, fields })
+        let layout = self.layout;
+        self.visitor.visit_map(Access { inner: map, layout })
     }
 
     fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<V::Value, A::Error> {
-        let fields = self.fields;
+        let layout = self.layout;
         self.visitor.visit_enum(Access {
             inner: data,
-            fields,
+            layout,
         })
     }
 }
@@ -237,29 +295,29 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Wrap<V> {
 /// A seed whose deserializer keeps the layout.
 struct Seed<S> {
     seed: S,
-    fields: usize,
+    layout: Layout,
 }
 
 impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for Seed<S> {
     type Value = S::Value;
 
     fn deserialize<D: Deserializer<'de>>(self, inner: D) -> Result<S::Value, D::Error> {
-        let fields = self.fields;
-        self.seed.deserialize(Legacy { inner, fields })
+        let layout = self.layout;
+        self.seed.deserialize(Legacy { inner, layout })
     }
 }
 
 /// Sequence, map, enum and variant access whose elements keep the layout.
 struct Access<A> {
     inner: A,
-    fields: usize,
+    layout: Layout,
 }
 
 impl<A> Access<A> {
     fn seed<S>(&self, seed: S) -> Seed<S> {
         Seed {
             seed,
-            fields: self.fields,
+            layout: self.layout,
         }
     }
 }
@@ -309,9 +367,9 @@ impl<'de, A: EnumAccess<'de>> EnumAccess<'de> for Access<A> {
         self,
         seed: T,
     ) -> Result<(T::Value, Self::Variant), A::Error> {
-        let fields = self.fields;
-        let (value, inner) = self.inner.variant_seed(Seed { seed, fields })?;
-        Ok((value, Access { inner, fields }))
+        let layout = self.layout;
+        let (value, inner) = self.inner.variant_seed(Seed { seed, layout })?;
+        Ok((value, Access { inner, layout }))
     }
 }
 
@@ -328,8 +386,8 @@ impl<'de, A: VariantAccess<'de>> VariantAccess<'de> for Access<A> {
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value, A::Error> {
-        let fields = self.fields;
-        self.inner.tuple_variant(len, Wrap { visitor, fields })
+        let layout = self.layout;
+        self.inner.tuple_variant(len, Wrap { visitor, layout })
     }
 
     fn struct_variant<V: Visitor<'de>>(
@@ -337,7 +395,17 @@ impl<'de, A: VariantAccess<'de>> VariantAccess<'de> for Access<A> {
         names: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, A::Error> {
-        let fields = self.fields;
-        self.inner.struct_variant(names, Wrap { visitor, fields })
+        let layout = self.layout;
+        let stored = layout.iter().find(|(known, _)| *known == names.join(","));
+        let Some(&(_, fields)) = stored.filter(|(_, fields)| *fields < names.len()) else {
+            return self.inner.struct_variant(names, Wrap { visitor, layout });
+        };
+        let padded = Padded {
+            visitor,
+            layout,
+            fields,
+            total: names.len(),
+        };
+        self.inner.tuple_variant(fields, padded)
     }
 }

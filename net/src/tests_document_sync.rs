@@ -882,6 +882,8 @@ pub(crate) fn node_info_bytes(node_id: NodeId, updated_at_ms: u64) -> Vec<u8> {
             documents_held: None,
             load_permille: None,
             heartbeat_at_ms: updated_at_ms,
+            download_slots: None,
+            storage_capacity_bytes: None,
         },
         updated_at_ms,
         epoch: AdvertisementEpoch {

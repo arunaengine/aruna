@@ -982,6 +982,18 @@ pub struct RealmUtilizationResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_permille: Option<u32>,
     pub heartbeat_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_slots: Option<DownloadSlotsResponse>,
+}
+
+/// DRS download slot use from the node's heartbeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = RealmNodeDownloadSlots)]
+pub struct DownloadSlotsResponse {
+    pub active: u32,
+    pub max: u32,
+    /// Downloads refused for lack of a slot since the previous heartbeat.
+    pub refused: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1045,7 +1057,8 @@ token of another realm or one this node cannot validate, the response is the pub
   configuration; `placement` is the node's entry in the placement map and `info` is the last node
   information document that reached this node, so both may lag or be absent, as may
   `management_urls`.
-- `info.utilization` comes from the latest heartbeat the node pushed, with `heartbeat_at_ms` as the
+- `info.utilization` comes from the latest heartbeat the node pushed, including its DRS download
+  slot use in `download_slots`, with `heartbeat_at_ms` as the
   time it arrived. `info.telemetry` is `fresh` or `stale` with `info.telemetry_age_ms`, or `absent`
   when no heartbeat is held yet, in which case the values are those of the last published document.
 - Liveness is a separate, deliberately conservative signal: presence is resolved through a bounded
@@ -1383,6 +1396,13 @@ fn map_node_document(
             documents_held: utilization.documents_held,
             load_permille: utilization.load_permille,
             heartbeat_at_ms: utilization.heartbeat_at_ms,
+            download_slots: utilization
+                .download_slots
+                .map(|slots| DownloadSlotsResponse {
+                    active: slots.active,
+                    max: slots.max,
+                    refused: slots.refused,
+                }),
         },
         telemetry: TelemetryState::of(held),
         telemetry_age_ms: held.map(|held| held.age_ms),

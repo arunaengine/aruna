@@ -12,7 +12,8 @@ use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
     DhtEntry, DhtEvent, JobControlEvent, JobRecordEvent, LaunchOfferEvent, NetEvent,
-    PolicyFetchEvent, PolicySignEvent, StreamEvent, VaultFetchEvent, VaultSignEvent,
+    PolicyFetchEvent, PolicySignEvent, SnapshotSignEvent, StatementSignEvent, StreamEvent,
+    VaultFetchEvent, VaultSignEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::structs::identity::realm::RealmId;
@@ -233,6 +234,12 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         )),
         NetEffect::VaultSign(_) => NetEvent::VaultSign(VaultSignEvent::Unavailable(
             "vault signing must be dispatched by the operations runner".to_string(),
+        )),
+        NetEffect::SnapshotSign(_) => NetEvent::SnapshotSign(SnapshotSignEvent::Unavailable(
+            "snapshot signing must be dispatched by the operations runner".to_string(),
+        )),
+        NetEffect::StatementSign(_) => NetEvent::StatementSign(StatementSignEvent::Unavailable(
+            "statement signing must be dispatched by the operations runner".to_string(),
         )),
     }
 }
@@ -507,6 +514,8 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::PolicySign(_) => "policy_sign",
         NetEffect::VaultFetch(_) => "vault_fetch",
         NetEffect::VaultSign(_) => "vault_sign",
+        NetEffect::SnapshotSign(_) => "snapshot_sign",
+        NetEffect::StatementSign(_) => "statement_sign",
     }
 }
 

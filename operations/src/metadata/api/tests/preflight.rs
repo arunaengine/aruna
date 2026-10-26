@@ -5,9 +5,35 @@
 use super::*;
 
 use super::super::preflight::{
-    assemble_preflight_execution, plan_preflight_request, resolve_all_preflight,
+    assemble_preflight_execution, index_state, plan_preflight_request, resolve_all_preflight,
     resolve_preflight_targets, resolve_preflight_versions, verify_preflight_cursor, visible_prefix,
 };
+
+// Documents not materialized yet have no postings, so their absence is never reported current.
+#[test]
+fn unsettled_not_current() {
+    use crate::metadata::iri_index::IriFreshnessState as Returned;
+    assert_eq!(
+        index_state(Returned::Current, false, false),
+        MetadataIndexState::Current
+    );
+    assert_eq!(
+        index_state(Returned::Current, true, false),
+        MetadataIndexState::Pending
+    );
+    assert_eq!(
+        index_state(Returned::Current, false, true),
+        MetadataIndexState::Failed
+    );
+    assert_eq!(
+        index_state(Returned::Pending, false, true),
+        MetadataIndexState::Mixed
+    );
+    assert_eq!(
+        index_state(Returned::Mixed, false, false),
+        MetadataIndexState::Mixed
+    );
+}
 
 #[tokio::test]
 async fn preflight_fanout_reports() {

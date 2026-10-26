@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::structs::storage::data_identity::{
+use crate::structs::storage::data::identity::{
     CONTENT_URL, DataEntity, LOCAL_PATH, LOCAL_PATH_IRI, ObjectLocation, content_id,
     ensure_local_term, local_paths, normalized_id, text_values,
 };

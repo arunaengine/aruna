@@ -10,9 +10,9 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
-    ABE_ARCHIVE_KEYSPACE, ABE_VERSION_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_QUARANTINE_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE, MANAGED_COPY_KEYSPACE,
-    PENDING_CLAIM_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
+    ABE_ARCHIVE_KEYSPACE, ABE_VERSION_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_QUARANTINE_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE,
+    MANAGED_COPY_KEYSPACE, PENDING_CLAIM_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_BLAKE3;
@@ -20,9 +20,11 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::abe::EnvelopeArchive;
 use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BlobLocationKey, BlobQuarantineRecord, BlobVersion,
-    BlobVersionState, BucketInfo, CopyOwner, ManagedCopyKey, ManagedCopyRecord, VersionKey,
+    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobQuarantineRecord, BlobVersion,
+    BlobVersionState, BucketInfo, CopyOwner, CurrentVersionPointer, ManagedCopyKey,
+    ManagedCopyRecord, VersionKey,
 };
+use aruna_core::structs::storage::distribution::inventory::HeadEntry;
 use aruna_core::structs::storage::encryption::{
     BucketKeyError, BucketKeyRecord, BucketKeyRef, KeyState, ReadLease,
 };
@@ -32,6 +34,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::blob::records::{HeadAliasContext, add_index_effect};
+use crate::distribution::inventory::{
+    AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, entry_of,
+};
 use crate::replication::dht_registration::dht_registration_effect;
 
 /// Owner rows promoted per transaction.
@@ -59,6 +64,8 @@ pub enum PromoteError {
     },
     #[error("could not drop a version with a mismatched content hash: {0}")]
     Dropped(String),
+    #[error(transparent)]
+    Inventory(#[from] InventoryError),
 }
 
 #[derive(Debug, PartialEq)]
@@ -88,6 +95,10 @@ enum State {
     ReadBuckets,
     ReadManaged,
     WriteVersions,
+    /// Reads the heads of the promoted versions of distributed buckets.
+    ReadHeads,
+    /// Records their content identity in the inventory and content index.
+    Inventory,
     DeletePending,
     Commit,
     Abort,
@@ -114,10 +125,19 @@ pub struct PromotePendingOperation {
     restarts: u8,
     pending: Vec<(Key, BlobVersion)>,
     groups: HashMap<String, Ulid>,
+    /// The set of each distributed bucket among the owners.
+    sets: HashMap<String, Ulid>,
+    /// Promoted versions of distributed buckets whose inventory entries learn their identity.
+    learned: Vec<(VersionKey, Ulid, AddedVersion)>,
+    updates: Vec<InventoryUpdate>,
+    update: Option<InventoryUpdate>,
     promoted: usize,
     output: Option<Result<Promotion, PromoteError>>,
     /// A read admitted outside the unlock registry, such as with a token credential.
     lease: Option<ReadLease>,
+    /// Whether an owner sits in an ordinary bucket; `None` before any owner bucket was read.
+    /// Only owners all in distributed buckets keep the hash out of the DHT.
+    announced: Option<bool>,
 }
 
 impl PromotePendingOperation {
@@ -143,9 +163,14 @@ impl PromotePendingOperation {
             restarts: 0,
             pending: Vec::new(),
             groups: HashMap::new(),
+            sets: HashMap::new(),
+            learned: Vec::new(),
+            updates: Vec::new(),
+            update: None,
             promoted: 0,
             output: None,
             lease: None,
+            announced: None,
         }
     }
 
@@ -456,11 +481,17 @@ impl PromotePendingOperation {
         buckets: Vec<(Key, Option<Value>)>,
     ) -> Result<Effects, PromoteError> {
         self.groups.clear();
+        self.sets.clear();
         for (key, value) in buckets {
             let bucket = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
             if let Some(value) = value {
-                self.groups
-                    .insert(bucket, BucketInfo::from_bytes(&value)?.group_id);
+                let info = BucketInfo::from_bytes(&value)?;
+                let ordinary = info.distribution.is_none();
+                self.announced = Some(self.announced.unwrap_or(false) || ordinary);
+                if let Some(binding) = info.distribution {
+                    self.sets.insert(bucket.clone(), binding.set_id);
+                }
+                self.groups.insert(bucket, info.group_id);
             }
         }
         let backend = self
@@ -551,6 +582,17 @@ impl PromotePendingOperation {
                 encoding: location.format.encoding(),
                 source,
             };
+            // A distributed bucket's version now has the identity its holders look it up by.
+            if let Some(set_id) = self.sets.get(&version_key.bucket) {
+                version.identity = version.identity.or(Some(blake3));
+                let added = AddedVersion {
+                    version_id: version_key.version_id,
+                    epoch: version.original_epoch,
+                    generation: version.generation,
+                    entry: entry_of(&version, location.blob_size),
+                };
+                self.learned.push((version_key.clone(), *set_id, added));
+            }
             writes.push((
                 BLOB_VERSIONS_KEYSPACE.to_string(),
                 key,
@@ -582,6 +624,84 @@ impl PromotePendingOperation {
             writes,
             txn_id: self.txn_id,
         })])
+    }
+
+    /// Reads the head of each promoted version of a distributed bucket, whose inventory entry
+    /// changes too while the version is the head.
+    fn read_heads(&mut self) -> Effects {
+        if self.learned.is_empty() {
+            return self.next_page();
+        }
+        let reads = (self.learned.iter())
+            .map(|(key, _, _)| {
+                let head = BlobHeadKey::new(&key.bucket, &key.key).to_bytes()?;
+                Ok((BLOB_HEAD_KEYSPACE.to_string(), head.into()))
+            })
+            .collect::<Result<Vec<_>, ConversionError>>();
+        match reads {
+            Ok(reads) => {
+                self.state = State::ReadHeads;
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: self.txn_id,
+                })]
+            }
+            Err(error) => self.finish(Err(error.into())),
+        }
+    }
+
+    fn handle_heads(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected("ReadHeads", "BatchReadResult", event);
+        };
+        let learned = std::mem::take(&mut self.learned);
+        let mut changes = Vec::with_capacity(learned.len());
+        for ((key, set_id, added), (_, head)) in learned.into_iter().zip(values) {
+            let head = head
+                .map(|value| CurrentVersionPointer::from_bytes(&value))
+                .transpose();
+            let head = match head {
+                Ok(head) => head,
+                Err(error) => return self.finish(Err(error.into())),
+            };
+            let mut change = InventoryChange::new(set_id, key.key);
+            if head.is_some_and(|head| head.version_id == added.version_id) {
+                change.head = HeadChange::Set(HeadEntry {
+                    version_id: added.version_id,
+                    epoch: added.epoch,
+                    generation: added.generation,
+                    version: added.entry,
+                });
+            }
+            change.added.push(added);
+            changes.push(InventoryUpdate::new(change));
+        }
+        self.updates = changes;
+        self.next_update()
+    }
+
+    fn next_update(&mut self) -> Effects {
+        let (Some(txn_id), Some(mut update)) = (self.txn_id, self.updates.pop()) else {
+            return self.next_page();
+        };
+        self.state = State::Inventory;
+        let effects = update.start(txn_id);
+        self.update = Some(update);
+        effects
+    }
+
+    fn handle_inventory(&mut self, event: Event) -> Effects {
+        let (Some(txn_id), Some(update)) = (self.txn_id, self.update.as_mut()) else {
+            return self.finish(Err(StorageError::TransactionNotFound.into()));
+        };
+        match update.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                self.update = None;
+                self.next_update()
+            }
+            Err(error) => self.finish(Err(error.into())),
+        }
     }
 
     fn next_page(&mut self) -> Effects {
@@ -642,6 +762,11 @@ impl PromotePendingOperation {
             return self.start_page();
         }
         let blake3 = self.blake3.unwrap_or_default();
+        // Distributed buckets are found through their content indexes, not the DHT.
+        if self.announced == Some(false) {
+            let versions = self.promoted;
+            return self.finish(Ok(Promotion::Promoted { blake3, versions }));
+        }
         match dht_registration_effect(&blake3, self.realm_id, &self.limits) {
             Ok(effect) => {
                 self.state = State::Register;
@@ -678,9 +803,11 @@ impl Operation for PromotePendingOperation {
             State::ReadBuckets => self.handle_buckets(event),
             State::ReadManaged => self.handle_managed(event),
             State::WriteVersions => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.next_page(),
+                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.read_heads(),
                 event => self.unexpected("WriteVersions", "BatchWriteResult", event),
             },
+            State::ReadHeads => self.handle_heads(event),
+            State::Inventory => self.handle_inventory(event),
             State::DeletePending => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.last_page = true;

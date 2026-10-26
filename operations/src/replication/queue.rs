@@ -19,6 +19,7 @@ use aruna_core::structs::execution::notification_watch::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::replication::{ArunaArn, ReplicationFailure};
 use aruna_core::structs::{
@@ -39,6 +40,8 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
+use super::bootstrap::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
+use super::members::{MemberTarget, bound_record, member_jobs, member_publication};
 use super::parking::{PARKED_DUE, park_job};
 use super::plaintext::{consent_delete, consent_write, job_consent, plaintext_allowed};
 use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
@@ -76,6 +79,8 @@ pub struct BlobJobRecord {
     pub upstream_sources: Vec<ArunaArn>,
     pub writer_auth_context: Option<AuthContext>,
     pub reference_advance: Option<ReferenceAdvance>,
+    /// A coordinator's publication to one member of a distributed bucket.
+    pub distribution: Option<MemberTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,12 +120,15 @@ struct BlobJobIdentity<'a> {
     relationship_id: Option<Ulid>,
     origin: Option<&'a SyncOrigin>,
     upstream_sources: &'a [ArunaArn],
+    member: Option<&'a MemberTarget>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveReplicationContinuation {
     pub relationship_after: Option<Vec<u8>>,
     pub relationships_complete: bool,
+    /// The publications to the members of a distributed bucket are queued.
+    pub members_done: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +211,7 @@ impl BlobJobRecord {
             upstream_sources: Vec::new(),
             writer_auth_context,
             reference_advance: None,
+            distribution: None,
         }
     }
 
@@ -235,6 +244,11 @@ impl BlobJobRecord {
 
     pub fn with_reference_advance(mut self, advance: ReferenceAdvance) -> Self {
         self.reference_advance = Some(advance);
+        self
+    }
+
+    pub fn with_member(mut self, target: MemberTarget) -> Self {
+        self.distribution = Some(target);
         self
     }
 
@@ -318,6 +332,7 @@ pub fn blob_job_key(record: &BlobJobRecord) -> Result<Key, ConversionError> {
         relationship_id: record.relationship_id,
         origin: record.origin.as_ref(),
         upstream_sources: &record.upstream_sources,
+        member: record.distribution.as_ref(),
     };
     let mut key = b"v1".to_vec();
     key.extend(postcard::to_allocvec(&identity)?);
@@ -1171,7 +1186,7 @@ pub async fn relationship_job_stats(
 }
 
 pub async fn next_blob_timer(storage: &StorageHandle) -> Result<Option<Duration>, BlobQueueError> {
-    if live_obligations_exist(storage).await? {
+    if live_obligations_exist(storage).await? || bootstrap_waiting(storage).await {
         return Ok(Some(Duration::ZERO));
     }
 
@@ -1213,6 +1228,10 @@ pub async fn process_blob_batch(
 ) -> Result<BlobDrainResult, BlobQueueError> {
     let batch_started = Instant::now();
     let repair = process_live_obligations(context).await?;
+    let bootstrap = process_bootstrap(context).await.unwrap_or_else(|error| {
+        warn!(%error, "Distributed bucket bootstrap failed; retrying");
+        true
+    });
     let now_ms = unix_timestamp_millis();
     let scan = scan_due_jobs(&context.storage_handle, now_ms, REPLICATION_BATCH_SIZE).await?;
     let mut next_due_ms = scan.next_due_ms;
@@ -1239,6 +1258,15 @@ pub async fn process_blob_batch(
             Ok(BlobJobOutcome::Succeeded) => {
                 delete_blob_job(&context.storage_handle, job_key).await?;
                 succeeded = succeeded.saturating_add(1);
+            }
+            // A member job ends only once delivered or no longer owed: a bootstrap counts a
+            // deleted job as delivered, so a refusal retries instead.
+            Ok(BlobJobOutcome::TerminalFailure) if job.distribution.is_some() => {
+                let refused = "the member did not take the version".to_string();
+                let retry_due_at =
+                    reschedule_blob_job(&context.storage_handle, job_key, &job, refused).await?;
+                next_due_ms = min_due_at(next_due_ms, retry_due_at);
+                failed = failed.saturating_add(1);
             }
             Ok(BlobJobOutcome::TerminalFailure) => {
                 delete_blob_job(&context.storage_handle, job_key).await?;
@@ -1285,7 +1313,12 @@ pub async fn process_blob_batch(
         next_due_after: if has_more_due {
             None
         } else {
-            next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
+            let next = next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms));
+            // A bootstrap waiting for its jobs or the publisher is looked at again soon.
+            match bootstrap {
+                true => Some(next.map_or(BOOTSTRAP_POLL, |after| after.min(BOOTSTRAP_POLL))),
+                false => next,
+            }
         },
     })
 }
@@ -1480,6 +1513,9 @@ async fn process_blob_job(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
+    if let Some(target) = job.distribution.as_ref() {
+        return publish_member(context, job, target, operation, relationships).await;
+    }
     let mut watch_group_id = None;
     let relationship = if let Some(relationship_id) = job.relationship_id {
         let Some(relationship) = stored_relationship else {
@@ -1606,6 +1642,37 @@ async fn process_blob_job(
         relationships,
     )
     .await
+}
+
+/// Sends a distributed bucket's version to one member under the publication this node's
+/// record gives now. A job whose publication ended is done: the current coordinator owes it.
+async fn publish_member(
+    context: &DriverContext,
+    job: &BlobJobRecord,
+    target: &MemberTarget,
+    operation: ReplicateScopeOperation,
+    relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
+) -> Result<BlobJobOutcome, String> {
+    let ReplicateScopeTarget::Version { key, .. } = &job.input.target else {
+        return Ok(BlobJobOutcome::TerminalFailure);
+    };
+    let Some(local) = context.net_handle.as_ref().map(|net| net.node_id()) else {
+        return Err("source node identity unavailable".to_string());
+    };
+    let publication = bound_record(context, &job.input.bucket)
+        .await?
+        .and_then(|(binding, snapshot)| member_publication(&binding, &snapshot, key, target))
+        .filter(|(_, node_id)| *node_id == job.input.target_node_id);
+    let Some((publication, _)) = publication else {
+        info!(
+            bucket = %job.input.bucket,
+            member_id = %target.member_id,
+            "Dropping a publication this node no longer owes"
+        );
+        return Ok(BlobJobOutcome::Succeeded);
+    };
+    let operation = operation.with_distribution(publication, local);
+    finish_blob_job(context, job, operation, None, None, relationships).await
 }
 
 async fn finish_blob_job(
@@ -1831,6 +1898,15 @@ async fn process_live_obligations(
             })
             .or_insert(start);
     }
+    let mut records = HashMap::<String, Option<(DistributionBinding, DistributionSnapshot)>>::new();
+    for (_, obligation) in &obligations {
+        if !records.contains_key(&obligation.bucket) {
+            let record = bound_record(context, &obligation.bucket)
+                .await
+                .map_err(BlobQueueError::UnexpectedEvent)?;
+            records.insert(obligation.bucket.clone(), record);
+        }
+    }
     let mut relationship_cache = HashMap::<String, RelationshipPage>::new();
     let mut relationship_work = 0usize;
     for (bucket, start) in starts {
@@ -1865,7 +1941,14 @@ async fn process_live_obligations(
             result.has_more = true;
             continue;
         }
-        let write = write_live_jobs(&context.storage_handle, &obligation, relationships).await?;
+        let members = match records.get(&obligation.bucket) {
+            Some(Some((binding, snapshot))) if !cursor.members_done => {
+                member_jobs(binding, snapshot, &obligation, unix_timestamp_millis())
+            }
+            _ => Vec::new(),
+        };
+        let write =
+            write_live_jobs(&context.storage_handle, &obligation, relationships, members).await?;
         if !write.progressed {
             result.has_more = true;
             continue;
@@ -2085,6 +2168,7 @@ async fn write_live_jobs(
     storage: &StorageHandle,
     obligation: &LiveObligationRecord,
     relationships: Option<&RelationshipPage>,
+    members: Vec<BlobJobRecord>,
 ) -> Result<LiveRepairWrite, BlobQueueError> {
     if obligation
         .origin
@@ -2116,6 +2200,12 @@ async fn write_live_jobs(
         upstream_sources.push(source);
     }
     let mut cursor = obligation.continuation.clone().unwrap_or_default();
+    // Publications to set members are bounded by the member count and queued once.
+    let mut queued = 0;
+    if !cursor.members_done && !members.is_empty() {
+        queued = persist_live_jobs(storage, members, None).await?.queued;
+    }
+    cursor.members_done = true;
     let mut relationship_jobs = Vec::with_capacity(REPLICATION_JOB_LIMIT);
     if !cursor.relationships_complete {
         let Some(page) = relationships else {
@@ -2194,7 +2284,9 @@ async fn write_live_jobs(
         }
     }
     let continuation = (!cursor.relationships_complete).then_some(cursor);
-    persist_live_jobs(storage, relationship_jobs, continuation).await
+    let mut write = persist_live_jobs(storage, relationship_jobs, continuation).await?;
+    write.queued = write.queued.saturating_add(queued);
+    Ok(write)
 }
 
 async fn persist_live_jobs(
@@ -2523,7 +2615,8 @@ async fn scan_due_jobs(
     let cursor = read_replication_cursor(storage).await?;
     let start_after = cursor.after.clone();
     let mut jobs = Vec::new();
-    let mut next_due_ms = cursor.next_due_ms;
+    // A pass from the start drops the last pass's due time, which may already be past.
+    let mut next_due_ms = cursor.next_due_ms.filter(|_| start_after.is_some());
     let mut canonical_changed = false;
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
@@ -2704,6 +2797,7 @@ async fn reschedule_blob_job(
         upstream_sources: job.upstream_sources.clone(),
         writer_auth_context: job.writer_auth_context.clone(),
         reference_advance: job.reference_advance,
+        distribution: job.distribution.clone(),
     };
     match storage
         .send_storage_effect(StorageEffect::Write {
@@ -2942,6 +3036,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -3367,6 +3462,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refused_member_retries() {
+        // A member job that fails terminally stays queued, so a bootstrap never counts it
+        // as delivered.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let mut job = BlobJobRecord::new(on_demand_input(), None, 0).with_member(MemberTarget {
+            set_id: Ulid::from_parts(3, 3),
+            member_id: Ulid::from_parts(4, 4),
+        });
+        job.reference_advance = Some(reference_advance());
+        let (key_space, key, value) = blob_job_entry(&job).unwrap();
+        let write = StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+
+        let result = process_blob_batch(&context).await.expect("batch runs");
+
+        assert_eq!(result.failed, 1);
+        let jobs = read_jobs(&storage).await;
+        assert_eq!(jobs.len(), 1, "the refused member job stays queued");
+        assert_eq!(jobs[0].1.attempts, 1);
+    }
+
+    #[tokio::test]
     async fn denied_job_fails() {
         let temp_dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
@@ -3571,6 +3703,7 @@ mod tests {
         let current = LiveReplicationContinuation {
             relationship_after: Some(vec![2]),
             relationships_complete: false,
+            members_done: false,
         };
         let older = LiveReplicationContinuation {
             relationship_after: Some(vec![1]),
@@ -3607,6 +3740,7 @@ mod tests {
             upstream_sources: Vec::new(),
             writer_auth_context: Some(auth_context()),
             reference_advance: None,
+            distribution: None,
         };
         let (key_space, key, value) = blob_job_entry(&future_job).unwrap();
         match storage
@@ -3954,7 +4088,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            write_live_jobs(&storage, &obligation, Some(&relationships))
+            write_live_jobs(&storage, &obligation, Some(&relationships), Vec::new())
                 .await
                 .unwrap()
                 .queued,
@@ -4300,6 +4434,41 @@ mod tests {
         assert_eq!(result.processed, 0);
         assert!(!result.has_more_due);
         assert!(result.next_due_after.is_some());
+    }
+
+    #[tokio::test]
+    async fn past_due_settles() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        // A finished pass remembered a retry that has since run and left the queue empty.
+        let stale = ReplicationScanCursor {
+            generation: 1,
+            after: None,
+            next_due_ms: Some(1),
+        };
+        advance_replication_cursor(&storage, stale)
+            .await
+            .expect("stale cursor persists");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+
+        for _ in 0..2 {
+            let result = process_blob_batch(&context)
+                .await
+                .expect("empty drain succeeds");
+            assert!(!result.has_more_due);
+            assert_eq!(
+                result.next_due_after, None,
+                "an empty queue must not re-arm"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4655,6 +4824,7 @@ mod tests {
         let observed = LiveReplicationContinuation {
             relationship_after: Some(vec![1]),
             relationships_complete: false,
+            members_done: false,
         };
 
         delete_live_obligation(&storage, key.clone(), Some(&observed))
@@ -4686,6 +4856,7 @@ mod tests {
         record.continuation = Some(LiveReplicationContinuation {
             relationship_after: Some(vec![2]),
             relationships_complete: false,
+            members_done: false,
         });
         super::write_live_obligation(&storage, &record)
             .await
@@ -4694,6 +4865,7 @@ mod tests {
         stale.continuation = Some(LiveReplicationContinuation {
             relationship_after: Some(vec![1]),
             relationships_complete: false,
+            members_done: false,
         });
 
         super::write_live_obligation(&storage, &stale)

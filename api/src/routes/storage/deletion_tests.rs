@@ -82,3 +82,56 @@ async fn preflight_discloses_cleanup() {
     );
     assert!(!disclosed[0].blocker);
 }
+
+mod coverage {
+    use super::*;
+    use crate::tests::distributed::{BUCKET, Node, distribute, node_state};
+
+    async fn preflight(node: &Node, auth: &AuthContext) -> ServerResult<DeletionPreflightResponse> {
+        let request = DeletionPreflightRequest {
+            scope: PurgeScopeRequest::Bucket {
+                bucket: BUCKET.to_string(),
+            },
+            limit: None,
+            version_key_marker: None,
+            version_id_marker: None,
+            multipart_key_marker: None,
+            multipart_upload_marker: None,
+        };
+        let (_, Json(answer)) = deletion_preflight(
+            State(node.state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+            Json(request),
+        )
+        .await?;
+        Ok(answer)
+    }
+
+    /// An ordinary bucket's references are not evaluated; a distributed bucket asks the set's
+    /// postings on the metadata nodes.
+    #[tokio::test]
+    async fn preflight_covers_set() {
+        let node = node_state().await;
+        let ordinary = preflight(&node, &node.owner).await.unwrap();
+        assert_eq!(ordinary.reference_coverage.index_freshness, "not_evaluated");
+        assert!(
+            ordinary
+                .reference_coverage
+                .hidden_references_exist
+                .is_none()
+        );
+
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let distributed = preflight(&node, &node.owner).await.unwrap();
+        let coverage = distributed.reference_coverage;
+        assert_eq!(coverage.excluded, vec!["hash_only_references".to_string()]);
+        assert_eq!(coverage.index_freshness, "current");
+        assert_eq!(coverage.hidden_references_exist, Some(false));
+        assert!(distributed.linked_datasets.is_empty());
+        assert!(matches!(
+            preflight(&node, &node.stranger).await,
+            Err(ServerError::Forbidden)
+        ));
+    }
+}

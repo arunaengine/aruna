@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncSeekExt};
 use iroh_io::{AsyncSliceReader, AsyncSliceWriter, AsyncStreamReader, AsyncStreamWriter};
 use opendal::{FuturesAsyncReader, Operator};
-use std::{future::Future, io, time::Duration};
+use std::{future::Future, io, ops::Range, time::Duration};
 use tokio::io::{
     AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt, DuplexStream,
 };
@@ -200,6 +200,74 @@ impl BaoReadWriter {
             ));
         }
         Ok(())
+    }
+}
+
+/// Passes on the bytes of one range from the verified chunks a ranged bao read decodes; the
+/// chunks cover the range and arrive in order.
+pub struct RangeWriter {
+    writer: DuplexStream,
+    range: Range<u64>,
+    decoded: u64,
+    written: u64,
+}
+
+impl RangeWriter {
+    pub fn new(writer: DuplexStream, range: Range<u64>) -> Self {
+        Self {
+            writer,
+            decoded: range.start,
+            range,
+            written: 0,
+        }
+    }
+
+    pub fn finish(self) -> io::Result<()> {
+        let expected = self.range.end - self.range.start;
+        if self.written != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "ranged bao read ended after {} of {expected} bytes",
+                    self.written
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AsyncSliceWriter for RangeWriter {
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+        let end = offset + data.len() as u64;
+        // Chunks start at or before the range and never step back over bytes already passed on.
+        if offset > self.decoded || end < self.decoded {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ranged bao read produced non-sequential output",
+            ));
+        }
+        let from = self.decoded.max(self.range.start);
+        let to = end.min(self.range.end);
+        if from < to {
+            let slice = &data[(from - offset) as usize..(to - offset) as usize];
+            self.writer.write_all(slice).await?;
+            self.written += to - from;
+        }
+        self.decoded = self.decoded.max(end);
+        Ok(())
+    }
+
+    async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> io::Result<()> {
+        self.write_at(offset, &data).await
+    }
+
+    async fn set_len(&mut self, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn sync(&mut self) -> io::Result<()> {
+        self.writer.flush().await
     }
 }
 
@@ -460,10 +528,36 @@ impl OpenDalReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaoReadWriter, OpenDalWriter, idle_timeout_error, with_idle_timeout};
+    use super::{BaoReadWriter, OpenDalWriter, RangeWriter, idle_timeout_error, with_idle_timeout};
     use iroh_io::AsyncSliceWriter;
     use std::io;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    // Verified chunks cover more than the range; only the range is passed on, in order.
+    #[tokio::test]
+    async fn range_writer_trims() {
+        let (writer, mut reader) = tokio::io::duplex(64);
+        let mut range = RangeWriter::new(writer, 3..9);
+        range.write_at(0, b"abcde").await.unwrap();
+        range.write_at(5, b"fghij").await.unwrap();
+        range.finish().unwrap();
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"defghi");
+    }
+
+    // A gap in the decoded chunks or a short read never passes as the whole range.
+    #[tokio::test]
+    async fn range_writer_gaps() {
+        let (writer, _reader) = tokio::io::duplex(64);
+        let mut range = RangeWriter::new(writer, 3..9);
+        assert!(range.write_at(4, b"efgh").await.is_err());
+        let (writer, _reader) = tokio::io::duplex(64);
+        let mut short = RangeWriter::new(writer, 3..9);
+        short.write_at(0, b"abcde").await.unwrap();
+        assert!(short.finish().is_err());
+    }
 
     #[tokio::test]
     async fn reports_idle_timeout() {

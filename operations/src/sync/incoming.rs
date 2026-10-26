@@ -29,6 +29,7 @@ use crate::placement::process_placements::reconcile_shard_topics;
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::IncomingBaoOperation;
+use crate::replication::bootstrap::wake_bootstrap;
 use crate::replication::incoming::{IncomingVersionOperation, IncomingVersionResult};
 use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::{
@@ -301,6 +302,60 @@ impl OperationsInboundHandler {
         }
     }
 
+    /// Answers which key this member's version id index holds for one version.
+    async fn answer_version_key(
+        &self,
+        blob_handle: &aruna_blob::blob::BlobHandle,
+        stream_id: Ulid,
+        set_id: Ulid,
+        version_id: Ulid,
+    ) {
+        let key = crate::distribution::resolve::indexed_key(&self.context, set_id, version_id)
+            .await
+            .ok()
+            .flatten();
+        let Ok(payload) = VersionReplicationMessage::VersionKeyResponse(key).to_bytes() else {
+            close_failed_bao(blob_handle, stream_id).await;
+            return;
+        };
+        let sent = blob_handle
+            .send_blob_effect(BlobEffect::SendMessage { stream_id, payload })
+            .await;
+        if let Event::Blob(BlobEvent::Error(error)) = sent {
+            debug!(error = ?error, "Failed to answer a version key lookup");
+        }
+        close_failed_bao(blob_handle, stream_id).await;
+    }
+
+    /// Answers which versions this member's content index holds for one identity.
+    async fn answer_content(
+        &self,
+        blob_handle: &aruna_blob::blob::BlobHandle,
+        stream_id: Ulid,
+        set_id: Ulid,
+        identity: [u8; 32],
+    ) {
+        use crate::distribution::resolve::{MAX_CONTENT_VERSIONS, content_versions};
+        let Ok((versions, more)) =
+            content_versions(&self.context, set_id, &identity, MAX_CONTENT_VERSIONS).await
+        else {
+            close_failed_bao(blob_handle, stream_id).await;
+            return;
+        };
+        let answer = VersionReplicationMessage::ContentResponse { versions, more };
+        let Ok(payload) = answer.to_bytes() else {
+            close_failed_bao(blob_handle, stream_id).await;
+            return;
+        };
+        let sent = blob_handle
+            .send_blob_effect(BlobEffect::SendMessage { stream_id, payload })
+            .await;
+        if let Event::Blob(BlobEvent::Error(error)) = sent {
+            debug!(error = ?error, "Failed to answer a content lookup");
+        }
+        close_failed_bao(blob_handle, stream_id).await;
+    }
+
     /// The bao plane input boundary: admission, bounded frame reads, and
     /// family-specific refusals all happen here or in the family handlers.
     async fn handle_bao_stream(&self, stream: BiStream, node_id: NodeId) {
@@ -413,6 +468,33 @@ impl OperationsInboundHandler {
                             request,
                         )
                         .await;
+                    }
+                    Ok(VersionReplicationMessage::VersionKeyRequest {
+                        realm_id: asked,
+                        set_id,
+                        version_id,
+                    }) => {
+                        // Keys of a set are told to realm infrastructure only.
+                        if admission != BaoAdmission::Infra || asked != realm_id {
+                            warn!(peer = %node_id, "Refusing a version key lookup");
+                            close_failed_bao(&blob_handle, stream_id).await;
+                            return;
+                        }
+                        self.answer_version_key(&blob_handle, stream_id, set_id, version_id)
+                            .await;
+                    }
+                    Ok(VersionReplicationMessage::ContentRequest {
+                        realm_id: asked,
+                        set_id,
+                        identity,
+                    }) => {
+                        if admission != BaoAdmission::Infra || asked != realm_id {
+                            warn!(peer = %node_id, "Refusing a content lookup");
+                            close_failed_bao(&blob_handle, stream_id).await;
+                            return;
+                        }
+                        self.answer_content(&blob_handle, stream_id, set_id, identity)
+                            .await;
                     }
                     _ => {
                         error!(
@@ -574,6 +656,10 @@ async fn manifest_policy(
         Err(GetBucketError::NotFound) => manifest.group_id,
         Err(error) => return Err(error.to_string()),
     };
+    // The member admits a publication against its record of the set, not a user's grants.
+    if manifest.distribution.is_some() {
+        return Ok((None, None));
+    }
     let path = if manifest.key.is_empty() {
         bucket_permission_path(local_realm, group_id, local_node, &manifest.bucket)
     } else {
@@ -725,6 +811,11 @@ async fn bao_policy(
                 }
             }
             Ok((paths, allowed, had_denial))
+        }
+        // The serve finds the version in its member bucket and checks the caller in its
+        // snapshot transaction, as for every target.
+        crate::replication::protocol::BaoReadTarget::Version { .. } => {
+            Ok((paths, Vec::new(), false))
         }
     }
 }
@@ -891,6 +982,8 @@ async fn reconcile_inbound_topics(
         crate::federation::publish::publish_soon(context, realm_id, node_id).await;
     }
     refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
+    // An installed record may name a member this node bootstraps.
+    wake_bootstrap(context).await;
     refresh_target_interest(context, &targets.targets).await;
     let project_started = Instant::now();
     project_inbound_events(context, targets).await;
@@ -1436,6 +1529,7 @@ mod tests {
                     version_selector: None,
                     capabilities: Vec::new(),
                     origin_node_id: None,
+                    namespace: None,
                 },
                 connector_id: Some(Ulid::generate()),
             }),
@@ -1450,6 +1544,7 @@ mod tests {
                 etag: None,
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             }),
             metadata: HashMap::new(),
             reference_advance: Some(ReferenceAdvance {
@@ -1458,6 +1553,13 @@ mod tests {
             }),
             reference_advance_count: Some(0),
             placement_policies: Vec::new(),
+            original_epoch: Default::default(),
+            version_generation: 0,
+            logical_identity: None,
+            distribution: None,
+            version_origin: None,
+            version_hop: None,
+            sync_source: None,
         };
 
         assert_eq!(
@@ -1565,6 +1667,13 @@ mod tests {
             }),
             reference_advance_count: Some(0),
             placement_policies: Vec::new(),
+            original_epoch: Default::default(),
+            version_generation: 0,
+            logical_identity: None,
+            distribution: None,
+            version_origin: None,
+            version_hop: None,
+            sync_source: None,
         };
 
         assert_eq!(
@@ -1954,6 +2063,13 @@ mod tests {
             reference_advance: None,
             reference_advance_count: None,
             placement_policies: Vec::new(),
+            original_epoch: Default::default(),
+            version_generation: 0,
+            logical_identity: None,
+            distribution: None,
+            version_origin: None,
+            version_hop: None,
+            sync_source: None,
         });
         let summary = VersionReplicationMessage::LocationSummaryRequest(LocationSummaryRequest {
             realm_id: RealmId::from_bytes([8u8; 32]),
@@ -2003,6 +2119,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         boundary
             .handler
@@ -2097,6 +2214,7 @@ mod tests {
                 metadata_only: false,
                 destination: None,
                 known_refs: Vec::new(),
+                range: None,
             }
         };
 

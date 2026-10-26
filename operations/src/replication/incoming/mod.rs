@@ -8,6 +8,7 @@ use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, build_transition_effects,
     write_location_effect, write_version_effect,
 };
+use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::load_group_inputs;
 use crate::node::usage_stats::{
@@ -40,7 +41,7 @@ use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE,
     OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, PENDING_CLAIM_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, SYNC_RECEIPT_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -55,11 +56,19 @@ use aruna_core::structs::storage::blob::{
     VersionKey, WriteOwner, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::distribution::inventory::{VersionEntry, logical_identity};
+use aruna_core::structs::storage::distribution::source_root::RootEntry;
+use aruna_core::structs::storage::distribution::{
+    AdmissionError, DistributionBinding, OriginalEpoch,
+};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
 use aruna_core::structs::storage::format::{Compression, EncodingClass, StoredLayout};
+use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::multipart::MultipartObjectKey;
+use aruna_core::structs::storage::origin::{OriginVersion, SyncHop};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
 };
@@ -67,6 +76,7 @@ use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::structs::tagged_receipt;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
@@ -106,6 +116,10 @@ enum IncomingVersionState {
     StartTransaction,
     CheckPurgeFence,
     CheckDrift,
+    /// Reads the record of the destination's set to admit a publication.
+    ReadPublicationRecord,
+    /// Reads that record again inside the apply transaction.
+    RecheckPublication,
     VerifyReplaced,
     ReadReplacedEnvelope,
     ReadReplacedRows,
@@ -204,6 +218,8 @@ pub enum IncomingVersionError {
     CurrentVersionMissing,
     #[error("Invalid reference advance")]
     InvalidReferenceAdvance,
+    #[error("A version with this id is stored with another origin")]
+    OriginMismatch,
     #[error("Materialized replication manifest is missing blob info")]
     MissingBlobInfo,
     #[error("Materialized replication manifest is missing local blob location")]
@@ -233,6 +249,13 @@ pub enum IncomingVersionError {
     StalePlan,
     #[error(transparent)]
     Blob(#[from] BlobError),
+    #[error(transparent)]
+    Admission(#[from] AdmissionError),
+    /// A member bucket takes only its coordinators' publications, and only it takes them.
+    #[error("only a distributed bucket's coordinators publish to its member buckets")]
+    ForeignPublication,
+    #[error("the record of the destination's distributed bucket has not reached this node yet")]
+    RecordMissing,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -342,6 +365,14 @@ pub struct IncomingVersionOperation {
     destination_rules: Vec<StorageRoutingRule>,
     /// The destination bucket's compression: the replica is stored with this node's setting.
     destination_compression: Compression,
+    /// Only a bucket bound to a distributed set orders its heads by original epoch.
+    destination_bound: bool,
+    /// The destination's binding, whose inventory the apply transaction maintains.
+    destination_binding: Option<DistributionBinding>,
+    /// The head this apply installs and the content of the written version, for the inventory.
+    installed_head: Option<CurrentVersionPointer>,
+    written_identity: Option<[u8; 32]>,
+    written_pending: bool,
     destination_inputs: GroupRoutingInputs,
     create_attempted: bool,
     negotiation_result: Option<ReplicationNegotiationResult>,
@@ -417,6 +448,7 @@ impl IncomingVersionOperation {
             destination_group_id: None,
             destination_rules: Vec::new(),
             destination_compression: Compression::Off,
+            destination_bound: false,
             destination_inputs: GroupRoutingInputs::default(),
             create_attempted: false,
             negotiation_result: None,
@@ -435,6 +467,10 @@ impl IncomingVersionOperation {
             replaced_reference_bytes: 0,
             replaced_envelope: Vec::new(),
             pending_head: None,
+            destination_binding: None,
+            installed_head: None,
+            written_identity: None,
+            written_pending: false,
             head_transition_effects: VecDeque::new(),
             pending_version_effects: VecDeque::new(),
             release_id: None,
@@ -532,7 +568,10 @@ impl Operation for IncomingVersionOperation {
         {
             return self.reject_negotiation(IncomingVersionError::RealmMismatch);
         }
-        if self.manifest.writer_auth_context.is_none() && self.manifest.reference_advance.is_none()
+        // A publication is admitted against the record instead of a writer's permissions.
+        if self.manifest.writer_auth_context.is_none()
+            && self.manifest.reference_advance.is_none()
+            && self.manifest.distribution.is_none()
         {
             return self.reject_negotiation(IncomingVersionError::WriterPermissionDenied);
         }
@@ -577,6 +616,8 @@ impl Operation for IncomingVersionOperation {
             IncomingVersionState::StartTransaction => self.accept_transaction_start(event),
             IncomingVersionState::CheckPurgeFence => self.accept_purge_fence(event),
             IncomingVersionState::CheckDrift => self.accept_drift_check(event),
+            IncomingVersionState::ReadPublicationRecord => self.accept_publication_record(event),
+            IncomingVersionState::RecheckPublication => self.accept_publication_recheck(event),
             // Apply/commit: expose the version and settle ownership.
             IncomingVersionState::VerifyReplaced => self.accept_replaced_version(event),
             IncomingVersionState::ReadReplacedEnvelope => self.accept_replaced_envelope(event),
@@ -698,6 +739,8 @@ impl IncomingVersionOperation {
             IncomingVersionState::StartTransaction => "StartTransaction",
             IncomingVersionState::CheckPurgeFence => "CheckPurgeFence",
             IncomingVersionState::CheckDrift => "CheckDrift",
+            IncomingVersionState::ReadPublicationRecord => "ReadPublicationRecord",
+            IncomingVersionState::RecheckPublication => "RecheckPublication",
             IncomingVersionState::VerifyReplaced => "VerifyReplaced",
             IncomingVersionState::ReadReplacedEnvelope => "ReadReplacedEnvelope",
             IncomingVersionState::ReadReplacedRows => "ReadReplacedRows",
@@ -941,7 +984,7 @@ impl IncomingVersionOperation {
             .manifest
             .reference_advance_count
             .ok_or(IncomingVersionError::ReferenceCountMissing)?;
-        Ok(BlobVersion::reference(
+        let version = BlobVersion::reference(
             source,
             metadata,
             self.manifest.created_at,
@@ -951,7 +994,56 @@ impl IncomingVersionOperation {
         .with_metadata(self.manifest.metadata.clone())
         .with_advance_count(advance_count)
         .with_publisher(self.publisher_node_id)
-        .with_policies(self.manifest.placement_policies.clone())?)
+        .with_policies(self.manifest.placement_policies.clone())?;
+        Ok(self.stamped(version))
+    }
+
+    /// The version as this destination stores it: epoch, generation and, in a distributed
+    /// bucket, the identity the set fixed, so a retry compares equal to what it applied.
+    fn stamped(&self, version: BlobVersion) -> BlobVersion {
+        let version = version
+            .with_epoch(self.original_epoch())
+            .with_generation(self.version_generation())
+            .with_origin(self.manifest.version_origin.clone())
+            .with_hop(self.hop());
+        match self.destination_bound {
+            true => {
+                let identity = self.manifest.logical_identity;
+                let identity = identity.or_else(|| logical_identity(&version));
+                version.with_identity(identity)
+            }
+            false => version,
+        }
+    }
+
+    /// A sync destination records the hop from the sender's exact version, named by the
+    /// sender's own coordinates; member replication keeps the hop the version carries.
+    fn hop(&self) -> Option<SyncHop> {
+        let Some(sync) = &self.manifest.origin else {
+            return self.manifest.version_hop.clone();
+        };
+        let from = if self.manifest.original_epoch.0 > 0 {
+            OriginVersion::Global(GlobalId::Version {
+                realm_id: self.local_realm_id,
+                version_id: self.manifest.version_id,
+            })
+        } else {
+            let (bucket, key) = self.manifest.sync_source.as_ref()?;
+            OriginVersion::Node(
+                VersionedObjectArn::new(
+                    self.local_realm_id,
+                    self.publisher_node_id,
+                    bucket,
+                    key,
+                    self.manifest.version_id,
+                )
+                .ok()?,
+            )
+        };
+        Some(SyncHop {
+            relationship_id: sync.relationship_id,
+            from,
+        })
     }
 
     fn incoming_logical_bytes(&self) -> Result<u64, IncomingVersionError> {
@@ -980,6 +1072,7 @@ impl IncomingVersionOperation {
             Some(pending) => (Some(pending.pointer), pending.current_hash),
             None => (None, None),
         };
+        self.installed_head = pointer.clone();
         let effects = match build_transition_effects(&context, pointer, current_hash, self.txn_id) {
             Ok(effects) => effects,
             Err(err) => return self.fail(err.into()),
@@ -1015,6 +1108,7 @@ impl IncomingVersionOperation {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         }
     }
 
@@ -1046,6 +1140,9 @@ impl IncomingVersionOperation {
     }
 
     fn check_permissions(&mut self, group_id: Ulid) -> Effects {
+        if self.manifest.distribution.is_some() {
+            return self.read_publication_record(false);
+        }
         let path = self.target_authorization_path(group_id);
         if self.manifest_policy.as_deref() != Some(path.as_str()) {
             return self.reject_negotiation(IncomingVersionError::ManifestPermissionDenied);
@@ -1833,9 +1930,10 @@ impl IncomingVersionOperation {
             let advanced = CurrentVersionPointer::new_with_generation(
                 self.manifest.version_id,
                 advance.generation,
-            );
+            )
+            .with_epoch(self.original_epoch());
             if self.advance_version_exists
-                && (advanced == pointer || pointer.generation > advance.generation)
+                && (advanced == pointer || pointer.order() > advanced.order())
             {
                 self.existing_current_pointer = Some(pointer);
                 self.object_delta = 0;
@@ -1861,7 +1959,8 @@ impl IncomingVersionOperation {
         let candidate = CurrentVersionPointer::new_with_generation(
             self.manifest.version_id,
             incoming_generation,
-        );
+        )
+        .with_epoch(self.original_epoch());
         let should_write = candidate.supersedes(existing_pointer.as_ref());
 
         self.existing_current_pointer = existing_pointer.clone();
@@ -1891,6 +1990,25 @@ impl IncomingVersionOperation {
 
     fn write_version(&mut self) -> Effects {
         self.write_blob_version()
+    }
+
+    /// The manifest's epoch inside a distributed bucket; an ordinary bucket keeps 0, so its
+    /// heads order by generation exactly as before.
+    fn original_epoch(&self) -> OriginalEpoch {
+        match self.destination_bound {
+            true => self.manifest.original_epoch,
+            false => OriginalEpoch::default(),
+        }
+    }
+
+    /// The generation the version was written as, kept inside a distributed bucket whether
+    /// or not it is the current version; an ordinary bucket keeps 0.
+    fn version_generation(&self) -> u64 {
+        match (self.destination_bound, self.manifest.version_generation) {
+            (false, _) => 0,
+            (true, 0) => self.manifest.current_version_generation.unwrap_or_default(),
+            (true, generation) => generation,
+        }
     }
 
     fn write_blob_version(&mut self) -> Effects {
@@ -1981,10 +2099,17 @@ impl IncomingVersionOperation {
             ),
         };
 
+        let version = self.stamped(version);
+        self.written_identity = logical_identity(&version);
+        self.written_pending = matches!(version.state, BlobVersionState::PendingContent { .. });
         let effect = match write_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),
         };
+        // A member keeps the receipt of a pulled version, so a later coordinator answers replays.
+        if let Some(receipt) = self.pull_receipt() {
+            self.pending_version_effects.push_back(receipt);
+        }
         // The envelope, its mappings and usage are published with the version they name.
         if let (Some(envelope), Some(received)) = (&self.envelope, &self.received_blob) {
             let rows = (
@@ -2130,6 +2255,7 @@ impl IncomingVersionOperation {
                 blake3,
                 realm_id: self.local_realm_id,
                 ttl_ms: self.rocrate_limits.holder_ttl_ms,
+                announce: !self.destination_bound,
             },
             // A pending archive is kept while its pending location names it.
             None if location.format.bucket_key().is_some() => WriteOwner::Pending,
@@ -2198,6 +2324,54 @@ impl IncomingVersionOperation {
         })
     }
 
+    /// The receipt row of a device pull the received version of a distributed bucket records.
+    fn pull_receipt(&self) -> Option<Effect> {
+        self.destination_binding.as_ref()?;
+        let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
+        let target = (self.manifest.bucket.as_str(), self.manifest.key.as_str());
+        let key = tagged_receipt(target, &self.manifest.metadata, marker)?;
+        Some(Effect::Storage(StorageEffect::Write {
+            key_space: SYNC_RECEIPT_KEYSPACE.to_string(),
+            key: key.into(),
+            value: self.manifest.version_id.to_bytes().to_vec().into(),
+            txn_id: self.txn_id,
+        }))
+    }
+
+    /// The received version and, when this apply installs it, the head of a distributed bucket.
+    fn inventory_change(&self) -> Option<InventoryChange> {
+        let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
+        let size = match marker {
+            true => 0,
+            false => self.incoming_logical_bytes().unwrap_or_default(),
+        };
+        let added = AddedVersion {
+            version_id: self.manifest.version_id,
+            epoch: self.original_epoch(),
+            generation: self.version_generation(),
+            entry: VersionEntry {
+                marker,
+                size,
+                referenced: self.is_reference_item(),
+                identity: self.written_identity,
+                pending: self.written_pending,
+            },
+        };
+        let head = self.installed_head.is_some();
+        let mut change = version_written(
+            self.destination_binding.as_ref(),
+            &self.manifest.key,
+            added,
+            head,
+        )?;
+        // A reference carries its source root, which a member taking over the range checks.
+        let source = self.manifest.source.as_ref();
+        change.root = source
+            .filter(|_| self.is_reference_item())
+            .and_then(RootEntry::of);
+        Some(change)
+    }
+
     fn start_commit_quota(&mut self) -> Effects {
         let Some(group_id) = self.destination_group_id else {
             return self.fail(IncomingVersionError::DestinationNotFound);
@@ -2208,9 +2382,11 @@ impl IncomingVersionOperation {
         };
         let marker = self.manifest.kind == ReplicationItemKind::DeleteMarker;
         let row = RowChange::written(self.existing_marker, marker);
+        let inventory = self.inventory_change();
         if marker {
             let update = UsageCounterUpdate::for_group(group_id, group_delta)
-                .in_bucket(&self.manifest.bucket, row);
+                .in_bucket(&self.manifest.bucket, row)
+                .with_inventory(inventory);
             if update.is_noop() {
                 return self.commit_or_cleanup();
             }
@@ -2219,7 +2395,8 @@ impl IncomingVersionOperation {
         }
         if self.is_reference_item() {
             let update = UsageCounterUpdate::for_group(group_id, group_delta)
-                .in_bucket(&self.manifest.bucket, row);
+                .in_bucket(&self.manifest.bucket, row)
+                .with_inventory(inventory);
             if self.manifest.reference_advance.is_some() && update.is_noop() {
                 return self.commit_or_cleanup();
             }
@@ -2236,7 +2413,11 @@ impl IncomingVersionOperation {
                 None => return self.fail(IncomingVersionError::MissingBlobInfo),
             },
         };
-        self.usage_update = Some(update.in_bucket(&self.manifest.bucket, row));
+        self.usage_update = Some(
+            update
+                .in_bucket(&self.manifest.bucket, row)
+                .with_inventory(inventory),
+        );
         let Some(txn_id) = self.txn_id else {
             return self.fail(IncomingVersionError::StorageError(
                 StorageError::TransactionNotFound,
@@ -2351,7 +2532,8 @@ impl IncomingVersionOperation {
     }
 
     fn register_blob_dht(&mut self) -> Effects {
-        if self.is_reference_item() {
+        // Distributed buckets are found through their content indexes, not the DHT.
+        if self.is_reference_item() || self.destination_bound {
             return self.send_apply_complete();
         }
         let Ok(location) = self.effective_materialized_location() else {
@@ -2494,7 +2676,7 @@ impl IncomingVersionOperation {
         }
 
         let Some(value) = value else {
-            if self.create_attempted {
+            if self.create_attempted || self.manifest.distribution.is_some() {
                 return self.reject_negotiation(IncomingVersionError::DestinationNotFound);
             }
             if self.manifest.reference_advance.is_some() {
@@ -2526,6 +2708,11 @@ impl IncomingVersionOperation {
         self.gated_bucket = Some(GatedBucket::observe(Some(&bucket_info)));
         self.destination_rules = bucket_info.storage_routing;
         self.destination_compression = bucket_info.compression;
+        self.destination_bound = bucket_info.distribution.is_some();
+        self.destination_binding = bucket_info.distribution.clone();
+        if self.destination_bound != self.manifest.distribution.is_some() {
+            return self.reject_negotiation(IncomingVersionError::ForeignPublication);
+        }
         let Some(key) = settings
             .active_key()
             .filter(|_| self.manifest.kind == ReplicationItemKind::Materialized)
@@ -2628,12 +2815,16 @@ impl IncomingVersionOperation {
                 Err(error) => return self.fail(error.into()),
             };
             self.existing_marker = Some(existing.is_deleted());
+            // The origin is fixed at mint, so a replay must carry the stored one.
+            if existing.origin.is_some() && existing.origin != self.manifest.version_origin {
+                return self.reject_negotiation(IncomingVersionError::OriginMismatch);
+            }
             if self.manifest.reference_advance.is_some() {
                 let incoming = match self.reference_version() {
                     Ok(incoming) => incoming,
                     Err(error) => return self.reject_negotiation(error),
                 };
-                if existing != incoming {
+                if !same_reference(&existing, &incoming) {
                     return self.reject_negotiation(IncomingVersionError::InvalidReferenceAdvance);
                 }
                 self.replaced_reference_bytes = self
@@ -2656,7 +2847,7 @@ impl IncomingVersionOperation {
                             Ok(incoming) => incoming,
                             Err(error) => return self.fail(error),
                         };
-                        if existing == incoming {
+                        if same_reference(&existing, &incoming) {
                             return self.send_negotiation(
                                 ReplicationNegotiationResult::AlreadyReplicatedVersion,
                             );
@@ -3074,6 +3265,13 @@ impl IncomingVersionOperation {
             Ok(split) => split,
             Err(error) => return self.fail(error.into()),
         };
+        // A bucket bound or replaced since the negotiation takes nothing from this stream.
+        let binding = bucket
+            .as_ref()
+            .and_then(|bucket| bucket.distribution.clone());
+        if binding != self.destination_binding {
+            return self.fail(IncomingVersionError::ForeignPublication);
+        }
         let observed = GatedBucket::observe(bucket.as_ref());
         if let Some(gated) = self.gated_bucket.as_ref() {
             if !gated.matches(&observed) {
@@ -3098,7 +3296,10 @@ impl IncomingVersionOperation {
         {
             return self.fail(StorageError::TransactionConflict.into());
         }
-        self.verify_replaced()
+        match self.manifest.distribution {
+            Some(_) => self.read_publication_record(true),
+            None => self.verify_replaced(),
+        }
     }
 }
 
@@ -3333,6 +3534,7 @@ impl IncomingVersionOperation {
         let incoming_generation = self.manifest.current_version_generation;
         let pointer_will_update = incoming_generation.is_some_and(|generation| {
             CurrentVersionPointer::new_with_generation(self.manifest.version_id, generation)
+                .with_epoch(self.original_epoch())
                 .supersedes(existing_pointer.as_ref())
         });
         debug!(
@@ -3643,6 +3845,24 @@ impl IncomingVersionOperation {
     }
 }
 
+/// Whether a stored version is the incoming one; a local refresh changes only `last_refresh`.
+fn same_reference(existing: &BlobVersion, incoming: &BlobVersion) -> bool {
+    let mut existing = existing.clone();
+    if let (
+        BlobVersionState::Reference { last_refresh, .. },
+        BlobVersionState::Reference {
+            last_refresh: incoming_refresh,
+            ..
+        },
+    ) = (&mut existing.state, &incoming.state)
+    {
+        *last_refresh = *incoming_refresh;
+    }
+    existing == *incoming
+}
+
+mod admission;
+
 #[cfg(test)]
 mod pure_tests;
 
@@ -3650,3 +3870,7 @@ mod pure_tests;
 /// without a compliant local destination, and a reference registers nothing.
 #[cfg(test)]
 mod decision_tests;
+
+#[cfg(test)]
+#[path = "admission_tests.rs"]
+mod admission_tests;

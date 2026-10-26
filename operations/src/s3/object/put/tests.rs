@@ -146,6 +146,7 @@ fn guard_allows_edit() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let edited = BucketInfo {
         cors_configuration: Some(
@@ -199,6 +200,7 @@ fn stale_encoding_rejected() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Zstd { level: 3 },
+        distribution: None,
     };
     let mut op = PutObjectOperation::new(config);
     op.state = PutObjectState::StartTransaction;
@@ -242,6 +244,7 @@ fn recreate_rejected() {
         placement_policies: Vec::new(),
         placement_policy_generation: 0,
         compression: Compression::Off,
+        distribution: None,
     };
     let recreated = BucketInfo {
         created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
@@ -795,6 +798,7 @@ fn release_on_failure() {
                     blake3: [7u8; 32],
                     realm_id,
                     ttl_ms: super::RoCrateLimits::default().holder_ttl_ms,
+                    announce: true,
                 },
             })
             .is_some()
@@ -948,6 +952,7 @@ fn unknown_keeps_blob() {
                     blake3: [7u8; 32],
                     realm_id,
                     ttl_ms: super::RoCrateLimits::default().holder_ttl_ms,
+                    announce: true,
                 },
             }
         );
@@ -1459,6 +1464,7 @@ async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) 
         storage_handle.clone(),
         net_handle.clone(),
         EgressPolicy::loopback(),
+        None,
     )
     .await
     .unwrap();
@@ -2609,6 +2615,8 @@ mod sealed {
                     value: None,
                 })
             };
+            // The rebuild marker, the realm config and the local counter are absent.
+            op.step(empty());
             op.step(empty());
             op.step(empty());
             effects = op.step(Event::Storage(StorageEvent::IterResult {
@@ -2632,6 +2640,61 @@ mod sealed {
         assert!(refused(quota_charge(0, 3)));
         assert!(!refused(quota_charge(0, 2)));
         assert!(!refused(quota_charge(1, 1)));
+    }
+
+    /// While usage is rebuilt a write for a group with a quota is refused as retryable; a
+    /// group without a quota never reads the marker and books its usage.
+    #[test]
+    fn rebuild_refuses_quota() {
+        use aruna_core::structs::storage::usage::{USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY};
+        for ceiling in [Some(u64::MAX), None] {
+            let mut op = operation();
+            op.config.quota_ceiling = ceiling;
+            let mut location = test_location(op.config.user_id);
+            location.blob_size = 1;
+            location.hashes.insert(
+                aruna_core::structs::checksum::HASH_BLAKE3.to_string(),
+                vec![5; 32],
+            );
+            op.txn_id = Some(Ulid::generate());
+            op.output = Some(Ok(location));
+            op.state = PutObjectState::WriteReplicationObligation;
+            let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+                key: b"obligation".to_vec().into(),
+            }));
+            if ceiling.is_none() {
+                assert!(matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::AddUsage { .. })]
+                ));
+                continue;
+            }
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Read { key, .. })] if key.as_ref() == USAGE_REBUILD_KEY
+            ));
+            let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+                key: USAGE_REBUILD_KEY.to_vec().into(),
+                value: Some(Vec::new().into()),
+            }));
+            // No earlier rebuild completed the counters, so nothing backs the quota.
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Read { key, .. })] if key.as_ref() == USAGE_COMPLETE_KEY
+            ));
+            let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+                key: USAGE_COMPLETE_KEY.to_vec().into(),
+                value: None,
+            }));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+            ));
+            assert_eq!(
+                op.cleanup.take_error(),
+                Some(PutObjectError::UsageRebuilding)
+            );
+        }
     }
 }
 
@@ -2718,4 +2781,64 @@ async fn plain_owns_copy() {
         };
         assert_eq!(&BackendLocation::from_bytes(&value).unwrap(), written);
     }
+}
+
+/// Starts a put into a bucket bound as member `seed` of the two-shard test set and answers
+/// the bucket and record reads; the key "some-file.txt" lies in member 2's range.
+fn bound_put(seed: u8) -> (PutObjectOperation, aruna_core::types::Effects) {
+    use crate::distribution::test_record::{binding, record};
+    use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+    let (snapshot, bytes) = record(true);
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let config = put_config(realm_id, group_id, iroh::SecretKey::generate().public());
+    let bucket = BucketInfo {
+        group_id,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: config.user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(binding(&snapshot, seed, 5)),
+    };
+    let mut op = PutObjectOperation::new(config);
+    op.start();
+    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"mybucket".to_vec().into(),
+        value: Some(bucket.to_bytes().unwrap().into()),
+    }));
+    let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+        panic!("a bound bucket reads its record and fence first, got {effects:?}");
+    };
+    assert_eq!(reads[0].0, DISTRIBUTION_KEYSPACE);
+    let answer = crate::distribution::test_record::authority_rows(Some(bytes), None);
+    let effects = op.step(answer);
+    (op, effects)
+}
+
+#[test]
+fn coordinator_stamps_put() {
+    let (op, effects) = bound_put(2);
+    assert_eq!(
+        op.version_epoch,
+        aruna_core::structs::storage::distribution::OriginalEpoch(1)
+    );
+    let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+        panic!("the coordinator continues with the purge fence, got {effects:?}");
+    };
+    assert_eq!(key_space, PURGE_FENCE_KEYSPACE);
+}
+
+#[test]
+fn member_put_refused() {
+    let (op, effects) = bound_put(1);
+    assert!(effects.is_empty());
+    assert!(matches!(
+        op.finalize(),
+        Err(PutObjectError::Distribution(
+            crate::distribution::guard::GuardError::NotCoordinator { .. }
+        ))
+    ));
 }

@@ -1,0 +1,790 @@
+//! Bootstraps a catching-up member from its coordinators: bounded pages over the ordered
+//! inventory with a durable cursor, each waiting for its jobs while live publications overlap.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+// A coordinator whose walks all ended states the catch-up to the record's publisher.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use aruna_core::NodeId;
+use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, StatementSignEvent, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::{
+    BOOTSTRAP_KEYSPACE, CATCH_UP_KEYSPACE, INVENTORY_KEYSPACE, REPLICATION_JOB_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::distribution::bootstrap::{
+    BootstrapCursor, bootstrap_key, bootstrap_prefix,
+};
+use aruna_core::structs::storage::distribution::inventory::{
+    Entry, Position, VersionEntry, range_interval,
+};
+use aruna_core::structs::storage::distribution::{
+    DistributionMember, DistributionSnapshot, KeyRange, Statement, StatementClaim,
+};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_storage::StorageHandle;
+use smallvec::smallvec;
+use thiserror::Error;
+use tracing::{debug, warn};
+use ulid::Ulid;
+
+use super::members::{MemberTarget, read_record};
+use super::protocol::ReplicationMode;
+use super::queue::{BlobJobRecord, blob_job_key, schedule_blob_drain};
+use super::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
+use crate::distribution::create::submit;
+use crate::distribution::lifecycle::settle_marker;
+use crate::distribution::sign_statement;
+use crate::driver::{DriverContext, drive};
+use crate::s3::bucket::get::GetBucketOperation;
+
+/// Inventory rows one page queues at most; the next page waits until they are delivered.
+const PAGE_ROWS: usize = 64;
+const PAGE_BYTES: usize = 1 << 20;
+/// Sets and pages one drain works on at most.
+const SET_BATCH: usize = 16;
+const PAGE_BUDGET: usize = 32;
+/// Rows one drain deletes at most while it clears the cursors of a settled set.
+const CLEAR_BATCH: usize = 1024;
+/// How soon the drain looks again while a bootstrap waits for its jobs.
+pub const BOOTSTRAP_POLL: Duration = Duration::from_secs(5);
+/// The set after which the next drain continues; a restart begins at the first set.
+static SET_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// The range each walk of a set and member continues at, so later ranges get their turn.
+static RANGE_TURNS: Mutex<Option<HashMap<(Ulid, Ulid), usize>>> = Mutex::new(None);
+
+/// One page of one range's walk for one catching-up member.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageConfig {
+    pub realm_id: RealmId,
+    pub bucket: String,
+    pub set_id: Ulid,
+    pub member_id: Ulid,
+    pub node_id: NodeId,
+    pub intent: [u8; 32],
+    pub range: KeyRange,
+    pub now_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageProgress {
+    /// The previous page is still being delivered.
+    Waiting,
+    Queued(usize),
+    /// Everything up to the watermark was delivered.
+    Done {
+        watermark: u64,
+    },
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum BootstrapError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error("operation did not finish")]
+    NotFinished,
+    #[error("unexpected event in state {state}: got {got}")]
+    UnexpectedEvent { state: &'static str, got: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageState {
+    Init,
+    Start,
+    ReadCursor,
+    ReadPending,
+    ReadPage,
+    Write,
+    Commit,
+    Abort,
+    Finish,
+    Error,
+}
+
+/// Advances one cursor by one page in one transaction: the cursor and the page's jobs commit
+/// together, so a crash repeats at most the last page.
+#[derive(Debug, PartialEq)]
+pub struct BootstrapPage {
+    config: PageConfig,
+    state: PageState,
+    txn_id: Option<TxnId>,
+    cursor: BootstrapCursor,
+    progress: Option<PageProgress>,
+    output: Option<Result<PageProgress, BootstrapError>>,
+}
+
+impl BootstrapPage {
+    pub fn new(config: PageConfig) -> Self {
+        let cursor = BootstrapCursor::start(config.intent, config.now_ms);
+        Self {
+            config,
+            state: PageState::Init,
+            txn_id: None,
+            cursor,
+            progress: None,
+            output: None,
+        }
+    }
+
+    fn key(&self) -> Vec<u8> {
+        let config = &self.config;
+        bootstrap_key(config.set_id, config.member_id, config.range.range_id)
+    }
+
+    fn fail(&mut self, error: BootstrapError) -> Effects {
+        self.state = PageState::Error;
+        self.output = Some(Err(error));
+        match self.txn_id.take() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
+    }
+
+    fn unexpected(&mut self, event: Event) -> Effects {
+        let state = match self.state {
+            PageState::Start => "Start",
+            PageState::ReadCursor => "ReadCursor",
+            PageState::ReadPending => "ReadPending",
+            PageState::ReadPage => "ReadPage",
+            PageState::Write => "Write",
+            PageState::Commit => "Commit",
+            PageState::Abort => "Abort",
+            PageState::Init | PageState::Finish | PageState::Error => "Idle",
+        };
+        let got = format!("{event:?}");
+        self.fail(BootstrapError::UnexpectedEvent { state, got })
+    }
+
+    /// Ends without a write, keeping the cursor as it is.
+    fn settle(&mut self, progress: PageProgress) -> Effects {
+        self.progress = Some(progress);
+        match self.txn_id.take() {
+            Some(txn_id) => {
+                self.state = PageState::Abort;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            None => self.finish(),
+        }
+    }
+
+    fn finish(&mut self) -> Effects {
+        self.state = PageState::Finish;
+        self.output = self.progress.map(Ok);
+        smallvec![]
+    }
+
+    fn accept_cursor(&mut self, value: Option<Value>) -> Result<Effects, BootstrapError> {
+        if let Some(stored) = value
+            .map(|value| BootstrapCursor::from_bytes(&value))
+            .transpose()?
+        {
+            // A cursor of an earlier intent belongs to a former catch-up; this one starts over.
+            if stored.intent == self.config.intent {
+                self.cursor = stored;
+            }
+        }
+        if self.cursor.done {
+            let watermark = self.cursor.watermark;
+            return Ok(self.settle(PageProgress::Done { watermark }));
+        }
+        if self.cursor.pending.is_empty() {
+            return self.next_page();
+        }
+        self.state = PageState::ReadPending;
+        let reads = (self.cursor.pending.iter())
+            .map(|key| (REPLICATION_JOB_KEYSPACE.to_string(), Key::from(key.clone())))
+            .collect();
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })])
+    }
+
+    fn accept_pending(
+        &mut self,
+        values: Vec<(Key, Option<Value>)>,
+    ) -> Result<Effects, BootstrapError> {
+        if values.iter().any(|(_, value)| value.is_some()) {
+            return Ok(self.settle(PageProgress::Waiting));
+        }
+        self.cursor.pending.clear();
+        self.next_page()
+    }
+
+    /// Reads the next page outside the transaction: live writes into the range never conflict
+    /// a page, because the comparator orders whatever arrives twice.
+    fn next_page(&mut self) -> Result<Effects, BootstrapError> {
+        if self.cursor.walked {
+            self.cursor.done = true;
+            let watermark = self.cursor.watermark;
+            self.progress = Some(PageProgress::Done { watermark });
+            return self.write(Vec::new());
+        }
+        let range = &self.config.range;
+        let (lower, upper) =
+            range_interval(self.config.set_id, &range.lower, range.upper.as_deref());
+        let start = match &self.cursor.after {
+            Some(after) => IterStart::After(after.clone().into()),
+            None => IterStart::At(lower.into()),
+        };
+        self.state = PageState::ReadPage;
+        Ok(smallvec![Effect::Storage(StorageEffect::IterRange {
+            key_space: INVENTORY_KEYSPACE.to_string(),
+            start,
+            end: IterEnd::Before(upper.into()),
+            limit: PAGE_ROWS,
+            max_bytes: PAGE_BYTES,
+            txn_id: None,
+        })])
+    }
+
+    fn accept_page(
+        &mut self,
+        values: Vec<(Key, Value)>,
+        more: bool,
+    ) -> Result<Effects, BootstrapError> {
+        let mut writes = Vec::new();
+        let mut pending = Vec::new();
+        for (key, value) in &values {
+            let position = Position::decode(key)?;
+            let Entry::Version { version_id, .. } = position.entry else {
+                continue;
+            };
+            let marker = VersionEntry::from_bytes(value)?.marker;
+            let job = self.job(position.key, version_id, marker);
+            let job_key = blob_job_key(&job)?;
+            pending.push(job_key.to_vec());
+            writes.push((
+                REPLICATION_JOB_KEYSPACE.to_string(),
+                job_key,
+                job.to_bytes()?.into(),
+            ));
+        }
+        if let Some((last, _)) = values.last() {
+            self.cursor.after = Some(last.to_vec());
+        }
+        self.progress = Some(PageProgress::Queued(pending.len()));
+        self.cursor.pending = pending;
+        self.cursor.walked = !more;
+        self.write(writes)
+    }
+
+    fn job(&self, key: String, version_id: Ulid, marker: bool) -> BlobJobRecord {
+        let config = &self.config;
+        let input = ReplicateScopeInput {
+            bucket: config.bucket.clone(),
+            target: ReplicateScopeTarget::Version { key, version_id },
+            target_node_id: config.node_id,
+            auth_context: AuthContext::anonymous(config.realm_id),
+            replicate_delete_markers: true,
+            mode: ReplicationMode::Live,
+        };
+        BlobJobRecord::new(input, Some(marker), config.now_ms).with_member(MemberTarget {
+            set_id: config.set_id,
+            member_id: config.member_id,
+        })
+    }
+
+    fn write(&mut self, mut writes: Vec<(String, Key, Value)>) -> Result<Effects, BootstrapError> {
+        let Some(txn_id) = self.txn_id else {
+            return Err(StorageError::TransactionNotFound.into());
+        };
+        let cursor = self.cursor.to_bytes()?;
+        writes.push((
+            BOOTSTRAP_KEYSPACE.to_string(),
+            self.key().into(),
+            cursor.into(),
+        ));
+        self.state = PageState::Write;
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(txn_id),
+        })])
+    }
+}
+
+impl Operation for BootstrapPage {
+    type Output = PageProgress;
+    type Error = BootstrapError;
+
+    fn start(&mut self) -> Effects {
+        self.state = PageState::Start;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let result = match (self.state, event) {
+            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (PageState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.txn_id = Some(txn_id);
+                self.state = PageState::ReadCursor;
+                Ok(smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: BOOTSTRAP_KEYSPACE.to_string(),
+                    key: self.key().into(),
+                    txn_id: Some(txn_id),
+                })])
+            }
+            (PageState::ReadCursor, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.accept_cursor(value)
+            }
+            (PageState::ReadPending, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.accept_pending(values)
+            }
+            (
+                PageState::ReadPage,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.accept_page(values, next_start_after.is_some()),
+            (PageState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                match self.txn_id.take() {
+                    Some(txn_id) => {
+                        self.state = PageState::Commit;
+                        Ok(smallvec![Effect::Storage(
+                            StorageEffect::CommitTransaction { txn_id }
+                        )])
+                    }
+                    None => Err(StorageError::TransactionNotFound.into()),
+                }
+            }
+            (PageState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. }))
+            | (PageState::Abort, Event::Storage(StorageEvent::TransactionAborted { .. })) => {
+                Ok(self.finish())
+            }
+            (_, event) => return self.unexpected(event),
+        };
+        result.unwrap_or_else(|error| self.fail(error))
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, PageState::Finish | PageState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(BootstrapError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        match self.txn_id.take() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
+    }
+}
+
+/// Rows of one keyspace under `prefix` after `after`, at most `limit`.
+async fn scan(
+    context: &DriverContext,
+    key_space: &str,
+    (prefix, after): (Option<Vec<u8>>, Option<Vec<u8>>),
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Value)>, String> {
+    let iter = StorageEffect::Iter {
+        key_space: key_space.to_string(),
+        prefix: prefix.map(Key::from),
+        start: after.map(|key| IterStart::After(key.into())),
+        limit,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(iter).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values
+            .into_iter()
+            .map(|(key, value)| (key.to_vec(), value))
+            .collect()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected scan answer {other:?}")),
+    }
+}
+
+async fn delete(context: &DriverContext, deletes: Vec<(String, Key)>) -> Result<(), String> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    let effect = StorageEffect::BatchDelete {
+        deletes,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected delete answer {other:?}")),
+    }
+}
+
+/// One stored cursor, read on its own key.
+async fn read_cursor(
+    context: &DriverContext,
+    key: Vec<u8>,
+) -> Result<Option<BootstrapCursor>, String> {
+    let read = StorageEffect::Read {
+        key_space: BOOTSTRAP_KEYSPACE.to_string(),
+        key: key.into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| BootstrapCursor::from_bytes(&value))
+            .transpose()
+            .map_err(|error| error.to_string()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected cursor answer {other:?}")),
+    }
+}
+
+/// The range index a walk continues at; with `next` it records where the next walk starts.
+fn turn(walk: (Ulid, Ulid), next: Option<usize>) -> usize {
+    let Ok(mut turns) = RANGE_TURNS.lock() else {
+        return 0;
+    };
+    let turns = turns.get_or_insert_with(HashMap::new);
+    match next {
+        Some(index) => {
+            turns.insert(walk, index);
+            index
+        }
+        None => turns.get(&walk).copied().unwrap_or(0),
+    }
+}
+
+/// Wakes the replication drain when a set waits for its bootstrap.
+pub async fn wake_bootstrap(context: &DriverContext) {
+    if let Some(task) = context.task_handle.as_ref()
+        && bootstrap_waiting(&context.storage_handle).await
+    {
+        task.send_effect(schedule_blob_drain()).await;
+    }
+}
+
+/// Whether any set still waits for its bootstrap here.
+pub async fn bootstrap_waiting(storage: &StorageHandle) -> bool {
+    let iter = StorageEffect::Iter {
+        key_space: CATCH_UP_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: 1,
+        txn_id: None,
+    };
+    matches!(
+        storage.send_storage_effect(iter).await,
+        Event::Storage(StorageEvent::IterResult { values, .. }) if !values.is_empty()
+    )
+}
+
+/// Works on the sets that name catching-up members, within the drain's page budget. Returns
+/// whether some bootstrap still waits, so the drain looks again soon.
+pub async fn process_bootstrap(context: &DriverContext) -> Result<bool, String> {
+    let Some(net) = context.net_handle.as_ref() else {
+        return Ok(false);
+    };
+    let (realm_id, local) = (*net.realm_id(), net.node_id());
+    let mut budget = PAGE_BUDGET;
+    let mut waiting = false;
+    // Sets after the last batch come next, so waiting sets never starve later ones.
+    let after = SET_CURSOR
+        .lock()
+        .map(|cursor| cursor.clone())
+        .unwrap_or(None);
+    let rows = scan(context, CATCH_UP_KEYSPACE, (None, after), SET_BATCH).await?;
+    let next = (rows.len() == SET_BATCH)
+        .then(|| rows.last().map(|(key, _)| key.clone()))
+        .flatten();
+    if let Ok(mut cursor) = SET_CURSOR.lock() {
+        *cursor = next.clone();
+    }
+    // A pass that stopped short of the end looks again soon.
+    waiting |= next.is_some();
+    for (key, seen) in rows {
+        let Ok(set_id) = <[u8; 16]>::try_from(key.as_slice()).map(Ulid::from_bytes) else {
+            delete(context, vec![(CATCH_UP_KEYSPACE.to_string(), key.into())]).await?;
+            continue;
+        };
+        let walk = SetWalk {
+            realm_id,
+            local,
+            set_id,
+        };
+        match walk.run(context, &mut budget).await {
+            Ok(Outcome::Settled) => settle_marker(context, CATCH_UP_KEYSPACE, &key, &seen).await?,
+            Ok(Outcome::Waiting) => waiting = true,
+            Ok(Outcome::Stated) => {}
+            Err(error) => {
+                warn!(%set_id, %error, "Distributed bucket bootstrap failed; retrying");
+                waiting = true;
+            }
+        }
+    }
+    Ok(waiting)
+}
+
+/// What a drain left of one set's bootstraps on this node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Outcome {
+    /// Nothing is left to do; the set's row goes.
+    Settled,
+    /// A walk waits for its jobs or the drain's budget; the drain looks again soon.
+    Waiting,
+    /// The catch-up was stated; the record that makes the member ready settles the set.
+    Stated,
+}
+
+impl Outcome {
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Waiting, _) | (_, Self::Waiting) => Self::Waiting,
+            (Self::Stated, _) | (_, Self::Stated) => Self::Stated,
+            (Self::Settled, Self::Settled) => Self::Settled,
+        }
+    }
+}
+
+/// One set's bootstraps as seen by this node.
+struct SetWalk {
+    realm_id: RealmId,
+    local: NodeId,
+    set_id: Ulid,
+}
+
+impl SetWalk {
+    async fn run(&self, context: &DriverContext, budget: &mut usize) -> Result<Outcome, String> {
+        let Some(view) = read_record(context, self.set_id).await? else {
+            return Ok(Outcome::Settled);
+        };
+        let snapshot = view.head.snapshot;
+        let targets = snapshot.catching_up();
+        let local = snapshot
+            .config
+            .members
+            .iter()
+            .find(|m| m.node_id == self.local);
+        let (Some(local), false) = (local, targets.is_empty()) else {
+            return self.clear(context).await;
+        };
+        // Only the admitted incarnation of this member's bucket publishes.
+        let info = drive(
+            GetBucketOperation::new(snapshot.config.bucket.clone()),
+            context,
+        )
+        .await;
+        let bound = info
+            .ok()
+            .and_then(|info| info.distribution)
+            .is_some_and(|binding| {
+                binding.member_id == local.member_id
+                    && local.incarnation == Some(binding.incarnation)
+            });
+        if !bound {
+            return self.clear(context).await;
+        }
+        self.clear_departed(context, &targets).await?;
+        let mut outcome = Outcome::Settled;
+        for target in targets {
+            let walked = self.walk(context, &snapshot, local, target, budget).await?;
+            outcome = outcome.and(walked);
+        }
+        Ok(outcome)
+    }
+
+    /// Walks the ranges this node publishes to `target`; when every walk ended, states the
+    /// catch-up.
+    async fn walk(
+        &self,
+        context: &DriverContext,
+        snapshot: &DistributionSnapshot,
+        local: &DistributionMember,
+        target: &DistributionMember,
+        budget: &mut usize,
+    ) -> Result<Outcome, String> {
+        let ranges = snapshot.catch_up_ranges(local.member_id, target.member_id);
+        if ranges.is_empty() {
+            return Ok(Outcome::Settled);
+        }
+        let turns = (self.set_id, target.member_id);
+        let first = turn(turns, None) % ranges.len();
+        let mut watermark = u64::MAX;
+        let mut done = true;
+        let order = (first..ranges.len()).chain(0..first);
+        for index in order {
+            let range = ranges[index];
+            let key = bootstrap_key(self.set_id, target.member_id, range.range_id);
+            let own = (read_cursor(context, key).await?).filter(|c| c.intent == target.intent);
+            let cursor = match own {
+                Some(cursor) => Some(cursor),
+                None => self.seed_child(context, snapshot, target, range).await?,
+            };
+            if let Some(cursor) = cursor
+                && cursor.done
+            {
+                watermark = watermark.min(cursor.watermark);
+                continue;
+            }
+            if *budget == 0 {
+                // The next drain starts at this range; nothing is stated before all are done.
+                turn(turns, Some(index));
+                done = false;
+                break;
+            }
+            *budget -= 1;
+            let page = BootstrapPage::new(PageConfig {
+                realm_id: self.realm_id,
+                bucket: snapshot.config.bucket.clone(),
+                set_id: self.set_id,
+                member_id: target.member_id,
+                node_id: target.node_id,
+                intent: target.intent,
+                range: range.clone(),
+                now_ms: unix_timestamp_millis(),
+            });
+            match drive(page, context)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                PageProgress::Done { watermark: ended } => watermark = watermark.min(ended),
+                PageProgress::Waiting | PageProgress::Queued(_) => done = false,
+            }
+        }
+        if !done {
+            return Ok(Outcome::Waiting);
+        }
+        self.state(context, snapshot, local, target, watermark)
+            .await
+    }
+
+    /// Hands the signed catch-up to the publisher; the next record makes the member ready.
+    async fn state(
+        &self,
+        context: &DriverContext,
+        snapshot: &DistributionSnapshot,
+        local: &DistributionMember,
+        target: &DistributionMember,
+        watermark: u64,
+    ) -> Result<Outcome, String> {
+        let cover = snapshot.catch_up_cover(local.member_id, target.member_id);
+        let statement =
+            Statement::caught_up(self.realm_id, self.set_id, local, target, cover, watermark);
+        let claim = StatementClaim {
+            signer: self.local,
+            statement,
+        };
+        let signed = match sign_statement(context, claim) {
+            StatementSignEvent::Signed(signed) => *signed,
+            StatementSignEvent::Unavailable(reason) => return Err(reason),
+        };
+        let publisher = snapshot.root.publisher;
+        let shared = Arc::new(context.clone());
+        match submit(&shared, publisher, self.local, signed).await {
+            Ok(()) => Ok(Outcome::Stated),
+            Err(refusal) => {
+                debug!(set_id = %self.set_id, member_id = %target.member_id, %refusal, "Catch-up statement not taken yet");
+                Ok(Outcome::Waiting)
+            }
+        }
+    }
+
+    /// A split child of a walked range continues from its ancestor's cursor instead of walking
+    /// again from the start; the derived cursor is stored for the page that follows. Only a
+    /// child without a cursor of its own is seeded, so an ancestor never resets its progress.
+    async fn seed_child(
+        &self,
+        context: &DriverContext,
+        snapshot: &DistributionSnapshot,
+        target: &DistributionMember,
+        range: &KeyRange,
+    ) -> Result<Option<BootstrapCursor>, String> {
+        let own = bootstrap_key(self.set_id, target.member_id, range.range_id);
+        if read_cursor(context, own.clone()).await?.is_some() {
+            // A cursor of a former intent starts over in the page, never from an ancestor.
+            return Ok(None);
+        }
+        let mut ancestor = range.lineage;
+        for _ in 0..=snapshot.retired.len() {
+            let Some(id) = ancestor else {
+                return Ok(None);
+            };
+            let key = bootstrap_key(self.set_id, target.member_id, id);
+            let parent = (read_cursor(context, key).await?).filter(|c| c.intent == target.intent);
+            if let Some(parent) = parent {
+                let child = parent.for_child(self.set_id, range);
+                let bytes = child.to_bytes().map_err(|error| error.to_string())?;
+                let write = StorageEffect::Write {
+                    key_space: BOOTSTRAP_KEYSPACE.to_string(),
+                    key: own.into(),
+                    value: bytes.into(),
+                    txn_id: None,
+                };
+                return match context.storage_handle.send_storage_effect(write).await {
+                    Event::Storage(StorageEvent::WriteResult { .. }) => Ok(Some(child)),
+                    other => Err(format!("a child cursor was not stored: {other:?}")),
+                };
+            }
+            ancestor = snapshot
+                .retired_range(id)
+                .and_then(|retired| retired.lineage);
+        }
+        Ok(None)
+    }
+
+    /// Deletes the cursors of members that no longer catch up, such as a member that left,
+    /// in one bounded batch per drain.
+    async fn clear_departed(
+        &self,
+        context: &DriverContext,
+        targets: &[&DistributionMember],
+    ) -> Result<(), String> {
+        let prefix = bootstrap_prefix(self.set_id);
+        let rows = scan(
+            context,
+            BOOTSTRAP_KEYSPACE,
+            (Some(prefix), None),
+            CLEAR_BATCH,
+        )
+        .await?;
+        let departed = |key: &[u8]| {
+            let member = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
+            member.is_some_and(|id| !targets.iter().any(|t| t.member_id.to_bytes() == id))
+        };
+        let deletes = (rows.into_iter())
+            .filter(|(key, _)| departed(key))
+            .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), Key::from(key)))
+            .collect();
+        delete(context, deletes).await
+    }
+
+    /// Deletes the set's cursors in bounded batches; settled once none is left.
+    async fn clear(&self, context: &DriverContext) -> Result<Outcome, String> {
+        let prefix = bootstrap_prefix(self.set_id);
+        let rows = scan(
+            context,
+            BOOTSTRAP_KEYSPACE,
+            (Some(prefix), None),
+            CLEAR_BATCH,
+        )
+        .await?;
+        let settled = rows.len() < CLEAR_BATCH;
+        let deletes = (rows.into_iter())
+            .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), Key::from(key)))
+            .collect();
+        delete(context, deletes).await?;
+        Ok(match settled {
+            true => Outcome::Settled,
+            false => Outcome::Waiting,
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "bootstrap_tests.rs"]
+mod tests;

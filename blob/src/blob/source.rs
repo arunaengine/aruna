@@ -7,7 +7,9 @@ use crate::opendal::{
     check_staging_source, head_staging_source, list_staging_source, read_staging_source,
 };
 use aruna_core::events::StagingSourceEvent;
-use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+use aruna_core::structs::execution::source_access::{
+    ListRequest, ResolvedSourceAccess, SourceMetadata,
+};
 
 impl BlobHandler {
     pub(crate) async fn check_staging_source(
@@ -34,8 +36,9 @@ impl BlobHandler {
         &self,
         access: ResolvedSourceAccess,
         range: Option<std::ops::Range<u64>>,
+        expected: Option<SourceMetadata>,
     ) -> StagingSourceEvent {
-        match read_staging_source(&self.egress, &access, range).await {
+        match read_staging_source(&self.egress, &access, range, expected.as_ref()).await {
             Ok((metadata, stream)) => StagingSourceEvent::ReadResult { metadata, stream },
             Err(error) => StagingSourceEvent::Error { error },
         }
@@ -44,14 +47,13 @@ impl BlobHandler {
     pub(crate) async fn list_staging_source(
         &self,
         access: ResolvedSourceAccess,
-        offset: usize,
-        limit: usize,
-        recursive: bool,
-        files_only: bool,
+        request: ListRequest,
     ) -> StagingSourceEvent {
-        match list_staging_source(&self.egress, &access, offset, limit, recursive, files_only).await
-        {
-            Ok((entries, truncated)) => StagingSourceEvent::ListResult { entries, truncated },
+        match list_staging_source(&self.egress, &access, &request).await {
+            Ok((entries, next_cursor)) => StagingSourceEvent::ListResult {
+                entries,
+                next_cursor,
+            },
             Err(error) => StagingSourceEvent::Error { error },
         }
     }

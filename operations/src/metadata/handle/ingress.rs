@@ -914,6 +914,19 @@ impl MetadataHandle {
                 })
                 .await
             }
+            admit @ MetadataTransportMessage::ForwardAdmitMember { .. } => {
+                Box::pin(async {
+                    crate::distribution::forward::serve_admission(context, peer, admit).await
+                })
+                .await
+            }
+            publish @ (MetadataTransportMessage::ForwardDistributionRequest { .. }
+            | MetadataTransportMessage::SubmitDistributionStatement { .. }) => {
+                Box::pin(async {
+                    crate::distribution::forward::serve_publish(context, peer, publish).await
+                })
+                .await
+            }
             fetch @ MetadataTransportMessage::FetchRealmDocuments { .. } => {
                 Box::pin(async {
                     crate::device::forward::serve_realm_documents(context, peer, fetch).await
@@ -1025,6 +1038,79 @@ impl MetadataHandle {
                 };
                 (MetadataTransportMessage::IdentifierMatches { result }, None)
             }
+            MetadataTransportMessage::DataLinks {
+                auth_token,
+                request,
+            } => {
+                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                    Ok(auth) => match self.inner.net_handle.as_ref() {
+                        Some(net_handle) => crate::metadata::api::links_local(
+                            context.as_ref(),
+                            *net_handle.realm_id(),
+                            auth.as_ref(),
+                            *request,
+                        )
+                        .await
+                        .map(Box::new)
+                        .map_err(crate::forward::transport::read_error),
+                        None => Err(MetadataReadError::Unavailable),
+                    },
+                    Err(error) => Err(error),
+                };
+                (MetadataTransportMessage::DataLinkResults { result }, None)
+            }
+            MetadataTransportMessage::BucketOwner { auth_token, bucket } => {
+                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                    Ok(Some(_)) => crate::driver::drive(
+                        crate::s3::bucket::get::GetBucketOperation::new(bucket),
+                        context.as_ref(),
+                    )
+                    .await
+                    .map(|info| info.group_id)
+                    .map_err(|error| match error {
+                        crate::s3::bucket::get::GetBucketError::NotFound => {
+                            MetadataReadError::NotFound
+                        }
+                        _ => MetadataReadError::Unavailable,
+                    }),
+                    Ok(None) => Err(MetadataReadError::Unauthorized),
+                    Err(error) => Err(error),
+                };
+                (MetadataTransportMessage::BucketOwnerResult { result }, None)
+            }
+            MetadataTransportMessage::SetPreview {
+                auth_token,
+                set_id,
+                limit,
+            } => {
+                let result = match self.authorize_read_peer(peer, auth_token, false).await {
+                    Ok(auth) => match self.inner.net_handle.as_ref() {
+                        Some(net_handle) => crate::metadata::api::set_preview_local(
+                            context.as_ref(),
+                            *net_handle.realm_id(),
+                            auth.as_ref(),
+                            set_id,
+                            None,
+                            limit,
+                        )
+                        .await
+                        .map(Box::new)
+                        .map_err(crate::forward::transport::read_error),
+                        None => Err(MetadataReadError::Unavailable),
+                    },
+                    Err(error) => Err(error),
+                };
+                (MetadataTransportMessage::SetPreviewResults { result }, None)
+            }
+            MetadataTransportMessage::StagingSpec {
+                transfer_id,
+                job_id,
+            } => {
+                let job = (transfer_id, job_id);
+                let spec = crate::distribution::imports::staging_spec(context, peer, job);
+                let result = spec.await.map(Box::new);
+                (MetadataTransportMessage::StagingSpecResult { result }, None)
+            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)
@@ -1061,6 +1147,9 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardCreateBucket { .. }
             | MetadataTransportMessage::ForwardNewBucket { .. }
             | MetadataTransportMessage::ForwardCheckBucket { .. }
+            | MetadataTransportMessage::ForwardAdmitMember { .. }
+            | MetadataTransportMessage::ForwardDistributionRequest { .. }
+            | MetadataTransportMessage::SubmitDistributionStatement { .. }
             | MetadataTransportMessage::FetchRealmDocuments { .. }
             | MetadataTransportMessage::FetchGraphState { .. }
             | MetadataTransportMessage::ForwardApplyBatch { .. }

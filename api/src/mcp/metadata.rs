@@ -556,6 +556,7 @@ impl McpServer {
                 predicate: input.predicate,
                 limit: input.limit,
                 resolve: false,
+                after: None,
             },
         )
         .await
@@ -761,6 +762,7 @@ pub(crate) async fn load_raw(
         limit: None,
         offset: None,
         after: None,
+        here: false,
     };
     let export = export_rocrate_routed(
         &server.state.get_ctx(),

@@ -114,6 +114,7 @@ pub(crate) fn map_references_response(
             .into_iter()
             .map(map_reference_entry)
             .collect(),
+        next_after: execution.next_after.map(|id| id.to_string()),
     }
 }
 
@@ -213,6 +214,20 @@ fn format_timestamp_ms(timestamp_ms: u64) -> String {
         .and_then(|timestamp_ms| Utc.timestamp_millis_opt(timestamp_ms).single())
         .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
+}
+
+/// The crate or entity with objects of local distributed member buckets named by global id.
+pub(crate) async fn with_global_ids(state: &ServerState, value: &Value) -> ServerResult<Value> {
+    let mut value = value.clone();
+    aruna_operations::metadata::global_entries::normalize_entries(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        &mut value,
+    )
+    .await
+    .map_err(ServerError::InternalError)?;
+    Ok(value)
 }
 
 pub(crate) fn serialize_jsonld_object(value: &Value) -> ServerResult<String> {

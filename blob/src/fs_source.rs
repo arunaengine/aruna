@@ -96,6 +96,7 @@ pub(crate) async fn head_local(
             etag: Some(weak_fingerprint(&entry_stat(&metadata))),
             last_modified: metadata.modified().ok().map(|time| time.into_std()),
             source_version: None,
+            digests: Default::default(),
         })
     })
     .await
@@ -117,6 +118,18 @@ pub(crate) async fn list_local(
     .map_err(|error| StagingSourceError::ListError(error.to_string()))?
 }
 
+/// Entries one local listing page may examine, skipped ones included.
+const MAX_LOCAL_EXAMINED: usize = 250_000;
+/// Directories one local listing page may hold queued at once.
+const MAX_LOCAL_QUEUED: usize = 50_000;
+
+/// How much raw traversal one local listing page may do before it fails.
+#[derive(Clone, Copy)]
+struct WalkBounds {
+    examined: usize,
+    queued: usize,
+}
+
 fn list_entries(
     root: &str,
     path: &str,
@@ -124,6 +137,21 @@ fn list_entries(
     limit: usize,
     recursive: bool,
     files_only: bool,
+) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
+    let bounds = WalkBounds {
+        examined: MAX_LOCAL_EXAMINED,
+        queued: MAX_LOCAL_QUEUED,
+    };
+    walk_entries(root, path, (offset, limit), (recursive, files_only), bounds)
+}
+
+/// One page of a local walk; exhausting `bounds` fails the page instead of walking on.
+fn walk_entries(
+    root: &str,
+    path: &str,
+    (offset, limit): (usize, usize),
+    (recursive, files_only): (bool, bool),
+    bounds: WalkBounds,
 ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
     let root = OfferedRoot::open(root)?;
     let start = root.resolve(path)?;
@@ -133,6 +161,7 @@ fn list_entries(
     let mut queue = VecDeque::from([(start, path.to_string())]);
     let mut entries = Vec::new();
     let mut skipped = 0usize;
+    let mut examined = 0usize;
 
     while let Some((directory, prefix)) = queue.pop_front() {
         let reader = root
@@ -141,6 +170,13 @@ fn list_entries(
             .map_err(|error| StagingSourceError::ListError(error.to_string()))?;
         for entry in reader {
             let entry = entry.map_err(|error| StagingSourceError::ListError(error.to_string()))?;
+            examined += 1;
+            if examined > bounds.examined {
+                return Err(StagingSourceError::InvalidListing(format!(
+                    "a local listing page examines at most {} entries; list a narrower path",
+                    bounds.examined
+                )));
+            }
             let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
                 continue;
             };
@@ -160,6 +196,12 @@ fn list_entries(
             };
             let kind = if metadata.is_dir() {
                 if recursive && visited.insert(resolved.clone()) {
+                    if queue.len() >= bounds.queued {
+                        return Err(StagingSourceError::InvalidListing(format!(
+                            "a local listing page queues at most {} directories; list a narrower path",
+                            bounds.queued
+                        )));
+                    }
                     queue.push_back((resolved, relative.clone()));
                 }
                 if files_only {
@@ -184,6 +226,7 @@ fn list_entries(
                 kind,
                 size: (kind == SourceEntryKind::File).then_some(metadata.len()),
                 modified: metadata.modified().ok().map(|time| time.into_std()),
+                etag: None,
                 // The listing carries the same stat the serve path reads, so an
                 // observation and a later read agree on one identity.
                 stat: Some(entry_stat(&metadata)),
@@ -401,6 +444,7 @@ fn file_metadata(metadata: &std::fs::Metadata) -> SourceMetadata {
         etag: Some(weak_fingerprint(&FileStat::from_metadata(metadata))),
         last_modified: modified,
         source_version: None,
+        digests: Default::default(),
     }
 }
 
@@ -417,6 +461,30 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use std::collections::HashMap;
+
+    // Empty directories still cost traversal, so a page fails once its bounds are spent.
+    #[test]
+    fn walk_bounds_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            std::fs::create_dir(dir.path().join(format!("empty-{index}"))).unwrap();
+        }
+        let root = dir.path().to_str().unwrap();
+        let walk = |examined, queued| {
+            let bounds = WalkBounds { examined, queued };
+            walk_entries(root, "", (0, 10), (true, true), bounds)
+        };
+
+        assert!(walk(10, 10).is_ok());
+        assert!(matches!(
+            walk(10, 2),
+            Err(StagingSourceError::InvalidListing(_))
+        ));
+        assert!(matches!(
+            walk(3, 10),
+            Err(StagingSourceError::InvalidListing(_))
+        ));
+    }
 
     fn access(root: &Path, path: &str) -> ResolvedSourceAccess {
         ResolvedSourceAccess::OpenDal {

@@ -208,9 +208,14 @@ pub struct StagingJobSpec {
     pub node_id: NodeId,
     pub connector_id: Ulid,
     pub bucket: String,
+    /// The destination bucket as submitted; a bucket recreated under the name ends the job.
+    pub bucket_identity: crate::structs::storage::blob::BucketIdentity,
     pub strategy: StagingStrategy,
     pub items: Vec<StagingJobItem>,
     pub prefixes: Vec<StagingJobPrefix>,
+    /// Name of an `md5sum` or `sha256sum` manifest below each prefix whose digests the
+    /// imported files carry and a complete read must match.
+    pub checksum_manifest: Option<String>,
 }
 
 /// One server-side object copy run outside a request, for a source whose bytes
@@ -248,25 +253,52 @@ pub struct StagingJobError {
     pub error: String,
 }
 
+/// A directory waiting in a job's durable queue, for sources without flat listing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagingJobDirectory {
     pub source_path: String,
     pub target_prefix: String,
-    pub offset: usize,
 }
 
+/// The listing a staging job is walking: a whole prefix when the source lists flat,
+/// otherwise one directory, with the provider cursor of the next page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StagingPendingItem {
+pub struct StagingWalk {
     pub source_path: String,
-    pub target_key: String,
-    pub size: Option<u64>,
+    pub target_prefix: String,
+    pub cursor: Option<crate::structs::execution::source_access::ListCursor>,
+    /// The queue row this directory came from, deleted with the walk's last page.
+    pub queue_row: Option<u64>,
+    /// In a distributed destination, the target key from which the walk lists the key ranges
+    /// this node coordinates, one range after another; `None` starts at the first.
+    pub from: Option<String>,
 }
 
+/// A checksum manifest being read in bounded chunks before its prefix is walked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestRead {
+    pub source_path: String,
+    pub offset: u64,
+    /// The manifest as first observed; later chunks are read bound to it.
+    pub observation: Option<crate::structs::execution::source_access::SourceMetadata>,
+}
+
+/// Progress of a staging job. It stays small: positions and counters only, while directories
+/// still to list wait in the separately paginated queue.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagingJobCheckpoint {
     pub phase: StagingJobPhase,
-    pub pending_items: Vec<StagingPendingItem>,
-    pub pending_directories: Vec<StagingJobDirectory>,
+    /// Whether the source lists a prefix flat; decided from the connector kind on first run.
+    pub flat: Option<bool>,
+    /// Explicit items of the spec already handled.
+    pub items_done: u64,
+    /// Spec prefixes already started.
+    pub prefixes_done: u64,
+    pub walk: Option<StagingWalk>,
+    pub manifest: Option<ManifestRead>,
+    /// Queue rows `[queue_head, queue_tail)` are directories still to list.
+    pub queue_head: u64,
+    pub queue_tail: u64,
     pub items_current: u64,
     pub items_succeeded: u64,
     pub items_failed: u64,
@@ -274,8 +306,8 @@ pub struct StagingJobCheckpoint {
     pub bytes_current: u64,
     pub bytes_total: Option<u64>,
     pub bytes_discovered: u64,
-    pub unknown_sizes: u64,
     pub current_path: Option<String>,
+    /// A bounded sample of per-item errors; `items_failed` counts every failure.
     pub errors: Vec<StagingJobError>,
 }
 

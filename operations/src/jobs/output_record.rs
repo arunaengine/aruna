@@ -327,9 +327,14 @@ mod tests {
         .await
         .unwrap();
         let destinations = vec![(net.node_id(), "ws".to_string(), "reports/a.txt".to_string())];
-        let control = reserve_output_commits(&context.storage_handle, record.job_id, &destinations)
-            .await
-            .unwrap();
+        let control = reserve_output_commits(
+            &context.storage_handle,
+            record.job_id,
+            &destinations,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         let version_id = control.output_commits[0].version_id;
         let outputs = vec![output(control.execution_id, version_id)];
 

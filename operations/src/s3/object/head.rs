@@ -523,7 +523,10 @@ impl HeadObjectOperation {
             self.txn_id = None;
             if let Some(source) = self.reference_source.take() {
                 self.state = HeadObjectState::ResolveReferenceAccess;
-                return smallvec![resolve_binding_effect(ResolveBindingInput { source },)];
+                return smallvec![resolve_binding_effect(ResolveBindingInput {
+                    source,
+                    group_id: None,
+                },)];
             }
             self.state = HeadObjectState::Finish;
             smallvec![]
@@ -1026,6 +1029,7 @@ mod tests {
             etag: Some("cached".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         };
         let refreshed_metadata = SourceMetadata {
             content_length: 17,
@@ -1033,6 +1037,7 @@ mod tests {
             etag: Some("current".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: Some(version_id.to_string()),
+            digests: Default::default(),
         };
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
@@ -1046,6 +1051,7 @@ mod tests {
                 version_selector: Some(format!("version:{version_id}")),
                 capabilities: Vec::new(),
                 origin_node_id: Some(origin),
+                namespace: None,
             },
             connector_id: None,
         };
@@ -1149,6 +1155,7 @@ mod tests {
             etag: Some("etag-123".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
             source_version: None,
+            digests: Default::default(),
         };
         let last_refresh = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(17);
         let source = VersionSourceBinding {
@@ -1163,6 +1170,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::generate()),
         };

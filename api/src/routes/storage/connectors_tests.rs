@@ -255,6 +255,7 @@ async fn entries_reject_traversal() {
         Query(ConnectorEntriesQuery {
             path: "../secret".to_string(),
             limit: None,
+            cursor: None,
         }),
     )
     .await;
@@ -273,6 +274,7 @@ async fn entries_require_permission() {
         Query(ConnectorEntriesQuery {
             path: String::new(),
             limit: None,
+            cursor: None,
         }),
     )
     .await;
@@ -285,6 +287,29 @@ fn entries_normalize_prefix() {
     assert_eq!(normalize_browse_path("prefix").unwrap(), "prefix/");
     assert_eq!(normalize_browse_path("prefix/").unwrap(), "prefix/");
     assert_eq!(normalize_browse_path("").unwrap(), "");
+}
+
+#[test]
+fn cursor_round_trips() {
+    for cursor in [
+        ListCursor::After("datasets/run 1/ä.txt".to_string()),
+        ListCursor::Offset(500),
+        ListCursor::At("datasets/run 0".to_string()),
+    ] {
+        assert_eq!(decode_cursor(&encode_cursor(&cursor)).unwrap(), cursor);
+    }
+    for invalid in ["%%%", "", "eA", "aw"] {
+        assert!(matches!(
+            decode_cursor(invalid),
+            Err(ServerError::BadRequestReason(_))
+        ));
+    }
+    assert!(matches!(
+        map_list_error(ListStagingError::Staging(
+            aruna_core::errors::StagingSourceError::InvalidListing("past".to_string()),
+        )),
+        ServerError::BadRequestReason(reason) if reason == "past"
+    ));
 }
 
 #[test]
@@ -439,4 +464,25 @@ fn requests_hide_secrets() {
         assert!(!text.contains("canary-5b1e"), "{text}");
         assert!(text.contains("token"), "{text}");
     }
+}
+
+#[test]
+fn pending_references_retry() {
+    // A connector whose references are still being checked can be replaced or deleted later.
+    assert!(matches!(
+        map_replace_error(ReplaceSourceError::ReferencesPending),
+        ServerError::ServiceUnavailableReason(_)
+    ));
+    assert!(matches!(
+        map_delete_error(DeleteSourceError::ReferencesPending),
+        ServerError::ServiceUnavailableReason(_)
+    ));
+    assert!(matches!(
+        map_replace_error(ReplaceSourceError::ReferencedObjectVersion),
+        ServerError::Conflict(_)
+    ));
+    assert!(matches!(
+        map_delete_error(DeleteSourceError::NotFound),
+        ServerError::NotFound
+    ));
 }

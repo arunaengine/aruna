@@ -86,6 +86,7 @@ pub async fn stage_remote_input(
                 // source evaluates placement against where the bytes would land.
                 destination: None,
                 known_refs: Vec::new(),
+                range: None,
             };
             match managed_read(context, holder, request).await {
                 Ok(BaoReadOutput::Stream { blob, size, .. }) => {

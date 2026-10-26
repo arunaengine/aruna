@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use aruna_core::metadata::MetadataValidationViolation;
-use aruna_core::structs::storage::data_identity::{LOCAL_PATH_IRI, ensure_local_term};
+use aruna_core::structs::storage::data::identity::{LOCAL_PATH_IRI, ensure_local_term};
 use craqle::{CrateViolation, RoCrateError, UpdateError};
 use oxrdf::{NamedOrBlankNode, Term};
 use oxttl::NQuadsParser;
@@ -595,7 +595,7 @@ mod pure_tests {
     #[test]
     fn rewrite_updates_refs() {
         let validated = validate_document(&crate_json("1.1")).unwrap();
-        let id = aruna_core::structs::storage::data_identity::content_id([10; 32]);
+        let id = aruna_core::structs::storage::data::identity::content_id([10; 32]);
         let target = RewriteTarget {
             id: id.clone(),
             content_url: "s3://bucket/data/a.txt".to_string(),

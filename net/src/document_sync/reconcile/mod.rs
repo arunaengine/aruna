@@ -8,11 +8,14 @@ pub(crate) mod admin;
 mod apply;
 mod batch;
 pub(crate) mod cursor;
+mod distribution;
 mod document;
 mod git;
 mod links;
 mod materialize;
 mod metadata;
+mod overflow;
+mod parked;
 mod registry;
 mod shared;
 mod validate;
@@ -22,7 +25,9 @@ pub(in crate::document_sync) use self::admin::*;
 #[cfg(test)]
 pub(in crate::document_sync) use self::apply::*;
 pub(in crate::document_sync) use self::cursor::*;
+pub(in crate::document_sync) use self::distribution::*;
 pub(in crate::document_sync) use self::materialize::*;
+pub(in crate::document_sync) use self::parked::*;
 pub(in crate::document_sync) use self::registry::*;
 pub(in crate::document_sync) use self::validate::*;
 

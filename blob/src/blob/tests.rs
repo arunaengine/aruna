@@ -19,8 +19,8 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE, PATHS_INDEX_KEYSPACE,
-    STORAGE_BACKEND_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BUCKET_FREE_INDEX, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE,
+    PATHS_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::Status;
@@ -441,27 +441,10 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
         TestContextSetup::Single {
             max_bucket_size,
             timeouts,
-        } => {
-            let blob_root = format!("{temp_root}/blobstore");
-            std::fs::create_dir_all(&blob_root).unwrap();
-            let mut backends = std::collections::BTreeMap::new();
-            backends.insert(
-                BackendRef::DEFAULT_NODE_NAME.to_string(),
-                Arc::new(NodeBackend::new(
-                    BackendConfig {
-                        backend_type: Backend::FileSystem,
-                        root: blob_root,
-                        service_config: HashMap::new(),
-                        bucket_prefix: Some("aruna-test-".to_string()),
-                        max_bucket_size: Some(*max_bucket_size),
-                        multipart_bucket: Some("uploaded-parts".to_string()),
-                        timeouts: *timeouts,
-                    },
-                    None,
-                )),
-            );
-            (backends, EgressPolicy::strict())
-        }
+        } => (
+            single_backend(&temp_root, *max_bucket_size, *timeouts),
+            EgressPolicy::strict(),
+        ),
         TestContextSetup::TwoFilesystem | TestContextSetup::S3Mixed(_) => {
             let mut backends = std::collections::BTreeMap::new();
             backends.insert(
@@ -494,16 +477,48 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
         }
     };
     let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
-    let blob_handle =
-        BlobHandler::with_registry(registry, storage_handle.clone(), net_handle, policy)
-            .await
-            .unwrap();
+    let blob_handle = BlobHandler::with_registry(
+        registry,
+        storage_handle.clone(),
+        net_handle,
+        policy,
+        Some(temp_dir.path().join("spool")),
+    )
+    .await
+    .unwrap();
 
     TestContext {
         _temp_dir: temp_dir,
         blob_handle,
         storage_handle,
     }
+}
+
+/// The one filesystem backend of a `Single` test context, below `temp_root`.
+fn single_backend(
+    temp_root: &str,
+    max_bucket_size: u64,
+    timeouts: BlobTimeoutConfig,
+) -> std::collections::BTreeMap<String, Arc<NodeBackend>> {
+    let blob_root = format!("{temp_root}/blobstore");
+    std::fs::create_dir_all(&blob_root).unwrap();
+    let mut backends = std::collections::BTreeMap::new();
+    backends.insert(
+        BackendRef::DEFAULT_NODE_NAME.to_string(),
+        Arc::new(NodeBackend::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                root: blob_root,
+                service_config: HashMap::new(),
+                bucket_prefix: Some("aruna-test-".to_string()),
+                max_bucket_size: Some(max_bucket_size),
+                multipart_bucket: Some("uploaded-parts".to_string()),
+                timeouts,
+            },
+            None,
+        )),
+    );
+    backends
 }
 
 async fn setup_blob_handle(max_bucket_size: u64) -> TestContext {
@@ -1195,6 +1210,93 @@ async fn hidden_bucket_registered() {
 }
 
 #[tokio::test]
+async fn full_bucket_unselectable() {
+    let context = setup_blob_handle(2).await;
+    let write = |key: &str| BlobEffect::Write {
+        resolved: ResolvedBackend::node_default(),
+        bucket: "bucket-a".to_string(),
+        key: key.to_string(),
+        created_by: test_user_id(),
+        blob: stream_from_bytes(b"one"),
+        size: None,
+    };
+    let Event::Blob(BlobEvent::WriteFinished { location: first }) =
+        context.blob_handle.send_blob_effect(write("one.bin")).await
+    else {
+        panic!("first write failed")
+    };
+    assert_eq!(
+        keyspace_count(&context.storage_handle, BUCKET_FREE_INDEX).await,
+        1,
+        "a bucket below its limit stays selectable"
+    );
+    let Event::Blob(BlobEvent::WriteFinished { location: second }) =
+        context.blob_handle.send_blob_effect(write("two.bin")).await
+    else {
+        panic!("second write failed")
+    };
+    assert_eq!(first.storage_bucket, second.storage_bucket);
+    assert_eq!(
+        keyspace_count(&context.storage_handle, BUCKET_FREE_INDEX).await,
+        0,
+        "a full bucket leaves the free index in the reserving transaction"
+    );
+}
+
+#[tokio::test]
+async fn backfills_free_index() {
+    // A bucket with room but no free index row, as from before the index, gains its row when
+    // the handler starts, so the next write fills it instead of opening a new bucket.
+    let context = setup_blob_handle(5).await;
+    let mut key = BackendRef::node_default().key_bytes();
+    key.push(0);
+    key.extend_from_slice(b"aruna-test-old");
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: BUCKET_STATS_DB.to_string(),
+            key: key.into(),
+            value: 1u64.to_le_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    let root = context._temp_dir.path().to_str().unwrap();
+    let backends = single_backend(root, 5, BlobTimeoutConfig::default());
+    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+    let storage = context.storage_handle.clone();
+    let net = NetHandle::new(NetConfig::default(), storage.clone())
+        .await
+        .unwrap();
+    let restarted =
+        BlobHandler::with_registry(registry, storage, net, EgressPolicy::strict(), None)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        keyspace_count(&context.storage_handle, BUCKET_FREE_INDEX).await,
+        1
+    );
+    let Event::Blob(BlobEvent::WriteFinished { location }) = restarted
+        .send_blob_effect(BlobEffect::Write {
+            resolved: ResolvedBackend::node_default(),
+            bucket: "bucket-a".to_string(),
+            key: "one.bin".to_string(),
+            created_by: test_user_id(),
+            blob: stream_from_bytes(b"one"),
+            size: None,
+        })
+        .await
+    else {
+        panic!("write failed")
+    };
+    assert_eq!(location.storage_bucket, "aruna-test-old");
+}
+
+#[tokio::test]
 async fn starts_fresh_bucket() {
     let context = setup_blob_handle(1).await;
 
@@ -1498,6 +1600,138 @@ async fn hidden_spool_limits() {
     assert!(entries.is_empty());
 }
 
+fn local_spool(size: u64, range: Option<std::ops::Range<u64>>, bytes: &[u8]) -> BlobEffect {
+    BlobEffect::SpoolLocal {
+        size,
+        deadline: None,
+        range,
+        blob: stream_from_bytes(bytes),
+    }
+}
+
+// A local spool answers the hashes of every byte and streams only the range; its budget is held
+// until that stream ends.
+#[tokio::test]
+async fn local_spool_range() {
+    let context = setup_blob_handle(5).await;
+    let budget = context.blob_handle.handler.spool_budget.clone();
+    let full = budget.available_permits();
+    let Event::Blob(BlobEvent::LocalSpooled { hashes, size, blob }) = context
+        .blob_handle
+        .send_blob_effect(local_spool(4, Some(1..3), b"four"))
+        .await
+    else {
+        panic!("local spool failed")
+    };
+    assert_eq!(size, 4);
+    assert_eq!(
+        hashes.get(HASH_BLAKE3),
+        Some(&blake3::hash(b"four").as_bytes().to_vec())
+    );
+    assert_eq!(budget.available_permits(), full - 1);
+    let served: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
+    assert_eq!(served.concat(), b"ou");
+    assert_eq!(budget.available_permits(), full);
+}
+
+// A stream longer or shorter than announced is refused, and the refused spool frees its budget.
+#[tokio::test]
+async fn local_spool_length() {
+    let context = setup_blob_handle(5).await;
+    let budget = context.blob_handle.handler.spool_budget.clone();
+    let full = budget.available_permits();
+    for bytes in [&b"fours"[..], &b"for"[..]] {
+        assert!(matches!(
+            context
+                .blob_handle
+                .send_blob_effect(local_spool(4, None, bytes))
+                .await,
+            Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_)))
+        ));
+    }
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(local_spool(4, Some(2..5), b"four"))
+            .await,
+        Event::Blob(BlobEvent::Error(BlobError::ReadError(_)))
+    ));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while budget.available_permits() < full {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a refused spool must free its budget");
+}
+
+// A dropped stream frees the budget; a full budget refuses at once, an oversized spool for good.
+#[tokio::test]
+async fn local_spool_budget() {
+    let context = setup_blob_handle(5).await;
+    let budget = context.blob_handle.handler.spool_budget.clone();
+    let full = budget.available_permits();
+    let Event::Blob(BlobEvent::LocalSpooled { blob, .. }) = context
+        .blob_handle
+        .send_blob_effect(local_spool(4, None, b"four"))
+        .await
+    else {
+        panic!("local spool failed")
+    };
+    drop(blob);
+    assert_eq!(budget.available_permits(), full);
+
+    let held = budget
+        .clone()
+        .try_acquire_many_owned(u32::try_from(full).unwrap())
+        .unwrap();
+    assert!(matches!(
+        context
+            .blob_handle
+            .send_blob_effect(local_spool(4, None, b"four"))
+            .await,
+        Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. }))
+    ));
+    drop(held);
+    let limit = super::runtime::SPOOL_BUDGET_MIB as u64 * 1024 * 1024;
+    assert_eq!(
+        context
+            .blob_handle
+            .send_blob_effect(local_spool(limit + 1, None, b"four"))
+            .await,
+        Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit }))
+    );
+}
+
+// A node without a spool directory refuses to spool instead of falling back to another place.
+#[tokio::test]
+async fn local_spool_unconfigured() {
+    let temp_dir = tempdir().unwrap();
+    let temp_root = temp_dir.path().to_str().unwrap().to_string();
+    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let config = BackendConfig {
+        backend_type: Backend::FileSystem,
+        root: format!("{temp_root}/blobstore"),
+        service_config: HashMap::new(),
+        bucket_prefix: None,
+        max_bucket_size: None,
+        multipart_bucket: Some("uploaded-parts".to_string()),
+        timeouts: BlobTimeoutConfig::default(),
+    };
+    let blob_handle = BlobHandler::new(config, storage_handle, net_handle)
+        .await
+        .unwrap();
+    assert!(matches!(
+        blob_handle
+            .send_blob_effect(local_spool(4, None, b"four"))
+            .await,
+        Event::Blob(BlobEvent::Error(BlobError::WriteError(_)))
+    ));
+}
+
 #[tokio::test]
 async fn sweeps_demoted_backend() {
     // A changed default must not hide the old backend's crash leftovers.
@@ -1531,6 +1765,7 @@ async fn sweeps_demoted_backend() {
         storage_handle.clone(),
         net_handle.clone(),
         EgressPolicy::loopback(),
+        None,
     )
     .await
     .unwrap();
@@ -1554,6 +1789,7 @@ async fn sweeps_demoted_backend() {
         storage_handle,
         net_handle,
         EgressPolicy::loopback(),
+        None,
     )
     .await
     .unwrap();

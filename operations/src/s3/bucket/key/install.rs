@@ -707,6 +707,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         // The authorization documents the enable reads its admins from.
         let rows = crate::s3::bucket::key::rows::authority_rows(&info, None, &[creator]);

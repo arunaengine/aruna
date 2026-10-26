@@ -4,13 +4,20 @@
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::connectors::repository::{
-    StorageReadError, parse_secret_read, read_secret_effect, source_connector_key,
+    StorageReadError, connector_reference_write, parse_secret_read, read_secret_effect,
+    source_connector_key,
 };
 use crate::connectors::resolver::secret_fingerprint;
+use crate::distribution::guard::{GuardError, authority_read, record_epoch};
+use crate::distribution::inventory::{
+    AddedVersion, entry_of, stamp_head, stamp_version, version_written,
+};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
+use crate::replication::queue::build_live_obligation;
+use crate::s3::object::origin::database_entry;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
@@ -27,11 +34,15 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use std::time::SystemTime;
@@ -52,6 +63,8 @@ pub struct MaterializeReferenceInput {
     /// Refs the reference carries over from an object it derives from; they
     /// are unioned with the bucket default and never dropped.
     pub inherited_policies: Vec<PlacementPolicyRef>,
+    /// The writer's path restrictions, which its replication obligation keeps.
+    pub restrictions: Option<Vec<PathRestriction>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -76,6 +89,8 @@ pub enum MaterializeReferenceError {
     Policy(#[from] PlacementPolicyError),
     #[error(transparent)]
     Purge(#[from] PurgeFenceError),
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
 }
 
 pub async fn stage_reference_blob(
@@ -114,6 +129,7 @@ pub async fn stage_reference_blob(
             version_source: version_source.clone(),
             metadata: head_result.metadata.clone(),
             inherited_policies: input.inherited_policies,
+            restrictions: input.restrictions,
             connector_guard: Some((
                 head_result.connector.clone(),
                 head_result.secret_fingerprint,
@@ -148,6 +164,8 @@ pub struct ReferenceWrite {
     pub inherited_policies: Vec<PlacementPolicyRef>,
     /// The connector the binding was resolved through, re-checked at commit.
     pub connector_guard: Option<(SourceConnector, Option<[u8; 16]>)>,
+    /// The writer's path restrictions, which its replication obligation keeps.
+    pub restrictions: Option<Vec<PathRestriction>>,
 }
 
 /// Writes the reference version in one transaction and says whether anything
@@ -156,7 +174,6 @@ pub async fn write_reference_version(
     context: &DriverContext,
     write: ReferenceWrite,
 ) -> Result<(Ulid, bool), MaterializeReferenceError> {
-    let version_id = write.preassigned_version_id.unwrap_or_else(Ulid::generate);
     let now = SystemTime::now();
 
     let txn_id = match context
@@ -171,7 +188,7 @@ pub async fn write_reference_version(
 
     let result: Result<(Ulid, bool), MaterializeReferenceError> = async {
         guard_purge_fence(context, txn_id, &write.bucket, &write.key).await?;
-        let mut policies = guard_expected_bucket(
+        let (mut policies, binding) = guard_expected_bucket(
             context,
             txn_id,
             &write.bucket,
@@ -179,6 +196,35 @@ pub async fn write_reference_version(
             write.expected_bucket.as_ref(),
         )
         .await?;
+        let set_hint = binding.as_ref().map(DistributionBinding::hint);
+        let database = database_entry(
+            context,
+            (write.realm_id, write.node_id),
+            &write.bucket,
+            binding.as_ref().map(|binding| binding.set_id),
+        )
+        .await;
+        // Only the coordinator of the key's range writes, at its epoch.
+        let epoch = match binding.as_ref() {
+            Some(binding) => {
+                // Read in the write transaction, so a fence set meanwhile conflicts it.
+                let read = authority_read(binding.set_id, Some(txn_id));
+                let event = send_storage_effect(context, read).await?;
+                record_epoch(binding, &write.key, event)?
+            }
+            None => Default::default(),
+        };
+        if let (Some(hint), Some(planned)) = (set_hint, write.preassigned_version_id)
+            && SetHint::of_version(planned) != hint
+        {
+            return Err(StorageError::WriteError(
+                "planned reference version lacks the set hint".into(),
+            )
+            .into());
+        }
+        let version_id = write
+            .preassigned_version_id
+            .unwrap_or_else(|| mint_version(set_hint));
         policies.extend(write.inherited_policies.iter().copied());
         if let Some((connector, fingerprint)) = write.connector_guard.as_ref() {
             guard_connector_unchanged(context, txn_id, connector, *fingerprint).await?;
@@ -262,6 +308,8 @@ pub async fn write_reference_version(
             .and_then(|version| version.offered_size(&write.bucket, &write.key));
         let was_live = existing_version.is_some_and(|version| !version.is_deleted());
         let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id)?;
+        let next_pointer = stamp_head(next_pointer, binding.as_ref(), epoch);
+        let generation = next_pointer.generation;
 
         for effect in build_transition_effects(
             &HeadAliasContext::new(
@@ -279,24 +327,56 @@ pub async fn write_reference_version(
         }
 
         let version_key = VersionKey::new(&write.bucket, &write.key, version_id);
+        let version = BlobVersion::reference(
+            write.version_source.clone(),
+            write.metadata.clone(),
+            now,
+            write.user_id,
+            now,
+        )
+        .with_origin(Some(VersionOrigin::Source { database }))
+        .with_policies(policies)?;
+        let version = stamp_version(version, binding.as_ref(), generation, epoch);
         apply_storage_effect(
             context,
-            write_version_effect(
-                &version_key,
-                &BlobVersion::reference(
-                    write.version_source.clone(),
-                    write.metadata.clone(),
-                    now,
-                    write.user_id,
-                    now,
-                )
-                .with_policies(policies)?,
-                Some(txn_id),
-            )?,
+            write_version_effect(&version_key, &version, Some(txn_id))?,
         )
         .await?;
+        if let Some((key_space, key, value)) = connector_reference_write(&version, &version_key)? {
+            let row = StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: Some(txn_id),
+            };
+            apply_storage_effect(context, Effect::Storage(row)).await?;
+        }
+        // The obligation commits with the version, so its fan-out survives a crash.
+        let auth = AuthContext {
+            user_id: write.user_id,
+            realm_id: write.realm_id,
+            path_restrictions: write.restrictions.clone(),
+            session: None,
+        };
+        let obligation = build_live_obligation(
+            write.node_id,
+            auth,
+            write.bucket.clone(),
+            write.key.clone(),
+            version_id,
+            false,
+            Some(txn_id),
+        )?;
+        apply_storage_effect(context, obligation).await?;
 
         let referenced_bytes = write.metadata.content_length;
+        let added = AddedVersion {
+            version_id,
+            epoch: version.original_epoch,
+            generation,
+            entry: entry_of(&version, referenced_bytes),
+        };
+        let inventory = version_written(binding.as_ref(), &write.key, added, true);
         let mut usage_update = UsageCounterUpdate::for_group(
             write.group_id,
             UsageDelta {
@@ -305,7 +385,8 @@ pub async fn write_reference_version(
                 ..Default::default()
             },
         )
-        .in_bucket(&write.bucket, RowChange::AddedVersion);
+        .in_bucket(&write.bucket, RowChange::AddedVersion)
+        .with_inventory(inventory);
         if !usage_update.is_noop() {
             run_usage_update(context, txn_id, &mut usage_update).await?;
         }
@@ -541,7 +622,7 @@ async fn guard_expected_bucket(
     bucket: &str,
     group_id: GroupId,
     expected: Option<&BucketInfo>,
-) -> Result<Vec<PlacementPolicyRef>, MaterializeReferenceError> {
+) -> Result<(Vec<PlacementPolicyRef>, Option<DistributionBinding>), MaterializeReferenceError> {
     let current = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
@@ -570,9 +651,15 @@ async fn guard_expected_bucket(
     if !unchanged {
         return Err(StorageError::TransactionConflict.into());
     }
-    Ok(current
-        .map(|bucket| bucket.placement_policies)
-        .unwrap_or_default())
+    let binding = current
+        .as_ref()
+        .and_then(|bucket| bucket.distribution.clone());
+    Ok((
+        current
+            .map(|bucket| bucket.placement_policies)
+            .unwrap_or_default(),
+        binding,
+    ))
 }
 
 #[cfg(test)]
@@ -581,12 +668,13 @@ mod tests {
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::driver::drive;
     use crate::node::usage_stats::RebuildStatsOperation;
+    use crate::replication::queue::{LiveObligationRecord, live_obligation_key};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE,
-        SOURCE_INDEX_KEYSPACE, USAGE_STATS_KEYSPACE,
+        REPLICATION_OBLIGATION_KEYSPACE, SOURCE_INDEX_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
     use aruna_core::node_vault::NodeVaultKey;
     use aruna_core::stream::BackendStream;
@@ -856,6 +944,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let recreated = BucketInfo {
             created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
@@ -939,6 +1028,7 @@ mod tests {
                 key: "object.txt".to_string(),
                 expected_bucket,
                 inherited_policies: Vec::new(),
+                restrictions: None,
             },
         )
         .await
@@ -1040,6 +1130,7 @@ mod tests {
                 key: "object.txt".to_string(),
                 expected_bucket,
                 inherited_policies: Vec::new(),
+                restrictions: None,
             },
         )
         .await;
@@ -1108,6 +1199,7 @@ mod tests {
             key: "object.txt".to_string(),
             expected_bucket,
             inherited_policies: Vec::new(),
+            restrictions: None,
         };
 
         let first = stage_reference_blob(context, input.clone()).await.unwrap();
@@ -1157,6 +1249,7 @@ mod tests {
                 key: "object.txt".into(),
                 expected_bucket: bucket.clone(),
                 inherited_policies: Vec::new(),
+                restrictions: None,
             },
         )
         .await
@@ -1180,12 +1273,30 @@ mod tests {
             },
             inherited_policies: Vec::new(),
             connector_guard: None,
+            restrictions: None,
         };
         assert_eq!(
             write_reference_version(context, input(8)).await.unwrap(),
             (planned, true)
         );
         assert_ne!(planned, original.version_id);
+        // The written version commits with its replication obligation.
+        let record = LiveObligationRecord::new(
+            node_id,
+            AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            "bucket-a".into(),
+            "object.txt".into(),
+            planned,
+            false,
+        );
+        let key = live_obligation_key(&record).unwrap();
+        let obligation = read_value(context, REPLICATION_OBLIGATION_KEYSPACE, key.to_vec()).await;
+        assert!(obligation.is_some(), "the reference has no obligation");
         assert_eq!(
             write_reference_version(context, input(8)).await.unwrap(),
             (planned, false)
@@ -1239,6 +1350,7 @@ mod tests {
                     version_selector: None,
                     capabilities: Vec::new(),
                     origin_node_id: None,
+                    namespace: None,
                 },
                 connector_id: Some(Ulid::generate()),
             },
@@ -1248,9 +1360,11 @@ mod tests {
                 etag: None,
                 last_modified: None,
                 source_version: None,
+                digests: Default::default(),
             },
             inherited_policies: Vec::new(),
             connector_guard: None,
+            restrictions: None,
         };
         write_reference_version(context, write).await.unwrap();
 

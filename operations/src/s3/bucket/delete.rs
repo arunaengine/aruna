@@ -14,8 +14,8 @@ use aruna_core::keyspaces::{
     GROUP_ENCRYPTED_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_REMOVAL_KEYSPACE,
     KEY_COPY_KEYSPACE, LINKED_JOB_KEYSPACE, MIGRATION_AHEAD_KEYSPACE, NODE_VAULT_KEYSPACE,
     RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, RENAME_MOVE_KEYSPACE,
-    RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
-    USAGE_STATS_KEYSPACE,
+    RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE,
+    UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -23,6 +23,7 @@ use aruna_core::structs::storage::backend_import::{BackendImport, ProviderCleanu
 use aruna_core::structs::storage::blob::{
     BlobCleanupWork, BlobHeadKey, BucketInfo, VersionKey, incarnation,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRecord};
 use aruna_core::structs::storage::group_backend::{BUCKET_DELETING, BUCKET_STATE, GroupStorage};
 use aruna_core::structs::storage::multipart::MultipartUpload;
@@ -103,6 +104,8 @@ pub struct DeleteBucketOperation {
     key_deletes: Vec<(String, Key)>,
     /// Rules that link this bucket whole to a provider bucket; they go with it.
     links: Vec<BackendImport>,
+    /// A set deletion deletes only the member bucket of this binding.
+    member: Option<DistributionBinding>,
     output: Option<Result<(), DeleteBucketError>>,
 }
 
@@ -123,8 +126,26 @@ impl DeleteBucketOperation {
             key_spaces: Vec::new(),
             key_deletes: Vec::new(),
             links: Vec::new(),
+            member: None,
             output: None,
         }
+    }
+
+    /// Deletes the bucket only while it carries `binding`'s set, member and incarnation, read
+    /// in the delete transaction; another bucket of the name answers `NotFound`.
+    pub fn bound_to(mut self, binding: DistributionBinding) -> Self {
+        self.member = Some(binding);
+        self
+    }
+
+    fn member_matches(&self, info: &BucketInfo) -> bool {
+        let Some(member) = self.member.as_ref() else {
+            return true;
+        };
+        info.distribution.as_ref().is_some_and(|binding| {
+            (binding.set_id, binding.member_id, binding.incarnation)
+                == (member.set_id, member.member_id, member.incarnation)
+        })
     }
 
     fn emit_error(&mut self, error: DeleteBucketError) -> Effects {
@@ -176,6 +197,9 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::NotFound);
         };
         match BucketInfo::from_bytes(value.as_ref()) {
+            Ok(info) if !self.member_matches(&info) => {
+                return self.emit_error(DeleteBucketError::NotFound);
+            }
             Ok(info) => {
                 self.group_id = Some(info.group_id);
                 self.incarnation = incarnation(creation.as_deref());
@@ -240,6 +264,16 @@ impl DeleteBucketOperation {
         }
 
         self.state = DeleteBucketState::CheckMultipartUploads;
+        // A member bucket's open uploads are all in its set's upload inventory.
+        if let Some(member) = self.member.as_ref() {
+            return smallvec![Effect::Storage(StorageEffect::Iter {
+                key_space: UPLOAD_INVENTORY_KEYSPACE.to_string(),
+                prefix: Some(member.set_id.to_bytes().to_vec().into()),
+                start: None,
+                limit: 1,
+                txn_id: self.txn_id,
+            })];
+        }
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: UPLOAD_KEYSPACE.to_string(),
             prefix: None,
@@ -258,6 +292,9 @@ impl DeleteBucketOperation {
             });
         };
 
+        if self.member.is_some() && !values.is_empty() {
+            return self.emit_error(DeleteBucketError::NotEmpty);
+        }
         for (_, value) in values {
             let Ok(upload) = MultipartUpload::from_bytes(value.as_ref()) else {
                 continue;
@@ -825,6 +862,7 @@ mod link_tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         info.to_bytes().unwrap().into()
     }
@@ -1059,6 +1097,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 },
             ),
             &driver_ctx,
@@ -1112,6 +1151,61 @@ mod test {
         assert!(value.is_none());
     }
 
+    #[test]
+    fn member_checks_inventory() {
+        // A member bucket looks for open uploads in its set's inventory, not every upload here.
+        let binding = DistributionBinding {
+            set_id: Ulid::from_bytes([3; 16]),
+            member_id: Ulid::from_bytes([4; 16]),
+            incarnation: 5,
+            revision: Default::default(),
+        };
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([6; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: Some(binding.clone()),
+        };
+        let mut operation = DeleteBucketOperation::new("spire".to_string()).bound_to(binding);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([7; 16]),
+        }));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    b"spire".to_vec().into(),
+                    Some(info.to_bytes().unwrap().into()),
+                ),
+                (b"spire".to_vec().into(), None),
+            ],
+        }));
+        let empty = || {
+            Event::Storage(StorageEvent::IterResult {
+                values: Vec::new(),
+                next_start_after: None,
+            })
+        };
+        operation.step(empty());
+        let effects = operation.step(empty());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, limit: 1, prefix: Some(_), .. })]
+                if key_space == UPLOAD_INVENTORY_KEYSPACE
+        ));
+        let row = (vec![3; 20].into(), Vec::new().into());
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![row],
+            next_start_after: None,
+        }));
+        assert_eq!(operation.output, Some(Err(DeleteBucketError::NotEmpty)));
+    }
+
     #[tokio::test]
     async fn removes_encryption_settings() {
         use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
@@ -1136,6 +1230,7 @@ mod test {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         drive(
             CreateBucketOperation::new(bucket.clone(), info),
@@ -1254,6 +1349,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 },
             ),
             &driver_ctx,
@@ -1304,6 +1400,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 },
             ),
             &driver_ctx,
@@ -1425,6 +1522,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 }
                 .to_bytes()
                 .unwrap()
@@ -1492,6 +1590,7 @@ mod test {
                     placement_policies: Vec::new(),
                     placement_policy_generation: 0,
                     compression: Compression::Off,
+                    distribution: None,
                 }
                 .to_bytes()
                 .unwrap()

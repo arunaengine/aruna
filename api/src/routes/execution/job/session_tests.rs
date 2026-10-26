@@ -687,6 +687,7 @@ async fn seed_bucket(state: &Arc<ServerState>, bucket: &str, group_id: Ulid, own
         placement_policies: Vec::new(),
         placement_policy_generation: 1,
         compression: Compression::Off,
+        distribution: None,
     };
     write_row(
         &state.get_ctx().storage_handle,
@@ -710,6 +711,7 @@ async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: Some(Ulid::generate()),
         },
@@ -719,6 +721,7 @@ async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
             etag: Some("etag-1".to_string()),
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         },
         UNIX_EPOCH,
         owner,

@@ -5,8 +5,9 @@
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
+use aruna_core::structs::storage::distribution::accounting::{CounterOverflow, RangeCounters};
 use aruna_core::structs::storage::usage::{
-    BucketCounters, BucketDelta, CounterShortfall, UsageCounters, UsageDelta,
+    BucketCounters, BucketDelta, CounterShortfall, USAGE_SHADOW_PREFIX, UsageCounters, UsageDelta,
 };
 use byteview::ByteView;
 use fjall::Readable;
@@ -15,6 +16,8 @@ use ulid::Ulid;
 
 use crate::compaction::{DELETE_THRESHOLD, compactable};
 
+use super::rebuild::shadow_row;
+
 use super::{CleanupEntry, CleanupKind, FjallStorage, MAX_TRANSACTION_CLEANUP, Txn};
 
 /// A transaction's pending change of one counter row.
@@ -22,16 +25,21 @@ use super::{CleanupEntry, CleanupKind, FjallStorage, MAX_TRANSACTION_CLEANUP, Tx
 pub(super) enum CounterChange {
     Usage(UsageDelta),
     Bucket(BucketDelta),
+    Range(RangeCounters),
 }
 
 impl CounterChange {
     /// Folds two changes of one row; rows of one key always hold the same kind.
-    fn merge(self, other: Self) -> Self {
-        match (self, other) {
+    pub(super) fn merge(self, other: Self) -> Result<Self, StorageError> {
+        let overflow = |error: CounterOverflow| StorageError::WriteError(error.to_string());
+        Ok(match (self, other) {
             (Self::Usage(left), Self::Usage(right)) => Self::Usage(left.merge(right)),
             (Self::Bucket(left), Self::Bucket(right)) => Self::Bucket(left.merge(right)),
+            (Self::Range(left), Self::Range(right)) => {
+                Self::Range(left.merge(right).map_err(overflow)?)
+            }
             (_, other) => other,
-        }
+        })
     }
 }
 
@@ -49,6 +57,41 @@ impl FjallStorage {
         buckets: Vec<(ByteView, BucketDelta)>,
         txn_id: Ulid,
     ) -> StorageEvent {
+        let usage = deltas
+            .into_iter()
+            .map(|(key, delta)| (key, CounterChange::Usage(delta)));
+        let rows = buckets
+            .into_iter()
+            .map(|(key, delta)| (key, CounterChange::Bucket(delta)));
+        self.pend_changes(key_space, usage.chain(rows).collect(), txn_id)
+    }
+
+    #[tracing::instrument(
+        name = "storage.add_counters",
+        level = "debug",
+        skip(self, deltas),
+        fields(key_space = %key_space, delta_count = deltas.len(), txn_id = %txn_id)
+    )]
+    pub(super) fn add_counters(
+        &mut self,
+        key_space: String,
+        deltas: Vec<(ByteView, RangeCounters)>,
+        txn_id: Ulid,
+    ) -> StorageEvent {
+        let changes = deltas
+            .into_iter()
+            .map(|(key, delta)| (key, CounterChange::Range(delta)))
+            .collect();
+        self.pend_changes(key_space, changes, txn_id)
+    }
+
+    /// Queues counter changes of an open write transaction for its commit.
+    fn pend_changes(
+        &mut self,
+        key_space: String,
+        changes: Vec<(ByteView, CounterChange)>,
+        txn_id: Ulid,
+    ) -> StorageEvent {
         if let Err(error) = self.store.resolve_keyspace(&key_space) {
             return StorageEvent::Error { error };
         }
@@ -58,20 +101,17 @@ impl FjallStorage {
             };
         }
         let pending = self.txn_usage.entry(txn_id).or_default();
-        let mut entries = Vec::with_capacity(deltas.len() + buckets.len());
-        let usage = deltas
-            .into_iter()
-            .map(|(key, delta)| (key, CounterChange::Usage(delta)));
-        let rows = buckets
-            .into_iter()
-            .map(|(key, delta)| (key, CounterChange::Bucket(delta)));
-        for (key, change) in usage.chain(rows) {
+        let mut entries = Vec::with_capacity(changes.len());
+        for (key, change) in changes {
             entries.push((key_space.clone(), key.clone()));
             match pending
                 .iter_mut()
                 .find(|(space, existing, _)| *space == key_space && *existing == key)
             {
-                Some((_, _, existing)) => *existing = existing.merge(change),
+                Some((_, _, existing)) => match existing.merge(change) {
+                    Ok(merged) => *existing = merged,
+                    Err(error) => return StorageEvent::Error { error },
+                },
                 None => pending.push((key_space.clone(), key, change)),
             }
         }
@@ -85,9 +125,10 @@ impl FjallStorage {
         txn_id: Ulid,
         txn: &mut fjall::OptimisticWriteTx,
     ) -> Result<(), StorageError> {
-        let Some(pending) = self.txn_usage.remove(&txn_id) else {
+        let Some(mut pending) = self.txn_usage.remove(&txn_id) else {
             return Ok(());
         };
+        self.shadow_changes(&mut pending)?;
         let snapshot = self.store.db.read_tx();
         let failed = |error: &dyn std::fmt::Display| StorageError::WriteError(error.to_string());
         for (key_space, key, change) in pending {
@@ -97,6 +138,11 @@ impl FjallStorage {
                 .map_err(|error| StorageError::ReadError(error.to_string()))?;
             let stored = stored.as_deref();
             let (value, shortfalls) = match change {
+                CounterChange::Usage(_) | CounterChange::Bucket(_)
+                    if key.as_ref().starts_with(USAGE_SHADOW_PREFIX) =>
+                {
+                    (shadow_row(stored, change)?, Vec::new())
+                }
                 CounterChange::Usage(delta) => {
                     let counters = stored.map(UsageCounters::from_bytes).transpose();
                     let mut counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
@@ -108,6 +154,13 @@ impl FjallStorage {
                     let mut counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
                     let shortfalls = counters.apply(&delta).map_err(|e| failed(&e))?;
                     (counters.to_bytes().map_err(|e| failed(&e))?, shortfalls)
+                }
+                CounterChange::Range(delta) => {
+                    let counters = stored.map(RangeCounters::from_bytes).transpose();
+                    let counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
+                    let merged = counters.merge(delta).map_err(|e| failed(&e))?;
+                    let value = merged.to_bytes();
+                    (value.map_err(|e| failed(&e))?, Vec::new())
                 }
             };
             warn_clamped(&key, shortfalls);
@@ -194,6 +247,8 @@ impl FjallStorage {
         }
         self.take_txn_deletes(txn_id, false);
         self.txn_usage.remove(&txn_id);
+        self.txn_rows.remove(&txn_id);
+        self.usage_views.remove(&txn_id);
         self.config_txns.remove(&txn_id);
         match self.txns.remove(&txn_id) {
             Some(Txn::Write(txn)) => {
@@ -245,10 +300,14 @@ impl FjallStorage {
         }
 
         let config_txn = self.config_txns.remove(&txn_id);
+        self.usage_views.remove(&txn_id);
+        let rows = self.txn_rows.remove(&txn_id).unwrap_or_default();
         match self.txns.remove(&txn_id) {
             Some(Txn::Read(_)) => StorageEvent::TransactionCommitted { txn_id },
             Some(Txn::Write(mut txn)) => {
-                if let Err(error) = self.stage_usage(txn_id, &mut txn) {
+                let rows = rows.iter().map(|(space, key)| (space.as_str(), key));
+                let staged = self.keep_preimages(&mut txn, rows);
+                if let Err(error) = staged.and_then(|()| self.stage_usage(txn_id, &mut txn)) {
                     self.take_txn_deletes(txn_id, false);
                     txn.rollback();
                     return StorageEvent::Error { error };
@@ -347,7 +406,7 @@ impl FjallStorage {
     }
 }
 
-fn warn_clamped(key: &[u8], shortfalls: Vec<CounterShortfall>) {
+pub(super) fn warn_clamped(key: &[u8], shortfalls: Vec<CounterShortfall>) {
     for shortfall in shortfalls {
         warn!(
             event = "storage.usage.clamped",

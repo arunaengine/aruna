@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use aruna_api::error::ServerError;
-use aruna_api::routes::bucket_usage::get_bucket_usage;
+use aruna_api::routes::bucket_usage::{UsageQuery, get_bucket_usage};
 use aruna_api::routes::storage::routing::{
     BucketRoutingRequest, get_bucket_routing, put_bucket_routing,
 };
@@ -37,7 +37,7 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::node::usage_stats::RebuildStatsOperation;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
@@ -182,6 +182,7 @@ async fn setup() -> Fixture {
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
+                distribution: None,
             }
             .to_bytes()
             .unwrap(),
@@ -298,7 +299,10 @@ async fn usage_counts_inventory() {
     let Json(usage) = get_bucket_usage(
         State(fixture.state.clone()),
         Extension(Some(fixture.reader.clone())),
+        Extension(None),
+        axum::http::HeaderMap::new(),
         Path("data".to_string()),
+        Query(UsageQuery::default()),
     )
     .await
     .unwrap();
@@ -328,7 +332,10 @@ async fn usage_counts_inventory() {
     let Json(usage) = get_bucket_usage(
         State(fixture.state.clone()),
         Extension(Some(fixture.reader.clone())),
+        Extension(None),
+        axum::http::HeaderMap::new(),
         Path("data".to_string()),
+        Query(UsageQuery::default()),
     )
     .await
     .unwrap();

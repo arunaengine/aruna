@@ -27,6 +27,8 @@ use aruna_core::structs::placement::policy::{
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
@@ -162,6 +164,8 @@ pub struct PolicyBulkOperation {
     state: BulkState,
     txn_id: Option<TxnId>,
     group_id: Option<Ulid>,
+    /// The set hint of a distributed bucket, so planned successor ids carry it.
+    set_hint: Option<SetHint>,
     run: Option<PolicyBulkRun>,
     resolver: Option<PolicySetResolver>,
     resolved: BTreeMap<Ulid, PolicyResolution>,
@@ -196,6 +200,7 @@ impl PolicyBulkOperation {
             state: BulkState::Init,
             txn_id: None,
             group_id: None,
+            set_hint: None,
             run: None,
             resolver: None,
             resolved: BTreeMap::new(),
@@ -305,6 +310,7 @@ impl PolicyBulkOperation {
             Err(error) => return self.fail(error.into()),
         };
         self.group_id = Some(bucket.group_id);
+        self.set_hint = bucket.distribution.as_ref().map(DistributionBinding::hint);
         self.report.generation = bucket.placement_policy_generation;
         self.report.target_refs = bucket.placement_policies.clone();
 
@@ -600,7 +606,7 @@ impl PolicyBulkOperation {
                         operation_id: self.config.operation_id,
                         key: candidate.key.clone(),
                         observed_head: candidate.pointer.clone(),
-                        successor_version_id: Ulid::generate(),
+                        successor_version_id: mint_version(self.set_hint),
                         outcome: PolicyIntentOutcome::Planned,
                     }
                 }
@@ -1118,6 +1124,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let _ = context
             .storage_handle
@@ -1402,6 +1409,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         Value::from(bucket.to_bytes().expect("bucket encodes"))
     }

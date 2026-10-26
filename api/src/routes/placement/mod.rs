@@ -15,6 +15,7 @@ use aruna_core::structs::placement::policy::{
 };
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
+use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_operations::driver::{drive, gate_context, now_ms};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
@@ -1207,7 +1208,9 @@ operation.
 - A materialized object needs a verified local copy of its bytes on a destination the new references
   admit: without one the outcome is `blocked` with a reason and nothing was written, and compliant
   bytes have to be staged and registered first.
-- A reference-only head mints a successor and registers no copy."#,
+- A reference-only head mints a successor and registers no copy.
+- In a distributed bucket the coordinator of the key's range mints the successor: another member
+  relays the request there with the caller's bearer token."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
     request_body(content = ObjectPlacementRequest, example = json!({
         "key": "raw/sample.fastq",
@@ -1245,6 +1248,8 @@ operation.
 pub async fn mint_object_placement(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
     Path(bucket): Path<String>,
     Json(request): Json<ObjectPlacementRequest>,
 ) -> ServerResult<Json<ObjectPlacementResponse>> {
@@ -1252,32 +1257,50 @@ pub async fn mint_object_placement(
     ensure_placement_writer(&state, &auth, &bucket).await?;
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
+    // In a distributed bucket the coordinator of the key's range mints the successor.
+    let forward = crate::routes::storage::relay::rest_target(&state, &info, &request.key, &headers);
+    if let Some(forward) = forward.await? {
+        let path = format!("/data/buckets/{bucket}/placement/objects");
+        let relayed = crate::routes::storage::relay::relay_json(
+            &state,
+            &forward,
+            &path,
+            bearer.as_ref(),
+            &request,
+        );
+        return Ok(Json(relayed.await?.1));
+    }
     let subject = local_subject(&state, auth.realm_id).await?;
     let mutation_id =
         Ulid::from_string(&request.mutation_id).map_err(|_| ServerError::BadRequest)?;
     let expected_version_id =
         Ulid::from_string(&request.expected_version_id).map_err(|_| ServerError::BadRequest)?;
+    // A distributed bucket's successor id carries its set hint.
+    let hint = info.distribution.as_ref().map(|binding| binding.hint());
     let outcome = drive(
-        PolicyMutationOperation::new(PolicyMutationConfig {
-            context: aruna_operations::blob::records::HeadAliasContext::new(
-                auth.realm_id,
-                info.group_id,
-                state.get_node_id(),
-                bucket,
-                request.key,
-            ),
-            auth_context: auth,
-            mutation_id,
-            expected_head: CurrentVersionPointer::new_with_generation(
-                expected_version_id,
-                request.expected_generation,
-            ),
-            bucket_identity: info.identity(),
-            target_refs: refs_from(request.policies)?,
-            subject,
-            created_at: SystemTime::now(),
-            now_ms: now_ms(),
-        }),
+        PolicyMutationOperation::new_with_version(
+            PolicyMutationConfig {
+                context: aruna_operations::blob::records::HeadAliasContext::new(
+                    auth.realm_id,
+                    info.group_id,
+                    state.get_node_id(),
+                    bucket,
+                    request.key,
+                ),
+                auth_context: auth,
+                mutation_id,
+                expected_head: CurrentVersionPointer::new_with_generation(
+                    expected_version_id,
+                    request.expected_generation,
+                ),
+                bucket_identity: info.identity(),
+                target_refs: refs_from(request.policies)?,
+                subject,
+                created_at: SystemTime::now(),
+                now_ms: now_ms(),
+            },
+            mint_version(hint),
+        ),
         &state.get_ctx(),
     )
     .await

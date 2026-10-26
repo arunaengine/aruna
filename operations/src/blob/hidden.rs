@@ -9,12 +9,16 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    JOB_KEYSPACE, NODE_STATE_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE,
+    ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE, JOB_KEYSPACE, NODE_STATE_KEYSPACE,
+    ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     JobId, JobRecord, JobResultPayload, RoCrateUploadCleanup, RoCrateUploadRecord, job_record_key,
 };
 use aruna_core::structs::storage::blob::{BackendLocation, HiddenBlobEntry, HiddenBlobKey};
+use aruna_core::structs::storage::distribution::on_use::{
+    ATTACHMENT_NAMESPACE, Attachment, CACHE_NAMESPACE, CacheEntry, attachment_key,
+};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, TxnId};
@@ -416,6 +420,9 @@ async fn is_protected(
     deadline: Instant,
 ) -> Result<bool, String> {
     let namespace = key.namespace().map_err(|error| error.to_string())?;
+    if namespace == ATTACHMENT_NAMESPACE || namespace == CACHE_NAMESPACE {
+        return kept_protected(context, key, namespace, deadline).await;
+    }
     if let Some(value) = read_value(
         &context.storage_handle,
         ROCRATE_UPLOAD_KEYSPACE,
@@ -467,6 +474,59 @@ async fn is_protected(
         }
     }
     Ok(false)
+}
+
+/// Whether a kept copy is still the one its attachment or cache entry names. The blob name is
+/// the row's key: set and version id for an attachment, the hex BLAKE3 for a cache entry.
+async fn kept_protected(
+    context: &DriverContext,
+    key: &HiddenBlobKey,
+    namespace: Ulid,
+    deadline: Instant,
+) -> Result<bool, String> {
+    // An evicted copy a read still holds stays until the read ends.
+    if crate::distribution::pull::pinned_path(&key.backend_path) {
+        return Ok(true);
+    }
+    let name = std::path::Path::new(&key.backend_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('_'))
+        .map(|(name, _)| name);
+    let row = match (namespace == ATTACHMENT_NAMESPACE, name) {
+        (true, Some(name)) => name.split_once('-').and_then(|(set, version)| {
+            let (set, version) = (
+                Ulid::from_string(set).ok()?,
+                Ulid::from_string(version).ok()?,
+            );
+            Some((ATTACHMENT_KEYSPACE, attachment_key(set, version)))
+        }),
+        (false, Some(name)) => hex::decode(name)
+            .ok()
+            .filter(|blake3| blake3.len() == 32)
+            .map(|blake3| (CACHE_ENTRY_KEYSPACE, blake3)),
+        (_, None) => None,
+    };
+    let Some((key_space, row_key)) = row else {
+        return Ok(false);
+    };
+    let Some(value) = read_value(
+        &context.storage_handle,
+        key_space,
+        row_key.into(),
+        None,
+        deadline,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    let location = match key_space == ATTACHMENT_KEYSPACE {
+        true => Attachment::from_bytes(&value).map(|kept| kept.location),
+        false => CacheEntry::from_bytes(&value).map(|kept| kept.location),
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(HiddenBlobKey::try_from(&location).is_ok_and(|kept| kept == *key))
 }
 
 async fn read_value(
@@ -974,6 +1034,46 @@ mod tests {
         .await
         .expect("read upload")
         .is_some()
+    }
+
+    // A kept copy is protected only while its attachment or cache entry names exactly it.
+    #[tokio::test]
+    async fn kept_copies_guarded() {
+        let (_dir, context) = temp_context();
+        let (set, version) = (Ulid::from_bytes([6u8; 16]), Ulid::from_bytes([7u8; 16]));
+        let name = format!("{set}-{version}");
+        let attached = hidden_location(ATTACHMENT_NAMESPACE, &format!("{name}_{}", Ulid::nil()));
+        let row = Attachment {
+            blake3: [1u8; 32],
+            location: attached.clone(),
+        };
+        write_row(
+            &context.storage_handle,
+            ATTACHMENT_KEYSPACE,
+            attachment_key(set, version),
+            row.to_bytes().expect("encode attachment"),
+        )
+        .await;
+        let key = HiddenBlobKey::try_from(&attached).expect("hidden key");
+        let leftover = hidden_location(ATTACHMENT_NAMESPACE, &format!("{name}_{set}"));
+        let leftover = HiddenBlobKey::try_from(&leftover).expect("hidden key");
+        let cached = hidden_location(
+            CACHE_NAMESPACE,
+            &format!("{}_{}", hex::encode([2u8; 32]), set),
+        );
+        let cached = HiddenBlobKey::try_from(&cached).expect("hidden key");
+
+        assert!(is_protected(&context, &key, 0, deadline()).await.unwrap());
+        assert!(
+            !is_protected(&context, &leftover, 0, deadline())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !is_protected(&context, &cached, 0, deadline())
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

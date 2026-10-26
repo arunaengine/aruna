@@ -10,7 +10,9 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::execution::jobs::{
     decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
 };
+use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::connectors::ApiConnectorKind;
+use crate::routes::storage::relay::{RestForward, relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
@@ -18,14 +20,16 @@ use aruna_core::structs::execution::job::{
     JobPayload, JobRecord, JobState, StagingJobCheckpoint, StagingJobItem, StagingJobPhase,
     StagingJobPrefix, StagingJobSpec,
 };
-use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
+use aruna_core::structs::execution::source_access::{ListRequest, SourceEntry, SourceEntryKind};
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_operations::auth::permission_rules::permission_rules;
+use aruna_operations::distribution::guard::bound_view;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
+use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -188,6 +192,9 @@ pub struct StageBatchRequest {
     pub items: Option<Vec<StageBatchItem>>,
     #[serde(default)]
     pub prefixes: Option<Vec<StageBatchPrefix>>,
+    /// Name of an `md5sum` or `sha256sum` manifest below each prefix; jobs only.
+    #[serde(default)]
+    pub checksum_manifest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -214,7 +221,22 @@ pub struct StageBatchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[schema(as = SubmitStagingJobResponse)]
 pub struct SubmitStagingResponse {
+    /// This node's job, or the first coordinator's when this node coordinates no range of a
+    /// distributed bucket.
     pub job_id: String,
+    /// The jobs the other coordinators of a distributed bucket run for their own keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coordinator_jobs: Vec<CoordinatorJobResponse>,
+}
+
+/// A coordinator's job of a distributed bucket import, or why it was not started.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct CoordinatorJobResponse {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -277,6 +299,9 @@ connector's source path, both checked against the concrete path rather than a pr
 - `sync` is accepted by the schema but not implemented and always fails.
 - A 201 means the new version is committed here and immediately readable through S3; propagating it
   to any sync target is queued afterwards and neither awaited nor reported here.
+- In a distributed bucket only the coordinator of the key's range writes. Another member relays
+  the request there with the caller's bearer token, and the coordinator checks it again. An
+  unreachable coordinator answers 503 and the write is not queued.
 
 **Limits**
 - A snapshot is charged against the realm's quota ceiling for the group."#,
@@ -313,16 +338,30 @@ connector's source path, both checked against the concrete path rather than a pr
         (status = 403, description = "Token from another realm, no WRITE on the target key or READ on the source path, or the snapshot would exceed the group's quota ceiling", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, the connector does not exist, or the source object is absent", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
-        (status = 502, description = "The source connector could not be read; nothing was staged and the caller may retry", body = ErrorResponse)
+        (status = 502, description = "The source connector could not be read; nothing was staged and the caller may retry", body = ErrorResponse),
+        (status = 503, description = "The coordinator of the key's distributed range is unreachable or the bucket is not active yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn stage_blob(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<StageRequest>,
 ) -> ServerResult<(StatusCode, Json<StageResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
+    // A member that does not coordinate the key's range relays the write with the bearer.
+    if let StageRequest::Snapshot(target) | StageRequest::Reference(target) = &request {
+        let bucket_info = load_bucket_info(&state, &target.bucket).await?;
+        let forward = rest_target(&state, &bucket_info, &target.key, &headers).await?;
+        if let Some(forward) = forward {
+            let path = "/data/staging";
+            let (status, answer) =
+                relay_json(&state, &forward, path, bearer.as_ref(), &request).await?;
+            return Ok((status, Json(answer)));
+        }
+    }
 
     match request {
         StageRequest::Snapshot(request) => snapshot_blob(state, auth, request).await,
@@ -356,7 +395,10 @@ route, and sending `prefixes` additionally requires READ on the group's data pat
 **Limits**
 - Named and expanded objects together may not exceed 1000, and a prefix that would expand past that
   limit fails the entire request rather than truncating.
-- `node_id`, when given, must be this node: staging always runs where the request lands."#,
+- All prefixes of one request are listed in at most 8 pages together; a request that needs more
+  fails with 400 and belongs in a staging job.
+- `node_id`, when given, must be this node: staging always runs where the request lands.
+- `checksum_manifest` is refused with 400; manifests are read by staging jobs only."#,
     request_body(
         content = StageBatchRequest,
         description = "One connector and target bucket for the whole batch, plus explicit `items`, `prefixes` to expand, or both; leaving both out runs an empty batch",
@@ -420,6 +462,11 @@ pub async fn stage_batch(
     if request.strategy == ApiStagingStrategy::Sync {
         return Err(ServerError::Unimplemented);
     }
+    if request.checksum_manifest.is_some() {
+        return Err(ServerError::BadRequestReason(
+            "checksum manifests are read by staging jobs only".to_string(),
+        ));
+    }
     let node_id = request
         .node_id
         .as_deref()
@@ -445,6 +492,8 @@ pub async fn stage_batch(
         .await?;
     }
     let mut expansion_errors = Vec::new();
+    // One page budget for the whole request, however many prefixes it names.
+    let mut pages_left = BATCH_LIST_PAGES;
     for prefix in prefixes {
         let source_prefix = match normalize_prefix(&prefix.source_prefix) {
             Ok(prefix) => prefix,
@@ -459,28 +508,28 @@ pub async fn stage_batch(
             }
         };
         let remaining = BATCH_LIMIT - items.len();
-        match drive(
-            ListStagingOperation::new(ListStagingInput {
-                group_id,
-                connector_id,
-                source_path: source_prefix.clone(),
-                offset: 0,
-                limit: remaining,
-                recursive: true,
-                files_only: true,
-            }),
-            &state.get_ctx(),
+        let listed = list_prefix(
+            &state,
+            (group_id, connector_id),
+            &source_prefix,
+            remaining,
+            &mut pages_left,
         )
-        .await
-        {
-            Ok(result) => {
-                if result.truncated {
+        .await;
+        match listed {
+            Ok(None) => {
+                return Err(ServerError::BadRequestReason(
+                    "the prefixes list more than a batch examines; submit them as a staging job"
+                        .to_string(),
+                ));
+            }
+            Ok(Some(entries)) => {
+                if entries.len() > remaining {
                     return Err(ServerError::BadRequestReason(format!(
                         "batch expands beyond {BATCH_LIMIT} items"
                     )));
                 }
-                let expanded =
-                    map_prefix_entries(result.entries, &source_prefix, &prefix.target_prefix);
+                let expanded = map_prefix_entries(entries, &source_prefix, &prefix.target_prefix);
                 ensure_batch_capacity(items.len(), expanded.len(), BATCH_LIMIT)?;
                 items.extend(expanded);
             }
@@ -515,6 +564,48 @@ pub async fn stage_batch(
     Ok((StatusCode::OK, Json(StageBatchResponse { results })))
 }
 
+/// Listing pages one batch request may examine across its prefixes; more belongs in a job.
+const BATCH_LIST_PAGES: usize = 8;
+
+/// Lists the files below a prefix page by page, stopping once more than `remaining` are found.
+/// Each page spends one of `pages_left`; `None` once the request's pages are spent.
+async fn list_prefix(
+    state: &ServerState,
+    (group_id, connector_id): (aruna_core::types::GroupId, ulid::Ulid),
+    source_prefix: &str,
+    remaining: usize,
+    pages_left: &mut usize,
+) -> Result<Option<Vec<SourceEntry>>, ListStagingError> {
+    let mut entries = Vec::new();
+    let mut cursor = None;
+    while *pages_left > 0 {
+        *pages_left -= 1;
+        let page = drive(
+            ListStagingOperation::new(ListStagingInput {
+                group_id,
+                connector_id,
+                source_path: source_prefix.to_string(),
+                // One spare entry tells a listing that fits from one that does not.
+                request: ListRequest {
+                    cursor,
+                    limit: remaining + 1 - entries.len(),
+                    recursive: true,
+                    files_only: true,
+                    ..Default::default()
+                },
+            }),
+            &state.get_ctx(),
+        )
+        .await?;
+        entries.extend(page.entries);
+        match page.next_cursor {
+            Some(next) if entries.len() <= remaining => cursor = Some(next),
+            _ => return Ok(Some(entries)),
+        }
+    }
+    Ok(None)
+}
+
 #[utoipa::path(
     post,
     path = "/data/staging/jobs",
@@ -531,9 +622,19 @@ Nothing is authorized later while the job runs.
   means the job is durable and queued on this node, and nothing has been read or copied yet.
 - Unlike the blocking route there is no cap on the number of items, and prefixes are stored and
   walked by the job rather than expanded here.
+- S3 prefixes are walked as one flat listing with a provider cursor; other sources are walked
+  directory by directory from a durable queue. Each page and its checkpoint are written together,
+  and references are registered from listing metadata (size, ETag, last-modified) without a HEAD
+  per file.
+- `checksum_manifest` names an `md5sum` or `sha256sum` file below each prefix. It is read before
+  the prefix, and each imported file carries its digest; a later complete read of a reference and a
+  snapshot copy keep bytes only when they match it.
 - There is no idempotency key, so resubmitting the same body creates another job and stages the same
   objects a second time.
 - Progress and completion are observed by reading the job by its id.
+- In a distributed bucket every coordinator imports only the keys of the ranges it coordinates:
+  this node relays the job to the other coordinators with the caller's bearer token and lists their
+  jobs in `coordinator_jobs`; it starts no job of its own when it coordinates no range.
 
 **Limits**
 - At least one item or prefix is required.
@@ -551,7 +652,8 @@ Nothing is authorized later while the job runs.
                     "source_prefix": "refseq/2026",
                     "target_prefix": "genomes/2026"
                 }
-            ]
+            ],
+            "checksum_manifest": "MD5SUMS"
         })
     ),
     responses(
@@ -563,21 +665,27 @@ Nothing is authorized later while the job runs.
                 "job_id": "01JJOB0123456789ABCDEFGHJ"
             })
         ),
-        (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path or prefix is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
+        (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path, prefix or checksum manifest name is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on a source path or WRITE on a target key", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, or a connector or source path does not exist", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
-        (status = 503, description = "Job placement or the structured id clock is unavailable; the response carries `Retry-After` and the identical body may be resubmitted", body = ErrorResponse)
+        (status = 503, description = "Job placement or the structured id clock is unavailable, or a key range of the distributed bucket is moving away from this node; the response carries `Retry-After` and the identical body may be resubmitted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn submit_staging(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<StageBatchRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitStagingResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
+    let relayed = StageBatchRequest {
+        node_id: None,
+        ..request.clone()
+    };
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
     if request.strategy == ApiStagingStrategy::Sync {
@@ -653,7 +761,35 @@ pub async fn submit_staging(
             "at least one staging item or prefix is required".to_string(),
         ));
     }
+    let checksum_manifest = request
+        .checksum_manifest
+        .filter(|name| !name.trim().is_empty());
+    if let Some(name) = checksum_manifest.as_deref() {
+        validate_source_path(name)?;
+    }
 
+    crate::routes::storage::relay::relayed_set(&bucket_info, &headers)?;
+    // A distributed bucket imports by range: every coordinator runs a job for its own keys.
+    let fan_out =
+        (bucket_info.distribution.as_ref()).filter(|_| !headers.contains_key(RELAY_HOP_HEADER));
+    let (local, coordinator_jobs) = match fan_out {
+        Some(binding) => coordinator_jobs(&state, binding, bearer.as_ref(), &relayed).await?,
+        None => (true, Vec::new()),
+    };
+    if !local {
+        let job_id = (coordinator_jobs.iter())
+            .find_map(|job| job.job_id.clone())
+            .ok_or_else(|| {
+                ServerError::ServiceUnavailableReason(
+                    "no coordinator of the distributed bucket accepted the job".to_string(),
+                )
+            })?;
+        let response = SubmitStagingResponse {
+            job_id,
+            coordinator_jobs,
+        };
+        return Ok((StatusCode::ACCEPTED, Json(response)));
+    }
     let result = submit_staging_job(
         &state.get_ctx(),
         StagingJobSpec {
@@ -662,6 +798,7 @@ pub async fn submit_staging(
             node_id,
             connector_id,
             bucket: request.bucket,
+            bucket_identity: bucket_info.identity(),
             strategy: match request.strategy {
                 ApiStagingStrategy::Snapshot => StagingStrategy::Snapshot,
                 ApiStagingStrategy::Reference => StagingStrategy::Reference,
@@ -669,6 +806,7 @@ pub async fn submit_staging(
             },
             items,
             prefixes,
+            checksum_manifest,
         },
         node_id,
         state.rocrate_limits().artifact_retention_ms,
@@ -680,6 +818,7 @@ pub async fn submit_staging(
         StatusCode::ACCEPTED,
         Json(SubmitStagingResponse {
             job_id: result.job_id.to_string(),
+            coordinator_jobs,
         }),
     ))
 }
@@ -1250,6 +1389,7 @@ async fn snapshot_blob(
             retry_key: None,
             expected_bucket: bucket_info,
             restrictions: auth.path_restrictions.clone(),
+            expected_checksums: Vec::new(),
         },
     )
     .await
@@ -1314,6 +1454,7 @@ async fn reference_blob(
             key: request.key.clone(),
             expected_bucket: bucket_info,
             inherited_policies: Vec::new(),
+            restrictions: auth.path_restrictions.clone(),
         },
     )
     .await
@@ -1342,6 +1483,60 @@ async fn reference_blob(
             last_modified: result.source_metadata.last_modified.map(format_system_time),
         }),
     ))
+}
+
+/// Starts the job on every other coordinator of a distributed bucket with the caller's bearer;
+/// reports whether this node coordinates a range itself.
+async fn coordinator_jobs(
+    state: &ServerState,
+    binding: &aruna_core::structs::storage::distribution::DistributionBinding,
+    bearer: Option<&ValidatedBearer>,
+    request: &StageBatchRequest,
+) -> ServerResult<(bool, Vec<CoordinatorJobResponse>)> {
+    let view = bound_view(state.get_ctx().as_ref(), binding)
+        .await
+        .map_err(crate::routes::storage::distributed::map_guard_error)?;
+    let snapshot = view.snapshot();
+    // Refused before any relay, as the local job would be while a range moves away from here.
+    let moving = (snapshot.lifecycle.transfers.iter()).any(|open| open.from == binding.member_id);
+    if moving {
+        let error = SubmitJobError::RangeMoving(binding.set_id);
+        return Err(ServerError::ServiceUnavailableReason(error.to_string()));
+    }
+    let local = state.get_node_id();
+    let (mut coordinates, mut nodes) = (false, Vec::<RestForward>::new());
+    for range in &snapshot.config.ranges {
+        let Some(member) = snapshot.member(range.coordinator) else {
+            continue;
+        };
+        if member.node_id == local {
+            coordinates = true;
+        } else if !nodes
+            .iter()
+            .any(|forward| forward.node_id == member.node_id)
+        {
+            nodes.push(RestForward {
+                set_id: binding.set_id,
+                range_id: range.range_id,
+                node_id: member.node_id,
+            });
+        }
+    }
+    let mut jobs = Vec::with_capacity(nodes.len());
+    for forward in nodes {
+        let path = "/data/staging/jobs";
+        let answer = relay_json::<SubmitStagingResponse>(state, &forward, path, bearer, request);
+        let (job_id, error) = match answer.await {
+            Ok((_, answer)) => (Some(answer.job_id), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        jobs.push(CoordinatorJobResponse {
+            node_id: forward.node_id.to_string(),
+            job_id,
+            error,
+        });
+    }
+    Ok((coordinates, jobs))
 }
 
 /// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes` from
@@ -1480,6 +1675,9 @@ fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
         // never learn: the refusal is reported without them.
         MaterializeReferenceError::Policy(_) => ServerError::Forbidden,
         MaterializeReferenceError::Purge(_) => ServerError::ServiceUnavailable,
+        MaterializeReferenceError::Distribution(error) => {
+            crate::routes::storage::distributed::map_guard_error(error)
+        }
     }
 }
 

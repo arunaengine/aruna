@@ -423,6 +423,7 @@ async fn fill(
         acquired.storage_handle.clone(),
         net_handle.clone(),
         EgressPolicy::strict().with_deny(config.blob_backends.extra_deny.clone()),
+        Some(config.spool_path.clone()),
     )
     .await?;
     acquired.blob_handle = Some(blob_handle.clone());
@@ -474,8 +475,17 @@ async fn fill(
     checkpoint(StartupStage::Ops)?;
     stopped(stop)?;
 
-    // A rebuild is the only local evidence that counters were not carried over.
+    // A rebuild is the only local evidence that counters were not carried over. It runs in
+    // the background; quota-limited writes are refused until it finishes.
     acquired.usage_counters_rebuilt = ensure_usage_counters(driver_ctx.as_ref()).await?;
+    if acquired.usage_counters_rebuilt {
+        aruna_operations::node::usage_stats::spawn_usage_rebuild(
+            driver_ctx.clone(),
+            config.realm_id,
+            config.node_id,
+            &acquired.shutdown,
+        );
+    }
     checkpoint(StartupStage::UsageCounters)?;
     stopped(stop)?;
 
@@ -592,23 +602,25 @@ async fn record_restart_locks(
     Ok(())
 }
 
-/// Ensures the maintained usage counter shards exist before background writes
-/// start, and reports whether that required a rebuild.
+/// Reports whether the usage counters need a rebuild: shards or bucket rows are missing, or
+/// an earlier rebuild was interrupted. It then writes the rebuild marker, so the counters count
+/// as incomplete at once, and leaves the rebuild itself to the caller's background task.
 async fn ensure_usage_counters(
     driver_ctx: &DriverContext,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-    use aruna_core::structs::storage::usage::global_shard_keys;
-    use aruna_operations::driver::drive;
-    use aruna_operations::node::usage_stats::RebuildStatsOperation;
+    use aruna_core::structs::storage::usage::{
+        USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY, global_shard_keys,
+    };
 
-    let shard_keys = global_shard_keys();
+    let mut probe_keys = global_shard_keys();
+    probe_keys.push(USAGE_REBUILD_KEY.to_vec());
     let event = driver_ctx
         .storage_handle
         .send_storage_effect(StorageEffect::BatchRead {
-            reads: shard_keys
+            reads: probe_keys
                 .iter()
                 .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.clone().into()))
                 .collect(),
@@ -618,19 +630,41 @@ async fn ensure_usage_counters(
 
     match event {
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            if values.len() != shard_keys.len() {
+            if values.len() != probe_keys.len() {
                 return Err(format!(
-                    "usage counter probe returned {} values for {} shards",
+                    "usage counter probe returned {} values for {} rows",
                     values.len(),
-                    shard_keys.len()
+                    probe_keys.len()
                 )
                 .into());
             }
-            if values.iter().any(|(_, value)| value.is_none())
-                || bucket_rows_missing(driver_ctx).await?
-            {
-                drive(RebuildStatsOperation::new(), driver_ctx).await?;
-                return Ok(true);
+            let (marker, shards) = values.split_last().ok_or("usage counter probe is empty")?;
+            let shards_missing = shards.iter().any(|(_, value)| value.is_none());
+            if marker.1.is_some() || shards_missing || bucket_rows_missing(driver_ctx).await? {
+                // Missing group rows leave no complete counters for quota decisions.
+                if shards_missing {
+                    let forget = StorageEffect::Delete {
+                        key_space: USAGE_STATS_KEYSPACE.to_string(),
+                        key: USAGE_COMPLETE_KEY.to_vec().into(),
+                        txn_id: None,
+                    };
+                    let event = driver_ctx.storage_handle.send_storage_effect(forget).await;
+                    if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
+                        return Err(format!("usage completion marker kept: {event:?}").into());
+                    }
+                }
+                let mark = StorageEffect::Write {
+                    key_space: USAGE_STATS_KEYSPACE.to_string(),
+                    key: USAGE_REBUILD_KEY.to_vec().into(),
+                    value: Vec::new().into(),
+                    txn_id: None,
+                };
+                match driver_ctx.storage_handle.send_storage_effect(mark).await {
+                    Event::Storage(StorageEvent::WriteResult { .. }) => return Ok(true),
+                    other => {
+                        return Err(format!("usage rebuild marker not written: {other:?}").into());
+                    }
+                }
             }
         }
         Event::Storage(StorageEvent::Error { error }) => {
@@ -708,8 +742,32 @@ mod tests {
             .expect("storage opens")
     }
 
+    async fn read_usage(storage_handle: &StorageHandle, key: Vec<u8>) -> Option<Vec<u8>> {
+        let event = storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                key: key.into(),
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            panic!("expected a usage read result, got {event:?}");
+        };
+        value.map(|value| value.to_vec())
+    }
+
+    async fn rebuild(driver_ctx: &DriverContext) {
+        use aruna_operations::driver::drive;
+        use aruna_operations::node::usage_stats::RebuildStatsOperation;
+        drive(RebuildStatsOperation::new(), driver_ctx)
+            .await
+            .expect("usage rebuild finishes");
+    }
+
+    // Startup only marks the counters incomplete and returns; the rebuild runs later.
     #[tokio::test]
     async fn counters_rebuild_shards() {
+        use aruna_core::structs::storage::usage::USAGE_REBUILD_KEY;
         let temp = tempdir().expect("temp dir");
         let storage_handle = open_storage(&temp);
         let driver_ctx = test_driver_ctx(storage_handle.clone());
@@ -717,6 +775,21 @@ mod tests {
         assert!(
             ensure_usage_counters(&driver_ctx).await.unwrap(),
             "missing shards must report a rebuild"
+        );
+        let marker = read_usage(&storage_handle, USAGE_REBUILD_KEY.to_vec()).await;
+        assert!(marker.is_some(), "the counters must count as incomplete");
+        let shard = read_usage(&storage_handle, global_shard_keys()[0].clone()).await;
+        assert!(shard.is_none(), "startup must not wait for the rebuild");
+        assert!(
+            ensure_usage_counters(&driver_ctx).await.unwrap(),
+            "an unfinished rebuild must be started again"
+        );
+
+        rebuild(&driver_ctx).await;
+        assert!(
+            read_usage(&storage_handle, USAGE_REBUILD_KEY.to_vec())
+                .await
+                .is_none()
         );
         assert!(
             !ensure_usage_counters(&driver_ctx).await.unwrap(),
@@ -755,6 +828,7 @@ mod tests {
         let storage_handle = open_storage(&temp);
         let driver_ctx = test_driver_ctx(storage_handle.clone());
         assert!(ensure_usage_counters(&driver_ctx).await.unwrap());
+        rebuild(&driver_ctx).await;
         // A bucket from before bucket rows existed has shards but no row of its own.
         let info = BucketInfo {
             group_id: ulid::Ulid::from_bytes([3; 16]),
@@ -765,6 +839,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -779,6 +854,7 @@ mod tests {
             ensure_usage_counters(&driver_ctx).await.unwrap(),
             "a bucket without a row must report a rebuild"
         );
+        rebuild(&driver_ctx).await;
         let event = storage_handle
             .send_storage_effect(StorageEffect::Read {
                 key_space: USAGE_STATS_KEYSPACE.to_string(),

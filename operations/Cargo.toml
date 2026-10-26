@@ -29,6 +29,7 @@ md5 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 byteview = { workspace = true }
+chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
 globset = { workspace = true }
@@ -49,6 +50,7 @@ serde_json = { workspace = true }
 smallvec = { workspace = true }
 spargebra = { workspace = true }
 sysinfo = { workspace = true }
+tantivy = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }

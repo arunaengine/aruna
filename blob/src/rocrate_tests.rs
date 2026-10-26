@@ -235,7 +235,7 @@ const OID: &str = "4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2
 
 /// Metadata with one stored entity and the object it names, linked at `data/c.csv`.
 fn stored() -> (Value, LinkedObject) {
-    let id = aruna_core::structs::storage::data_identity::content_id([5; 32]);
+    let id = aruna_core::structs::storage::data::identity::content_id([5; 32]);
     let file = json!({"@id": id, "@type": "File", "name": "c.csv",
         "contentUrl": "s3://datasets-g/doc/data/c.csv", "localPath": "data/c.csv"});
     let value = document(json!([{"@id": id}]), vec![file]);
@@ -249,6 +249,7 @@ fn stored() -> (Value, LinkedObject) {
         size: 12,
         sha256: OID.into(),
         blake3: [5; 32],
+        global: None,
     };
     let linked = LinkedObject {
         entity: id,

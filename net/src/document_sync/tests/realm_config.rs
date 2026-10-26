@@ -2343,7 +2343,10 @@ async fn drops_evicted_node() {
             target,
             &actor,
             3,
-            AdminDocumentOperation::ConfigNodeRemoved { node_id: device },
+            AdminDocumentOperation::ConfigNodeRemoved {
+                node_id: device,
+                cutoffs: Vec::new(),
+            },
         ),
     )
     .await
@@ -3019,5 +3022,166 @@ async fn kind_conflict_withholds() {
         )
         .await
         .is_some()
+    );
+}
+
+#[tokio::test]
+async fn database_waits_group() {
+    // Without the owning group's roles yet, a database mark waits instead of being refused.
+    use aruna_core::structs::identity::database::{DatabaseEntry, DatabaseTarget};
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([61; 32]);
+    let group_id = Ulid::from_parts(1_640, 1);
+    let actor = test_actor(
+        12,
+        UserId::local(Ulid::from_parts(1_641, 1), realm_id),
+        realm_id,
+    );
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(actor.node_id, RealmNodeKind::Management);
+    let realm_auth = RealmAuthorizationDocument {
+        realm_id,
+        roles: HashMap::new(),
+        operation_restrictions: Default::default(),
+    };
+    batch_write_to(
+        &storage,
+        vec![
+            target_write_entry(
+                DocumentTarget::RealmConfig { realm_id },
+                config.to_bytes(&actor).expect("config serializes").into(),
+            ),
+            target_write_entry(
+                DocumentTarget::RealmAuthorization { realm_id },
+                realm_auth.to_bytes(&actor).expect("auth serializes").into(),
+            ),
+        ],
+    )
+    .await
+    .expect("realm state writes");
+    let entry = DatabaseEntry {
+        entry_id: Ulid::from_parts(1_642, 1),
+        dataset_id: Ulid::from_parts(1_643, 1),
+        target: DatabaseTarget::Distributed {
+            set_id: Ulid::from_parts(1_644, 1),
+        },
+        owner_group: group_id,
+    };
+    let event = test_admin_event(
+        Ulid::from_parts(1_645, 1),
+        AdminDocumentTarget::RealmConfig { realm_id },
+        &actor,
+        1,
+        AdminDocumentOperation::DatabaseSet {
+            entry,
+            predecessor: None,
+            consent: None,
+        },
+    );
+    let target = DocumentTarget::RealmConfig { realm_id };
+    let placement = admin_test_placement();
+    let topic = target.sync_topic_id(realm_id, &placement);
+    let validation = validate_admin_event(
+        &storage,
+        topic,
+        ::irokle::actor_id_for(topic, node_to_peer(&actor.node_id)),
+        &target,
+        &event,
+        realm_id,
+        &placement,
+        &sign_as_origin(&event, &placement),
+        &mut ConfigValidationCache::default(),
+    )
+    .await
+    .expect("validation runs");
+    assert!(
+        matches!(
+            validation,
+            AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::GroupAuthorization(id)),
+                ..
+            } if id == group_id
+        ),
+        "{validation:?}"
+    );
+}
+
+#[tokio::test]
+async fn database_applies_inbound() {
+    // A received database mark applies and leaves the topic open for the next event.
+    use aruna_core::structs::identity::database::{DatabaseEntry, DatabaseTarget};
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([62; 32]);
+    let actor = test_actor(
+        13,
+        UserId::local(Ulid::from_parts(1_650, 1), realm_id),
+        realm_id,
+    );
+    let target = AdminDocumentTarget::RealmConfig { realm_id };
+    let document_target = DocumentTarget::RealmConfig { realm_id };
+    let seed_config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    batch_write_to(
+        &storage,
+        vec![target_write_entry(
+            document_target.clone(),
+            seed_config
+                .to_bytes(&actor)
+                .expect("config serializes")
+                .into(),
+        )],
+    )
+    .await
+    .expect("seed realm config writes");
+    let entry = DatabaseEntry {
+        entry_id: Ulid::from_parts(1_651, 1),
+        dataset_id: Ulid::from_parts(1_652, 1),
+        target: DatabaseTarget::Distributed {
+            set_id: Ulid::from_parts(1_653, 1),
+        },
+        owner_group: Ulid::from_parts(1_654, 1),
+    };
+    let ops = [
+        AdminDocumentOperation::DatabaseSet {
+            entry: entry.clone(),
+            predecessor: None,
+            consent: None,
+        },
+        AdminDocumentOperation::ConfigDescriptionSet {
+            description: "After Database".to_string(),
+        },
+    ];
+    for (seq, op) in (1..).zip(ops) {
+        let event = test_admin_event(
+            Ulid::from_parts(1_655 + seq, 1),
+            target.clone(),
+            &actor,
+            seq,
+            op,
+        );
+        apply_admin_operation(&storage, document_target.clone(), event)
+            .await
+            .expect("realm config event applies");
+    }
+    let config = stored_realm_config(&storage, realm_id).await;
+    assert_eq!(config.databases, vec![entry.clone()]);
+    assert_eq!(config.description, "After Database");
+
+    let removal = test_admin_event(
+        Ulid::from_parts(1_658, 1),
+        target,
+        &actor,
+        3,
+        AdminDocumentOperation::DatabaseRemoved {
+            entry_id: entry.entry_id,
+        },
+    );
+    apply_admin_operation(&storage, document_target, removal)
+        .await
+        .expect("database removal applies");
+    assert!(
+        stored_realm_config(&storage, realm_id)
+            .await
+            .databases
+            .is_empty()
     );
 }

@@ -29,8 +29,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::storage::usage::{
-    BucketCounters, NodeUsageSnapshot, USAGE_BUCKET_PREFIX, UsageCounters, dirty_group_key,
-    global_shard_keys, usage_bucket_key, usage_group_key, usage_snapshot_key,
+    BucketCounters, NodeUsageSnapshot, USAGE_BUCKET_PREFIX, USAGE_COMPLETE_KEY, UsageCounters,
+    dirty_group_key, global_shard_keys, usage_bucket_key, usage_group_key, usage_snapshot_key,
 };
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::records::HeadAliasContext;
@@ -140,6 +140,7 @@ async fn create_bucket(h: &Harness, bucket: &str, group_id: Ulid) {
                 placement_policies: Vec::new(),
                 placement_policy_generation: 0,
                 compression: Compression::Off,
+                distribution: None,
             },
         ),
         &h.driver,
@@ -309,6 +310,7 @@ async fn usage_rows(ctx: &DriverContext) -> Vec<(Vec<u8>, Vec<u8>)> {
 async fn read_usage_stats(ctx: &DriverContext) -> Vec<(Vec<u8>, UsageCounters)> {
     let rows = usage_rows(ctx).await.into_iter();
     rows.filter(|(key, _)| !key.starts_with(USAGE_BUCKET_PREFIX.as_bytes()))
+        .filter(|(key, _)| key != USAGE_COMPLETE_KEY)
         .map(|(key, value)| (key, UsageCounters::from_bytes(&value).unwrap()))
         .collect()
 }

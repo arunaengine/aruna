@@ -667,6 +667,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Zstd { level: 3 },
+            distribution: None,
         };
         let bucket = Some(info.to_bytes().unwrap().into());
         let (mut operation, effects) = read(&whole, Some(PLAIN_PATTERN));

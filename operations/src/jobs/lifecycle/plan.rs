@@ -525,6 +525,8 @@ mod tests {
                 documents_held: None,
                 load_permille: Some(100),
                 heartbeat_at_ms: 1,
+                download_slots: None,
+                storage_capacity_bytes: None,
             },
             updated_at_ms: 1,
             epoch: AdvertisementEpoch::default(),

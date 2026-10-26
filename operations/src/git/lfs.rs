@@ -7,6 +7,7 @@ use super::state::{Ancestry, reduce};
 use super::{GitError, publish, records, repository};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::distribution::resolve::version_holders;
 use crate::driver::DriverContext;
 use crate::replication::bao_read::{BaoReadError, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
@@ -15,6 +16,7 @@ use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use bytes::Bytes;
@@ -90,6 +92,7 @@ fn described(auth: &AuthContext, object: &StoredObject) -> BaoReadRequest {
         metadata_only: true,
         destination: None,
         known_refs: Vec::new(),
+        range: None,
     }
 }
 
@@ -167,6 +170,7 @@ pub async fn upload(
         size: object.size,
         sha256: object.oid.clone(),
         blake3: [0; 32],
+        global: None,
     };
     permit(context, auth, &target, Permission::WRITE).await?;
     let content = (target.key, object.size, object.oid.as_str());
@@ -177,6 +181,17 @@ pub async fn upload(
 
 /// Streams LFS content after authorizing the original object. Content held elsewhere is
 /// relayed from its node and not stored here.
+/// The members that keep a pinned distributed version, found through the resolver.
+async fn set_holders(context: &DriverContext, object: &StoredObject) -> Vec<aruna_core::NodeId> {
+    match &object.global {
+        Some(GlobalId::Version { version_id, .. }) => version_holders(context, *version_id)
+            .await
+            .map(|resolved| resolved.holders)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 pub async fn download(
     context: &DriverContext,
     auth: &AuthContext,
@@ -197,7 +212,8 @@ pub async fn download(
         Some(copy) => copy,
         None if original.node_id == node => original,
         None => {
-            let holders = publish::holders(context, &document).await?;
+            let mut holders = publish::holders(context, &document).await?;
+            holders.extend(set_holders(context, &original).await);
             let blob = objects::open(context, auth, &document, &original, &holders).await?;
             return Ok((blob, original.size));
         }

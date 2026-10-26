@@ -32,6 +32,7 @@ use crate::structs::placement::transition::{
     BucketBarrier, BucketCompletion, BucketForceFinalize, CandidatePlacementMap, CompletionProof,
     PlacementActivation, PlacementTransition, StallReport, TransitionPlan, TransitionStatus,
 };
+use crate::structs::storage::distribution::{MAX_CUTOFFS, PublisherCutoff};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::reserved_label;
 use crate::structured_id::PlacementHandle;
@@ -44,6 +45,7 @@ mod apply;
 mod paths;
 mod placement;
 mod revocation;
+mod snapshot;
 mod targets;
 
 pub use paths::*;
@@ -72,6 +74,8 @@ pub enum AdminDocumentError {
     InvalidGroupDeletion,
     #[error("group dataset location is invalid")]
     InvalidLocation,
+    #[error("database entry is invalid")]
+    InvalidDatabase,
     #[error(transparent)]
     InvalidUserAttribute(#[from] UserAttributeError),
     #[error("placement labels must not set the derived label `{0}`")]
@@ -105,6 +109,10 @@ pub enum AdminDocumentError {
     JobFamilyChanged,
     #[error("job family placement strategy cannot be removed")]
     JobFamilyRemoved,
+    #[error(transparent)]
+    Distribution(#[from] crate::structs::storage::distribution::DistributionError),
+    #[error("publisher cutoffs repeat a set or exceed their bound")]
+    InvalidCutoffs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

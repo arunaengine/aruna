@@ -2744,6 +2744,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression,
+            distribution: None,
         }
         .to_bytes()
         .unwrap()
@@ -3396,6 +3397,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let request = RenameRequest {
             started_at_ms: 7,
@@ -3507,6 +3509,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Compression::Off,
+            distribution: None,
         };
         let id = Ulid::from_parts(9, 9);
         let intent = WriteIntent {

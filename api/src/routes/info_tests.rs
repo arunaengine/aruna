@@ -1471,6 +1471,8 @@ async fn management_urls_follow() {
             documents_held: None,
             load_permille: None,
             heartbeat_at_ms: 1_700_000_000_000,
+            download_slots: None,
+            storage_capacity_bytes: None,
         },
         updated_at_ms: 1_700_000_000_500,
         epoch: aruna_core::structs::storage::node_info::AdvertisementEpoch {
@@ -1541,6 +1543,12 @@ async fn realm_node_details() {
             documents_held: None,
             load_permille: None,
             heartbeat_at_ms: 1_700_000_000_000,
+            download_slots: Some(aruna_core::download_slots::DownloadSlots {
+                active: 2,
+                max: 256,
+                refused: 1,
+            }),
+            storage_capacity_bytes: None,
         },
         updated_at_ms: 1_700_000_000_500,
         epoch: aruna_core::structs::storage::node_info::AdvertisementEpoch {
@@ -1587,6 +1595,11 @@ async fn realm_node_details() {
     assert_eq!(node_info.labels.get("tier"), Some(&"hot".to_string()));
     assert_eq!(node_info.urls.s3.as_deref(), Some("s3.example"));
     assert_eq!(node_info.utilization.storage_bytes_used, 4_096);
+    let slots = node_info
+        .utilization
+        .download_slots
+        .expect("heartbeat slots reported");
+    assert_eq!((slots.active, slots.max, slots.refused), (2, 256, 1));
     assert_eq!(node_info.telemetry, TelemetryState::Absent);
     assert_eq!(node_info.telemetry_age_ms, None);
     let serialized = serde_json::to_value(node_info).unwrap();
@@ -1602,7 +1615,7 @@ fn node_openapi_optional() {
         ("RealmNodeUrlsResponse", &["api", "s3"][..]),
         (
             "RealmNodeUtilizationResponse",
-            &["documents_held", "load_permille"][..],
+            &["documents_held", "load_permille", "download_slots"][..],
         ),
     ] {
         let schema = &openapi["components"]["schemas"][schema];

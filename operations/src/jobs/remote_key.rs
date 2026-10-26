@@ -574,6 +574,7 @@ mod tests {
             placement_policies: Vec::new(),
             placement_policy_generation: 0,
             compression: Default::default(),
+            distribution: None,
         };
         let realm_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
         let config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -962,6 +963,7 @@ mod tests {
                 version_selector: None,
                 capabilities: Vec::new(),
                 origin_node_id: None,
+                namespace: None,
             },
             connector_id: None,
         };
@@ -971,6 +973,7 @@ mod tests {
             etag: None,
             last_modified: None,
             source_version: None,
+            digests: Default::default(),
         };
         let epoch = std::time::SystemTime::UNIX_EPOCH;
         let reference = BlobVersion::reference(source, metadata, epoch, owner, epoch);

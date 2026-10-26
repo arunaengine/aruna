@@ -118,6 +118,35 @@ pub(crate) async fn job_entry_deletes(
     ))
 }
 
+/// One bounded page of a staging job's queue and manifest rows; `true` while more remain.
+pub(crate) async fn staging_row_deletes(
+    storage: &StorageHandle,
+    job_id: JobId,
+    limit: usize,
+) -> Result<(JobDeletes, bool), String> {
+    let prefix = ByteView::from(job_id.to_bytes().to_vec());
+    let mut deletes = Vec::new();
+    let mut more = false;
+    for key_space in [
+        aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE,
+        aruna_core::keyspaces::STAGING_MANIFEST_KEYSPACE,
+    ] {
+        let room = limit.saturating_sub(deletes.len());
+        if room == 0 {
+            return Ok((deletes, true));
+        }
+        let (values, next) =
+            iter_prefix_page(storage, key_space, Some(prefix.clone()), None, room, None).await?;
+        more |= next.is_some();
+        deletes.extend(
+            values
+                .into_iter()
+                .map(|(key, _)| (key_space.to_string(), key)),
+        );
+    }
+    Ok((deletes, more))
+}
+
 pub async fn find_dedup_job(
     storage: &StorageHandle,
     created_by: UserId,

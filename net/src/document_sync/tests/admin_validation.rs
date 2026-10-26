@@ -154,7 +154,10 @@ fn removal_needs_management() {
             AdminDocumentTarget::RealmConfig { realm_id },
             &actor,
             1,
-            AdminDocumentOperation::ConfigNodeRemoved { node_id: device },
+            AdminDocumentOperation::ConfigNodeRemoved {
+                node_id: device,
+                cutoffs: Vec::new(),
+            },
         )
     };
 

@@ -619,6 +619,7 @@ enum AdminOperationFamily {
     RealmAuthorization,
     User,
     RealmConfig,
+    Distribution,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
