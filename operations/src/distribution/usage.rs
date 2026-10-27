@@ -259,9 +259,11 @@ async fn copied_rows(
 ) -> Result<RangeCounters, UsageError> {
     let set_id = binding.set_id;
     let accounts = local_accounts(context, set_id, txn_id).await?;
+    // A split parent this node has not split its accounting for yet counts with its children.
     let coordinated = |range_id: &Ulid| {
-        (snapshot.config.ranges.iter())
-            .any(|range| range.range_id == *range_id && range.coordinator == binding.member_id)
+        (snapshot.config.ranges.iter()).any(|range| {
+            range.coordinator == binding.member_id && snapshot.descends(range, *range_id)
+        })
     };
     let own: Vec<_> = (accounts.iter())
         .filter(|(range_id, _)| coordinated(range_id))
@@ -495,12 +497,12 @@ mod tests {
     /// Stores the bound bucket "spire" of member 1, its record and these accounts and counters.
     async fn spire(
         handle: &aruna_storage::storage::StorageHandle,
+        (snapshot, bytes): (DistributionSnapshot, Vec<u8>),
         accounts: Vec<(Ulid, Charge)>,
         counters: Vec<(Vec<u8>, RangeCounters)>,
     ) -> DistributionSnapshot {
-        use crate::distribution::test_record::{binding, replicated, store_record};
+        use crate::distribution::test_record::{binding, store_record};
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-        let (snapshot, bytes) = replicated(true, 1);
         let set_id = snapshot.set_id();
         store_record(handle, set_id, bytes).await;
         let info = BucketInfo {
@@ -571,7 +573,8 @@ mod tests {
             (generation_key(set_id, upper, 2), counted(1, 10, 7)),
             (generation_key(set_id, purged, 1), counted(2, 5, 0)),
         ];
-        let snapshot = spire(&handle, accounts, counters).await;
+        let record = crate::distribution::test_record::replicated(true, 1);
+        let snapshot = spire(&handle, record, accounts, counters).await;
 
         assert_eq!(
             replica_share(&context, "spire").await.unwrap(),
@@ -618,7 +621,8 @@ mod tests {
             (pending_key(set_id, lower), objects(2)),
             (pending_key(set_id, upper), objects(-1)),
         ];
-        spire(&handle, accounts, counters).await;
+        let record = crate::distribution::test_record::replicated(true, 1);
+        spire(&handle, record, accounts, counters).await;
 
         assert_eq!(replica_share(&context, "spire").await.unwrap(), objects(-1));
         let shares = replica_shares(&context).await.unwrap();
@@ -626,6 +630,43 @@ mod tests {
             shares.values().all(|share| share.objects == 0),
             "a negative share reads as zero"
         );
+    }
+
+    #[tokio::test]
+    async fn split_parent_owned() {
+        // Until this node splits its accounting, the parent account of a split range it
+        // coordinates stays active; its charge is owned through the children, not a copy.
+        use crate::distribution::test_record::{replicated, split_lower};
+        use crate::distribution::test_store::{context, open};
+        let (_dir, handle) = open();
+        let context = context(&handle);
+        let parent = replicated(true, 1).0.config.ranges[0].range_id;
+        let record = split_lower(1, "f");
+        let set_id = record.0.set_id();
+        let copy = (record.0.config.ranges.iter())
+            .find(|range| range.lower == "m")
+            .unwrap()
+            .range_id;
+        assert!(
+            record
+                .0
+                .config
+                .ranges
+                .iter()
+                .all(|range| range.range_id != parent)
+        );
+        let logical = |logical_bytes| RangeCounters {
+            logical_bytes,
+            ..RangeCounters::default()
+        };
+        let accounts = vec![(parent, Charge::Active(3)), (copy, Charge::Active(2))];
+        let counters = vec![
+            (generation_key(set_id, parent, 3), logical(40)),
+            (generation_key(set_id, copy, 2), logical(10)),
+        ];
+        spire(&handle, record, accounts, counters).await;
+
+        assert_eq!(replica_share(&context, "spire").await.unwrap(), logical(10));
     }
 
     #[test]
