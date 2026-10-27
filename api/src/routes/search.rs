@@ -210,6 +210,9 @@ pub struct ObjectCoverage {
     /// Index progress of the incomplete ranges whose coordinator reported it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub index_progress: Vec<RangeIndexProgress>,
+    /// Incomplete ranges whose index, still being built, answered for keys up to a key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_ranges: Vec<PartialRange>,
     pub complete: bool,
     pub truncated: bool,
     pub partitions: Vec<ObjectPartitionCoverage>,
@@ -225,6 +228,15 @@ pub struct RangeIndexProgress {
     pub indexed_keys: u64,
     /// Keys of the range by the coordinator's range counters, an estimate.
     pub keys: u64,
+}
+
+/// A range whose hits are exact for its keys up to `indexed_through` and miss later keys.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PartialRange {
+    pub node_id: String,
+    pub range_id: String,
+    /// The last key the index holds every key up to; `null` if the caller may not read it.
+    pub indexed_through: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -480,6 +492,9 @@ restrictions and request policies before it can be returned.
   the key, split at `/`, `.`, `-`, `_` and other separators. `coverage.incomplete_ranges` counts
   ranges whose index is missing or still being built (and, in `local` mode, ranges another
   member coordinates); they are never scanned, and `complete` is false while any remain.
+  A range whose index is still being built answers for the keys indexed so far and is listed in
+  `coverage.partial_ranges` with `indexed_through`, the key up to which its hits are exact; a
+  query that ends at or before that key counts the range as complete.
   `coverage.index_progress` lists the keys indexed so far and the range's key count for each
   such range whose coordinator answered. `distributed_strict` answers 503 while any remain, and
   the error message says how many ranges and about how many keys are still to be indexed.
@@ -665,6 +680,13 @@ fn map_search_response(result: ObjectExecution, mode: ObjectMode) -> ObjectRespo
                     ready: progress.ready,
                     indexed_keys: progress.indexed,
                     keys: progress.keys,
+                })
+                .collect(),
+            partial_ranges: (result.partial_ranges.into_iter())
+                .map(|(node_id, range_id, indexed_through)| PartialRange {
+                    node_id: node_id.to_string(),
+                    range_id: range_id.to_string(),
+                    indexed_through,
                 })
                 .collect(),
             complete: result.complete,

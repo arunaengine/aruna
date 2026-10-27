@@ -123,6 +123,8 @@ pub struct ObjectExecution {
     pub incomplete_ranges: usize,
     /// Index progress of incomplete ranges, by the node that coordinates them.
     pub index_progress: Vec<(NodeId, ulid::Ulid, IndexProgress)>,
+    /// Incomplete ranges answered up to a key, by their coordinator.
+    pub partial_ranges: Vec<(NodeId, ulid::Ulid, Option<String>)>,
     pub complete: bool,
 }
 
@@ -627,10 +629,17 @@ pub(super) fn assemble_object_execution(
             progress.map(|(range_id, progress)| (*node_id, *range_id, *progress))
         })
         .collect();
+    let partial_ranges: Vec<_> = (parts.iter())
+        .flat_map(|(node_id, page)| {
+            let partial = page.partial_ranges.iter();
+            partial.map(|(range_id, through)| (*node_id, *range_id, through.clone()))
+        })
+        .collect();
     // Strict mode answers complete pages only: an unsearched range fails the request.
     if plan.mode == ObjectQueryMode::DistributedStrict && incomplete_ranges > 0 {
         return Err(MetadataApiError::SearchIncomplete(incomplete_reason(
             incomplete_ranges,
+            partial_ranges.len(),
             &index_progress,
         )));
     }
@@ -722,13 +731,18 @@ pub(super) fn assemble_object_execution(
         omitted_partitions,
         incomplete_ranges,
         index_progress,
+        partial_ranges,
         complete,
     })
 }
 
-/// Why a strict search refused: how many ranges were not searched and how many keys their
-/// indexes still miss.
-fn incomplete_reason(ranges: usize, progress: &[(NodeId, ulid::Ulid, IndexProgress)]) -> String {
+/// Why a strict search refused: how many ranges were not searched or only in part, and how
+/// many keys their indexes still miss.
+fn incomplete_reason(
+    ranges: usize,
+    partial: usize,
+    progress: &[(NodeId, ulid::Ulid, IndexProgress)],
+) -> String {
     let pending = (progress.iter())
         .map(|(_, _, progress)| progress.keys.saturating_sub(progress.indexed))
         .sum::<u64>();
@@ -736,6 +750,11 @@ fn incomplete_reason(ranges: usize, progress: &[(NodeId, ulid::Ulid, IndexProgre
         "{ranges} distributed bucket ranges were not searched: their search index is missing \
          or still being built, or the search names no bucket"
     );
+    if partial > 0 {
+        reason.push_str(&format!(
+            "; {partial} of them are indexed only up to a key before the end of the query"
+        ));
+    }
     if pending > 0 {
         reason.push_str(&format!("; about {pending} keys are still to be indexed"));
     }

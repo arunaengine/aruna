@@ -12,7 +12,7 @@ use crate::errors::ConversionError;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IndexState {
     /// A new generation is filled from the inventory heads; `cursor` is the last head
-    /// position written to it. Queries treat the range as incomplete.
+    /// position written to it. Queries trust it only for keys up to the cursor's key.
     Building {
         generation: u64,
         cursor: Option<Vec<u8>>,

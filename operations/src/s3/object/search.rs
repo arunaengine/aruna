@@ -106,6 +106,10 @@ pub struct SearchNodePage {
     /// This node's index progress of the incomplete ranges it coordinates.
     #[serde(default)]
     pub index_progress: Vec<(ulid::Ulid, IndexProgress)>,
+    /// Incomplete ranges whose building index answered for the keys up to a key, named only
+    /// if the caller may read it.
+    #[serde(default)]
+    pub partial_ranges: Vec<(ulid::Ulid, Option<String>)>,
 }
 
 #[derive(Debug, Error)]
@@ -219,6 +223,7 @@ fn node_page(
         incomplete_ranges: distributed.values().filter(|bound| **bound).count(),
         remote_ranges: 0,
         index_progress: Vec::new(),
+        partial_ranges: Vec::new(),
     }
 }
 
