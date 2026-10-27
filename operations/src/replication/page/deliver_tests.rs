@@ -151,12 +151,13 @@ fn committed(key: &str, id: u128, generation: u64, head: bool) -> Vec<(String, K
 struct Member<'a> {
     handle: &'a StorageHandle,
     lost: Mutex<usize>,
-    pages: Mutex<usize>,
+    /// Records of each page sent.
+    pages: Mutex<Vec<usize>>,
 }
 
 impl PageSender for Member<'_> {
     async fn send(&self, _node: NodeId, page: ReferencePage) -> Result<PageAnswer, String> {
-        *self.pages.lock().unwrap() += 1;
+        self.pages.lock().unwrap().push(page.manifests.len());
         let input = ApplyInput {
             page,
             publisher: secret(1).public(),
@@ -206,7 +207,7 @@ async fn backlog_arrives_once() {
     let sender = Member {
         handle: &member.handle,
         lost: Mutex::new(0),
-        pages: Mutex::new(0),
+        pages: Mutex::default(),
     };
     let context = context(&coordinator.handle);
     for _ in 0..16 {
@@ -248,8 +249,43 @@ async fn backlog_arrives_once() {
         pointer.version_id,
         Ulid::from_parts(1_700_000_000_000, 900_002)
     );
-    let pages = *sender.pages.lock().unwrap();
+    let pages = sender.pages.lock().unwrap().len();
     assert!(pages <= 4, "records travel in pages, {pages} sent");
+}
+
+// Prints how fast a backlog reaches a member in pages; a measurement, not a contract. Run in
+// release with `--ignored --nocapture` to read it.
+#[tokio::test]
+#[ignore]
+async fn pages_measured() {
+    let (snapshot, bytes) = replicated(true, 1);
+    let coordinator = node(&snapshot, &bytes, 1).await;
+    let member = node(&snapshot, &bytes, 2).await;
+    let count = 49_152;
+    let mut writes = Vec::new();
+    for index in 0..count {
+        let key = format!("a/{index:07}");
+        writes.extend(committed(&key, index as u128 + 1, 1, true));
+    }
+    write(&coordinator.handle, writes).await;
+    let sender = Member {
+        handle: &member.handle,
+        lost: Mutex::new(0),
+        pages: Mutex::default(),
+    };
+    let context = context(&coordinator.handle);
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        drain_batch(&context, &sender).await.unwrap();
+        if counters(&member.handle).await.versions == count as u64 {
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(counters(&member.handle).await.versions, count as u64);
+    let pages = sender.pages.lock().unwrap().len();
+    let rate = count as f64 / elapsed.as_secs_f64();
+    println!("{count} records in {pages} pages, {elapsed:?}: {rate:.0} records/s");
 }
 
 #[tokio::test]
@@ -267,7 +303,7 @@ async fn lost_answer_replays() {
     let sender = Member {
         handle: &member.handle,
         lost: Mutex::new(1),
-        pages: Mutex::new(0),
+        pages: Mutex::default(),
     };
     let context = context(&coordinator.handle);
     let result = drain_batch(&context, &sender).await.unwrap();
@@ -292,4 +328,33 @@ async fn lost_answer_replays() {
         counted,
         "the replay counts nothing"
     );
+}
+
+#[tokio::test]
+async fn failed_page_shrinks() {
+    // A page whose answer never came returns in pages of half its size, so a page too slow for
+    // its member gets cheaper instead of timing out the same way again.
+    let (snapshot, bytes) = replicated(true, 1);
+    let coordinator = node(&snapshot, &bytes, 1).await;
+    let member = node(&snapshot, &bytes, 2).await;
+    let mut writes = Vec::new();
+    for index in 0..PAGE_RECORDS {
+        writes.extend(committed(&format!("d/{index}"), index as u128 + 1, 1, true));
+    }
+    write(&coordinator.handle, writes).await;
+    let sender = Member {
+        handle: &member.handle,
+        lost: Mutex::new(1),
+        pages: Mutex::default(),
+    };
+    let context = context(&coordinator.handle);
+    drain_batch(&context, &sender).await.unwrap();
+    let jobs = rows(&coordinator.handle, REPLICATION_JOB_KEYSPACE).await;
+    let jobs = (jobs.into_iter())
+        .map(|(key, value)| (key, BlobJobRecord::from_bytes(&value).unwrap()))
+        .collect();
+    let report = deliver_pages(&context, jobs, &sender).await.unwrap();
+    assert_eq!(report.delivered, PAGE_RECORDS);
+    let half = PAGE_RECORDS / 2;
+    assert_eq!(*sender.pages.lock().unwrap(), [PAGE_RECORDS, half, half]);
 }

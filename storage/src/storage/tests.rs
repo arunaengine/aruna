@@ -316,7 +316,7 @@ fn bulk_full_rejects() {
         .manual_journal_persist(true)
         .open()
         .unwrap();
-    let (bulk_sender, _bulk_receiver) = crossfire::mpsc::bounded_blocking(1);
+    let (bulk_sender, _bulk_receiver) = crossfire::mpmc::bounded_blocking(1);
     let mut storage = super::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
@@ -325,10 +325,8 @@ fn bulk_full_rejects() {
             std::collections::BTreeMap::new(),
         )),
         metrics: std::sync::Arc::new(super::StorageMetrics::default()),
-        read_pool: Vec::new(),
-        next_reader: 0,
-        bulk_read_pool: vec![bulk_sender],
-        next_bulk_reader: 0,
+        read_pool: crossfire::mpmc::bounded_blocking(1).0,
+        bulk_read_pool: bulk_sender,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
@@ -351,8 +349,9 @@ fn bulk_full_rejects() {
     let guard = super::InFlightGuard::acquire(&metrics);
     let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
     assert!(
-        storage.bulk_read_pool[0]
-            .try_send((filler, filler_tx, span, Instant::now(), guard))
+        storage
+            .bulk_read_pool
+            .try_send(((filler, filler_tx, span, Instant::now(), guard), None))
             .is_ok(),
         "saturate bulk read pool"
     );
@@ -363,7 +362,7 @@ fn bulk_full_rejects() {
     let (target_tx, mut target_rx) = super::response_channel(super::ResponseToken::empty());
     let mut slow = super::SlowQueueAggregator::default();
     storage.forward_read(
-        (target, target_tx, span, Instant::now(), guard),
+        ((target, target_tx, span, Instant::now(), guard), None),
         StoragePriority::Bulk,
         &mut slow,
     );
@@ -1308,13 +1307,14 @@ fn unknown_commit_runs() {
     let mut storage = super::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
-        txns: std::collections::HashMap::from([(txn_id, super::Txn::Write(Box::new(txn)))]),
+        txns: std::collections::HashMap::from([(
+            txn_id,
+            super::Txn::Write(std::sync::Arc::new(txn)),
+        )]),
         transaction_cleanup,
         metrics: std::sync::Arc::new(super::StorageMetrics::default()),
-        read_pool: Vec::new(),
-        next_reader: 0,
-        bulk_read_pool: Vec::new(),
-        next_bulk_reader: 0,
+        read_pool: crossfire::mpmc::bounded_blocking(1).0,
+        bulk_read_pool: crossfire::mpmc::bounded_blocking(1).0,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
@@ -1363,10 +1363,8 @@ fn unknown_commit_retires() {
         txns: std::collections::HashMap::new(),
         transaction_cleanup,
         metrics: std::sync::Arc::new(super::StorageMetrics::default()),
-        read_pool: Vec::new(),
-        next_reader: 0,
-        bulk_read_pool: Vec::new(),
-        next_bulk_reader: 0,
+        read_pool: crossfire::mpmc::bounded_blocking(1).0,
+        bulk_read_pool: crossfire::mpmc::bounded_blocking(1).0,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
@@ -1409,13 +1407,14 @@ fn retry_skips_queued() {
     let mut storage = super::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
-        txns: std::collections::HashMap::from([(txn_id, super::Txn::Write(Box::new(txn)))]),
+        txns: std::collections::HashMap::from([(
+            txn_id,
+            super::Txn::Write(std::sync::Arc::new(txn)),
+        )]),
         transaction_cleanup,
         metrics: std::sync::Arc::new(super::StorageMetrics::default()),
-        read_pool: Vec::new(),
-        next_reader: 0,
-        bulk_read_pool: Vec::new(),
-        next_bulk_reader: 0,
+        read_pool: crossfire::mpmc::bounded_blocking(1).0,
+        bulk_read_pool: crossfire::mpmc::bounded_blocking(1).0,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),

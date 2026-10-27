@@ -85,11 +85,17 @@ impl FjallStorage {
         Ok(sender)
     }
 
-    fn close(mut self) {
-        self.compactor.shutdown();
-        self.read_pool.clear();
-        self.bulk_read_pool.clear();
-        for reader in std::mem::take(&mut self.pool_threads) {
+    fn close(self) {
+        let Self {
+            mut compactor,
+            read_pool,
+            bulk_read_pool,
+            pool_threads,
+            ..
+        } = self;
+        compactor.shutdown();
+        drop((read_pool, bulk_read_pool));
+        for reader in pool_threads {
             let _ = reader.join();
         }
     }
@@ -114,9 +120,7 @@ impl FjallStorage {
             transaction_cleanup: handle.transaction_cleanup.clone(),
             metrics: handle.metrics.clone(),
             read_pool,
-            next_reader: 0,
             bulk_read_pool,
-            next_bulk_reader: 0,
             pool_threads,
             compactor: Compactor::spawn(),
             deletes: HashMap::new(),

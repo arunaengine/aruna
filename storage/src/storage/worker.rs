@@ -16,27 +16,35 @@ use aruna_core::keyspaces::{NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, prefix_u
 use aruna_core::telemetry::duration_ms;
 use byteview::ByteView;
 use crossfire::select::Select;
-use crossfire::{RecvError, TryRecvError, TrySendError, mpsc};
+use crossfire::{RecvError, TryRecvError, TrySendError, mpmc};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use tracing::warn;
 use ulid::Ulid;
 
 use super::handle::{
-    CleanupEntry, CleanupKind, EffectHandle, EffectReceiver, EffectSender, MAX_CLEANUP_ATTEMPTS,
-    ResponseSender, StorageReceivers, cleanup_effect, effect_txn_id, finish_cleanup,
-    observe_cleanup, storage_effect_mutates,
+    CleanupEntry, CleanupKind, EffectHandle, MAX_CLEANUP_ATTEMPTS, ResponseSender,
+    StorageReceivers, cleanup_effect, effect_txn_id, finish_cleanup, observe_cleanup,
+    storage_effect_mutates,
 };
 use super::metrics::{StorageMetrics, record_storage_call};
 use super::persistence::FjallPersistPolicy;
+use super::records::run_read;
 use super::telemetry::{storage_effect_kind, storage_event_kind};
 use super::transactions::CounterChange;
 use crate::compaction::Compactor;
 
+/// An open transaction; a read pool thread holds a clone while it reads in it.
+#[derive(Clone)]
 pub(super) enum Txn {
     Read(fjall::Snapshot),
-    Write(Box<fjall::OptimisticWriteTx>),
+    Write(Arc<fjall::OptimisticWriteTx>),
 }
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
+/// A read and the transaction it reads in.
+pub(super) type PoolItem = (EffectHandle, Option<Txn>);
+/// One queue per read pool, so a slow read holds one thread, never the reads behind it.
+pub(super) type PoolSender = crossfire::MTx<mpmc::Array<PoolItem>>;
+type PoolReceiver = crossfire::MRx<mpmc::Array<PoolItem>>;
 /// True when the effect writes or deletes a realm config row.
 pub(super) fn touches_config(effect: &StorageEffect) -> bool {
     let is_config = |key_space: &str| key_space == REALM_CONFIG_KEYSPACE;
@@ -88,6 +96,10 @@ const QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const MAX_GROUP_COMMIT: usize = 256;
 pub(super) const READ_POOL_THREADS: usize = 4;
 pub(super) const BULK_POOL_THREADS: usize = 2;
+/// Point reads on a network disk wait on its latency, so a batch of more than `READ_CHUNK`
+/// keys is read by up to `READ_THREADS` threads at once.
+const READ_CHUNK: usize = 256;
+const READ_THREADS: usize = 8;
 // Count foreground effects so large batches cannot starve the bulk lane under load.
 pub(super) const FOREGROUND_PER_BULK: usize = 8;
 #[derive(Clone)]
@@ -155,10 +167,8 @@ pub struct FjallStorage {
     pub(super) txns: HashMap<Ulid, Txn>,
     pub(super) transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
     pub(super) metrics: Arc<StorageMetrics>,
-    pub(super) read_pool: Vec<EffectSender>,
-    pub(super) next_reader: usize,
-    pub(super) bulk_read_pool: Vec<EffectSender>,
-    pub(super) next_bulk_reader: usize,
+    pub(super) read_pool: PoolSender,
+    pub(super) bulk_read_pool: PoolSender,
     pub(super) pool_threads: Vec<thread::JoinHandle<()>>,
     pub(super) compactor: Compactor,
     /// Committed deletes per keyspace since its last compaction.
@@ -206,9 +216,8 @@ impl FjallStorage {
         self.txn_usage.remove(&txn_id);
         self.txn_rows.remove(&txn_id);
         self.config_txns.remove(&txn_id);
-        if let Some(Txn::Write(txn)) = self.txns.remove(&txn_id) {
-            txn.rollback();
-        }
+        // Dropping the last handle rolls the transaction back.
+        self.txns.remove(&txn_id);
         if let Some(entry) = self
             .transaction_cleanup
             .lock()
@@ -367,13 +376,12 @@ impl FjallStorage {
                     let served = self.serve_foreground_batch(&receivers, first, &mut slow_queue);
                     lanes.record_foreground(served);
                 }
-                StoragePriority::Bulk => {
-                    if is_poolable_read(&first.0) {
-                        self.forward_read(first, StoragePriority::Bulk, &mut slow_queue);
-                    } else {
-                        self.process_single(first, &mut slow_queue);
+                StoragePriority::Bulk => match self.pooled_txn(&first.0) {
+                    Some(txn) => {
+                        self.forward_read((first, txn), StoragePriority::Bulk, &mut slow_queue)
                     }
-                }
+                    None => self.process_single(first, &mut slow_queue),
+                },
             }
         }
     }
@@ -406,8 +414,10 @@ impl FjallStorage {
                 group.push(item);
                 continue;
             }
-            if is_poolable_read(&item.0) {
-                let conflicts = !group.is_empty()
+            if let Some(txn) = self.pooled_txn(&item.0) {
+                // A transaction reads its own snapshot, which no pending write changes.
+                let conflicts = txn.is_none()
+                    && !group.is_empty()
                     && group_index
                         .get_or_insert_with(|| PendingWriteIndex::from_group(&group))
                         .conflicts_with_read(&item.0);
@@ -415,7 +425,7 @@ impl FjallStorage {
                     self.flush_write_group(&mut group, slow_queue);
                     group_index = None;
                 }
-                self.forward_read(item, StoragePriority::Foreground, slow_queue);
+                self.forward_read((item, txn), StoragePriority::Foreground, slow_queue);
                 continue;
             }
             self.flush_write_group(&mut group, slow_queue);
@@ -427,32 +437,56 @@ impl FjallStorage {
         served
     }
 
+    /// The transaction a read runs in on a read pool: `Some(None)` outside one, `None` for an
+    /// effect this thread runs, such as a range read outside one, which pending writes may change.
+    fn pooled_txn(&self, effect: &StorageEffect) -> Option<Option<Txn>> {
+        let txn_id = match effect {
+            StorageEffect::Read { txn_id, .. }
+            | StorageEffect::BatchRead { txn_id, .. }
+            | StorageEffect::Iter { txn_id, .. }
+            | StorageEffect::Last { txn_id, .. } => *txn_id,
+            StorageEffect::IterRange {
+                txn_id: Some(txn_id),
+                ..
+            } => Some(*txn_id),
+            _ => return None,
+        };
+        match txn_id {
+            None => Some(None),
+            Some(txn_id) if self.usage_views.contains(&txn_id) => None,
+            Some(txn_id) => self.txns.get(&txn_id).cloned().map(Some),
+        }
+    }
+
     pub(super) fn forward_read(
         &mut self,
-        item: EffectHandle,
+        item: PoolItem,
         priority: StoragePriority,
         slow_queue: &mut SlowQueueAggregator,
     ) {
-        match priority {
-            StoragePriority::Foreground => {
-                let reader = self.next_reader % self.read_pool.len();
-                self.next_reader = self.next_reader.wrapping_add(1);
-                match self.read_pool[reader].try_send(item) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(item)) | Err(TrySendError::Disconnected(item)) => {
-                        self.process_single(item, slow_queue);
-                    }
-                }
+        // A large batch reads on the bulk pool, so small foreground reads never wait behind it.
+        let priority = match &item.0.0 {
+            StorageEffect::BatchRead { reads, .. } if reads.len() > READ_CHUNK => {
+                StoragePriority::Bulk
             }
+            _ => priority,
+        };
+        match priority {
+            StoragePriority::Foreground => match self.read_pool.try_send(item) {
+                Ok(()) => {}
+                Err(TrySendError::Full((item, _))) | Err(TrySendError::Disconnected((item, _))) => {
+                    self.process_single(item, slow_queue);
+                }
+            },
             StoragePriority::Bulk => {
-                let reader = self.next_bulk_reader % self.bulk_read_pool.len();
-                self.next_bulk_reader = self.next_bulk_reader.wrapping_add(1);
-                match self.bulk_read_pool[reader].try_send(item) {
+                match self.bulk_read_pool.try_send(item) {
                     Ok(()) => {}
                     // A full bulk read queue backpressures rather than stealing
                     // the write actor thread from foreground sync traffic.
-                    Err(TrySendError::Full(item)) => reject_bulk_read(item),
-                    Err(TrySendError::Disconnected(item)) => self.process_single(item, slow_queue),
+                    Err(TrySendError::Full((item, _))) => reject_bulk_read(item),
+                    Err(TrySendError::Disconnected((item, _))) => {
+                        self.process_single(item, slow_queue)
+                    }
                 }
             }
         }
@@ -728,36 +762,55 @@ pub(super) fn store_read(
     }
 }
 
-pub(super) fn batch_read_with<R: Readable>(
+pub(super) fn batch_read_with<R: Readable + Sync>(
     store: &Store,
     reader: &R,
     reads: Vec<(String, ByteView)>,
     create: bool,
 ) -> StorageEvent {
+    let chunk = reads.len().div_ceil(READ_THREADS).max(READ_CHUNK);
+    let values = match reads.len() > chunk {
+        false => read_keys(store, reader, &reads, create),
+        true => thread::scope(|scope| {
+            let parts: Vec<_> = (reads.chunks(chunk))
+                .map(|part| scope.spawn(move || read_keys(store, reader, part, create)))
+                .collect();
+            let mut values = Vec::with_capacity(reads.len());
+            for part in parts {
+                let part = part
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                values.extend(part?);
+            }
+            Ok(values)
+        }),
+    };
+    match values {
+        Ok(values) => StorageEvent::BatchReadResult { values },
+        Err(error) => StorageEvent::Error { error },
+    }
+}
+
+fn read_keys<R: Readable>(
+    store: &Store,
+    reader: &R,
+    reads: &[(String, ByteView)],
+    create: bool,
+) -> Result<Vec<(ByteView, Option<ByteView>)>, StorageError> {
     let mut values = Vec::with_capacity(reads.len());
     for (key_space, key) in reads {
         let keyspace = match create {
-            true => store.resolve_keyspace(&key_space).map(Some),
-            false => store.existing_keyspace(&key_space),
+            true => store.resolve_keyspace(key_space).map(Some),
+            false => store.existing_keyspace(key_space),
+        }?;
+        let value = match keyspace {
+            Some(keyspace) => reader.get(&keyspace, key),
+            None => Ok(None),
         };
-        let keyspace = match keyspace {
-            Ok(Some(ks)) => ks,
-            Ok(None) => {
-                values.push((key, None));
-                continue;
-            }
-            Err(error) => return StorageEvent::Error { error },
-        };
-        match reader.get(&keyspace, &key) {
-            Ok(value_opt) => values.push((key, value_opt.map(Into::into))),
-            Err(error) => {
-                return StorageEvent::Error {
-                    error: StorageError::ReadError(error.to_string()),
-                };
-            }
-        }
+        let value = value.map_err(|error| StorageError::ReadError(error.to_string()))?;
+        values.push((key.clone(), value.map(Into::into)));
     }
-    StorageEvent::BatchReadResult { values }
+    Ok(values)
 }
 
 pub(super) fn store_batch_read(store: &Store, reads: Vec<(String, ByteView)>) -> StorageEvent {
@@ -830,16 +883,6 @@ fn is_groupable_write(effect: &StorageEffect) -> bool {
             | StorageEffect::BatchWrite { txn_id: None, .. }
             | StorageEffect::Delete { txn_id: None, .. }
             | StorageEffect::BatchDelete { txn_id: None, .. }
-    )
-}
-
-fn is_poolable_read(effect: &StorageEffect) -> bool {
-    matches!(
-        effect,
-        StorageEffect::Read { txn_id: None, .. }
-            | StorageEffect::BatchRead { txn_id: None, .. }
-            | StorageEffect::Iter { txn_id: None, .. }
-            | StorageEffect::Last { txn_id: None, .. }
     )
 }
 
@@ -1122,20 +1165,19 @@ pub(super) fn spawn_read_pool(
     store: Store,
     threads: usize,
     capacity: usize,
-) -> (Vec<EffectSender>, Vec<thread::JoinHandle<()>>) {
-    let mut senders = Vec::with_capacity(threads);
-    let mut handles = Vec::with_capacity(threads);
-    for _ in 0..threads {
-        let (sender, receiver) = mpsc::bounded_blocking(capacity);
-        let store = store.clone();
-        handles.push(thread::spawn(move || read_pool_loop(store, receiver)));
-        senders.push(sender);
-    }
-    (senders, handles)
+) -> (PoolSender, Vec<thread::JoinHandle<()>>) {
+    let (sender, receiver) = mpmc::bounded_blocking(capacity);
+    let handles = (0..threads)
+        .map(|_| {
+            let (store, receiver) = (store.clone(), receiver.clone());
+            thread::spawn(move || read_pool_loop(store, receiver))
+        })
+        .collect();
+    (sender, handles)
 }
 
-fn read_pool_loop(store: Store, receiver: EffectReceiver) {
-    while let Ok((effect, response_tx, span, enqueued_at, in_flight)) = receiver.recv() {
+fn read_pool_loop(store: Store, receiver: PoolReceiver) {
+    while let Ok(((effect, response_tx, span, enqueued_at, in_flight), txn)) = receiver.recv() {
         let _guard = span.enter();
         if response_tx.is_closed() {
             continue;
@@ -1144,59 +1186,9 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
         let key_space = effect_keyspace(&effect).map(str::to_string);
         let queue_wait = enqueued_at.elapsed();
         let service_started = Instant::now();
-        let event = match effect {
-            StorageEffect::Read {
-                key_space,
-                key,
-                txn_id: None,
-            } => match store.existing_keyspace(&key_space) {
-                Ok(Some(keyspace)) => store_read(&store, keyspace, key),
-                Ok(None) => StorageEvent::ReadResult { key, value: None },
-                Err(error) => StorageEvent::Error { error },
-            },
-            StorageEffect::Last {
-                key_space,
-                prefix,
-                txn_id: None,
-            } => match store.existing_keyspace(&key_space) {
-                Ok(Some(keyspace)) => store_last(&store, keyspace, prefix),
-                Ok(None) => StorageEvent::IterResult {
-                    values: Vec::new(),
-                    next_start_after: None,
-                },
-                Err(error) => StorageEvent::Error { error },
-            },
-            StorageEffect::BatchRead {
-                reads,
-                txn_id: None,
-            } => store_batch_read(&store, reads),
-            StorageEffect::Iter {
-                key_space,
-                prefix,
-                start,
-                limit,
-                txn_id: None,
-            } => match store.existing_keyspace(&key_space) {
-                Ok(None) => StorageEvent::IterResult {
-                    values: Vec::new(),
-                    next_start_after: None,
-                },
-                Ok(Some(keyspace)) => {
-                    if limit == 0 {
-                        StorageEvent::IterResult {
-                            values: Vec::new(),
-                            next_start_after: None,
-                        }
-                    } else {
-                        store_iterate(&store, keyspace, prefix, start, limit)
-                    }
-                }
-                Err(error) => StorageEvent::Error { error },
-            },
-            _ => StorageEvent::Error {
-                error: StorageError::InvalidEffect,
-            },
-        };
+        let event = run_read(&store, txn.as_ref(), effect);
+        // Released before the answer, so the caller's next write finds the transaction free.
+        drop(txn);
         let service_elapsed = service_started.elapsed();
         span.record("queue_wait_ms", duration_ms(queue_wait));
         span.record("service_ms", duration_ms(service_elapsed));
