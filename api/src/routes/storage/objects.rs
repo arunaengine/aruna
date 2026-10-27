@@ -461,11 +461,15 @@ pub async fn list_objects(
         None => bucket_permission_path(realm_id, info.group_id, node_id, &bucket),
     };
     ensure_permission(&state, &auth, path, Permission::READ).await?;
+    // A start key resumes like a cursor after that key.
+    let start = (query.start_after.clone().filter(|key| !key.is_empty()))
+        .map(|key| encode_resume(&Resume::After { key, group: None }))
+        .transpose()?;
     let request = ListRequest {
         bucket,
         prefix: query.prefix.clone(),
         delimiter: query.delimiter.clone(),
-        cursor: query.cursor.clone(),
+        cursor: query.cursor.clone().or(start),
         limit: query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
     };
     if let Some(bounds) = relayed_bounds(&state, &info, &headers, &query).await? {

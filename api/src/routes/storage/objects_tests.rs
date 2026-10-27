@@ -224,6 +224,28 @@ async fn copy_defers_listing() {
 }
 
 #[tokio::test]
+async fn start_after_resumes() {
+    let node = node_state().await;
+    store(&node, &["a.md", "b.md", "c.md"]).await;
+    let mut after = query(None, None, 10);
+    after.start_after = Some("a.md".to_string());
+    let page = list(&node, &node.owner, HeaderMap::new(), after.clone())
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["b.md", "c.md"]);
+    distribute(&node.state, node.group_id, BUCKET).await;
+    let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+        "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+        "prefixes":[],"next_cursor":null}"#;
+    let peer = mock_peer(StatusCode::OK, answer).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let page = list(&node, &node.owner, HeaderMap::new(), after)
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["b.md", "c.md", "x.md"]);
+}
+
+#[tokio::test]
 async fn unanswered_range_fails() {
     let node = node_state().await;
     distribute(&node.state, node.group_id, BUCKET).await;
