@@ -27,6 +27,8 @@ use crate::tasks::queue_backoff::{min_due_at, retry_delay_ms};
 
 /// The error a job carries while single delivery owes it instead of a page.
 pub(crate) const PAGE_SINGLE: &str = "left to single delivery by a reference page";
+/// Failed attempts that each halve the pages a job travels in.
+const PAGE_SHRINKS: u32 = 4;
 
 /// Sends one page to a member and returns its answer; an error leaves the outcome unknown.
 pub trait PageSender {
@@ -79,7 +81,13 @@ pub(crate) fn pageable(job: &BlobJobRecord) -> bool {
         && job.last_error.as_deref() != Some(PAGE_SINGLE)
 }
 
-/// Delivers `jobs` in pages per bucket, member and publication.
+/// Records a page of `job` carries at most: each failed attempt halves it, so a page too slow
+/// for its member returns smaller instead of failing the same way again.
+fn page_limit(job: &BlobJobRecord) -> usize {
+    PAGE_RECORDS >> job.attempts.min(PAGE_SHRINKS)
+}
+
+/// Delivers `jobs` in pages per bucket, member, publication and page size.
 pub(crate) async fn deliver_pages(
     context: &DriverContext,
     jobs: Vec<Job>,
@@ -101,11 +109,14 @@ pub(crate) async fn deliver_pages(
             retire.push(key);
             continue;
         };
+        let limit = page_limit(&job);
         let target = (&job.input.bucket, job.input.target_node_id);
         let page = (pages.iter_mut()).find(|(other, jobs)| {
+            let first = &jobs[0].1;
             *other == publication
-                && jobs.len() < PAGE_RECORDS
-                && (&jobs[0].1.input.bucket, jobs[0].1.input.target_node_id) == target
+                && jobs.len() < limit
+                && page_limit(first) == limit
+                && (&first.input.bucket, first.input.target_node_id) == target
         });
         match page {
             Some((_, jobs)) => jobs.push((key, job)),

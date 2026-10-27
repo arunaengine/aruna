@@ -330,3 +330,32 @@ async fn lost_answer_replays() {
         "the replay counts nothing"
     );
 }
+
+#[tokio::test]
+async fn failed_page_shrinks() {
+    // A page whose answer never came returns in pages of half its size, so a page too slow for
+    // its member gets cheaper instead of timing out the same way again.
+    let (snapshot, bytes) = replicated(true, 1);
+    let coordinator = node(&snapshot, &bytes, 1).await;
+    let member = node(&snapshot, &bytes, 2).await;
+    let mut writes = Vec::new();
+    for index in 0..PAGE_RECORDS {
+        writes.extend(committed(&format!("d/{index}"), index as u128 + 1, 1, true));
+    }
+    write(&coordinator.handle, writes).await;
+    let sender = Member {
+        handle: &member.handle,
+        lost: Mutex::new(1),
+        pages: Mutex::default(),
+    };
+    let context = context(&coordinator.handle);
+    drain_batch(&context, &sender).await.unwrap();
+    let jobs = rows(&coordinator.handle, REPLICATION_JOB_KEYSPACE).await;
+    let jobs = (jobs.into_iter())
+        .map(|(key, value)| (key, BlobJobRecord::from_bytes(&value).unwrap()))
+        .collect();
+    let report = deliver_pages(&context, jobs, &sender).await.unwrap();
+    assert_eq!(report.delivered, PAGE_RECORDS);
+    let half = PAGE_RECORDS / 2;
+    assert_eq!(*sender.pages.lock().unwrap(), [PAGE_RECORDS, half, half]);
+}
