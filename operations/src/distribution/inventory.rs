@@ -114,7 +114,7 @@ enum Phase {
 
 /// Which inventory a contribution's position belongs to, so it is compared with that cursor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Walk {
+pub(super) enum Walk {
     Versions,
     Uploads,
 }
@@ -849,7 +849,7 @@ fn add_counter(
 
 /// Routes each contribution to the rows the account names: the active or pending row, and
 /// the rebuild row when the contribution is behind that walk's cursor.
-fn route(
+pub(super) fn route(
     set_id: Ulid,
     range_id: Ulid,
     account: &RangeAccount,
