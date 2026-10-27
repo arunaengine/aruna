@@ -19,6 +19,7 @@ pub mod moves;
 pub mod objects;
 pub mod organize;
 pub mod origin;
+pub mod provenance;
 pub mod relay;
 pub mod rename;
 pub mod routing;

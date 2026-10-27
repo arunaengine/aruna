@@ -428,9 +428,21 @@ pub async fn get_version_origin(
     Query(params): Query<VersionOriginParams>,
 ) -> ServerResult<Json<OriginResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    let directed = node_directed(&state, &headers)?;
+    let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
+    version_answer(&state, &auth, bearer, &headers, (&params.version, deadline)).await
+}
+
+/// The origin of the version `version` names, read where it lives with the caller's token.
+pub(crate) async fn version_answer(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+    bearer: Option<ValidatedBearer>,
+    headers: &HeaderMap,
+    (version, deadline): (&str, tokio::time::Instant),
+) -> ServerResult<Json<OriginResponse>> {
+    let directed = node_directed(state, headers)?;
     let refused = || ServerError::BadRequestReason("not a version id".to_string());
-    match W3idIdentifier::parse(&params.version).map_err(|_| refused())? {
+    match W3idIdentifier::parse(version).map_err(|_| refused())? {
         W3idIdentifier::VersionedObject(arn) if arn.realm_id != state.get_realm_id() => {
             Err(ServerError::NotFound)
         }
@@ -439,16 +451,15 @@ pub async fn get_version_origin(
                 key: arn.key,
                 version_id: Some(arn.version),
             };
-            origin_answer(&state, &auth, bearer, &headers, arn.bucket, params).await
+            origin_answer(state, auth, bearer, headers, arn.bucket, params).await
         }
         // A node-directed read reached its node; it never directs the read on.
         W3idIdentifier::VersionedObject(_) if directed => Err(ServerError::Conflict(
             "the version is not on the node the read was directed at".to_string(),
         )),
         W3idIdentifier::VersionedObject(arn) => {
-            let path = relay::query_path("/data/origin", &[("version", &params.version)]);
-            let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
-            node_read(&state, arn.node_id, &path, bearer.as_ref(), deadline)
+            let path = relay::query_path("/data/origin", &[("version", version)]);
+            node_read(state, arn.node_id, &path, bearer.as_ref(), deadline)
                 .await
                 .map(Json)
         }
@@ -456,7 +467,7 @@ pub async fn get_version_origin(
             realm_id,
             version_id,
         }) if realm_id == state.get_realm_id() => {
-            global_origin(&state, &auth, bearer, &headers, version_id).await
+            global_origin(state, auth, bearer, headers, version_id).await
         }
         _ => Err(refused()),
     }

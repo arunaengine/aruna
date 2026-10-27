@@ -85,9 +85,21 @@ pub async fn get_run(
     Path(run_id): Path<String>,
 ) -> ServerResult<Json<RunResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    let run_id = crate::jobs::parse_job_id(&run_id).map_err(|_| ServerError::NotFound)?;
+    let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
+    run_answer(&state, &auth, bearer, &headers, (&run_id, deadline)).await
+}
+
+/// What the caller may see of run `run_id`, read on the node that ran it.
+pub(crate) async fn run_answer(
+    state: &ServerState,
+    auth: &AuthContext,
+    bearer: Option<ValidatedBearer>,
+    headers: &HeaderMap,
+    (run_id, deadline): (&str, tokio::time::Instant),
+) -> ServerResult<Json<RunResponse>> {
+    let run_id = crate::jobs::parse_job_id(run_id).map_err(|_| ServerError::NotFound)?;
     let context = state.get_ctx();
-    if !node_directed(&state, &headers)? && context.net_handle.is_some() {
+    if !node_directed(state, headers)? && context.net_handle.is_some() {
         let owner = resolve_job_owner(&context, run_id)
             .await
             .map_err(|error| match error {
@@ -96,12 +108,11 @@ pub async fn get_run(
             })?;
         if owner != state.get_node_id() {
             let path = format!("/compute/runs/{run_id}");
-            let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
-            let answer = node_read(&state, owner, &path, bearer.as_ref(), deadline).await?;
+            let answer = node_read(state, owner, &path, bearer.as_ref(), deadline).await?;
             return Ok(Json(answer));
         }
     }
-    let view = read_run(&context, state.get_realm_id(), &auth, run_id)
+    let view = read_run(&context, state.get_realm_id(), auth, run_id)
         .await
         .map_err(|error| match error {
             RunReadError::NotFound => ServerError::NotFound,

@@ -1,0 +1,290 @@
+//! Exports the provenance of a file version or dataset as one RO-Crate, streamed as a ZIP while
+//! the links are followed. Nothing is stored.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+// Each hop is read with the caller's credential on the node that holds it, exactly as the
+// origin and run routes answer it; the crate shows only what those reads show.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_operations::metadata::provenance::{CrateFile, Hop, ProvenanceCrate, Target};
+use async_zip::tokio::write::ZipFileWriter;
+use async_zip::{Compression, ZipEntryBuilder};
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, header};
+use axum::response::Response;
+use axum::{Extension, Json};
+use futures_util::StreamExt;
+use serde::Deserialize;
+use tokio::io::DuplexStream;
+use tokio::time::Instant;
+use tokio_util::io::ReaderStream;
+use tokio_util::sync::CancellationToken;
+use utoipa::{IntoParams, OpenApi};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::metadata::{MetadataRoCrateResponse, RoCrateExportParams};
+use crate::routes::execution::runs::run_answer;
+use crate::routes::metadata::rocrate::export_metadata_rocrate;
+use crate::routes::storage::origin::version_answer;
+use crate::server::state::ServerState;
+
+/// The technical time limit of one export; the crate is marked incomplete when it is reached.
+const EXPORT_DEADLINE: Duration = Duration::from_secs(15 * 60);
+/// Bytes buffered between the walk and the client.
+const PIPE_BYTES: usize = 64 * 1024;
+
+#[derive(OpenApi)]
+#[openapi()]
+pub struct ProvenanceApiDoc;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::with_openapi(ProvenanceApiDoc::openapi()).routes(routes!(export_provenance))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ExportParams {
+    /// Start at this exact version: a global id URL or a versioned object w3id.
+    pub version: Option<String>,
+    /// Start at this dataset document, from its file parts with exact versions.
+    pub dataset: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/provenance/crate",
+    tag = "data/storage",
+    summary = "Export where data came from as a crate",
+    description = r#"Streams one RO-Crate ZIP with the provenance of a file version or dataset, assembled while the links are followed.
+
+**Authentication**: realm bearer token. Each hop is read with this token on the node that holds
+it, as the origin and run routes do.
+
+**Behavior**
+- The root `ro-crate-metadata.json` lists versions, runs, sources, database identifiers and
+  their links. Each readable run crate is a nested crate under `runs/{run_id}/`; a dataset
+  start is nested under `dataset/`. File bytes are referenced, not included.
+- A hop the caller may not read is named by its global id or the digest that referred to it,
+  never by bucket or key. A node that does not answer is listed, and the crate is incomplete.
+- Each version and run is read once per export, so cycles end.
+- The walk stops when the client disconnects or at the time limit; the root then says
+  `Incomplete` in `creativeWorkStatus`.
+
+**Limits**
+- No count limit; one export takes at most 15 minutes."#,
+    params(ExportParams),
+    responses(
+        (status = 200, description = "RO-Crate ZIP stream", content_type = "application/zip"),
+        (status = 400, description = "Neither or both of version and dataset given", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn export_provenance(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    Query(params): Query<ExportParams>,
+) -> ServerResult<Response> {
+    let auth = require_realm_auth(&state, auth)?;
+    let start = match (params.version, params.dataset) {
+        (Some(version), None) => Start::Version(version),
+        (None, Some(dataset)) => Start::Dataset(dataset),
+        _ => {
+            return Err(ServerError::BadRequestReason(
+                "give either version or dataset".to_string(),
+            ));
+        }
+    };
+    let (writer, reader) = tokio::io::duplex(PIPE_BYTES);
+    let gone = CancellationToken::new();
+    let guard = gone.clone().drop_guard();
+    let caller = Caller {
+        state,
+        auth,
+        bearer,
+        deadline: Instant::now() + EXPORT_DEADLINE,
+    };
+    tokio::spawn(async move { walk(caller, start, writer, gone).await });
+    // Dropping the body, as a disconnect does, stops the walk.
+    let body = ReaderStream::new(reader).map(move |chunk| {
+        let _ = &guard;
+        chunk
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"provenance.zip\"",
+        )
+        .body(Body::from_stream(body))
+        .map_err(|error| ServerError::InternalError(error.to_string()))
+}
+
+enum Start {
+    Version(String),
+    Dataset(String),
+}
+
+struct Caller {
+    state: Arc<ServerState>,
+    auth: AuthContext,
+    bearer: Option<ValidatedBearer>,
+    deadline: Instant,
+}
+
+/// What one hop read gave.
+enum Read {
+    Answer(serde_json::Value),
+    Hidden,
+    Silent,
+}
+
+async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: CancellationToken) {
+    let mut zip = ZipFileWriter::with_tokio(writer);
+    let published = chrono::Utc::now().to_rfc3339();
+    let mut queue = VecDeque::new();
+    let mut built = match &start {
+        Start::Version(version) => {
+            let built = ProvenanceCrate::new(version, &published);
+            queue.push_back(built.version_start());
+            built
+        }
+        Start::Dataset(document) => {
+            let mut built = ProvenanceCrate::new(document, &published);
+            match bounded(&caller, &gone, crate_document(&caller, document)).await {
+                Some(Some(dataset)) => {
+                    let (hops, file) = built.dataset(&dataset);
+                    if !write(&mut zip, file).await {
+                        return;
+                    }
+                    queue.extend(hops);
+                }
+                Some(None) => built.stop("the dataset is not readable"),
+                None => built.stop("stopped before the dataset was read"),
+            }
+            built
+        }
+    };
+    while let Some(hop) = queue.pop_front() {
+        if built.known(&hop) {
+            continue;
+        }
+        let Some(read) = bounded(&caller, &gone, read_hop(&caller, &hop)).await else {
+            built.stop("the export stopped at its time limit or on disconnect");
+            break;
+        };
+        match (&hop.target, read) {
+            (Target::Version(_), Read::Answer(origin)) => {
+                queue.extend(built.version(&hop, &origin))
+            }
+            (Target::Run(_), Read::Answer(run)) => {
+                let document = run["run_crate"].as_str().map(str::to_string);
+                let run_crate = match document {
+                    Some(document) => {
+                        let read = crate_document(&caller, &document);
+                        bounded(&caller, &gone, read).await.flatten()
+                    }
+                    None => None,
+                };
+                let (hops, file) = built.run(&hop, run_crate.as_ref());
+                if let Some(file) = file
+                    && !write(&mut zip, file).await
+                {
+                    return;
+                }
+                queue.extend(hops);
+            }
+            (Target::Run(_), Read::Hidden) => {
+                built.run(&hop, None);
+            }
+            (_, Read::Hidden) => built.hidden(&hop),
+            (_, Read::Silent) => built.unreachable(&hop),
+        }
+    }
+    let root = serde_json::to_vec_pretty(&built.finish()).unwrap_or_default();
+    let path = "ro-crate-metadata.json".to_string();
+    if write(&mut zip, CrateFile { path, bytes: root }).await {
+        let _ = zip.close().await;
+    }
+}
+
+/// Runs `read` until the export deadline or a disconnect; `None` when either came first.
+async fn bounded<T>(
+    caller: &Caller,
+    gone: &CancellationToken,
+    read: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        _ = gone.cancelled() => None,
+        answer = tokio::time::timeout_at(caller.deadline, read) => answer.ok(),
+    }
+}
+
+async fn read_hop(caller: &Caller, hop: &Hop) -> Read {
+    let state = &caller.state;
+    let bearer = caller.bearer.clone();
+    let headers = HeaderMap::new();
+    let answer = match &hop.target {
+        Target::Version(version) => {
+            let ask = (version.as_str(), caller.deadline);
+            version_answer(state, &caller.auth, bearer, &headers, ask)
+                .await
+                .and_then(|Json(origin)| to_value(&origin))
+        }
+        Target::Run(run_id) => {
+            let ask = (run_id.as_str(), caller.deadline);
+            run_answer(state, &caller.auth, bearer, &headers, ask)
+                .await
+                .and_then(|Json(run)| to_value(&run))
+        }
+    };
+    match answer {
+        Ok(answer) => Read::Answer(answer),
+        Err(
+            ServerError::Forbidden
+            | ServerError::NotFound
+            | ServerError::Unauthorized
+            | ServerError::BadRequestReason(_),
+        ) => Read::Hidden,
+        Err(_) => Read::Silent,
+    }
+}
+
+fn to_value(answer: &impl serde::Serialize) -> ServerResult<serde_json::Value> {
+    serde_json::to_value(answer).map_err(|error| ServerError::InternalError(error.to_string()))
+}
+
+/// A metadata document's crate as the caller may read it; `None` when it is not readable.
+async fn crate_document(caller: &Caller, document_id: &str) -> Option<serde_json::Value> {
+    let answer = export_metadata_rocrate(
+        State(caller.state.clone()),
+        Extension(Some(caller.auth.clone())),
+        Extension(caller.bearer.clone()),
+        Path(document_id.to_string()),
+        Query(RoCrateExportParams::default()),
+    )
+    .await;
+    match answer {
+        Ok((_, Json(MetadataRoCrateResponse::Projected(projected)))) => Some(projected.rocrate),
+        _ => None,
+    }
+}
+
+/// Writes one file into the ZIP; `false` when the client is gone.
+async fn write(zip: &mut ZipFileWriter<DuplexStream>, file: CrateFile) -> bool {
+    let entry = ZipEntryBuilder::new(file.path.into(), Compression::Stored);
+    zip.write_entry_whole(entry, &file.bytes).await.is_ok()
+}
+
+#[cfg(test)]
+#[path = "provenance_tests.rs"]
+mod tests;

@@ -568,7 +568,7 @@ async fn reads_by_version() {
 }
 
 #[tokio::test]
-async fn directed_read_relays_once() {
+async fn directed_relays_once() {
     // A version of a distributed bucket whose range the target keeps no records of is
     // answered through one set-directed relay to a holder.
     use crate::tests::distributed::LOCAL;
