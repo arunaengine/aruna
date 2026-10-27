@@ -34,6 +34,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
+use crate::distribution::usage::replica_shares;
 use crate::driver::{DriverContext, drive};
 use crate::storage_read::scan_all;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
@@ -997,10 +998,19 @@ async fn publish_retaining_markers(
         return Ok((PublishedUsage::default(), Vec::new()));
     }
 
+    let shares = replica_shares(ctx).await.map_err(|e| e.to_string())?;
     let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(groups.len() + 1);
     if global {
         let counters = read_local_global(storage).await?;
-        let snapshot = NodeUsageSnapshot { node_id, counters };
+        let mut replicas = UsageCounters::default();
+        for share in shares.values() {
+            replicas.add(share).map_err(|e| e.to_string())?;
+        }
+        let snapshot = NodeUsageSnapshot {
+            node_id,
+            counters,
+            replicas,
+        };
         writes.push((
             NODE_STATS_KEYSPACE.to_string(),
             Key::from(usage_global_key(node_id)),
@@ -1010,7 +1020,11 @@ async fn publish_retaining_markers(
     let group_list: Vec<GroupId> = groups.into_iter().collect();
     for group_id in &group_list {
         let counters = read_local_group(storage, *group_id).await?;
-        let snapshot = NodeUsageSnapshot { node_id, counters };
+        let snapshot = NodeUsageSnapshot {
+            node_id,
+            counters,
+            replicas: shares.get(group_id).copied().unwrap_or_default(),
+        };
         writes.push((
             NODE_STATS_KEYSPACE.to_string(),
             Key::from(usage_snapshot_key(*group_id, node_id)),
@@ -2454,6 +2468,7 @@ mod tests {
         let remote_snapshot = |counters| NodeUsageSnapshot {
             node_id: remote,
             counters,
+            replicas: Default::default(),
         };
         let remote_counters = UsageCounters {
             logical_bytes: 5,
@@ -2482,6 +2497,7 @@ mod tests {
                     logical_bytes: 999,
                     ..Default::default()
                 },
+                replicas: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -2529,6 +2545,7 @@ mod tests {
                     logical_bytes: 4,
                     ..Default::default()
                 },
+                replicas: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -2554,6 +2571,7 @@ mod tests {
                 logical_bytes: 42,
                 ..Default::default()
             },
+            replicas: Default::default(),
         };
         write_node_stat(&ctx, snapshot_key.clone(), snapshot.to_bytes().unwrap()).await;
         write_node_stat(&ctx, SUMMARY_GLOBAL_KEY.to_vec(), Vec::new()).await;
@@ -2865,6 +2883,7 @@ mod tests {
                     logical_bytes: 500,
                     ..Default::default()
                 },
+                replicas: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -2921,6 +2940,7 @@ mod tests {
             NodeUsageSnapshot {
                 node_id: remote,
                 counters: remote_counters,
+                replicas: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -2932,6 +2952,7 @@ mod tests {
             NodeUsageSnapshot {
                 node_id: remote,
                 counters: remote_counters,
+                replicas: Default::default(),
             }
             .to_bytes()
             .unwrap(),

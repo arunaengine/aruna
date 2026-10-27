@@ -304,6 +304,7 @@ async fn bootstrap_usage_genesis(
     let snapshot = NodeUsageSnapshot {
         node_id,
         counters: UsageCounters::default(),
+        replicas: Default::default(),
     };
     match publisher
         .context

@@ -334,6 +334,7 @@ async fn seed_usage_state(state: &Arc<ServerState>) {
                     buckets: 3,
                     ..Default::default()
                 },
+                replicas: Default::default(),
             }
             .to_bytes()
             .unwrap()

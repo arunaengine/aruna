@@ -95,6 +95,8 @@ impl RebuildProgress {
 pub struct NodeUsageSnapshot {
     pub node_id: NodeId,
     pub counters: UsageCounters,
+    /// The part of `counters` from distributed ranges this node holds but does not coordinate.
+    pub replicas: UsageCounters,
 }
 
 impl NodeUsageSnapshot {
@@ -314,6 +316,15 @@ impl UsageCounters {
         self.logical_bytes = logical_bytes;
         self.referenced_bytes = referenced_bytes;
         Ok(())
+    }
+
+    /// Counts each object once: removes the `replicas` share from the object and data
+    /// counters, saturating; the physical `stored_*` and `buckets` stay.
+    pub fn without_replicas(mut self, replicas: &Self) -> Self {
+        self.objects = self.objects.saturating_sub(replicas.objects);
+        self.logical_bytes = self.logical_bytes.saturating_sub(replicas.logical_bytes);
+        self.referenced_bytes = (self.referenced_bytes).saturating_sub(replicas.referenced_bytes);
+        self
     }
 }
 
@@ -714,9 +725,41 @@ mod tests {
                 logical_bytes: 9,
                 ..Default::default()
             },
+            replicas: UsageCounters {
+                logical_bytes: 4,
+                ..Default::default()
+            },
         };
         let bytes = snapshot.to_bytes().unwrap();
         assert_eq!(NodeUsageSnapshot::from_bytes(&bytes).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn replicas_leave_physical() {
+        let counters = UsageCounters {
+            buckets: 2,
+            objects: 5,
+            stored_blobs: 4,
+            stored_bytes: 40,
+            logical_bytes: 30,
+            referenced_bytes: 10,
+        };
+        let replicas = UsageCounters {
+            objects: 2,
+            logical_bytes: 12,
+            referenced_bytes: 20,
+            ..Default::default()
+        };
+        let once = counters.without_replicas(&replicas);
+        assert_eq!((once.objects, once.logical_bytes), (3, 18));
+        assert_eq!(
+            once.referenced_bytes, 0,
+            "a lagging share never goes below zero"
+        );
+        assert_eq!(
+            (once.buckets, once.stored_blobs, once.stored_bytes),
+            (2, 4, 40)
+        );
     }
 
     #[test]

@@ -5,21 +5,25 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
+use aruna_core::keyspaces::{RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, RangeAccount, RangeCounters, account_key, generation_key, pending_key,
 };
 use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::structs::storage::usage::UsageCounters;
+use aruna_core::types::{GroupId, Key, TxnId, Value};
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::node::usage_stats::usage_complete;
 use crate::replication::members::bound_record;
+use crate::storage_read::scan_all;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageError {
@@ -218,6 +222,147 @@ pub fn sum_held<'a>(
     Ok(total)
 }
 
+/// What this member holds of `bucket`'s set as copies: every range with an account here, one
+/// being purged included, less the ranges it coordinates. Zero for an ordinary bucket.
+pub async fn replica_share(
+    context: &DriverContext,
+    bucket: &str,
+) -> Result<RangeCounters, UsageError> {
+    let Some((binding, snapshot)) = bound_record(context, bucket)
+        .await
+        .map_err(UsageError::Record)?
+    else {
+        return Ok(RangeCounters::default());
+    };
+    let txn_id = match (context.storage_handle)
+        .send_storage_effect(StorageEffect::StartTransaction { read: true })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(StorageError::ReadError(format!("unexpected answer {other:?}")).into());
+        }
+    };
+    let share = copied_rows(context, (&binding, &snapshot), txn_id).await;
+    (context.storage_handle)
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
+    share
+}
+
+/// The charged rows of every local account of the set less those of the coordinated ranges, so
+/// a split parent's row shared with a coordinated child is not subtracted.
+async fn copied_rows(
+    context: &DriverContext,
+    (binding, snapshot): (&DistributionBinding, &DistributionSnapshot),
+    txn_id: TxnId,
+) -> Result<RangeCounters, UsageError> {
+    let set_id = binding.set_id;
+    let accounts = local_accounts(context, set_id, txn_id).await?;
+    let coordinated = |range_id: &Ulid| {
+        (snapshot.config.ranges.iter())
+            .any(|range| range.range_id == *range_id && range.coordinator == binding.member_id)
+    };
+    let own: Vec<_> = (accounts.iter())
+        .filter(|(range_id, _)| coordinated(range_id))
+        .cloned()
+        .collect();
+    let (held, own) = (charged_rows(set_id, &accounts), charged_rows(set_id, &own));
+    let keys: BTreeSet<Vec<u8>> = held.iter().chain(&own).cloned().collect();
+    let reads = (keys.iter())
+        .map(|key| (RANGE_COUNTER_KEYSPACE.to_string(), key.clone().into()))
+        .collect();
+    let stored: BTreeMap<_, _> = keys
+        .into_iter()
+        .zip(batch_read(context, reads, txn_id).await?)
+        .collect();
+    let sum = |rows: &[Vec<u8>]| {
+        let values: Vec<_> = rows.iter().map(|key| stored[key].clone()).collect();
+        sum_rows(&values)
+    };
+    Ok(sum(&held)?.merge(sum(&own)?.negate()?)?)
+}
+
+/// Every range account this node keeps for the set, read in `txn_id`.
+async fn local_accounts(
+    context: &DriverContext,
+    set_id: Ulid,
+    txn_id: TxnId,
+) -> Result<Vec<(Ulid, RangeAccount)>, UsageError> {
+    let mut accounts = Vec::new();
+    let mut start = None;
+    loop {
+        let iter = StorageEffect::Iter {
+            key_space: RANGE_ACCOUNT_KEYSPACE.to_string(),
+            prefix: Some(set_id.to_bytes().to_vec().into()),
+            start: start.map(IterStart::After),
+            limit: 1_000,
+            txn_id: Some(txn_id),
+        };
+        let (values, next) = match context.storage_handle.send_storage_effect(iter).await {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            other => {
+                return Err(StorageError::ReadError(format!("unexpected answer {other:?}")).into());
+            }
+        };
+        for (key, value) in values {
+            let Some(range_id) = key.get(16..).and_then(|id| <[u8; 16]>::try_from(id).ok()) else {
+                continue;
+            };
+            accounts.push((
+                Ulid::from_bytes(range_id),
+                RangeAccount::from_bytes(&value)?,
+            ));
+        }
+        match next {
+            Some(next) => start = Some(next),
+            None => return Ok(accounts),
+        }
+    }
+}
+
+/// Each group's replica share on this node, summed over its local distributed buckets. A bucket
+/// whose share cannot be read is left out, so its copies count as owned until the next run.
+pub async fn replica_shares(
+    context: &DriverContext,
+) -> Result<BTreeMap<GroupId, UsageCounters>, UsageError> {
+    let buckets = scan_all(&context.storage_handle, S3_BUCKET_KEYSPACE, None)
+        .await
+        .map_err(UsageError::Record)?;
+    let mut shares: BTreeMap<GroupId, UsageCounters> = BTreeMap::new();
+    for (key, value) in buckets {
+        let info = BucketInfo::from_bytes(value.as_ref())?;
+        if info.distribution.is_none() {
+            continue;
+        }
+        let bucket = String::from_utf8_lossy(key.as_ref()).into_owned();
+        let share = match replica_share(context, &bucket).await {
+            Ok(share) => share,
+            Err(error) => {
+                warn!(bucket = %bucket, error = %error, "replica share unavailable");
+                continue;
+            }
+        };
+        let count = |value: i128| u64::try_from(value.max(0)).unwrap_or(u64::MAX);
+        let counters = UsageCounters {
+            objects: count(share.objects),
+            logical_bytes: count(share.logical_bytes),
+            referenced_bytes: count(share.referenced_bytes),
+            ..UsageCounters::default()
+        };
+        let total = shares.entry(info.group_id).or_default();
+        total
+            .add(&counters)
+            .map_err(|_| CounterOverflow("replicas"))?;
+    }
+    Ok(shares)
+}
+
 /// The usage of a local distributed bucket from the range counters this member holds; `None`
 /// for an ordinary bucket or a member whose record has not arrived.
 pub async fn range_usage(
@@ -352,6 +497,142 @@ mod tests {
         assert_eq!(sum_held(&held).unwrap().objects, 4);
         assert!(held[0].complete);
         assert!(held[0].coordinated, "member 1 coordinates the lower shard");
+    }
+
+    /// Stores the bound bucket "spire" of member 1, its record and these accounts and counters.
+    async fn spire(
+        handle: &aruna_storage::storage::StorageHandle,
+        accounts: Vec<(Ulid, Charge)>,
+        counters: Vec<(Vec<u8>, RangeCounters)>,
+    ) -> DistributionSnapshot {
+        use crate::distribution::test_record::{binding, replicated, store_record};
+        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+        let (snapshot, bytes) = replicated(true, 1);
+        let set_id = snapshot.set_id();
+        store_record(handle, set_id, bytes).await;
+        let info = BucketInfo {
+            group_id: snapshot.config.owner_group,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: Some(binding(&snapshot, 1, 5)),
+        };
+        let row = |space: &str, key: Vec<u8>, value: Vec<u8>| {
+            (space.to_string(), key.into(), value.into())
+        };
+        let mut writes = vec![row(
+            S3_BUCKET_KEYSPACE,
+            b"spire".to_vec(),
+            info.to_bytes().unwrap(),
+        )];
+        for (range_id, charge) in accounts {
+            let value = account(charge).to_bytes().unwrap();
+            writes.push(row(
+                RANGE_ACCOUNT_KEYSPACE,
+                account_key(set_id, range_id),
+                value,
+            ));
+        }
+        for (key, value) in counters {
+            writes.push(row(RANGE_COUNTER_KEYSPACE, key, value.to_bytes().unwrap()));
+        }
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        handle.send_storage_effect(write).await;
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn shares_copied_ranges() {
+        // Member 1 coordinates the lower shard and holds the upper one and a range it purges
+        // as copies; only the copies form its replica share.
+        use crate::distribution::test_store::{context, open};
+        let (_dir, handle) = open();
+        let context = context(&handle);
+        let (snapshot, _) = crate::distribution::test_record::replicated(true, 1);
+        let set_id = snapshot.set_id();
+        let (lower, upper) = (
+            snapshot.config.ranges[0].range_id,
+            snapshot.config.ranges[1].range_id,
+        );
+        let purged = Ulid::from_bytes([77; 16]);
+        let counted = |objects, logical_bytes, referenced_bytes| RangeCounters {
+            objects,
+            logical_bytes,
+            referenced_bytes,
+            ..RangeCounters::default()
+        };
+        let accounts = vec![
+            (lower, Charge::Active(3)),
+            (upper, Charge::Active(2)),
+            (purged, Charge::Active(1)),
+        ];
+        let counters = vec![
+            (generation_key(set_id, lower, 3), counted(4, 40, 0)),
+            (generation_key(set_id, upper, 2), counted(1, 10, 7)),
+            (generation_key(set_id, purged, 1), counted(2, 5, 0)),
+        ];
+        let snapshot = spire(&handle, accounts, counters).await;
+
+        assert_eq!(
+            replica_share(&context, "spire").await.unwrap(),
+            counted(3, 15, 7)
+        );
+        let shares = replica_shares(&context).await.unwrap();
+        let expected = UsageCounters {
+            objects: 3,
+            logical_bytes: 15,
+            referenced_bytes: 7,
+            ..UsageCounters::default()
+        };
+        assert_eq!(
+            shares,
+            BTreeMap::from([(snapshot.config.owner_group, expected)])
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_parent_stays() {
+        // Split children share their parent's frozen row; a coordinated child keeps it.
+        use crate::distribution::test_store::{context, open};
+        let (_dir, handle) = open();
+        let context = context(&handle);
+        let (snapshot, _) = crate::distribution::test_record::replicated(true, 1);
+        let set_id = snapshot.set_id();
+        let (lower, upper) = (
+            snapshot.config.ranges[0].range_id,
+            snapshot.config.ranges[1].range_id,
+        );
+        let parent = Ulid::from_bytes([78; 16]);
+        let child = |sibling| Charge::Child {
+            parent,
+            sibling,
+            frozen: 7,
+        };
+        let objects = |objects| RangeCounters {
+            objects,
+            ..RangeCounters::default()
+        };
+        let accounts = vec![(lower, child(upper)), (upper, child(lower))];
+        let counters = vec![
+            (generation_key(set_id, parent, 7), objects(10)),
+            (pending_key(set_id, lower), objects(2)),
+            (pending_key(set_id, upper), objects(-1)),
+        ];
+        spire(&handle, accounts, counters).await;
+
+        assert_eq!(replica_share(&context, "spire").await.unwrap(), objects(-1));
+        let shares = replica_shares(&context).await.unwrap();
+        assert!(
+            shares.values().all(|share| share.objects == 0),
+            "a negative share reads as zero"
+        );
     }
 
     #[test]

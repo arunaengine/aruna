@@ -751,6 +751,7 @@ async fn inject_group_snapshot(h: &Harness, group_id: Ulid, node_id: NodeId, log
             logical_bytes,
             ..Default::default()
         },
+        replicas: Default::default(),
     };
     match h
         .driver

@@ -482,6 +482,7 @@ async fn drain_reconcile_summary() {
                 logical_bytes: 5,
                 ..Default::default()
             },
+            replicas: Default::default(),
         }
         .to_bytes()
         .unwrap(),

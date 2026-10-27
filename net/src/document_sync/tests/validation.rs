@@ -29,6 +29,7 @@ fn usage_owner_validation() {
             buckets: 3,
             ..Default::default()
         },
+        replicas: Default::default(),
     };
     let owned_bytes = owned.to_bytes().unwrap();
     assert!(validate_usage_upsert(&global, &owned_bytes).is_ok());
@@ -38,6 +39,7 @@ fn usage_owner_validation() {
     let zero = NodeUsageSnapshot {
         node_id,
         counters: UsageCounters::default(),
+        replicas: Default::default(),
     };
     assert!(validate_usage_upsert(&global, &zero.to_bytes().unwrap()).is_ok());
 
@@ -48,6 +50,7 @@ fn usage_owner_validation() {
             buckets: 99,
             ..Default::default()
         },
+        replicas: Default::default(),
     };
     assert!(validate_usage_upsert(&global, &misattributed.to_bytes().unwrap()).is_err());
 
@@ -767,6 +770,7 @@ async fn forged_usage_skipped() {
             buckets: 5,
             ..Default::default()
         },
+        replicas: Default::default(),
     };
     let snapshot_bytes = snapshot.to_bytes().expect("snapshot serializes");
 
