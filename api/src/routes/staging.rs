@@ -26,9 +26,10 @@ use aruna_core::structs::execution::source_access::{ListRequest, SourceEntry, So
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
+use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_operations::auth::permission_rules::permission_rules;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
-use aruna_operations::distribution::guard::bound_view;
+use aruna_operations::distribution::guard::{bound_view, route_read};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
@@ -126,6 +127,9 @@ pub struct ReferenceListResponse {
     pub entries: Vec<ReferenceListEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// False when this member of a distributed bucket does not keep every range the listing
+    /// reaches, or is still catching up, so objects may be missing.
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1020,6 +1024,9 @@ outside a path restriction, are left out of the page.
 **Behavior**
 - This is a node-local listing of the bucket as this node currently sees it, so objects written
   elsewhere appear once they have replicated here.
+- In a distributed bucket `complete` is false when this node does not keep every key range the
+  prefix reaches, or is still catching up; the page then lists only what this node holds, and
+  a node that keeps every range answers in full.
 - Every live object is returned, materialized and referenced alike, which is what lets a caller
   total a bucket in one pass.
 - `referenced` false means the bytes are stored here and `size` is the stored blob size.
@@ -1053,7 +1060,8 @@ outside a path restriction, are left out of the page.
                         "connector_id": "01JCONNECTOR0123456789ABCD"
                     }
                 ],
-                "next_cursor": "AWdlbm9tZXMvMjAyNi9iLmZuYS5neg"
+                "next_cursor": "AWdlbm9tZXMvMjAyNi9iLmZuYS5neg",
+                "complete": true
             })
         ),
         (status = 400, description = "The cursor could not be decoded", body = ErrorResponse),
@@ -1088,13 +1096,22 @@ pub async fn list_references(
         .filter(|limit| *limit > 0)
         .unwrap_or(DEFAULT_REFERENCE_LIMIT)
         .min(MAX_REFERENCE_LIMIT);
+    let prefix = query.prefix.filter(|prefix| !prefix.is_empty());
+    let complete = match bucket_info.distribution.as_ref() {
+        None => true,
+        Some(binding) => {
+            let reach = prefix.as_deref().unwrap_or_default();
+            let route = route_read(state.get_ctx().as_ref(), binding, reach, true).await;
+            matches!(route, Ok(ReadRoute::Local { catching_up: false }))
+        }
+    };
     let result = drive(
         ListBucketOperation::new(ListBucketInput {
             bucket: query.bucket,
             group_id: bucket_info.group_id,
             continuation_token,
             max_keys: Some(limit),
-            prefix: query.prefix.filter(|prefix| !prefix.is_empty()),
+            prefix,
             delimiter: None,
             start_after: None,
         }),
@@ -1142,6 +1159,7 @@ pub async fn list_references(
         Json(ReferenceListResponse {
             entries,
             next_cursor,
+            complete,
         }),
     ))
 }

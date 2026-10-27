@@ -1181,3 +1181,30 @@ mod distributed {
         ));
     }
 }
+
+#[tokio::test]
+async fn references_state_completeness() {
+    // A member that keeps only the lower shard lists the whole bucket incompletely.
+    use crate::tests::distributed::{BUCKET, distribute, node_state};
+    let node = node_state().await;
+    distribute(&node.state, node.group_id, BUCKET).await;
+    let page = |prefix: &str| {
+        list_references(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Query(ReferenceListQuery {
+                bucket: BUCKET.to_string(),
+                prefix: Some(prefix.to_string()),
+                limit: None,
+                cursor: None,
+            }),
+        )
+    };
+    let (_, Json(whole)) = page("").await.unwrap();
+    assert!(!whole.complete);
+    let (_, Json(lower)) = page("apple").await.unwrap();
+    assert!(
+        lower.complete,
+        "a prefix inside the held shard is listed in full"
+    );
+}
