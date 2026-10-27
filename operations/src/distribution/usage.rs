@@ -17,7 +17,6 @@ use aruna_core::structs::storage::distribution::{DistributionBinding, Distributi
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
@@ -326,8 +325,8 @@ async fn local_accounts(
     }
 }
 
-/// Each group's replica share on this node, summed over its local distributed buckets. A bucket
-/// whose share cannot be read is left out, so its copies count as owned until the next run.
+/// Each group's replica share on this node, summed over its local distributed buckets. A share
+/// that cannot be read fails the whole run, so the publish keeps its markers and retries.
 pub async fn replica_shares(
     context: &DriverContext,
 ) -> Result<BTreeMap<GroupId, UsageCounters>, UsageError> {
@@ -341,13 +340,7 @@ pub async fn replica_shares(
             continue;
         }
         let bucket = String::from_utf8_lossy(key.as_ref()).into_owned();
-        let share = match replica_share(context, &bucket).await {
-            Ok(share) => share,
-            Err(error) => {
-                warn!(bucket = %bucket, error = %error, "replica share unavailable");
-                continue;
-            }
-        };
+        let share = replica_share(context, &bucket).await?;
         let count = |value: i128| u64::try_from(value.max(0)).unwrap_or(u64::MAX);
         let counters = UsageCounters {
             objects: count(share.objects),

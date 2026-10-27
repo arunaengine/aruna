@@ -2424,10 +2424,14 @@ mod tests {
     }
 
     async fn write_node_stat(ctx: &DriverContext, key: Vec<u8>, value: Vec<u8>) {
+        write_stat(ctx, NODE_STATS_KEYSPACE, key, value).await;
+    }
+
+    async fn write_stat(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: NODE_STATS_KEYSPACE.to_string(),
+                key_space: key_space.to_string(),
                 key: key.into(),
                 value: value.into(),
                 txn_id: None,
@@ -2555,42 +2559,50 @@ mod tests {
         assert_eq!(group.counters, counters(2, 20, 5, 0));
     }
 
+    fn binding(seed: u8) -> aruna_core::structs::storage::distribution::DistributionBinding {
+        aruna_core::structs::storage::distribution::DistributionBinding {
+            set_id: Ulid::from_bytes([seed; 16]),
+            member_id: Ulid::from_bytes([9; 16]),
+            incarnation: 1,
+            revision: Default::default(),
+        }
+    }
+
+    async fn write_bucket(
+        ctx: &DriverContext,
+        bucket: &str,
+        group_id: GroupId,
+        distribution: Option<aruna_core::structs::storage::distribution::DistributionBinding>,
+    ) {
+        let info = BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution,
+        };
+        let write = StorageEffect::Write {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
+            value: info.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        ctx.storage_handle.send_storage_effect(write).await;
+    }
+
     // Distribution records arrive as realm config targets; the groups of local distributed
     // buckets are marked so their replica shares are published again.
     #[tokio::test]
     async fn record_marks_groups() {
-        use aruna_core::structs::storage::distribution::DistributionBinding;
         let temp = tempdir().unwrap();
         let ctx = test_ctx(temp.path().to_str().unwrap());
         let (bound, plain) = (Ulid::from_bytes([6; 16]), Ulid::from_bytes([7; 16]));
-        let binding = DistributionBinding {
-            set_id: Ulid::from_bytes([8; 16]),
-            member_id: Ulid::from_bytes([9; 16]),
-            incarnation: 1,
-            revision: Default::default(),
-        };
-        for (bucket, group_id, distribution) in
-            [("spire", bound, Some(binding)), ("plain", plain, None)]
-        {
-            let info = BucketInfo {
-                group_id,
-                created_at: SystemTime::UNIX_EPOCH,
-                created_by: Default::default(),
-                cors_configuration: None,
-                storage_routing: Vec::new(),
-                placement_policies: Vec::new(),
-                placement_policy_generation: 0,
-                compression: Compression::Off,
-                distribution,
-            };
-            let write = StorageEffect::Write {
-                key_space: S3_BUCKET_KEYSPACE.to_string(),
-                key: bucket.as_bytes().to_vec().into(),
-                value: info.to_bytes().unwrap().into(),
-                txn_id: None,
-            };
-            ctx.storage_handle.send_storage_effect(write).await;
-        }
+        write_bucket(&ctx, "spire", bound, Some(binding(8))).await;
+        write_bucket(&ctx, "plain", plain, None).await;
 
         let target = DocumentTarget::RealmConfig {
             realm_id: RealmId([4; 32]),
@@ -2601,6 +2613,28 @@ mod tests {
         assert!(read_node_stat(&ctx, dirty_group_key(plain)).await.is_none());
         assert!(
             read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
+                .await
+                .is_some()
+        );
+    }
+
+    // A replica share that cannot be read fails the publish, so its markers stay for the retry.
+    #[tokio::test]
+    async fn share_failure_keeps() {
+        use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let group_id = Ulid::from_bytes([6; 16]);
+        write_bucket(&ctx, "spire", group_id, Some(binding(8))).await;
+        let record = Ulid::from_bytes([8; 16]).to_bytes().to_vec();
+        write_stat(&ctx, DISTRIBUTION_KEYSPACE, record, vec![0xff; 3]).await;
+        write_node_stat(&ctx, dirty_group_key(group_id), vec![1]).await;
+
+        let published = publish_usage_snapshots(&ctx, node(1), RealmId([4; 32]), false).await;
+
+        assert!(published.is_err(), "an unreadable record is no zero share");
+        assert!(
+            read_node_stat(&ctx, dirty_group_key(group_id))
                 .await
                 .is_some()
         );
