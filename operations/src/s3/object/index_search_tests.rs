@@ -281,6 +281,42 @@ async fn prefix_below_cursor() {
 }
 
 #[tokio::test]
+async fn hidden_cursor_incomplete() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["job/a", "job/b", "job0/c", "jz/d"]).await;
+    test.building_through("job0/c").await;
+    let fixture = &test.fixture;
+    let only = |key: &str| AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: object_permission_path(
+                fixture.realm_id,
+                fixture.visible_group,
+                fixture.node_id,
+                "spire",
+                key,
+            ),
+            permission: Permission::READ,
+        }]),
+        ..owner(fixture)
+    };
+    for query in ["job/", "jz/"] {
+        let mut prefix = test.input(only("job/a"), query);
+        prefix.key_match = ObjectKeyMatch::Prefix;
+        let page = test.search(prefix, 100).await;
+        assert_eq!(
+            page.incomplete_ranges, 1,
+            "{query} must not reveal the cursor"
+        );
+        assert_eq!(page.partial_ranges, [(test.lower, None)]);
+    }
+
+    let mut prefix = test.input(only("job0/c"), "job/");
+    prefix.key_match = ObjectKeyMatch::Prefix;
+    let page = test.search(prefix, 100).await;
+    assert_eq!(page.incomplete_ranges, 0, "a readable cursor still covers");
+}
+
+#[tokio::test]
 async fn prefix_window_continues() {
     let ready = IndexState::Ready { generation: 1 };
     let test = distributed(ready, &["job/a", "job/b", "job0/c", "jo/d"]).await;

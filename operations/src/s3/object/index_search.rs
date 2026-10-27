@@ -8,11 +8,12 @@ use std::ops::Bound;
 use std::sync::{Arc, LazyLock};
 
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, SEARCH_INDEX_KEYSPACE};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::inventory::Position;
 use aruna_core::structs::storage::distribution::search::IndexState;
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
-use aruna_core::types::{Key, TxnId};
+use aruna_core::types::{GroupId, Key, TxnId};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use futures_util::future::join_all;
@@ -23,6 +24,7 @@ use super::{
     SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits, finish_read,
     load_live, start_read,
 };
+use crate::auth::request_policy::PolicyEvaluator;
 use crate::distribution::index_feed::{range_progress, state_key};
 use crate::distribution::key_index::{KeyPage, KeyQuery, RangeIndexes};
 use crate::driver::DriverContext;
@@ -76,15 +78,26 @@ async fn partial_ranges(
         let Some(through) = through else {
             continue;
         };
-        let mut shown = None;
-        for hit in resolve_keys(context, input, bucket, std::slice::from_ref(through)).await? {
-            if authorize(context, input, &mut evaluators, &hit).await? {
-                shown = Some(hit.hit.key);
-            }
-        }
-        partial.push((*range_id, shown));
+        let shown = readable(context, input, bucket, &mut evaluators, through).await?;
+        partial.push((*range_id, shown.then(|| through.clone())));
     }
     Ok(partial)
+}
+
+/// Whether the caller may read `key`, a building index's cursor.
+async fn readable(
+    context: &DriverContext,
+    input: &SearchObjectsInput,
+    bucket: &str,
+    evaluators: &mut HashMap<(RealmId, GroupId), PolicyEvaluator>,
+    key: &str,
+) -> Result<bool, SearchObjectsError> {
+    for hit in resolve_keys(context, input, bucket, &[key.to_string()]).await? {
+        if authorize(context, input, evaluators, &hit).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn range_page(
@@ -137,8 +150,12 @@ async fn range_page(
                 incomplete += 1;
                 continue;
             };
-            if through.is_some() {
-                unready.push((*range_id, through));
+            // Coverage below a hidden cursor would reveal where the cursor is.
+            if let Some(through) = through
+                && (!ends_by(&end, &through)
+                    || !readable(context, input, &bucket, &mut evaluators, &through).await?)
+            {
+                unready.push((*range_id, Some(through)));
                 incomplete += 1;
             }
             examined += found.examined;
@@ -172,8 +189,7 @@ async fn range_page(
 }
 
 /// Queries the indexes of `chunk` at once; `None` for a range without a searchable one. A
-/// building index is searched up to its cursor, with the key it covers through if the query
-/// reaches past it.
+/// building index is searched up to its cursor and returned with the key it covers through.
 async fn search_chunk(
     context: &DriverContext,
     search: &RangeSearch,
@@ -199,10 +215,13 @@ async fn search_chunk(
                 IndexState::Building {
                     generation,
                     cursor: Some(cursor),
-                } => (
-                    generation,
-                    end_at(&mut query, Position::decode(&cursor).ok()?.key),
-                ),
+                } => {
+                    let through = Position::decode(&cursor).ok()?.key;
+                    if !ends_by(&query.end, &through) {
+                        query.end = Bound::Included(through.clone());
+                    }
+                    (generation, Some(through))
+                }
                 IndexState::Building { cursor: None, .. } => return None,
             };
             let found = indexes?.search(set_id, *range_id, generation, query).await;
@@ -276,16 +295,10 @@ fn prefix_end(prefix: &str) -> Option<String> {
     None
 }
 
-/// Ends `query` at `through`, the last key a building index holds every head up to; returns
-/// it if the query could reach past it.
-fn end_at(query: &mut KeyQuery, through: String) -> Option<String> {
-    if let Bound::Included(end) | Bound::Excluded(end) = &query.end
-        && *end <= through
-    {
-        return None;
-    }
-    query.end = Bound::Included(through.clone());
-    Some(through)
+/// Whether a query ending at `end` stays within `through`, the last key a building index holds
+/// every head up to.
+fn ends_by(end: &Bound<String>, through: &str) -> bool {
+    matches!(end, Bound::Included(end) | Bound::Excluded(end) if end.as_str() <= through)
 }
 
 fn overlaps(range: &KeyRange, start: &Bound<String>, end: &Bound<String>) -> bool {
