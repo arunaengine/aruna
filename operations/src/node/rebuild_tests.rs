@@ -396,6 +396,7 @@ async fn quota_buckets_first() {
             group_id: GROUP_B,
             quota_bytes: None,
             grace_factor_percent: None,
+            count_replicas: None,
         }],
         ..QuotaConfig::default()
     };

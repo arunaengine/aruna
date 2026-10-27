@@ -283,6 +283,10 @@ pub struct QuotaConfig {
     /// Inbound requests one user device may keep in flight at a realm node at
     /// once, which is what bounds long blob pulls. `None` leaves them uncapped.
     pub device_concurrent_pulls: Option<u32>,
+    /// Whether copies of a distributed range besides its coordinator's count toward group
+    /// quotas. References never count.
+    #[serde(default)]
+    pub count_replicas: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -290,6 +294,9 @@ pub struct GroupQuotaOverride {
     pub group_id: GroupId,
     pub quota_bytes: Option<u64>,
     pub grace_factor_percent: Option<u32>,
+    /// Overrides the realm's `count_replicas`; `None` keeps it.
+    #[serde(default)]
+    pub count_replicas: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -310,6 +317,7 @@ impl Default for QuotaConfig {
             devices_per_user: None,
             device_request_rate: None,
             device_concurrent_pulls: None,
+            count_replicas: false,
         }
     }
 }
@@ -351,6 +359,14 @@ impl QuotaConfig {
             .unwrap_or(self.grace_factor_percent);
         let ceiling = u128::from(quota) * u128::from(grace) / 100;
         Some(ceiling.min(u128::from(u64::MAX)) as u64)
+    }
+
+    /// Whether replicas count toward the group's quota: its override, else the realm default.
+    pub fn counts_replicas(&self, group_id: &GroupId) -> bool {
+        (self.group_overrides.iter())
+            .find(|over| over.group_id == *group_id)
+            .and_then(|over| over.count_replicas)
+            .unwrap_or(self.count_replicas)
     }
 }
 
@@ -1272,7 +1288,7 @@ mod test {
     fn config_bytes_canonical() {
         // Pins the canonical wire form. Postcard is positional, so the field
         // occupies a fixed slot that a shorter encoding cannot satisfy.
-        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d000000";
+        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e550001030000000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d000000";
         let mut config = RealmConfigDocument::new(RealmId([1u8; 32]), Vec::new(), 3);
         config.family_strategy_id = Ulid::from_bytes([2u8; 16]);
 
@@ -1708,6 +1724,7 @@ mod test {
                 group_id: group,
                 quota_bytes: Some(2_000),
                 grace_factor_percent: Some(150),
+                count_replicas: None,
             }],
             ..super::QuotaConfig::default()
         };
@@ -1733,6 +1750,7 @@ mod test {
                 group_id: group,
                 quota_bytes: None,
                 grace_factor_percent: None,
+                count_replicas: None,
             }],
             ..super::QuotaConfig::default()
         };
@@ -1755,6 +1773,58 @@ mod test {
             ..super::QuotaConfig::default()
         };
         assert_eq!(over_huge.effective_group_ceiling(&other), Some(u64::MAX));
+    }
+
+    #[test]
+    fn replicas_follow_override() {
+        let override_of = |group_id, count_replicas| super::GroupQuotaOverride {
+            group_id,
+            quota_bytes: None,
+            grace_factor_percent: None,
+            count_replicas,
+        };
+        let (kept, on, off) = (
+            Ulid::from_bytes([1u8; 16]),
+            Ulid::from_bytes([2u8; 16]),
+            Ulid::from_bytes([3u8; 16]),
+        );
+        let mut quota = super::QuotaConfig {
+            group_overrides: vec![
+                override_of(kept, None),
+                override_of(on, Some(true)),
+                override_of(off, Some(false)),
+            ],
+            ..super::QuotaConfig::default()
+        };
+        let other = Ulid::from_bytes([4u8; 16]);
+        assert!(
+            !quota.counts_replicas(&other),
+            "replicas do not count by default"
+        );
+        assert!(!quota.counts_replicas(&kept));
+        assert!(quota.counts_replicas(&on));
+        quota.count_replicas = true;
+        assert!(quota.counts_replicas(&other));
+        assert!(
+            quota.counts_replicas(&kept),
+            "an override without a value keeps the realm's"
+        );
+        assert!(!quota.counts_replicas(&off));
+    }
+
+    #[test]
+    fn quota_json_defaults() {
+        // Reducer quota values are JSON; values written before the setting still decode.
+        let quota: super::QuotaConfig = serde_json::from_str(
+            r#"{"default_group_quota_bytes":null,"grace_factor_percent":110,
+            "warn_threshold_percent":85,"group_overrides":[{"group_id":"01JABCDEF0123456789ABCDEFG",
+            "quota_bytes":5,"grace_factor_percent":null}],"max_groups_per_user":3,
+            "user_group_cap_overrides":[],"max_devices_per_user":null,
+            "device_requests_per_minute":null,"device_concurrent_pulls":null}"#,
+        )
+        .unwrap();
+        assert!(!quota.count_replicas);
+        assert_eq!(quota.group_overrides[0].count_replicas, None);
     }
 
     #[test]

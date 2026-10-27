@@ -860,6 +860,7 @@ async fn group_override_wins() {
             group_id: overridden,
             quota_bytes: Some(200),
             grace_factor_percent: Some(100),
+            count_replicas: None,
         }],
         ..QuotaConfig::default()
     };

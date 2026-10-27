@@ -344,6 +344,10 @@ pub struct RealmQuotaConfig {
     #[serde(rename = "device_requests_per_minute")]
     pub device_request_rate: Option<u32>,
     pub device_concurrent_pulls: Option<u32>,
+    /// Whether copies of a distributed range besides its coordinator's count toward group
+    /// quotas; `false` when omitted. References never count.
+    #[serde(default)]
+    pub count_replicas: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -352,6 +356,9 @@ pub struct RealmQuotaOverride {
     pub group_id: String,
     pub quota_bytes: Option<u64>,
     pub grace_factor_percent: Option<u32>,
+    /// Overrides the realm's `count_replicas` for this group; omitted keeps it.
+    #[serde(default)]
+    pub count_replicas: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -374,6 +381,7 @@ impl From<QuotaConfig> for RealmQuotaConfig {
                     group_id: over.group_id.to_string(),
                     quota_bytes: over.quota_bytes,
                     grace_factor_percent: over.grace_factor_percent,
+                    count_replicas: over.count_replicas,
                 })
                 .collect(),
             groups_per_user: quota.groups_per_user,
@@ -388,6 +396,7 @@ impl From<QuotaConfig> for RealmQuotaConfig {
             devices_per_user: quota.devices_per_user,
             device_request_rate: quota.device_request_rate,
             device_concurrent_pulls: quota.device_concurrent_pulls,
+            count_replicas: quota.count_replicas,
         }
     }
 }
@@ -407,6 +416,7 @@ impl RealmQuotaConfig {
                     })?,
                     quota_bytes: over.quota_bytes,
                     grace_factor_percent: over.grace_factor_percent,
+                    count_replicas: over.count_replicas,
                 })
             })
             .collect::<ServerResult<Vec<_>>>()?;
@@ -435,6 +445,7 @@ impl RealmQuotaConfig {
             devices_per_user: self.devices_per_user,
             device_request_rate: self.device_request_rate,
             device_concurrent_pulls: self.device_concurrent_pulls,
+            count_replicas: self.count_replicas,
         })
     }
 }
@@ -1166,7 +1177,8 @@ token of another realm or one this node cannot validate, the response is the pub
                             "user_group_cap_overrides": [],
                             "max_devices_per_user": 5,
                             "device_requests_per_minute": 600,
-                            "device_concurrent_pulls": 8
+                            "device_concurrent_pulls": 8,
+                            "count_replicas": false
                         },
                         "interfaces": {
                             "rest": {"status": "available", "bind": "0.0.0.0:3000", "url": "https://node.example.test/api/v1"},
@@ -1807,8 +1819,8 @@ management node serves the call and every other node relays it to one.
 - `default_group_quota_bytes` is the pre-grace allowance per group and null means unlimited;
   `grace_factor_percent` scales it into the hard ceiling a write is refused at, while
   `warn_threshold_percent` only decides when a group is reported as warning.
-- Per-group overrides replace both values for one group, and per-user overrides cap how many groups
-  a user may hold.
+- Per-group overrides replace these values for one group, and per-user overrides cap how many
+  groups a user may hold.
 - `max_devices_per_user` caps how many devices one user may enroll, counting unclaimed enrollment
   secrets as well as enrolled devices; null leaves device enrollment uncapped.
 - `device_requests_per_minute` and `device_concurrent_pulls` bound what one enrolled device may ask
@@ -1821,6 +1833,9 @@ management node serves the call and every other node relays it to one.
 - Quota is evaluated against a group's realm-wide logical bytes, which are aggregated from counters
   that replicate between nodes, so enforcement follows a policy change as those counters and the
   realm configuration propagate.
+- A distributed bucket counts each object once, at the node coordinating its key range.
+  `count_replicas` (default false, overridable per group) decides whether the copies other member
+  nodes hold count as well. References to external data never count toward a quota.
 
 **Limits**
 - `grace_factor_percent` must be at least 100 and `warn_threshold_percent` between 1 and 100.
@@ -1834,7 +1849,7 @@ management node serves the call and every other node relays it to one.
             "grace_factor_percent": 110,
             "warn_threshold_percent": 80,
             "group_overrides": [
-                {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400_i64, "grace_factor_percent": 120}
+                {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400_i64, "grace_factor_percent": 120, "count_replicas": true}
             ],
             "max_groups_per_user": 10,
             "user_group_cap_overrides": [
@@ -1842,7 +1857,8 @@ management node serves the call and every other node relays it to one.
             ],
             "max_devices_per_user": 5,
             "device_requests_per_minute": 600,
-            "device_concurrent_pulls": 8
+            "device_concurrent_pulls": 8,
+            "count_replicas": false
         })
     ),
     responses(
@@ -1855,7 +1871,7 @@ management node serves the call and every other node relays it to one.
                 "grace_factor_percent": 110,
                 "warn_threshold_percent": 80,
                 "group_overrides": [
-                    {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400_i64, "grace_factor_percent": 120}
+                    {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400_i64, "grace_factor_percent": 120, "count_replicas": true}
                 ],
                 "max_groups_per_user": 10,
                 "user_group_cap_overrides": [
@@ -1863,7 +1879,8 @@ management node serves the call and every other node relays it to one.
                 ],
                 "max_devices_per_user": 5,
                 "device_requests_per_minute": 600,
-                "device_concurrent_pulls": 8
+                "device_concurrent_pulls": 8,
+                "count_replicas": false
             })
         ),
         (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a zero device cap or device limit", body = crate::error::ErrorResponse),

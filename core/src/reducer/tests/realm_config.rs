@@ -462,11 +462,13 @@ fn realm_config_detection() {
                 group_id: group_a,
                 quota_bytes: Some(500),
                 grace_factor_percent: None,
+                count_replicas: None,
             },
             GroupQuotaOverride {
                 group_id: group_b,
                 quota_bytes: Some(750),
                 grace_factor_percent: Some(150),
+                count_replicas: None,
             },
         ],
         groups_per_user: Some(4),

@@ -1070,12 +1070,14 @@ async fn quota_surfaces_failure() -> TestResult<()> {
                 group_id: harness.group_id.clone(),
                 quota_bytes: Some(1),
                 grace_factor_percent: Some(100),
+                count_replicas: None,
             }],
             groups_per_user: Some(3),
             group_cap_overrides: Vec::new(),
             devices_per_user: None,
             device_request_rate: None,
             device_concurrent_pulls: None,
+            count_replicas: false,
         };
         let quota_response = reqwest::Client::new()
             .put(format!(

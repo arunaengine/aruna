@@ -581,6 +581,7 @@ mod tests {
                 group_id: Ulid::from_bytes([7; 16]),
                 quota_bytes: Some(2_000_000),
                 grace_factor_percent: Some(150),
+                count_replicas: Some(true),
             }],
             groups_per_user: Some(5),
             group_cap_overrides: vec![UserCapOverride {
@@ -590,6 +591,7 @@ mod tests {
             devices_per_user: Some(4),
             device_request_rate: Some(600),
             device_concurrent_pulls: Some(8),
+            count_replicas: false,
         }
     }
 
@@ -835,11 +837,13 @@ mod tests {
                 group_id,
                 quota_bytes: Some(1),
                 grace_factor_percent: None,
+                count_replicas: None,
             },
             GroupQuotaOverride {
                 group_id,
                 quota_bytes: Some(2),
                 grace_factor_percent: None,
+                count_replicas: None,
             },
         ];
         assert!(matches!(
@@ -875,6 +879,7 @@ mod tests {
                 group_id: Ulid::from_bytes([5; 16]),
                 quota_bytes: Some(1),
                 grace_factor_percent: Some(99),
+                count_replicas: None,
             }],
             ..QuotaConfig::default()
         };
@@ -891,6 +896,7 @@ mod tests {
                 group_id: Ulid::from_bytes([5; 16]),
                 quota_bytes: Some(1),
                 grace_factor_percent: Some(100),
+                count_replicas: None,
             }],
             ..QuotaConfig::default()
         };
@@ -904,6 +910,7 @@ mod tests {
                 group_id: Ulid::from_bytes([6; 16]),
                 quota_bytes: None,
                 grace_factor_percent: Some(110),
+                count_replicas: None,
             }],
             ..QuotaConfig::default()
         };
