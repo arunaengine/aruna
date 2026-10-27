@@ -490,6 +490,49 @@ pub async fn put_crate_status(
     .await
 }
 
+/// Records the crate outcome and the run link in one batch, so a run whose crate status is
+/// final always has its link.
+pub async fn put_crate_outcome(
+    storage: &StorageHandle,
+    job_id: JobId,
+    status: &aruna_core::structs::execution::job::RunCrateStatus,
+    link: &aruna_core::structs::execution::job::RunLink,
+) -> Result<(), String> {
+    let key = aruna_core::structs::execution::job::run_crate_key(job_id);
+    let status = status.to_bytes().map_err(|error| error.to_string())?;
+    let link = link.to_bytes().map_err(|error| error.to_string())?;
+    batch_write(
+        storage,
+        vec![
+            (
+                RUN_CRATE_KEYSPACE.to_string(),
+                key.clone(),
+                ByteView::from(status),
+            ),
+            (
+                aruna_core::keyspaces::RUN_LINK_KEYSPACE.to_string(),
+                key,
+                ByteView::from(link),
+            ),
+        ],
+        None,
+    )
+    .await
+}
+
+/// Read the run link of a physical job id, if recorded.
+pub async fn read_run_link(
+    storage: &StorageHandle,
+    job_id: JobId,
+) -> Result<Option<aruna_core::structs::execution::job::RunLink>, String> {
+    let key = aruna_core::structs::execution::job::run_crate_key(job_id);
+    read_raw(storage, aruna_core::keyspaces::RUN_LINK_KEYSPACE, key, None)
+        .await?
+        .map(|value| aruna_core::structs::execution::job::RunLink::from_bytes(value.as_ref()))
+        .transpose()
+        .map_err(|error| error.to_string())
+}
+
 /// Read the run-crate obligation status for `job_id`, if recorded.
 pub async fn read_crate_status(
     storage: &StorageHandle,

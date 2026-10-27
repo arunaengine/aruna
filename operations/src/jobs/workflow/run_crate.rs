@@ -12,7 +12,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, RunCrateStatus,
+    JobResultPayload, JobState, RunCrateStatus, RunLink,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -32,7 +32,9 @@ pub(crate) const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5"
 const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
 
 use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{put_crate_status, read_crate_status, read_job_record};
+use super::super::store::{
+    put_crate_outcome, put_crate_status, read_crate_status, read_job_record, read_run_link,
+};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
@@ -211,7 +213,7 @@ pub(crate) async fn record_crate(
         let status = RunCrateStatus::Denied {
             message: "metadata write access denied".to_string(),
         };
-        if let Err(error) = put_crate_status(storage, for_job, &status).await {
+        if let Err(error) = put_outcome(storage, for_job, parent, spec, &status, None).await {
             return JobRunOutcome::Failed(JobError::retryable(format!(
                 "run crate status write failed: {error}"
             )));
@@ -231,7 +233,7 @@ pub(crate) async fn record_crate(
     };
     let jsonld = build_crate_jsonld(parent, spec, document_id, &devices);
 
-    let (status, resource) = match route_metadata_create(
+    let (status, resource, written) = match route_metadata_create(
         CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor,
             group_id: spec.group_id,
@@ -267,6 +269,7 @@ pub(crate) async fn record_crate(
                     resource: resource.clone(),
                 },
                 resource,
+                Some(result.record.document_id),
             )
         }
         // An invalid crate is permanent: record it and discharge the
@@ -281,15 +284,35 @@ pub(crate) async fn record_crate(
                 message: error.to_string(),
             };
             let resource = status.name().to_string();
-            (status, resource)
+            (status, resource, None)
         }
     };
-    if let Err(error) = put_crate_status(storage, for_job, &status).await {
+    if let Err(error) = put_outcome(storage, for_job, parent, spec, &status, written).await {
         return JobRunOutcome::Failed(JobError::retryable(format!(
             "run crate status write failed: {error}"
         )));
     }
     JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource })
+}
+
+/// Records the final crate status with the run link; a link the receipt wrote keeps its family.
+async fn put_outcome(
+    storage: &aruna_storage::storage::StorageHandle,
+    for_job: JobId,
+    parent: &JobRecord,
+    spec: &ExecutionSpec,
+    status: &RunCrateStatus,
+    run_crate: Option<Ulid>,
+) -> Result<(), String> {
+    let known = read_run_link(storage, for_job).await?;
+    let link = RunLink {
+        family: known.as_ref().and_then(|link| link.family),
+        logical_job_id: known.and_then(|link| link.logical_job_id),
+        group_id: spec.group_id,
+        created_by: parent.created_by,
+        run_crate,
+    };
+    put_crate_outcome(storage, for_job, status, &link).await
 }
 
 fn is_transient(error: &MetadataWriteError) -> bool {

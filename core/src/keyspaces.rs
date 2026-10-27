@@ -410,6 +410,8 @@ pub const JOB_INDEX_KEYSPACE: &str = "job_owner_index";
 pub const ACTIVE_USER_KEYSPACE: &str = "job_active_user";
 pub const DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const RUN_CRATE_KEYSPACE: &str = "job_run_crate";
+/// `RunLink` rows by physical job id; job pruning keeps them.
+pub const RUN_LINK_KEYSPACE: &str = "job_run_links";
 
 /// The realm target a device froze for publishing one local run, and the copies it made,
 /// keyed like `job_run_crate`. Device-local and never replicated.
@@ -709,6 +711,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ACTIVE_USER_KEYSPACE,
     DEDUP_INDEX_KEYSPACE,
     RUN_CRATE_KEYSPACE,
+    RUN_LINK_KEYSPACE,
     RUN_PUBLISH_KEYSPACE,
     ATTEMPT_CONTROL_KEYSPACE,
     JOB_CLAIM_KEYSPACE,

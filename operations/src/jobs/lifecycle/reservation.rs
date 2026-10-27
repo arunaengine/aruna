@@ -10,11 +10,12 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     FAMILY_OUTBOX_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    JOB_RESERVATION_KEYSPACE,
+    JOB_RESERVATION_KEYSPACE, RUN_LINK_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    EffectiveResources, JobFamilyRecord, JobId, JobRecord, LaunchIntent, RecordVerdict,
+    EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, LaunchIntent, RecordVerdict,
+    RunLink, run_crate_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -317,6 +318,20 @@ impl ReserveExecutionOperation {
                 ),
             ),
         ];
+        if let JobPayload::Execution(spec) = &self.config.record.payload {
+            let link = RunLink {
+                family: Some(self.family()),
+                logical_job_id: Some(self.config.logical_job_id),
+                group_id: spec.group_id,
+                created_by: self.config.record.created_by,
+                run_crate: None,
+            };
+            writes.push((
+                RUN_LINK_KEYSPACE.to_string(),
+                run_crate_key(self.config.job_id),
+                Value::from(link.to_bytes()?.as_slice()),
+            ));
+        }
         writes.extend(
             job_insert_entries(self.config.record.as_ref())?
                 .into_iter()
