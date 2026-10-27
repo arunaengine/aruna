@@ -8,6 +8,7 @@ use crate::mcp::data::{WriteObjectInput, store_text};
 use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
+    replicate,
 };
 use axum::http::StatusCode;
 
@@ -202,6 +203,24 @@ async fn merges_peer_range() {
     )
     .await;
     assert_eq!(keys(&rest.unwrap()), vec!["x.md"]);
+}
+
+// A copy may lag behind, so the coordinator lists the range even where a copy is kept.
+#[tokio::test]
+async fn copy_defers_listing() {
+    let node = node_state().await;
+    store(&node, &["a.md"]).await;
+    replicate(&node.state, node.group_id, BUCKET).await;
+    let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+        "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+        "prefixes":[],"next_cursor":null}"#;
+    let peer = mock_peer(StatusCode::OK, answer).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let page = list(&node, &node.owner, HeaderMap::new(), query(None, None, 10))
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["x.md"]);
+    assert_eq!(peer.paths.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

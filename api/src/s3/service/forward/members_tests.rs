@@ -715,6 +715,31 @@ async fn listing_incomplete_holder() {
     assert!(page(&members, 0, near).await.is_ok());
 }
 
+// Copies here never receive their records, as a lagging copy; every node still lists all keys.
+#[tokio::test]
+async fn copies_defer_listing() {
+    use s3s::dto::ListObjectsInput;
+    let members = members(3, &["h", "p"], 1).await;
+    for key in SPREAD {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    for on in 0..3 {
+        let (keys, _, next) = page(&members, on, list_input(100)).await.unwrap();
+        assert_eq!((keys, next), (SPREAD.map(String::from).to_vec(), None));
+        let node = &members.nodes[on];
+        let input = ListObjectsInput {
+            bucket: BUCKET.to_string(),
+            ..Default::default()
+        };
+        let list = request(input, Method::GET, members.user_on(on), node.bucket().await);
+        let output = node.service.list_objects(list).await.unwrap().output;
+        let keys: Vec<String> = (output.contents.unwrap_or_default().into_iter())
+            .filter_map(|object| object.key)
+            .collect();
+        assert_eq!(keys, SPREAD);
+    }
+}
+
 // Versions list across ranges newest first per key, delete markers included, and the
 // markers of a short page resume the next one.
 #[tokio::test]

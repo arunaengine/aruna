@@ -753,7 +753,7 @@ struct SetListing {
 }
 
 /// One page of a distributed bucket's heads in key order, range by range from this member's
-/// inventory. A range it keeps no records of ends the page there; a page that starts there is
+/// inventory. A range it does not list ends the page there; a page that starts there is
 /// read from a holder of the range for a device, and refused for a forwarded listing.
 async fn set_heads(
     context: &Arc<DriverContext>,
@@ -838,7 +838,7 @@ async fn holder_heads(
         .ok_or(SyncRefusal::Unavailable)?;
     let device = node_kind(&config, peer).is_some_and(|kind| kind.owner().is_some());
     let local = local_node(context)?;
-    let holder = (snapshot.record_holders(range).into_iter())
+    let holder = (snapshot.list_holder(range).into_iter())
         .map(|member| member.node_id)
         .find(|node_id| *node_id != local && *node_id != peer);
     let (Some(holder), true, Some(metadata)) = (holder, device, context.metadata_handle.as_ref())

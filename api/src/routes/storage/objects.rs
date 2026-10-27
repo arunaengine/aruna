@@ -324,7 +324,7 @@ async fn merged_page(
                 let cursor = (start
                     .map(|(key, group)| encode_resume(&Resume::After { key, group })))
                 .transpose()?;
-                let holders = (snapshot.record_holders(range).into_iter())
+                let holders = (snapshot.list_holder(range).into_iter())
                     .filter(|member| member.member_id != binding.member_id)
                     .map(|member| member.node_id)
                     .collect();

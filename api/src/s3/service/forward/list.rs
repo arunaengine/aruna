@@ -240,7 +240,7 @@ impl ArunaS3Service {
             .map_err(|error| guard_error(&error))
     }
 
-    /// Asks the holders of `range` in turn; only a range nobody answers ends the listing.
+    /// Asks the member that lists `range`; a range it does not answer ends the listing.
     pub(in crate::s3::service) async fn ask_holders(
         &self,
         user: &UserAccess,
@@ -248,7 +248,7 @@ impl ArunaS3Service {
         range: &KeyRange,
         (operation, bucket, query): (&'static str, &str, String),
     ) -> S3Result<String> {
-        let holders = snapshot.record_holders(range);
+        let holders = snapshot.list_holder(range);
         let others = holders
             .into_iter()
             .filter(|member| member.member_id != binding.member_id);
