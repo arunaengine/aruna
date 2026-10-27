@@ -144,7 +144,7 @@ pub(super) fn page_items(
 ) -> Result<Vec<PageItem>, PageError> {
     let count = page.manifests.len();
     if count == 0 || count > PAGE_RECORDS {
-        return Err(PageError::Invalid("a page holds 1 to 4096 records"));
+        return Err(PageError::Invalid("a page holds 1 to 8192 records"));
     }
     let mut keys = BTreeSet::new();
     let mut items = Vec::with_capacity(count);

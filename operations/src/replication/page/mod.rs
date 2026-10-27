@@ -15,7 +15,7 @@ use ulid::Ulid;
 use super::protocol::VersionReplicationManifest;
 
 /// Records one page carries at most.
-pub const PAGE_RECORDS: usize = 4096;
+pub const PAGE_RECORDS: usize = 8192;
 /// Encoded bytes one page carries at most, below the 16 MiB metadata message limit.
 pub const PAGE_BYTES: usize = 12 * 1024 * 1024;
 
