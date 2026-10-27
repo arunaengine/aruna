@@ -271,6 +271,7 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/links"),
         ("GET", "/data/buckets/{bucket}/objects"),
         ("GET", "/data/buckets/{bucket}/objects/origin"),
+        ("GET", "/data/origin"),
         ("GET", "/data/buckets/{bucket}/objects/part-of"),
         ("GET", "/data/buckets/{bucket}/sources"),
         ("GET", "/data/databases"),

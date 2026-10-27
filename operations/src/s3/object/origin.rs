@@ -64,6 +64,8 @@ pub struct OriginView {
     pub database_entry: Option<Ulid>,
     /// What that entry's parser finds in the key and source URL.
     pub identifiers: Vec<Identifier>,
+    /// The BLAKE3 of the bytes, for a materialized version only; never a reference identity.
+    pub content_hash: Option<[u8; 32]>,
 }
 
 /// Reads the origin of `version_id`, or of the current version, of a local bucket's key.
@@ -220,7 +222,9 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         version.hop.as_ref(),
         (source.as_ref().filter(|_| published)).and_then(|source| source.url.clone()),
     );
+    let content_hash = version.blob_hash().copied();
     OriginView {
+        content_hash,
         version_id,
         global,
         created_by: version.created_by,
