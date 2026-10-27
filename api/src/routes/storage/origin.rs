@@ -263,11 +263,20 @@ pub async fn get_origin(
         &params.key,
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
-    // A member that holds no copy of the key's range asks a holder, which checks again.
+    // A member that holds no copy of the key's range asks a holder, which checks again. A copy
+    // may lag behind the current version, so only a pinned version comes from one.
     if let Some(binding) = info.distribution.as_ref()
         && !headers.contains_key(RELAY_HOP_HEADER)
     {
         let context = state.get_ctx();
+        if params.version_id.is_none() {
+            let coordinator = read_coordinator(context.as_ref(), binding, &params.key).await;
+            if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
+                let path = origin_path(&bucket, &params);
+                let target = (binding.set_id, range_id, node_id);
+                return relay_origin(&state, target, vec![node_id], &path, bearer).await;
+            }
+        }
         let route = route_read(context.as_ref(), binding, &params.key, false).await;
         if let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? {
             let mut holders = key_holders(context.as_ref(), binding.set_id, &params.key).await;

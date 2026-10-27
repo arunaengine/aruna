@@ -1931,7 +1931,11 @@ impl S3 for ArunaS3Service {
         let response_bucket = bucket.clone();
         let response_key = key.clone();
         if let Some(holder) = self
-            .read_holder(&req.extensions, bucket_info.as_ref(), &key)
+            .read_holder(
+                &req.extensions,
+                bucket_info.as_ref(),
+                (&key, version_id.is_some()),
+            )
             .await?
         {
             let request = || {
@@ -2208,7 +2212,11 @@ impl S3 for ArunaS3Service {
             .map(|info| info.group_id)
             .unwrap_or(user_access.group_id);
         if let Some(holder) = self
-            .read_holder(&req.extensions, bucket_info.as_ref(), &key)
+            .read_holder(
+                &req.extensions,
+                bucket_info.as_ref(),
+                (&key, version_id.is_some()),
+            )
             .await?
         {
             let request = || {

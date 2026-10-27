@@ -772,6 +772,73 @@ async fn copy_miss_forwards() {
     );
 }
 
+/// Copies the object rows of node `from` to node `to`, as a copy that received them.
+async fn copy_rows(members: &Members, from: usize, to: usize) {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    };
+    for key_space in [
+        BLOB_HEAD_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE,
+    ] {
+        let iter = StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: None,
+            limit: 1000,
+            txn_id: None,
+        };
+        let storage = &members.nodes[from].context.storage_handle;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) =
+            storage.send_storage_effect(iter).await
+        else {
+            panic!("rows of {key_space} read");
+        };
+        for (key, value) in values {
+            let write = StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key,
+                value,
+                txn_id: None,
+            };
+            let storage = &members.nodes[to].context.storage_handle;
+            storage.send_storage_effect(write).await;
+        }
+    }
+}
+
+// A copy that still holds an older version never answers a read of the current one.
+#[tokio::test]
+async fn stale_copy_skipped() {
+    let members = members(3, &["h", "p"], 1).await;
+    let old = put(&members, 0, "q/1", b"old").await;
+    copy_rows(&members, 2, 0).await;
+    put(&members, 0, "q/1", b"newer").await;
+    assert_eq!(read(&members, 0, "q/1").await.0, b"newer");
+    let node = &members.nodes[0];
+    let input = s3s::dto::HeadObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "q/1".to_string(),
+        ..Default::default()
+    };
+    let head = request(input, Method::HEAD, members.user_on(0), node.bucket().await);
+    let output = node.service.head_object(head).await.unwrap().output;
+    assert_eq!(output.content_length, Some(5));
+    // A pinned version is the same everywhere, so the copy still answers it.
+    let input = s3s::dto::HeadObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "q/1".to_string(),
+        version_id: Some(old),
+        ..Default::default()
+    };
+    let head = request(input, Method::HEAD, members.user_on(0), node.bucket().await);
+    let output = node.service.head_object(head).await.unwrap().output;
+    assert_eq!(output.content_length, Some(3));
+}
+
 // Versions list across ranges newest first per key, delete markers included, and the
 // markers of a short page resume the next one.
 #[tokio::test]

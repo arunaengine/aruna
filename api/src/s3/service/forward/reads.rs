@@ -162,20 +162,27 @@ pub(in crate::s3::service) fn anonymous_window(user: &UserAccess) -> UserAccess 
 }
 
 impl ArunaS3Service {
-    /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, when this
-    /// member keeps no records of the key's range, or `None` when this member answers it.
-    /// A delegated read is never sent on.
+    /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, or `None` when
+    /// this member answers it. Only a `pinned` version may come from a copy: a copy may lag
+    /// behind the current version. A delegated read is never sent on.
     pub(in crate::s3::service) async fn read_holder(
         &self,
         extensions: &http::Extensions,
         bucket: Option<&BucketInfo>,
-        key: &str,
+        (key, pinned): (&str, bool),
     ) -> S3Result<Option<(Forward, NodeId)>> {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(None);
         };
         if extensions.get::<DelegatedRequest>().is_some() {
             return Ok(None);
+        }
+        if !pinned {
+            let coordinator = self.range_coordinator(binding, key).await?;
+            return Ok(coordinator.map(|forward| {
+                let node_id = forward.node_id;
+                (forward, node_id)
+            }));
         }
         let (range_id, coordinator) =
             match route_read(self.state.as_ref(), binding, key, false).await {

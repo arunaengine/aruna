@@ -182,6 +182,21 @@ async fn copy_miss_relays() {
     assert_eq!(peer.paths.lock().unwrap().len(), 1);
 }
 
+// A copy may hold an older version, so a read of the current one goes to the coordinator.
+#[tokio::test]
+async fn stale_copy_relays() {
+    let node = node_state().await;
+    store(&node, "a.md").await;
+    replicate(&node.state, node.group_id, BUCKET).await;
+    let peer = mock_peer(StatusCode::OK, &answer()).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let relayed = origin(&node, &node.owner, HeaderMap::new(), BUCKET, "a.md", None)
+        .await
+        .unwrap();
+    assert_eq!(relayed.created_by, "peer-user");
+    assert_eq!(peer.paths.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn unanswered_holder_fails() {
     let node = node_state().await;
