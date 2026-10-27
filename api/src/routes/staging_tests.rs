@@ -1023,7 +1023,7 @@ mod distributed {
         replicate(&node.state, node.group_id, BUCKET).await;
         store_connector(&node, true).await;
         let (seen, task) = coordinator(&node).await;
-        submit(&node, batch(&node, &["data/a.bin"], &[]))
+        let _ = submit(&node, batch(&node, &["data/a.bin"], &[]))
             .await
             .unwrap();
         task.abort();
