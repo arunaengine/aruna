@@ -251,6 +251,8 @@ async fn reads_object_refs() {
     let Ok(axum::Json(view)) = get_object_placement(
         State(state),
         Extension(Some(auth(owner))),
+        Extension(None),
+        axum::http::HeaderMap::new(),
         Path(BUCKET.to_string()),
         Query(ObjectPlacementQuery {
             key: KEY.to_string(),
@@ -282,6 +284,8 @@ async fn unknown_key_missing() {
     let error = get_object_placement(
         State(state),
         Extension(Some(auth(owner))),
+        Extension(None),
+        axum::http::HeaderMap::new(),
         Path(BUCKET.to_string()),
         Query(ObjectPlacementQuery {
             key: "raw/missing.fastq".to_string(),
@@ -303,6 +307,8 @@ async fn refuses_foreign_reader() {
     let error = get_object_placement(
         State(state),
         Extension(Some(auth(outsider))),
+        Extension(None),
+        axum::http::HeaderMap::new(),
         Path(BUCKET.to_string()),
         Query(ObjectPlacementQuery {
             key: KEY.to_string(),

@@ -481,6 +481,8 @@ async fn locations_require_read() {
     let denied = blob_locations(
         State(state.clone()),
         Extension(Some(auth_for(stranger, realm_id))),
+        Extension(None),
+        axum::http::HeaderMap::new(),
         locations_query(),
     )
     .await;
@@ -489,6 +491,8 @@ async fn locations_require_read() {
     let allowed = blob_locations(
         State(state),
         Extension(Some(auth_for(owner, realm_id))),
+        Extension(None),
+        axum::http::HeaderMap::new(),
         locations_query(),
     )
     .await;
@@ -507,6 +511,8 @@ async fn policy_denies_locations() {
     let denied = blob_locations(
         State(state),
         Extension(Some(auth_for(owner, realm_id))),
+        Extension(None),
+        axum::http::HeaderMap::new(),
         locations_query(),
     )
     .await;

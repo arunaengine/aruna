@@ -6,6 +6,7 @@
 use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
+use crate::routes::storage::relay::{query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
@@ -1116,7 +1117,8 @@ pub async fn put_bucket_placement(
 
 **Behavior**
 - This is a node-local read of the head this node stores: a version written on another node is
-  reported only once it has arrived here.
+  reported only once it has arrived here. A member of a distributed bucket that keeps no records
+  of the key's range relays the call to a holder with the caller's token.
 - `generation` is the head pointer's counter, which `POST /data/buckets/{bucket}/placement/objects`
   takes as `expected_generation`; `version_id` is what it takes as `expected_version_id`.
 - Every reference carries the `name` and `owner_group_id` this node resolved for its id, and null
@@ -1143,13 +1145,16 @@ pub async fn put_bucket_placement(
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the object", body = ErrorResponse),
-        (status = 404, description = "No bucket of that name is known to this node, or the key has no current version here", body = ErrorResponse)
+        (status = 404, description = "No bucket of that name is known to this node, or the key has no current version here", body = ErrorResponse),
+        (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_object_placement(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
     Path(bucket): Path<String>,
     Query(query): Query<ObjectPlacementQuery>,
 ) -> ServerResult<Json<ObjectPlacementView>> {
@@ -1168,6 +1173,13 @@ pub async fn get_object_placement(
         aruna_core::structs::identity::auth::Permission::READ,
     )
     .await?;
+    if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
+        let route = format!("/data/buckets/{bucket}/placement/objects");
+        let path = query_path(&route, &[("key", &query.key)]);
+        return relay_read(&state, &holders, &path, bearer.as_ref())
+            .await
+            .map(Json);
+    }
     let placement = drive(
         ObjectPlacementOperation::new(ObjectPlacementInput {
             bucket: bucket.clone(),

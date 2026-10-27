@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::storage::relay::{query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -10,6 +12,7 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CopyOrigin, bucket_permission_path, object_permission_path,
 };
 use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
+use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::replication::locations::{
     LocationSummaryError, LocationSummaryOperation, QueuedNodesOperation, QueuedReplicas,
@@ -25,7 +28,7 @@ use aruna_operations::replication::version_replication::{
 };
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -486,7 +489,10 @@ fn copy_response(
 **Behavior**
 - This node asks every destination that might hold a copy: the destinations a sync relationship
   maps this key to, the bucket's configured replication targets, the destinations with queued
-  replication work, and the nodes the durable holder index names for these bytes.
+  replication work, the nodes the durable holder index names for these bytes, and in a
+  distributed bucket the other members that keep the key's range.
+- A member of a distributed bucket that keeps no records of the key's range relays the call to
+  a holder with the caller's token, and returns the holder's answer.
 - One entry is returned per destination, so a node reached under two bucket-and-key pairs appears
   twice; copies are ordered local first, then by node, bucket and key.
 - Every answered copy carries the `origin` the holding node recorded when it registered the copy,
@@ -551,13 +557,16 @@ fn copy_response(
         (status = 400, description = "Malformed version id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the object", body = ErrorResponse),
-        (status = 404, description = "The bucket is unknown to this node, or the object has no such version", body = ErrorResponse)
+        (status = 404, description = "The bucket is unknown to this node, or the object has no such version", body = ErrorResponse),
+        (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn blob_locations(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: HeaderMap,
     Query(query): Query<BlobLocationsQuery>,
 ) -> ServerResult<Json<BlobLocationsResponse>> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
@@ -572,12 +581,13 @@ pub async fn blob_locations(
         .map(ulid::Ulid::from_string)
         .transpose()
         .map_err(|_| ServerError::BadRequest)?;
+    let info = load_bucket(&state, &query.bucket).await?;
     crate::auth::ensure_permission(
         &state,
         &auth,
         object_permission_path(
             state.get_realm_id(),
-            load_bucket(&state, &query.bucket).await?.group_id,
+            info.group_id,
             local_node,
             &query.bucket,
             &query.path,
@@ -585,6 +595,19 @@ pub async fn blob_locations(
         Permission::READ,
     )
     .await?;
+    if let Some(holders) = read_holders(&state, &info, &query.path, &headers).await? {
+        let mut pairs = vec![("bucket", query.bucket.as_str()), ("path", &query.path)];
+        pairs.extend(
+            query
+                .version_id
+                .as_deref()
+                .map(|version| ("version_id", version)),
+        );
+        let path = query_path("/data/blobs/locations", &pairs);
+        return relay_read(&state, &holders, &path, bearer.as_ref())
+            .await
+            .map(Json);
+    }
     let request = LocationSummaryRequest {
         realm_id: state.get_realm_id(),
         bucket: query.bucket.clone(),
@@ -671,6 +694,16 @@ pub async fn blob_locations(
         let destination = (*node_id, query.bucket.clone(), query.path.clone());
         expected.insert(destination.clone());
         capped |= !add_candidate(&mut candidates, destination);
+    }
+    // Members that keep the key's range hold its versions under the bucket's name.
+    if let Some(binding) = info.distribution.as_ref() {
+        for node_id in key_holders(&ctx, binding.set_id, &query.path).await {
+            if node_id != local_node {
+                let destination = (node_id, query.bucket.clone(), query.path.clone());
+                expected.insert(destination.clone());
+                capped |= !add_candidate(&mut candidates, destination);
+            }
+        }
     }
     // The holder index retains stored copies no longer present in configuration or the queue.
     match holder_nodes(&ctx, blake3, state.get_realm_id(), local_node).await {

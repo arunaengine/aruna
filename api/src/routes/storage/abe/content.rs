@@ -7,6 +7,7 @@ use crate::download::{self, AdmissionError};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::LocalKey;
 use crate::routes::execution::jobs::range_request;
+use crate::routes::storage::relay::relay_stream;
 use aruna_operations::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, read_object,
 };
@@ -36,7 +37,9 @@ fn read_error(error: GetObjectError) -> ServerError {
 
 **Behavior**
 - Binary fields use padded base64; version and request ids use ULIDs.
-- Encrypted versions without an envelope require bucket unlock."#,
+- Encrypted versions without an envelope require bucket unlock.
+- A member of a distributed bucket that keeps no records of the key's range streams the answer
+  of a holder, which it asks with the caller's token, range and object key."#,
     params(("bucket" = String, Query, description = "Node-local S3 bucket name"), ("key" = String, Query, description = "Literal object key"), ("version_id" = String, Query, description = "Pinned version ULID"),
         ("x-aruna-object-key" = Option<String>, Header, description = "Padded base64 of a 32-byte object private key, removed before tracing"),
         ("Range" = Option<String>, Header, description = "One HTTP bytes range")),
@@ -46,10 +49,11 @@ fn read_error(error: GetObjectError) -> ServerError {
         (status = 403, body = ErrorResponse, description = "READ refused or wrong object key"), (status = 404, body = ErrorResponse, description = "Version missing"),
         (status = 409, body = ErrorResponse, description = "Envelope pending or stale version"), (status = 416, body = ErrorResponse, description = "Range not satisfiable"),
         (status = 423, body = ErrorResponse, description = "Locked, object key required"),
-        (status = 503, body = ErrorResponse, description = "Download or storage unavailable")), security(("bearer_auth" = [])))]
+        (status = 503, body = ErrorResponse, description = "Download or storage unavailable, or no holder of the key's range answered")), security(("bearer_auth" = [])))]
 pub async fn content(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Extension(object): Extension<ObjectKey>,
     Query(query): Query<VersionQuery>,
     headers: HeaderMap,
@@ -57,6 +61,21 @@ pub async fn content(
     let auth = crate::auth::require_realm_auth(&state, auth)?;
     let (version, info) = authorize_version(&state, &auth, &query).await?;
     let private = object.0.map_err(|_| ServerError::BadRequest)?;
+    if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
+        let mut sent = HeaderMap::new();
+        if let Some(range) = headers.get(header::RANGE) {
+            sent.insert(header::RANGE, range.clone());
+        }
+        if let Some(private) = &private {
+            let encoded = zeroize::Zeroizing::new(STANDARD.encode(private.bytes().expose()));
+            let mut value =
+                http::HeaderValue::from_str(&encoded).map_err(|_| ServerError::BadRequest)?;
+            value.set_sensitive(true);
+            sent.insert("x-aruna-object-key", value);
+        }
+        let path = version_path("/data/blobs/content", &query);
+        return relay_stream(&state, &holders, &path, bearer.as_ref(), sent).await;
+    }
     let keyed = private.is_some();
     let range = range_request(&headers).map_err(|_| ServerError::BadRequest)?;
     let input = GetObjectInput {
