@@ -99,7 +99,9 @@ pub struct JobContext {
 /// One turn per distribution range, shared by every job on this node: page imports into one
 /// range commit one at a time instead of conflicting on the range's key sample.
 #[derive(Clone, Debug, Default)]
-pub struct RangeTurns(Arc<Mutex<HashMap<(Ulid, Ulid), Arc<tokio::sync::Mutex<()>>>>>);
+pub struct RangeTurns(Arc<Mutex<HashMap<(Ulid, Ulid), Turn>>>);
+
+type Turn = Arc<tokio::sync::Mutex<()>>;
 
 impl RangeTurns {
     /// Waits for the turns of `ranges`, keyed by set and range, in key order; they end when
