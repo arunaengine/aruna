@@ -19,10 +19,10 @@ use aruna_core::structs::storage::usage::{
     BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
     SUMMARY_GROUP_PREFIX, USAGE_COMPLETE_KEY, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX,
     USAGE_GROUP_PREFIX, USAGE_REBUILD_KEY, UsageCounterError, UsageCounters, UsageDelta,
-    dirty_group_id, dirty_group_key, global_group_key, global_shard_key, global_shard_keys,
-    shard_for_archive, shard_for_hash, usage_backend_key, usage_bucket_key, usage_global_key,
-    usage_group_id, usage_group_key, usage_group_prefix, usage_node_id, usage_snapshot_key,
-    usage_summary_key,
+    dirty_group_id, dirty_group_key, dirty_share_key, global_group_key, global_shard_key,
+    global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key, usage_bucket_key,
+    usage_global_key, usage_group_id, usage_group_key, usage_group_prefix, usage_node_id,
+    usage_snapshot_key, usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -313,10 +313,27 @@ impl UsageCounterUpdate {
             writes.push((
                 NODE_STATS_KEYSPACE.to_string(),
                 ByteView::from(dirty_group_key(group_id)),
-                generation,
+                generation.clone(),
             ));
+            // Only a removal can shrink this node's replica share; additions leave it deductible.
+            if self.shrinks(group_id) {
+                let key = ByteView::from(dirty_share_key(group_id));
+                writes.push((NODE_STATS_KEYSPACE.to_string(), key, generation));
+            }
         }
         writes
+    }
+
+    /// Whether the update lowers the group's logical bytes or removes a distributed version.
+    fn shrinks(&self, group_id: GroupId) -> bool {
+        let group = usage_group_key(group_id);
+        let lowers =
+            (self.entries.iter()).any(|(key, delta)| *key == group && delta.logical_bytes < 0);
+        lowers
+            || self
+                .inventory
+                .as_ref()
+                .is_some_and(InventoryUpdate::removes)
     }
 
     pub fn is_noop(&self) -> bool {
@@ -404,7 +421,7 @@ enum QuotaGatePhase {
     ReadRealmConfig,
     ReadLocal,
     ScanRemote,
-    /// Whether this node's own share is older than its live counters.
+    /// Whether this node's own share may have shrunk since its last publish.
     ReadDirty,
     Done,
 }
@@ -434,7 +451,7 @@ pub struct QuotaGate {
     usage: u64,
     /// The replicas' logical bytes in `usage`, from the other nodes' last published snapshots.
     replica_bytes: u64,
-    /// This node's own published share, deducted only while no later change awaits a publish.
+    /// This node's own published share, deducted only while nothing shrank it since.
     own_replicas: u64,
     count_replicas: bool,
     rebuilding: bool,
@@ -598,12 +615,12 @@ impl QuotaGate {
                 }
                 match next_start_after {
                     Some(start) => Ok(Some(self.scan_effect(Some(start), txn_id))),
-                    // The own share is older than the live counters while the group is dirty.
+                    // The own share may exceed the live copies once a removal shrank it.
                     None if !self.count_replicas && self.own_replicas > 0 => {
                         self.phase = QuotaGatePhase::ReadDirty;
                         Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
                             key_space: NODE_STATS_KEYSPACE.to_string(),
-                            key: Key::from(dirty_group_key(self.group_id)),
+                            key: Key::from(dirty_share_key(self.group_id)),
                             txn_id: Some(txn_id),
                         })]))
                     }
@@ -1524,11 +1541,10 @@ pub(crate) fn dirty_rows(groups: impl IntoIterator<Item = GroupId>) -> Vec<(Stri
         )
     };
     let mut rows = vec![marker(DIRTY_GLOBAL_KEY.to_vec())];
-    rows.extend(
-        groups
-            .into_iter()
-            .map(|group| marker(dirty_group_key(group))),
-    );
+    for group in groups {
+        rows.push(marker(dirty_group_key(group)));
+        rows.push(marker(dirty_share_key(group)));
+    }
     rows
 }
 
@@ -2493,7 +2509,7 @@ mod tests {
     }
 
     /// Drives a gate of a two-node realm: `live` local logical bytes, then each node's snapshot
-    /// as (counters, replicas), the local one first, and whether the group is dirty here.
+    /// as (counters, replicas), the local one first, and whether a removal shrank the share.
     fn run_gate(
         count_replicas: bool,
         (ceiling, delta): (u64, u64),
@@ -2542,7 +2558,15 @@ mod tests {
             values,
             next_start_after: None,
         });
-        if gate.step(scanned, txn_id).unwrap().is_some() {
+        if let Some(effects) = gate.step(scanned, txn_id).unwrap() {
+            let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
+                panic!("the gate reads one marker: {effects:?}");
+            };
+            assert_eq!(
+                key.as_ref(),
+                dirty_share_key(group_id),
+                "the share marker, not the group's"
+            );
             let marker = dirty.then(|| vec![1]);
             assert_eq!(gate.step(read(marker), txn_id).unwrap(), None);
         }
@@ -2550,7 +2574,7 @@ mod tests {
     }
 
     // Replicas count toward a quota only by the group's setting; the own snapshot adds its
-    // replica share, never its counters a second time, and no share while the group is dirty.
+    // replica share, never its counters a second time, and no share once a removal shrank it.
     #[test]
     fn gate_counts_replicas() {
         let cases = [(false, false, 61), (false, true, 101), (true, false, 151)];
@@ -2577,6 +2601,45 @@ mod tests {
             published.is_exceeded(),
             "after the publish the owner's bytes still count"
         );
+    }
+
+    // Steady additions keep a group dirty but never mark its share, so the gate keeps deducting
+    // it: with 100 B owned elsewhere and a 100 B local copy, a 150 B quota admits 1 B more.
+    #[test]
+    fn additions_keep_share() {
+        let group_id = Ulid::from_bytes([2; 16]);
+        let txn_id = Ulid::from_bytes([1; 16]);
+        let markers = |logical_bytes| {
+            let delta = UsageDelta {
+                logical_bytes,
+                ..Default::default()
+            };
+            let mut update = UsageCounterUpdate::for_group(group_id, delta);
+            update.start(txn_id);
+            let added = Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            });
+            let effects = update.step(added, txn_id).unwrap().unwrap();
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+            else {
+                panic!("the update writes its markers: {effects:?}");
+            };
+            writes
+                .iter()
+                .map(|(_, key, _)| key.to_vec())
+                .collect::<Vec<_>>()
+        };
+        let share = dirty_share_key(group_id);
+        assert!(markers(100).contains(&dirty_group_key(group_id)));
+        assert!(
+            !markers(100).contains(&share),
+            "an addition leaves the share deductible"
+        );
+        assert!(markers(-100).contains(&share), "a removal may shrink it");
+
+        let gate = run_gate(false, (150, 1), 100, [(100, 100), (100, 0)], false);
+        assert_eq!(gate.projected_usage(), 101);
+        assert!(!gate.is_exceeded());
     }
 
     // Realm totals leave out the copies of distributed ranges, the own node's included, while

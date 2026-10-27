@@ -204,6 +204,11 @@ impl InventoryUpdate {
         }
     }
 
+    /// Whether a queued change removes a version.
+    pub fn removes(&self) -> bool {
+        self.queued.iter().any(|change| !change.removed.is_empty())
+    }
+
     /// Adds the change of another key before the update starts.
     pub fn push(&mut self, change: InventoryChange) {
         self.queued.push_back(change);

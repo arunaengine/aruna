@@ -28,6 +28,8 @@ pub const USAGE_GROUP_PREFIX: &[u8] = b"g/";
 pub const DIRTY_PREFIX: &[u8] = b"dirty/";
 pub const DIRTY_GLOBAL_KEY: &[u8] = b"dirty/global";
 pub const DIRTY_GROUP_PREFIX: &[u8] = b"dirty/group/";
+/// Marks a group whose replica share on this node may have shrunk since its last publish.
+pub const DIRTY_SHARE_PREFIX: &[u8] = b"dirty/share/";
 pub const SUMMARY_GLOBAL_KEY: &[u8] = b"summary/global";
 pub const SUMMARY_GROUP_PREFIX: &[u8] = b"summary/group/";
 /// Marker row of a running usage rebuild; while it exists the live counters are incomplete.
@@ -145,6 +147,10 @@ pub fn dirty_group_key(group_id: GroupId) -> Vec<u8> {
     key.extend_from_slice(DIRTY_GROUP_PREFIX);
     key.extend_from_slice(&group_id.to_bytes());
     key
+}
+
+pub fn dirty_share_key(group_id: GroupId) -> Vec<u8> {
+    [DIRTY_SHARE_PREFIX, &group_id.to_bytes()].concat()
 }
 
 /// Recovers the group id from a `dirty/group/<ulid>` marker key.
