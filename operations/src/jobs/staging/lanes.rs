@@ -376,6 +376,8 @@ mod tests {
         PageImportError, PageImportInput, PageImportOperation, PageImportResult,
     };
     use aruna_core::structs::execution::job::{StagingJobError, StagingJobPrefix};
+    use std::collections::BTreeSet;
+    use ulid::Ulid;
 
     /// A connector endpoint the tests never reach.
     const UNUSED: &str = "http://127.0.0.1:9";
@@ -714,6 +716,210 @@ mod tests {
 
         assert_eq!(runs, 2);
         assert_eq!(result.err(), Some(PageImportError::ClaimLost));
+    }
+
+    /// Runs `input` through the retry in the turns of `ranges`; every run asserts that no other
+    /// run is inside a transaction at the same time.
+    async fn counted(
+        ctx: &JobContext,
+        input: PageImportInput,
+        ranges: &BTreeSet<(Ulid, Ulid)>,
+        inside: &AtomicBool,
+    ) -> (usize, Result<PageImportResult, PageImportError>) {
+        use crate::driver::drive;
+        let mut runs = 0;
+        let result = retry_page(ctx, (input, ranges), |input| {
+            runs += 1;
+            async move {
+                assert!(!inside.swap(true, Ordering::SeqCst), "two pages overlapped");
+                let result = drive(PageImportOperation::new(input), &ctx.driver).await;
+                inside.store(false, Ordering::SeqCst);
+                result
+            }
+        })
+        .await;
+        (runs, result)
+    }
+
+    // Pages of two jobs into one range with a full key sample take turns, so neither page
+    // conflicts on the sample entries both would evict.
+    #[tokio::test]
+    async fn jobs_share_turn() {
+        let prefixes = [("a", "ta"), ("b", "tb")];
+        let (ctx, spec, _dir) = job_context(UNUSED.to_string(), &prefixes, None).await;
+        let ranges = BTreeSet::from([distribute(&ctx, &spec).await]);
+        let other = second_job(&ctx, &spec).await;
+        let first = page_input(&ctx, &spec).await;
+        let mut second = page_input(&other, &spec).await;
+        for entry in &mut second.entries {
+            entry.source_path = entry.source_path.replace("a/", "b/");
+            entry.target_key = entry.target_key.replace("ta/", "tb/");
+        }
+
+        let inside = AtomicBool::new(false);
+        let (first, second) = tokio::join!(
+            counted(&ctx, first, &ranges, &inside),
+            counted(&other, second, &ranges, &inside),
+        );
+
+        assert_eq!((first.0, second.0), (1, 1), "no page conflicted");
+        assert_eq!(first.1.ok().map(|result| result.registered), Some(2));
+        assert_eq!(second.1.ok().map(|result| result.registered), Some(2));
+    }
+
+    // Pages of two jobs into different ranges run at the same time.
+    #[tokio::test]
+    async fn ranges_run_apart() {
+        let (ctx, spec, _dir) = job_context(UNUSED.to_string(), &[("a", "ta")], None).await;
+        let other = second_job(&ctx, &spec).await;
+        let barrier = tokio::sync::Barrier::new(2);
+        let page = |ctx, seed| {
+            let ranges =
+                BTreeSet::from([(Ulid::from_bytes([3; 16]), Ulid::from_bytes([seed; 16]))]);
+            let (barrier, spec) = (&barrier, &spec);
+            async move {
+                let input = page_input(ctx, spec).await;
+                // Each run returns only once the other page runs too.
+                let run = |_| async {
+                    barrier.wait().await;
+                    Err(PageImportError::ClaimLost)
+                };
+                retry_page(ctx, (input, &ranges), run).await
+            }
+        };
+
+        let both = async { tokio::join!(page(&ctx, 1), page(&other, 2)) };
+        // A generous cap turns a lost turn into a failure instead of a hang.
+        let ran = tokio::time::timeout(std::time::Duration::from_secs(120), both).await;
+
+        let (first, second) = ran.expect("both pages ran at once");
+        assert_eq!(first.err(), Some(PageImportError::ClaimLost));
+        assert_eq!(second.err(), Some(PageImportError::ClaimLost));
+    }
+
+    // A page waiting for its range's turn checks every guard once it runs: a claim lost while
+    // it waited stops it.
+    #[tokio::test]
+    async fn waiting_rechecks_guards() {
+        use crate::driver::drive;
+        use crate::jobs::store::ClaimGuard;
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::JOB_CLAIM_KEYSPACE;
+        use aruna_core::structs::execution::job::job_record_key;
+        let (ctx, spec, _dir) = job_context(UNUSED.to_string(), &[("a", "ta")], None).await;
+        let input = page_input(&ctx, &spec).await;
+        let ranges = BTreeSet::from([(Ulid::from_bytes([3; 16]), Ulid::from_bytes([1; 16]))]);
+        let held = ctx.range_turns.take(&ranges).await;
+        let key = job_record_key(ctx.job_id).to_vec();
+        let claim = stored(&ctx, JOB_CLAIM_KEYSPACE, key.clone()).await;
+        let mut claim = ClaimGuard::from_bytes(&claim).unwrap();
+        claim.claim_token = Ulid::from_bytes([8; 16]);
+
+        let mut runs = 0;
+        let page = retry_page(&ctx, (input, &ranges), |input| {
+            runs += 1;
+            drive(PageImportOperation::new(input), &ctx.driver)
+        });
+        // The page is polled first, so it waits for the turn while the claim changes.
+        let lose = async {
+            let write = StorageEffect::Write {
+                key_space: JOB_CLAIM_KEYSPACE.to_string(),
+                key: key.into(),
+                value: ByteView::from(claim.to_bytes().unwrap()),
+                txn_id: None,
+            };
+            ctx.driver.storage_handle.send_storage_effect(write).await;
+            drop(held);
+        };
+        let (result, ()) = tokio::join!(page, lose);
+
+        assert_eq!(runs, 1);
+        assert_eq!(result.err(), Some(PageImportError::ClaimLost));
+    }
+
+    /// A second claimed job of `spec` on the node of `ctx`, sharing its storage and turns.
+    async fn second_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobContext {
+        use crate::jobs::executor::ProgressReporter;
+        use aruna_core::structs::execution::job::{JobClaim, JobPayload, JobProgress, JobRecord};
+        use tokio_util::sync::CancellationToken;
+        let (job_id, claim_token) = (JobId::from_bytes([9; 16]), Ulid::from_bytes([5; 16]));
+        let payload = JobPayload::Staging(spec.clone());
+        let owner = spec.auth_context.user_id;
+        let mut record = JobRecord::new(job_id, payload, owner, spec.node_id, 1, 1, None);
+        record.claim = Some(JobClaim {
+            holder_node_id: spec.node_id,
+            claim_token,
+            lease_expires_ms: u64::MAX,
+        });
+        crate::jobs::store::insert_job(&ctx.driver.storage_handle, &record)
+            .await
+            .unwrap();
+        JobContext {
+            driver: ctx.driver.clone(),
+            job_id,
+            owner_node_id: spec.node_id,
+            claim_token,
+            final_attempt: false,
+            cancel: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
+            progress: ProgressReporter::from_progress(&JobProgress::new("items")),
+            range_turns: ctx.range_turns.clone(),
+        }
+    }
+
+    /// Makes the job's bucket distributed, in one range this node coordinates with a full key
+    /// sample whose largest entry every new key evicts; returns the set and range.
+    async fn distribute(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
+        use crate::distribution::test_record::{binding, record, store_record};
+        use crate::distribution::test_store::{begin, commit, install, range};
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::{
+            KEY_SAMPLE_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
+        };
+        use aruna_core::structs::storage::distribution::accounting::{
+            RangeCounters, SAMPLE_SIZE, SampleEntry, sample_count_key,
+        };
+        let handle = &ctx.driver.storage_handle;
+        let (snapshot, bytes) = record(true);
+        let set_id = snapshot.set_id();
+        store_record(handle, set_id, bytes).await;
+        let mut bucket = super::super::pinned_bucket(ctx, spec).await.ok().unwrap();
+        bucket.distribution = Some(binding(&snapshot, 2, 5));
+        let range_id = Ulid::from_bytes([1; 16]);
+        install(handle, set_id, &[range(1, "", None)]).await;
+        let full = RangeCounters {
+            sampled: i128::from(SAMPLE_SIZE),
+            ..RangeCounters::default()
+        };
+        let largest = SampleEntry {
+            priority: u64::MAX,
+            key: "largest".to_string(),
+        };
+        let txn_id = begin(handle).await;
+        let effects = [
+            StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: spec.bucket.as_bytes().to_vec().into(),
+                value: bucket.to_bytes().unwrap().into(),
+                txn_id: Some(txn_id),
+            },
+            StorageEffect::AddCounters {
+                key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+                deltas: vec![(sample_count_key(set_id, range_id).into(), full)],
+                txn_id,
+            },
+            StorageEffect::Write {
+                key_space: KEY_SAMPLE_KEYSPACE.to_string(),
+                key: largest.row_key(set_id, range_id).into(),
+                value: Vec::new().into(),
+                txn_id: Some(txn_id),
+            },
+        ];
+        for effect in effects {
+            handle.send_storage_effect(effect).await;
+        }
+        assert!(commit(handle, txn_id).await);
+        (set_id, range_id)
     }
 
     /// A claimed reference import of `prefixes`, source and target, from a connector at
