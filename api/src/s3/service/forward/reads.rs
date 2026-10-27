@@ -34,6 +34,8 @@ use crate::s3::service::ArunaS3Service;
 
 /// How long an anonymous caller's stand-in credential lasts; the delegation is shorter.
 const ANONYMOUS_SECS: u64 = 60;
+/// How long a holder may take to start its answer; the body then streams without a bound.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Marks an answer a copy gave for ranges whose coordinator could not answer; it may be behind.
 pub(in crate::s3::service) const STALE_HEADER: &str = "x-aruna-stale";
@@ -205,6 +207,17 @@ pub(in crate::s3::service) fn anonymous_window(user: &UserAccess) -> UserAccess 
     user
 }
 
+/// The holder's answer, or the holder as unreachable when it does not start answering in time.
+async fn answer_within(
+    forward: &Forward,
+    answer: impl Future<Output = S3Result<reqwest::Response>>,
+) -> S3Result<reqwest::Response> {
+    match tokio::time::timeout(ANSWER_TIMEOUT, answer).await {
+        Ok(answer) => answer,
+        Err(_) => Err(super::unreachable_error(forward, "not answering in time")),
+    }
+}
+
 impl ArunaS3Service {
     /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, or `None` when
     /// this member answers it. Only a `pinned` version may come from a copy: a copy may lag
@@ -371,7 +384,7 @@ impl ArunaS3Service {
         request: ForwardRequest,
     ) -> S3Result<reqwest::Response> {
         let user = anonymous_window(user);
-        let result = self.forward_write(&user, forward, request).await;
+        let result = answer_within(forward, self.forward_write(&user, forward, request)).await;
         if let Err(error) = &result
             && error
                 .status_code()
@@ -404,6 +417,21 @@ mod tests {
             .body("abc")
             .unwrap();
         reqwest::Response::from(response)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_holder_unreachable() {
+        let forward = Forward {
+            set_id: Ulid::nil(),
+            range_id: Ulid::nil(),
+            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+        };
+        let error = answer_within(&forward, std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(unreachable(&error));
+        let answer = answer_within(&forward, async { Ok(holder_answer(200)) }).await;
+        assert_eq!(answer.unwrap().status(), 200);
     }
 
     #[test]

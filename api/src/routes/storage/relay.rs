@@ -31,6 +31,8 @@ use crate::server::state::ServerState;
 
 const API_PREFIX: &str = "/api/v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a holder may take to start its answer; the body then streams without a bound.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// The distributed bucket a relayed request is meant for; its target refuses another bucket.
 pub(crate) const RELAY_SET_HEADER: &str = "x-aruna-relay-set";
 /// Bytes of a node's answer read at most; a longer answer fails instead of filling memory.
@@ -390,11 +392,17 @@ async fn send_get(
         .header(header::AUTHORIZATION, format!("Bearer {}", bearer.as_str()))
         .header(RELAY_HOP_HEADER, state.get_node_id().to_string())
         .header(RELAY_SET_HEADER, forward.set_id.to_string())
-        .send()
-        .await;
-    match response {
-        Ok(response) => Ok(Some(response)),
-        Err(error) => {
+        .send();
+    match tokio::time::timeout(ANSWER_TIMEOUT, response).await {
+        Ok(Ok(response)) => Ok(Some(response)),
+        Err(_) => {
+            warn!(
+                node_id = %forward.node_id,
+                "A distributed bucket holder did not start answering a relayed read in time"
+            );
+            Ok(None)
+        }
+        Ok(Err(error)) => {
             warn!(
                 node_id = %forward.node_id,
                 connect = error.is_connect(),
