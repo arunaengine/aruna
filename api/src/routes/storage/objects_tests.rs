@@ -245,6 +245,38 @@ async fn start_after_resumes() {
     assert_eq!(keys(&page), vec!["b.md", "c.md", "x.md"]);
 }
 
+// A start key on or inside a common prefix skips the whole prefix, here and in later ranges.
+#[tokio::test]
+async fn start_after_groups() {
+    let node = node_state().await;
+    store(&node, &["a/a/x", "a/b/x"]).await;
+    for start in ["a/a/", "a/a/x"] {
+        let mut after = query(Some("a/"), None, 10);
+        after.start_after = Some(start.to_string());
+        let page = list(&node, &node.owner, HeaderMap::new(), after)
+            .await
+            .unwrap();
+        assert_eq!(page.prefixes, vec!["a/b/".to_string()], "{start}");
+    }
+    distribute(&node.state, node.group_id, BUCKET).await;
+    let answer = r#"{"bucket":"routed","objects":[],"prefixes":["y/","z/"],"next_cursor":null}"#;
+    let peer = mock_peer(StatusCode::OK, answer).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let mut after = query(None, None, 10);
+    after.start_after = Some("a/a/x".to_string());
+    let page = list(&node, &node.owner, HeaderMap::new(), after.clone())
+        .await
+        .unwrap();
+    assert_eq!(page.prefixes, vec!["y/".to_string(), "z/".into()]);
+    // In the peer's range the prefix it names is not listed again.
+    after.start_after = Some("y/q".to_string());
+    let page = list(&node, &node.owner, HeaderMap::new(), after)
+        .await
+        .unwrap();
+    assert_eq!(page.prefixes, vec!["z/".to_string()]);
+    assert!(peer.paths.lock().unwrap()[1].contains("cursor="));
+}
+
 #[tokio::test]
 async fn unanswered_range_fails() {
     let node = node_state().await;

@@ -13,6 +13,7 @@ use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use aruna_operations::auth::permission_rules::permission_rules;
 use aruna_operations::distribution::guard::{bound_view, lists_interval, local_fence};
 use aruna_operations::driver::drive;
+use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
@@ -464,9 +465,16 @@ pub async fn list_objects(
         None => bucket_permission_path(realm_id, info.group_id, node_id, &bucket),
     };
     ensure_permission(&state, &auth, path, Permission::READ).await?;
-    // A start key resumes like a cursor after that key.
+    // A start key resumes like a cursor after that key, past the whole common prefix it names.
     let start = (query.start_after.clone().filter(|key| !key.is_empty()))
-        .map(|key| encode_resume(&Resume::After { key, group: None }))
+        .map(|key| {
+            let (prefix, delimiter) = (query.prefix.as_deref(), query.delimiter.as_deref());
+            let group = (key.starts_with(prefix.unwrap_or_default()))
+                .then(|| common_prefix_of(&key, prefix, delimiter))
+                .flatten();
+            let key = group.clone().unwrap_or(key);
+            encode_resume(&Resume::After { key, group })
+        })
         .transpose()?;
     let request = ListRequest {
         bucket,
