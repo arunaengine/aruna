@@ -271,13 +271,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let stale = sessions::stale_sessions(&db, &session_rows, &expiry_rows, &owner_rows)?;
     let old_uploads = uploads::stale_uploads(&db, &upload_rows, &part_rows)?;
     let (versions, roots) = versions::compact_rows(&db, &version_rows, BLOB_VERSIONS_KEYSPACE)?;
-    let references = versions::reference_rows(
-        &db,
-        &version_rows,
-        &versions.rows,
-        &reference_rows,
-        BLOB_VERSIONS_KEYSPACE,
-    )?;
+    let references =
+        versions::reference_rows(&db, &versions.rows, &reference_rows, BLOB_VERSIONS_KEYSPACE)?;
     let buckets = rewrite_rows(&db, &bucket_rows, S3_BUCKET_KEYSPACE, |value| {
         relaid::<BucketInfo, buckets::LegacyBucket>(value, buckets::LAYOUT)
     })?;

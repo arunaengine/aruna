@@ -157,43 +157,38 @@ pub(super) fn broken_version(value: &[u8]) -> Result<Option<Vec<u8>>, postcard::
     Ok(Some(postcard::to_allocvec(&broken)?))
 }
 
-/// Connector reference rows missing for reference versions, reading `rewrites` over the stored
-/// rows. References from before the index have none, so connector checks would miss them.
+/// Connector reference rows missing for reference versions in `rewrites`. Rows already in the
+/// current shape were written with their index row; older ones may predate the index.
 pub(super) fn reference_rows(
     db: &OptimisticTxDatabase,
-    versions: &OptimisticTxKeyspace,
     rewrites: &[(Vec<u8>, Vec<u8>)],
     index: &OptimisticTxKeyspace,
     name: &str,
 ) -> Result<Rewrites, ExplorerError> {
-    let rewrites: BTreeMap<&[u8], &[u8]> = rewrites
-        .iter()
-        .map(|(key, value)| (key.as_slice(), value.as_slice()))
-        .collect();
     let read = db.read_tx();
-    let (mut scanned, mut rows) = (0, Vec::new());
-    for entry in read.iter(versions) {
-        let (key, stored) = entry.into_inner()?;
-        scanned += 1;
-        let value = rewrites.get(key.as_ref()).copied().unwrap_or(&stored);
+    let mut rows = Vec::new();
+    for (key, value) in rewrites {
         let version =
-            BlobVersion::from_bytes(value).map_err(|error| decode_error(name, &key, error))?;
+            BlobVersion::from_bytes(value).map_err(|error| decode_error(name, key, error))?;
         let BlobVersionState::Reference { source, .. } = &version.state else {
             continue;
         };
         if source.connector_id.is_none() {
             continue;
         }
-        let row = VersionKey::from_bytes(&key)
+        let row = VersionKey::from_bytes(key)
             .and_then(|version_key| connector_reference_write(&version, &version_key));
-        let Some((_, row, value)) = row.map_err(|error| decode_error(name, &key, error))? else {
+        let Some((_, row, value)) = row.map_err(|error| decode_error(name, key, error))? else {
             continue;
         };
         if read.get(index, row.as_ref())?.is_none() {
             rows.push((row.to_vec(), value.to_vec()));
         }
     }
-    Ok(Rewrites { scanned, rows })
+    Ok(Rewrites {
+        scanned: rewrites.len(),
+        rows,
+    })
 }
 
 #[cfg(test)]
@@ -400,7 +395,8 @@ mod tests {
 
     #[test]
     fn indexes_connector_references() {
-        // A reference bound to a connector, stored before the reference index existed.
+        // A reference bound to a connector, stored before bindings named their root and so
+        // possibly before the reference index existed.
         let connector_id = ulid::Ulid::from_bytes([6; 16]);
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
@@ -431,7 +427,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary directory");
         let path = temp.path().join("db");
         let database = path.to_str().expect("path");
-        let value = reference.to_bytes().expect("encodes");
+        let current = reference.to_bytes().expect("encodes");
+        let descriptor = &reference.source_binding().expect("bound").descriptor;
+        let descriptor = postcard::to_allocvec(descriptor).expect("encodes");
+        let value = strip(&current, &descriptor, 1);
         write(&path, BLOB_VERSIONS_KEYSPACE, vec![(key.as_slice(), value)]);
 
         let output = migrate_output(database).expect("migration runs");
@@ -442,5 +441,99 @@ mod tests {
         assert!(rows.contains_key(&row));
         let again = migrate_output(database).expect("migration repeats");
         assert_eq!(again.connector_references_written, 0);
+    }
+
+    /// A compact reference to a public S3 source bound to a connector, as an import stores it.
+    fn imported(path: &str) -> BlobVersion {
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::S3,
+                public_config: HashMap::from([
+                    ("bucket".to_string(), "bakrep".to_string()),
+                    ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                ]),
+                source_path: path.to_string(),
+                version_selector: None,
+                capabilities: vec!["head".to_string(), "read".to_string()],
+                origin_node_id: None,
+                namespace: None,
+                root: None,
+            },
+            connector_id: Some(ulid::Ulid::from_bytes([6; 16])),
+        };
+        let metadata = SourceMetadata {
+            content_length: 1234,
+            content_type: None,
+            etag: Some("etag".to_string()),
+            last_modified: None,
+            source_version: None,
+            digests: BTreeMap::new(),
+        };
+        let now = SystemTime::UNIX_EPOCH;
+        let version = BlobVersion::reference(source, metadata, now, UserId::default(), now);
+        compact_version(version).expect("compacts").0
+    }
+
+    /// Writes `count` imported references with their connector index and head rows.
+    fn write_imported(path: &std::path::Path, count: usize) {
+        use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
+        use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
+        use fjall::KeyspaceCreateOptions;
+        let db = fjall::OptimisticTxDatabase::builder(path).open().unwrap();
+        let open = |name| db.keyspace(name, KeyspaceCreateOptions::default).unwrap();
+        let versions = open(BLOB_VERSIONS_KEYSPACE);
+        let index = open(CONNECTOR_REFERENCE_KEYSPACE);
+        let heads = open(BLOB_HEAD_KEYSPACE);
+        for chunk in (0..count).collect::<Vec<_>>().chunks(50_000) {
+            let mut txn = db.write_tx().unwrap();
+            for &at in chunk {
+                let name = format!("genomes/{at:09}.gff");
+                let id = ulid::Ulid::from_parts(at as u64, 7);
+                let version = imported(&name);
+                let key = VersionKey::new("bucket", &name, id);
+                let (_, row, _) = connector_reference_write(&version, &key).unwrap().unwrap();
+                txn.insert(&index, row.to_vec(), b"");
+                let value = version.to_bytes().unwrap();
+                txn.insert(&versions, key.to_bytes().unwrap(), value);
+                let head = BlobHeadKey::new("bucket", &name).to_bytes().unwrap();
+                let pointer = CurrentVersionPointer::new(id).to_bytes().unwrap();
+                txn.insert(&heads, head, pointer);
+            }
+            txn.commit().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn keeps_current_rows() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        write_imported(&path, 3);
+        let before = read(&path, BLOB_VERSIONS_KEYSPACE);
+
+        let output = migrate_output(path.to_str().expect("path")).expect("migration runs");
+
+        assert_eq!((output.versions_scanned, output.versions_rewritten), (3, 0));
+        assert_eq!(output.connector_references_written, 0);
+        assert!(output.relaid_rows.is_empty());
+        assert_eq!(read(&path, BLOB_VERSIONS_KEYSPACE), before);
+    }
+
+    /// Times a migration over current rows; `MIGRATE_ROWS` sets the count, `TMPDIR` the disk.
+    #[test]
+    #[ignore = "measurement"]
+    fn current_rows_timing() {
+        let count = std::env::var("MIGRATE_ROWS").map_or(2_000_000, |rows| rows.parse().unwrap());
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let started = std::time::Instant::now();
+        write_imported(&path, count);
+        eprintln!("wrote {count} rows in {:?}", started.elapsed());
+
+        let started = std::time::Instant::now();
+        let output = migrate_output(path.to_str().expect("path")).expect("migration runs");
+
+        eprintln!("migrated {count} rows in {:?}", started.elapsed());
+        assert_eq!(output.versions_rewritten, 0);
     }
 }
