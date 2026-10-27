@@ -823,6 +823,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::ConfigComputeSet { .. }
             | AdminDocumentOperation::ConfigFederationSet { .. }
             | AdminDocumentOperation::ConfigPortalSet { .. }
+            | AdminDocumentOperation::ConfigReplicasSet { .. }
             | AdminDocumentOperation::DatabaseSet { .. }
             | AdminDocumentOperation::DatabaseRemoved { .. }
             | AdminDocumentOperation::ConfigTokenRevoked { .. }

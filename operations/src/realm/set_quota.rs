@@ -11,12 +11,14 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_QUOTA_PATH};
+use aruna_core::reducer::{
+    AdminDocumentError, AdminDocumentState, CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH,
+};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument};
+use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, ReplicaQuota};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -38,6 +40,8 @@ pub struct SetQuotaConfig {
     /// restricted; it is never derived from `actor`.
     pub auth_context: AuthContext,
     pub quota: QuotaConfig,
+    /// Whether replicas count toward group quotas, published as its own operation.
+    pub replicas: ReplicaQuota,
 }
 
 #[derive(Debug, PartialEq)]
@@ -183,6 +187,12 @@ impl SetQuotaOperation {
                 quota: self.config.quota.clone(),
             },
         )?;
+        let replicas_event = reducer_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::ConfigReplicasSet {
+                replicas: self.config.replicas.clone(),
+            },
+        )?;
         // Materialized reducer state keeps local and replicated quota conflict outcomes equal.
         apply_reducer_quota(&mut document, &reducer_state);
 
@@ -198,16 +208,18 @@ impl SetQuotaOperation {
             ),
             reducer_state_entry(&reducer_state)?,
         ];
-        let record = new_identified_record(
-            admin_event.event_id,
-            self.config.actor.node_id,
-            document_target,
-            Vec::new(),
-            DocumentOutboxEvent::admin(admin_event),
-            placement,
-            false,
-        );
-        writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        for event in [admin_event, replicas_event] {
+            let record = new_identified_record(
+                event.event_id,
+                self.config.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentOutboxEvent::admin(event),
+                placement,
+                false,
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
@@ -401,6 +413,11 @@ fn apply_reducer_quota(document: &mut RealmConfigDocument, reducer_state: &Admin
     {
         document.quota = quota;
     }
+    if !reducer_state.conflicts.contains_key(CONFIG_REPLICAS_PATH)
+        && let Some(replicas) = reducer_state.materialized_realm_replicas()
+    {
+        document.replica_quota = replicas;
+    }
 }
 
 fn validate_quota(quota: &QuotaConfig) -> Result<(), SetQuotaError> {
@@ -522,6 +539,7 @@ mod tests {
             actor: actor.clone(),
             auth_context: auth(actor),
             quota,
+            replicas: ReplicaQuota::default(),
         }
     }
 
@@ -604,18 +622,23 @@ mod tests {
         seed_realm_admin(&ctx, &actor).await;
 
         let quota = custom_quota();
-        let stored = drive(
-            SetQuotaOperation::new(quota_config(&actor, quota.clone())),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let replicas = ReplicaQuota {
+            count: true,
+            groups: [(Ulid::from_bytes([7; 16]), false)].into(),
+        };
+        let config = SetQuotaConfig {
+            replicas: replicas.clone(),
+            ..quota_config(&actor, quota.clone())
+        };
+        let stored = drive(SetQuotaOperation::new(config), &ctx).await.unwrap();
         assert_eq!(stored.quota, quota);
+        assert_eq!(stored.replica_quota, replicas);
 
         let reread = drive(GetConfigOperation::new(realm_id), &ctx)
             .await
             .unwrap();
         assert_eq!(reread.quota, quota);
+        assert_eq!(reread.replica_quota, replicas);
         assert_eq!(reread.quota.devices_per_user, Some(4));
         assert_eq!(reread.quota.device_request_rate, Some(600));
         assert_eq!(reread.quota.device_concurrent_pulls, Some(8));

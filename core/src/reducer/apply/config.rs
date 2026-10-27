@@ -55,6 +55,10 @@ impl AdminDocumentState {
             AdminDocumentOperation::ConfigPortalSet { features } => {
                 self.apply_config_setting(event, CONFIG_PORTAL_PATH, portal_value(features));
             }
+            AdminDocumentOperation::ConfigReplicasSet { replicas } => {
+                let value = replicas_value(replicas);
+                self.apply_config_setting(event, CONFIG_REPLICAS_PATH, value);
+            }
             AdminDocumentOperation::DatabaseSet {
                 entry,
                 predecessor,

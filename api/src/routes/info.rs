@@ -14,7 +14,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind, ReplicaQuota};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::placement::record::PlacementScope;
 use aruna_core::structs::storage::blob::BackendRef;
@@ -28,7 +28,7 @@ use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use aruna_operations::node::status::load_status;
-use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsageScope};
+use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
 };
@@ -344,6 +344,10 @@ pub struct RealmQuotaConfig {
     #[serde(rename = "device_requests_per_minute")]
     pub device_request_rate: Option<u32>,
     pub device_concurrent_pulls: Option<u32>,
+    /// Whether copies of a distributed range besides its coordinator's count toward group
+    /// quotas; `false` when omitted. References never count.
+    #[serde(default)]
+    pub count_replicas: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -352,6 +356,9 @@ pub struct RealmQuotaOverride {
     pub group_id: String,
     pub quota_bytes: Option<u64>,
     pub grace_factor_percent: Option<u32>,
+    /// Overrides the realm's `count_replicas` for this group; omitted keeps it.
+    #[serde(default)]
+    pub count_replicas: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -374,6 +381,7 @@ impl From<QuotaConfig> for RealmQuotaConfig {
                     group_id: over.group_id.to_string(),
                     quota_bytes: over.quota_bytes,
                     grace_factor_percent: over.grace_factor_percent,
+                    count_replicas: None,
                 })
                 .collect(),
             groups_per_user: quota.groups_per_user,
@@ -388,23 +396,42 @@ impl From<QuotaConfig> for RealmQuotaConfig {
             devices_per_user: quota.devices_per_user,
             device_request_rate: quota.device_request_rate,
             device_concurrent_pulls: quota.device_concurrent_pulls,
+            count_replicas: false,
         }
     }
 }
 
 impl RealmQuotaConfig {
-    fn into_quota_config(self) -> ServerResult<QuotaConfig> {
+    /// Adds the stored replica setting, a group's beside its quota override.
+    fn with_replicas(mut self, replicas: &ReplicaQuota) -> Self {
+        self.count_replicas = replicas.count;
+        for over in &mut self.group_overrides {
+            let group_id = Ulid::from_string(&over.group_id).ok();
+            over.count_replicas = group_id.and_then(|id| replicas.groups.get(&id).copied());
+        }
+        self
+    }
+
+    fn into_quota_config(self) -> ServerResult<(QuotaConfig, ReplicaQuota)> {
+        let mut replicas = ReplicaQuota {
+            count: self.count_replicas,
+            groups: Default::default(),
+        };
         let group_overrides = self
             .group_overrides
             .into_iter()
             .map(|over| {
+                let group_id = Ulid::from_string(&over.group_id).map_err(|_| {
+                    ServerError::BadRequestReason(format!(
+                        "invalid group id in group_overrides: {}",
+                        over.group_id
+                    ))
+                })?;
+                if let Some(count) = over.count_replicas {
+                    replicas.groups.insert(group_id, count);
+                }
                 Ok(GroupQuotaOverride {
-                    group_id: Ulid::from_string(&over.group_id).map_err(|_| {
-                        ServerError::BadRequestReason(format!(
-                            "invalid group id in group_overrides: {}",
-                            over.group_id
-                        ))
-                    })?,
+                    group_id,
                     quota_bytes: over.quota_bytes,
                     grace_factor_percent: over.grace_factor_percent,
                 })
@@ -425,7 +452,7 @@ impl RealmQuotaConfig {
                 })
             })
             .collect::<ServerResult<Vec<_>>>()?;
-        Ok(QuotaConfig {
+        let quota = QuotaConfig {
             default_quota_bytes: self.default_quota_bytes,
             grace_factor_percent: self.grace_factor_percent,
             warn_threshold_percent: self.warn_threshold_percent,
@@ -435,7 +462,8 @@ impl RealmQuotaConfig {
             devices_per_user: self.devices_per_user,
             device_request_rate: self.device_request_rate,
             device_concurrent_pulls: self.device_concurrent_pulls,
-        })
+        };
+        Ok((quota, replicas))
     }
 }
 
@@ -1166,7 +1194,8 @@ token of another realm or one this node cannot validate, the response is the pub
                             "user_group_cap_overrides": [],
                             "max_devices_per_user": 5,
                             "device_requests_per_minute": 600,
-                            "device_concurrent_pulls": 8
+                            "device_concurrent_pulls": 8,
+                            "count_replicas": false
                         },
                         "interfaces": {
                             "rest": {"status": "available", "bind": "0.0.0.0:3000", "url": "https://node.example.test/api/v1"},
@@ -1265,7 +1294,7 @@ pub(crate) async fn run_realm_info(
         (
             Some(discovery),
             nodes,
-            Some(RealmQuotaConfig::from(config.quota.clone())),
+            Some(RealmQuotaConfig::from(config.quota.clone()).with_replicas(&config.replica_quota)),
         )
     } else {
         (None, Vec::new(), None)
@@ -1807,8 +1836,8 @@ management node serves the call and every other node relays it to one.
 - `default_group_quota_bytes` is the pre-grace allowance per group and null means unlimited;
   `grace_factor_percent` scales it into the hard ceiling a write is refused at, while
   `warn_threshold_percent` only decides when a group is reported as warning.
-- Per-group overrides replace both values for one group, and per-user overrides cap how many groups
-  a user may hold.
+- Per-group overrides replace these values for one group, and per-user overrides cap how many
+  groups a user may hold.
 - `max_devices_per_user` caps how many devices one user may enroll, counting unclaimed enrollment
   secrets as well as enrolled devices; null leaves device enrollment uncapped.
 - `device_requests_per_minute` and `device_concurrent_pulls` bound what one enrolled device may ask
@@ -1821,6 +1850,9 @@ management node serves the call and every other node relays it to one.
 - Quota is evaluated against a group's realm-wide logical bytes, which are aggregated from counters
   that replicate between nodes, so enforcement follows a policy change as those counters and the
   realm configuration propagate.
+- A distributed bucket counts each object once, at the node coordinating its key range.
+  `count_replicas` (default false, overridable per group) decides whether the copies other member
+  nodes hold count as well. References to external data never count toward a quota.
 
 **Limits**
 - `grace_factor_percent` must be at least 100 and `warn_threshold_percent` between 1 and 100.
@@ -1834,7 +1866,7 @@ management node serves the call and every other node relays it to one.
             "grace_factor_percent": 110,
             "warn_threshold_percent": 80,
             "group_overrides": [
-                {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400_i64, "grace_factor_percent": 120}
+                {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400_i64, "grace_factor_percent": 120, "count_replicas": true}
             ],
             "max_groups_per_user": 10,
             "user_group_cap_overrides": [
@@ -1842,7 +1874,8 @@ management node serves the call and every other node relays it to one.
             ],
             "max_devices_per_user": 5,
             "device_requests_per_minute": 600,
-            "device_concurrent_pulls": 8
+            "device_concurrent_pulls": 8,
+            "count_replicas": false
         })
     ),
     responses(
@@ -1855,7 +1888,7 @@ management node serves the call and every other node relays it to one.
                 "grace_factor_percent": 110,
                 "warn_threshold_percent": 80,
                 "group_overrides": [
-                    {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400_i64, "grace_factor_percent": 120}
+                    {"group_id": "01JABCDEF0123456789ABCDEFG", "quota_bytes": 107374182400_i64, "grace_factor_percent": 120, "count_replicas": true}
                 ],
                 "max_groups_per_user": 10,
                 "user_group_cap_overrides": [
@@ -1863,7 +1896,8 @@ management node serves the call and every other node relays it to one.
                 ],
                 "max_devices_per_user": 5,
                 "device_requests_per_minute": 600,
-                "device_concurrent_pulls": 8
+                "device_concurrent_pulls": 8,
+                "count_replicas": false
             })
         ),
         (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a zero device cap or device limit", body = crate::error::ErrorResponse),
@@ -1890,7 +1924,7 @@ pub async fn set_realm_quota(
         Permission::WRITE,
     )
     .await?;
-    let quota = request.into_quota_config()?;
+    let (quota, replicas) = request.into_quota_config()?;
     let actor = Actor {
         node_id: state.get_node_id(),
         user_id: auth.user_id,
@@ -1901,12 +1935,14 @@ pub async fn set_realm_quota(
             actor,
             auth_context: auth,
             quota,
+            replicas,
         }),
         &state.get_ctx(),
     )
     .await
     .map_err(map_quota_error)?;
-    Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
+    let response = RealmQuotaConfig::from(stored.quota).with_replicas(&stored.replica_quota);
+    Ok((StatusCode::OK, Json(response)))
 }
 
 fn map_quota_error(error: SetQuotaError) -> ServerError {
@@ -2103,7 +2139,7 @@ pub(crate) async fn distinct_buckets(
 pub async fn load_realm_usage(
     state: &ServerState,
     scope: RealmUsageScope,
-) -> ServerResult<UsageCounters> {
+) -> ServerResult<RealmUsage> {
     aruna_operations::node::usage_stats::load_realm_usage(
         &state.get_ctx(),
         state.get_node_id(),
@@ -2128,6 +2164,9 @@ checked, because the figures are realm-wide totals and not per-caller views.
   node's replicated usage snapshot, so it is eventually consistent: a node whose snapshot has not
   arrived or has not refreshed yet is simply not part of the sum, which can make the total lag
   reality after a burst of writes.
+- `realm.objects`, `realm.logical_bytes` and `realm.referenced_bytes` count each object once: the
+  copies other member nodes hold of a distributed bucket's key range are left out, so the node
+  coordinating the range counts it. The flat fields count everything this node holds.
 - `stored_blobs` and `stored_bytes` count physical, content-addressed blob copies. A copy is shared
   by every group referencing it, so it is attributed to this node and its backend, never to a group;
   the group usage endpoint therefore omits both fields.
@@ -2175,7 +2214,7 @@ pub async fn get_usage(
     require_unrestricted_auth(&state, auth)?;
     let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
     let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
-    let mut response = UsageResponse::new(local, realm);
+    let mut response = UsageResponse::new(local, realm.counters);
     response.realm.distinct_buckets = distinct_buckets(&state, None, response.realm.buckets).await;
     // Best effort: storage counters stay reportable when the metadata
     // subsystem cannot answer, and the omitted field never reads as zero.

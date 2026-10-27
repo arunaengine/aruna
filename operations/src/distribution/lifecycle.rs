@@ -45,6 +45,7 @@ use super::roots::roots_checked;
 use super::sign_statement;
 use super::status::read_view;
 use crate::driver::{DriverContext, drive};
+use crate::node::usage_stats::{dirty_rows, wake_publish};
 use crate::replication::members::owes_fanout;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -904,6 +905,12 @@ async fn unbind(
         txn_id: Some(txn_id),
     };
     storage.send_storage_effect(write).await;
+    // The released bucket is ordinary now: its group's published replica share must go.
+    let markers = StorageEffect::BatchWrite {
+        writes: dirty_rows([info.group_id]),
+        txn_id: Some(txn_id),
+    };
+    storage.send_storage_effect(markers).await;
     if drop_fence {
         let delete = StorageEffect::Delete {
             key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
@@ -916,7 +923,10 @@ async fn unbind(
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+            wake_publish(context).await;
+            Ok(())
+        }
         other => Err(format!("the bucket was not released: {other:?}")),
     }
 }
@@ -950,6 +960,55 @@ mod tests {
             ..bound(6)
         };
         assert!(!owns(set_id, &member, &other));
+    }
+
+    #[tokio::test]
+    async fn release_marks_group() {
+        // A leaving member's bucket turns ordinary, so its group's replica share is published
+        // again in the same commit.
+        use crate::distribution::test_store::{context, get, open};
+        use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
+        use aruna_core::structs::storage::usage::{DIRTY_GLOBAL_KEY, dirty_group_key};
+        let (_dir, handle) = open();
+        let context = context(&handle);
+        let (snapshot, _) = crate::distribution::test_record::record(true);
+        let binding = crate::distribution::test_record::binding(&snapshot, 1, 5);
+        let group_id = Ulid::from_bytes([2; 16]);
+        let info = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: Some(binding.clone()),
+        };
+        let write = StorageEffect::Write {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: b"spire".to_vec().into(),
+            value: info.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        handle.send_storage_effect(write).await;
+
+        unbind(&context, "spire", &binding, false).await.unwrap();
+
+        let stored = get(&handle, S3_BUCKET_KEYSPACE, b"spire".to_vec()).await;
+        assert!(
+            BucketInfo::from_bytes(&stored.unwrap())
+                .unwrap()
+                .distribution
+                .is_none()
+        );
+        let marked = get(&handle, NODE_STATS_KEYSPACE, dirty_group_key(group_id)).await;
+        assert!(marked.is_some(), "the group's share is published again");
+        assert!(
+            get(&handle, NODE_STATS_KEYSPACE, DIRTY_GLOBAL_KEY.to_vec())
+                .await
+                .is_some()
+        );
     }
 
     #[test]

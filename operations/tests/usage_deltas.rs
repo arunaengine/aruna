@@ -751,6 +751,8 @@ async fn inject_group_snapshot(h: &Harness, group_id: Ulid, node_id: NodeId, log
             logical_bytes,
             ..Default::default()
         },
+        replicas: Default::default(),
+        revisions: Default::default(),
     };
     match h
         .driver
@@ -1279,6 +1281,7 @@ async fn reported_bytes(h: &Harness, group_id: Ulid) -> u64 {
     load_realm_usage(&h.driver, h.node_id, RealmUsageScope::Group(group_id))
         .await
         .unwrap()
+        .counters
         .logical_bytes
 }
 

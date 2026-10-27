@@ -1822,6 +1822,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::ConfigComputeSet { .. }
         | AdminDocumentOperation::ConfigFederationSet { .. }
         | AdminDocumentOperation::ConfigPortalSet { .. }
+        | AdminDocumentOperation::ConfigReplicasSet { .. }
         | AdminDocumentOperation::DatabaseSet { .. }
         | AdminDocumentOperation::DatabaseRemoved { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,

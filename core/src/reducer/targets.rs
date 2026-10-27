@@ -289,6 +289,18 @@ impl AdminDocumentState {
             .and_then(|value| serde_json::from_str(value).ok())
     }
 
+    /// Whether replicas count toward group quotas, as the events agree, if any event set it.
+    pub fn materialized_realm_replicas(&self) -> Option<ReplicaQuota> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(CONFIG_REPLICAS_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| serde_json::from_str(value).ok())
+    }
+
     /// The realm portal feature defaults the events agree on, if any.
     pub fn materialized_realm_portal(&self) -> Option<BTreeMap<String, bool>> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {

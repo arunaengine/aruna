@@ -284,6 +284,11 @@ pub(in crate::document_sync) fn overlay_realm_config(
     {
         config.portal_features = features;
     }
+    if !reducer_state.conflicts.contains_key(CONFIG_REPLICAS_PATH)
+        && let Some(replicas) = reducer_state.materialized_realm_replicas()
+    {
+        config.replica_quota = replicas;
+    }
     config.databases = reducer_state.materialized_databases();
 
     config.revocation_floor = config.revocation_floor.max(reducer_state.revocation_floor);
@@ -380,6 +385,7 @@ pub(in crate::document_sync) fn materialized_realm_config(
         federation: None,
         portal_features: Default::default(),
         databases: Default::default(),
+        replica_quota: Default::default(),
     };
     overlay_realm_config(&mut config, reducer_state, now, now_ms, revocation_index);
     Some(config)

@@ -219,6 +219,8 @@ pub struct RealmConfigDocument {
     pub portal_features: BTreeMap<String, bool>,
     /// Buckets marked as databases, each with the dataset that describes it.
     pub databases: Vec<crate::structs::identity::database::DatabaseEntry>,
+    /// Whether replicas count toward group quotas; set with the quota policy.
+    pub replica_quota: ReplicaQuota,
 }
 
 pub const MAX_PORTAL_FEATURES: usize = 64;
@@ -290,6 +292,21 @@ pub struct GroupQuotaOverride {
     pub group_id: GroupId,
     pub quota_bytes: Option<u64>,
     pub grace_factor_percent: Option<u32>,
+}
+
+/// Whether copies of a distributed range besides its coordinator's count toward group quotas:
+/// the realm default and per-group exceptions. References never count.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct ReplicaQuota {
+    pub count: bool,
+    pub groups: BTreeMap<GroupId, bool>,
+}
+
+impl ReplicaQuota {
+    /// The group's exception, else the realm default.
+    pub fn counts(&self, group_id: &GroupId) -> bool {
+        self.groups.get(group_id).copied().unwrap_or(self.count)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -547,6 +564,7 @@ impl RealmConfigDocument {
             federation: None,
             portal_features: BTreeMap::new(),
             databases: Vec::new(),
+            replica_quota: ReplicaQuota::default(),
         }
     }
 
@@ -1245,6 +1263,7 @@ mod test {
             federation: None,
             portal_features: BTreeMap::new(),
             databases: Vec::new(),
+            replica_quota: Default::default(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -1272,7 +1291,7 @@ mod test {
     fn config_bytes_canonical() {
         // Pins the canonical wire form. Postcard is positional, so the field
         // occupies a fixed slot that a shorter encoding cannot satisfy.
-        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d000000";
+        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d0000000000";
         let mut config = RealmConfigDocument::new(RealmId([1u8; 32]), Vec::new(), 3);
         config.family_strategy_id = Ulid::from_bytes([2u8; 16]);
 
@@ -1758,6 +1777,26 @@ mod test {
     }
 
     #[test]
+    fn replicas_follow_groups() {
+        let (on, off, other) = (
+            Ulid::from_bytes([2u8; 16]),
+            Ulid::from_bytes([3u8; 16]),
+            Ulid::from_bytes([4u8; 16]),
+        );
+        let mut replicas = super::ReplicaQuota {
+            count: false,
+            groups: BTreeMap::from([(on, true), (off, false)]),
+        };
+        assert!(
+            !super::ReplicaQuota::default().counts(&other),
+            "off by default"
+        );
+        assert!(replicas.counts(&on) && !replicas.counts(&other));
+        replicas.count = true;
+        assert!(replicas.counts(&other) && !replicas.counts(&off));
+    }
+
+    #[test]
     pub fn replication_resolution() {
         let group_id = Ulid::generate();
         let other_group_id = Ulid::generate();
@@ -1806,6 +1845,7 @@ mod test {
             federation: None,
             portal_features: BTreeMap::new(),
             databases: Vec::new(),
+            replica_quota: Default::default(),
         };
 
         assert_eq!(document.replication_factor_for(other_group_id, None), 3);
@@ -2211,6 +2251,7 @@ mod test {
             &config.federation,
             &config.portal_features,
             &config.databases,
+            &config.replica_quota,
         ))
         .expect("tail encodes");
         assert!(encoded.ends_with(&tail));

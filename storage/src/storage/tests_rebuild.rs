@@ -192,6 +192,58 @@ async fn finish_replaces_rows() {
     assert!(read(&handle, USAGE_COMPLETE_KEY, None).await.is_some());
 }
 
+/// Finish marks every group whose counter row it replaced or removed, in its own commit: the
+/// corrected counters may undercut replica shares published from the old ones.
+#[tokio::test]
+async fn finish_marks_shares() {
+    use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
+    use aruna_core::structs::storage::usage::{dirty_share_key, usage_group_key};
+    let dir = tempdir().unwrap();
+    let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let (kept, gone) = (
+        ulid::Ulid::from_bytes([1; 16]),
+        ulid::Ulid::from_bytes([2; 16]),
+    );
+    commit_delta(&handle, &usage_group_key(kept), objects(3)).await;
+    commit_delta(&handle, &usage_group_key(gone), objects(4)).await;
+    let snapshot = begin(&handle).await;
+    let page = start_write_transaction(&handle).await;
+    let rebuilt = ByteView::from(usage_shadow_key(&usage_group_key(kept)));
+    handle
+        .send_storage_effect(StorageEffect::AddUsage {
+            key_space: SPACE.to_string(),
+            deltas: vec![(rebuilt, objects(1))],
+            buckets: Vec::new(),
+            txn_id: page,
+        })
+        .await;
+    commit_transaction(&handle, page).await;
+    handle
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id: snapshot })
+        .await;
+
+    assert!(matches!(
+        finish(&handle).await,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+    for group in [kept, gone] {
+        let marker = handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: NODE_STATS_KEYSPACE.to_string(),
+                key: ByteView::from(dirty_share_key(group)),
+                txn_id: None,
+            })
+            .await;
+        assert!(
+            matches!(
+                marker,
+                Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
+            ),
+            "the share of {group} is marked"
+        );
+    }
+}
+
 /// A begin clears rebuild rows a crashed rebuild left; a finish without a begin in this
 /// running storage, as after a restart, is refused and leaves the live rows alone.
 #[tokio::test]

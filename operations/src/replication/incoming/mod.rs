@@ -2980,6 +2980,12 @@ impl IncomingVersionOperation {
             .map(|value| RealmConfigDocument::from_bytes(value.as_ref()))
             .transpose()
         {
+            // A bound destination only takes its coordinator's publications: always a copy.
+            Ok(Some(config))
+                if self.destination_bound && !config.replica_quota.counts(&group_id) =>
+            {
+                None
+            }
             Ok(Some(config)) => config.quota.effective_group_ceiling(&group_id),
             Ok(None) => None,
             Err(err) => return self.fail(err.into()),

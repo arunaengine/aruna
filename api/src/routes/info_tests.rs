@@ -5,10 +5,10 @@
 use super::{
     GroupCapOverride, InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeKindInfo,
     PeerContacts, RealmBinding, RealmBindingScope, RealmConnectionStatus, RealmPlacementOverride,
-    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, ServiceStatus, TelemetryState,
-    UsageResponse, get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
-    map_placement_error, map_quota_error, map_realm_nodes, mutate_realm_placement, presence_nodes,
-    set_realm_quota,
+    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, RealmQuotaOverride,
+    ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info, get_realm_placement,
+    get_usage, map_handle_error, map_placement_error, map_quota_error, map_realm_nodes,
+    mutate_realm_placement, presence_nodes, set_realm_quota,
 };
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
@@ -334,6 +334,8 @@ async fn seed_usage_state(state: &Arc<ServerState>) {
                     buckets: 3,
                     ..Default::default()
                 },
+                replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap()
@@ -1176,6 +1178,19 @@ async fn admin_sets_quota() {
     body.devices_per_user = Some(3);
     body.device_request_rate = Some(600);
     body.device_concurrent_pulls = Some(8);
+    body.count_replicas = true;
+    let group_id = Ulid::from_bytes([6; 16]).to_string();
+    let over: RealmQuotaOverride =
+        serde_json::from_value(serde_json::json!({"group_id": group_id, "quota_bytes": 1}))
+            .unwrap();
+    assert_eq!(
+        over.count_replicas, None,
+        "an omitted override keeps the realm's setting"
+    );
+    body.group_overrides = vec![RealmQuotaOverride {
+        count_replicas: Some(false),
+        ..over
+    }];
 
     let (status, Json(stored)) = set_realm_quota(
         State(state.clone()),
@@ -1189,6 +1204,8 @@ async fn admin_sets_quota() {
     assert_eq!(stored.devices_per_user, Some(3));
     assert_eq!(stored.device_request_rate, Some(600));
     assert_eq!(stored.device_concurrent_pulls, Some(8));
+    assert!(stored.count_replicas);
+    assert_eq!(stored.group_overrides[0].count_replicas, Some(false));
 
     let (status, Json(info)) = get_realm_info(State(state), Extension(Some(auth)))
         .await
@@ -1197,6 +1214,7 @@ async fn admin_sets_quota() {
     let quota = info.quota.expect("realm token sees quota");
     assert_eq!(quota.default_quota_bytes, Some(4096));
     assert_eq!(quota.devices_per_user, Some(3));
+    assert!(quota.count_replicas);
 }
 
 fn federation_body(name: &str) -> RealmFederation {

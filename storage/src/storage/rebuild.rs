@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use aruna_core::effects::IterStart;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
-use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::structs::storage::usage::{
     RebuildProgress, ShadowCounters, USAGE_COMPLETE_KEY, USAGE_PROGRESS_KEY, USAGE_REBUILD_KEY,
-    USAGE_SHADOW_PREFIX, UsageDelta, global_shard_keys, usage_shadow_key,
+    USAGE_SHADOW_PREFIX, UsageDelta, dirty_share_key, global_shard_keys, usage_shadow_key,
 };
 use byteview::ByteView;
 use fjall::Readable;
@@ -194,6 +194,7 @@ impl FjallStorage {
         let mut tx = self.buffered_write_tx()?;
         let failed = |message: String| StorageError::WriteError(message);
         let mut entries = Vec::new();
+        let mut groups = BTreeSet::new();
         let mut start = None;
         loop {
             let (values, next) =
@@ -210,6 +211,7 @@ impl FjallStorage {
                     let (live_value, shortfalls) =
                         row.live_row().map_err(|error| failed(error.to_string()))?;
                     warn_clamped(live, shortfalls);
+                    groups.extend(counter_group(live));
                     let live = ByteView::from(live);
                     tx.insert(keyspace.clone(), live.clone(), ByteView::from(live_value));
                     tx.remove(keyspace.clone(), key);
@@ -221,6 +223,7 @@ impl FjallStorage {
                         .map_err(|error| StorageError::ReadError(error.to_string()))?;
                     // A counter row the rebuild did not produce is stale.
                     if kept.is_none() {
+                        groups.extend(counter_group(key.as_ref()));
                         tx.remove(keyspace.clone(), key);
                     }
                 }
@@ -230,10 +233,27 @@ impl FjallStorage {
                 None => break,
             }
         }
+        // Corrected group counters may undercut replica shares published from the old ones, so
+        // each group's quota gate stops deducting its own share until the next publish.
+        let stats = self.store.resolve_keyspace(NODE_STATS_KEYSPACE)?;
+        let generation = ByteView::from(Ulid::generate().to_bytes().to_vec());
+        for group in groups {
+            tx.insert(
+                stats.clone(),
+                ByteView::from(dirty_share_key(group)),
+                generation.clone(),
+            );
+        }
         let complete = ByteView::from(USAGE_COMPLETE_KEY);
         tx.insert(keyspace, complete, ByteView::from(&[][..]));
         self.commit_buffered(tx)?;
         self.persist_journal()?;
         Ok(entries)
     }
+}
+
+/// The group of a `group/<id>` counter row.
+fn counter_group(key: &[u8]) -> Option<Ulid> {
+    let id = key.strip_prefix(b"group/")?;
+    Some(Ulid::from_bytes(id.try_into().ok()?))
 }

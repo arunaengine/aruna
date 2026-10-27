@@ -409,6 +409,12 @@ pub enum AdminDocumentOperation {
     DatabaseRemoved {
         entry_id: Ulid,
     },
+    /// Replaces whether replicas count toward group quotas. Its own operation, so quota events
+    /// signed before the setting keep their encoding.
+    #[serde(rename = "RealmConfigReplicasSet")]
+    ConfigReplicasSet {
+        replicas: crate::structs::identity::realm::ReplicaQuota,
+    },
 }
 
 impl AdminDocumentOperation {
@@ -605,6 +611,9 @@ mod tests {
             },
             AdminDocumentOperation::ConfigPortalSet {
                 features: BTreeMap::from([("compute".to_string(), false)]),
+            },
+            AdminDocumentOperation::ConfigReplicasSet {
+                replicas: Default::default(),
             },
             AdminDocumentOperation::NodePlacementSet {
                 entry: placement_entry(node(1)),

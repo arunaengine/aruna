@@ -33,6 +33,21 @@ pub(crate) fn replicated(active: bool, replicas: usize) -> (DistributionSnapshot
     with_settings(active, replicas, DistributionSettings::default())
 }
 
+/// The record of [`replicated`] with its lower shard split at `key` by its coordinator.
+pub(crate) fn split_lower(replicas: usize, key: &str) -> (DistributionSnapshot, Vec<u8>) {
+    let (head, _) = replicated(true, replicas);
+    let signer = head.member(member(1)).unwrap();
+    let lower = &head.config.ranges[0];
+    let statement = Statement::split(realm(), head.set_id(), signer, head.number, lower, key);
+    let request = DistributionRequest::Statement(Box::new(statement.sign(&secret(1))));
+    let head = next_snapshot(realm(), Some(&head), &request).unwrap();
+    let view = DistributionView {
+        head: SignedSnapshot::sign(head.clone(), realm(), &secret(1)).unwrap(),
+        conflict: None,
+    };
+    (head, view.to_bytes().unwrap())
+}
+
 /// The active record of [`record`] with a search index kept.
 pub(crate) fn searched() -> (DistributionSnapshot, Vec<u8>) {
     let settings = DistributionSettings {
