@@ -180,13 +180,35 @@ impl DistributionSnapshot {
         (lower, upper): (&str, Option<&str>),
         fence: &LocalFence,
     ) -> bool {
-        (self.config.ranges.iter())
-            .filter(|range| {
-                let starts_before = upper.is_none_or(|upper| range.lower.as_str() < upper);
-                let ends_after = range.upper.as_deref().is_none_or(|end| lower < end);
-                starts_before && ends_after
-            })
-            .all(|range| self.lists_locally(member_id, range, fence))
+        (self.overlapping(lower, upper)).all(|range| self.lists_locally(member_id, range, fence))
+    }
+
+    /// Whether `member_id` is a ready copy of every range in `[lower, upper)`, so it can answer
+    /// a listing while their coordinators cannot.
+    pub fn copies_interval(&self, member_id: Ulid, (lower, upper): (&str, Option<&str>)) -> bool {
+        (self.overlapping(lower, upper)).all(|range| {
+            (self.copy_holders(range).iter()).any(|member| member.member_id == member_id)
+        })
+    }
+
+    fn overlapping<'a>(
+        &'a self,
+        lower: &'a str,
+        upper: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a KeyRange> {
+        (self.config.ranges.iter()).filter(move |range| {
+            let starts_before = upper.is_none_or(|upper| range.lower.as_str() < upper);
+            let ends_after = range.upper.as_deref().is_none_or(|end| lower < end);
+            starts_before && ends_after
+        })
+    }
+
+    /// The ready members other than the coordinator that keep the records of `range`; they
+    /// answer for it while the coordinator cannot, possibly behind it.
+    pub fn copy_holders(&self, range: &KeyRange) -> Vec<&DistributionMember> {
+        (self.record_holders(range).into_iter())
+            .filter(|member| member.member_id != range.coordinator)
+            .collect()
     }
 
     /// The ready members that keep the records of `range`, its coordinator last, so reads of
@@ -401,6 +423,25 @@ mod tests {
         assert!(!head.lists_interval(member(1), ("", Some("m")), &fenced));
         head.config.members[0].state = crate::structs::storage::distribution::MemberState::Failed;
         assert!(head.list_holder(&lower).is_none());
+    }
+
+    // A ready replica answers for a range its coordinator cannot serve; the coordinator never
+    // counts as a copy.
+    #[test]
+    fn copies_answer_ranges() {
+        let mut head = active();
+        head.config.ranges[0].replicas.push(member(2));
+        let lower = head.config.ranges[0].clone();
+        let copies: Vec<_> = (head.copy_holders(&lower).iter())
+            .map(|member| member.member_id)
+            .collect();
+        assert_eq!(copies, [member(2)]);
+        assert!(head.copies_interval(member(2), ("", Some("m"))));
+        assert!(!head.copies_interval(member(1), ("", Some("m"))));
+        assert!(
+            !head.copies_interval(member(2), ("", None)),
+            "member 2 copies no upper range"
+        );
     }
 
     #[test]

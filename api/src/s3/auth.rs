@@ -18,7 +18,7 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, UserAccess, bucket_permission_path, group_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::distribution::delegation::{
-    DELEGATION_HEADER, Payload, SignedDelegation,
+    COPY_READ_HEADER, DELEGATION_HEADER, Payload, SignedDelegation,
 };
 use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::{NodeId, UserId};
@@ -92,6 +92,8 @@ pub(crate) struct DelegatedRequest {
     pub issuer: NodeId,
     pub nonce: [u8; 16],
     pub payload: Payload,
+    /// The issuer asked this node as a copy, so a current read is answered and marked stale.
+    pub copy_read: bool,
 }
 
 /// The body binding each forwarded operation must carry.
@@ -805,12 +807,14 @@ impl AuthProvider {
             }
             Err(error) => return Err(map_authorize_error(error)),
         }
+        let copy_read = cx.headers().contains_key(COPY_READ_HEADER);
         cx.extensions_mut().insert(extras);
         cx.extensions_mut().insert(bucket_info);
         cx.extensions_mut().insert(DelegatedRequest {
             issuer: delegation.issuer,
             nonce: delegation.nonce,
             payload: delegation.payload.clone(),
+            copy_read,
         });
         cx.extensions_mut().insert(user_access);
         Ok(())

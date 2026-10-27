@@ -148,6 +148,44 @@ async fn build_resumes_cursor() {
     assert_eq!(keys(&fixture.indexes, 1).await, ["a", "b", "c"]);
 }
 
+// Feed rows of keys the build has not read yet settle unapplied; the build indexes them later.
+#[tokio::test]
+async fn build_skips_unread() {
+    let fixture = fixture().await;
+    let handle = &fixture.handle;
+    for (seed, key) in [(1, "a"), (2, "b"), (3, "c")] {
+        assert!(apply(handle, write(set(), key, seed, 1)).await.unwrap());
+    }
+    let limits = FeedLimits {
+        rebuild_rows: 1,
+        rebuild_pages: 1,
+        ..FeedLimits::default()
+    };
+    let mut feeder = Feeder::new(fixture.indexes.clone(), limits);
+    feeder.pass(&context(handle)).await;
+    assert_eq!(keys(&fixture.indexes, 1).await, ["a"]);
+
+    assert!(apply(handle, write(set(), "a", 4, 2)).await.unwrap());
+    assert!(apply(handle, write(set(), "c", 5, 2)).await.unwrap());
+    feeder.pass(&context(handle)).await;
+    let row = |key| get(handle, SEARCH_FEED_KEYSPACE, head_position(set(), key));
+    assert!(row("a").await.is_none(), "a read key's row is applied");
+    assert!(row("c").await.is_none(), "an unread key's row settles");
+    assert_eq!(keys(&fixture.indexes, 1).await, ["a"]);
+
+    for _ in 0..16 {
+        if state(handle).await == Some(IndexState::Ready { generation: 1 }) {
+            break;
+        }
+        feeder.pass(&context(handle)).await;
+    }
+    assert_eq!(
+        state(handle).await,
+        Some(IndexState::Ready { generation: 1 })
+    );
+    assert_eq!(keys(&fixture.indexes, 1).await, ["a", "b", "c"]);
+}
+
 #[tokio::test]
 async fn missing_index_rebuilds() {
     let fixture = fixture().await;

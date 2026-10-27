@@ -4,7 +4,7 @@
 
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::relay::{query_path, read_holders, relay_read};
+use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -595,15 +595,15 @@ pub async fn blob_locations(
         Permission::READ,
     )
     .await?;
+    let mut pairs = vec![("bucket", query.bucket.as_str()), ("path", &query.path)];
+    pairs.extend(
+        query
+            .version_id
+            .as_deref()
+            .map(|version| ("version_id", version)),
+    );
+    let path = query_path("/data/blobs/locations", &pairs);
     if let Some(holders) = read_holders(&state, &info, &query.path, &headers).await? {
-        let mut pairs = vec![("bucket", query.bucket.as_str()), ("path", &query.path)];
-        pairs.extend(
-            query
-                .version_id
-                .as_deref()
-                .map(|version| ("version_id", version)),
-        );
-        let path = query_path("/data/blobs/locations", &pairs);
         return relay_read(&state, &holders, &path, bearer.as_ref())
             .await
             .map(Json);
@@ -626,7 +626,12 @@ pub async fn blob_locations(
         other => ServerError::InternalError(other.to_string()),
     })?;
     let Some(resolved) = local.summary.version_id else {
-        return Err(ServerError::NotFound);
+        let Some(coordinator) = copy_miss(&state, &info, &query.path, &headers).await? else {
+            return Err(ServerError::NotFound);
+        };
+        return relay_read(&state, &coordinator, &path, bearer.as_ref())
+            .await
+            .map(Json);
     };
     let blake3 = local.blake3;
     let delete_marker = local.delete_marker;

@@ -18,7 +18,7 @@ const S3_ALLOWED_HEADERS: &str = "authorization,content-type,content-md5,range,\
 const S3_EXPOSED_HEADERS: &str = "etag,content-range,accept-ranges,content-length,last-modified,\
      x-amz-request-id,x-amz-version-id,x-amz-delete-marker,aruna-source-content-type,\
      aruna-source-etag,aruna-source-last-modified,aruna-last-refresh,x-aruna-bucket-locked,\
-     x-amz-server-side-encryption";
+     x-amz-server-side-encryption,x-aruna-stale";
 pub(crate) const S3_PREFLIGHT_VARY: &[HeaderName] = &[
     header::ORIGIN,
     header::ACCESS_CONTROL_REQUEST_METHOD,
@@ -453,14 +453,13 @@ mod tests {
                 .unwrap(),
             &origin
         );
-        assert!(
-            response_headers
-                .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("etag")
-        );
+        let exposed = response_headers
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(exposed.contains("etag"));
+        assert!(exposed.contains("x-aruna-stale"));
     }
 
     #[test]

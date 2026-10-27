@@ -10,8 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
+use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
 use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute};
-use aruna_operations::distribution::guard::{read_coordinator, route_read};
+use aruna_operations::distribution::guard::{
+    GuardError, copy_readers, read_coordinator, route_read,
+};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
 use futures_util::TryStreamExt;
@@ -21,7 +24,9 @@ use s3s::dto::{
     TimestampFormat,
 };
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
+use ulid::Ulid;
 
+use super::list::unreachable;
 use super::{Forward, ForwardBody, ForwardRequest, header, passed_headers, passed_query};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
@@ -29,6 +34,47 @@ use crate::s3::service::ArunaS3Service;
 
 /// How long an anonymous caller's stand-in credential lasts; the delegation is shorter.
 const ANONYMOUS_SECS: u64 = 60;
+/// How long a holder may take to start its answer; the body then streams without a bound.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Marks an answer a copy gave for ranges whose coordinator could not answer; it may be behind.
+pub(in crate::s3::service) const STALE_HEADER: &str = "x-aruna-stale";
+
+/// Where a GET or HEAD is answered; `Some` names the range a copy answered for.
+pub(in crate::s3::service) enum ReadAnswer {
+    Forwarded(reqwest::Response, Option<Ulid>),
+    Local(Option<Ulid>),
+}
+
+/// Adds the stale mark of `ranges` to an answer's headers.
+pub(in crate::s3::service) fn mark_stale(headers: &mut HeaderMap, ranges: &[Ulid]) {
+    let value = (ranges.iter())
+        .map(|range_id| format!("range={range_id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !ranges.is_empty()
+        && let Ok(value) = http::HeaderValue::from_str(&value)
+    {
+        headers.insert(STALE_HEADER, value);
+    }
+}
+
+/// A copy's error, marked; its miss says the key may still exist at the coordinator.
+pub(in crate::s3::service) fn stale_error(mut error: S3Error, range_id: Ulid) -> S3Error {
+    if matches!(
+        error.code(),
+        S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion
+    ) {
+        error.set_message(format!(
+            "Not found on a copy of range {range_id}, which answered because the range's \
+             coordinator could not; the copy may be behind, so the object may exist."
+        ));
+    }
+    let mut headers = error.headers().cloned().unwrap_or_default();
+    mark_stale(&mut headers, &[range_id]);
+    error.set_headers(headers);
+    error
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -161,10 +207,22 @@ pub(in crate::s3::service) fn anonymous_window(user: &UserAccess) -> UserAccess 
     user
 }
 
+/// The holder's answer, or the holder as unreachable when it does not start answering in time.
+async fn answer_within(
+    forward: &Forward,
+    answer: impl Future<Output = S3Result<reqwest::Response>>,
+) -> S3Result<reqwest::Response> {
+    match tokio::time::timeout(ANSWER_TIMEOUT, answer).await {
+        Ok(answer) => answer,
+        Err(_) => Err(super::unreachable_error(forward, "not answering in time")),
+    }
+}
+
 impl ArunaS3Service {
     /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, or `None` when
     /// this member answers it. Only a `pinned` version may come from a copy: a copy may lag
-    /// behind the current version. A delegated read is never sent on.
+    /// behind the current version. A delegated read is never sent on, and a current one is
+    /// refused here unless this node still coordinates the range or the sender asked a copy.
     pub(in crate::s3::service) async fn read_holder(
         &self,
         extensions: &http::Extensions,
@@ -174,7 +232,17 @@ impl ArunaS3Service {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(None);
         };
-        if extensions.get::<DelegatedRequest>().is_some() {
+        if let Some(delegated) = extensions.get::<DelegatedRequest>() {
+            if !pinned
+                && !delegated.copy_read
+                && let Some(coordinator) = self.range_coordinator(binding, key).await?
+            {
+                return Err(guard_error(&GuardError::NotCoordinator {
+                    set_id: binding.set_id,
+                    range_id: coordinator.range_id,
+                    node_id: coordinator.node_id,
+                }));
+            }
             return Ok(None);
         }
         if !pinned {
@@ -243,6 +311,52 @@ impl ArunaS3Service {
         }
     }
 
+    /// Answers a GET or HEAD of `key` at its holder, coordinator first. While the coordinator
+    /// or this node's fenced view cannot answer a current read, a copy answers, marked stale.
+    pub(in crate::s3::service) async fn answer_read(
+        &self,
+        extensions: &http::Extensions,
+        user: &UserAccess,
+        bucket: Option<&BucketInfo>,
+        (key, pinned): (&str, bool),
+        request: impl Fn() -> ForwardRequest,
+    ) -> S3Result<ReadAnswer> {
+        let error = match self.read_holder(extensions, bucket, (key, pinned)).await {
+            Ok(None) => return Ok(ReadAnswer::Local(None)),
+            Ok(Some(holder)) => match self.read_object(user, &holder, &request).await {
+                Ok(response) => return Ok(ReadAnswer::Forwarded(response, None)),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        // A delegated read's refusal goes back to its sender, which asks the copies itself.
+        let delegated = extensions.get::<DelegatedRequest>().is_some();
+        let binding = bucket.and_then(|bucket| bucket.distribution.as_ref());
+        let Some(binding) = binding.filter(|_| !pinned && !delegated && unreachable(&error)) else {
+            return Err(error);
+        };
+        let readers = copy_readers(self.state.as_ref(), binding, key).await;
+        let (range_id, here, copies) = readers.map_err(|error| guard_error(&error))?;
+        if here {
+            return Ok(ReadAnswer::Local(Some(range_id)));
+        }
+        for node_id in copies {
+            let forward = Forward {
+                set_id: binding.set_id,
+                range_id,
+                node_id,
+            };
+            let mut copy_read = request();
+            (copy_read.headers).push((COPY_READ_HEADER.to_string(), "1".to_string()));
+            match self.forward_read(user, &forward, copy_read).await {
+                Ok(response) => return Ok(ReadAnswer::Forwarded(response, Some(range_id))),
+                Err(failed) if unreachable(&failed) => {}
+                Err(failed) => return Err(stale_error(failed, range_id)),
+            }
+        }
+        Err(error)
+    }
+
     /// Sends a GET or HEAD to the chosen holder; a replica's miss goes on to the coordinator.
     pub(in crate::s3::service) async fn read_object(
         &self,
@@ -270,7 +384,7 @@ impl ArunaS3Service {
         request: ForwardRequest,
     ) -> S3Result<reqwest::Response> {
         let user = anonymous_window(user);
-        let result = self.forward_write(&user, forward, request).await;
+        let result = answer_within(forward, self.forward_write(&user, forward, request)).await;
         if let Err(error) = &result
             && error
                 .status_code()
@@ -303,6 +417,21 @@ mod tests {
             .body("abc")
             .unwrap();
         reqwest::Response::from(response)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_holder_unreachable() {
+        let forward = Forward {
+            set_id: Ulid::nil(),
+            range_id: Ulid::nil(),
+            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+        };
+        let error = answer_within(&forward, std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(unreachable(&error));
+        let answer = answer_within(&forward, async { Ok(holder_answer(200)) }).await;
+        assert_eq!(answer.unwrap().status(), 200);
     }
 
     #[test]

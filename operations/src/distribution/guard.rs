@@ -565,6 +565,41 @@ pub async fn lists_interval(
         .lists_interval(binding.member_id, (lower, upper), &fence))
 }
 
+/// Whether this member, as a ready copy, may answer listings of every key in `[lower, upper)`
+/// while their coordinators cannot.
+pub async fn copies_interval(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    lower: &str,
+    upper: Option<&str>,
+) -> Result<bool, GuardError> {
+    let view = bound_view(context, binding).await?;
+    Ok(view
+        .snapshot()
+        .copies_interval(binding.member_id, (lower, upper)))
+}
+
+/// Who answers a read of `key` while its range's coordinator cannot: the range, whether this
+/// member keeps the range's records, and the other nodes with a ready copy.
+pub async fn copy_readers(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+) -> Result<(Ulid, bool, Vec<NodeId>), GuardError> {
+    let view = bound_view(context, binding).await?;
+    let snapshot = view.snapshot();
+    let range = snapshot
+        .range_for(key)
+        .ok_or(RouteError::NoRange(binding.set_id))?;
+    let here =
+        (snapshot.record_holders(range).iter()).any(|member| member.member_id == binding.member_id);
+    let copies = (snapshot.copy_holders(range).into_iter())
+        .filter(|member| member.member_id != binding.member_id)
+        .map(|member| member.node_id)
+        .collect();
+    Ok((range.range_id, here, copies))
+}
+
 /// The nodes that answer reads of `key`'s range from their own records, coordinator last.
 pub async fn record_holders(
     context: &DriverContext,

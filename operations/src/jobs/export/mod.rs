@@ -1457,9 +1457,9 @@ fn snapshot_read_failure(error: MetadataApiError) -> ExportFailure {
         MetadataApiError::PlacementUnavailable(error) => {
             ExportFailure::Retryable(error.to_string())
         }
-        MetadataApiError::InvalidCursor(message) | MetadataApiError::Internal(message) => {
-            ExportFailure::Retryable(message)
-        }
+        MetadataApiError::InvalidCursor(message)
+        | MetadataApiError::SearchIncomplete(message)
+        | MetadataApiError::Internal(message) => ExportFailure::Retryable(message),
     }
 }
 

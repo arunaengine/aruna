@@ -277,6 +277,36 @@ async fn start_after_groups() {
     assert!(peer.paths.lock().unwrap()[1].contains("cursor="));
 }
 
+// While the coordinator cannot answer, this node's copy lists the range, marked stale, and a
+// relayed listing asks a copy only with `copy`.
+#[tokio::test]
+async fn down_coordinator_copy() {
+    let node = node_state().await;
+    store(&node, &["a.md"]).await;
+    let snapshot = replicate(&node.state, node.group_id, BUCKET).await;
+    publish_api(&node.state, node_id(PEER), CLOSED_API).await;
+    let page = list(&node, &node.owner, HeaderMap::new(), query(None, None, 10))
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["a.md"]);
+    let range_id = snapshot.config.ranges[0].range_id.to_string();
+    assert_eq!(page.stale_ranges, [range_id]);
+
+    let mut bounded = query(None, None, 10);
+    bounded.lower = Some(String::new());
+    let relayed_set = relayed(snapshot.set_id());
+    let refused = list(&node, &node.owner, relayed_set.clone(), bounded.clone()).await;
+    assert!(matches!(
+        refused,
+        Err(ServerError::ServiceUnavailableReason(_))
+    ));
+    bounded.copy = Some(true);
+    let page = list(&node, &node.owner, relayed_set, bounded)
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["a.md"]);
+}
+
 #[tokio::test]
 async fn unanswered_range_fails() {
     let node = node_state().await;

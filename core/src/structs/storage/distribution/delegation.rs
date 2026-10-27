@@ -21,6 +21,8 @@ use crate::types::GroupId;
 
 /// The header a forwarded S3 request carries its delegation in.
 pub const DELEGATION_HEADER: &str = "x-aruna-delegation";
+/// Marks a read sent to a copy because the coordinator could not answer; the answer is stale.
+pub const COPY_READ_HEADER: &str = "x-aruna-copy-read";
 /// The longest a delegation may be valid.
 pub const MAX_VALID_SECS: u64 = 30;
 /// Clock difference between nodes a delegation tolerates at its start.

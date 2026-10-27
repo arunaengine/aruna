@@ -349,7 +349,7 @@ async fn holder_ranges(
             range_id,
             node_id,
         };
-        let answer = relay_get(state, &forward, &path, bearer).await?;
+        let answer = relay_get(state, &forward, &path, bearer, HeaderMap::new()).await?;
         merge_answer(answer, node_id, &mut ranges, &mut copies);
     }
     for range in &snapshot.config.ranges {
@@ -368,7 +368,7 @@ async fn holder_ranges(
                     range_id: range.range_id,
                     node_id: holder.node_id,
                 };
-                let answer = relay_get(state, &forward, &path, bearer).await?;
+                let answer = relay_get(state, &forward, &path, bearer, HeaderMap::new()).await?;
                 merge_answer(answer, holder.node_id, &mut ranges, &mut copies);
             }
         }

@@ -21,9 +21,11 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::distribution::index_feed::{IndexProgress, range_progress};
 use crate::driver::DriverContext;
 use crate::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use crate::placement::process_placements::load_realm_config;
+use crate::replication::members::{CopyLag, copy_lag};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum StatusError {
@@ -66,6 +68,19 @@ pub struct RangeStatus {
     pub replicas: Vec<Ulid>,
     /// The coordinator is unreachable, so writes to the range fail.
     pub degraded: Option<Reach>,
+    /// This node's search index of the range, while it holds the range and the set keeps one.
+    pub search_index: Option<IndexProgress>,
+    /// What this node, as the range's coordinator, still owes each member it publishes to.
+    pub copies: Vec<CopyStatus>,
+}
+
+/// The deliveries a coordinator still owes one member of a range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CopyStatus {
+    pub member_id: Ulid,
+    /// The member keeps the bytes; otherwise it receives records only.
+    pub bytes: bool,
+    pub lag: CopyLag,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +104,9 @@ pub struct DistributionStatus {
     /// member pass that member's own check.
     pub recommended_grant: String,
     pub lifecycle: LifecycleStatus,
+    /// The copy queues of the ranges this node coordinates were read to their end, so the
+    /// pending counts of `copies` are exact rather than lower bounds.
+    pub copies_counted: bool,
 }
 
 /// Open transfers and deletion from the record, and this node's own fences.
@@ -154,6 +172,8 @@ pub fn summarize(
                 epoch: range.epoch,
                 replicas: range.replicas.clone(),
                 degraded,
+                search_index: None,
+                copies: Vec::new(),
             }
         })
         .collect();
@@ -187,6 +207,7 @@ pub fn summarize(
         members,
         ranges,
         lifecycle: lifecycle(snapshot),
+        copies_counted: false,
     }
 }
 
@@ -318,6 +339,49 @@ pub async fn read_status(
         status.lifecycle.publications_closed = !fence.receiving();
     }
     Ok(Some(status))
+}
+
+/// Adds this node's search index progress and, for the ranges it coordinates, what it still
+/// owes each member. Both are hints, so a failed read leaves them out.
+pub async fn add_progress(context: &Arc<DriverContext>, status: &mut DistributionStatus) {
+    if let Some(handle) = context.metadata_handle.as_ref() {
+        let progress = range_progress(context, &handle.range_indexes(), &status.bucket).await;
+        let progress = progress.unwrap_or_default();
+        for range in &mut status.ranges {
+            range.search_index = progress.get(&range.range_id).copied();
+        }
+    }
+    let Ok(Some(view)) = read_view(context, status.set_id).await else {
+        return;
+    };
+    let snapshot = view.snapshot();
+    let local = context.net_handle.as_ref().map(|net| net.node_id());
+    let Some(member) = (snapshot.config.members.iter()).find(|m| Some(m.node_id) == local) else {
+        return;
+    };
+    let Ok((lag, counted)) = copy_lag(context, snapshot, member.member_id).await else {
+        return;
+    };
+    status.copies_counted = counted;
+    for range in &mut status.ranges {
+        let Some(range_config) = snapshot
+            .config
+            .ranges
+            .iter()
+            .find(|r| r.range_id == range.range_id)
+        else {
+            continue;
+        };
+        range.copies = (snapshot
+            .range_deliveries(member.member_id, range_config)
+            .into_iter())
+        .map(|delivery| CopyStatus {
+            member_id: delivery.member_id,
+            bytes: delivery.bytes,
+            lag: (lag.get(&(range.range_id, delivery.member_id)).copied()).unwrap_or_default(),
+        })
+        .collect();
+    }
 }
 
 #[cfg(test)]

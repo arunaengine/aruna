@@ -9,13 +9,19 @@ use std::thread;
 use std::time::Instant;
 
 use aruna_core::telemetry::duration_ms;
-use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
+use fjall::{
+    AbstractTree, KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable,
+};
 use tracing::{debug, warn};
 
 pub(crate) const DELETE_THRESHOLD: u64 = 5_000;
 pub(crate) const MAX_KEYSPACE_BYTES: u64 = 256 * 1024 * 1024;
 /// Key a checkpoint writes back unchanged, or removes while it is absent.
 const CHECKPOINT: &[u8] = b"\xffcheckpoint";
+/// Journal count that calls for a sweep, about twice Fjall's own 512 MiB journal limit.
+pub(crate) const JOURNAL_LIMIT: usize = 16;
+/// Job name of a sweep, which no keyspace name matches.
+const SWEEP: &str = "journal sweep";
 
 pub(crate) struct CompactionJob {
     pub(crate) key_space: String,
@@ -106,6 +112,40 @@ impl Compactor {
         }
     }
 
+    /// Checkpoints every keyspace without unflushed rows, since any of them may hold old journals.
+    pub(crate) fn sweep(&self, db: OptimisticTxDatabase) {
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        if !self
+            .active
+            .lock()
+            .expect("storage compaction mutex poisoned")
+            .insert(SWEEP.to_string())
+        {
+            return;
+        }
+        let job = CompactionJob {
+            key_space: SWEEP.to_string(),
+            deletes: 0,
+            run: Box::new(move || {
+                for name in db.list_keyspace_names() {
+                    let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
+                    let inner = keyspace.inner();
+                    // Fjall flushes keyspaces with unflushed rows itself once journals grow.
+                    if inner.tree.active_memtable().is_empty() && inner.sealed_memtable_count() == 0
+                    {
+                        checkpoint(&db, &keyspace)?;
+                    }
+                }
+                Ok(())
+            }),
+        };
+        if sender.send(job).is_err() {
+            self.release(SWEEP);
+        }
+    }
+
     fn release(&self, key_space: &str) {
         self.active
             .lock()
@@ -140,6 +180,18 @@ fn checkpoint(db: &OptimisticTxDatabase, keyspace: &OptimisticTxKeyspace) -> fja
     // After a conflict the other write is newer still, so the flush covers it as well.
     tx.commit()?.ok();
     keyspace.inner().rotate_memtable().map(drop)
+}
+
+/// Whether `count` journals call for a sweep, and the count to remember. A further sweep waits
+/// for another limit of journals, so a pin no sweep clears is retried rarely.
+pub(crate) fn sweep_due(count: usize, swept: usize) -> (bool, usize) {
+    if count < JOURNAL_LIMIT {
+        (false, 0)
+    } else if count >= swept + JOURNAL_LIMIT {
+        (true, count)
+    } else {
+        (false, swept)
+    }
 }
 
 pub(crate) fn compactable(disk_space: u64) -> bool {
@@ -177,7 +229,10 @@ pub(crate) fn run_job(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactionJob, Compactor, DELETE_THRESHOLD, MAX_KEYSPACE_BYTES, compactable};
+    use super::{
+        CompactionJob, Compactor, DELETE_THRESHOLD, JOURNAL_LIMIT, MAX_KEYSPACE_BYTES, compactable,
+        sweep_due,
+    };
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -185,6 +240,25 @@ mod tests {
         assert!(compactable(0));
         assert!(compactable(MAX_KEYSPACE_BYTES));
         assert!(!compactable(MAX_KEYSPACE_BYTES + 1));
+    }
+
+    #[test]
+    fn sweep_gate() {
+        assert_eq!(sweep_due(JOURNAL_LIMIT - 1, 0), (false, 0));
+        assert_eq!(sweep_due(JOURNAL_LIMIT, 0), (true, JOURNAL_LIMIT));
+        assert_eq!(
+            sweep_due(2 * JOURNAL_LIMIT - 1, JOURNAL_LIMIT),
+            (false, JOURNAL_LIMIT)
+        );
+        assert_eq!(
+            sweep_due(2 * JOURNAL_LIMIT, JOURNAL_LIMIT),
+            (true, 2 * JOURNAL_LIMIT)
+        );
+        assert_eq!(
+            sweep_due(3, 2 * JOURNAL_LIMIT),
+            (false, 0),
+            "a drop below resets"
+        );
     }
 
     #[test]

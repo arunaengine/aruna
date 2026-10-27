@@ -200,6 +200,22 @@ impl RangeIndexes {
             .await
     }
 
+    /// Live keys in a generation as of its last commit; a missing generation holds none.
+    pub async fn count(
+        self: &Arc<Self>,
+        set_id: Ulid,
+        range_id: Ulid,
+        generation: u64,
+    ) -> Result<u64, KeyIndexError> {
+        let dir = self.directory(set_id, range_id, generation);
+        self.blocking(move |indexes| match indexes.open_index(&dir, false) {
+            Ok(open) => Ok(open.reader.searcher().num_docs()),
+            Err(KeyIndexError::Missing(_)) => Ok(0),
+            Err(error) => Err(error),
+        })
+        .await
+    }
+
     /// Removes every generation of a range except `keep`.
     pub async fn prune(
         self: &Arc<Self>,

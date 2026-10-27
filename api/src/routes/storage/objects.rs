@@ -9,9 +9,13 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BucketInfo, bucket_permission_path, object_permission_path,
 };
-use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
+use aruna_core::structs::storage::distribution::{
+    DistributionBinding, DistributionMember, KeyRange,
+};
 use aruna_operations::auth::permission_rules::permission_rules;
-use aruna_operations::distribution::guard::{bound_view, lists_interval, local_fence};
+use aruna_operations::distribution::guard::{
+    bound_view, copies_interval, lists_interval, local_fence,
+};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::object::list::{
@@ -69,6 +73,9 @@ pub struct ObjectListQuery {
     pub lower: Option<String>,
     /// Exclusive upper key of one range; only for requests another member relays.
     pub upper: Option<String>,
+    /// Lists this member's copy of the named range while its coordinator cannot; only for
+    /// requests another member relays.
+    pub copy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, ToSchema)]
@@ -79,6 +86,10 @@ pub struct ObjectListResponse {
     pub prefixes: Vec<String>,
     /// Present while more entries follow.
     pub next_cursor: Option<String>,
+    /// Ranges a copy listed because their coordinator could not answer; the copy may be
+    /// behind, so their entries may be missing recent changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_ranges: Vec<String>,
 }
 
 /// Where a merged page continues: after a listed key or common prefix, or at the first key of
@@ -199,11 +210,16 @@ async fn local_part(
                 encode_resume(&Resume::After { key, group })
             })
             .transpose()?,
+        stale_ranges: Vec::new(),
     })
 }
 
-/// The relayed listing of one range on a holder.
-fn range_path(request: &ListRequest, cursor: Option<&str>, range: &KeyRange) -> String {
+/// The relayed listing of one range on a holder, or with `copy` on a copy of it.
+fn range_path(
+    request: &ListRequest,
+    cursor: Option<&str>,
+    (range, copy): (&KeyRange, bool),
+) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query.append_pair("limit", &request.limit.to_string());
     for (name, value) in [
@@ -212,6 +228,7 @@ fn range_path(request: &ListRequest, cursor: Option<&str>, range: &KeyRange) -> 
         ("cursor", cursor),
         ("lower", Some(range.lower.as_str())),
         ("upper", range.upper.as_deref()),
+        ("copy", copy.then_some("true")),
     ] {
         if let Some(value) = value {
             query.append_pair(name, value);
@@ -228,18 +245,18 @@ fn range_path(request: &ListRequest, cursor: Option<&str>, range: &KeyRange) -> 
 async fn remote_part(
     state: &ServerState,
     (binding, holders): (&DistributionBinding, Vec<aruna_core::NodeId>),
-    range: &KeyRange,
+    (range, copy): (&KeyRange, bool),
     bearer: Option<&ValidatedBearer>,
     (request, cursor): (&ListRequest, Option<String>),
 ) -> ServerResult<ObjectListResponse> {
-    let path = range_path(request, cursor.as_deref(), range);
+    let path = range_path(request, cursor.as_deref(), (range, copy));
     for node_id in holders {
         let forward = RestForward {
             set_id: binding.set_id,
             range_id: range.range_id,
             node_id,
         };
-        if let Some(page) = relay_get(state, &forward, &path, bearer).await? {
+        if let Some(page) = relay_get(state, &forward, &path, bearer, HeaderMap::new()).await? {
             return Ok(page);
         }
     }
@@ -315,24 +332,56 @@ async fn merged_page(
             cursor: None,
             ..request.clone()
         };
-        let part = match snapshot.lists_locally(binding.member_id, range, &fence) {
-            true => {
+        let remote = match snapshot.lists_locally(binding.member_id, range, &fence) {
+            true => None,
+            false => {
+                // The full position, so a common prefix is skipped as a whole.
+                let cursor = (start.clone())
+                    .map(|(key, group)| encode_resume(&Resume::After { key, group }))
+                    .transpose()?;
+                let others = |members: Vec<&DistributionMember>| {
+                    (members.into_iter())
+                        .filter(|member| member.member_id != binding.member_id)
+                        .map(|member| member.node_id)
+                        .collect()
+                };
+                let holders = others(snapshot.list_holder(range).into_iter().collect());
+                let asked = (&sub, cursor.clone());
+                match remote_part(state, (binding, holders), (range, false), bearer, asked).await {
+                    Ok(part) => Some(part),
+                    // The coordinator cannot answer, so this member's copy or another lists.
+                    Err(error) if error.status_code().is_server_error() => {
+                        page.stale_ranges.push(range.range_id.to_string());
+                        let here = (snapshot.record_holders(range).iter())
+                            .any(|member| member.member_id == binding.member_id);
+                        match here {
+                            true => None,
+                            false => {
+                                let copies = others(snapshot.copy_holders(range));
+                                let asked = (&sub, cursor);
+                                let part = remote_part(
+                                    state,
+                                    (binding, copies),
+                                    (range, true),
+                                    bearer,
+                                    asked,
+                                );
+                                Some(part.await?)
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        let part = match remote {
+            Some(part) => part,
+            None => {
                 let token = (start.as_ref())
                     .map(|(key, group)| resume_token(&request.bucket, key, group.as_deref()))
                     .transpose()?;
                 let bounds = Some((range.lower.clone(), range.upper.clone()));
                 local_part(state, info, &sub, (token, None), bounds).await?
-            }
-            false => {
-                // The full position, so a common prefix is skipped as a whole.
-                let cursor = (start
-                    .map(|(key, group)| encode_resume(&Resume::After { key, group })))
-                .transpose()?;
-                let holders = (snapshot.list_holder(range).into_iter())
-                    .filter(|member| member.member_id != binding.member_id)
-                    .map(|member| member.node_id)
-                    .collect();
-                remote_part(state, (binding, holders), range, bearer, (&sub, cursor)).await?
             }
         };
         let keys = (part.objects.iter().map(|object| &object.key)).chain(part.prefixes.iter());
@@ -389,7 +438,14 @@ async fn relayed_bounds(
         ));
     }
     let upper = query.upper.clone();
-    match lists_interval(state.get_ctx().as_ref(), binding, &lower, upper.as_deref()).await {
+    let context = state.get_ctx();
+    let held = match lists_interval(context.as_ref(), binding, &lower, upper.as_deref()).await {
+        Ok(false) if query.copy == Some(true) => {
+            copies_interval(context.as_ref(), binding, &lower, upper.as_deref()).await
+        }
+        held => held,
+    };
+    match held {
         Ok(true) => Ok(Some((lower, upper))),
         Ok(false) => Err(ServerError::ServiceUnavailableReason(
             "this member does not list the named key range".into(),
@@ -414,8 +470,11 @@ async fn relayed_bounds(
   listed by one of their holders, which checks the caller's token again on its own path. The
   merged page visits a bounded number of ranges; a range no holder answers fails the page with
   503 instead of returning an incomplete listing.
-- `lower` and `upper` name one key range and are accepted only on requests another member of
-  the distributed bucket relays."#,
+- A range is listed by its coordinator. While the coordinator cannot answer, a ready copy
+  lists it instead and `stale_ranges` names the range: the copy may be behind, so recent
+  changes may be missing.
+- `lower`, `upper` and `copy` name one key range and are accepted only on requests another
+  member of the distributed bucket relays."#,
     params(
         ("bucket" = String, Path, description = "Bucket name as used by the S3 surface"),
         ObjectListQuery
@@ -557,8 +616,12 @@ mod tests {
             replicas: Vec::new(),
         };
         assert_eq!(
-            range_path(&request, Some("q&r"), &range),
+            range_path(&request, Some("q&r"), (&range, false)),
             "/data/buckets/b/objects?limit=5&prefix=a+b%2F&cursor=q%26r&lower=m"
+        );
+        assert_eq!(
+            range_path(&request, None, (&range, true)),
+            "/data/buckets/b/objects?limit=5&prefix=a+b%2F&lower=m&copy=true"
         );
     }
 

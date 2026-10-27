@@ -8,10 +8,12 @@ use std::ops::Bound;
 use std::sync::{Arc, LazyLock};
 
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, SEARCH_INDEX_KEYSPACE};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
+use aruna_core::structs::storage::distribution::inventory::Position;
 use aruna_core::structs::storage::distribution::search::IndexState;
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
-use aruna_core::types::{Key, TxnId};
+use aruna_core::types::{GroupId, Key, TxnId};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use futures_util::future::join_all;
@@ -22,7 +24,8 @@ use super::{
     SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits, finish_read,
     load_live, start_read,
 };
-use crate::distribution::index_feed::state_key;
+use crate::auth::request_policy::PolicyEvaluator;
+use crate::distribution::index_feed::{range_progress, state_key};
 use crate::distribution::key_index::{KeyPage, KeyQuery, RangeIndexes};
 use crate::driver::DriverContext;
 use crate::replication::members::read_record;
@@ -39,11 +42,69 @@ pub(super) struct RangeSearch {
 }
 
 /// One page of a distributed bucket. Ranges are read in key order and continue by key; a
-/// missing or building index is reported as incomplete and never replaced by a scan.
+/// missing or building index is reported as incomplete, with its progress, and never replaced
+/// by a scan. A building index answers for the keys up to its cursor and is reported partial.
 pub(super) async fn search_ranges(
     context: &DriverContext,
     input: &SearchObjectsInput,
     search: RangeSearch,
+) -> Result<SearchNodePage, SearchObjectsError> {
+    let indexes = search.indexes.clone();
+    let mut unready = Vec::new();
+    let mut page = range_page(context, input, search, &mut unready).await?;
+    page.partial_ranges = partial_ranges(context, input, &unready).await?;
+    if let (Some(indexes), false) = (indexes, unready.is_empty()) {
+        let bucket = input.bucket.as_deref().unwrap_or_default();
+        // Progress is a hint, so a failed read leaves it out.
+        let progress = (range_progress(context, &indexes, bucket).await).unwrap_or_default();
+        page.index_progress = (unready.into_iter())
+            .filter_map(|(range_id, _)| Some((range_id, *progress.get(&range_id)?)))
+            .collect();
+    }
+    Ok(page)
+}
+
+/// The partial ranges of `unready` with the key each is indexed through, shown only if the
+/// caller may read it, so a partial range never names a hidden key.
+async fn partial_ranges(
+    context: &DriverContext,
+    input: &SearchObjectsInput,
+    unready: &[(Ulid, Option<String>)],
+) -> Result<Vec<(Ulid, Option<String>)>, SearchObjectsError> {
+    let bucket = input.bucket.as_deref().unwrap_or_default();
+    let mut evaluators = HashMap::new();
+    let mut partial = Vec::new();
+    for (range_id, through) in unready {
+        let Some(through) = through else {
+            continue;
+        };
+        let shown = readable(context, input, bucket, &mut evaluators, through).await?;
+        partial.push((*range_id, shown.then(|| through.clone())));
+    }
+    Ok(partial)
+}
+
+/// Whether the caller may read `key`, a building index's cursor.
+async fn readable(
+    context: &DriverContext,
+    input: &SearchObjectsInput,
+    bucket: &str,
+    evaluators: &mut HashMap<(RealmId, GroupId), PolicyEvaluator>,
+    key: &str,
+) -> Result<bool, SearchObjectsError> {
+    for hit in resolve_keys(context, input, bucket, &[key.to_string()]).await? {
+        if authorize(context, input, evaluators, &hit).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn range_page(
+    context: &DriverContext,
+    input: &SearchObjectsInput,
+    search: RangeSearch,
+    unready: &mut Vec<(Ulid, Option<String>)>,
 ) -> Result<SearchNodePage, SearchObjectsError> {
     let bucket = input.bucket.clone().unwrap_or_default();
     let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
@@ -83,11 +144,20 @@ pub(super) async fn search_ranges(
             limit: budget.saturating_sub(examined).max(1),
         };
         let found = search_chunk(context, &search, chunk, query).await?;
-        for found in found {
-            let Some(found) = found else {
+        for (range_id, found) in chunk.iter().zip(found) {
+            let Some((found, through)) = found else {
+                unready.push((*range_id, None));
                 incomplete += 1;
                 continue;
             };
+            // Coverage below a hidden cursor would reveal where the cursor is.
+            if let Some(through) = through
+                && (!ends_by(&end, &through)
+                    || !readable(context, input, &bucket, &mut evaluators, &through).await?)
+            {
+                unready.push((*range_id, Some(through)));
+                incomplete += 1;
+            }
             examined += found.examined;
             let (mut keys, last) = (found.keys, found.last);
             keys.retain(|key| input.key_match.matches(key, &input.query));
@@ -118,13 +188,14 @@ pub(super) async fn search_ranges(
     Ok(page(visible, None, incomplete, remote))
 }
 
-/// Queries the ready indexes of `chunk` at once; `None` for a range without one.
+/// Queries the indexes of `chunk` at once; `None` for a range without a searchable one. A
+/// building index is searched up to its cursor and returned with the key it covers through.
 async fn search_chunk(
     context: &DriverContext,
     search: &RangeSearch,
     chunk: &[Ulid],
     query: KeyQuery,
-) -> Result<Vec<Option<KeyPage>>, SearchObjectsError> {
+) -> Result<Vec<Option<(KeyPage, Option<String>)>>, SearchObjectsError> {
     let set_id = search.binding.set_id;
     let reads = (chunk.iter())
         .map(|range_id| {
@@ -137,15 +208,24 @@ async fn search_chunk(
     let states = finish_read(context, txn_id, states).await?;
     let searches = chunk.iter().zip(states).map(|(range_id, (_, state))| {
         let state = state.and_then(|value| IndexState::from_bytes(value.as_ref()).ok());
-        let (indexes, query) = (search.indexes.clone(), query.clone());
+        let (indexes, mut query) = (search.indexes.clone(), query.clone());
         async move {
-            let (Some(indexes), Some(IndexState::Ready { generation })) = (indexes, state) else {
-                return None;
+            let (generation, through) = match state? {
+                IndexState::Ready { generation } => (generation, None),
+                IndexState::Building {
+                    generation,
+                    cursor: Some(cursor),
+                } => {
+                    let through = Position::decode(&cursor).ok()?.key;
+                    if !ends_by(&query.end, &through) {
+                        query.end = Bound::Included(through.clone());
+                    }
+                    (generation, Some(through))
+                }
+                IndexState::Building { cursor: None, .. } => return None,
             };
-            indexes
-                .search(set_id, *range_id, generation, query)
-                .await
-                .ok()
+            let found = indexes?.search(set_id, *range_id, generation, query).await;
+            Some((found.ok()?, through))
         }
     });
     Ok(join_all(searches).await)
@@ -215,6 +295,12 @@ fn prefix_end(prefix: &str) -> Option<String> {
     None
 }
 
+/// Whether a query ending at `end` stays within `through`, the last key a building index holds
+/// every head up to.
+fn ends_by(end: &Bound<String>, through: &str) -> bool {
+    matches!(end, Bound::Included(end) | Bound::Excluded(end) if end.as_str() <= through)
+}
+
 fn overlaps(range: &KeyRange, start: &Bound<String>, end: &Bound<String>) -> bool {
     let after_start = match start {
         Bound::Included(key) | Bound::Excluded(key) => range
@@ -243,6 +329,8 @@ fn page(
         observed_at: std::time::SystemTime::now(),
         incomplete_ranges,
         remote_ranges,
+        index_progress: Vec::new(),
+        partial_ranges: Vec::new(),
     }
 }
 

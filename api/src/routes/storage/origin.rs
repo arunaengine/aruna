@@ -11,12 +11,15 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::identity::content_id;
 use aruna_core::structs::storage::distribution::ReadRoute;
+use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, VersionOrigin,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
-use aruna_operations::distribution::guard::{read_coordinator, route_read};
+use aruna_operations::distribution::guard::{
+    GuardError, copy_readers, read_coordinator, route_read,
+};
 use aruna_operations::distribution::resolve::{
     GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version,
 };
@@ -39,7 +42,7 @@ use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
 use crate::routes::storage::relay::{
-    self, RestForward, node_directed, node_read, relay_get, relayed_set,
+    self, RestForward, node_directed, node_read, relay_get, relayed_set, stale_miss,
 };
 use crate::server::state::ServerState;
 
@@ -149,6 +152,9 @@ pub struct OriginResponse {
     /// The content id of the bytes, from their BLAKE3; absent for versions not stored here
     /// as bytes, such as references.
     pub content_id: Option<String>,
+    /// Ranges a copy answered for because their coordinator could not; it may be behind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_ranges: Vec<String>,
 }
 
 fn version_id(version: &OriginVersion) -> String {
@@ -230,6 +236,7 @@ impl From<OriginView> for OriginResponse {
             database_entry: view.database_entry.map(|entry| entry.to_string()),
             identifiers: view.identifiers.into_iter().map(Into::into).collect(),
             content_id: view.content_hash.map(content_id),
+            stale_ranges: Vec::new(),
         }
     }
 }
@@ -254,6 +261,9 @@ impl From<OriginView> for OriginResponse {
   uploads and imports in place; `identifier` for each link the database's parser finds.
 - `database_entry` and `identifiers` come from the database entry that lists the bucket now,
   not from when the version was made; a removed entry gives none.
+- Without `version_id` the range's coordinator answers. While it cannot, a ready copy answers
+  and `stale_ranges` names the range, since the copy may be behind; a 404 from a copy has the
+  code `stale_not_found` and says the version may exist.
 
 **Limits**
 - One version per call; one point read. A member of a distributed bucket that holds no copy
@@ -278,7 +288,7 @@ impl From<OriginView> for OriginResponse {
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
-        (status = 404, description = "Bucket or version not found", body = ErrorResponse),
+        (status = 404, description = "Bucket or version not found, or not found on a copy that may be behind", body = ErrorResponse),
         (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -316,17 +326,40 @@ async fn origin_answer(
     ensure_permission(state, auth, path, Permission::READ).await?;
     relayed_set(&info, headers)?;
     // A member that holds no copy of the key's range asks a holder, which checks again. A copy
-    // may lag behind the current version, so only a pinned version comes from one.
+    // may lag behind the current version, so only a pinned version comes from one, unless the
+    // coordinator cannot answer; then a copy answers, marked stale.
+    let mut stale = None;
     if let Some(binding) = info.distribution.as_ref()
         && !headers.contains_key(RELAY_HOP_HEADER)
     {
         let context = state.get_ctx();
         if params.version_id.is_none() {
+            let path = origin_path(&bucket, &params);
             let coordinator = read_coordinator(context.as_ref(), binding, &params.key).await;
-            if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
-                let path = origin_path(&bucket, &params);
-                let target = (binding.set_id, range_id, node_id);
-                return relay_origin(state, target, vec![node_id], &path, bearer).await;
+            let asked = match coordinator.map_err(map_guard_error) {
+                Ok(None) => None,
+                Ok(Some((range_id, node_id))) => {
+                    let target = (binding.set_id, range_id, node_id);
+                    let path = (path.as_str(), HeaderMap::new());
+                    Some(relay_origin(state, target, vec![node_id], path, bearer.clone()).await)
+                }
+                Err(error) => Some(Err(error)),
+            };
+            match asked {
+                Some(Err(error)) if error.status_code().is_server_error() => {
+                    let readers = copy_readers(context.as_ref(), binding, &params.key).await;
+                    let (range_id, here, copies) = readers.map_err(map_guard_error)?;
+                    if !here && copies.is_empty() {
+                        return Err(error);
+                    }
+                    stale = Some(range_id);
+                    if !here {
+                        let target = (binding.set_id, range_id);
+                        return copy_origin(state, target, copies, &path, bearer).await;
+                    }
+                }
+                Some(answer) => return answer,
+                None => {}
             }
         }
         let route = route_read(context.as_ref(), binding, &params.key, false).await;
@@ -335,14 +368,23 @@ async fn origin_answer(
             holders.retain(|holder| *holder != state.get_node_id());
             holders.push(node_id);
             let target = (binding.set_id, range_id, node_id);
-            return relay_origin(
-                state,
-                target,
-                holders,
-                &origin_path(&bucket, &params),
-                bearer,
-            )
-            .await;
+            let path = origin_path(&bucket, &params);
+            return relay_origin(state, target, holders, (&path, HeaderMap::new()), bearer).await;
+        }
+    }
+    // A relayed current read sent here as coordinator is refused once this node is none.
+    if let Some(binding) = info.distribution.as_ref()
+        && params.version_id.is_none()
+        && headers.contains_key(RELAY_HOP_HEADER)
+        && !headers.contains_key(COPY_READ_HEADER)
+    {
+        let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
+        if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
+            return Err(map_guard_error(GuardError::NotCoordinator {
+                set_id: binding.set_id,
+                range_id,
+                node_id,
+            }));
         }
     }
     let view = read_origin(
@@ -355,21 +397,65 @@ async fn origin_answer(
     .await;
     // A copy may not have the version yet, so its miss goes on to the range's coordinator; a
     // miss on a range this node fenced is refused.
-    if let (Err(OriginError::VersionMissing), Some(binding)) = (&view, info.distribution.as_ref()) {
+    if let (Err(OriginError::VersionMissing), Some(binding), None) =
+        (&view, info.distribution.as_ref(), stale)
+    {
         let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)?
             && !headers.contains_key(RELAY_HOP_HEADER)
         {
             let path = origin_path(&bucket, &params);
             let target = (binding.set_id, range_id, node_id);
-            return relay_origin(state, target, vec![node_id], &path, bearer).await;
+            // While the coordinator cannot answer, this copy's miss stands, marked.
+            let asked = relay_origin(
+                state,
+                target,
+                vec![node_id],
+                (&path, HeaderMap::new()),
+                bearer,
+            );
+            return match asked.await {
+                Err(error) if error.status_code().is_server_error() => Err(stale_miss(range_id)),
+                answer => answer,
+            };
         }
     }
-    let view = view.map_err(|error| match error {
-        OriginError::BucketMissing | OriginError::VersionMissing => ServerError::NotFound,
-        OriginError::Storage(reason) => ServerError::InternalError(reason),
+    let view = view.map_err(|error| match (error, stale) {
+        (OriginError::VersionMissing, Some(range_id)) => stale_miss(range_id),
+        (OriginError::BucketMissing | OriginError::VersionMissing, _) => ServerError::NotFound,
+        (OriginError::Storage(reason), _) => ServerError::InternalError(reason),
     })?;
-    Ok(Json(view.into()))
+    let mut answer = OriginResponse::from(view);
+    answer.stale_ranges = stale.iter().map(ToString::to_string).collect();
+    Ok(Json(answer))
+}
+
+/// Asks the copies of a range whose coordinator cannot answer; the answer is marked stale and
+/// a miss says the version may exist.
+async fn copy_origin(
+    state: &ServerState,
+    (set_id, range_id): (Ulid, Ulid),
+    copies: Vec<aruna_core::NodeId>,
+    path: &str,
+    bearer: Option<ValidatedBearer>,
+) -> ServerResult<Json<OriginResponse>> {
+    let Some(last) = copies.last().copied() else {
+        return Err(ServerError::ServiceUnavailableReason(format!(
+            "neither the coordinator nor a copy of range {range_id} of distributed bucket \
+             {set_id} answered"
+        )));
+    };
+    let mut sent = HeaderMap::new();
+    sent.insert(COPY_READ_HEADER, http::HeaderValue::from_static("1"));
+    let target = (set_id, range_id, last);
+    match relay_origin(state, target, copies, (path, sent), bearer).await {
+        Ok(Json(mut answer)) => {
+            answer.stale_ranges = vec![range_id.to_string()];
+            Ok(Json(answer))
+        }
+        Err(ServerError::NotFound) => Err(stale_miss(range_id)),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -504,21 +590,15 @@ async fn global_origin(
         return origin_answer(state, auth, bearer, headers, found.bucket, params).await;
     }
     let path = origin_path(&found.bucket, &params);
-    for node_id in found.holders {
-        let forward = RestForward {
-            set_id: found.set_id,
-            range_id: Ulid::nil(),
-            node_id,
-        };
-        match relay_get(state, &forward, &path, bearer.as_ref()).await {
-            Ok(Some(answer)) => return Ok(Json(answer)),
-            Ok(None) | Err(ServerError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(ServerError::ServiceUnavailableReason(format!(
-        "no holder of version {version_id} answered"
-    )))
+    // Holders come coordinator first, so its miss decides.
+    let Some(coordinator) = found.holders.first().copied() else {
+        return Err(ServerError::ServiceUnavailableReason(format!(
+            "no holder of version {version_id} is known"
+        )));
+    };
+    let target = (found.set_id, Ulid::nil(), coordinator);
+    let sent = (path.as_str(), HeaderMap::new());
+    relay_origin(state, target, found.holders, sent, bearer).await
 }
 
 /// Asks `holders` in turn for the origin; a copy's miss goes on, the coordinator's decides.
@@ -526,7 +606,7 @@ async fn relay_origin(
     state: &ServerState,
     (set_id, range_id, coordinator): (Ulid, Ulid, aruna_core::NodeId),
     holders: Vec<aruna_core::NodeId>,
-    path: &str,
+    (path, sent): (&str, HeaderMap),
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Json<OriginResponse>> {
     for node_id in holders {
@@ -535,7 +615,7 @@ async fn relay_origin(
             range_id,
             node_id,
         };
-        match relay_get(state, &forward, path, bearer.as_ref()).await {
+        match relay_get(state, &forward, path, bearer.as_ref(), sent.clone()).await {
             Ok(Some(answer)) => return Ok(Json(answer)),
             Err(ServerError::NotFound) if node_id != coordinator => {}
             Ok(None) => {}

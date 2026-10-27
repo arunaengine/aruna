@@ -19,8 +19,8 @@ use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::distribution::delegation::{
-    COPY_CONTEXT_HEADER, CopyContext, DELEGATION_HEADER, Payload, TRAILER_BYTES, body_digest,
-    request_digest,
+    COPY_CONTEXT_HEADER, COPY_READ_HEADER, CopyContext, DELEGATION_HEADER, Payload, TRAILER_BYTES,
+    body_digest, request_digest,
 };
 use aruna_core::structs::storage::distribution::upload::UploadTag;
 use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
@@ -221,6 +221,7 @@ fn semantic(name: &str) -> bool {
     DIGEST_HEADERS.contains(&name)
         || PASSED_HEADERS.contains(&name)
         || name == COPY_CONTEXT_HEADER
+        || name == COPY_READ_HEADER
         || name == "accept"
         || name.starts_with("x-amz-meta-")
         || name.starts_with("x-amz-checksum-")
