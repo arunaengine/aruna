@@ -37,7 +37,6 @@ pub(crate) fn targets_change_dashboard(targets: &[DocumentTarget]) -> bool {
                 | DocumentTarget::MetadataCreateEvent { .. }
                 | DocumentTarget::MetadataDocumentLifecycle { .. }
                 | DocumentTarget::MetadataGraphLifecycle { .. }
-                | DocumentTarget::NodeUsage { .. }
         )
     })
 }
@@ -74,11 +73,6 @@ mod pure_tests {
             DocumentTarget::MetadataGraphLifecycle {
                 graph_iri: "https://example.test/graph".to_string(),
             },
-            DocumentTarget::NodeUsage {
-                realm_id,
-                node_id,
-                group_id: None,
-            },
         ];
         assert!(
             relevant
@@ -93,6 +87,12 @@ mod pure_tests {
                 watch_id: Ulid::from_parts(7, 1),
             },
             DocumentTarget::NodeInfo { realm_id, node_id },
+            // Usage snapshots republish often; the dashboard polls usage on its own.
+            DocumentTarget::NodeUsage {
+                realm_id,
+                node_id,
+                group_id: None,
+            },
         ];
         assert!(!targets_change_dashboard(&ignored));
     }
