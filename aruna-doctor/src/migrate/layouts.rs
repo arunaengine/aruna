@@ -7,8 +7,11 @@ use super::session_refs::{self, Layout};
 use super::vault::Moves;
 use super::{Rewrites, decode_error, relaid, rewrite_rows};
 use crate::explorer::ExplorerError;
+use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
 use aruna_core::structs::storage::blob::BlobCleanupWork;
-use aruna_core::structs::storage::usage::USAGE_PROGRESS_KEY;
+use aruna_core::structs::storage::usage::{
+    NodeUsageSnapshot, USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX, USAGE_PROGRESS_KEY, UsageCounters,
+};
 use aruna_operations::replication::queue::{BlobJobRecord, blob_job_key};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use std::collections::BTreeMap;
@@ -164,6 +167,31 @@ pub(super) fn rebuild_progress(
         .map(|_| USAGE_PROGRESS_KEY.to_vec())
         .into_iter()
         .collect())
+}
+
+/// Usage snapshots from before the replica share, their last value, which they gain as zero; a
+/// peer's own publish replaces it.
+pub(super) fn snapshot_rows<'k>(
+    db: &OptimisticTxDatabase,
+    keyspace: &'k OptimisticTxKeyspace,
+) -> Result<KeyspaceRows<'k>, ExplorerError> {
+    let share = postcard::to_allocvec(&UsageCounters::default())
+        .map_err(|error| decode_error(NODE_STATS_KEYSPACE, &[], error))?;
+    let mut rows = Vec::new();
+    for prefix in [USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX] {
+        for entry in db.read_tx().prefix(keyspace, prefix) {
+            let (key, value) = entry.into_inner()?;
+            if NodeUsageSnapshot::from_bytes(&value).is_ok() {
+                continue;
+            }
+            let bytes = [value.as_ref(), &share].concat();
+            if let Err(error) = NodeUsageSnapshot::from_bytes(&bytes) {
+                return Err(decode_error(NODE_STATS_KEYSPACE, &key, error));
+            }
+            rows.push((key.to_vec(), bytes));
+        }
+    }
+    Ok((keyspace, NODE_STATS_KEYSPACE, rows))
 }
 
 /// IRI index rows in the old key layout; the index rebuild at startup writes them anew.
@@ -335,5 +363,45 @@ mod tests {
         assert!(!rows.contains_key(USAGE_PROGRESS_KEY));
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert!(again.stale_rows_deleted.is_empty());
+    }
+
+    #[test]
+    fn pads_usage_snapshots() {
+        // Snapshots from before the replica share gain a zero one; other usage rows stay.
+        use aruna_core::structs::storage::usage::{
+            UsageCounters, usage_global_key, usage_snapshot_key,
+        };
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let snapshot = NodeUsageSnapshot {
+            node_id,
+            counters: UsageCounters {
+                objects: 3,
+                ..Default::default()
+            },
+            replicas: UsageCounters::default(),
+        };
+        let current = snapshot.to_bytes().unwrap();
+        let share = UsageCounters::default().to_bytes().unwrap();
+        let old = current[..current.len() - share.len()].to_vec();
+        let global = usage_global_key(node_id);
+        let group = usage_snapshot_key(Ulid::from_bytes([6; 16]), node_id);
+        let entries: Vec<(&[u8], Vec<u8>)> = vec![
+            (global.as_slice(), old.clone()),
+            (group.as_slice(), old),
+            (b"dirty/global", vec![7; 16]),
+        ];
+        write(&path, NODE_STATS_KEYSPACE, entries);
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(output.relaid_rows[NODE_STATS_KEYSPACE], 2);
+        let rows = read(&path, NODE_STATS_KEYSPACE);
+        assert_eq!(rows[&global], current);
+        assert_eq!(rows[&group], current);
+        assert_eq!(rows[b"dirty/global".as_slice()], vec![7; 16]);
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert!(again.relaid_rows.is_empty());
     }
 }

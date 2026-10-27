@@ -18,12 +18,12 @@ use aruna_core::keyspaces::{
     FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
     FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE,
     JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
-    NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
-    ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE,
-    SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
-    SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
-    USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE,
+    NODE_STATS_KEYSPACE, NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, QUARANTINE_USAGE_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE,
+    REPLICATION_OBLIGATION_KEYSPACE, ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE,
+    SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE,
+    STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -245,6 +245,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let reference_rows =
         db.keyspace(CONNECTOR_REFERENCE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let root_rows = db.keyspace(ROOT_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let snapshot_rows = db.keyspace(NODE_STATS_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
     let records =
@@ -340,6 +341,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             .rows,
         ),
         padded::<StoredObject>(&db, &object_rows, LOCAL_OBJECTS, git::LAYOUT)?,
+        layouts::snapshot_rows(&db, &snapshot_rows)?,
     ];
     let (replication, renamed) =
         layouts::replication_jobs(&db, &replication_rows, REPLICATION_JOB_KEYSPACE)?;
@@ -631,8 +633,8 @@ fn rewrite_rows(
 }
 
 /// Realm configuration documents gained the catch-up wait, the session idle timeout, federation
-/// settings, portal features and the database list as their last values. Postcard is positional,
-/// so appending the defaults an older row lacks re-encodes it.
+/// settings, portal features and the database list as their last values; quota settings gained
+/// `count_replicas`. Postcard is positional, so an older row is read in its layout and re-encoded.
 fn realm_configs(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
@@ -652,8 +654,11 @@ fn realm_configs(
     Ok(Rewrites { scanned, rows })
 }
 
-/// Appends the trailing defaults an older row lacks, shortest suffix first, so
-/// a row missing only the newest value keeps the one it already has.
+/// Quota settings before `count_replicas`, which reads as unset.
+const QUOTA: Layout = &[("QuotaConfig", 9), ("GroupQuotaOverride", 3)];
+
+/// Appends the trailing defaults an older row lacks, shortest suffix first, so a row missing only
+/// the newest value keeps the one it already has, and reads it in the older quota layout.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
     let databases = postcard::to_allocvec(&Vec::<DatabaseEntry>::new()).ok()?;
     let features = postcard::to_allocvec(&BTreeMap::<String, bool>::new()).ok()?;
@@ -664,11 +669,18 @@ fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
     let federation_on = [federation.as_slice(), &features_on].concat();
     let idle_on = [idle.as_slice(), &federation_on].concat();
     let both = [catch_up.as_slice(), &idle_on].concat();
-    for suffix in [databases, features_on, federation_on, idle_on, both] {
+    for suffix in [
+        Vec::new(),
+        databases,
+        features_on,
+        federation_on,
+        idle_on,
+        both,
+    ] {
         let mut bytes = value.to_vec();
         bytes.extend_from_slice(&suffix);
-        if RealmConfigDocument::from_bytes(&bytes).is_ok() {
-            return Some(bytes);
+        if let Ok(config) = session_refs::decode::<RealmConfigDocument>(&bytes, QUOTA) {
+            return postcard::to_allocvec(&config).ok();
         }
     }
     None
@@ -887,7 +899,7 @@ mod tests {
         SubmissionId,
     };
     use aruna_core::structs::identity::database::DatabaseEntry;
-    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+    use aruna_core::structs::identity::realm::{GroupQuotaOverride, RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -1071,18 +1083,36 @@ mod tests {
     #[test]
     fn rewrites_realm_configs() {
         // Legacy documents decode with default timeouts, no federation settings, no portal
-        // features and no databases. Current documents remain byte-identical.
+        // features, no databases and unset `count_replicas`. Current documents remain
+        // byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
-        let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
+        let mut document = RealmConfigDocument::new(REALM, Vec::new(), 3);
+        document.quota.group_overrides.push(GroupQuotaOverride {
+            group_id: Ulid::from_bytes([5; 16]),
+            quota_bytes: Some(9),
+            grace_factor_percent: None,
+            count_replicas: None,
+        });
         let current = postcard::to_allocvec(&document).unwrap();
+        // Before `count_replicas` the quota and its override lacked their last byte.
+        let quota = postcard::to_allocvec(&document.quota).unwrap();
+        let over = postcard::to_allocvec(&document.quota.group_overrides[0]).unwrap();
+        let start = current
+            .windows(quota.len())
+            .position(|w| w == quota)
+            .unwrap();
+        let at = quota.windows(over.len()).position(|w| w == over).unwrap();
+        let mut legacy = current.clone();
+        legacy.remove(start + quota.len() - 1);
+        legacy.remove(start + at + over.len() - 1);
         // Every legacy layout ends where the fields it lacks would start.
         let features = postcard::to_allocvec(&BTreeMap::<String, bool>::new()).unwrap();
         let federation = postcard::to_allocvec(&None::<super::FederationSettings>).unwrap();
         let idle = postcard::to_allocvec(&IDLE_AFTER_MS).unwrap();
         let catch_up = postcard::to_allocvec(&CATCH_UP_MS).unwrap();
         let databases = postcard::to_allocvec(&Vec::<DatabaseEntry>::new()).unwrap();
-        let listless = current[..current.len() - databases.len()].to_vec();
+        let listless = legacy[..legacy.len() - databases.len()].to_vec();
         let featureless = listless[..listless.len() - features.len()].to_vec();
         let unfederated = featureless[..featureless.len() - federation.len()].to_vec();
         let one_missing = unfederated[..unfederated.len() - idle.len()].to_vec();
@@ -1096,6 +1126,7 @@ mod tests {
                 (b"main", unfederated),
                 (b"prior", featureless),
                 (b"latest", listless),
+                (b"quota", legacy),
                 (b"new", current.clone()),
             ],
         );
@@ -1104,10 +1135,11 @@ mod tests {
 
         assert_eq!(
             (output.realm_configs_scanned, output.realm_configs_rewritten),
-            (6, 5)
+            (7, 6)
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
+        assert_eq!(rows[b"quota".as_slice()], current);
         assert_eq!(rows[b"main".as_slice()], current);
         assert_eq!(rows[b"prior".as_slice()], current);
         assert_eq!(rows[b"latest".as_slice()], current);
