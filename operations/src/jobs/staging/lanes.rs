@@ -611,6 +611,7 @@ mod tests {
             deletes: Vec::new(),
             now: std::time::SystemTime::now(),
             database: None,
+            ranges: None,
         }
     }
 
@@ -837,6 +838,48 @@ mod tests {
         assert_eq!(result.err(), Some(PageImportError::ClaimLost));
     }
 
+    // A page holding the turn of a range that split before it ran takes the turn of the range
+    // its keys now lie in, so it never commits while another job holds that turn.
+    #[tokio::test]
+    async fn split_range_turn() {
+        use crate::driver::drive;
+        let (ctx, spec, _dir) = job_context(UNUSED.to_string(), &[("a", "ta")], None).await;
+        let (set_id, child) = distribute(&ctx, &spec).await;
+        let input = page_input(&ctx, &spec).await;
+        let held = ctx
+            .range_turns
+            .take(&BTreeSet::from([(set_id, child)]))
+            .await;
+        let (inside, ran) = (AtomicBool::new(true), tokio::sync::Notify::new());
+        let split = BTreeSet::from([(set_id, Ulid::from_bytes([1; 16]))]);
+
+        let mut runs = 0;
+        let page = retry_page(&ctx, (input, &split), |input| {
+            runs += 1;
+            let (inside, ran, ctx) = (&inside, &ran, &ctx);
+            async move {
+                let result = drive(PageImportOperation::new(input), &ctx.driver).await;
+                let other = inside.load(Ordering::SeqCst);
+                assert!(result.is_err() || !other, "committed in another job's turn");
+                ran.notify_one();
+                result
+            }
+        });
+        // The other job ends its page only after this page's first run.
+        let other = async {
+            ran.notified().await;
+            inside.store(false, Ordering::SeqCst);
+            drop(held);
+        };
+        let both = async { tokio::join!(page, other) };
+        // A generous cap turns a lost turn into a failure instead of a hang.
+        let ran = tokio::time::timeout(std::time::Duration::from_secs(120), both).await;
+
+        let (result, ()) = ran.expect("the page ran");
+        assert_eq!(runs, 2, "the first run ended at the moved range");
+        assert_eq!(result.ok().map(|result| result.registered), Some(2));
+    }
+
     /// A second claimed job of `spec` on the node of `ctx`, sharing its storage and turns.
     async fn second_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobContext {
         use crate::jobs::executor::ProgressReporter;
@@ -876,6 +919,7 @@ mod tests {
         use aruna_core::keyspaces::{
             KEY_SAMPLE_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
         };
+        use aruna_core::structs::storage::distribution::KeyRange;
         use aruna_core::structs::storage::distribution::accounting::{
             RangeCounters, SAMPLE_SIZE, SampleEntry, sample_count_key,
         };
@@ -885,8 +929,16 @@ mod tests {
         store_record(handle, set_id, bytes).await;
         let mut bucket = super::super::pinned_bucket(ctx, spec).await.ok().unwrap();
         bucket.distribution = Some(binding(&snapshot, 2, 5));
-        let range_id = Ulid::from_bytes([1; 16]);
-        install(handle, set_id, &[range(1, "", None)]).await;
+        let range_id = snapshot.range_for("ta/").unwrap().range_id;
+        install(
+            handle,
+            set_id,
+            &[KeyRange {
+                range_id,
+                ..range(1, "", None)
+            }],
+        )
+        .await;
         let full = RangeCounters {
             sampled: i128::from(SAMPLE_SIZE),
             ..RangeCounters::default()

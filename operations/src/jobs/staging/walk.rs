@@ -838,6 +838,7 @@ async fn import_page(
         deletes: rows.deletes,
         now: SystemTime::now(),
         database,
+        ranges: None,
     };
     let result = {
         // Listing and the reads above run in parallel; the page transactions take turns.
@@ -865,11 +866,11 @@ async fn import_page(
 }
 
 /// Runs the page transaction of `input` in the turns of `ranges`, again while its commit
-/// conflicts, at most [`PAGE_ATTEMPTS`] times. Each run is a new transaction that checks every
-/// guard again.
+/// conflicts or its ranges moved, at most [`PAGE_ATTEMPTS`] times. Each run is a new
+/// transaction that checks every guard again.
 pub(super) async fn retry_page<R, F>(
     ctx: &JobContext,
-    (input, ranges): (PageImportInput, &BTreeSet<(Ulid, Ulid)>),
+    (mut input, ranges): (PageImportInput, &BTreeSet<(Ulid, Ulid)>),
     mut run: R,
 ) -> Result<PageImportResult, PageImportError>
 where
@@ -877,10 +878,23 @@ where
     F: Future<Output = Result<PageImportResult, PageImportError>>,
 {
     // Pages of other jobs into these ranges wait here instead of conflicting on their rows.
-    let _turns = ctx.range_turns.take(ranges).await;
+    let mut turns = ctx.range_turns.take(ranges).await;
+    let set_id = ranges.first().map(|(set_id, _)| *set_id);
+    input.ranges = set_id.map(|_| ranges.iter().map(|(_, range)| *range).collect());
     let mut attempts = 1;
     loop {
         let result = run(input.clone()).await;
+        if let (Err(PageImportError::RangesMoved(moved)), Some(set_id)) = (&result, set_id)
+            && attempts < PAGE_ATTEMPTS
+        {
+            // A range split or merged meanwhile: the page runs again in the turns of the new ones.
+            drop(turns);
+            let moved_turns = moved.iter().map(|range| (set_id, *range)).collect();
+            turns = ctx.range_turns.take(&moved_turns).await;
+            input.ranges = Some(moved.clone());
+            attempts += 1;
+            continue;
+        }
         let conflict = PageImportError::Storage(StorageError::TransactionConflict);
         if result.as_ref().err() != Some(&conflict) || attempts >= PAGE_ATTEMPTS {
             return result;

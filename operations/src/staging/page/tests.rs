@@ -139,6 +139,7 @@ fn input(entries: Vec<PageEntry>) -> PageImportInput {
         deletes: Vec::new(),
         now: SystemTime::UNIX_EPOCH + Duration::from_secs(2_000),
         database: None,
+        ranges: None,
     }
 }
 

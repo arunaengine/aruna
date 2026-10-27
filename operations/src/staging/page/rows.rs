@@ -42,7 +42,7 @@ use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
@@ -94,6 +94,8 @@ pub struct PageImportInput {
     pub now: SystemTime,
     /// The bucket's database list entry at registration, kept in every version's origin.
     pub database: Option<Ulid>,
+    /// The ranges whose turns the page holds; a page whose keys lie in others ends unwritten.
+    pub ranges: Option<BTreeSet<Ulid>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -165,6 +167,8 @@ pub enum PageImportError {
     },
     #[error("page import finished without output")]
     NotFinished,
+    #[error("the page's keys lie in other ranges than the turns it holds")]
+    RangesMoved(BTreeSet<Ulid>),
 }
 
 impl From<StorageReadError> for PageImportError {

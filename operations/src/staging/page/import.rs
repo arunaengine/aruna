@@ -21,6 +21,8 @@ use aruna_core::structs::storage::blob::CurrentVersionPointer;
 use aruna_core::structs::sync_relationship_prefix;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
+use std::collections::BTreeSet;
+use ulid::Ulid;
 
 pub use crate::staging::page::rows::{
     PageEntry, PageImportError, PageImportInput, PageImportResult, PageImportState,
@@ -239,8 +241,19 @@ impl PageImportOperation {
                     .entries
                     .iter()
                     .map(|entry| entry.target_key.as_str());
-                (guards.epochs, guards.search) =
+                let (routes, search) =
                     write_epochs(binding, keys, record.as_deref(), fence.as_deref())?;
+                let resolved: BTreeSet<Ulid> = routes.iter().map(|(range, _)| *range).collect();
+                if self
+                    .input
+                    .ranges
+                    .as_ref()
+                    .is_some_and(|held| *held != resolved)
+                {
+                    return Err(PageImportError::RangesMoved(resolved));
+                }
+                guards.epochs = routes.into_iter().map(|(_, epoch)| epoch).collect();
+                guards.search = search;
                 self.read_secret()
             }
             (

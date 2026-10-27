@@ -185,20 +185,20 @@ pub fn write_targets<'a>(
     Ok((routes.map(|key| route_in(binding, (&view, &fence), key, false))).collect())
 }
 
-/// [`write_epoch`] of each of `keys`, decoding the record and the fence once, and whether the
-/// set keeps a search index.
+/// The range and [`write_epoch`] of each of `keys`, decoding the record and the fence once, and
+/// whether the set keeps a search index.
 pub fn write_epochs<'a>(
     binding: &DistributionBinding,
     keys: impl IntoIterator<Item = &'a str>,
     record: Option<&[u8]>,
     fence: Option<&[u8]>,
-) -> Result<(Vec<OriginalEpoch>, bool), GuardError> {
+) -> Result<(Vec<(Ulid, OriginalEpoch)>, bool), GuardError> {
     let view = bound_record(binding, record)?;
     let fence = LocalFence::decode(fence)?;
     let epochs =
         keys.into_iter().map(
             |key| match route_in(binding, (&view, &fence), key, false)? {
-                WriteRoute::Local { epoch, .. } => Ok(epoch),
+                WriteRoute::Local { range_id, epoch } => Ok((range_id, epoch)),
                 WriteRoute::Forward {
                     range_id, node_id, ..
                 } => Err(GuardError::NotCoordinator {
