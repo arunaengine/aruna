@@ -2492,58 +2492,91 @@ mod tests {
         }
     }
 
-    // Replicas count toward a quota only by the group's setting; the own snapshot adds its
-    // replica share, never its counters a second time.
-    #[test]
-    fn gate_counts_replicas() {
+    /// Drives a gate of a two-node realm: `live` local logical bytes, then each node's snapshot
+    /// as (counters, replicas), the local one first, and whether the group is dirty here.
+    fn run_gate(
+        count_replicas: bool,
+        (ceiling, delta): (u64, u64),
+        live: u64,
+        shares: [(u64, u64); 2],
+        dirty: bool,
+    ) -> QuotaGate {
         use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
-        let (local, remote) = (node(1), node(2));
+        let nodes = [node(1), node(2)];
         let group_id = Ulid::from_bytes([2; 16]);
         let realm_id = RealmId([4; 32]);
         let txn_id = Ulid::from_bytes([1; 16]);
-        let read = |value: Vec<u8>| {
+        let read = |value: Option<Vec<u8>>| {
             Event::Storage(StorageEvent::ReadResult {
                 key: Key::from(b"row".to_vec()),
-                value: Some(value.into()),
+                value: value.map(Into::into),
             })
         };
-        let snapshot = |node_id: NodeId, counters, replicas| {
-            let snapshot = NodeUsageSnapshot {
-                node_id,
-                counters: logical(counters),
-                replicas: logical(replicas),
-            };
-            let key = Key::from(usage_snapshot_key(group_id, node_id));
-            (key, Value::from(snapshot.to_bytes().unwrap()))
-        };
-        for (count_replicas, projected) in [(false, 61), (true, 151)] {
-            let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-            config.nodes = [local, remote]
-                .map(|node_id| RealmNode {
-                    node_id: node_id.to_string(),
-                    kind: RealmNodeKind::Management,
-                })
-                .to_vec();
-            config.quota.count_replicas = count_replicas;
-            let mut gate = QuotaGate::new_for_realm(1_000, 1, group_id, local, realm_id);
-            gate.start(txn_id);
-            let no_marker = Event::Storage(StorageEvent::ReadResult {
-                key: Key::from(USAGE_REBUILD_KEY.to_vec()),
-                value: None,
-            });
-            gate.step(no_marker, txn_id).unwrap();
-            gate.step(read(postcard::to_allocvec(&config).unwrap()), txn_id)
-                .unwrap();
-            gate.step(read(logical(100).to_bytes().unwrap()), txn_id)
-                .unwrap();
-            let values = vec![snapshot(local, 100, 40), snapshot(remote, 50, 50)];
-            let scanned = Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after: None,
-            });
-            assert_eq!(gate.step(scanned, txn_id).unwrap(), None);
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.nodes = nodes
+            .map(|node_id| RealmNode {
+                node_id: node_id.to_string(),
+                kind: RealmNodeKind::Management,
+            })
+            .to_vec();
+        config.quota.count_replicas = count_replicas;
+        let mut gate = QuotaGate::new_for_realm(ceiling, delta, group_id, nodes[0], realm_id);
+        gate.start(txn_id);
+        gate.step(read(None), txn_id).unwrap();
+        gate.step(read(Some(postcard::to_allocvec(&config).unwrap())), txn_id)
+            .unwrap();
+        gate.step(read(Some(logical(live).to_bytes().unwrap())), txn_id)
+            .unwrap();
+        let values = (nodes.into_iter().zip(shares))
+            .map(|(node_id, (counters, replicas))| {
+                let snapshot = NodeUsageSnapshot {
+                    node_id,
+                    counters: logical(counters),
+                    replicas: logical(replicas),
+                };
+                let key = Key::from(usage_snapshot_key(group_id, node_id));
+                (key, Value::from(snapshot.to_bytes().unwrap()))
+            })
+            .collect();
+        let scanned = Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        });
+        if gate.step(scanned, txn_id).unwrap().is_some() {
+            let marker = dirty.then(|| vec![1]);
+            assert_eq!(gate.step(read(marker), txn_id).unwrap(), None);
+        }
+        gate
+    }
+
+    // Replicas count toward a quota only by the group's setting; the own snapshot adds its
+    // replica share, never its counters a second time, and no share while the group is dirty.
+    #[test]
+    fn gate_counts_replicas() {
+        let cases = [(false, false, 61), (false, true, 101), (true, false, 151)];
+        for (count_replicas, dirty, projected) in cases {
+            let gate = run_gate(
+                count_replicas,
+                (1_000, 1),
+                100,
+                [(100, 40), (50, 50)],
+                dirty,
+            );
             assert_eq!(gate.projected_usage(), projected);
         }
+    }
+
+    // Another node owns 100 B and this node just purged its 100 B copy: until the next publish
+    // its stale share must not hide the owner's bytes from a 100 B ceiling.
+    #[test]
+    fn stale_share_refused() {
+        let gate = run_gate(false, (100, 100), 0, [(100, 100), (100, 0)], true);
+        assert!(gate.is_exceeded());
+        let published = run_gate(false, (100, 100), 0, [(0, 0), (100, 0)], false);
+        assert!(
+            published.is_exceeded(),
+            "after the publish the owner's bytes still count"
+        );
     }
 
     // Realm totals leave out the copies of distributed ranges, the own node's included, while
