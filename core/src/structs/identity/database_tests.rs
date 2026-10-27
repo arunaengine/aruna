@@ -231,3 +231,64 @@ fn merged_list_bounded() {
     );
     assert_eq!(validate_databases(&list), Ok(()));
 }
+
+#[test]
+fn parser_register_merges() {
+    // A parser is its own register: set, clear and concurrent sets never touch the entry.
+    use crate::admin_documents::{AdminDocumentClock, AdminDocumentOperation};
+    use crate::structs::identity::identifier::{
+        IdentifierParser, IdentifierRule, IdentifierTarget,
+    };
+    use crate::tests::reducer::{node, realm_config_event, realm_config_state};
+    let parser = |name: &str| IdentifierParser {
+        rules: vec![IdentifierRule {
+            name: name.to_string(),
+            pattern: "(?P<id>SAMN\\d+)".to_string(),
+            target: IdentifierTarget::Key,
+            url_template: "https://example.org/{id}".to_string(),
+        }],
+    };
+    let id = entry(1).entry_id;
+    let set = |seed, origin, parser| {
+        let op = AdminDocumentOperation::DatabaseParserSet {
+            entry_id: id,
+            parser,
+        };
+        realm_config_event(seed, node(origin), 1, AdminDocumentClock::default(), op)
+    };
+    let mut state = realm_config_state();
+    let mark = AdminDocumentOperation::DatabaseSet {
+        entry: entry(1),
+        predecessor: None,
+        consent: None,
+    };
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            mark,
+        ))
+        .unwrap();
+    state.apply(&set(2, 2, Some(parser("A")))).unwrap();
+    assert_eq!(state.database_parser(id), Some(parser("A")));
+    assert_eq!(state.database_entries(), vec![entry(1)]);
+
+    let mut cleared = state.clone();
+    let observed = AdminDocumentClock::default().with_observed(node(2), 1);
+    let clear = AdminDocumentOperation::DatabaseParserSet {
+        entry_id: id,
+        parser: None,
+    };
+    cleared
+        .apply(&realm_config_event(3, node(2), 2, observed, clear))
+        .unwrap();
+    assert_eq!(cleared.database_parser(id), None);
+    assert_eq!(cleared.database_entries(), vec![entry(1)]);
+
+    // Two curators set different parsers without seeing each other: no parser applies.
+    state.apply(&set(4, 3, Some(parser("B")))).unwrap();
+    assert_eq!(state.database_parser(id), None);
+    assert_eq!(state.database_entries(), vec![entry(1)]);
+}

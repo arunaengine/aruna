@@ -3185,3 +3185,134 @@ async fn database_applies_inbound() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn parser_set_admission() {
+    // A replicated parser change needs a curator or owner group admin and a valid parser.
+    use aruna_core::structs::identity::database::{DatabaseEntry, DatabaseTarget};
+    use aruna_core::structs::identity::identifier::{
+        IdentifierParser, IdentifierRule, IdentifierTarget,
+    };
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([63; 32]);
+    let group_id = Ulid::from_parts(1_660, 1);
+    let curator = UserId::local(Ulid::from_parts(1_661, 1), realm_id);
+    let outsider = UserId::local(Ulid::from_parts(1_662, 1), realm_id);
+    let actor = test_actor(14, curator, realm_id);
+    let entry = DatabaseEntry {
+        entry_id: Ulid::from_parts(1_663, 1),
+        dataset_id: Ulid::from_parts(1_664, 1),
+        target: DatabaseTarget::Distributed {
+            set_id: Ulid::from_parts(1_665, 1),
+        },
+        owner_group: group_id,
+    };
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(actor.node_id, RealmNodeKind::Management);
+    config.databases = vec![entry.clone()];
+    let role_id = Ulid::from_parts(1_666, 1);
+    let realm_auth = RealmAuthorizationDocument {
+        realm_id,
+        roles: HashMap::from([(
+            role_id,
+            Role {
+                role_id,
+                name: "curator".to_string(),
+                permissions: HashMap::from([(
+                    format!("/{realm_id}/admin/databases"),
+                    Permission::WRITE,
+                )]),
+                assigned_users: HashSet::from([curator]),
+            },
+        )]),
+        operation_restrictions: Default::default(),
+    };
+    let group_auth = GroupAuthorizationDocument {
+        group_id,
+        policies: Vec::new(),
+        roles: HashMap::new(),
+    };
+    batch_write_to(
+        &storage,
+        vec![
+            target_write_entry(
+                DocumentTarget::RealmConfig { realm_id },
+                config.to_bytes(&actor).expect("config serializes").into(),
+            ),
+            target_write_entry(
+                DocumentTarget::RealmAuthorization { realm_id },
+                realm_auth.to_bytes(&actor).expect("auth serializes").into(),
+            ),
+            target_write_entry(
+                DocumentTarget::GroupAuthorization { group_id },
+                group_auth.to_bytes(&actor).expect("auth serializes").into(),
+            ),
+        ],
+    )
+    .await
+    .expect("realm state writes");
+    let parser = |pattern: &str| IdentifierParser {
+        rules: vec![IdentifierRule {
+            name: "BioSample".to_string(),
+            pattern: pattern.to_string(),
+            target: IdentifierTarget::Key,
+            url_template: "https://www.ebi.ac.uk/biosamples/samples/{id}".to_string(),
+        }],
+    };
+    let target = DocumentTarget::RealmConfig { realm_id };
+    let placement = admin_test_placement();
+    let topic = target.sync_topic_id(realm_id, &placement);
+    let event = |seed, user, pattern: &str| {
+        test_admin_event(
+            Ulid::from_parts(1_670 + seed, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &test_actor(14, user, realm_id),
+            seed,
+            AdminDocumentOperation::DatabaseParserSet {
+                entry_id: entry.entry_id,
+                parser: Some(parser(pattern)),
+            },
+        )
+    };
+    let valid = r"(?P<id>SAMN\d+)";
+    let cases = [
+        (event(1, curator, valid), true),
+        // A management node relays it, but its actor holds neither right.
+        (event(2, outsider, valid), false),
+        (event(3, curator, r"(?P<name>SAMN\d+)"), false),
+    ];
+    for (event, accept) in cases {
+        let validation = validate_admin_event(
+            &storage,
+            topic,
+            ::irokle::actor_id_for(topic, node_to_peer(&actor.node_id)),
+            &target,
+            &event,
+            realm_id,
+            &placement,
+            &sign_as_origin(&event, &placement),
+            &mut ConfigValidationCache::default(),
+        )
+        .await
+        .expect("validation runs");
+        if accept {
+            assert!(
+                matches!(validation, AdminEventValidation::Accepted),
+                "{validation:?}"
+            );
+            apply_admin_operation(&storage, target.clone(), event)
+                .await
+                .expect("parser change applies");
+        } else {
+            assert!(
+                matches!(validation, AdminEventValidation::Rejected(_)),
+                "{validation:?}"
+            );
+        }
+    }
+    let state = read_reducer_state(&storage, &AdminDocumentTarget::RealmConfig { realm_id })
+        .await
+        .expect("state reads")
+        .expect("state exists");
+    assert_eq!(state.database_parser(entry.entry_id), Some(parser(valid)));
+}

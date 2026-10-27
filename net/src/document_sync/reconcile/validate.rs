@@ -900,7 +900,7 @@ pub(in crate::document_sync) async fn validate_group_authority(
 
 /// Database entries need more than a management origin: the actor's current WRITE on the
 /// databases path, and admin WRITE on the owning group from the actor or the consent's
-/// approver. A removal needs either right (P1 pattern, plan r39 section 20).
+/// approver. A removal or parser change needs either right (P1 pattern, plan r39 section 20).
 async fn validate_database_actors(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
@@ -911,7 +911,8 @@ async fn validate_database_actors(
         AdminDocumentOperation::DatabaseSet { entry, consent, .. } => {
             (Some(entry.owner_group), consent.as_deref())
         }
-        AdminDocumentOperation::DatabaseRemoved { entry_id } => (
+        AdminDocumentOperation::DatabaseRemoved { entry_id }
+        | AdminDocumentOperation::DatabaseParserSet { entry_id, .. } => (
             config
                 .and_then(|config| {
                     config
@@ -1605,6 +1606,13 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                     .map_err(|error| format!("database consent rejected: {error}"))?;
             }
         }
+        AdminDocumentOperation::DatabaseParserSet {
+            parser: Some(parser),
+            ..
+        } => {
+            aruna_core::structs::identity::identifier::validate_parser(parser)
+                .map_err(|error| format!("database parser rejected: {error}"))?;
+        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1825,6 +1833,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::ConfigReplicasSet { .. }
         | AdminDocumentOperation::DatabaseSet { .. }
         | AdminDocumentOperation::DatabaseRemoved { .. }
+        | AdminDocumentOperation::DatabaseParserSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
         AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };

@@ -42,6 +42,7 @@ globset = { workspace = true }
 opentelemetry = { workspace = true }
 oxrdf = { workspace = true }
 percent-encoding = { workspace = true }
+regex = { workspace = true }
 serde_json = { workspace = true }
 subtle = { workspace = true }
 tokio = { workspace = true }
