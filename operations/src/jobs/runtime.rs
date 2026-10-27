@@ -26,7 +26,9 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::executor::{JobContext, JobRunOutcome, ProgressReporter, dispatch_payload, run_cleanup};
+use super::executor::{
+    JobContext, JobRunOutcome, ProgressReporter, RangeTurns, dispatch_payload, run_cleanup,
+};
 use super::reconcile::ExternalReconciler;
 use super::store::{
     AwaitOutcome, JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job,
@@ -87,6 +89,7 @@ pub struct JobsRuntime {
     /// user asked for a `Cancelled` job and runs cleanup handlers, while this one only
     /// means "stop here"; in-process jobs re-queue and external attempts hand off.
     shutdown: CancellationToken,
+    range_turns: RangeTurns,
 }
 
 impl std::fmt::Debug for JobsRuntime {
@@ -137,6 +140,7 @@ impl JobsRuntime {
             reconciler: Mutex::new(reconciler),
             claim_producer_barrier: RwLock::new(()),
             shutdown: CancellationToken::new(),
+            range_turns: RangeTurns::default(),
         })
     }
 
@@ -255,6 +259,7 @@ impl JobsRuntime {
         }
         let runtime = self.clone();
         let shutdown = self.shutdown.clone();
+        let turns = self.range_turns.clone();
         tokio::spawn(async move {
             // A panicking payload is turned into a failure inside `supervise`; this guard
             // still runs `finish` on other unwinds, so a panic cannot leak the slot.
@@ -263,7 +268,7 @@ impl JobsRuntime {
                 record,
                 claim_token,
                 cancel,
-                shutdown,
+                (shutdown, turns),
             ))
             .catch_unwind()
             .await;
@@ -587,7 +592,7 @@ async fn run_job(
     record: JobRecord,
     token: ulid::Ulid,
     cancel: CancellationToken,
-    shutdown: CancellationToken,
+    (shutdown, range_turns): (CancellationToken, RangeTurns),
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
     // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
@@ -655,6 +660,7 @@ async fn run_job(
         cancel: cancel.clone(),
         shutdown,
         progress: progress.clone(),
+        range_turns,
     };
 
     // Capture the timestamp AFTER the payload runs, so finished_at, backoff, and
@@ -1192,7 +1198,7 @@ mod tests {
             claimed,
             token,
             CancellationToken::new(),
-            CancellationToken::new(),
+            (CancellationToken::new(), RangeTurns::default()),
         )
         .await;
 
@@ -1237,7 +1243,7 @@ mod tests {
             claimed,
             token,
             CancellationToken::new(),
-            CancellationToken::new(),
+            (CancellationToken::new(), RangeTurns::default()),
         )
         .await;
 
@@ -1265,7 +1271,7 @@ mod tests {
             claimed,
             stale_token,
             cancel.clone(),
-            CancellationToken::new(),
+            (CancellationToken::new(), RangeTurns::default()),
         ));
         for _ in 0..100 {
             if marker.exists() {
@@ -1803,6 +1809,7 @@ mod tests {
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&record.progress),
+            range_turns: RangeTurns::default(),
         };
 
         let JobRunOutcome::Failed(error) = handle_panic(&ctx) else {

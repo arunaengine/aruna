@@ -1232,6 +1232,7 @@ async fn crate_write_idempotent() {
         cancel: CancellationToken::new(),
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
+        range_turns: Default::default(),
     };
     let outcome = super::run_crate::write_run_crate(&ctx, job_id).await;
     match outcome {

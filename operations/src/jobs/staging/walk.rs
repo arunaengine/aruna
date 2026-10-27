@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path};
 use std::time::{Duration, SystemTime};
 
@@ -21,11 +22,14 @@ use aruna_core::structs::execution::source_access::{
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::distribution::{DistributionView, WriteRoute};
+use aruna_core::structs::storage::distribution::{
+    DistributionBinding, DistributionView, WriteRoute,
+};
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use tokio::sync::Mutex;
 use tracing::warn;
+use ulid::Ulid;
 
 use super::manifest::{
     ManifestDigest, lasting_head, lasting_resolution, lasting_source, manifest_digests,
@@ -522,6 +526,16 @@ pub(super) async fn coordinated(
     let Some(binding) = bucket.distribution.as_ref() else {
         return Ok(vec![true; keys.len()]);
     };
+    let ranges = local_ranges(ctx, binding, keys).await?;
+    Ok(ranges.iter().map(Option::is_some).collect())
+}
+
+/// The range of each of `keys` if this node coordinates it, else `None`.
+async fn local_ranges(
+    ctx: &JobContext,
+    binding: &DistributionBinding,
+    keys: &[&str],
+) -> Result<Vec<Option<Ulid>>, String> {
     let read = StorageEffect::BatchRead {
         reads: authority_reads(binding.set_id),
         txn_id: None,
@@ -531,14 +545,14 @@ pub(super) async fn coordinated(
     let (record, fence) = (record.as_deref(), fence.as_deref());
     let routes = match write_targets(binding, keys.iter().copied(), record, fence) {
         Ok(routes) => routes,
-        Err(error) if error.moved_away() => return Ok(vec![false; keys.len()]),
+        Err(error) if error.moved_away() => return Ok(vec![None; keys.len()]),
         Err(error) => return Err(error.to_string()),
     };
     (routes.into_iter())
         .map(|route| match route {
-            Ok(WriteRoute::Local { .. }) => Ok(true),
-            Ok(WriteRoute::Forward { .. }) => Ok(false),
-            Err(error) if error.moved_away() => Ok(false),
+            Ok(WriteRoute::Local { range_id, .. }) => Ok(Some(range_id)),
+            Ok(WriteRoute::Forward { .. }) => Ok(None),
+            Err(error) if error.moved_away() => Ok(None),
             Err(error) => Err(error.to_string()),
         })
         .collect()
@@ -726,19 +740,27 @@ pub(super) fn target_of(walk: &StagingWalk, source_key: &str) -> Option<String> 
     Some(join_target_prefix(&walk.target_prefix, &relative))
 }
 
-/// The files of a page this node imports.
+/// The files of a page this node imports, and the set and range of each distributed one.
 async fn own_files(
     ctx: &JobContext,
     bucket: &BucketInfo,
     files: Vec<StagedFile>,
-) -> Result<Vec<StagedFile>, PageFailure> {
+) -> Result<(Vec<StagedFile>, BTreeSet<(Ulid, Ulid)>), PageFailure> {
+    let Some(binding) = bucket.distribution.as_ref() else {
+        return Ok((files, BTreeSet::new()));
+    };
     let keys: Vec<&str> = files.iter().map(|file| file.target_key.as_str()).collect();
-    let own = coordinated(ctx, bucket, &keys)
+    let ranges = local_ranges(ctx, binding, &keys)
         .await
         .map_err(PageFailure::Retry)?;
-    Ok((files.into_iter().zip(own))
-        .filter_map(|(file, own)| own.then_some(file))
-        .collect())
+    let mut turns = BTreeSet::new();
+    let files = (files.into_iter().zip(ranges))
+        .filter_map(|(file, range)| {
+            turns.insert((binding.set_id, range?));
+            Some(file)
+        })
+        .collect();
+    Ok((files, turns))
 }
 
 /// Registers a page's files as references with listing metadata, in one transaction with the
@@ -763,7 +785,7 @@ async fn import_page(
             return Err(PageFailure::Permanent(message));
         }
     };
-    let files = own_files(ctx, &bucket, rows.files).await?;
+    let (files, ranges) = own_files(ctx, &bucket, rows.files).await?;
     let mut entries = Vec::with_capacity(files.len());
     // The submitter's rules are collected once per page and decide every file in memory.
     let rules = access_rules(ctx, spec).await.map_err(PageFailure::Retry)?;
@@ -824,7 +846,7 @@ async fn import_page(
             None => None,
         };
         let run = |input| drive(PageImportOperation::new(input), &ctx.driver);
-        retry_page(ctx, input, run).await
+        retry_page(ctx, (input, &ranges), run).await
     };
     match result {
         Ok(result) => {
@@ -842,17 +864,20 @@ async fn import_page(
     }
 }
 
-/// Runs the page transaction of `input` again while its commit conflicts, at most
-/// [`PAGE_ATTEMPTS`] times. Each run is a new transaction that checks every guard again.
+/// Runs the page transaction of `input` in the turns of `ranges`, again while its commit
+/// conflicts, at most [`PAGE_ATTEMPTS`] times. Each run is a new transaction that checks every
+/// guard again.
 pub(super) async fn retry_page<R, F>(
     ctx: &JobContext,
-    input: PageImportInput,
+    (input, ranges): (PageImportInput, &BTreeSet<(Ulid, Ulid)>),
     mut run: R,
 ) -> Result<PageImportResult, PageImportError>
 where
     R: FnMut(PageImportInput) -> F,
     F: Future<Output = Result<PageImportResult, PageImportError>>,
 {
+    // Pages of other jobs into these ranges wait here instead of conflicting on their rows.
+    let _turns = ctx.range_turns.take(ranges).await;
     let mut attempts = 1;
     loop {
         let result = run(input.clone()).await;
@@ -887,7 +912,7 @@ async fn snapshot_page(
             | ItemFailure::Lasting(message),
         ) => return Err(PageFailure::Permanent(message)),
     };
-    for file in own_files(ctx, &bucket, rows.files).await? {
+    for file in own_files(ctx, &bucket, rows.files).await?.0 {
         if ctx.cancel.is_cancelled() || ctx.shutdown.is_cancelled() {
             return Ok(());
         }

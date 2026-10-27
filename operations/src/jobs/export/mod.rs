@@ -717,6 +717,7 @@ pub(crate) async fn unheld_bucket(
         progress: super::executor::ProgressReporter::from_progress(
             &aruna_core::structs::execution::job::JobProgress::new("entries"),
         ),
+        range_turns: Default::default(),
     };
     resolve_entries(
         &ctx,

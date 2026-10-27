@@ -278,6 +278,7 @@ mod tests {
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("steps")),
+            range_turns: Default::default(),
         }
     }
 

@@ -665,7 +665,7 @@ mod tests {
     ) -> (usize, Result<PageImportResult, PageImportError>) {
         use crate::driver::drive;
         let mut runs = 0;
-        let result = retry_page(ctx, input, |input| {
+        let result = retry_page(ctx, (input, &Default::default()), |input| {
             runs += 1;
             let (first, row) = (runs == 1, row.clone());
             async move {
@@ -789,6 +789,7 @@ mod tests {
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
+            range_turns: Default::default(),
         };
         (ctx, spec, test._tempdir)
     }

@@ -272,6 +272,7 @@ mod tests {
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("bytes")),
+            range_turns: Default::default(),
         }
     }
 

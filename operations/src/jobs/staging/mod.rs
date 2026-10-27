@@ -665,6 +665,7 @@ mod pure_tests {
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
+            range_turns: Default::default(),
         };
 
         let pinned = StagingJobSpec {

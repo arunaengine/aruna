@@ -2,15 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     JobError, JobId, JobPayload, JobProgress, JobResultPayload,
 };
+use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
@@ -90,6 +93,32 @@ pub struct JobContext {
     /// Node shutdown: stop where you are, the lease is handed back and the job re-runs.
     pub shutdown: CancellationToken,
     pub progress: ProgressReporter,
+    pub range_turns: RangeTurns,
+}
+
+/// One turn per distribution range, shared by every job on this node: page imports into one
+/// range commit one at a time instead of conflicting on the range's key sample.
+#[derive(Clone, Debug, Default)]
+pub struct RangeTurns(Arc<Mutex<HashMap<(Ulid, Ulid), Arc<tokio::sync::Mutex<()>>>>>);
+
+impl RangeTurns {
+    /// Waits for the turns of `ranges`, keyed by set and range, in key order; they end when
+    /// the guards drop.
+    pub async fn take(&self, ranges: &BTreeSet<(Ulid, Ulid)>) -> Vec<OwnedMutexGuard<()>> {
+        let turns: Vec<_> = {
+            let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            // A turn nobody holds or waits for is dropped.
+            map.retain(|_, turn| Arc::strong_count(turn) > 1);
+            (ranges.iter())
+                .map(|range| map.entry(*range).or_default().clone())
+                .collect()
+        };
+        let mut guards = Vec::with_capacity(turns.len());
+        for turn in turns {
+            guards.push(turn.lock_owned().await);
+        }
+        guards
+    }
 }
 
 pub enum JobRunOutcome {
