@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use axum::http::HeaderMap;
 use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::NodeId;
@@ -240,7 +241,15 @@ pub(super) async fn coverage_spread(
             Some(read) => read(position).await,
             None => {
                 let path = coverage_path(&base, query, position.as_deref());
-                match relay_get::<CoverageResponse>(state, &forward, &path, bearer).await {
+                match relay_get::<CoverageResponse>(
+                    state,
+                    &forward,
+                    &path,
+                    bearer,
+                    HeaderMap::new(),
+                )
+                .await
+                {
                     Ok(Some(answer)) => Ok(answer),
                     Ok(None) => Err(ServerError::ServiceUnavailableReason(format!(
                         "node {} is not reachable",

@@ -10,8 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
+use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
 use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute};
-use aruna_operations::distribution::guard::{copy_readers, read_coordinator, route_read};
+use aruna_operations::distribution::guard::{
+    GuardError, copy_readers, read_coordinator, route_read,
+};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
 use futures_util::TryStreamExt;
@@ -205,7 +208,8 @@ pub(in crate::s3::service) fn anonymous_window(user: &UserAccess) -> UserAccess 
 impl ArunaS3Service {
     /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, or `None` when
     /// this member answers it. Only a `pinned` version may come from a copy: a copy may lag
-    /// behind the current version. A delegated read is never sent on.
+    /// behind the current version. A delegated read is never sent on, and a current one is
+    /// refused here unless this node still coordinates the range or the sender asked a copy.
     pub(in crate::s3::service) async fn read_holder(
         &self,
         extensions: &http::Extensions,
@@ -215,7 +219,17 @@ impl ArunaS3Service {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(None);
         };
-        if extensions.get::<DelegatedRequest>().is_some() {
+        if let Some(delegated) = extensions.get::<DelegatedRequest>() {
+            if !pinned
+                && !delegated.copy_read
+                && let Some(coordinator) = self.range_coordinator(binding, key).await?
+            {
+                return Err(guard_error(&GuardError::NotCoordinator {
+                    set_id: binding.set_id,
+                    range_id: coordinator.range_id,
+                    node_id: coordinator.node_id,
+                }));
+            }
             return Ok(None);
         }
         if !pinned {
@@ -302,8 +316,10 @@ impl ArunaS3Service {
             },
             Err(error) => error,
         };
+        // A delegated read's refusal goes back to its sender, which asks the copies itself.
+        let delegated = extensions.get::<DelegatedRequest>().is_some();
         let binding = bucket.and_then(|bucket| bucket.distribution.as_ref());
-        let Some(binding) = binding.filter(|_| !pinned && unreachable(&error)) else {
+        let Some(binding) = binding.filter(|_| !pinned && !delegated && unreachable(&error)) else {
             return Err(error);
         };
         let readers = copy_readers(self.state.as_ref(), binding, key).await;
@@ -317,7 +333,9 @@ impl ArunaS3Service {
                 range_id,
                 node_id,
             };
-            match self.forward_read(user, &forward, request()).await {
+            let mut copy_read = request();
+            (copy_read.headers).push((COPY_READ_HEADER.to_string(), "1".to_string()));
+            match self.forward_read(user, &forward, copy_read).await {
                 Ok(response) => return Ok(ReadAnswer::Forwarded(response, Some(range_id))),
                 Err(failed) if unreachable(&failed) => {}
                 Err(failed) => return Err(stale_error(failed, range_id)),

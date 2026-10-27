@@ -180,7 +180,7 @@ pub(crate) async fn relay_read<T: DeserializeOwned>(
     bearer: Option<&ValidatedBearer>,
 ) -> ServerResult<T> {
     for forward in holders {
-        if let Some(answer) = relay_get(state, forward, path, bearer).await? {
+        if let Some(answer) = relay_get(state, forward, path, bearer, HeaderMap::new()).await? {
             return Ok(answer);
         }
     }
@@ -323,15 +323,17 @@ async fn answer<T: DeserializeOwned>(
     Ok((status, answer))
 }
 
-/// Sends a GET of `path` to the forward's node with the caller's bearer token and decodes its
-/// answer; `None` when the node did not answer, so the caller may ask another holder.
+/// Sends a GET of `path` with `sent` headers to the forward's node with the caller's bearer
+/// token and decodes its answer; `None` when the node did not answer, so the caller may ask
+/// another holder.
 pub(crate) async fn relay_get<T: DeserializeOwned>(
     state: &ServerState,
     forward: &RestForward,
     path: &str,
     bearer: Option<&ValidatedBearer>,
+    sent: HeaderMap,
 ) -> ServerResult<Option<T>> {
-    match send_get(state, forward, path, bearer, HeaderMap::new()).await? {
+    match send_get(state, forward, path, bearer, sent).await? {
         Some(response) => Ok(Some(answer(forward, response).await?.1)),
         None => Ok(None),
     }
