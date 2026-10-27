@@ -1,4 +1,5 @@
-//! Serves the database list: marks, owner consent, removal and the reader-filtered listing.
+//! Serves the database list: marks, owner consent, removal, parsers and the reader-filtered
+//! listing.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -20,6 +21,7 @@ use aruna_core::structs::identity::database::{
     ConsentClaim, DatabaseConsent, DatabaseEntry, DatabaseRequest, DatabaseTarget,
     database_admin_path, owner_admin_path,
 };
+use aruna_core::structs::identity::identifier::IdentifierParser;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::types::GroupId;
@@ -347,21 +349,8 @@ pub async fn remove_database(
     caller: &Caller,
     entry_id: Ulid,
 ) -> Result<(), DatabaseServiceError> {
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .map_err(|error| DatabaseServiceError::Unavailable(error.to_string()))?;
-    let entry = config
-        .databases
-        .iter()
-        .find(|entry| entry.entry_id == entry_id)
-        .ok_or_else(|| DatabaseServiceError::NotFound(format!("database {entry_id} not found")))?;
+    let path = change_path(context, realm_id, caller, entry_id).await?;
     let auth = &caller.auth;
-    let curator_path = database_admin_path(realm_id);
-    let path = if allowed(context, realm_id, auth, &curator_path, Permission::WRITE).await? {
-        curator_path
-    } else {
-        owner_admin_path(realm_id, entry.owner_group)
-    };
     drive(
         PublishDatabaseOperation::new(PublishDatabaseConfig {
             actor: Actor {
@@ -371,6 +360,68 @@ pub async fn remove_database(
             },
             checks: vec![(auth.clone(), path)],
             change: DatabaseChange::Remove { entry_id },
+        }),
+        context,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The path whose WRITE allows removing an entry or changing its parser: the curator path, or
+/// else the owning group's admin path.
+async fn change_path(
+    context: &DriverContext,
+    realm_id: RealmId,
+    caller: &Caller,
+    entry_id: Ulid,
+) -> Result<String, DatabaseServiceError> {
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .map_err(|error| DatabaseServiceError::Unavailable(error.to_string()))?;
+    let entry = config
+        .databases
+        .iter()
+        .find(|entry| entry.entry_id == entry_id)
+        .ok_or_else(|| DatabaseServiceError::NotFound(format!("database {entry_id} not found")))?;
+    let curator_path = database_admin_path(realm_id);
+    Ok(
+        if allowed(
+            context,
+            realm_id,
+            &caller.auth,
+            &curator_path,
+            Permission::WRITE,
+        )
+        .await?
+        {
+            curator_path
+        } else {
+            owner_admin_path(realm_id, entry.owner_group)
+        },
+    )
+}
+
+/// Sets or clears an entry's identifier parser: a curator or an admin of the owning group may.
+/// No owner consent, because a parser grants nothing.
+pub async fn set_parser(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    caller: &Caller,
+    entry_id: Ulid,
+    parser: Option<IdentifierParser>,
+) -> Result<(), DatabaseServiceError> {
+    let path = change_path(context, realm_id, caller, entry_id).await?;
+    let auth = &caller.auth;
+    drive(
+        PublishDatabaseOperation::new(PublishDatabaseConfig {
+            actor: Actor {
+                node_id,
+                user_id: auth.user_id,
+                realm_id,
+            },
+            checks: vec![(auth.clone(), path)],
+            change: DatabaseChange::Parser { entry_id, parser },
         }),
         context,
     )

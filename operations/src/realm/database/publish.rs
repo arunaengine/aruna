@@ -1,5 +1,5 @@
 //! Publishes one database list change through the realm config's admin document path on a
-//! management node: a mark or retarget with its owner consent, or a removal.
+//! management node: a mark or retarget with its owner consent, a removal or a parser change.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -20,6 +20,9 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::database::{
     DatabaseConsent, DatabaseEntry, DatabaseError, validate_databases,
+};
+use aruna_core::structs::identity::identifier::{
+    IdentifierError, IdentifierParser, validate_parser,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
@@ -48,6 +51,11 @@ pub enum DatabaseChange {
     Remove {
         entry_id: Ulid,
     },
+    /// Sets or clears an entry's identifier parser.
+    Parser {
+        entry_id: Ulid,
+        parser: Option<IdentifierParser>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +77,8 @@ pub enum PublishDatabaseError {
     AdminDocument(#[from] AdminDocumentError),
     #[error(transparent)]
     Database(#[from] DatabaseError),
+    #[error(transparent)]
+    Parser(#[from] IdentifierError),
     #[error("realm config document missing")]
     ConfigMissing,
     #[error("caller may not change this database entry")]
@@ -209,6 +219,22 @@ impl PublishDatabaseOperation {
                 }
                 Ok(AdminDocumentOperation::DatabaseRemoved {
                     entry_id: *entry_id,
+                })
+            }
+            DatabaseChange::Parser { entry_id, parser } => {
+                if !document
+                    .databases
+                    .iter()
+                    .any(|entry| entry.entry_id == *entry_id)
+                {
+                    return Err(PublishDatabaseError::NotFound(*entry_id));
+                }
+                if let Some(parser) = parser {
+                    validate_parser(parser)?;
+                }
+                Ok(AdminDocumentOperation::DatabaseParserSet {
+                    entry_id: *entry_id,
+                    parser: parser.clone(),
                 })
             }
         }
