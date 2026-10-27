@@ -449,14 +449,14 @@ pub struct QuotaGate {
     realm_id: Option<RealmId>,
     active_node_ids: Option<HashSet<NodeId>>,
     usage: u64,
-    /// The replicas' logical bytes in `usage`, from the other nodes' last published snapshots.
+    /// The deducted replicas' logical bytes in `usage`, from the other nodes' last snapshots.
     replica_bytes: u64,
     /// This node's own published share, deducted only while nothing shrank it since.
     own_replicas: u64,
     /// The record numbers this node's own share was computed under, by set.
     own_revisions: BTreeMap<ulid::Ulid, u64>,
-    /// The newest record number any other node's share was computed under, by set.
-    remote_revisions: BTreeMap<ulid::Ulid, u64>,
+    /// The other nodes' shares and the record numbers each was computed under, by set.
+    remote_shares: Vec<(u64, BTreeMap<ulid::Ulid, u64>)>,
     count_replicas: bool,
     rebuilding: bool,
     phase: QuotaGatePhase,
@@ -484,7 +484,7 @@ impl QuotaGate {
             replica_bytes: 0,
             own_replicas: 0,
             own_revisions: BTreeMap::new(),
-            remote_revisions: BTreeMap::new(),
+            remote_shares: Vec::new(),
             count_replicas: false,
             rebuilding: false,
             phase: QuotaGatePhase::Pending,
@@ -617,16 +617,11 @@ impl QuotaGate {
                         self.own_revisions = snapshot.revisions;
                         continue;
                     }
-                    for (set_id, number) in &snapshot.revisions {
-                        let newest = self.remote_revisions.entry(*set_id).or_default();
-                        *newest = (*newest).max(*number);
-                    }
-                    self.replica_bytes = self.replica_bytes.saturating_add(replicas);
                     self.usage = self.usage.saturating_add(snapshot.counters.logical_bytes);
+                    self.remote_shares.push((replicas, snapshot.revisions));
                 }
-                // Another node already counts under a record this node has not published under.
-                if next_start_after.is_none() && self.newer_record() {
-                    self.own_replicas = 0;
+                if next_start_after.is_none() {
+                    self.settle_shares();
                 }
                 match next_start_after {
                     Some(start) => Ok(Some(self.scan_effect(Some(start), txn_id))),
@@ -656,12 +651,25 @@ impl QuotaGate {
         }
     }
 
-    /// Whether another node computed its share under a newer record of a set this node's own
-    /// share covers: until this node applies and publishes that record, its share may be stale.
-    fn newer_record(&self) -> bool {
-        (self.remote_revisions.iter()).any(|(set_id, number)| {
-            (self.own_revisions.get(set_id)).is_some_and(|own| number > own)
-        })
+    /// Deducts only shares, this node's own included, computed under the newest record known for
+    /// every set they cover: a node that has not published under it may still count copies of
+    /// ranges another node now counts, so its share stays charged until it publishes again.
+    fn settle_shares(&mut self) {
+        let mut newest = self.own_revisions.clone();
+        for (set_id, number) in self.remote_shares.iter().flat_map(|(_, numbers)| numbers) {
+            let known = newest.entry(*set_id).or_default();
+            *known = (*known).max(*number);
+        }
+        let current = |numbers: &BTreeMap<ulid::Ulid, u64>| {
+            let newer = |(set_id, number)| newest.get(set_id).is_some_and(|known| known > number);
+            !numbers.iter().any(newer)
+        };
+        if !current(&self.own_revisions) {
+            self.own_replicas = 0;
+        }
+        self.replica_bytes = (self.remote_shares.iter())
+            .filter(|(_, numbers)| current(numbers))
+            .fold(0, |sum, (bytes, _)| sum.saturating_add(*bytes));
     }
 
     /// Projected group-wide `logical_bytes` if the pending write commits.
@@ -2667,6 +2675,28 @@ mod tests {
             applied.projected_usage(),
             21,
             "both shares under one record are exact"
+        );
+    }
+
+    // The reverse on the former coordinator A: it writes under record 2 while the promoted node's
+    // snapshot is still from record 1, so that stale share stays charged too: 1 B counts as 121 B.
+    #[test]
+    fn older_record_charged() {
+        let shares = [(100, 100), (120, 100)];
+        let stale = run_gate_at(false, (1_000, 1), 100, shares, false, [2, 1]);
+        assert_eq!(stale.projected_usage(), 121);
+        let published = run_gate_at(
+            false,
+            (1_000, 1),
+            100,
+            [(100, 100), (120, 0)],
+            false,
+            [2, 2],
+        );
+        assert_eq!(
+            published.projected_usage(),
+            121,
+            "the republished share counts the same"
         );
     }
 
