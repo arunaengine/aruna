@@ -28,6 +28,7 @@ use super::handle::{
 };
 use super::metrics::{StorageMetrics, record_storage_call};
 use super::persistence::FjallPersistPolicy;
+use super::records::run_read;
 use super::telemetry::{storage_effect_kind, storage_event_kind};
 use super::transactions::CounterChange;
 use crate::compaction::Compactor;
@@ -1138,59 +1139,7 @@ fn read_pool_loop(store: Store, receiver: PoolReceiver) {
         let key_space = effect_keyspace(&effect).map(str::to_string);
         let queue_wait = enqueued_at.elapsed();
         let service_started = Instant::now();
-        let event = match effect {
-            StorageEffect::Read {
-                key_space,
-                key,
-                txn_id: None,
-            } => match store.existing_keyspace(&key_space) {
-                Ok(Some(keyspace)) => store_read(&store, keyspace, key),
-                Ok(None) => StorageEvent::ReadResult { key, value: None },
-                Err(error) => StorageEvent::Error { error },
-            },
-            StorageEffect::Last {
-                key_space,
-                prefix,
-                txn_id: None,
-            } => match store.existing_keyspace(&key_space) {
-                Ok(Some(keyspace)) => store_last(&store, keyspace, prefix),
-                Ok(None) => StorageEvent::IterResult {
-                    values: Vec::new(),
-                    next_start_after: None,
-                },
-                Err(error) => StorageEvent::Error { error },
-            },
-            StorageEffect::BatchRead {
-                reads,
-                txn_id: None,
-            } => store_batch_read(&store, reads),
-            StorageEffect::Iter {
-                key_space,
-                prefix,
-                start,
-                limit,
-                txn_id: None,
-            } => match store.existing_keyspace(&key_space) {
-                Ok(None) => StorageEvent::IterResult {
-                    values: Vec::new(),
-                    next_start_after: None,
-                },
-                Ok(Some(keyspace)) => {
-                    if limit == 0 {
-                        StorageEvent::IterResult {
-                            values: Vec::new(),
-                            next_start_after: None,
-                        }
-                    } else {
-                        store_iterate(&store, keyspace, prefix, start, limit)
-                    }
-                }
-                Err(error) => StorageEvent::Error { error },
-            },
-            _ => StorageEvent::Error {
-                error: StorageError::InvalidEffect,
-            },
-        };
+        let event = run_read(&store, None, effect);
         let service_elapsed = service_started.elapsed();
         span.record("queue_wait_ms", duration_ms(queue_wait));
         span.record("service_ms", duration_ms(service_elapsed));

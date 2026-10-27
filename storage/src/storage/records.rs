@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{IterEnd, IterStart};
+use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use byteview::ByteView;
@@ -10,21 +10,28 @@ use fjall::{OptimisticTxKeyspace, Readable};
 use ulid::Ulid;
 
 use super::{
-    FjallStorage, Txn, batch_read_with, iterate_page, range_page, read_last_with, store_batch_read,
-    store_iterate, store_last, store_read,
+    FjallStorage, Store, Txn, batch_read_with, iterate_page, range_page, read_last_with,
+    store_batch_read, store_iterate, store_last, store_read,
 };
 
+type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
+
 impl FjallStorage {
-    /// A write transaction creates the keyspace it reads; other reads see an absent one as empty.
-    fn read_keyspace(
-        &self,
-        key_space: &str,
-        txn_id: Option<Ulid>,
-    ) -> Result<Option<OptimisticTxKeyspace>, StorageError> {
-        match txn_id.map(|txn_id| self.txns.get(&txn_id)) {
-            Some(None) => Err(StorageError::TransactionNotFound),
-            Some(Some(Txn::Write(_))) => self.store.resolve_keyspace(key_space).map(Some),
-            _ => self.store.existing_keyspace(key_space),
+    /// The open transaction `txn_id` names, if any.
+    fn txn_of(&self, txn_id: Option<Ulid>) -> Result<Option<&Txn>, StorageError> {
+        let txn = |txn_id| {
+            self.txns
+                .get(&txn_id)
+                .ok_or(StorageError::TransactionNotFound)
+        };
+        txn_id.map(txn).transpose()
+    }
+
+    /// The open write transaction `txn_id`.
+    fn write_txn(&mut self, txn_id: Ulid) -> Result<&mut fjall::OptimisticWriteTx, StorageError> {
+        match self.txns.get_mut(&txn_id) {
+            Some(Txn::Write(txn)) => Ok(txn.as_mut()),
+            _ => Err(StorageError::TransactionNotFound),
         }
     }
 
@@ -55,37 +62,10 @@ impl FjallStorage {
                 Err(error) => StorageEvent::Error { error },
             };
         }
-        let keyspace = match self.read_keyspace(&key_space, txn_id) {
-            Ok(Some(keyspace)) => keyspace,
-            Ok(None) => return StorageEvent::ReadResult { key, value: None },
-            Err(error) => return StorageEvent::Error { error },
-        };
-        if let Some(txn_id) = txn_id {
-            return match self.txns.get(&txn_id) {
-                Some(Txn::Read(txn)) => match txn.get(keyspace, &key) {
-                    Ok(value) => StorageEvent::ReadResult {
-                        key,
-                        value: value.map(|value| value.into()),
-                    },
-                    Err(error) => StorageEvent::Error {
-                        error: StorageError::ReadError(error.to_string()),
-                    },
-                },
-                Some(Txn::Write(txn)) => match txn.get(keyspace, &key) {
-                    Ok(value) => StorageEvent::ReadResult {
-                        key,
-                        value: value.map(|value| value.into()),
-                    },
-                    Err(error) => StorageEvent::Error {
-                        error: StorageError::ReadError(error.to_string()),
-                    },
-                },
-                None => StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                },
-            };
+        match self.txn_of(txn_id) {
+            Ok(txn) => read_row(&self.store, txn, &key_space, key),
+            Err(error) => StorageEvent::Error { error },
         }
-        store_read(&self.store, keyspace, key)
     }
 
     pub(super) fn batch_read(
@@ -103,16 +83,10 @@ impl FjallStorage {
             }
             return StorageEvent::BatchReadResult { values };
         }
-        if let Some(txn_id) = txn_id {
-            return match self.txns.get(&txn_id) {
-                Some(Txn::Read(txn)) => batch_read_with(&self.store, txn, reads, false),
-                Some(Txn::Write(txn)) => batch_read_with(&self.store, txn.as_ref(), reads, true),
-                None => StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                },
-            };
+        match self.txn_of(txn_id) {
+            Ok(txn) => read_rows(&self.store, txn, reads),
+            Err(error) => StorageEvent::Error { error },
         }
-        store_batch_read(&self.store, reads)
     }
 
     #[tracing::instrument(
@@ -133,14 +107,13 @@ impl FjallStorage {
             Err(error) => return StorageEvent::Error { error },
         };
         if let Some(txn_id) = txn_id {
-            return if let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) {
-                txn.insert(keyspace, key.clone(), value);
-                self.note_rows(txn_id, [(key_space.as_str(), &key)]);
-                StorageEvent::WriteResult { key }
-            } else {
-                StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
+            return match self.write_txn(txn_id) {
+                Ok(txn) => {
+                    txn.insert(keyspace, key.clone(), value);
+                    self.note_rows(txn_id, [(key_space.as_str(), &key)]);
+                    StorageEvent::WriteResult { key }
                 }
+                Err(error) => StorageEvent::Error { error },
             };
         }
         let result = self.buffered_write_tx().and_then(|mut tx| {
@@ -176,10 +149,9 @@ impl FjallStorage {
             resolved.push((keyspace, key_space, key, value));
         }
         if let Some(txn_id) = txn_id {
-            let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) else {
-                return StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                };
+            let txn = match self.write_txn(txn_id) {
+                Ok(txn) => txn,
+                Err(error) => return StorageEvent::Error { error },
             };
             for (keyspace, key_space, key, value) in resolved {
                 txn.insert(keyspace, key.clone(), value);
@@ -227,15 +199,14 @@ impl FjallStorage {
             Err(error) => return StorageEvent::Error { error },
         };
         if let Some(txn_id) = txn_id {
-            return if let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) {
-                txn.remove(keyspace, key.clone());
-                self.hold_txn_delete(txn_id, &key_space);
-                self.note_rows(txn_id, [(key_space.as_str(), &key)]);
-                StorageEvent::DeleteResult { key }
-            } else {
-                StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
+            return match self.write_txn(txn_id) {
+                Ok(txn) => {
+                    txn.remove(keyspace, key.clone());
+                    self.hold_txn_delete(txn_id, &key_space);
+                    self.note_rows(txn_id, [(key_space.as_str(), &key)]);
+                    StorageEvent::DeleteResult { key }
                 }
+                Err(error) => StorageEvent::Error { error },
             };
         }
         let mut tx = match self.buffered_write_tx() {
@@ -275,10 +246,9 @@ impl FjallStorage {
             resolved.push((keyspace, key_space, key));
         }
         if let Some(txn_id) = txn_id {
-            let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) else {
-                return StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                };
+            let txn = match self.write_txn(txn_id) {
+                Ok(txn) => txn,
+                Err(error) => return StorageEvent::Error { error },
             };
             for (keyspace, key_space, key) in resolved {
                 txn.remove(keyspace, key.clone());
@@ -334,56 +304,10 @@ impl FjallStorage {
                 0 => Ok((Vec::new(), None)),
                 _ => self.view_page(snapshot, &key_space, prefix.as_ref(), start.as_ref(), limit),
             };
-            return match page {
-                Ok((values, next_start_after)) => StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                },
-                Err(error) => StorageEvent::Error { error },
-            };
+            return page_event(page);
         }
-        let keyspace = match self.read_keyspace(&key_space, txn_id) {
-            Ok(Some(keyspace)) => keyspace,
-            Ok(None) => {
-                return StorageEvent::IterResult {
-                    values: Vec::new(),
-                    next_start_after: None,
-                };
-            }
-            Err(error) => return StorageEvent::Error { error },
-        };
-        if limit == 0 {
-            return StorageEvent::IterResult {
-                values: Vec::new(),
-                next_start_after: None,
-            };
-        }
-        let result = if let Some(txn_id) = txn_id {
-            match self.txns.get(&txn_id) {
-                Some(Txn::Read(txn)) => {
-                    iterate_page(txn, &keyspace, prefix.as_ref(), start.as_ref(), limit)
-                }
-                Some(Txn::Write(txn)) => iterate_page(
-                    txn.as_ref(),
-                    &keyspace,
-                    prefix.as_ref(),
-                    start.as_ref(),
-                    limit,
-                ),
-                None => {
-                    return StorageEvent::Error {
-                        error: StorageError::TransactionNotFound,
-                    };
-                }
-            }
-        } else {
-            return store_iterate(&self.store, keyspace, prefix, start, limit);
-        };
-        match result {
-            Ok((values, next_start_after)) => StorageEvent::IterResult {
-                values,
-                next_start_after,
-            },
+        match self.txn_of(txn_id) {
+            Ok(txn) => iterate_rows(&self.store, txn, &key_space, (prefix, start, limit)),
             Err(error) => StorageEvent::Error { error },
         }
     }
@@ -401,29 +325,8 @@ impl FjallStorage {
                 error: StorageError::InvalidEffect,
             };
         }
-        let keyspace = match self.read_keyspace(&key_space, txn_id) {
-            Ok(Some(keyspace)) => keyspace,
-            Ok(None) => {
-                return StorageEvent::IterResult {
-                    values: Vec::new(),
-                    next_start_after: None,
-                };
-            }
-            Err(error) => return StorageEvent::Error { error },
-        };
-        let result = match txn_id.map(|txn_id| self.txns.get(&txn_id)) {
-            Some(Some(Txn::Read(txn))) => range_page(txn, &keyspace, &start, &end, budget),
-            Some(Some(Txn::Write(txn))) => {
-                range_page(txn.as_ref(), &keyspace, &start, &end, budget)
-            }
-            Some(None) => Err(StorageError::TransactionNotFound),
-            None => range_page(&self.store.db.read_tx(), &keyspace, &start, &end, budget),
-        };
-        match result {
-            Ok((values, next_start_after)) => StorageEvent::IterResult {
-                values,
-                next_start_after,
-            },
+        match self.txn_of(txn_id) {
+            Ok(txn) => range_rows(&self.store, txn, &key_space, (&start, &end), budget),
             Err(error) => StorageEvent::Error { error },
         }
     }
@@ -439,25 +342,154 @@ impl FjallStorage {
                 error: StorageError::InvalidEffect,
             };
         }
-        let keyspace = match self.read_keyspace(&key_space, txn_id) {
-            Ok(Some(keyspace)) => keyspace,
-            Ok(None) => {
-                return StorageEvent::IterResult {
-                    values: Vec::new(),
-                    next_start_after: None,
-                };
-            }
-            Err(error) => return StorageEvent::Error { error },
-        };
-        if let Some(txn_id) = txn_id {
-            return match self.txns.get(&txn_id) {
-                Some(Txn::Read(txn)) => read_last_with(txn, &keyspace, prefix.as_ref()),
-                Some(Txn::Write(txn)) => read_last_with(txn.as_ref(), &keyspace, prefix.as_ref()),
-                None => StorageEvent::Error {
-                    error: StorageError::TransactionNotFound,
-                },
-            };
+        match self.txn_of(txn_id) {
+            Ok(txn) => last_row(&self.store, txn, &key_space, prefix),
+            Err(error) => StorageEvent::Error { error },
         }
-        store_last(&self.store, keyspace, prefix)
+    }
+}
+
+/// Runs a read effect in `txn`, or on the latest committed rows without one.
+pub(super) fn run_read(store: &Store, txn: Option<&Txn>, effect: StorageEffect) -> StorageEvent {
+    match effect {
+        StorageEffect::Read { key_space, key, .. } => read_row(store, txn, &key_space, key),
+        StorageEffect::BatchRead { reads, .. } => read_rows(store, txn, reads),
+        StorageEffect::Iter {
+            key_space,
+            prefix,
+            start,
+            limit,
+            ..
+        } => iterate_rows(store, txn, &key_space, (prefix, start, limit)),
+        StorageEffect::IterRange {
+            key_space,
+            start,
+            end,
+            limit,
+            max_bytes,
+            ..
+        } => range_rows(store, txn, &key_space, (&start, &end), (limit, max_bytes)),
+        StorageEffect::Last {
+            key_space, prefix, ..
+        } => last_row(store, txn, &key_space, prefix),
+        _ => StorageEvent::Error {
+            error: StorageError::InvalidEffect,
+        },
+    }
+}
+
+/// A write transaction creates the keyspace it reads; other reads see an absent one as empty.
+fn read_keyspace(
+    store: &Store,
+    txn: Option<&Txn>,
+    key_space: &str,
+) -> Result<Option<OptimisticTxKeyspace>, StorageError> {
+    match txn {
+        Some(Txn::Write(_)) => store.resolve_keyspace(key_space).map(Some),
+        _ => store.existing_keyspace(key_space),
+    }
+}
+
+fn page_event(page: Result<PageResult, StorageError>) -> StorageEvent {
+    match page {
+        Ok((values, next_start_after)) => StorageEvent::IterResult {
+            values,
+            next_start_after,
+        },
+        Err(error) => StorageEvent::Error { error },
+    }
+}
+
+fn read_row(store: &Store, txn: Option<&Txn>, key_space: &str, key: ByteView) -> StorageEvent {
+    let keyspace = match read_keyspace(store, txn, key_space) {
+        Ok(Some(keyspace)) => keyspace,
+        Ok(None) => return StorageEvent::ReadResult { key, value: None },
+        Err(error) => return StorageEvent::Error { error },
+    };
+    let value = match txn {
+        Some(Txn::Read(snapshot)) => snapshot.get(keyspace, &key),
+        Some(Txn::Write(txn)) => txn.get(keyspace, &key),
+        None => return store_read(store, keyspace, key),
+    };
+    match value {
+        Ok(value) => StorageEvent::ReadResult {
+            key,
+            value: value.map(Into::into),
+        },
+        Err(error) => StorageEvent::Error {
+            error: StorageError::ReadError(error.to_string()),
+        },
+    }
+}
+
+fn read_rows(store: &Store, txn: Option<&Txn>, reads: Vec<(String, ByteView)>) -> StorageEvent {
+    match txn {
+        Some(Txn::Read(snapshot)) => batch_read_with(store, snapshot, reads, false),
+        Some(Txn::Write(txn)) => batch_read_with(store, txn.as_ref(), reads, true),
+        None => store_batch_read(store, reads),
+    }
+}
+
+fn iterate_rows(
+    store: &Store,
+    txn: Option<&Txn>,
+    key_space: &str,
+    (prefix, start, limit): (Option<ByteView>, Option<IterStart>, usize),
+) -> StorageEvent {
+    let keyspace = match read_keyspace(store, txn, key_space) {
+        Ok(Some(keyspace)) if limit > 0 => keyspace,
+        Ok(_) => return page_event(Ok((Vec::new(), None))),
+        Err(error) => return StorageEvent::Error { error },
+    };
+    let page = match txn {
+        Some(Txn::Read(snapshot)) => {
+            iterate_page(snapshot, &keyspace, prefix.as_ref(), start.as_ref(), limit)
+        }
+        Some(Txn::Write(txn)) => iterate_page(
+            txn.as_ref(),
+            &keyspace,
+            prefix.as_ref(),
+            start.as_ref(),
+            limit,
+        ),
+        None => return store_iterate(store, keyspace, prefix, start, limit),
+    };
+    page_event(page)
+}
+
+fn range_rows(
+    store: &Store,
+    txn: Option<&Txn>,
+    key_space: &str,
+    (start, end): (&IterStart, &IterEnd),
+    budget: (usize, usize),
+) -> StorageEvent {
+    let keyspace = match read_keyspace(store, txn, key_space) {
+        Ok(Some(keyspace)) => keyspace,
+        Ok(None) => return page_event(Ok((Vec::new(), None))),
+        Err(error) => return StorageEvent::Error { error },
+    };
+    page_event(match txn {
+        Some(Txn::Read(snapshot)) => range_page(snapshot, &keyspace, start, end, budget),
+        Some(Txn::Write(txn)) => range_page(txn.as_ref(), &keyspace, start, end, budget),
+        None => range_page(&store.db.read_tx(), &keyspace, start, end, budget),
+    })
+}
+
+fn last_row(
+    store: &Store,
+    txn: Option<&Txn>,
+    key_space: &str,
+    prefix: Option<ByteView>,
+) -> StorageEvent {
+    let keyspace = match read_keyspace(store, txn, key_space) {
+        Ok(Some(keyspace)) => keyspace,
+        Ok(None) => return page_event(Ok((Vec::new(), None))),
+        Err(error) => return StorageEvent::Error { error },
+    };
+    match txn {
+        Some(Txn::Read(snapshot)) => read_last_with(snapshot, &keyspace, prefix.as_ref()),
+        Some(Txn::Write(txn)) => read_last_with(txn.as_ref(), &keyspace, prefix.as_ref()),
+        None => store_last(store, keyspace, prefix),
     }
 }
