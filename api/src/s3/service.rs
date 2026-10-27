@@ -1163,7 +1163,11 @@ impl S3 for ArunaS3Service {
             .await?
         {
             return match self
-                .copy_path(&source_bucket_info, &source_key, &forward)
+                .copy_path(
+                    &source_bucket_info,
+                    (&source_key, source_version_id.is_some()),
+                    &forward,
+                )
                 .await?
             {
                 CopyPath::Stream => {
@@ -1226,7 +1230,11 @@ impl S3 for ArunaS3Service {
                 }
             };
         }
-        self.ensure_source(&source_bucket_info, &source_key).await?;
+        self.ensure_source(
+            &source_bucket_info,
+            (&source_key, source_version_id.is_some()),
+        )
+        .await?;
         let dest_group_id = dest_bucket_info
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
@@ -1597,7 +1605,11 @@ impl S3 for ArunaS3Service {
                 url::form_urlencoded::byte_serialize(req.input.upload_id.as_bytes()).collect();
             let query = format!("partNumber={}&uploadId={upload}", req.input.part_number);
             return match self
-                .copy_path(&source_bucket_info, &source_key, &forward)
+                .copy_path(
+                    &source_bucket_info,
+                    (&source_key, source_version_id.is_some()),
+                    &forward,
+                )
                 .await?
             {
                 CopyPath::Stream => {
@@ -1640,7 +1652,11 @@ impl S3 for ArunaS3Service {
                 }
             };
         }
-        self.ensure_source(&source_bucket_info, &source_key).await?;
+        self.ensure_source(
+            &source_bucket_info,
+            (&source_key, source_version_id.is_some()),
+        )
+        .await?;
         let upload_id = self
             .upload_id(dest_info.as_ref(), &req.input.key, &req.input.upload_id)
             .await?;

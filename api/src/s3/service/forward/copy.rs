@@ -12,10 +12,10 @@ use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{BucketInfo, CONTENT_TYPE_KEY, UserAccess};
 use aruna_core::structs::storage::distribution::delegation::{COPY_CONTEXT_HEADER, CopyContext};
-use aruna_core::structs::storage::distribution::{ReadRoute, RouteError};
+use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute, RouteError};
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
-use aruna_operations::distribution::guard::{record_holders, route_read};
+use aruna_operations::distribution::guard::{read_coordinator, route_read};
 use aruna_operations::s3::object::copy::{CopySourceConditions, read_copy_source, source_origin};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use futures_util::TryStreamExt;
@@ -162,12 +162,22 @@ fn e_tag(text: Option<String>) -> Option<ETag> {
 }
 
 impl ArunaS3Service {
-    /// Whether this node answers reads of `key` itself: an ordinary bucket, or a caught-up
-    /// member that keeps the records of the key's range.
-    async fn keeps_source(&self, bucket: &BucketInfo, key: &str) -> S3Result<bool> {
+    /// Whether this node answers reads of `key` itself: an ordinary bucket, the coordinator of
+    /// the key's range, or for a `pinned` version a caught-up member that keeps its records.
+    async fn keeps_source(
+        &self,
+        bucket: &BucketInfo,
+        (key, pinned): (&str, bool),
+    ) -> S3Result<bool> {
         let Some(binding) = bucket.distribution.as_ref() else {
             return Ok(true);
         };
+        if !pinned {
+            let coordinator = read_coordinator(self.state.as_ref(), binding, key).await;
+            return coordinator
+                .map(|coordinator| coordinator.is_none())
+                .map_err(|error| guard_error(&error));
+        }
         match route_read(self.state.as_ref(), binding, key, false).await {
             Ok(ReadRoute::Local { catching_up }) => Ok(!catching_up),
             Ok(ReadRoute::Holder { .. }) => Ok(false),
@@ -175,21 +185,37 @@ impl ArunaS3Service {
         }
     }
 
+    /// The range of the copy source and the nodes that may answer its read: only the
+    /// coordinator for the current version, since a copy may lag behind it.
+    async fn source_holders(
+        &self,
+        binding: &DistributionBinding,
+        (key, pinned): (&str, bool),
+    ) -> S3Result<(ulid::Ulid, Vec<NodeId>)> {
+        let snapshot = self.snapshot(binding).await?;
+        let range = (snapshot.range_for(key))
+            .ok_or_else(|| guard_error(&RouteError::NoRange(binding.set_id).into()))?;
+        let holders = match pinned {
+            true => snapshot.record_holders(range),
+            false => snapshot.list_holder(range).into_iter().collect(),
+        };
+        let holders = holders.into_iter().map(|member| member.node_id).collect();
+        Ok((range.range_id, holders))
+    }
+
     /// Refuses a copy this node writes itself when it does not keep the source.
     pub(in crate::s3::service) async fn ensure_source(
         &self,
         bucket: &BucketInfo,
-        key: &str,
+        source: (&str, bool),
     ) -> S3Result<()> {
-        if self.keeps_source(bucket, key).await? {
+        if self.keeps_source(bucket, source).await? {
             return Ok(());
         }
         let Some(binding) = bucket.distribution.as_ref() else {
             return Ok(());
         };
-        let holders = record_holders(self.state.as_ref(), binding, key)
-            .await
-            .map_err(|error| guard_error(&error))?;
+        let (_, holders) = self.source_holders(binding, source).await?;
         Err(source_elsewhere(binding.set_id, &holders))
     }
 
@@ -197,28 +223,23 @@ impl ArunaS3Service {
     pub(in crate::s3::service) async fn copy_path(
         &self,
         bucket: &BucketInfo,
-        key: &str,
+        source: (&str, bool),
         forward: &Forward,
     ) -> S3Result<CopyPath> {
-        if self.keeps_source(bucket, key).await? {
+        if self.keeps_source(bucket, source).await? {
             return Ok(CopyPath::Stream);
         }
         let Some(binding) = bucket.distribution.as_ref() else {
             return Ok(CopyPath::Stream);
         };
-        let snapshot = self.snapshot(binding).await?;
-        let range = (snapshot.range_for(key))
-            .ok_or_else(|| guard_error(&RouteError::NoRange(binding.set_id).into()))?;
-        let holders: Vec<NodeId> = (snapshot.record_holders(range).into_iter())
-            .map(|member| member.node_id)
-            .collect();
+        let (range_id, holders) = self.source_holders(binding, source).await?;
         if holders.contains(&forward.node_id) {
             return Ok(CopyPath::Delegate);
         }
         match holders.iter().find(|node_id| **node_id != self.node_id) {
             Some(node_id) => Ok(CopyPath::Relay(Forward {
                 set_id: binding.set_id,
-                range_id: range.range_id,
+                range_id,
                 node_id: *node_id,
             })),
             None => Err(source_elsewhere(binding.set_id, &holders)),

@@ -839,6 +839,34 @@ async fn stale_copy_skipped() {
     assert_eq!(output.content_length, Some(3));
 }
 
+// A copy of the current version reads its source from the coordinator, never a stale copy.
+#[tokio::test]
+async fn stale_copy_source() {
+    let members = members(3, &["h", "p"], 1).await;
+    put(&members, 0, "q/src", b"old").await;
+    copy_rows(&members, 2, 0).await;
+    put(&members, 0, "q/src", b"newer").await;
+    // Node 0 keeps the stale copy; node 1 hands the copy to node 0, which keeps it too.
+    copy(&members, 0, ("q/src", "k/dst"), None).await.unwrap();
+    copy(&members, 1, ("q/src", "a/dst"), None).await.unwrap();
+    assert_eq!(read(&members, 1, "k/dst").await.0, b"newer");
+    assert_eq!(read(&members, 0, "a/dst").await.0, b"newer");
+    // A copy node 0 writes itself is refused with the source's coordinator named.
+    let error = copy(&members, 0, ("q/src", "a/own"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        *error.code(),
+        s3s::S3ErrorCode::Custom("CopySourceNotHeld".into())
+    );
+    let coordinator = members.nodes[2].node_id().to_string();
+    assert!(
+        error
+            .message()
+            .is_some_and(|text| text.contains(&coordinator))
+    );
+}
+
 // Versions list across ranges newest first per key, delete markers included, and the
 // markers of a short page resume the next one.
 #[tokio::test]
