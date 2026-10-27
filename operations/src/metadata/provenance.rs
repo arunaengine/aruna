@@ -393,10 +393,11 @@ fn graph(document: &Value) -> impl Iterator<Item = &Value> {
     document["@graph"].as_array().into_iter().flatten()
 }
 
+/// A stored crate names files `MediaObject`, the term `File` stands for.
 fn is_file(node: &Value) -> bool {
     text_values(node.get("@type"))
         .iter()
-        .any(|kind| kind == "File")
+        .any(|kind| kind == "File" || kind == "MediaObject")
 }
 
 /// The exact version ids among an entity's `contentUrl` values.

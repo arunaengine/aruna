@@ -154,3 +154,24 @@ fn hidden_hops_private() {
         .to_string();
     assert!(status.starts_with("Incomplete"));
 }
+
+#[test]
+fn stored_dataset_parts() {
+    // A stored dataset names its files `MediaObject`, with `contentUrl` values in any order.
+    let exact = arn(3, "in.txt");
+    let document = json!({ "@graph": [
+        { "@id": "./", "@type": "Dataset", "hasPart": [{ "@id": "#a" }, { "@id": "#b" }] },
+        { "@id": "#a", "@type": "MediaObject", "contentUrl": [exact, "s3://bucket/in.txt"] },
+        { "@id": "#b", "@type": "MediaObject", "contentUrl": "s3://bucket/old.txt" }
+    ]});
+    let mut built = ProvenanceCrate::new("dataset", "2026-10-27T12:00:00Z");
+    let (hops, file) = built.dataset(&document);
+    assert_eq!(hops.len(), 1);
+    assert_eq!(hops[0].target, Target::Version(exact));
+    assert_eq!(file.path, "dataset/ro-crate-metadata.json");
+    let root = built.finish();
+    assert_eq!(
+        node(&root, "#b")["description"],
+        "No exact version recorded"
+    );
+}
