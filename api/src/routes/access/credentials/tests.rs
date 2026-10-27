@@ -384,16 +384,41 @@ fn permission_case_insensitive() {
 #[test]
 fn delegation_accepts_descendants() {
     assert_eq!(
-        DelegationScope::parse_supported("/root/path"),
+        DelegationScope::parse_supported("/root/path", "node"),
         Some(DelegationScope::exact("/root/path".to_string()))
     );
     assert_eq!(
-        DelegationScope::parse_supported("/root/path/**"),
+        DelegationScope::parse_supported("/root/path/**", "node"),
         Some(DelegationScope::descendants("/root/path".to_string()))
     );
-    assert_eq!(DelegationScope::parse_supported("/root/*/path"), None);
-    assert_eq!(DelegationScope::parse_supported("/root/**/path"), None);
-    assert_eq!(DelegationScope::parse_supported("relative/path"), None);
+    assert_eq!(
+        DelegationScope::parse_supported("/root/*/path", "node"),
+        None
+    );
+    assert_eq!(
+        DelegationScope::parse_supported("/root/**/path", "node"),
+        None
+    );
+    assert_eq!(
+        DelegationScope::parse_supported("relative/path", "node"),
+        None
+    );
+}
+
+#[test]
+fn any_node_scope() {
+    let scope =
+        DelegationScope::parse_supported("/realm/g/group/data/*/bucket/**", "node").unwrap();
+    assert_eq!(scope.root, "/realm/g/group/data/node/bucket");
+    assert!(scope.is_within("/realm/g/group/data/node"));
+    assert_eq!(scope.to_pattern(), "/realm/g/group/data/*/bucket/**");
+    let local = DelegationScope::descendants("/realm/g/group/data/node/bucket".to_string());
+    assert!(scope.contains(&local));
+    assert!(!local.contains(&scope));
+    // `*` names only the node of a group data path.
+    for pattern in ["/realm/g/*/data/node/bucket", "/realm/g/group/data/node/*"] {
+        assert_eq!(DelegationScope::parse_supported(pattern, "node"), None);
+    }
 }
 
 #[test]
@@ -429,6 +454,7 @@ fn relative_paths_normalized() {
                 permission: "WRITE".to_string(),
             }]),
             group_root,
+            "node",
         )
         .unwrap(),
         Some(vec![NormalizedRestriction {
@@ -449,6 +475,7 @@ fn empty_path_normalized() {
                 permission: "READ".to_string(),
             }]),
             group_root,
+            "node",
         )
         .unwrap(),
         Some(vec![NormalizedRestriction {
@@ -466,6 +493,7 @@ fn external_path_rejected() {
             permission: "WRITE".to_string(),
         }]),
         "/realm/g/group/data/node",
+        "node",
     )
     .unwrap_err();
 
@@ -480,10 +508,11 @@ fn wildcards_are_rejected() {
             permission: "WRITE".to_string(),
         }]),
         "/realm/g/group/data/node",
+        "node",
     )
     .unwrap_err();
 
-    assert!(matches!(err, ServerError::BadRequest));
+    assert!(matches!(err, ServerError::BadRequestReason(_)));
 }
 
 #[test]
@@ -494,7 +523,7 @@ fn unrelated_groups_filtered() {
     }]));
 
     assert_eq!(
-        normalize_auth_restrictions(&auth, "/realm/g/group/data/node").unwrap(),
+        normalize_auth_restrictions(&auth, "/realm/g/group/data/node", "node").unwrap(),
         Some(Vec::new())
     );
 }
@@ -532,7 +561,7 @@ fn broad_scope_narrowed() {
     }]));
 
     assert_eq!(
-        normalize_auth_restrictions(&auth, "/realm/g/group/data/node").unwrap(),
+        normalize_auth_restrictions(&auth, "/realm/g/group/data/node", "node").unwrap(),
         Some(vec![NormalizedRestriction {
             scope: DelegationScope::descendants("/realm/g/group/data/node".to_string()),
             permission: Permission::WRITE,
@@ -547,7 +576,7 @@ fn auth_wildcards_rejected() {
         permission: Permission::WRITE,
     }]));
 
-    let err = normalize_auth_restrictions(&auth, "/realm/g/group/data/node").unwrap_err();
+    let err = normalize_auth_restrictions(&auth, "/realm/g/group/data/node", "node").unwrap_err();
     assert!(matches!(err, ServerError::Forbidden));
 }
 

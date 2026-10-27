@@ -119,6 +119,8 @@ pub struct ListS3Response {
 struct DelegationScope {
     root: String,
     recursive: bool,
+    /// The pattern named the node as `*`; `root` holds this node, the pattern every node.
+    any_node: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +134,7 @@ impl DelegationScope {
         Self {
             root,
             recursive: false,
+            any_node: false,
         }
     }
 
@@ -139,10 +142,22 @@ impl DelegationScope {
         Self {
             root,
             recursive: true,
+            any_node: false,
         }
     }
 
-    fn parse_supported(pattern: &str) -> Option<Self> {
+    /// Parses a pattern, reading a `*` node segment of a group data path as `node`.
+    fn parse_supported(pattern: &str, node: &str) -> Option<Self> {
+        let mut segments: Vec<&str> = pattern.split('/').collect();
+        let any_node = matches!(segments.as_slice(), ["", _, "g", _, "data", "*", ..]);
+        if any_node {
+            segments[5] = node;
+        }
+        let pattern = &segments.join("/");
+        Self::parse_literal(pattern).map(|scope| Self { any_node, ..scope })
+    }
+
+    fn parse_literal(pattern: &str) -> Option<Self> {
         if !pattern.starts_with('/')
             || pattern
                 .chars()
@@ -171,6 +186,9 @@ impl DelegationScope {
 
     /// Whether every path of `other` lies in this scope.
     fn contains(&self, other: &Self) -> bool {
+        if other.any_node && !self.any_node {
+            return false;
+        }
         if self.recursive {
             path_within(&other.root, &self.root)
         } else {
@@ -203,10 +221,15 @@ impl DelegationScope {
     }
 
     fn to_pattern(&self) -> String {
+        let mut segments: Vec<&str> = self.root.split('/').collect();
+        if let Some(node) = segments.get_mut(5).filter(|_| self.any_node) {
+            *node = "*";
+        }
+        let root = segments.join("/");
         if self.recursive {
-            format!("{}/**", self.root)
+            format!("{root}/**")
         } else {
-            self.root.clone()
+            root
         }
     }
 }
@@ -223,8 +246,9 @@ impl NormalizedRestriction {
 fn parse_normalized_restriction(
     pattern: &str,
     permission: Permission,
+    node: &str,
 ) -> Option<NormalizedRestriction> {
-    DelegationScope::parse_supported(pattern)
+    DelegationScope::parse_supported(pattern, node)
         .map(|scope| NormalizedRestriction { scope, permission })
 }
 
@@ -341,7 +365,9 @@ to the group data root and can never widen them.
 - `encrypted_buckets` names at most 64 buckets.
 - A restriction pattern is relative to the group data root or an absolute path inside it, may name
   an exact path or a subtree with a trailing `/**`, and takes `READ`, `WRITE` or `DENY` case
-  insensitively; at most 50 restrictions are accepted.
+  insensitively; at most 50 restrictions are accepted. An absolute pattern may name the node as
+  `*` (`/<realm>/g/<group>/data/*/<bucket>/**`), so the credential applies on every node, also to
+  requests forwarded within a distributed bucket.
 - A user holds at most 16 active credentials."#,
     request_body(
         content = CreateS3Request,
@@ -650,8 +676,10 @@ pub(crate) async fn build_credential_restrictions(
     root: &str,
     requested_restrictions: Option<Vec<CreatePathRestriction>>,
 ) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
-    let auth_restrictions = normalize_auth_restrictions(auth, root)?;
-    let requested_restrictions = normalize_requested_restrictions(requested_restrictions, root)?;
+    let node = state.get_node_id().to_string();
+    let auth_restrictions = normalize_auth_restrictions(auth, root, &node)?;
+    let requested_restrictions =
+        normalize_requested_restrictions(requested_restrictions, root, &node)?;
     if let (Some(parent), Some(requested)) = (&auth_restrictions, &requested_restrictions)
         && !contained(parent, requested)
     {
@@ -669,6 +697,7 @@ pub(crate) async fn build_credential_restrictions(
 fn normalize_auth_restrictions(
     auth: &AuthContext,
     group_root: &str,
+    node: &str,
 ) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
     let Some(restrictions) = auth.path_restrictions.as_ref() else {
         return Ok(None);
@@ -677,7 +706,7 @@ fn normalize_auth_restrictions(
     let mut normalized = Vec::new();
     for restriction in restrictions {
         if let Some(restriction) =
-            parse_normalized_restriction(&restriction.pattern, restriction.permission.clone())
+            parse_normalized_restriction(&restriction.pattern, restriction.permission.clone(), node)
         {
             if let Some(scope) = restriction.scope.intersect_group_root(group_root) {
                 normalized.push(NormalizedRestriction {
@@ -699,6 +728,7 @@ fn normalize_auth_restrictions(
 fn normalize_requested_restrictions(
     requested_restrictions: Option<Vec<CreatePathRestriction>>,
     group_root: &str,
+    node: &str,
 ) -> ServerResult<Option<Vec<NormalizedRestriction>>> {
     let Some(requested_restrictions) = requested_restrictions else {
         return Ok(None);
@@ -717,8 +747,11 @@ fn normalize_requested_restrictions(
                 restriction.pattern.trim_start_matches('/')
             )
         };
-        let Some(restriction) = parse_normalized_restriction(&pattern, permission) else {
-            return Err(ServerError::BadRequest);
+        let Some(restriction) = parse_normalized_restriction(&pattern, permission, node) else {
+            return Err(ServerError::BadRequestReason(format!(
+                "restriction {pattern} must be an exact path or end in /**; `*` may only name \
+                 the node of a group data path"
+            )));
         };
 
         if !restriction.scope.is_within(group_root) {
@@ -922,7 +955,9 @@ fn parse_permission(permission: &str) -> ServerResult<Permission> {
         "READ" => Ok(Permission::READ),
         "WRITE" => Ok(Permission::WRITE),
         "DENY" => Ok(Permission::DENY),
-        _ => Err(ServerError::BadRequest),
+        _ => Err(ServerError::BadRequestReason(format!(
+            "restriction permission {permission} must be READ, WRITE or DENY"
+        ))),
     }
 }
 

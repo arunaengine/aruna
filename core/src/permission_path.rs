@@ -4,6 +4,7 @@
 
 use crate::structs::identity::auth::{PathRestriction, Permission};
 use globset::GlobMatcher;
+use std::borrow::Cow;
 use thiserror::Error;
 
 /// Maximum number of path restrictions a token or credential may carry.
@@ -57,6 +58,27 @@ pub fn path_within(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// The pattern with each whole `*` segment after a literal prefix taken from `path`, so a
+/// restriction naming any node yields this node's literal root.
+pub fn bind_wildcards<'a>(pattern: &'a str, path: &str) -> Cow<'a, str> {
+    if !pattern.split('/').any(|segment| segment == "*") {
+        return Cow::Borrowed(pattern);
+    }
+    let mut concrete = path.split('/');
+    let mut aligned = true;
+    let bound: Vec<&str> = (pattern.split('/'))
+        .map(|segment| match (segment, concrete.next()) {
+            ("*", Some(own)) if aligned && !own.is_empty() => own,
+            _ => {
+                // Later segments align with `path` only while each one matches one segment.
+                aligned &= segment != "*" && !segment.contains(GLOB_CHARS);
+                segment
+            }
+        })
+        .collect();
+    Cow::Owned(bound.join("/"))
+}
+
 /// Whether restrictions allow every path below `root`: one allow must cover the whole subtree
 /// and no deny may reach into it. Group-wide checks ask for a literal `root/**` this way.
 pub fn restrictions_cover_subtree<'a>(
@@ -66,6 +88,8 @@ pub fn restrictions_cover_subtree<'a>(
 ) -> bool {
     let mut covered = false;
     for (pattern, permission) in restrictions {
+        let bound = bind_wildcards(pattern, root);
+        let pattern = bound.as_ref();
         match permission {
             Permission::DENY => {
                 let literal = &pattern[..pattern.find(GLOB_CHARS).unwrap_or(pattern.len())];
@@ -140,10 +164,15 @@ pub fn readable_roots(
         root,
     );
     if let Some(restrictions) = restrictions {
+        let bound: Vec<_> = (restrictions.iter())
+            .map(|restriction| bind_wildcards(&restriction.pattern, root))
+            .collect();
         let (restricted, restricted_denied) = split_roots(
-            restrictions
-                .iter()
-                .map(|restriction| (restriction.pattern.as_str(), &restriction.permission)),
+            (bound.iter().map(|pattern| pattern.as_ref())).zip(
+                restrictions
+                    .iter()
+                    .map(|restriction| &restriction.permission),
+            ),
             root,
         );
         allowed = narrow_roots(&allowed, &restricted);
@@ -321,6 +350,23 @@ mod tests {
     }
 
     #[test]
+    fn binds_aligned_wildcards() {
+        use super::bind_wildcards;
+        let path = "/r/g/G/data/n1/b";
+        assert_eq!(
+            bind_wildcards("/r/g/G/data/*/b/**", path),
+            "/r/g/G/data/n1/b/**"
+        );
+        // A segment after `**` or a partial wildcard no longer lines up with the path.
+        assert_eq!(bind_wildcards("/r/**/*/b", path), "/r/**/*/b");
+        assert_eq!(bind_wildcards("/r/g/G/da*/*/b", path), "/r/g/G/da*/*/b");
+        assert_eq!(
+            bind_wildcards("/r/g/G/data/n1/b/*", path),
+            "/r/g/G/data/n1/b/*"
+        );
+    }
+
+    #[test]
     fn rejects_excess_restrictions() {
         let restriction = PathRestriction {
             pattern: "/realm/g/abc/data/**".to_string(),
@@ -415,6 +461,19 @@ mod tests {
             permission: Permission::READ,
         }];
         assert!(readable_roots(&granted, Some(&elsewhere), BUCKET).is_empty());
+    }
+
+    #[test]
+    fn any_node_roots() {
+        let granted = granted(&[("/r/g/G/data/**", Permission::WRITE)]);
+        let restrictions = [PathRestriction {
+            pattern: "/r/g/G/data/*/b/**".to_string(),
+            permission: Permission::READ,
+        }];
+        assert_eq!(
+            readable_roots(&granted, Some(&restrictions), "/r/g/G/data/n2"),
+            vec!["/r/g/G/data/n2/b".to_string()]
+        );
     }
 
     #[test]

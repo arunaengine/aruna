@@ -956,6 +956,32 @@ mod pure_tests {
     }
 
     #[test]
+    fn any_node_restriction() {
+        let data = "/realm/g/group/data";
+        let restricted = PermissionRules::from_roles(
+            vec![CollectedRole {
+                role: role(
+                    HashMap::from([(format!("{data}/**"), Permission::WRITE)]),
+                    HashSet::new(),
+                ),
+                direct: true,
+                public: false,
+            }],
+            Some(&[PathRestriction {
+                pattern: format!("{data}/*/bucket/**"),
+                permission: Permission::READ,
+            }]),
+        )
+        .expect("patterns compile");
+        // Every member node grants the same scope, also for a whole subtree.
+        for node in ["node-1", "node-2"] {
+            assert!(restricted.allows(&format!("{data}/{node}/bucket/key"), &Permission::READ));
+            assert!(restricted.allows(&format!("{data}/{node}/bucket/**"), &Permission::READ));
+            assert!(!restricted.allows(&format!("{data}/{node}/other/key"), &Permission::READ));
+        }
+    }
+
+    #[test]
     fn public_grants_read() {
         // Public roles grant READ to everyone but never WRITE, and a direct
         // DENY still wins over a public grant.
