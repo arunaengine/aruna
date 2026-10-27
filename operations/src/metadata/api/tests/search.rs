@@ -428,6 +428,7 @@ fn search_assembly_order() {
         incomplete_ranges: 0,
         remote_ranges: 0,
         index_progress: Vec::new(),
+        partial_ranges: Vec::new(),
     };
     let stats = || MetadataFanoutStats {
         nodes_queried: 2,
@@ -450,6 +451,7 @@ fn search_assembly_order() {
     let unsearched = SearchNodePage {
         incomplete_ranges: 1,
         index_progress: vec![(Ulid::nil(), progress)],
+        partial_ranges: vec![(Ulid::nil(), Some("m".to_string()))],
         ..page(second, None)
     };
     let parts = vec![(first, page(first, Some("a"))), (second, unsearched)];
@@ -459,6 +461,10 @@ fn search_assembly_order() {
     };
     assert!(
         reason.starts_with("1 distributed bucket ranges"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("1 of them are indexed only up to"),
         "{reason}"
     );
     assert!(

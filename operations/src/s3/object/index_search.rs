@@ -9,6 +9,7 @@ use std::sync::{Arc, LazyLock};
 
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, SEARCH_INDEX_KEYSPACE};
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
+use aruna_core::structs::storage::distribution::inventory::Position;
 use aruna_core::structs::storage::distribution::search::IndexState;
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use aruna_core::types::{Key, TxnId};
@@ -40,7 +41,7 @@ pub(super) struct RangeSearch {
 
 /// One page of a distributed bucket. Ranges are read in key order and continue by key; a
 /// missing or building index is reported as incomplete, with its progress, and never replaced
-/// by a scan.
+/// by a scan. A building index answers for the keys up to its cursor and is reported partial.
 pub(super) async fn search_ranges(
     context: &DriverContext,
     input: &SearchObjectsInput,
@@ -49,22 +50,48 @@ pub(super) async fn search_ranges(
     let indexes = search.indexes.clone();
     let mut unready = Vec::new();
     let mut page = range_page(context, input, search, &mut unready).await?;
+    page.partial_ranges = partial_ranges(context, input, &unready).await?;
     if let (Some(indexes), false) = (indexes, unready.is_empty()) {
         let bucket = input.bucket.as_deref().unwrap_or_default();
         // Progress is a hint, so a failed read leaves it out.
         let progress = (range_progress(context, &indexes, bucket).await).unwrap_or_default();
         page.index_progress = (unready.into_iter())
-            .filter_map(|range_id| Some((range_id, *progress.get(&range_id)?)))
+            .filter_map(|(range_id, _)| Some((range_id, *progress.get(&range_id)?)))
             .collect();
     }
     Ok(page)
+}
+
+/// The partial ranges of `unready` with the key each is indexed through, shown only if the
+/// caller may read it, so a partial range never names a hidden key.
+async fn partial_ranges(
+    context: &DriverContext,
+    input: &SearchObjectsInput,
+    unready: &[(Ulid, Option<String>)],
+) -> Result<Vec<(Ulid, Option<String>)>, SearchObjectsError> {
+    let bucket = input.bucket.as_deref().unwrap_or_default();
+    let mut evaluators = HashMap::new();
+    let mut partial = Vec::new();
+    for (range_id, through) in unready {
+        let Some(through) = through else {
+            continue;
+        };
+        let mut shown = None;
+        for hit in resolve_keys(context, input, bucket, std::slice::from_ref(through)).await? {
+            if authorize(context, input, &mut evaluators, &hit).await? {
+                shown = Some(hit.hit.key);
+            }
+        }
+        partial.push((*range_id, shown));
+    }
+    Ok(partial)
 }
 
 async fn range_page(
     context: &DriverContext,
     input: &SearchObjectsInput,
     search: RangeSearch,
-    unready: &mut Vec<Ulid>,
+    unready: &mut Vec<(Ulid, Option<String>)>,
 ) -> Result<SearchNodePage, SearchObjectsError> {
     let bucket = input.bucket.clone().unwrap_or_default();
     let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
@@ -105,11 +132,15 @@ async fn range_page(
         };
         let found = search_chunk(context, &search, chunk, query).await?;
         for (range_id, found) in chunk.iter().zip(found) {
-            let Some(found) = found else {
-                unready.push(*range_id);
+            let Some((found, through)) = found else {
+                unready.push((*range_id, None));
                 incomplete += 1;
                 continue;
             };
+            if through.is_some() {
+                unready.push((*range_id, through));
+                incomplete += 1;
+            }
             examined += found.examined;
             let (mut keys, last) = (found.keys, found.last);
             keys.retain(|key| input.key_match.matches(key, &input.query));
@@ -140,13 +171,15 @@ async fn range_page(
     Ok(page(visible, None, incomplete, remote))
 }
 
-/// Queries the ready indexes of `chunk` at once; `None` for a range without one.
+/// Queries the indexes of `chunk` at once; `None` for a range without a searchable one. A
+/// building index is searched up to its cursor, with the key it covers through if the query
+/// reaches past it.
 async fn search_chunk(
     context: &DriverContext,
     search: &RangeSearch,
     chunk: &[Ulid],
     query: KeyQuery,
-) -> Result<Vec<Option<KeyPage>>, SearchObjectsError> {
+) -> Result<Vec<Option<(KeyPage, Option<String>)>>, SearchObjectsError> {
     let set_id = search.binding.set_id;
     let reads = (chunk.iter())
         .map(|range_id| {
@@ -159,15 +192,21 @@ async fn search_chunk(
     let states = finish_read(context, txn_id, states).await?;
     let searches = chunk.iter().zip(states).map(|(range_id, (_, state))| {
         let state = state.and_then(|value| IndexState::from_bytes(value.as_ref()).ok());
-        let (indexes, query) = (search.indexes.clone(), query.clone());
+        let (indexes, mut query) = (search.indexes.clone(), query.clone());
         async move {
-            let (Some(indexes), Some(IndexState::Ready { generation })) = (indexes, state) else {
-                return None;
+            let (generation, through) = match state? {
+                IndexState::Ready { generation } => (generation, None),
+                IndexState::Building {
+                    generation,
+                    cursor: Some(cursor),
+                } => (
+                    generation,
+                    end_at(&mut query, Position::decode(&cursor).ok()?.key),
+                ),
+                IndexState::Building { cursor: None, .. } => return None,
             };
-            indexes
-                .search(set_id, *range_id, generation, query)
-                .await
-                .ok()
+            let found = indexes?.search(set_id, *range_id, generation, query).await;
+            Some((found.ok()?, through))
         }
     });
     Ok(join_all(searches).await)
@@ -237,6 +276,18 @@ fn prefix_end(prefix: &str) -> Option<String> {
     None
 }
 
+/// Ends `query` at `through`, the last key a building index holds every head up to; returns
+/// it if the query could reach past it.
+fn end_at(query: &mut KeyQuery, through: String) -> Option<String> {
+    if let Bound::Included(end) | Bound::Excluded(end) = &query.end
+        && *end <= through
+    {
+        return None;
+    }
+    query.end = Bound::Included(through.clone());
+    Some(through)
+}
+
 fn overlaps(range: &KeyRange, start: &Bound<String>, end: &Bound<String>) -> bool {
     let after_start = match start {
         Bound::Included(key) | Bound::Excluded(key) => range
@@ -266,6 +317,7 @@ fn page(
         incomplete_ranges,
         remote_ranges,
         index_progress: Vec::new(),
+        partial_ranges: Vec::new(),
     }
 }
 
