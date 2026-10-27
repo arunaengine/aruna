@@ -2869,6 +2869,8 @@ async fn scan_due_jobs(
     };
     let mut last_key;
     let page_empty = values.is_empty();
+    // The scan meets each key once; only after a key repair may a job already be taken.
+    let mut repaired = false;
 
     for (key, value) in values {
         let mut key = key.to_vec();
@@ -2883,6 +2885,7 @@ async fn scan_due_jobs(
         };
         let canonical_key = blob_job_key(&job)?.to_vec();
         if canonical_key.as_slice() != key.as_slice() {
+            repaired = true;
             warn!(key = ?key, "Repairing blob replication job stored under non-canonical key");
             if let Some(existing) = read_blob_job(storage, &canonical_key).await?
                 && blob_job_preferred(&existing, &job)
@@ -2908,7 +2911,7 @@ async fn scan_due_jobs(
             next_due_ms = min_due_at(next_due_ms, job.due_at_ms);
             continue;
         }
-        if merge_due_job(&mut jobs, key, job, limit) {
+        if merge_due_job(&mut jobs, key, job, (repaired, limit)) {
             return Ok(BlobJobScan {
                 next_cursor: ReplicationScanCursor {
                     generation: cursor.generation,
@@ -3051,12 +3054,13 @@ fn merge_due_job(
     jobs: &mut Vec<(Vec<u8>, BlobJobRecord)>,
     key: Vec<u8>,
     job: BlobJobRecord,
-    limit: usize,
+    (repaired, limit): (bool, usize),
 ) -> bool {
-    if let Some((_, existing)) = jobs
-        .iter_mut()
-        .find(|(existing_key, _)| existing_key.as_slice() == key.as_slice())
-    {
+    let existing = match repaired {
+        true => (jobs.iter_mut()).find(|(existing_key, _)| *existing_key == key),
+        false => None,
+    };
+    if let Some((_, existing)) = existing {
         if blob_job_preferred(&job, existing) {
             *existing = job;
         }
