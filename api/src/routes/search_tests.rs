@@ -963,6 +963,7 @@ fn search_maps_partiality() {
         },
         omitted_partitions: 0,
         incomplete_ranges: 0,
+        index_progress: Vec::new(),
         complete: false,
     };
 

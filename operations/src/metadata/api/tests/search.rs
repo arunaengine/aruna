@@ -427,6 +427,7 @@ fn search_assembly_order() {
         observed_at: SystemTime::UNIX_EPOCH,
         incomplete_ranges: 0,
         remote_ranges: 0,
+        index_progress: Vec::new(),
     };
     let stats = || MetadataFanoutStats {
         nodes_queried: 2,
@@ -441,13 +442,29 @@ fn search_assembly_order() {
         query: plan.query.clone(),
         ..plan
     };
+    let progress = crate::distribution::index_feed::IndexProgress {
+        ready: false,
+        indexed: 10,
+        keys: 50,
+    };
     let unsearched = SearchNodePage {
         incomplete_ranges: 1,
+        index_progress: vec![(Ulid::nil(), progress)],
         ..page(second, None)
     };
     let parts = vec![(first, page(first, Some("a"))), (second, unsearched)];
     let refused = assemble_object_execution(&test.context, &strict, partitions(), parts, stats());
-    assert!(matches!(refused, Err(MetadataApiError::ServiceUnavailable)));
+    let Err(MetadataApiError::SearchIncomplete(reason)) = refused else {
+        panic!("a strict search with an unsearched range is refused");
+    };
+    assert!(
+        reason.starts_with("1 distributed bucket ranges"),
+        "{reason}"
+    );
+    assert!(
+        reason.ends_with("about 40 keys are still to be indexed"),
+        "{reason}"
+    );
     let plan = ObjectSearchPlan {
         mode: ObjectQueryMode::DistributedBestEffort,
         ..strict

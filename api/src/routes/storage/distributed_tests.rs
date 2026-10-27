@@ -4,6 +4,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::distribution::{DistributionError, DistributionRevision};
+use aruna_operations::distribution::index_feed::IndexProgress;
 use aruna_operations::distribution::status::{
     DeletionStatus, LifecycleStatus, MemberStatus, RangeStatus, TransferStatus,
 };
@@ -118,6 +119,11 @@ fn degraded_names_coordinator() {
             epoch: 1,
             replicas: Vec::new(),
             degraded: Some(Reach::Unreachable { since_ms: Some(77) }),
+            search_index: Some(IndexProgress {
+                ready: false,
+                indexed: 3,
+                keys: 8,
+            }),
         }],
         recommended_grant: "/r/g/9/data/*/spire/**".to_string(),
         lifecycle: LifecycleStatus {
@@ -150,6 +156,8 @@ fn degraded_names_coordinator() {
         vec![Ulid::from_bytes([3; 16]).to_string()]
     );
     assert!(response.deletion.is_none());
+    let index = response.ranges[0].search_index.as_ref().unwrap();
+    assert_eq!((index.ready, index.indexed_keys, index.keys), (false, 3, 8));
 }
 
 #[test]

@@ -25,6 +25,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
+use crate::distribution::index_feed::IndexProgress;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -102,6 +103,9 @@ pub struct SearchNodePage {
     /// that member's page.
     #[serde(default)]
     pub remote_ranges: usize,
+    /// This node's index progress of the incomplete ranges it coordinates.
+    #[serde(default)]
+    pub index_progress: Vec<(ulid::Ulid, IndexProgress)>,
 }
 
 #[derive(Debug, Error)]
@@ -214,6 +218,7 @@ fn node_page(
         observed_at: SystemTime::now(),
         incomplete_ranges: distributed.values().filter(|bound| **bound).count(),
         remote_ranges: 0,
+        index_progress: Vec::new(),
     }
 }
 

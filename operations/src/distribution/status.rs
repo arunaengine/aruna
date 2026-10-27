@@ -21,6 +21,7 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::distribution::index_feed::{IndexProgress, range_progress};
 use crate::driver::DriverContext;
 use crate::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use crate::placement::process_placements::load_realm_config;
@@ -66,6 +67,8 @@ pub struct RangeStatus {
     pub replicas: Vec<Ulid>,
     /// The coordinator is unreachable, so writes to the range fail.
     pub degraded: Option<Reach>,
+    /// This node's search index of the range, while it holds the range and the set keeps one.
+    pub search_index: Option<IndexProgress>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,6 +157,7 @@ pub fn summarize(
                 epoch: range.epoch,
                 replicas: range.replicas.clone(),
                 degraded,
+                search_index: None,
             }
         })
         .collect();
@@ -318,6 +322,17 @@ pub async fn read_status(
         status.lifecycle.publications_closed = !fence.receiving();
     }
     Ok(Some(status))
+}
+
+/// Adds this node's search index progress of each range; a failed read leaves it out.
+pub async fn add_progress(context: &Arc<DriverContext>, status: &mut DistributionStatus) {
+    if let Some(handle) = context.metadata_handle.as_ref() {
+        let progress = range_progress(context, &handle.range_indexes(), &status.bucket).await;
+        let progress = progress.unwrap_or_default();
+        for range in &mut status.ranges {
+            range.search_index = progress.get(&range.range_id).copied();
+        }
+    }
 }
 
 #[cfg(test)]

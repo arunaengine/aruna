@@ -15,6 +15,7 @@ use super::{
 };
 
 use super::distributed::run_search_distributed;
+use crate::distribution::index_feed::IndexProgress;
 use crate::metadata::search_cursor::{SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE};
 
 const OBJECT_CURSOR_VERSION: u8 = 1;
@@ -120,6 +121,8 @@ pub struct ObjectExecution {
     /// Distributed bucket ranges this page could not search: a missing or building index,
     /// or in local mode a range another member coordinates.
     pub incomplete_ranges: usize,
+    /// Index progress of incomplete ranges, by the node that coordinates them.
+    pub index_progress: Vec<(NodeId, ulid::Ulid, IndexProgress)>,
     pub complete: bool,
 }
 
@@ -618,9 +621,18 @@ pub(super) fn assemble_object_execution(
     let incomplete_ranges = (parts.iter())
         .map(|(_, page)| page.incomplete_ranges + if local { page.remote_ranges } else { 0 })
         .sum::<usize>();
+    let index_progress: Vec<_> = (parts.iter())
+        .flat_map(|(node_id, page)| {
+            let progress = page.index_progress.iter();
+            progress.map(|(range_id, progress)| (*node_id, *range_id, *progress))
+        })
+        .collect();
     // Strict mode answers complete pages only: an unsearched range fails the request.
     if plan.mode == ObjectQueryMode::DistributedStrict && incomplete_ranges > 0 {
-        return Err(MetadataApiError::ServiceUnavailable);
+        return Err(MetadataApiError::SearchIncomplete(incomplete_reason(
+            incomplete_ranges,
+            &index_progress,
+        )));
     }
     let mut pages = parts.into_iter().collect::<HashMap<_, _>>();
     let mut hits = Vec::with_capacity(plan.limit);
@@ -709,8 +721,25 @@ pub(super) fn assemble_object_execution(
         fanout_stats,
         omitted_partitions,
         incomplete_ranges,
+        index_progress,
         complete,
     })
+}
+
+/// Why a strict search refused: how many ranges were not searched and how many keys their
+/// indexes still miss.
+fn incomplete_reason(ranges: usize, progress: &[(NodeId, ulid::Ulid, IndexProgress)]) -> String {
+    let pending = (progress.iter())
+        .map(|(_, _, progress)| progress.keys.saturating_sub(progress.indexed))
+        .sum::<u64>();
+    let mut reason = format!(
+        "{ranges} distributed bucket ranges were not searched: their search index is missing \
+         or still being built, or the search names no bucket"
+    );
+    if pending > 0 {
+        reason.push_str(&format!("; about {pending} keys are still to be indexed"));
+    }
+    reason
 }
 
 pub async fn search_metadata(

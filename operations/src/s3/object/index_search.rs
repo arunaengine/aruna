@@ -22,7 +22,7 @@ use super::{
     SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits, finish_read,
     load_live, start_read,
 };
-use crate::distribution::index_feed::state_key;
+use crate::distribution::index_feed::{range_progress, state_key};
 use crate::distribution::key_index::{KeyPage, KeyQuery, RangeIndexes};
 use crate::driver::DriverContext;
 use crate::replication::members::read_record;
@@ -39,11 +39,32 @@ pub(super) struct RangeSearch {
 }
 
 /// One page of a distributed bucket. Ranges are read in key order and continue by key; a
-/// missing or building index is reported as incomplete and never replaced by a scan.
+/// missing or building index is reported as incomplete, with its progress, and never replaced
+/// by a scan.
 pub(super) async fn search_ranges(
     context: &DriverContext,
     input: &SearchObjectsInput,
     search: RangeSearch,
+) -> Result<SearchNodePage, SearchObjectsError> {
+    let indexes = search.indexes.clone();
+    let mut unready = Vec::new();
+    let mut page = range_page(context, input, search, &mut unready).await?;
+    if let (Some(indexes), false) = (indexes, unready.is_empty()) {
+        let bucket = input.bucket.as_deref().unwrap_or_default();
+        // Progress is a hint, so a failed read leaves it out.
+        let progress = (range_progress(context, &indexes, bucket).await).unwrap_or_default();
+        page.index_progress = (unready.into_iter())
+            .filter_map(|range_id| Some((range_id, *progress.get(&range_id)?)))
+            .collect();
+    }
+    Ok(page)
+}
+
+async fn range_page(
+    context: &DriverContext,
+    input: &SearchObjectsInput,
+    search: RangeSearch,
+    unready: &mut Vec<Ulid>,
 ) -> Result<SearchNodePage, SearchObjectsError> {
     let bucket = input.bucket.clone().unwrap_or_default();
     let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
@@ -83,8 +104,9 @@ pub(super) async fn search_ranges(
             limit: budget.saturating_sub(examined).max(1),
         };
         let found = search_chunk(context, &search, chunk, query).await?;
-        for found in found {
+        for (range_id, found) in chunk.iter().zip(found) {
             let Some(found) = found else {
+                unready.push(*range_id);
                 incomplete += 1;
                 continue;
             };
@@ -243,6 +265,7 @@ fn page(
         observed_at: std::time::SystemTime::now(),
         incomplete_ranges,
         remote_ranges,
+        index_progress: Vec::new(),
     }
 }
 

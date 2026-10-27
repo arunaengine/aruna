@@ -55,6 +55,7 @@ pub(crate) fn read_error(error: MetadataApiError) -> MetadataReadError {
         MetadataApiError::NotFound => MetadataReadError::NotFound,
         MetadataApiError::BadRequest
         | MetadataApiError::ServiceUnavailable
+        | MetadataApiError::SearchIncomplete(_)
         | MetadataApiError::PlacementUnavailable(_)
         | MetadataApiError::InvalidCursor(_)
         | MetadataApiError::Internal(_) => MetadataReadError::Unavailable,

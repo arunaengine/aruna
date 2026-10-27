@@ -207,9 +207,24 @@ pub struct ObjectCoverage {
     pub omitted_partitions: usize,
     /// Distributed bucket ranges this page could not search; `complete` is false when any.
     pub incomplete_ranges: usize,
+    /// Index progress of the incomplete ranges whose coordinator reported it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index_progress: Vec<RangeIndexProgress>,
     pub complete: bool,
     pub truncated: bool,
     pub partitions: Vec<ObjectPartitionCoverage>,
+}
+
+/// How far a coordinator's search index of one range is.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RangeIndexProgress {
+    pub node_id: String,
+    pub range_id: String,
+    /// The index became ready after the page was searched.
+    pub ready: bool,
+    pub indexed_keys: u64,
+    /// Keys of the range by the coordinator's range counters, an estimate.
+    pub keys: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -465,7 +480,9 @@ restrictions and request policies before it can be returned.
   the key, split at `/`, `.`, `-`, `_` and other separators. `coverage.incomplete_ranges` counts
   ranges whose index is missing or still being built (and, in `local` mode, ranges another
   member coordinates); they are never scanned, and `complete` is false while any remain.
-  `distributed_strict` answers 503 while any remain.
+  `coverage.index_progress` lists the keys indexed so far and the range's key count for each
+  such range whose coordinator answered. `distributed_strict` answers 503 while any remain, and
+  the error message says how many ranges and about how many keys are still to be indexed.
 - A search without `bucket` skips distributed buckets, which only their key indexes cover;
   each skipped bucket counts in `coverage.incomplete_ranges`.
 - A cursor that continues after keys the caller may not see carries them sealed; a restart of
@@ -641,6 +658,15 @@ fn map_search_response(result: ObjectExecution, mode: ObjectMode) -> ObjectRespo
             failed_partitions,
             omitted_partitions: result.omitted_partitions,
             incomplete_ranges: result.incomplete_ranges,
+            index_progress: (result.index_progress.into_iter())
+                .map(|(node_id, range_id, progress)| RangeIndexProgress {
+                    node_id: node_id.to_string(),
+                    range_id: range_id.to_string(),
+                    ready: progress.ready,
+                    indexed_keys: progress.indexed,
+                    keys: progress.keys,
+                })
+                .collect(),
             complete: result.complete,
             truncated,
             partitions: result

@@ -18,7 +18,7 @@ use aruna_operations::distribution::create::{
 use aruna_operations::distribution::forward::PublishRefusal;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::status::{
-    DeletionStatus, DistributionStatus, Reach, read_status,
+    DeletionStatus, DistributionStatus, Reach, add_progress, read_status,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -177,6 +177,18 @@ pub struct RangeResponse {
     /// When this node last heard from the unreachable coordinator, in Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreachable_since_ms: Option<u64>,
+    /// This node's search index of the range; omitted when it keeps none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_index: Option<SearchIndexResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SearchIndexResponse {
+    /// Searches cover the range; until then they report it in `incomplete_ranges`.
+    pub ready: bool,
+    pub indexed_keys: u64,
+    /// Keys of the range by this node's range counters, an estimate.
+    pub keys: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -398,6 +410,11 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
                 Some(Reach::Unreachable { since_ms }) => since_ms,
                 _ => None,
             },
+            search_index: range.search_index.map(|index| SearchIndexResponse {
+                ready: index.ready,
+                indexed_keys: index.indexed,
+                keys: index.keys,
+            }),
         })
         .collect();
     DistributedResponse {
@@ -499,7 +516,8 @@ const STATUS_EXAMPLE: &str = r#"{
         "coordinator_node": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
         "epoch": 1,
         "replicas": [],
-        "degraded": false
+        "degraded": false,
+        "search_index": {"ready": false, "indexed_keys": 1200000, "keys": 14600000}
     }],
     "recommended_grant": "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/*/spire/**"
 }"#;
@@ -667,7 +685,9 @@ pub(crate) async fn owned_status(
   node that may publish: data service continues, but admissions and other configuration
   changes wait.
 - `recommended_grant` is the node glob grant that lets reads that pull from another member
-  pass that member's own check."#,
+  pass that member's own check.
+- `search_index` shows this node's search index of a range: whether it is ready, the keys
+  indexed so far and the range's key count."#,
     params(
         ("group_id" = String, Path, description = "Owner group id"),
         ("set_id" = String, Path, description = "Distributed bucket set id")
@@ -686,7 +706,7 @@ pub async fn get_distributed(
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<Json<DistributedResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    let status = owned_status(&state, group_id, set_id).await?;
+    let mut status = owned_status(&state, group_id, set_id).await?;
     let path = bucket_permission_path(
         state.get_realm_id(),
         group_id,
@@ -694,6 +714,7 @@ pub async fn get_distributed(
         &status.bucket,
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
+    add_progress(&state.get_ctx(), &mut status).await;
     Ok(Json(status_response(status)))
 }
 
@@ -733,7 +754,8 @@ pub async fn get_bucket_distribution(
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
     let binding = info.distribution.ok_or(ServerError::NotFound)?;
-    let status = owned_status(&state, info.group_id, binding.set_id).await?;
+    let mut status = owned_status(&state, info.group_id, binding.set_id).await?;
+    add_progress(&state.get_ctx(), &mut status).await;
     Ok(Json(status_response(status)))
 }
 
