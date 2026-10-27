@@ -28,7 +28,7 @@ use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use aruna_operations::node::status::load_status;
-use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsageScope};
+use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
 };
@@ -2120,7 +2120,7 @@ pub(crate) async fn distinct_buckets(
 pub async fn load_realm_usage(
     state: &ServerState,
     scope: RealmUsageScope,
-) -> ServerResult<UsageCounters> {
+) -> ServerResult<RealmUsage> {
     aruna_operations::node::usage_stats::load_realm_usage(
         &state.get_ctx(),
         state.get_node_id(),
@@ -2145,6 +2145,9 @@ checked, because the figures are realm-wide totals and not per-caller views.
   node's replicated usage snapshot, so it is eventually consistent: a node whose snapshot has not
   arrived or has not refreshed yet is simply not part of the sum, which can make the total lag
   reality after a burst of writes.
+- `realm.objects`, `realm.logical_bytes` and `realm.referenced_bytes` count each object once: the
+  copies other member nodes hold of a distributed bucket's key range are left out, so the node
+  coordinating the range counts it. The flat fields count everything this node holds.
 - `stored_blobs` and `stored_bytes` count physical, content-addressed blob copies. A copy is shared
   by every group referencing it, so it is attributed to this node and its backend, never to a group;
   the group usage endpoint therefore omits both fields.
@@ -2192,7 +2195,7 @@ pub async fn get_usage(
     require_unrestricted_auth(&state, auth)?;
     let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
     let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
-    let mut response = UsageResponse::new(local, realm);
+    let mut response = UsageResponse::new(local, realm.counters);
     response.realm.distinct_buckets = distinct_buckets(&state, None, response.realm.buckets).await;
     // Best effort: storage counters stay reportable when the metadata
     // subsystem cannot answer, and the omitted field never reads as zero.

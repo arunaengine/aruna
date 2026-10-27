@@ -1281,6 +1281,7 @@ async fn reported_bytes(h: &Harness, group_id: Ulid) -> u64 {
     load_realm_usage(&h.driver, h.node_id, RealmUsageScope::Group(group_id))
         .await
         .unwrap()
+        .counters
         .logical_bytes
 }
 

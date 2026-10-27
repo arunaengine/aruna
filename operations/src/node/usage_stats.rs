@@ -8,10 +8,12 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::keyspaces::{
+    NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BucketInfo};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::usage::{
     BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
@@ -414,18 +416,23 @@ pub enum QuotaGateError {
 }
 
 /// Embeddable read side of the per-group quota gate: sums the realm-wide `logical_bytes` in the
-/// caller's write transaction, so same-group writes conflict; `ceiling` folds in grace. A rebuild
-/// without complete counters from an earlier one refuses every write.
+/// caller's write transaction, so same-group writes conflict; `ceiling` folds in grace. Replicas
+/// count only when the group's quota settings say so. A rebuild without complete counters from
+/// an earlier one refuses every write.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,
     delta_logical_bytes: u64,
+    group_id: GroupId,
     group_key: Vec<u8>,
     remote_prefix: Vec<u8>,
     local_node_id: NodeId,
     realm_id: Option<RealmId>,
     active_node_ids: Option<HashSet<NodeId>>,
     usage: u64,
+    /// The replicas' logical bytes in `usage`, from every node's last published snapshot.
+    replica_bytes: u64,
+    count_replicas: bool,
     rebuilding: bool,
     phase: QuotaGatePhase,
 }
@@ -442,12 +449,15 @@ impl QuotaGate {
         Self {
             ceiling,
             delta_logical_bytes,
+            group_id,
             group_key: usage_group_key(group_id),
             remote_prefix: usage_group_prefix(group_id),
             local_node_id,
             realm_id: None,
             active_node_ids: None,
             usage: 0,
+            replica_bytes: 0,
+            count_replicas: false,
             rebuilding: false,
             phase: QuotaGatePhase::Pending,
         }
@@ -542,6 +552,7 @@ impl QuotaGate {
                     let document = RealmConfigDocument::from_bytes(bytes.as_ref())?;
                     self.active_node_ids =
                         Some(document.sync_eligible_nodes()?.into_iter().collect());
+                    self.count_replicas = document.quota.counts_replicas(&self.group_id);
                 }
                 Ok(Some(self.read_local_effect(txn_id)))
             }
@@ -561,23 +572,22 @@ impl QuotaGate {
                 }),
             ) => {
                 for (key, value) in values {
-                    // Live counters already include our snapshot. Remote snapshots must also
-                    // bind their embedded node id to the storage key.
+                    // Live counters already include our snapshot's counters, not its replica
+                    // share. Snapshots must also bind their embedded node id to the storage key.
                     let key_node_id = usage_node_id(key.as_ref());
-                    if key_node_id == Some(self.local_node_id) {
-                        continue;
-                    }
-                    if let (Some(active_node_ids), Some(node_id)) =
-                        (&self.active_node_ids, key_node_id)
-                        && !active_node_ids.contains(&node_id)
-                    {
+                    let local = key_node_id == Some(self.local_node_id);
+                    if !local && !counted(self.active_node_ids.as_ref(), key_node_id) {
                         continue;
                     }
                     let snapshot = NodeUsageSnapshot::from_bytes(value.as_ref())?;
                     if key_node_id != Some(snapshot.node_id) {
                         continue;
                     }
-                    self.usage = self.usage.saturating_add(snapshot.counters.logical_bytes);
+                    let replicas = snapshot.replicas.logical_bytes;
+                    self.replica_bytes = self.replica_bytes.saturating_add(replicas);
+                    if !local {
+                        self.usage = self.usage.saturating_add(snapshot.counters.logical_bytes);
+                    }
                 }
                 match next_start_after {
                     Some(start) => Ok(Some(self.scan_effect(Some(start), txn_id))),
@@ -593,7 +603,11 @@ impl QuotaGate {
 
     /// Projected group-wide `logical_bytes` if the pending write commits.
     pub fn projected_usage(&self) -> u64 {
-        self.usage.saturating_add(self.delta_logical_bytes)
+        let usage = match self.count_replicas {
+            true => self.usage,
+            false => self.usage.saturating_sub(self.replica_bytes),
+        };
+        usage.saturating_add(self.delta_logical_bytes)
     }
 
     /// True when committing the pending write would push the group's realm-wide
@@ -893,24 +907,29 @@ async fn read_local_group(
     }
 }
 
-/// Sums remote nodes' snapshots under `prefix`, skipping the local node's own
-/// snapshot so it is never double-counted against the live local counters.
-async fn sum_remote_snapshots(
+/// Whether a snapshot of `node_id` counts: with a realm config, only its sync-eligible nodes do.
+fn counted(active_node_ids: Option<&HashSet<NodeId>>, node_id: Option<NodeId>) -> bool {
+    match (active_node_ids, node_id) {
+        (Some(active_node_ids), Some(node_id)) => active_node_ids.contains(&node_id),
+        _ => true,
+    }
+}
+
+/// Sums remote nodes' snapshots under `prefix`, and every node's replica share, the local one
+/// included. The local counters are skipped so they are never double-counted against the live
+/// local counters.
+async fn sum_snapshots(
     storage: &StorageHandle,
     prefix: Vec<u8>,
     local_node_id: NodeId,
     active_node_ids: Option<&HashSet<NodeId>>,
-) -> Result<UsageCounters, String> {
+) -> Result<(UsageCounters, UsageCounters), String> {
     let entries = scan_all(storage, NODE_STATS_KEYSPACE, Some(Key::from(prefix))).await?;
-    let mut total = UsageCounters::default();
+    let (mut total, mut replicas) = (UsageCounters::default(), UsageCounters::default());
     for (key, value) in entries {
         let key_node_id = usage_node_id(key.as_ref());
-        if key_node_id == Some(local_node_id) {
-            continue;
-        }
-        if let (Some(active_node_ids), Some(node_id)) = (active_node_ids, key_node_id)
-            && !active_node_ids.contains(&node_id)
-        {
+        let local = key_node_id == Some(local_node_id);
+        if !local && !counted(active_node_ids, key_node_id) {
             continue;
         }
         let snapshot = NodeUsageSnapshot::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
@@ -918,9 +937,14 @@ async fn sum_remote_snapshots(
         if key_node_id != Some(snapshot.node_id) {
             continue;
         }
-        total.add(&snapshot.counters).map_err(|e| e.to_string())?;
+        replicas
+            .add(&snapshot.replicas)
+            .map_err(|e| e.to_string())?;
+        if !local {
+            total.add(&snapshot.counters).map_err(|e| e.to_string())?;
+        }
     }
-    Ok(total)
+    Ok((total, replicas))
 }
 
 /// Rebuilds this node's snapshot documents from live counters and distributes them
@@ -1349,7 +1373,7 @@ pub async fn recompute_usage_summary(
         writes.push((
             NODE_STATS_KEYSPACE.to_string(),
             Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
-            Value::from(total.to_bytes().map_err(|e| e.to_string())?),
+            Value::from(total.counters.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
     for group_id in groups {
@@ -1358,7 +1382,7 @@ pub async fn recompute_usage_summary(
         writes.push((
             NODE_STATS_KEYSPACE.to_string(),
             Key::from(usage_summary_key(group_id)),
-            Value::from(total.to_bytes().map_err(|e| e.to_string())?),
+            Value::from(total.counters.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
 
@@ -1406,6 +1430,10 @@ pub async fn refresh_usage_targets(
     if realm_config_changed && let Err(error) = clear_usage_cache(ctx).await {
         warn!(error = %error, "Failed to clear realm usage summary after realm config change");
     }
+    // Distribution records arrive as realm config targets; a new coordinator moves replica shares.
+    if realm_config_changed && let Err(error) = dirty_bound_groups(ctx).await {
+        warn!(error = %error, "Failed to mark distributed bucket groups for a usage publish");
+    }
     if !include_global && groups.is_empty() {
         return;
     }
@@ -1421,21 +1449,81 @@ pub async fn refresh_usage_targets(
     }
 }
 
+/// A realm-wide usage total.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RealmUsage {
+    /// Objects and data counted once, a distributed range at its coordinator; `stored_*` and
+    /// `buckets` over every node.
+    pub counters: UsageCounters,
+    /// The copies of distributed ranges left out of `counters`.
+    pub replicas: UsageCounters,
+}
+
+impl RealmUsage {
+    fn of(
+        local: UsageCounters,
+        (remote, replicas): (UsageCounters, UsageCounters),
+    ) -> Result<Self, String> {
+        let mut total = local;
+        total.add(&remote).map_err(|e| e.to_string())?;
+        Ok(Self {
+            counters: total.without_replicas(&replicas),
+            replicas,
+        })
+    }
+}
+
+/// Marks the groups of local distributed buckets and the global for the next publish, which
+/// recomputes their replica shares, and schedules it.
+async fn dirty_bound_groups(ctx: &DriverContext) -> Result<(), String> {
+    let mut groups = BTreeSet::new();
+    for (_, value) in scan_all(&ctx.storage_handle, S3_BUCKET_KEYSPACE, None).await? {
+        let info = BucketInfo::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
+        if info.distribution.is_some() {
+            groups.insert(info.group_id);
+        }
+    }
+    if groups.is_empty() {
+        return Ok(());
+    }
+    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
+    let marker = |key: Vec<u8>| {
+        (
+            NODE_STATS_KEYSPACE.to_string(),
+            Key::from(key),
+            generation.clone(),
+        )
+    };
+    let mut writes = vec![marker(DIRTY_GLOBAL_KEY.to_vec())];
+    writes.extend(
+        groups
+            .into_iter()
+            .map(|group_id| marker(dirty_group_key(group_id))),
+    );
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    match ctx.storage_handle.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+        other => return Err(format!("dirty marker write failed: {other:?}")),
+    }
+    if let Some(task_handle) = ctx.task_handle.as_ref() {
+        task_handle.send_effect(schedule_snapshot_publish()).await;
+    }
+    Ok(())
+}
+
 async fn realm_global_usage(
     storage: &StorageHandle,
     local_node_id: NodeId,
     active_node_ids: Option<&HashSet<NodeId>>,
-) -> Result<UsageCounters, String> {
-    let mut total = read_local_global(storage).await?;
-    let remote = sum_remote_snapshots(
-        storage,
-        USAGE_GLOBAL_PREFIX.to_vec(),
-        local_node_id,
-        active_node_ids,
-    )
-    .await?;
-    total.add(&remote).map_err(|e| e.to_string())?;
-    Ok(total)
+) -> Result<RealmUsage, String> {
+    let local = read_local_global(storage).await?;
+    let prefix = USAGE_GLOBAL_PREFIX.to_vec();
+    let remote = sum_snapshots(storage, prefix, local_node_id, active_node_ids).await?;
+    RealmUsage::of(local, remote)
 }
 
 async fn realm_group_usage(
@@ -1443,17 +1531,11 @@ async fn realm_group_usage(
     local_node_id: NodeId,
     group_id: GroupId,
     active_node_ids: Option<&HashSet<NodeId>>,
-) -> Result<UsageCounters, String> {
-    let mut total = read_local_group(storage, group_id).await?;
-    let remote = sum_remote_snapshots(
-        storage,
-        usage_group_prefix(group_id),
-        local_node_id,
-        active_node_ids,
-    )
-    .await?;
-    total.add(&remote).map_err(|e| e.to_string())?;
-    Ok(total)
+) -> Result<RealmUsage, String> {
+    let local = read_local_group(storage, group_id).await?;
+    let prefix = usage_group_prefix(group_id);
+    let remote = sum_snapshots(storage, prefix, local_node_id, active_node_ids).await?;
+    RealmUsage::of(local, remote)
 }
 
 /// Sums the realm-wide total from the live local counters and the remote snapshots, the
@@ -1462,7 +1544,7 @@ pub async fn load_realm_usage(
     ctx: &DriverContext,
     local_node_id: NodeId,
     scope: RealmUsageScope,
-) -> Result<UsageCounters, String> {
+) -> Result<RealmUsage, String> {
     let storage = &ctx.storage_handle;
     let active_node_ids = active_usage_nodes(ctx).await?;
     match scope {
@@ -2357,6 +2439,173 @@ mod tests {
         }
     }
 
+    fn logical(logical_bytes: u64) -> UsageCounters {
+        UsageCounters {
+            logical_bytes,
+            ..Default::default()
+        }
+    }
+
+    // Replicas count toward a quota only by the group's setting; the own snapshot adds its
+    // replica share, never its counters a second time.
+    #[test]
+    fn gate_counts_replicas() {
+        use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
+        let (local, remote) = (node(1), node(2));
+        let group_id = Ulid::from_bytes([2; 16]);
+        let realm_id = RealmId([4; 32]);
+        let txn_id = Ulid::from_bytes([1; 16]);
+        let read = |value: Vec<u8>| {
+            Event::Storage(StorageEvent::ReadResult {
+                key: Key::from(b"row".to_vec()),
+                value: Some(value.into()),
+            })
+        };
+        let snapshot = |node_id: NodeId, counters, replicas| {
+            let snapshot = NodeUsageSnapshot {
+                node_id,
+                counters: logical(counters),
+                replicas: logical(replicas),
+            };
+            let key = Key::from(usage_snapshot_key(group_id, node_id));
+            (key, Value::from(snapshot.to_bytes().unwrap()))
+        };
+        for (count_replicas, projected) in [(false, 61), (true, 151)] {
+            let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+            config.nodes = [local, remote]
+                .map(|node_id| RealmNode {
+                    node_id: node_id.to_string(),
+                    kind: RealmNodeKind::Management,
+                })
+                .to_vec();
+            config.quota.count_replicas = count_replicas;
+            let mut gate = QuotaGate::new_for_realm(1_000, 1, group_id, local, realm_id);
+            gate.start(txn_id);
+            let no_marker = Event::Storage(StorageEvent::ReadResult {
+                key: Key::from(USAGE_REBUILD_KEY.to_vec()),
+                value: None,
+            });
+            gate.step(no_marker, txn_id).unwrap();
+            gate.step(read(postcard::to_allocvec(&config).unwrap()), txn_id)
+                .unwrap();
+            gate.step(read(logical(100).to_bytes().unwrap()), txn_id)
+                .unwrap();
+            let values = vec![snapshot(local, 100, 40), snapshot(remote, 50, 50)];
+            let scanned = Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after: None,
+            });
+            assert_eq!(gate.step(scanned, txn_id).unwrap(), None);
+            assert_eq!(gate.projected_usage(), projected);
+        }
+    }
+
+    // Realm totals leave out the copies of distributed ranges, the own node's included, while
+    // physical stored bytes add up over every node.
+    #[tokio::test]
+    async fn totals_count_once() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let (local, remote) = (node(1), node(2));
+        let group_id = Ulid::from_bytes([5; 16]);
+        let counters = |objects, logical_bytes, referenced_bytes, stored_bytes| UsageCounters {
+            objects,
+            logical_bytes,
+            referenced_bytes,
+            stored_bytes,
+            ..Default::default()
+        };
+        write_counters(&ctx, global_shard_key(0), counters(3, 30, 9, 50)).await;
+        write_counters(&ctx, usage_group_key(group_id), counters(3, 30, 9, 0)).await;
+        let snapshot = |node_id, counters, replicas| {
+            NodeUsageSnapshot {
+                node_id,
+                counters,
+                replicas,
+            }
+            .to_bytes()
+            .unwrap()
+        };
+        for (global, key) in [
+            (true, usage_global_key(local)),
+            (false, usage_snapshot_key(group_id, local)),
+        ] {
+            let own = counters(3, 30, 9, if global { 50 } else { 0 });
+            let value = snapshot(local, own, counters(1, 10, 4, 0));
+            write_node_stat(&ctx, key, value).await;
+        }
+        for (global, key) in [
+            (true, usage_global_key(remote)),
+            (false, usage_snapshot_key(group_id, remote)),
+        ] {
+            // The remote node holds copies only.
+            let held = counters(2, 20, 6, if global { 25 } else { 0 });
+            let value = snapshot(remote, held, counters(2, 20, 6, 0));
+            write_node_stat(&ctx, key, value).await;
+        }
+
+        let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
+            .await
+            .unwrap();
+        assert_eq!(global.counters, counters(2, 20, 5, 75));
+        assert_eq!(global.replicas, counters(3, 30, 10, 0));
+        let group = load_realm_usage(&ctx, local, RealmUsageScope::Group(group_id))
+            .await
+            .unwrap();
+        assert_eq!(group.counters, counters(2, 20, 5, 0));
+    }
+
+    // Distribution records arrive as realm config targets; the groups of local distributed
+    // buckets are marked so their replica shares are published again.
+    #[tokio::test]
+    async fn record_marks_groups() {
+        use aruna_core::structs::storage::distribution::DistributionBinding;
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let (bound, plain) = (Ulid::from_bytes([6; 16]), Ulid::from_bytes([7; 16]));
+        let binding = DistributionBinding {
+            set_id: Ulid::from_bytes([8; 16]),
+            member_id: Ulid::from_bytes([9; 16]),
+            incarnation: 1,
+            revision: Default::default(),
+        };
+        for (bucket, group_id, distribution) in
+            [("spire", bound, Some(binding)), ("plain", plain, None)]
+        {
+            let info = BucketInfo {
+                group_id,
+                created_at: SystemTime::UNIX_EPOCH,
+                created_by: Default::default(),
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+                compression: Compression::Off,
+                distribution,
+            };
+            let write = StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: bucket.as_bytes().to_vec().into(),
+                value: info.to_bytes().unwrap().into(),
+                txn_id: None,
+            };
+            ctx.storage_handle.send_storage_effect(write).await;
+        }
+
+        let target = DocumentTarget::RealmConfig {
+            realm_id: RealmId([4; 32]),
+        };
+        refresh_usage_targets(&ctx, node(1), &[target]).await;
+
+        assert!(read_node_stat(&ctx, dirty_group_key(bound)).await.is_some());
+        assert!(read_node_stat(&ctx, dirty_group_key(plain)).await.is_none());
+        assert!(
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
+                .await
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn update_writes_markers() {
         let temp = tempdir().unwrap();
@@ -2510,12 +2759,14 @@ mod tests {
 
         let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
             .await
-            .unwrap();
+            .unwrap()
+            .counters;
         assert_eq!(global.logical_bytes, 15);
         assert_eq!(global.objects, 2);
         let group = load_realm_usage(&ctx, local, RealmUsageScope::Group(group_id))
             .await
-            .unwrap();
+            .unwrap()
+            .counters;
         assert_eq!(group.logical_bytes, 15);
         assert_eq!(group.objects, 2);
     }
@@ -2555,7 +2806,8 @@ mod tests {
         // No summary/global cache entry exists, so the read recomputes on the fly.
         let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
             .await
-            .unwrap();
+            .unwrap()
+            .counters;
         assert_eq!(global.logical_bytes, 7);
     }
 
