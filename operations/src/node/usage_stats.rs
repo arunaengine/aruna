@@ -404,6 +404,8 @@ enum QuotaGatePhase {
     ReadRealmConfig,
     ReadLocal,
     ScanRemote,
+    /// Whether this node's own share is older than its live counters.
+    ReadDirty,
     Done,
 }
 
@@ -430,8 +432,10 @@ pub struct QuotaGate {
     realm_id: Option<RealmId>,
     active_node_ids: Option<HashSet<NodeId>>,
     usage: u64,
-    /// The replicas' logical bytes in `usage`, from every node's last published snapshot.
+    /// The replicas' logical bytes in `usage`, from the other nodes' last published snapshots.
     replica_bytes: u64,
+    /// This node's own published share, deducted only while no later change awaits a publish.
+    own_replicas: u64,
     count_replicas: bool,
     rebuilding: bool,
     phase: QuotaGatePhase,
@@ -457,6 +461,7 @@ impl QuotaGate {
             active_node_ids: None,
             usage: 0,
             replica_bytes: 0,
+            own_replicas: 0,
             count_replicas: false,
             rebuilding: false,
             phase: QuotaGatePhase::Pending,
@@ -584,18 +589,36 @@ impl QuotaGate {
                         continue;
                     }
                     let replicas = snapshot.replicas.logical_bytes;
-                    self.replica_bytes = self.replica_bytes.saturating_add(replicas);
-                    if !local {
-                        self.usage = self.usage.saturating_add(snapshot.counters.logical_bytes);
+                    if local {
+                        self.own_replicas = replicas;
+                        continue;
                     }
+                    self.replica_bytes = self.replica_bytes.saturating_add(replicas);
+                    self.usage = self.usage.saturating_add(snapshot.counters.logical_bytes);
                 }
                 match next_start_after {
                     Some(start) => Ok(Some(self.scan_effect(Some(start), txn_id))),
+                    // The own share is older than the live counters while the group is dirty.
+                    None if !self.count_replicas && self.own_replicas > 0 => {
+                        self.phase = QuotaGatePhase::ReadDirty;
+                        Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
+                            key_space: NODE_STATS_KEYSPACE.to_string(),
+                            key: Key::from(dirty_group_key(self.group_id)),
+                            txn_id: Some(txn_id),
+                        })]))
+                    }
                     None => {
                         self.phase = QuotaGatePhase::Done;
                         Ok(None)
                     }
                 }
+            }
+            (QuotaGatePhase::ReadDirty, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                if value.is_some() {
+                    self.own_replicas = 0;
+                }
+                self.phase = QuotaGatePhase::Done;
+                Ok(None)
             }
             (_, received) => Err(QuotaGateError::UnexpectedEvent(received)),
         }
@@ -603,9 +626,10 @@ impl QuotaGate {
 
     /// Projected group-wide `logical_bytes` if the pending write commits.
     pub fn projected_usage(&self) -> u64 {
+        let replicas = self.replica_bytes.saturating_add(self.own_replicas);
         let usage = match self.count_replicas {
             true => self.usage,
-            false => self.usage.saturating_sub(self.replica_bytes),
+            false => self.usage.saturating_sub(replicas),
         };
         usage.saturating_add(self.delta_logical_bytes)
     }
