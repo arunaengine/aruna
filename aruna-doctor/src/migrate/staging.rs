@@ -154,6 +154,11 @@ pub(super) struct Checkpoints {
 
 /// Finished checkpoints keep their counts. The pending work of an unfinished one has no place
 /// in the new queue, so its row is removed and the job starts its walk again.
+/// A lane's stop row: its checkpoint key (job id, slot) followed by `u`; it holds no checkpoint.
+fn is_lane_bound(key: &[u8]) -> bool {
+    key.len() == 16 + 8 + 1 && key.last() == Some(&b'u')
+}
+
 pub(super) fn checkpoint_rows(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
@@ -165,6 +170,9 @@ pub(super) fn checkpoint_rows(
     for entry in db.read_tx().iter(keyspace) {
         let (key, value) = entry.into_inner()?;
         scanned += 1;
+        if is_lane_bound(&key) {
+            continue;
+        }
         if postcard::from_bytes::<StagingJobCheckpoint>(&value)
             .is_ok_and(|current| postcard::to_allocvec(&current).is_ok_and(|bytes| bytes == *value))
         {
@@ -310,5 +318,28 @@ mod tests {
             (again.jobs_rewritten, again.staging_checkpoints_rewritten),
             (0, 0)
         );
+    }
+    #[test]
+    fn keeps_lane_bounds() {
+        // A running job's lane keeps its checkpoint and the stop row beside it untouched.
+        let job = JobId::from_bytes([3; 16]);
+        let mut lane = job.to_bytes().to_vec();
+        lane.extend_from_slice(&2u64.to_be_bytes());
+        let bound = [lane.as_slice(), b"u"].concat();
+        let current = StagingJobCheckpoint::from(checkpoint(StagingJobPhase::Completed));
+        let rows = vec![
+            (lane.as_slice(), postcard::to_allocvec(&current).unwrap()),
+            (bound.as_slice(), postcard::to_allocvec(&Some("k")).unwrap()),
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("db");
+        write(&path, STAGING_STATE_KEYSPACE, rows.clone());
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(output.staging_checkpoints_rewritten, 0);
+        let states = read(&path, STAGING_STATE_KEYSPACE);
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[&bound[..]], rows[1].1);
     }
 }
