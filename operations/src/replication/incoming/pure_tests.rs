@@ -1800,6 +1800,48 @@ fn quota_excess_rejects() {
 }
 
 #[test]
+fn copies_skip_quota() {
+    // A copy into a distributed bucket passes a full quota unless the group counts replicas.
+    let cases = [
+        (false, IncomingVersionState::ReadExistingBlob),
+        (true, IncomingVersionState::StartQuotaCheck),
+    ];
+    for (count_replicas, expected) in cases {
+        let mut op = IncomingVersionOperation::new(
+            Ulid::from_parts(33, 33),
+            iroh::SecretKey::from_bytes(&[82; 32]).public(),
+            test_realm_id(),
+            make_manifest(ReplicationItemKind::Materialized),
+        );
+        let _effects = advance_version_lookup(&mut op, test_group_id());
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        assert_eq!(op.state, IncomingVersionState::ReadQuotaConfig);
+        // Stands in for a bound bucket, which admits only its coordinator's publications.
+        op.destination_bound = true;
+        let mut config = RealmConfigDocument::default_for_realm(test_realm_id(), Vec::new());
+        config.quota = QuotaConfig {
+            default_quota_bytes: Some(1),
+            grace_factor_percent: 100,
+            count_replicas,
+            ..QuotaConfig::default()
+        };
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(postcard::to_allocvec(&config).unwrap().into()),
+        }));
+        assert_eq!(op.state, expected);
+        assert_eq!(
+            op.quota_ceiling.is_some(),
+            count_replicas,
+            "no commit check either"
+        );
+    }
+}
+
+#[test]
 fn full_backend_rejects() {
     // Replication now routes through the quota-marked catalog, so a full
     // destination backend owes the sender a reason before any transfer.
