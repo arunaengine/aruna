@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::Arc;
+
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
@@ -205,7 +207,7 @@ impl FjallStorage {
             Txn::Read(self.store.db.read_tx())
         } else {
             match self.store.db.write_tx() {
-                Ok(txn) => Txn::Write(Box::new(
+                Ok(txn) => Txn::Write(Arc::new(
                     txn.durability(Some(self.persist_policy.as_fjall())),
                 )),
                 Err(_) => {
@@ -250,12 +252,9 @@ impl FjallStorage {
         self.txn_rows.remove(&txn_id);
         self.usage_views.remove(&txn_id);
         self.config_txns.remove(&txn_id);
+        // A read still running in the transaction drops the last handle, which rolls it back.
         match self.txns.remove(&txn_id) {
-            Some(Txn::Write(txn)) => {
-                txn.rollback();
-                StorageEvent::TransactionAborted { txn_id }
-            }
-            Some(Txn::Read(_)) => StorageEvent::TransactionAborted { txn_id },
+            Some(Txn::Write(_) | Txn::Read(_)) => StorageEvent::TransactionAborted { txn_id },
             None => StorageEvent::Error {
                 error: StorageError::TransactionNotFound,
             },
@@ -304,7 +303,15 @@ impl FjallStorage {
         let rows = self.txn_rows.remove(&txn_id).unwrap_or_default();
         match self.txns.remove(&txn_id) {
             Some(Txn::Read(_)) => StorageEvent::TransactionCommitted { txn_id },
-            Some(Txn::Write(mut txn)) => {
+            Some(Txn::Write(txn)) => {
+                // A commit never waits for a read still running in the transaction.
+                let Ok(mut txn) = Arc::try_unwrap(txn) else {
+                    self.take_txn_deletes(txn_id, false);
+                    self.txn_usage.remove(&txn_id);
+                    return StorageEvent::Error {
+                        error: StorageError::TransactionConflict,
+                    };
+                };
                 let rows = rows.iter().map(|(space, key)| (space.as_str(), key));
                 let staged = self.keep_preimages(&mut txn, rows);
                 if let Err(error) = staged.and_then(|()| self.stage_usage(txn_id, &mut txn)) {

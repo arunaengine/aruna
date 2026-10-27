@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::Arc;
+
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
@@ -27,10 +29,10 @@ impl FjallStorage {
         txn_id.map(txn).transpose()
     }
 
-    /// The open write transaction `txn_id`.
+    /// The open write transaction `txn_id`; a read still running in it holds it back.
     fn write_txn(&mut self, txn_id: Ulid) -> Result<&mut fjall::OptimisticWriteTx, StorageError> {
         match self.txns.get_mut(&txn_id) {
-            Some(Txn::Write(txn)) => Ok(txn.as_mut()),
+            Some(Txn::Write(txn)) => Arc::get_mut(txn).ok_or(StorageError::TransactionConflict),
             _ => Err(StorageError::TransactionNotFound),
         }
     }

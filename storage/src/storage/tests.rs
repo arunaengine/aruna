@@ -351,7 +351,7 @@ fn bulk_full_rejects() {
     assert!(
         storage
             .bulk_read_pool
-            .try_send((filler, filler_tx, span, Instant::now(), guard))
+            .try_send(((filler, filler_tx, span, Instant::now(), guard), None))
             .is_ok(),
         "saturate bulk read pool"
     );
@@ -362,7 +362,7 @@ fn bulk_full_rejects() {
     let (target_tx, mut target_rx) = super::response_channel(super::ResponseToken::empty());
     let mut slow = super::SlowQueueAggregator::default();
     storage.forward_read(
-        (target, target_tx, span, Instant::now(), guard),
+        ((target, target_tx, span, Instant::now(), guard), None),
         StoragePriority::Bulk,
         &mut slow,
     );
@@ -1307,7 +1307,10 @@ fn unknown_commit_runs() {
     let mut storage = super::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
-        txns: std::collections::HashMap::from([(txn_id, super::Txn::Write(Box::new(txn)))]),
+        txns: std::collections::HashMap::from([(
+            txn_id,
+            super::Txn::Write(std::sync::Arc::new(txn)),
+        )]),
         transaction_cleanup,
         metrics: std::sync::Arc::new(super::StorageMetrics::default()),
         read_pool: crossfire::mpmc::bounded_blocking(1).0,
@@ -1404,7 +1407,10 @@ fn retry_skips_queued() {
     let mut storage = super::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
-        txns: std::collections::HashMap::from([(txn_id, super::Txn::Write(Box::new(txn)))]),
+        txns: std::collections::HashMap::from([(
+            txn_id,
+            super::Txn::Write(std::sync::Arc::new(txn)),
+        )]),
         transaction_cleanup,
         metrics: std::sync::Arc::new(super::StorageMetrics::default()),
         read_pool: crossfire::mpmc::bounded_blocking(1).0,

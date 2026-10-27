@@ -22,6 +22,8 @@ mod tests_counters;
 #[cfg(test)]
 mod tests_persistence;
 #[cfg(test)]
+mod tests_pool;
+#[cfg(test)]
 mod tests_range;
 #[cfg(test)]
 mod tests_rebuild;
