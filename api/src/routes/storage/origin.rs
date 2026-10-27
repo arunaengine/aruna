@@ -32,7 +32,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
-use crate::routes::storage::relay::{RestForward, relay_get};
+use crate::routes::storage::relay::{RestForward, relay_get, relayed_set};
 use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
@@ -263,6 +263,7 @@ pub async fn get_origin(
         &params.key,
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
+    relayed_set(&info, &headers)?;
     // A member that holds no copy of the key's range asks a holder, which checks again. A copy
     // may lag behind the current version, so only a pinned version comes from one.
     if let Some(binding) = info.distribution.as_ref()

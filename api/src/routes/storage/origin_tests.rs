@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::mcp::data::{WriteObjectInput, store_text};
+use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
     replicate, write,
@@ -138,7 +139,9 @@ fn answer() -> String {
 #[tokio::test]
 async fn relays_to_holder() {
     let node = node_state().await;
-    distribute(&node.state, node.group_id, BUCKET).await;
+    let set_id = distribute(&node.state, node.group_id, BUCKET)
+        .await
+        .set_id();
     let peer = mock_peer(StatusCode::OK, &answer()).await;
     publish_api(&node.state, node_id(PEER), &peer.url).await;
 
@@ -163,6 +166,14 @@ async fn relays_to_holder() {
     // A relayed call is never relayed again: this node holds no such key.
     let mut hop = HeaderMap::new();
     hop.insert(RELAY_HOP_HEADER, "peer".parse().unwrap());
+    // Without the set it meant, the bucket of this name may be another one.
+    let unnamed = origin(&node, &node.owner, hop.clone(), BUCKET, "z.md", None).await;
+    assert!(matches!(unnamed, Err(ServerError::Conflict(_))));
+    let mut other = hop.clone();
+    other.insert(RELAY_SET_HEADER, Ulid::nil().to_string().parse().unwrap());
+    let stranger = origin(&node, &node.owner, other, BUCKET, "z.md", None).await;
+    assert!(matches!(stranger, Err(ServerError::Conflict(_))));
+    hop.insert(RELAY_SET_HEADER, set_id.to_string().parse().unwrap());
     let local = origin(&node, &node.owner, hop, BUCKET, "z.md", None).await;
     assert!(matches!(local, Err(ServerError::NotFound)));
     assert_eq!(peer.paths.lock().unwrap().len(), 1);
