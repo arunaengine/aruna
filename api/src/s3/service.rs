@@ -1163,7 +1163,11 @@ impl S3 for ArunaS3Service {
             .await?
         {
             return match self
-                .copy_path(&source_bucket_info, &source_key, &forward)
+                .copy_path(
+                    &source_bucket_info,
+                    (&source_key, source_version_id.is_some()),
+                    &forward,
+                )
                 .await?
             {
                 CopyPath::Stream => {
@@ -1226,7 +1230,11 @@ impl S3 for ArunaS3Service {
                 }
             };
         }
-        self.ensure_source(&source_bucket_info, &source_key).await?;
+        self.ensure_source(
+            &source_bucket_info,
+            (&source_key, source_version_id.is_some()),
+        )
+        .await?;
         let dest_group_id = dest_bucket_info
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
@@ -1597,7 +1605,11 @@ impl S3 for ArunaS3Service {
                 url::form_urlencoded::byte_serialize(req.input.upload_id.as_bytes()).collect();
             let query = format!("partNumber={}&uploadId={upload}", req.input.part_number);
             return match self
-                .copy_path(&source_bucket_info, &source_key, &forward)
+                .copy_path(
+                    &source_bucket_info,
+                    (&source_key, source_version_id.is_some()),
+                    &forward,
+                )
                 .await?
             {
                 CopyPath::Stream => {
@@ -1640,7 +1652,11 @@ impl S3 for ArunaS3Service {
                 }
             };
         }
-        self.ensure_source(&source_bucket_info, &source_key).await?;
+        self.ensure_source(
+            &source_bucket_info,
+            (&source_key, source_version_id.is_some()),
+        )
+        .await?;
         let upload_id = self
             .upload_id(dest_info.as_ref(), &req.input.key, &req.input.upload_id)
             .await?;
@@ -1931,7 +1947,11 @@ impl S3 for ArunaS3Service {
         let response_bucket = bucket.clone();
         let response_key = key.clone();
         if let Some(holder) = self
-            .read_holder(&req.extensions, bucket_info.as_ref(), &key)
+            .read_holder(
+                &req.extensions,
+                bucket_info.as_ref(),
+                (&key, version_id.is_some()),
+            )
             .await?
         {
             let request = || {
@@ -1976,8 +1996,34 @@ impl S3 for ArunaS3Service {
             }
             _ => get_object_token(&self.state, input, restrictions, token).await,
         }
-        .map_err(IntoS3Error::into_s3_error)
-        .map_err(|error| forward::catch_up_miss(error, catching_up, bucket_info.as_ref()))?;
+        .map_err(IntoS3Error::into_s3_error);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let miss = self
+                    .copy_miss(&req.extensions, bucket_info.as_ref(), &response_key, &error)
+                    .await?;
+                let Some(coordinator) = miss else {
+                    return Err(forward::catch_up_miss(
+                        error,
+                        catching_up,
+                        bucket_info.as_ref(),
+                    ));
+                };
+                let request = forward::reads::read_request(
+                    http::Method::GET,
+                    "GetObject",
+                    &response_bucket,
+                    &response_key,
+                    req.uri.query(),
+                    &req.headers,
+                );
+                let response = self
+                    .forward_read(&user_access, &coordinator, request)
+                    .await?;
+                return Ok(forward::reads::forwarded_get(response));
+            }
+        };
         self.record_touch(
             &user_access.access_key,
             &response_bucket,
@@ -2182,7 +2228,11 @@ impl S3 for ArunaS3Service {
             .map(|info| info.group_id)
             .unwrap_or(user_access.group_id);
         if let Some(holder) = self
-            .read_holder(&req.extensions, bucket_info.as_ref(), &key)
+            .read_holder(
+                &req.extensions,
+                bucket_info.as_ref(),
+                (&key, version_id.is_some()),
+            )
             .await?
         {
             let request = || {
@@ -2205,10 +2255,34 @@ impl S3 for ArunaS3Service {
             version_id,
         });
 
-        let result = drive(operation, &self.state)
-            .await
-            .map_err(IntoS3Error::into_s3_error)
-            .map_err(|error| forward::catch_up_miss(error, catching_up, bucket_info.as_ref()))?;
+        let result = match drive(operation, &self.state).await {
+            Ok(result) => result,
+            Err(error) => {
+                let error = error.into_s3_error();
+                let miss = self
+                    .copy_miss(&req.extensions, bucket_info.as_ref(), &key, &error)
+                    .await?;
+                let Some(coordinator) = miss else {
+                    return Err(forward::catch_up_miss(
+                        error,
+                        catching_up,
+                        bucket_info.as_ref(),
+                    ));
+                };
+                let request = forward::reads::read_request(
+                    http::Method::HEAD,
+                    "HeadObject",
+                    &bucket,
+                    &key,
+                    req.uri.query(),
+                    &req.headers,
+                );
+                let response = self
+                    .forward_read(&user_access, &coordinator, request)
+                    .await?;
+                return Ok(forward::reads::forwarded_head(&response));
+            }
+        };
 
         // A reference answers from its source observation without opening a source read.
         let remote_info = if result.location.is_none() && result.source_metadata.is_none() {

@@ -4,10 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, UserAccess};
+use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionSnapshot, KeyRange,
 };
-use aruna_operations::distribution::guard::{bound_view, lists_interval};
+use aruna_operations::distribution::guard::{bound_view, lists_interval, local_fence};
 use aruna_operations::s3::object::list::{ListBucketInput, ListContinuationToken};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -240,7 +241,16 @@ impl ArunaS3Service {
             .map_err(|error| guard_error(&error))
     }
 
-    /// Asks the holders of `range` in turn; only a range nobody answers ends the listing.
+    pub(in crate::s3::service) async fn fence(
+        &self,
+        binding: &DistributionBinding,
+    ) -> S3Result<LocalFence> {
+        local_fence(self.state.as_ref(), binding.set_id)
+            .await
+            .map_err(|error| guard_error(&error))
+    }
+
+    /// Asks the member that lists `range`; a range it does not answer ends the listing.
     pub(in crate::s3::service) async fn ask_holders(
         &self,
         user: &UserAccess,
@@ -248,7 +258,7 @@ impl ArunaS3Service {
         range: &KeyRange,
         (operation, bucket, query): (&'static str, &str, String),
     ) -> S3Result<String> {
-        let holders = snapshot.record_holders(range);
+        let holders = snapshot.list_holder(range);
         let others = holders
             .into_iter()
             .filter(|member| member.member_id != binding.member_id);
@@ -343,6 +353,7 @@ impl ArunaS3Service {
         (from, bounded): (Option<String>, bool),
     ) -> S3Result<(ObjectListingPage, Option<String>)> {
         let snapshot = self.snapshot(binding).await?;
+        let fence = self.fence(binding).await?;
         let max = input
             .max_keys
             .unwrap_or(aruna_operations::s3::object::list::ListBucketOperation::DEFAULT_MAX_KEYS);
@@ -396,7 +407,7 @@ impl ArunaS3Service {
                     .then(|| range.lower.clone());
                 return Ok((merged, next));
             }
-            let part = match snapshot.lists_locally(binding.member_id, range) {
+            let part = match snapshot.lists_locally(binding.member_id, range, &fence) {
                 true => {
                     let mut sub = input.clone();
                     sub.max_keys = Some(remaining);

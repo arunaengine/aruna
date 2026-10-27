@@ -29,7 +29,7 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::distribution::guard::{GuardError, bound_view, route_write};
+use crate::distribution::guard::{GuardError, bound_view, local_fence, route_write};
 use crate::distribution::versions::{InventoryVersionsInput, InventoryVersionsOperation};
 use crate::driver::{DriverContext, drive, routing_snapshot};
 use crate::forward::authorize::peer_acts_for;
@@ -753,7 +753,7 @@ struct SetListing {
 }
 
 /// One page of a distributed bucket's heads in key order, range by range from this member's
-/// inventory. A range it keeps no records of ends the page there; a page that starts there is
+/// inventory. A range it does not list ends the page there; a page that starts there is
 /// read from a holder of the range for a device, and refused for a forwarded listing.
 async fn set_heads(
     context: &Arc<DriverContext>,
@@ -765,6 +765,9 @@ async fn set_heads(
         .await
         .map_err(|_| SyncRefusal::Unavailable)?;
     let snapshot = view.snapshot();
+    let fence = local_fence(context, binding.set_id)
+        .await
+        .map_err(|_| SyncRefusal::Unavailable)?;
     let prefix = (!listing.prefix.is_empty()).then(|| listing_prefix(&listing.prefix));
     let (mut marker, mut version_marker) = match listing.cursor.clone() {
         Some(cursor) => (Some(cursor.key), cursor.version_id),
@@ -783,7 +786,7 @@ async fn set_heads(
     let (mut heads, mut next) = (Vec::new(), None);
     for (visited, range) in ranges.enumerate() {
         let remaining = listing.limit.get().saturating_sub(heads.len());
-        let here = snapshot.lists_locally(binding.member_id, range);
+        let here = snapshot.lists_locally(binding.member_id, range, &fence);
         if remaining == 0 || visited == MAX_PAGE_RANGES || (!here && visited > 0) {
             // The nil version id starts the next page at the first key of this range.
             next = Some(SyncListCursor {
@@ -838,7 +841,7 @@ async fn holder_heads(
         .ok_or(SyncRefusal::Unavailable)?;
     let device = node_kind(&config, peer).is_some_and(|kind| kind.owner().is_some());
     let local = local_node(context)?;
-    let holder = (snapshot.record_holders(range).into_iter())
+    let holder = (snapshot.list_holder(range).into_iter())
         .map(|member| member.node_id)
         .find(|node_id| *node_id != local && *node_id != peer);
     let (Some(holder), true, Some(metadata)) = (holder, device, context.metadata_handle.as_ref())

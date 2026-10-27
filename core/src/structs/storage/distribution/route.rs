@@ -6,6 +6,7 @@
 use thiserror::Error;
 use ulid::Ulid;
 
+use super::fence::LocalFence;
 use super::{
     DistributionMember, DistributionSnapshot, KeyRange, MemberState, MetadataCoverage,
     OriginalEpoch,
@@ -158,23 +159,34 @@ impl DistributionSnapshot {
             .collect()
     }
 
-    /// Whether `member_id` answers listings of `range` from its own records: it keeps them
-    /// and is not catching up.
-    pub fn lists_locally(&self, member_id: Ulid, range: &KeyRange) -> bool {
-        self.member(member_id).is_some_and(|member| {
-            member.state == MemberState::Ready && keeps_records(range, member)
-        })
+    /// Whether `member_id` answers listings of `range` from its own records; `fence` is its
+    /// node's, so a range it fenced for a transfer is listed by nobody until the record moves on.
+    pub fn lists_locally(&self, member_id: Ulid, range: &KeyRange, fence: &LocalFence) -> bool {
+        self.list_holder(range)
+            .is_some_and(|member| member.member_id == member_id)
+            && fence.check_read(self, range).is_ok()
+    }
+
+    /// The member that lists `range`: its ready coordinator, since copies may lag behind it.
+    pub fn list_holder(&self, range: &KeyRange) -> Option<&DistributionMember> {
+        self.member(range.coordinator)
+            .filter(|member| member.state == MemberState::Ready)
     }
 
     /// Whether `member_id` answers listings of every key in `[lower, upper)` itself.
-    pub fn lists_interval(&self, member_id: Ulid, lower: &str, upper: Option<&str>) -> bool {
+    pub fn lists_interval(
+        &self,
+        member_id: Ulid,
+        (lower, upper): (&str, Option<&str>),
+        fence: &LocalFence,
+    ) -> bool {
         (self.config.ranges.iter())
             .filter(|range| {
                 let starts_before = upper.is_none_or(|upper| range.lower.as_str() < upper);
                 let ends_after = range.upper.as_deref().is_none_or(|end| lower < end);
                 starts_before && ends_after
             })
-            .all(|range| self.lists_locally(member_id, range))
+            .all(|range| self.lists_locally(member_id, range, fence))
     }
 
     /// The ready members that keep the records of `range`, its coordinator last, so reads of
@@ -362,6 +374,33 @@ mod tests {
             Ok(ReadRoute::Local { catching_up: true }),
             "a created member has not received the range yet"
         );
+    }
+
+    // A copy may lag behind its coordinator's live publications, so only the coordinator lists.
+    #[test]
+    fn copies_list_remotely() {
+        let mut head = active();
+        head.config.ranges[0].replicas.push(member(2));
+        let lower = head.config.ranges[0].clone();
+        let open = super::super::fence::LocalFence::default();
+        assert!(head.lists_locally(member(1), &lower, &open));
+        assert!(!head.lists_locally(member(2), &lower, &open));
+        assert!(!head.lists_interval(member(2), ("", Some("m")), &open));
+        let holder = head.list_holder(&lower).map(|member| member.member_id);
+        assert_eq!(holder, Some(member(1)));
+        // A coordinator that fenced the range for a transfer may miss newer keys.
+        let mut fenced = super::super::fence::LocalFence::default();
+        fenced.fence_range(super::super::fence::RangeFence {
+            range_id: lower.range_id,
+            transfer_id: Ulid::from_bytes([5; 16]),
+            epoch: lower.epoch,
+            since_ms: 0,
+            uploads_open: false,
+        });
+        assert!(!head.lists_locally(member(1), &lower, &fenced));
+        assert!(!head.lists_interval(member(1), ("", Some("m")), &fenced));
+        head.config.members[0].state = crate::structs::storage::distribution::MemberState::Failed;
+        assert!(head.list_holder(&lower).is_none());
     }
 
     #[test]

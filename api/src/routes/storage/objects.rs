@@ -11,8 +11,9 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use aruna_operations::auth::permission_rules::permission_rules;
-use aruna_operations::distribution::guard::{bound_view, lists_interval};
+use aruna_operations::distribution::guard::{bound_view, lists_interval, local_fence};
 use aruna_operations::driver::drive;
+use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
@@ -262,6 +263,9 @@ async fn merged_page(
         .await
         .map_err(map_guard_error)?;
     let snapshot = view.snapshot();
+    let fence = local_fence(context.as_ref(), binding.set_id)
+        .await
+        .map_err(map_guard_error)?;
     let resume = request.cursor.as_deref().map(decode_resume).transpose()?;
     let (after, from) = match &resume {
         Some(Resume::After { key, group }) => (Some((key.clone(), group.clone())), None),
@@ -311,7 +315,7 @@ async fn merged_page(
             cursor: None,
             ..request.clone()
         };
-        let part = match snapshot.lists_locally(binding.member_id, range) {
+        let part = match snapshot.lists_locally(binding.member_id, range, &fence) {
             true => {
                 let token = (start.as_ref())
                     .map(|(key, group)| resume_token(&request.bucket, key, group.as_deref()))
@@ -324,7 +328,7 @@ async fn merged_page(
                 let cursor = (start
                     .map(|(key, group)| encode_resume(&Resume::After { key, group })))
                 .transpose()?;
-                let holders = (snapshot.record_holders(range).into_iter())
+                let holders = (snapshot.list_holder(range).into_iter())
                     .filter(|member| member.member_id != binding.member_id)
                     .map(|member| member.node_id)
                     .collect();
@@ -461,11 +465,22 @@ pub async fn list_objects(
         None => bucket_permission_path(realm_id, info.group_id, node_id, &bucket),
     };
     ensure_permission(&state, &auth, path, Permission::READ).await?;
+    // A start key resumes like a cursor after that key, past the whole common prefix it names.
+    let start = (query.start_after.clone().filter(|key| !key.is_empty()))
+        .map(|key| {
+            let (prefix, delimiter) = (query.prefix.as_deref(), query.delimiter.as_deref());
+            let group = (key.starts_with(prefix.unwrap_or_default()))
+                .then(|| common_prefix_of(&key, prefix, delimiter))
+                .flatten();
+            let key = group.clone().unwrap_or(key);
+            encode_resume(&Resume::After { key, group })
+        })
+        .transpose()?;
     let request = ListRequest {
         bucket,
         prefix: query.prefix.clone(),
         delimiter: query.delimiter.clone(),
-        cursor: query.cursor.clone(),
+        cursor: query.cursor.clone().or(start),
         limit: query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
     };
     if let Some(bounds) = relayed_bounds(&state, &info, &headers, &query).await? {

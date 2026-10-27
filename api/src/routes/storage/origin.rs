@@ -13,7 +13,7 @@ use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, VersionOrigin,
 };
-use aruna_operations::distribution::guard::route_read;
+use aruna_operations::distribution::guard::{read_coordinator, route_read};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
 use aruna_operations::s3::object::origin::{OriginError, OriginView, read_origin};
@@ -32,7 +32,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
-use crate::routes::storage::relay::{RestForward, relay_get};
+use crate::routes::storage::relay::{RestForward, relay_get, relayed_set};
 use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
@@ -263,31 +263,35 @@ pub async fn get_origin(
         &params.key,
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
-    // A member that holds no copy of the key's range asks a holder, which checks again.
+    relayed_set(&info, &headers)?;
+    // A member that holds no copy of the key's range asks a holder, which checks again. A copy
+    // may lag behind the current version, so only a pinned version comes from one.
     if let Some(binding) = info.distribution.as_ref()
         && !headers.contains_key(RELAY_HOP_HEADER)
     {
         let context = state.get_ctx();
+        if params.version_id.is_none() {
+            let coordinator = read_coordinator(context.as_ref(), binding, &params.key).await;
+            if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
+                let path = origin_path(&bucket, &params);
+                let target = (binding.set_id, range_id, node_id);
+                return relay_origin(&state, target, vec![node_id], &path, bearer).await;
+            }
+        }
         let route = route_read(context.as_ref(), binding, &params.key, false).await;
         if let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? {
             let mut holders = key_holders(context.as_ref(), binding.set_id, &params.key).await;
             holders.retain(|holder| *holder != state.get_node_id());
             holders.push(node_id);
-            let path = origin_path(&bucket, &params);
-            for node_id in holders {
-                let forward = RestForward {
-                    set_id: binding.set_id,
-                    range_id,
-                    node_id,
-                };
-                if let Some(answer) = relay_get(&state, &forward, &path, bearer.as_ref()).await? {
-                    return Ok(Json(answer));
-                }
-            }
-            return Err(ServerError::ServiceUnavailableReason(format!(
-                "no holder of range {range_id} of distributed bucket {} answered",
-                binding.set_id
-            )));
+            let target = (binding.set_id, range_id, node_id);
+            return relay_origin(
+                &state,
+                target,
+                holders,
+                &origin_path(&bucket, &params),
+                bearer,
+            )
+            .await;
         }
     }
     let view = read_origin(
@@ -297,12 +301,50 @@ pub async fn get_origin(
         &params.key,
         params.version_id,
     )
-    .await
-    .map_err(|error| match error {
+    .await;
+    // A copy may not have the version yet, so its miss goes on to the range's coordinator; a
+    // miss on a range this node fenced is refused.
+    if let (Err(OriginError::VersionMissing), Some(binding)) = (&view, info.distribution.as_ref()) {
+        let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
+        if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)?
+            && !headers.contains_key(RELAY_HOP_HEADER)
+        {
+            let path = origin_path(&bucket, &params);
+            let target = (binding.set_id, range_id, node_id);
+            return relay_origin(&state, target, vec![node_id], &path, bearer).await;
+        }
+    }
+    let view = view.map_err(|error| match error {
         OriginError::BucketMissing | OriginError::VersionMissing => ServerError::NotFound,
         OriginError::Storage(reason) => ServerError::InternalError(reason),
     })?;
     Ok(Json(view.into()))
+}
+
+/// Asks `holders` in turn for the origin; a copy's miss goes on, the coordinator's decides.
+async fn relay_origin(
+    state: &ServerState,
+    (set_id, range_id, coordinator): (Ulid, Ulid, aruna_core::NodeId),
+    holders: Vec<aruna_core::NodeId>,
+    path: &str,
+    bearer: Option<ValidatedBearer>,
+) -> ServerResult<Json<OriginResponse>> {
+    for node_id in holders {
+        let forward = RestForward {
+            set_id,
+            range_id,
+            node_id,
+        };
+        match relay_get(state, &forward, path, bearer.as_ref()).await {
+            Ok(Some(answer)) => return Ok(Json(answer)),
+            Err(ServerError::NotFound) if node_id != coordinator => {}
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(ServerError::ServiceUnavailableReason(format!(
+        "no holder of range {range_id} of distributed bucket {set_id} answered"
+    )))
 }
 
 /// The origin route of one file version, for a holder.

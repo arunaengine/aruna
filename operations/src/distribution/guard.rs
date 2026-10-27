@@ -403,6 +403,48 @@ pub async fn bound_view(
     Ok(view)
 }
 
+/// This node's fence row of the set.
+pub async fn local_fence(context: &DriverContext, set_id: Ulid) -> Result<LocalFence, GuardError> {
+    let read = StorageEffect::Read {
+        key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+        key: LocalFence::key(set_id).into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(LocalFence::decode(value.as_deref())?)
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(GuardError::Unreadable(error.to_string()))
+        }
+        other => Err(GuardError::Unreadable(format!(
+            "unexpected answer {other:?}"
+        ))),
+    }
+}
+
+/// The range id and node of the coordinator of `key`'s range, or `None` when this member
+/// coordinates it and has not fenced it for a transfer.
+pub async fn read_coordinator(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+) -> Result<Option<(Ulid, NodeId)>, GuardError> {
+    let view = bound_view(context, binding).await?;
+    let snapshot = view.snapshot();
+    let set_id = binding.set_id;
+    let range = snapshot.range_for(key).ok_or(RouteError::NoRange(set_id))?;
+    if range.coordinator == binding.member_id {
+        let fence = local_fence(context, set_id).await?;
+        fence.check_read(snapshot, range)?;
+        return Ok(None);
+    }
+    let coordinator = snapshot
+        .member(range.coordinator)
+        .ok_or(RouteError::NoRange(set_id))?;
+    Ok(Some((range.range_id, coordinator.node_id)))
+}
+
 /// Names a new upload of `key` by the range and epoch this member coordinates it under.
 pub async fn upload_tag(
     context: &DriverContext,
@@ -517,9 +559,10 @@ pub async fn lists_interval(
     upper: Option<&str>,
 ) -> Result<bool, GuardError> {
     let view = bound_view(context, binding).await?;
+    let fence = local_fence(context, binding.set_id).await?;
     Ok(view
         .snapshot()
-        .lists_interval(binding.member_id, lower, upper))
+        .lists_interval(binding.member_id, (lower, upper), &fence))
 }
 
 /// The nodes that answer reads of `key`'s range from their own records, coordinator last.

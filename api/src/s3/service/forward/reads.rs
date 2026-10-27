@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
-use aruna_core::structs::storage::distribution::ReadRoute;
-use aruna_operations::distribution::guard::route_read;
+use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute};
+use aruna_operations::distribution::guard::{read_coordinator, route_read};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
 use futures_util::TryStreamExt;
@@ -20,7 +20,7 @@ use s3s::dto::{
     ChecksumType, ETag, GetObjectOutput, HeadObjectOutput, StreamingBlob, Timestamp,
     TimestampFormat,
 };
-use s3s::{S3Error, S3Response, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 
 use super::{Forward, ForwardBody, ForwardRequest, header, passed_headers, passed_query};
 use crate::s3::auth::DelegatedRequest;
@@ -162,20 +162,27 @@ pub(in crate::s3::service) fn anonymous_window(user: &UserAccess) -> UserAccess 
 }
 
 impl ArunaS3Service {
-    /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, when this
-    /// member keeps no records of the key's range, or `None` when this member answers it.
-    /// A delegated read is never sent on.
+    /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, or `None` when
+    /// this member answers it. Only a `pinned` version may come from a copy: a copy may lag
+    /// behind the current version. A delegated read is never sent on.
     pub(in crate::s3::service) async fn read_holder(
         &self,
         extensions: &http::Extensions,
         bucket: Option<&BucketInfo>,
-        key: &str,
+        (key, pinned): (&str, bool),
     ) -> S3Result<Option<(Forward, NodeId)>> {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(None);
         };
         if extensions.get::<DelegatedRequest>().is_some() {
             return Ok(None);
+        }
+        if !pinned {
+            let coordinator = self.range_coordinator(binding, key).await?;
+            return Ok(coordinator.map(|forward| {
+                let node_id = forward.node_id;
+                (forward, node_id)
+            }));
         }
         let (range_id, coordinator) =
             match route_read(self.state.as_ref(), binding, key, false).await {
@@ -193,6 +200,47 @@ impl ArunaS3Service {
             node_id,
         };
         Ok(Some((holder, coordinator)))
+    }
+
+    /// The coordinator of `key`'s range when another member coordinates it, or `None` when
+    /// this member does; a range this node fenced for a transfer is refused.
+    async fn range_coordinator(
+        &self,
+        binding: &DistributionBinding,
+        key: &str,
+    ) -> S3Result<Option<Forward>> {
+        let coordinator = read_coordinator(self.state.as_ref(), binding, key)
+            .await
+            .map_err(|error| guard_error(&error))?;
+        Ok(coordinator.map(|(range_id, node_id)| Forward {
+            set_id: binding.set_id,
+            range_id,
+            node_id,
+        }))
+    }
+
+    /// The coordinator a local miss goes on to, since a copy may lag behind it; a miss on a
+    /// range this node fenced is refused. A delegated read is never sent on.
+    pub(in crate::s3::service) async fn copy_miss(
+        &self,
+        extensions: &http::Extensions,
+        bucket: Option<&BucketInfo>,
+        key: &str,
+        error: &S3Error,
+    ) -> S3Result<Option<Forward>> {
+        let missing = matches!(
+            error.code(),
+            S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion
+        );
+        let binding = bucket.and_then(|bucket| bucket.distribution.as_ref());
+        let Some(binding) = binding.filter(|_| missing) else {
+            return Ok(None);
+        };
+        let coordinator = self.range_coordinator(binding, key).await?;
+        match extensions.get::<DelegatedRequest>() {
+            Some(_) => Ok(None),
+            None => Ok(coordinator),
+        }
     }
 
     /// Sends a GET or HEAD to the chosen holder; a replica's miss goes on to the coordinator.
