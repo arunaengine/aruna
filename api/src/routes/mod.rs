@@ -92,6 +92,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(access::group_join::router())
         .merge(execution::job::session::router())
         .merge(execution::jobs::router())
+        .merge(execution::runs::router())
         .merge(execution::job::audit::router())
         .merge(metadata::router())
         .merge(git::router())
@@ -399,6 +400,7 @@ pub(crate) mod tests {
         ("GET", "/compute/jobs"),
         ("DELETE", "/compute/jobs/{job_id}"),
         ("GET", "/compute/jobs/{job_id}"),
+        ("GET", "/compute/runs/{run_id}"),
         ("GET", "/compute/jobs/{job_id}/artifacts/rocrate"),
         ("GET", "/compute/jobs/{job_id}/audit"),
         ("GET", "/compute/jobs/{job_id}/report"),
