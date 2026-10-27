@@ -223,15 +223,16 @@ pub fn sum_held<'a>(
 
 /// What this member holds of `bucket`'s set as copies: every range with an account here, one
 /// being purged included, less the ranges it coordinates. Zero for an ordinary bucket.
+/// Also names the set and the number of the record the share was computed under.
 pub async fn replica_share(
     context: &DriverContext,
     bucket: &str,
-) -> Result<RangeCounters, UsageError> {
+) -> Result<(RangeCounters, Option<(Ulid, u64)>), UsageError> {
     let Some((binding, snapshot)) = bound_record(context, bucket)
         .await
         .map_err(UsageError::Record)?
     else {
-        return Ok(RangeCounters::default());
+        return Ok((RangeCounters::default(), None));
     };
     let txn_id = match (context.storage_handle)
         .send_storage_effect(StorageEffect::StartTransaction { read: true })
@@ -247,7 +248,7 @@ pub async fn replica_share(
     (context.storage_handle)
         .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
         .await;
-    share
+    Ok((share?, Some((binding.set_id, snapshot.number))))
 }
 
 /// The charged rows of every local account of the set less those of the coordinated ranges, so
@@ -331,18 +332,18 @@ async fn local_accounts(
 /// that cannot be read fails the whole run, so the publish keeps its markers and retries.
 pub async fn replica_shares(
     context: &DriverContext,
-) -> Result<BTreeMap<GroupId, UsageCounters>, UsageError> {
+) -> Result<BTreeMap<GroupId, GroupShare>, UsageError> {
     let buckets = scan_all(&context.storage_handle, S3_BUCKET_KEYSPACE, None)
         .await
         .map_err(UsageError::Record)?;
-    let mut shares: BTreeMap<GroupId, UsageCounters> = BTreeMap::new();
+    let mut shares: BTreeMap<GroupId, GroupShare> = BTreeMap::new();
     for (key, value) in buckets {
         let info = BucketInfo::from_bytes(value.as_ref())?;
         if info.distribution.is_none() {
             continue;
         }
         let bucket = String::from_utf8_lossy(key.as_ref()).into_owned();
-        let share = replica_share(context, &bucket).await?;
+        let (share, revision) = replica_share(context, &bucket).await?;
         let count = |value: i128| u64::try_from(value.max(0)).unwrap_or(u64::MAX);
         let counters = UsageCounters {
             objects: count(share.objects),
@@ -351,11 +352,19 @@ pub async fn replica_shares(
             ..UsageCounters::default()
         };
         let total = shares.entry(info.group_id).or_default();
-        total
+        (total.replicas)
             .add(&counters)
             .map_err(|_| CounterOverflow("replicas"))?;
+        total.revisions.extend(revision);
     }
     Ok(shares)
+}
+
+/// One group's replica share on this node, and the record number of each set it covers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GroupShare {
+    pub replicas: UsageCounters,
+    pub revisions: BTreeMap<Ulid, u64>,
 }
 
 /// The usage of a local distributed bucket from the range counters this member holds; `None`
@@ -577,7 +586,7 @@ mod tests {
         let snapshot = spire(&handle, record, accounts, counters).await;
 
         assert_eq!(
-            replica_share(&context, "spire").await.unwrap(),
+            replica_share(&context, "spire").await.unwrap().0,
             counted(3, 15, 7)
         );
         let shares = replica_shares(&context).await.unwrap();
@@ -587,9 +596,14 @@ mod tests {
             referenced_bytes: 7,
             ..UsageCounters::default()
         };
+        // The share names the record number it was computed under.
+        let share = GroupShare {
+            replicas: expected,
+            revisions: BTreeMap::from([(snapshot.set_id(), snapshot.number)]),
+        };
         assert_eq!(
             shares,
-            BTreeMap::from([(snapshot.config.owner_group, expected)])
+            BTreeMap::from([(snapshot.config.owner_group, share)])
         );
     }
 
@@ -624,10 +638,13 @@ mod tests {
         let record = crate::distribution::test_record::replicated(true, 1);
         spire(&handle, record, accounts, counters).await;
 
-        assert_eq!(replica_share(&context, "spire").await.unwrap(), objects(-1));
+        assert_eq!(
+            replica_share(&context, "spire").await.unwrap().0,
+            objects(-1)
+        );
         let shares = replica_shares(&context).await.unwrap();
         assert!(
-            shares.values().all(|share| share.objects == 0),
+            shares.values().all(|share| share.replicas.objects == 0),
             "a negative share reads as zero"
         );
     }
@@ -666,7 +683,10 @@ mod tests {
         ];
         spire(&handle, record, accounts, counters).await;
 
-        assert_eq!(replica_share(&context, "spire").await.unwrap(), logical(10));
+        assert_eq!(
+            replica_share(&context, "spire").await.unwrap().0,
+            logical(10)
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ use aruna_core::structs::storage::usage::{
 use aruna_operations::replication::queue::{BlobJobRecord, blob_job_key};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use std::collections::BTreeMap;
+use ulid::Ulid;
 
 /// Rows to write or keys to delete in one keyspace.
 pub(super) type KeyspaceRows<'k, R = (Vec<u8>, Vec<u8>)> =
@@ -169,13 +170,13 @@ pub(super) fn rebuild_progress(
         .collect())
 }
 
-/// Usage snapshots from before the replica share, their last value, which they gain as zero; a
-/// peer's own publish replaces it.
+/// Usage snapshots from before the replica share and its record numbers, their last values,
+/// which they gain as zero and empty; a peer's own publish replaces them.
 pub(super) fn snapshot_rows<'k>(
     db: &OptimisticTxDatabase,
     keyspace: &'k OptimisticTxKeyspace,
 ) -> Result<KeyspaceRows<'k>, ExplorerError> {
-    let share = postcard::to_allocvec(&UsageCounters::default())
+    let share = postcard::to_allocvec(&(UsageCounters::default(), BTreeMap::<Ulid, u64>::new()))
         .map_err(|error| decode_error(NODE_STATS_KEYSPACE, &[], error))?;
     let mut rows = Vec::new();
     for prefix in [USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX] {
@@ -381,9 +382,11 @@ mod tests {
                 ..Default::default()
             },
             replicas: UsageCounters::default(),
+            revisions: Default::default(),
         };
         let current = snapshot.to_bytes().unwrap();
-        let share = UsageCounters::default().to_bytes().unwrap();
+        let share = (UsageCounters::default(), BTreeMap::<Ulid, u64>::new());
+        let share = postcard::to_allocvec(&share).unwrap();
         let old = current[..current.len() - share.len()].to_vec();
         let global = usage_global_key(node_id);
         let group = usage_snapshot_key(Ulid::from_bytes([6; 16]), node_id);

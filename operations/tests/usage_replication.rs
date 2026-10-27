@@ -313,6 +313,7 @@ async fn bootstrap_usage_genesis(
         node_id,
         counters: UsageCounters::default(),
         replicas: Default::default(),
+        revisions: Default::default(),
     };
     match publisher
         .context

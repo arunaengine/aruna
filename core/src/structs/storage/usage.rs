@@ -12,6 +12,7 @@ use crate::keyspaces::{
 use crate::structs::storage::blob::BackendRef;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -93,12 +94,14 @@ impl RebuildProgress {
 
 /// A single node's usage total distributed over the sync layer. Single writer
 /// per key (each node writes only its own snapshots), so ingest is last-write-wins.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeUsageSnapshot {
     pub node_id: NodeId,
     pub counters: UsageCounters,
     /// The part of `counters` from distributed ranges this node holds but does not coordinate.
     pub replicas: UsageCounters,
+    /// The record number of each distributed set `replicas` was computed under.
+    pub revisions: BTreeMap<Ulid, u64>,
 }
 
 impl NodeUsageSnapshot {
@@ -741,6 +744,7 @@ mod tests {
                 logical_bytes: 4,
                 ..Default::default()
             },
+            revisions: Default::default(),
         };
         let bytes = snapshot.to_bytes().unwrap();
         assert_eq!(NodeUsageSnapshot::from_bytes(&bytes).unwrap(), snapshot);

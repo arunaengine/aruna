@@ -30,7 +30,7 @@ use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
@@ -453,6 +453,10 @@ pub struct QuotaGate {
     replica_bytes: u64,
     /// This node's own published share, deducted only while nothing shrank it since.
     own_replicas: u64,
+    /// The record numbers this node's own share was computed under, by set.
+    own_revisions: BTreeMap<ulid::Ulid, u64>,
+    /// The newest record number any other node's share was computed under, by set.
+    remote_revisions: BTreeMap<ulid::Ulid, u64>,
     count_replicas: bool,
     rebuilding: bool,
     phase: QuotaGatePhase,
@@ -479,6 +483,8 @@ impl QuotaGate {
             usage: 0,
             replica_bytes: 0,
             own_replicas: 0,
+            own_revisions: BTreeMap::new(),
+            remote_revisions: BTreeMap::new(),
             count_replicas: false,
             rebuilding: false,
             phase: QuotaGatePhase::Pending,
@@ -608,10 +614,19 @@ impl QuotaGate {
                     let replicas = snapshot.replicas.logical_bytes;
                     if local {
                         self.own_replicas = replicas;
+                        self.own_revisions = snapshot.revisions;
                         continue;
+                    }
+                    for (set_id, number) in &snapshot.revisions {
+                        let newest = self.remote_revisions.entry(*set_id).or_default();
+                        *newest = (*newest).max(*number);
                     }
                     self.replica_bytes = self.replica_bytes.saturating_add(replicas);
                     self.usage = self.usage.saturating_add(snapshot.counters.logical_bytes);
+                }
+                // Another node already counts under a record this node has not published under.
+                if next_start_after.is_none() && self.newer_record() {
+                    self.own_replicas = 0;
                 }
                 match next_start_after {
                     Some(start) => Ok(Some(self.scan_effect(Some(start), txn_id))),
@@ -639,6 +654,14 @@ impl QuotaGate {
             }
             (_, received) => Err(QuotaGateError::UnexpectedEvent(received)),
         }
+    }
+
+    /// Whether another node computed its share under a newer record of a set this node's own
+    /// share covers: until this node applies and publishes that record, its share may be stale.
+    fn newer_record(&self) -> bool {
+        (self.remote_revisions.iter()).any(|(set_id, number)| {
+            (self.own_revisions.get(set_id)).is_some_and(|own| number > own)
+        })
     }
 
     /// Projected group-wide `logical_bytes` if the pending write commits.
@@ -1070,14 +1093,16 @@ async fn publish_retaining_markers(
     let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(groups.len() + 1);
     if global {
         let counters = read_local_global(storage).await?;
-        let mut replicas = UsageCounters::default();
+        let (mut replicas, mut revisions) = (UsageCounters::default(), BTreeMap::new());
         for share in shares.values() {
-            replicas.add(share).map_err(|e| e.to_string())?;
+            replicas.add(&share.replicas).map_err(|e| e.to_string())?;
+            revisions.extend(&share.revisions);
         }
         let snapshot = NodeUsageSnapshot {
             node_id,
             counters,
             replicas,
+            revisions,
         };
         writes.push((
             NODE_STATS_KEYSPACE.to_string(),
@@ -1088,10 +1113,12 @@ async fn publish_retaining_markers(
     let group_list: Vec<GroupId> = groups.into_iter().collect();
     for group_id in &group_list {
         let counters = read_local_group(storage, *group_id).await?;
+        let share = shares.get(group_id).cloned().unwrap_or_default();
         let snapshot = NodeUsageSnapshot {
             node_id,
             counters,
-            replicas: shares.get(group_id).copied().unwrap_or_default(),
+            replicas: share.replicas,
+            revisions: share.revisions,
         };
         writes.push((
             NODE_STATS_KEYSPACE.to_string(),
@@ -2515,10 +2542,22 @@ mod tests {
     /// as (counters, replicas), the local one first, and whether a removal shrank the share.
     fn run_gate(
         count_replicas: bool,
+        limits: (u64, u64),
+        live: u64,
+        shares: [(u64, u64); 2],
+        dirty: bool,
+    ) -> QuotaGate {
+        run_gate_at(count_replicas, limits, live, shares, dirty, [1, 1])
+    }
+
+    /// [`run_gate`] with the number of the one set's record each node's share was computed under.
+    fn run_gate_at(
+        count_replicas: bool,
         (ceiling, delta): (u64, u64),
         live: u64,
         shares: [(u64, u64); 2],
         dirty: bool,
+        numbers: [u64; 2],
     ) -> QuotaGate {
         use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
         let nodes = [node(1), node(2)];
@@ -2546,12 +2585,14 @@ mod tests {
             .unwrap();
         gate.step(read(Some(logical(live).to_bytes().unwrap())), txn_id)
             .unwrap();
-        let values = (nodes.into_iter().zip(shares))
-            .map(|(node_id, (counters, replicas))| {
+        let set_id = Ulid::from_bytes([3; 16]);
+        let values = (nodes.into_iter().zip(shares).zip(numbers))
+            .map(|((node_id, (counters, replicas)), number)| {
                 let snapshot = NodeUsageSnapshot {
                     node_id,
                     counters: logical(counters),
                     replicas: logical(replicas),
+                    revisions: BTreeMap::from([(set_id, number)]),
                 };
                 let key = Key::from(usage_snapshot_key(group_id, node_id));
                 (key, Value::from(snapshot.to_bytes().unwrap()))
@@ -2612,6 +2653,21 @@ mod tests {
     fn promotion_counts_once() {
         let gate = run_gate(false, (1_000, 1), 120, [(120, 100), (100, 100)], true);
         assert_eq!(gate.projected_usage(), 121);
+    }
+
+    // The former coordinator's snapshot under the promoting record can arrive before that record:
+    // a share computed under an older record of the set is then not deducted, 1 B counts as 121 B.
+    #[test]
+    fn newer_record_counts() {
+        let shares = [(120, 100), (100, 100)];
+        let early = run_gate_at(false, (1_000, 1), 120, shares, false, [1, 2]);
+        assert_eq!(early.projected_usage(), 121);
+        let applied = run_gate_at(false, (1_000, 1), 120, shares, false, [2, 2]);
+        assert_eq!(
+            applied.projected_usage(),
+            21,
+            "both shares under one record are exact"
+        );
     }
 
     // Steady additions keep a group dirty but never mark its share, so the gate keeps deducting
@@ -2675,6 +2731,7 @@ mod tests {
                 node_id,
                 counters,
                 replicas,
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap()
@@ -2926,6 +2983,7 @@ mod tests {
             node_id: remote,
             counters,
             replicas: Default::default(),
+            revisions: Default::default(),
         };
         let remote_counters = UsageCounters {
             logical_bytes: 5,
@@ -2955,6 +3013,7 @@ mod tests {
                     ..Default::default()
                 },
                 replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -3005,6 +3064,7 @@ mod tests {
                     ..Default::default()
                 },
                 replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -3032,6 +3092,7 @@ mod tests {
                 ..Default::default()
             },
             replicas: Default::default(),
+            revisions: Default::default(),
         };
         write_node_stat(&ctx, snapshot_key.clone(), snapshot.to_bytes().unwrap()).await;
         write_node_stat(&ctx, SUMMARY_GLOBAL_KEY.to_vec(), Vec::new()).await;
@@ -3344,6 +3405,7 @@ mod tests {
                     ..Default::default()
                 },
                 replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -3401,6 +3463,7 @@ mod tests {
                 node_id: remote,
                 counters: remote_counters,
                 replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -3413,6 +3476,7 @@ mod tests {
                 node_id: remote,
                 counters: remote_counters,
                 replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap(),

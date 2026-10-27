@@ -483,6 +483,7 @@ async fn drain_reconcile_summary() {
                 ..Default::default()
             },
             replicas: Default::default(),
+            revisions: Default::default(),
         }
         .to_bytes()
         .unwrap(),

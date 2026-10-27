@@ -335,6 +335,7 @@ async fn seed_usage_state(state: &Arc<ServerState>) {
                     ..Default::default()
                 },
                 replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap()
