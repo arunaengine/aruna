@@ -173,6 +173,8 @@ pub struct FjallStorage {
     pub(super) compactor: Compactor,
     /// Committed deletes per keyspace since its last compaction.
     pub(super) deletes: HashMap<String, u64>,
+    /// Journal count at the last journal sweep.
+    pub(super) swept: usize,
     pub(super) txn_deletes: HashMap<Ulid, HashMap<String, u64>>,
     pub(super) txn_usage: HashMap<Ulid, Vec<(String, ByteView, CounterChange)>>,
     /// Open write transactions that wrote or deleted realm config rows.
@@ -383,6 +385,7 @@ impl FjallStorage {
                     None => self.process_single(first, &mut slow_queue),
                 },
             }
+            self.check_journals();
         }
     }
 

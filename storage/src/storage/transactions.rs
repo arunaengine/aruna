@@ -16,7 +16,7 @@ use fjall::Readable;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::compaction::{DELETE_THRESHOLD, compactable};
+use crate::compaction::{DELETE_THRESHOLD, compactable, sweep_due};
 
 use super::rebuild::shadow_row;
 
@@ -346,6 +346,15 @@ impl FjallStorage {
             None => StorageEvent::Error {
                 error: StorageError::TransactionNotFound,
             },
+        }
+    }
+
+    /// Sweeps the keyspaces once journals pile up, as Fjall waits on any that compacted away.
+    pub(super) fn check_journals(&mut self) {
+        let (due, swept) = sweep_due(self.store.db.journal_count(), self.swept);
+        self.swept = swept;
+        if due {
+            self.compactor.sweep(self.store.db.clone());
         }
     }
 

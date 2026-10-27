@@ -331,6 +331,7 @@ fn bulk_full_rejects() {
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
+        swept: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1319,6 +1320,7 @@ fn unknown_commit_runs() {
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
+        swept: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1369,6 +1371,7 @@ fn unknown_commit_retires() {
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
+        swept: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1419,6 +1422,7 @@ fn retry_skips_queued() {
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
+        swept: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -2626,4 +2630,41 @@ async fn compaction_drops_journals() {
         pending.inner().rotate_memtable_and_wait().unwrap();
         first_dropped(dir.path()).await;
     }
+}
+
+/// Fjall's own compaction can drop every tombstone of a keyspace, which then holds a journal
+/// another keyspace kept meanwhile; a sweep lets that journal go.
+#[tokio::test]
+async fn sweep_drops_journals() {
+    let dir = tempdir().unwrap();
+    let (handle, _receivers) = StorageHandle::new();
+    let mut storage = worker(&dir, &handle);
+    let jobs = stub_compactor(&mut storage);
+    let db = storage.store.db.clone();
+    let open = |name| {
+        db.keyspace(name, fjall::KeyspaceCreateOptions::default)
+            .unwrap()
+    };
+    let drained = open("drained");
+    let drained = drained.inner();
+    drained.insert("owed", "row").unwrap();
+    drained.rotate_memtable_and_wait().unwrap();
+    drained.remove("owed").unwrap();
+    let pending = open("pending");
+    pending.inner().insert("pending", "row").unwrap();
+    seal_journal(&db);
+    // Four level 0 runs make Fjall merge them into the last level, which drops tombstones.
+    for key in ["owed", "a", "b", "c"] {
+        drained.remove(key).unwrap();
+        drained.rotate_memtable_and_wait().unwrap();
+    }
+    let cap = Instant::now() + Duration::from_secs(120);
+    while drained.table_count() > 0 {
+        assert!(Instant::now() < cap, "the keyspace never compacts away");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    pending.inner().rotate_memtable_and_wait().unwrap();
+    storage.compactor.sweep(db.clone());
+    (jobs.try_recv().expect("sweep is queued").run)().unwrap();
+    first_dropped(dir.path()).await;
 }
