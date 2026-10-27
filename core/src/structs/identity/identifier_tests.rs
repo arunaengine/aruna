@@ -1,3 +1,4 @@
+//! Tests identifier parsers: presets on real keys, match rules and refused rules.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

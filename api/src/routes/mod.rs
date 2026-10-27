@@ -275,6 +275,8 @@ pub(crate) mod tests {
         ("GET", "/data/databases"),
         ("POST", "/system/realm/databases"),
         ("DELETE", "/system/realm/databases/{entry_id}"),
+        ("PUT", "/system/realm/databases/{entry_id}/parser"),
+        ("POST", "/system/realm/databases/parser/test"),
         ("GET", "/system/realm/databases/requests"),
         (
             "POST",

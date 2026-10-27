@@ -374,3 +374,67 @@ async fn approval_needs_owner() {
         Err(ServerError::ServiceUnavailableReason(_))
     ));
 }
+
+#[tokio::test]
+async fn parser_routes() {
+    let test = setup_state().await;
+    datasets::grant_curator(&test).await;
+    store(&test, BUCKET).await;
+    let dataset = describe(&test).await;
+    let entry_id = marked(&test, &test.auth, &dataset.to_string())
+        .await
+        .unwrap()
+        .entry
+        .entry_id;
+    let parser = |pattern: &str| IdentifierParserBody {
+        rules: vec![IdentifierRuleBody {
+            name: "BioSample".to_string(),
+            pattern: pattern.to_string(),
+            target: IdentifierTargetBody::Key,
+            url_template: "https://www.ebi.ac.uk/biosamples/samples/{id}".to_string(),
+        }],
+    };
+    let put = |auth: AuthContext, parser| {
+        put_parser(
+            State(test.state.clone()),
+            Extension(Some(auth)),
+            Extension(None),
+            Path(entry_id.clone()),
+            Json(SetParserRequest { parser }),
+        )
+    };
+    let valid = r"(?P<id>SAMN\d+)";
+    let refused = put(stranger(&test), Some(parser(valid))).await;
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
+    let invalid = put(test.auth.clone(), Some(parser("(?P<x>a)"))).await;
+    assert!(matches!(invalid, Err(ServerError::BadRequestReason(_))));
+    let set = put(test.auth.clone(), Some(parser(valid))).await;
+    assert_eq!(set.unwrap(), StatusCode::NO_CONTENT);
+    let page = listed(&test, &test.auth, false).await.unwrap();
+    let listed_parser = page.databases[0].parser.as_ref().unwrap();
+    assert_eq!(listed_parser.rules[0].pattern, valid);
+
+    let tried = |parser| {
+        test_parser(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(ParserTestRequest {
+                parser,
+                key: "SAMN02138552/contigs.fna.gz".to_string(),
+                source_url: None,
+            }),
+        )
+    };
+    let Json(found) = tried(parser(valid)).await.unwrap();
+    assert_eq!(found.identifiers.len(), 1);
+    assert_eq!(found.identifiers[0].value, "SAMN02138552");
+    assert!(matches!(
+        tried(parser("(?P<id>[")).await,
+        Err(ServerError::BadRequestReason(_))
+    ));
+
+    let cleared = put(test.auth.clone(), None).await;
+    assert_eq!(cleared.unwrap(), StatusCode::NO_CONTENT);
+    let page = listed(&test, &test.auth, false).await.unwrap();
+    assert!(page.databases[0].parser.is_none());
+}
