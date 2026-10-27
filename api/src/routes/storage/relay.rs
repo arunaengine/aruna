@@ -149,6 +149,18 @@ pub(crate) fn query_path(route: &str, pairs: &[(&str, &str)]) -> String {
     format!("{route}?{}", query.finish())
 }
 
+/// 404 from a copy that answered for range `range_id` while its coordinator could not.
+pub(crate) fn stale_miss(range_id: Ulid) -> ServerError {
+    ServerError::Refused(
+        StatusCode::NOT_FOUND,
+        "stale_not_found",
+        format!(
+            "not found on a copy of range {range_id}, which answered because the range's \
+             coordinator could not; the copy may be behind, so the object may exist"
+        ),
+    )
+}
+
 /// 503 for a read no holder of the range answered.
 fn no_holder(holders: &[RestForward]) -> ServerError {
     let (range, set) = holders

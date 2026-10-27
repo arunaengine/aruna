@@ -208,6 +208,27 @@ async fn stale_copy_relays() {
     assert_eq!(peer.paths.lock().unwrap().len(), 1);
 }
 
+// While the coordinator cannot answer, this node's copy answers, marked stale, and its miss
+// says the version may exist.
+#[tokio::test]
+async fn down_coordinator_copy() {
+    let node = node_state().await;
+    store(&node, "a.md").await;
+    let snapshot = replicate(&node.state, node.group_id, BUCKET).await;
+    publish_api(&node.state, node_id(PEER), CLOSED_API).await;
+    let range_id = snapshot.config.ranges[0].range_id.to_string();
+    let answer = origin(&node, &node.owner, HeaderMap::new(), BUCKET, "a.md", None)
+        .await
+        .unwrap();
+    assert_eq!(answer.stale_ranges, std::slice::from_ref(&range_id));
+    let missing = origin(&node, &node.owner, HeaderMap::new(), BUCKET, "b.md", None).await;
+    let Err(ServerError::Refused(status, code, message)) = missing else {
+        panic!("a copy's miss is marked");
+    };
+    assert_eq!((status, code), (StatusCode::NOT_FOUND, "stale_not_found"));
+    assert!(message.contains(&range_id));
+}
+
 #[tokio::test]
 async fn unanswered_holder_fails() {
     let node = node_state().await;
