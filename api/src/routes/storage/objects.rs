@@ -11,7 +11,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use aruna_operations::auth::permission_rules::permission_rules;
-use aruna_operations::distribution::guard::{bound_view, lists_interval};
+use aruna_operations::distribution::guard::{bound_view, lists_interval, local_fence};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
@@ -262,6 +262,9 @@ async fn merged_page(
         .await
         .map_err(map_guard_error)?;
     let snapshot = view.snapshot();
+    let fence = local_fence(context.as_ref(), binding.set_id)
+        .await
+        .map_err(map_guard_error)?;
     let resume = request.cursor.as_deref().map(decode_resume).transpose()?;
     let (after, from) = match &resume {
         Some(Resume::After { key, group }) => (Some((key.clone(), group.clone())), None),
@@ -311,7 +314,7 @@ async fn merged_page(
             cursor: None,
             ..request.clone()
         };
-        let part = match snapshot.lists_locally(binding.member_id, range) {
+        let part = match snapshot.lists_locally(binding.member_id, range, &fence) {
             true => {
                 let token = (start.as_ref())
                     .map(|(key, group)| resume_token(&request.bucket, key, group.as_deref()))

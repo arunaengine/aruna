@@ -187,6 +187,7 @@ impl ArunaS3Service {
         (group_id, max_keys): (Ulid, usize),
     ) -> S3Result<ListObjectVersionsOutput> {
         let snapshot = self.snapshot(binding).await?;
+        let fence = self.fence(binding).await?;
         let url_encoded = url_of(&input);
         let owner = Owner {
             display_name: None,
@@ -223,7 +224,7 @@ impl ArunaS3Service {
             // The key marker skips a common prefix in every range; the id only in the first.
             let start = (marker.clone(), version_marker.clone().filter(|_| first));
             first = false;
-            let part = match snapshot.lists_locally(binding.member_id, range) {
+            let part = match snapshot.lists_locally(binding.member_id, range, &fence) {
                 true => {
                     let id = (start.1.as_deref())
                         .map(Ulid::from_string)

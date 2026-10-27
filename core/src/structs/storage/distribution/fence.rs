@@ -63,6 +63,16 @@ impl LocalFence {
         self.check(snapshot, range, epoch, true)
     }
 
+    /// Whether this node, while its record names it coordinator of `range`, may answer reads and
+    /// listings from its own records: a range it fenced for a transfer may have moved on.
+    pub fn check_read(
+        &self,
+        snapshot: &DistributionSnapshot,
+        range: &KeyRange,
+    ) -> Result<(), RouteError> {
+        self.check(snapshot, range, range.epoch, false)
+    }
+
     fn check(
         &self,
         snapshot: &DistributionSnapshot,

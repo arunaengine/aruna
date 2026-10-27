@@ -29,7 +29,7 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::distribution::guard::{GuardError, bound_view, route_write};
+use crate::distribution::guard::{GuardError, bound_view, local_fence, route_write};
 use crate::distribution::versions::{InventoryVersionsInput, InventoryVersionsOperation};
 use crate::driver::{DriverContext, drive, routing_snapshot};
 use crate::forward::authorize::peer_acts_for;
@@ -765,6 +765,9 @@ async fn set_heads(
         .await
         .map_err(|_| SyncRefusal::Unavailable)?;
     let snapshot = view.snapshot();
+    let fence = local_fence(context, binding.set_id)
+        .await
+        .map_err(|_| SyncRefusal::Unavailable)?;
     let prefix = (!listing.prefix.is_empty()).then(|| listing_prefix(&listing.prefix));
     let (mut marker, mut version_marker) = match listing.cursor.clone() {
         Some(cursor) => (Some(cursor.key), cursor.version_id),
@@ -783,7 +786,7 @@ async fn set_heads(
     let (mut heads, mut next) = (Vec::new(), None);
     for (visited, range) in ranges.enumerate() {
         let remaining = listing.limit.get().saturating_sub(heads.len());
-        let here = snapshot.lists_locally(binding.member_id, range);
+        let here = snapshot.lists_locally(binding.member_id, range, &fence);
         if remaining == 0 || visited == MAX_PAGE_RANGES || (!here && visited > 0) {
             // The nil version id starts the next page at the first key of this range.
             next = Some(SyncListCursor {

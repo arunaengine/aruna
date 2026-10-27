@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
-use aruna_core::structs::storage::distribution::ReadRoute;
-use aruna_operations::distribution::guard::route_read;
+use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute};
+use aruna_operations::distribution::guard::{read_coordinator, route_read};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
 use futures_util::TryStreamExt;
@@ -195,8 +195,25 @@ impl ArunaS3Service {
         Ok(Some((holder, coordinator)))
     }
 
-    /// The coordinator a local miss goes on to when this member only keeps a copy of the
-    /// key's range, since the copy may lag behind it. A delegated read is never sent on.
+    /// The coordinator of `key`'s range when another member coordinates it, or `None` when
+    /// this member does; a range this node fenced for a transfer is refused.
+    async fn range_coordinator(
+        &self,
+        binding: &DistributionBinding,
+        key: &str,
+    ) -> S3Result<Option<Forward>> {
+        let coordinator = read_coordinator(self.state.as_ref(), binding, key)
+            .await
+            .map_err(|error| guard_error(&error))?;
+        Ok(coordinator.map(|(range_id, node_id)| Forward {
+            set_id: binding.set_id,
+            range_id,
+            node_id,
+        }))
+    }
+
+    /// The coordinator a local miss goes on to, since a copy may lag behind it; a miss on a
+    /// range this node fenced is refused. A delegated read is never sent on.
     pub(in crate::s3::service) async fn copy_miss(
         &self,
         extensions: &http::Extensions,
@@ -212,19 +229,11 @@ impl ArunaS3Service {
         let Some(binding) = binding.filter(|_| missing) else {
             return Ok(None);
         };
-        if extensions.get::<DelegatedRequest>().is_some() {
-            return Ok(None);
+        let coordinator = self.range_coordinator(binding, key).await?;
+        match extensions.get::<DelegatedRequest>() {
+            Some(_) => Ok(None),
+            None => Ok(coordinator),
         }
-        let snapshot = self.snapshot(binding).await?;
-        let range = snapshot.range_for(key);
-        let Some(range) = range.filter(|range| range.coordinator != binding.member_id) else {
-            return Ok(None);
-        };
-        Ok(snapshot.member(range.coordinator).map(|member| Forward {
-            set_id: binding.set_id,
-            range_id: range.range_id,
-            node_id: member.node_id,
-        }))
     }
 
     /// Sends a GET or HEAD to the chosen holder; a replica's miss goes on to the coordinator.

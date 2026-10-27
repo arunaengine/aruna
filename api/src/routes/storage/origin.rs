@@ -13,7 +13,7 @@ use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, VersionOrigin,
 };
-use aruna_operations::distribution::guard::{bound_view, route_read};
+use aruna_operations::distribution::guard::{read_coordinator, route_read};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
 use aruna_operations::s3::object::origin::{OriginError, OriginView, read_origin};
@@ -292,19 +292,16 @@ pub async fn get_origin(
         params.version_id,
     )
     .await;
-    // A copy may not have the version yet, so its miss goes on to the range's coordinator.
-    if let (Err(OriginError::VersionMissing), Some(binding)) = (&view, info.distribution.as_ref())
-        && !headers.contains_key(RELAY_HOP_HEADER)
-    {
-        let record = bound_view(state.get_ctx().as_ref(), binding).await;
-        let snapshot = record.map_err(map_guard_error)?.head.snapshot;
-        let range = snapshot.range_for(&params.key);
-        if let Some(range) = range.filter(|range| range.coordinator != binding.member_id)
-            && let Some(coordinator) = snapshot.member(range.coordinator)
+    // A copy may not have the version yet, so its miss goes on to the range's coordinator; a
+    // miss on a range this node fenced is refused.
+    if let (Err(OriginError::VersionMissing), Some(binding)) = (&view, info.distribution.as_ref()) {
+        let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
+        if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)?
+            && !headers.contains_key(RELAY_HOP_HEADER)
         {
-            let target = (binding.set_id, range.range_id, coordinator.node_id);
             let path = origin_path(&bucket, &params);
-            return relay_origin(&state, target, vec![coordinator.node_id], &path, bearer).await;
+            let target = (binding.set_id, range_id, node_id);
+            return relay_origin(&state, target, vec![node_id], &path, bearer).await;
         }
     }
     let view = view.map_err(|error| match error {
