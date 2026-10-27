@@ -71,6 +71,7 @@ async fn docker_or_skip() -> Option<DockerBackend> {
 
 struct Fixture {
     seed: shared::SeedNode,
+    bearer: String,
     compute_ctx: Arc<DriverContext>,
     group_id: Ulid,
     s3: S3Credentials,
@@ -119,6 +120,7 @@ async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
 
     Ok(Fixture {
         seed,
+        bearer,
         compute_ctx,
         group_id,
         s3: creds,
@@ -324,18 +326,11 @@ async fn wait_run_crate(
     }
 }
 
-// Covers staged input, container output, terminal success, durable output, and run crate.
-// The run must not create a bucket of its own.
-#[tokio::test]
-async fn executes_job() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
-    let fixture = setup(backend).await?;
-
+/// Runs a container that upper-cases the source into `outputs/result.txt`; it must succeed.
+async fn run_upper(fixture: &Fixture) -> JobId {
     let script = "tr a-z A-Z < /input/input.txt > /output/result.txt";
     let mut spec = execution_spec(
-        &fixture,
+        fixture,
         "busybox:latest",
         Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
         vec![script.to_string()],
@@ -353,7 +348,7 @@ async fn executes_job() -> TestResult<()> {
         description: None,
     }];
     spec.output_prefixes.clear();
-    let (job_id, record) = claim_execution(&fixture, spec).await;
+    let (job_id, record) = claim_execution(fixture, spec).await;
 
     run_execution_job(
         fixture.compute_ctx.clone(),
@@ -388,6 +383,18 @@ async fn executes_job() -> TestResult<()> {
         eprintln!("=== container logs ===\n{logs}");
     }
     assert_eq!(state, JobState::Succeeded, "container job must succeed");
+    job_id
+}
+
+// Covers staged input, container output, terminal success, durable output, and run crate.
+// The run must not create a bucket of its own.
+#[tokio::test]
+async fn executes_job() -> TestResult<()> {
+    let Some(backend) = docker_or_skip().await else {
+        return Ok(());
+    };
+    let fixture = setup(backend).await?;
+    let job_id = run_upper(&fixture).await;
 
     // The output copied from the container is durable at its declared URL.
     let client = s3_client(&fixture.endpoint, &fixture.s3);
@@ -410,6 +417,128 @@ async fn executes_job() -> TestResult<()> {
         matches!(crate_status, Some(RunCrateStatus::Written { .. })),
         "run crate must be written, got {crate_status:?}"
     );
+
+    fixture.seed.shutdown().await;
+    Ok(())
+}
+
+/// A GET of an api route with the fixture's token; `None` while it answers 503.
+async fn api_get(fixture: &Fixture, path: &str, query: &[(&str, &str)]) -> Option<Value> {
+    let url = format!("{}/api/v1{path}", fixture.seed.base_url);
+    let url = reqwest::Url::parse_with_params(&url, query).expect("api url");
+    let response = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(&fixture.bearer)
+        .send()
+        .await
+        .expect("api answers");
+    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    assert!(
+        response.status().is_success(),
+        "{path}: {}",
+        response.status()
+    );
+    Some(response.json().await.expect("json answer"))
+}
+
+/// The exact version id a run crate names for the file at `location`; the values of
+/// `contentUrl` have no order once the crate is stored.
+fn exact_version(run_crate: &Value, location: &str) -> String {
+    let graph = run_crate["@graph"].as_array().expect("crate graph");
+    let urls = |node: &Value| -> Vec<String> {
+        let values = node["contentUrl"].as_array().cloned().unwrap_or_default();
+        values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect()
+    };
+    let file = graph
+        .iter()
+        .map(urls)
+        .find(|urls| urls.iter().any(|url| url == location))
+        .expect("the crate names the file");
+    file.into_iter()
+        .find(|url| url.contains("arn:aruna:"))
+        .expect("exact id")
+}
+
+// Follows a run's output back to its input through the provenance routes, and exports it.
+#[tokio::test]
+async fn follows_provenance() -> TestResult<()> {
+    let Some(backend) = docker_or_skip().await else {
+        return Ok(());
+    };
+    let fixture = setup(backend).await?;
+    let job_id = run_upper(&fixture).await;
+    let crate_status = wait_run_crate(&fixture.compute_ctx, job_id, Duration::from_secs(30)).await;
+    assert!(matches!(crate_status, Some(RunCrateStatus::Written { .. })));
+    let bucket = fixture.source_bucket.clone();
+
+    let origin_path = format!("/data/buckets/{bucket}/objects/origin");
+    let key = [("key", "outputs/result.txt")];
+    let output = api_get(&fixture, &origin_path, &key).await.expect("origin");
+    assert_eq!(output["origin"]["kind"], "job");
+    assert_eq!(output["origin"]["run_id"], job_id.to_string());
+    assert!(
+        output["content_id"].is_string(),
+        "stored bytes carry a content id"
+    );
+
+    let run = api_get(&fixture, &format!("/compute/runs/{job_id}"), &[])
+        .await
+        .expect("run");
+    let document = run["run_crate"].as_str().expect("the run names its crate");
+    // The crate graph is read once it is materialized.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let run_crate = loop {
+        let path = format!("/metadata/{document}/rocrate");
+        if let Some(answer) = api_get(&fixture, &path, &[]).await {
+            break answer["rocrate"].clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the run crate never materialized"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+
+    let input_id = exact_version(&run_crate, &format!("s3://{bucket}/data.txt"));
+    let input = api_get(&fixture, "/data/origin", &[("version", &input_id)])
+        .await
+        .expect("input origin");
+    assert_eq!(input["origin"]["kind"], "upload");
+    let head = drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: bucket.clone(),
+            key: "data.txt".to_string(),
+            version_id: None,
+        }),
+        fixture.compute_ctx.as_ref(),
+    )
+    .await?;
+    let version = head
+        .resolved_version_id
+        .or(head.version_id)
+        .expect("version");
+    assert_eq!(input["version_id"], version.to_string());
+
+    let output_id = exact_version(&run_crate, &format!("s3://{bucket}/outputs/result.txt"));
+    let url = format!("{}/api/v1/data/provenance/crate", fixture.seed.base_url);
+    let url = reqwest::Url::parse_with_params(&url, [("version", output_id.as_str())])?;
+    let exported = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(&fixture.bearer)
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    // Stored ZIP entries carry their names in plain text.
+    let names = String::from_utf8_lossy(&exported);
+    assert!(names.contains(&format!("runs/{job_id}/ro-crate-metadata.json")));
+    assert!(names.contains(&input_id), "the export reaches the input");
+    assert!(names.contains("\"Complete\""), "every hop answered");
 
     fixture.seed.shutdown().await;
     Ok(())
