@@ -16,15 +16,15 @@ use aruna_core::keyspaces::{NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, prefix_u
 use aruna_core::telemetry::duration_ms;
 use byteview::ByteView;
 use crossfire::select::Select;
-use crossfire::{RecvError, TryRecvError, TrySendError, mpsc};
+use crossfire::{RecvError, TryRecvError, TrySendError, mpmc};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use tracing::warn;
 use ulid::Ulid;
 
 use super::handle::{
-    CleanupEntry, CleanupKind, EffectHandle, EffectReceiver, EffectSender, MAX_CLEANUP_ATTEMPTS,
-    ResponseSender, StorageReceivers, cleanup_effect, effect_txn_id, finish_cleanup,
-    observe_cleanup, storage_effect_mutates,
+    CleanupEntry, CleanupKind, EffectHandle, MAX_CLEANUP_ATTEMPTS, ResponseSender,
+    StorageReceivers, cleanup_effect, effect_txn_id, finish_cleanup, observe_cleanup,
+    storage_effect_mutates,
 };
 use super::metrics::{StorageMetrics, record_storage_call};
 use super::persistence::FjallPersistPolicy;
@@ -37,6 +37,9 @@ pub(super) enum Txn {
     Write(Box<fjall::OptimisticWriteTx>),
 }
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
+/// One queue per read pool, so a slow read holds one thread, never the reads behind it.
+pub(super) type PoolSender = crossfire::MTx<mpmc::Array<EffectHandle>>;
+type PoolReceiver = crossfire::MRx<mpmc::Array<EffectHandle>>;
 /// True when the effect writes or deletes a realm config row.
 pub(super) fn touches_config(effect: &StorageEffect) -> bool {
     let is_config = |key_space: &str| key_space == REALM_CONFIG_KEYSPACE;
@@ -155,10 +158,8 @@ pub struct FjallStorage {
     pub(super) txns: HashMap<Ulid, Txn>,
     pub(super) transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
     pub(super) metrics: Arc<StorageMetrics>,
-    pub(super) read_pool: Vec<EffectSender>,
-    pub(super) next_reader: usize,
-    pub(super) bulk_read_pool: Vec<EffectSender>,
-    pub(super) next_bulk_reader: usize,
+    pub(super) read_pool: PoolSender,
+    pub(super) bulk_read_pool: PoolSender,
     pub(super) pool_threads: Vec<thread::JoinHandle<()>>,
     pub(super) compactor: Compactor,
     /// Committed deletes per keyspace since its last compaction.
@@ -434,20 +435,14 @@ impl FjallStorage {
         slow_queue: &mut SlowQueueAggregator,
     ) {
         match priority {
-            StoragePriority::Foreground => {
-                let reader = self.next_reader % self.read_pool.len();
-                self.next_reader = self.next_reader.wrapping_add(1);
-                match self.read_pool[reader].try_send(item) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(item)) | Err(TrySendError::Disconnected(item)) => {
-                        self.process_single(item, slow_queue);
-                    }
+            StoragePriority::Foreground => match self.read_pool.try_send(item) {
+                Ok(()) => {}
+                Err(TrySendError::Full(item)) | Err(TrySendError::Disconnected(item)) => {
+                    self.process_single(item, slow_queue);
                 }
-            }
+            },
             StoragePriority::Bulk => {
-                let reader = self.next_bulk_reader % self.bulk_read_pool.len();
-                self.next_bulk_reader = self.next_bulk_reader.wrapping_add(1);
-                match self.bulk_read_pool[reader].try_send(item) {
+                match self.bulk_read_pool.try_send(item) {
                     Ok(()) => {}
                     // A full bulk read queue backpressures rather than stealing
                     // the write actor thread from foreground sync traffic.
@@ -1122,19 +1117,18 @@ pub(super) fn spawn_read_pool(
     store: Store,
     threads: usize,
     capacity: usize,
-) -> (Vec<EffectSender>, Vec<thread::JoinHandle<()>>) {
-    let mut senders = Vec::with_capacity(threads);
-    let mut handles = Vec::with_capacity(threads);
-    for _ in 0..threads {
-        let (sender, receiver) = mpsc::bounded_blocking(capacity);
-        let store = store.clone();
-        handles.push(thread::spawn(move || read_pool_loop(store, receiver)));
-        senders.push(sender);
-    }
-    (senders, handles)
+) -> (PoolSender, Vec<thread::JoinHandle<()>>) {
+    let (sender, receiver) = mpmc::bounded_blocking(capacity);
+    let handles = (0..threads)
+        .map(|_| {
+            let (store, receiver) = (store.clone(), receiver.clone());
+            thread::spawn(move || read_pool_loop(store, receiver))
+        })
+        .collect();
+    (sender, handles)
 }
 
-fn read_pool_loop(store: Store, receiver: EffectReceiver) {
+fn read_pool_loop(store: Store, receiver: PoolReceiver) {
     while let Ok((effect, response_tx, span, enqueued_at, in_flight)) = receiver.recv() {
         let _guard = span.enter();
         if response_tx.is_closed() {
