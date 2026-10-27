@@ -274,6 +274,8 @@ fn view_keeps_fields() {
                 run_id: Ulid::from_bytes([48; 16]),
             },
         ],
+        database_entry: None,
+        identifiers: Vec::new(),
     };
     let response = OriginResponse::from(view);
     assert_eq!(response.global_id, Some(global.to_url()));
@@ -337,6 +339,8 @@ fn origin_kinds_named() {
         hop: None,
         source: None,
         projection: Vec::new(),
+        database_entry: None,
+        identifiers: Vec::new(),
     };
     let bodies: Vec<_> = kinds
         .into_iter()

@@ -98,6 +98,12 @@ pub enum OriginProjection {
     BasedOn { id: String },
     /// The run crate convention: a `CreateAction` of the run with this file as `result`.
     CreatedBy { run_id: Ulid },
+    /// An `identifier` the database's parser found; computed per read, never stored.
+    Identifier {
+        name: String,
+        value: String,
+        url: String,
+    },
 }
 
 /// The publication-safe projection of an origin and hop. `source_url` is the public URL of

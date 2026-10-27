@@ -29,6 +29,7 @@ use utoipa_axum::routes;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::database_types::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
@@ -107,6 +108,13 @@ pub enum ProjectionBody {
     /// The run crate convention: a `CreateAction` of the run with this file as `result`.
     #[serde(rename = "CreateAction")]
     CreatedBy { run_id: String },
+    /// A `PropertyValue` the database's parser found, linked by `identifier`.
+    #[serde(rename = "identifier")]
+    Identifier {
+        name: String,
+        value: String,
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -122,6 +130,11 @@ pub struct OriginResponse {
     pub source: Option<SourceBody>,
     /// The publication-safe projection: uploads and imports in place give none.
     pub projection: Vec<ProjectionBody>,
+    /// The database entry that lists the bucket now; it may change after the version was made.
+    pub database_entry: Option<String>,
+    /// Links the current database entry's parser finds in the key and source URL.
+    #[serde(default)]
+    pub identifiers: Vec<IdentifierView>,
 }
 
 fn version_id(version: &OriginVersion) -> String {
@@ -195,8 +208,13 @@ impl From<OriginView> for OriginResponse {
                     OriginProjection::CreatedBy { run_id } => ProjectionBody::CreatedBy {
                         run_id: run_id.to_string(),
                     },
+                    OriginProjection::Identifier { name, value, url } => {
+                        ProjectionBody::Identifier { name, value, url }
+                    }
                 })
                 .collect(),
+            database_entry: view.database_entry.map(|entry| entry.to_string()),
+            identifiers: view.identifiers.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -218,7 +236,9 @@ impl From<OriginView> for OriginResponse {
 - `projection` is what datasets receive: `isBasedOn` the source URL, the copied version or
   the synced source version when it is a version of a distributed bucket (a node ARN names
   its bucket and key, so it is left out); `CreateAction` for job results; nothing for
-  uploads and imports in place.
+  uploads and imports in place; `identifier` for each link the database's parser finds.
+- `database_entry` and `identifiers` come from the database entry that lists the bucket now,
+  not from when the version was made; a removed entry gives none.
 
 **Limits**
 - One version per call; one point read. A member of a distributed bucket that holds no copy
@@ -236,7 +256,9 @@ impl From<OriginView> for OriginResponse {
             "origin": {"kind": "copy", "from": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"},
             "hop": null,
             "source": null,
-            "projection": [{"property": "isBasedOn", "id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"}]
+            "projection": [{"property": "isBasedOn", "id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"}],
+            "database_entry": null,
+            "identifiers": []
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
