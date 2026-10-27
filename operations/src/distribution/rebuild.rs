@@ -7,7 +7,8 @@ use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE,
+    INVENTORY_KEYSPACE, NODE_STATS_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
+    UPLOAD_INVENTORY_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::accounting::{
@@ -17,7 +18,8 @@ use aruna_core::structs::storage::distribution::accounting::{
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, Position, VersionEntry, range_interval,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::structs::storage::usage::dirty_share_key;
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -66,6 +68,9 @@ pub struct RebuildConfig {
     pub page_bytes: usize,
     /// Page transactions this run commits at most.
     pub max_pages: usize,
+    /// The group whose replica share an activation may lower, marked in the activation's commit;
+    /// `None` only for a run without page budget, which never activates.
+    pub group_id: Option<GroupId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -435,7 +440,13 @@ impl RebuildOperation {
                 }
                 let values = values.into_iter().map(|(_, value)| value).collect();
                 match plan_activation(set_id, range_id, values)? {
-                    Some(activation) => {
+                    Some(mut activation) => {
+                        if let Some(group) = self.config.group_id {
+                            let key = dirty_share_key(group).into();
+                            let generation = Ulid::generate().to_bytes().to_vec().into();
+                            let marker = (NODE_STATS_KEYSPACE.to_string(), key, generation);
+                            activation.writes.push(marker);
+                        }
                         self.plan = Plan {
                             writes: activation.writes,
                             deletes: activation.deletes,

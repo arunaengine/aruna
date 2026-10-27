@@ -161,6 +161,7 @@ pub async fn begin_range_rebuilds(context: &DriverContext) -> Result<usize, Stri
                 page_rows: WALK_ROWS,
                 page_bytes: WALK_BYTES,
                 max_pages: 0,
+                group_id: None,
             };
             match drive(RebuildOperation::new(config), context).await {
                 Ok(_) => begun += 1,
@@ -295,6 +296,7 @@ impl Tending<'_> {
             page_rows: WALK_ROWS,
             page_bytes: WALK_BYTES,
             max_pages: WALK_PAGES,
+            group_id: Some(self.snapshot.config.owner_group),
         };
         match drive(RebuildOperation::new(config), context.as_ref()).await {
             Ok(RebuildOutcome::Paused) => Tended::Busy,
@@ -516,6 +518,7 @@ mod tests {
             page_rows: 8,
             page_bytes: 1 << 20,
             max_pages: 100,
+            group_id: None,
         };
         let outcome = drive(RebuildOperation::new(config), &context).await;
         assert_eq!(outcome.unwrap(), RebuildOutcome::Done);

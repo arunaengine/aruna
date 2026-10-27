@@ -2606,6 +2606,14 @@ mod tests {
         );
     }
 
+    // After a promotion the former coordinator publishes its 100 B as replicas; the record marked
+    // this node's share in its install, so the stale 100 B share is not deducted as well.
+    #[test]
+    fn promotion_counts_once() {
+        let gate = run_gate(false, (1_000, 1), 120, [(120, 100), (100, 100)], true);
+        assert_eq!(gate.projected_usage(), 121);
+    }
+
     // Steady additions keep a group dirty but never mark its share, so the gate keeps deducting
     // it: with 100 B owned elsewhere and a 100 B local copy, a 150 B quota admits 1 B more.
     #[test]

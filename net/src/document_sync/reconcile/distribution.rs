@@ -6,10 +6,12 @@
 use super::*;
 use aruna_core::keyspaces::{
     CATCH_UP_KEYSPACE, DISTRIBUTION_KEYSPACE, DISTRIBUTION_LIFECYCLE_KEYSPACE,
-    DISTRIBUTION_PUBLISHER_KEYSPACE,
+    DISTRIBUTION_PUBLISHER_KEYSPACE, NODE_STATS_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::parking::{Authority, publisher_authority};
 use aruna_core::structs::storage::distribution::{PublisherCutoff, SignedSnapshot, publisher_key};
+use aruna_core::structs::storage::usage::dirty_share_key;
 
 /// Content rules that need no stored state: the target's set, the publisher as origin, the
 /// publisher's signature and every embedded statement. A failure is invalid input.
@@ -248,6 +250,27 @@ async fn distribution_writes(
         let space = DISTRIBUTION_LIFECYCLE_KEYSPACE.to_string();
         (space, key, Value::from(Vec::new()))
     });
+    // A member's replica share may shrink with the record: the gate stops deducting it now.
+    let bucket = head.config.bucket.as_bytes().to_vec().into();
+    let bucket = transaction_read(
+        storage,
+        S3_BUCKET_KEYSPACE.to_string(),
+        bucket,
+        Some(txn_id),
+    );
+    let bound = (bucket.await?.as_deref().map(BucketInfo::from_bytes))
+        .transpose()
+        .map_err(|error| bootstrap(error.to_string()))?
+        .filter(|info| {
+            info.distribution
+                .as_ref()
+                .is_some_and(|b| b.set_id == set_id)
+        });
+    let share = bound.map(|info| {
+        let generation = Value::from(Ulid::generate().to_bytes().to_vec());
+        let key = dirty_share_key(info.group_id).into();
+        (NODE_STATS_KEYSPACE.to_string(), key, generation)
+    });
     Ok(Some(
         vec![
             (
@@ -265,6 +288,7 @@ async fn distribution_writes(
         .into_iter()
         .chain(catch_up)
         .chain(lifecycle)
+        .chain(share)
         .collect(),
     ))
 }

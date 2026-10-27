@@ -6,8 +6,8 @@
 use super::*;
 use crate::distribution::inventory::{InventoryChange, InventoryUpdate};
 use crate::distribution::test_store::{
-    account, apply, begin, commit, context, counters, exact, install, open, purge, range, stage,
-    write,
+    account, apply, begin, commit, context, counters, exact, get, install, open, purge, range,
+    stage, write,
 };
 use crate::driver::drive;
 use aruna_core::structs::storage::distribution::OriginalEpoch;
@@ -28,7 +28,12 @@ fn config(page_rows: usize, max_pages: usize) -> RebuildConfig {
         page_rows,
         page_bytes: 1 << 20,
         max_pages,
+        group_id: Some(group()),
     }
+}
+
+fn group() -> Ulid {
+    Ulid::from_bytes([31; 16])
 }
 
 async fn run(handle: &StorageHandle, page_rows: usize, max_pages: usize) -> RebuildOutcome {
@@ -66,6 +71,9 @@ async fn repairs_drift() {
         generation(&handle, 1).await.is_zero(),
         "the old generation row is gone"
     );
+    // The correction lowers what the range counts: its group's share is marked in the same commit.
+    let marker = get(&handle, NODE_STATS_KEYSPACE, dirty_share_key(group())).await;
+    assert!(marker.is_some());
 }
 
 /// A run that stops after one page resumes from the durable cursor, and writes on both
