@@ -35,7 +35,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::identity::database::DatabaseEntry;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
 use aruna_core::structs::placement::policy::attachment::{
@@ -633,8 +633,8 @@ fn rewrite_rows(
 }
 
 /// Realm configuration documents gained the catch-up wait, the session idle timeout, federation
-/// settings, portal features and the database list as their last values; quota settings gained
-/// `count_replicas`. Postcard is positional, so an older row is read in its layout and re-encoded.
+/// settings, portal features, the database list and the replica quota as their last values.
+/// Postcard is positional, so appending the defaults an older row lacks re-encodes it.
 fn realm_configs(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
@@ -654,24 +654,23 @@ fn realm_configs(
     Ok(Rewrites { scanned, rows })
 }
 
-/// Quota settings before `count_replicas`, which reads as unset.
-const QUOTA: Layout = &[("QuotaConfig", 9), ("GroupQuotaOverride", 3)];
-
-/// Appends the trailing defaults an older row lacks, shortest suffix first, so a row missing only
-/// the newest value keeps the one it already has, and reads it in the older quota layout.
+/// Appends the trailing defaults an older row lacks, shortest suffix first, so
+/// a row missing only the newest value keeps the one it already has.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
+    let replicas = postcard::to_allocvec(&ReplicaQuota::default()).ok()?;
     let databases = postcard::to_allocvec(&Vec::<DatabaseEntry>::new()).ok()?;
     let features = postcard::to_allocvec(&BTreeMap::<String, bool>::new()).ok()?;
     let federation = postcard::to_allocvec(&None::<FederationSettings>).ok()?;
     let idle = postcard::to_allocvec(&IDLE_AFTER_MS).ok()?;
     let catch_up = postcard::to_allocvec(&CATCH_UP_MS).ok()?;
-    let features_on = [features.as_slice(), &databases].concat();
+    let databases_on = [databases.as_slice(), &replicas].concat();
+    let features_on = [features.as_slice(), &databases_on].concat();
     let federation_on = [federation.as_slice(), &features_on].concat();
     let idle_on = [idle.as_slice(), &federation_on].concat();
     let both = [catch_up.as_slice(), &idle_on].concat();
     for suffix in [
-        Vec::new(),
-        databases,
+        replicas,
+        databases_on,
         features_on,
         federation_on,
         idle_on,
@@ -679,8 +678,8 @@ fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
     ] {
         let mut bytes = value.to_vec();
         bytes.extend_from_slice(&suffix);
-        if let Ok(config) = session_refs::decode::<RealmConfigDocument>(&bytes, QUOTA) {
-            return postcard::to_allocvec(&config).ok();
+        if RealmConfigDocument::from_bytes(&bytes).is_ok() {
+            return Some(bytes);
         }
     }
     None
@@ -899,7 +898,7 @@ mod tests {
         SubmissionId,
     };
     use aruna_core::structs::identity::database::DatabaseEntry;
-    use aruna_core::structs::identity::realm::{GroupQuotaOverride, RealmConfigDocument, RealmId};
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -1083,36 +1082,20 @@ mod tests {
     #[test]
     fn rewrites_realm_configs() {
         // Legacy documents decode with default timeouts, no federation settings, no portal
-        // features, no databases and unset `count_replicas`. Current documents remain
-        // byte-identical.
+        // features, no databases and no replica quota. Current documents remain byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
-        let mut document = RealmConfigDocument::new(REALM, Vec::new(), 3);
-        document.quota.group_overrides.push(GroupQuotaOverride {
-            group_id: Ulid::from_bytes([5; 16]),
-            quota_bytes: Some(9),
-            grace_factor_percent: None,
-            count_replicas: None,
-        });
+        let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
         let current = postcard::to_allocvec(&document).unwrap();
-        // Before `count_replicas` the quota and its override lacked their last byte.
-        let quota = postcard::to_allocvec(&document.quota).unwrap();
-        let over = postcard::to_allocvec(&document.quota.group_overrides[0]).unwrap();
-        let start = current
-            .windows(quota.len())
-            .position(|w| w == quota)
-            .unwrap();
-        let at = quota.windows(over.len()).position(|w| w == over).unwrap();
-        let mut legacy = current.clone();
-        legacy.remove(start + quota.len() - 1);
-        legacy.remove(start + at + over.len() - 1);
         // Every legacy layout ends where the fields it lacks would start.
         let features = postcard::to_allocvec(&BTreeMap::<String, bool>::new()).unwrap();
         let federation = postcard::to_allocvec(&None::<super::FederationSettings>).unwrap();
         let idle = postcard::to_allocvec(&IDLE_AFTER_MS).unwrap();
         let catch_up = postcard::to_allocvec(&CATCH_UP_MS).unwrap();
         let databases = postcard::to_allocvec(&Vec::<DatabaseEntry>::new()).unwrap();
-        let listless = legacy[..legacy.len() - databases.len()].to_vec();
+        let replicas = postcard::to_allocvec(&super::ReplicaQuota::default()).unwrap();
+        let replicaless = current[..current.len() - replicas.len()].to_vec();
+        let listless = replicaless[..replicaless.len() - databases.len()].to_vec();
         let featureless = listless[..listless.len() - features.len()].to_vec();
         let unfederated = featureless[..featureless.len() - federation.len()].to_vec();
         let one_missing = unfederated[..unfederated.len() - idle.len()].to_vec();
@@ -1126,7 +1109,7 @@ mod tests {
                 (b"main", unfederated),
                 (b"prior", featureless),
                 (b"latest", listless),
-                (b"quota", legacy),
+                (b"replicaless", replicaless),
                 (b"new", current.clone()),
             ],
         );
@@ -1139,7 +1122,7 @@ mod tests {
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
-        assert_eq!(rows[b"quota".as_slice()], current);
+        assert_eq!(rows[b"replicaless".as_slice()], current);
         assert_eq!(rows[b"main".as_slice()], current);
         assert_eq!(rows[b"prior".as_slice()], current);
         assert_eq!(rows[b"latest".as_slice()], current);

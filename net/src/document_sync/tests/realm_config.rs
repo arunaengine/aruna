@@ -2146,7 +2146,6 @@ async fn quota_survives_materialization() {
             group_id: Ulid::from_parts(1_385, 1),
             quota_bytes: Some(4_500),
             grace_factor_percent: Some(140),
-            count_replicas: None,
         }],
         groups_per_user: Some(7),
         group_cap_overrides: vec![UserCapOverride {

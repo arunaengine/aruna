@@ -1367,7 +1367,7 @@ pub(crate) async fn run_group_usage(
     )
     .await
     {
-        let replicas = match config.quota.counts_replicas(&group_id) {
+        let replicas = match config.replica_quota.counts(&group_id) {
             true => replica_bytes,
             false => 0,
         };

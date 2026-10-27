@@ -14,7 +14,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind, ReplicaQuota};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::placement::record::PlacementScope;
 use aruna_core::structs::storage::blob::BackendRef;
@@ -381,7 +381,7 @@ impl From<QuotaConfig> for RealmQuotaConfig {
                     group_id: over.group_id.to_string(),
                     quota_bytes: over.quota_bytes,
                     grace_factor_percent: over.grace_factor_percent,
-                    count_replicas: over.count_replicas,
+                    count_replicas: None,
                 })
                 .collect(),
             groups_per_user: quota.groups_per_user,
@@ -396,27 +396,44 @@ impl From<QuotaConfig> for RealmQuotaConfig {
             devices_per_user: quota.devices_per_user,
             device_request_rate: quota.device_request_rate,
             device_concurrent_pulls: quota.device_concurrent_pulls,
-            count_replicas: quota.count_replicas,
+            count_replicas: false,
         }
     }
 }
 
 impl RealmQuotaConfig {
-    fn into_quota_config(self) -> ServerResult<QuotaConfig> {
+    /// Adds the stored replica setting, a group's beside its quota override.
+    fn with_replicas(mut self, replicas: &ReplicaQuota) -> Self {
+        self.count_replicas = replicas.count;
+        for over in &mut self.group_overrides {
+            let group_id = Ulid::from_string(&over.group_id).ok();
+            over.count_replicas = group_id.and_then(|id| replicas.groups.get(&id).copied());
+        }
+        self
+    }
+
+    fn into_quota_config(self) -> ServerResult<(QuotaConfig, ReplicaQuota)> {
+        let mut replicas = ReplicaQuota {
+            count: self.count_replicas,
+            groups: Default::default(),
+        };
         let group_overrides = self
             .group_overrides
             .into_iter()
             .map(|over| {
+                let group_id = Ulid::from_string(&over.group_id).map_err(|_| {
+                    ServerError::BadRequestReason(format!(
+                        "invalid group id in group_overrides: {}",
+                        over.group_id
+                    ))
+                })?;
+                if let Some(count) = over.count_replicas {
+                    replicas.groups.insert(group_id, count);
+                }
                 Ok(GroupQuotaOverride {
-                    group_id: Ulid::from_string(&over.group_id).map_err(|_| {
-                        ServerError::BadRequestReason(format!(
-                            "invalid group id in group_overrides: {}",
-                            over.group_id
-                        ))
-                    })?,
+                    group_id,
                     quota_bytes: over.quota_bytes,
                     grace_factor_percent: over.grace_factor_percent,
-                    count_replicas: over.count_replicas,
                 })
             })
             .collect::<ServerResult<Vec<_>>>()?;
@@ -435,7 +452,7 @@ impl RealmQuotaConfig {
                 })
             })
             .collect::<ServerResult<Vec<_>>>()?;
-        Ok(QuotaConfig {
+        let quota = QuotaConfig {
             default_quota_bytes: self.default_quota_bytes,
             grace_factor_percent: self.grace_factor_percent,
             warn_threshold_percent: self.warn_threshold_percent,
@@ -445,8 +462,8 @@ impl RealmQuotaConfig {
             devices_per_user: self.devices_per_user,
             device_request_rate: self.device_request_rate,
             device_concurrent_pulls: self.device_concurrent_pulls,
-            count_replicas: self.count_replicas,
-        })
+        };
+        Ok((quota, replicas))
     }
 }
 
@@ -1277,7 +1294,7 @@ pub(crate) async fn run_realm_info(
         (
             Some(discovery),
             nodes,
-            Some(RealmQuotaConfig::from(config.quota.clone())),
+            Some(RealmQuotaConfig::from(config.quota.clone()).with_replicas(&config.replica_quota)),
         )
     } else {
         (None, Vec::new(), None)
@@ -1907,7 +1924,7 @@ pub async fn set_realm_quota(
         Permission::WRITE,
     )
     .await?;
-    let quota = request.into_quota_config()?;
+    let (quota, replicas) = request.into_quota_config()?;
     let actor = Actor {
         node_id: state.get_node_id(),
         user_id: auth.user_id,
@@ -1918,12 +1935,14 @@ pub async fn set_realm_quota(
             actor,
             auth_context: auth,
             quota,
+            replicas,
         }),
         &state.get_ctx(),
     )
     .await
     .map_err(map_quota_error)?;
-    Ok((StatusCode::OK, Json(RealmQuotaConfig::from(stored.quota))))
+    let response = RealmQuotaConfig::from(stored.quota).with_replicas(&stored.replica_quota);
+    Ok((StatusCode::OK, Json(response)))
 }
 
 fn map_quota_error(error: SetQuotaError) -> ServerError {

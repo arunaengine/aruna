@@ -2982,7 +2982,7 @@ impl IncomingVersionOperation {
         {
             // A bound destination only takes its coordinator's publications: always a copy.
             Ok(Some(config))
-                if self.destination_bound && !config.quota.counts_replicas(&group_id) =>
+                if self.destination_bound && !config.replica_quota.counts(&group_id) =>
             {
                 None
             }

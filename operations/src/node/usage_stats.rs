@@ -557,7 +557,7 @@ impl QuotaGate {
                     let document = RealmConfigDocument::from_bytes(bytes.as_ref())?;
                     self.active_node_ids =
                         Some(document.sync_eligible_nodes()?.into_iter().collect());
-                    self.count_replicas = document.quota.counts_replicas(&self.group_id);
+                    self.count_replicas = document.replica_quota.counts(&self.group_id);
                 }
                 Ok(Some(self.read_local_effect(txn_id)))
             }
@@ -2519,7 +2519,7 @@ mod tests {
                 kind: RealmNodeKind::Management,
             })
             .to_vec();
-        config.quota.count_replicas = count_replicas;
+        config.replica_quota.count = count_replicas;
         let mut gate = QuotaGate::new_for_realm(ceiling, delta, group_id, nodes[0], realm_id);
         gate.start(txn_id);
         gate.step(read(None), txn_id).unwrap();

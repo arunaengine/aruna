@@ -1825,9 +1825,9 @@ fn copies_skip_quota() {
         config.quota = QuotaConfig {
             default_quota_bytes: Some(1),
             grace_factor_percent: 100,
-            count_replicas,
             ..QuotaConfig::default()
         };
+        config.replica_quota.count = count_replicas;
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(postcard::to_allocvec(&config).unwrap().into()),

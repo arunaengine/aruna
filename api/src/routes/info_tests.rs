@@ -488,7 +488,6 @@ fn quota_warning_unlimited() {
             group_id: unlimited_group,
             quota_bytes: None,
             grace_factor_percent: None,
-            count_replicas: None,
         }],
         ..QuotaConfig::default()
     };
