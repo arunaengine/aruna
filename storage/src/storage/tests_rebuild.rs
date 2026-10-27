@@ -3,17 +3,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::tests::{commit_transaction, start_write_transaction};
+use super::tests::{commit_transaction, start_write_transaction, worker};
 use super::{FjallStorage, StorageHandle};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, USAGE_PREIMAGE_KEYSPACE};
 use aruna_core::structs::storage::usage::{
     BucketCounters, BucketDelta, RebuildProgress, ShadowCounters, USAGE_COMPLETE_KEY,
     USAGE_PROGRESS_KEY, USAGE_REBUILD_KEY, UsageCounters, UsageDelta, usage_shadow_key,
 };
 use aruna_core::types::TxnId;
 use byteview::ByteView;
+use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, PersistMode};
+use std::path::Path;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 const SPACE: &str = "usage_stats";
@@ -403,4 +406,60 @@ async fn resume_reads_start() {
         (b"d".to_vec(), b"d1".to_vec()),
     ];
     assert_eq!(source_page(&handle, view).await, now);
+}
+
+/// Fills the first journal past Fjall's 64 MB rotation with rows below its compression threshold.
+fn seal_journal(db: &OptimisticTxDatabase) {
+    let bulk = db.keyspace(SOURCE, KeyspaceCreateOptions::default).unwrap();
+    for index in 0..17_000_u32 {
+        bulk.inner()
+            .insert(index.to_be_bytes(), [0; 4_000])
+            .unwrap();
+    }
+    db.persist(PersistMode::SyncAll).unwrap();
+    bulk.inner().rotate_memtable_and_wait().unwrap();
+}
+
+/// Waits until Fjall deletes the first journal in `dir`.
+async fn first_dropped(dir: &Path) {
+    let cap = Instant::now() + Duration::from_secs(120);
+    while dir.join("0.jnl").exists() {
+        assert!(Instant::now() < cap, "the first journal is never deleted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Clearing kept values that a sealed journal holds lets Fjall delete that journal.
+#[tokio::test]
+async fn clear_drops_journals() {
+    let dir = tempdir().unwrap();
+    let (handle, _receivers) = StorageHandle::new();
+    let storage = worker(&dir, &handle);
+    let kept = storage.store.resolve_keyspace(USAGE_PREIMAGE_KEYSPACE);
+    kept.unwrap().inner().insert("kept", "row").unwrap();
+    seal_journal(&storage.store.db);
+    storage.clear_preimages().unwrap();
+    first_dropped(dir.path()).await;
+}
+
+/// A restart replays a clear of the kept values from a sealed journal; once they flush, Fjall
+/// deletes that journal instead of keeping it and every later one.
+#[tokio::test]
+async fn restart_drops_journals() {
+    let dir = tempdir().unwrap();
+    {
+        let db = OptimisticTxDatabase::builder(dir.path())
+            .manual_journal_persist(true)
+            .open()
+            .unwrap();
+        let open = |name| db.keyspace(name, KeyspaceCreateOptions::default).unwrap();
+        open(USAGE_PREIMAGE_KEYSPACE).inner().clear().unwrap();
+        // An unflushed row keeps the first journal until the restart.
+        open(SPACE).inner().insert("pending", "row").unwrap();
+        seal_journal(&db);
+        assert!(dir.path().join("1.jnl").exists());
+    }
+    let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    first_dropped(dir.path()).await;
+    handle.close().await;
 }

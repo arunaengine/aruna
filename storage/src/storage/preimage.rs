@@ -13,14 +13,17 @@ use aruna_core::keyspaces::USAGE_PREIMAGE_KEYSPACE;
 use aruna_core::structs::storage::usage::USAGE_SOURCE_KEYSPACES;
 use byteview::ByteView;
 use fjall::Readable;
+use tracing::warn;
 
-use super::{FjallStorage, iterate_page};
+use super::{FjallStorage, Store, iterate_page};
 
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
 
 /// Value tag of a row that did not exist when the rebuild began.
 const ABSENT: u8 = 0;
 const PRESENT: u8 = 1;
+/// Key of no kept row, since kept rows always hold a zero byte.
+const FLUSH_MARK: &[u8] = b"flush";
 
 pub(super) fn is_source(key_space: &str) -> bool {
     USAGE_SOURCE_KEYSPACES.contains(&key_space)
@@ -37,6 +40,25 @@ fn tagged(key_space: &str, key: &[u8]) -> ByteView {
     let mut row = tag(key_space);
     row.extend_from_slice(key);
     ByteView::from(row)
+}
+
+/// Flushes a tombstone into `kept`. Fjall keeps every journal after a clear of a keyspace
+/// without tables, also across restarts, until that keyspace flushes again.
+fn flush_mark(kept: &fjall::Keyspace) -> fjall::Result<()> {
+    kept.remove(FLUSH_MARK)?;
+    kept.rotate_memtable().map(drop)
+}
+
+/// Flushes the kept values at open if they have no table, since a restart replays clears.
+pub(super) fn flush_empty(store: &Store) {
+    let Ok(Some(kept)) = store.existing_keyspace(USAGE_PREIMAGE_KEYSPACE) else {
+        return;
+    };
+    if kept.inner().table_count() == 0
+        && let Err(error) = flush_mark(kept.inner())
+    {
+        warn!(%error, "Old journals stay until the kept values flush");
+    }
 }
 
 fn kept_value(row: &[u8]) -> Result<Option<ByteView>, StorageError> {
@@ -102,6 +124,7 @@ impl FjallStorage {
         let kept = self.store.resolve_keyspace(USAGE_PREIMAGE_KEYSPACE)?;
         kept.inner()
             .clear()
+            .and_then(|()| flush_mark(kept.inner()))
             .map_err(|error| StorageError::WriteError(error.to_string()))
     }
 

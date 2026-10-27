@@ -10,6 +10,7 @@ use fjall::OptimisticTxDatabase;
 use crate::compaction::Compactor;
 use crate::errors::StorageLibError;
 
+use super::preimage::flush_empty;
 use super::rebuild::running_rebuild;
 use super::{
     BULK_POOL_THREADS, EFFECT_QUEUE_CAPACITY, FjallPersistPolicy, FjallStorage, QUEUE_CAPACITY,
@@ -113,6 +114,7 @@ impl FjallStorage {
             spawn_read_pool(store.clone(), bulk_threads, EFFECT_QUEUE_CAPACITY);
         pool_threads.extend(bulk_threads);
         let usage_shadow = running_rebuild(&store);
+        flush_empty(&store);
         Self {
             store,
             persist_policy: policy,
