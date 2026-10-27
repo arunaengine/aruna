@@ -261,7 +261,7 @@ async fn pages_measured() {
     let (snapshot, bytes) = replicated(true, 1);
     let coordinator = node(&snapshot, &bytes, 1).await;
     let member = node(&snapshot, &bytes, 2).await;
-    let count = 12 * PAGE_RECORDS;
+    let count = 49_152;
     let mut writes = Vec::new();
     for index in 0..count {
         let key = format!("a/{index:07}");
@@ -276,9 +276,8 @@ async fn pages_measured() {
     let context = context(&coordinator.handle);
     let started = std::time::Instant::now();
     for _ in 0..200 {
-        let result = drain_batch(&context, &sender).await.unwrap();
-        let owed = rows(&coordinator.handle, REPLICATION_OBLIGATION_KEYSPACE).await;
-        if owed.is_empty() && !result.has_more_due {
+        drain_batch(&context, &sender).await.unwrap();
+        if counters(&member.handle).await.versions == count as u64 {
             break;
         }
     }
