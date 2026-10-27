@@ -23,6 +23,7 @@ pub mod persistent_id;
 pub mod profile;
 pub mod projector;
 pub(crate) mod protocol;
+pub mod provenance;
 pub mod prune_queue;
 pub mod public_preview;
 mod query_cache;
