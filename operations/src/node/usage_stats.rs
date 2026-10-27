@@ -928,16 +928,16 @@ pub enum RealmUsageScope {
     Group(GroupId),
 }
 
-pub(crate) async fn read_local_global(storage: &StorageHandle) -> Result<UsageCounters, String> {
+pub(crate) async fn read_local_global(
+    storage: &StorageHandle,
+    txn_id: Option<TxnId>,
+) -> Result<UsageCounters, String> {
     let reads = global_shard_keys()
         .into_iter()
         .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
         .collect();
     match storage
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })
+        .send_storage_effect(StorageEffect::BatchRead { reads, txn_id })
         .await
     {
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -959,12 +959,13 @@ pub(crate) async fn read_local_global(storage: &StorageHandle) -> Result<UsageCo
 async fn read_local_group(
     storage: &StorageHandle,
     group_id: GroupId,
+    txn_id: Option<TxnId>,
 ) -> Result<UsageCounters, String> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: USAGE_STATS_KEYSPACE.to_string(),
             key: Key::from(usage_group_key(group_id)),
-            txn_id: None,
+            txn_id,
         })
         .await
     {
@@ -1097,10 +1098,37 @@ async fn publish_retaining_markers(
         return Ok((PublishedUsage::default(), Vec::new()));
     }
 
-    let shares = replica_shares(ctx).await.map_err(|e| e.to_string())?;
-    let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(groups.len() + 1);
+    // Counters and replica shares come from one snapshot, as a purge debits both together.
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: true })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(format!("unexpected transaction answer {other:?}")),
+    };
+    let group_list: Vec<GroupId> = groups.into_iter().collect();
+    let read = async {
+        let shares = replica_shares(ctx, txn_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let counters = if global {
+            read_local_global(storage, Some(txn_id)).await?
+        } else {
+            UsageCounters::default()
+        };
+        let mut group_counters = Vec::with_capacity(group_list.len());
+        for group_id in &group_list {
+            group_counters.push(read_local_group(storage, *group_id, Some(txn_id)).await?);
+        }
+        Ok::<_, String>((shares, counters, group_counters))
+    }
+    .await;
+    storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
+    let (shares, counters, group_counters) = read?;
+    let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(group_list.len() + 1);
     if global {
-        let counters = read_local_global(storage).await?;
         let (mut replicas, mut revisions) = (UsageCounters::default(), BTreeMap::new());
         for share in shares.values() {
             replicas.add(&share.replicas).map_err(|e| e.to_string())?;
@@ -1118,9 +1146,7 @@ async fn publish_retaining_markers(
             Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
-    let group_list: Vec<GroupId> = groups.into_iter().collect();
-    for group_id in &group_list {
-        let counters = read_local_group(storage, *group_id).await?;
+    for (group_id, counters) in group_list.iter().zip(group_counters) {
         let share = shares.get(group_id).cloned().unwrap_or_default();
         let snapshot = NodeUsageSnapshot {
             node_id,
@@ -1616,7 +1642,7 @@ async fn realm_global_usage(
     local_node_id: NodeId,
     active_node_ids: Option<&HashSet<NodeId>>,
 ) -> Result<RealmUsage, String> {
-    let local = read_local_global(storage).await?;
+    let local = read_local_global(storage, None).await?;
     let prefix = USAGE_GLOBAL_PREFIX.to_vec();
     let remote = sum_snapshots(storage, prefix, local_node_id, active_node_ids).await?;
     RealmUsage::of(local, remote)
@@ -1628,7 +1654,7 @@ async fn realm_group_usage(
     group_id: GroupId,
     active_node_ids: Option<&HashSet<NodeId>>,
 ) -> Result<RealmUsage, String> {
-    let local = read_local_group(storage, group_id).await?;
+    let local = read_local_group(storage, group_id, None).await?;
     let prefix = usage_group_prefix(group_id);
     let remote = sum_snapshots(storage, prefix, local_node_id, active_node_ids).await?;
     RealmUsage::of(local, remote)

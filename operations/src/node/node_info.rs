@@ -931,7 +931,7 @@ fn node_labels(
 
 async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
     Ok(
-        crate::node::usage_stats::read_local_global(&ctx.storage_handle)
+        crate::node::usage_stats::read_local_global(&ctx.storage_handle, None)
             .await?
             .stored_bytes,
     )

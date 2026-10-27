@@ -8,12 +8,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    DISTRIBUTION_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, RangeAccount, RangeCounters, account_key, generation_key, pending_key,
 };
-use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
+use aruna_core::structs::storage::distribution::{
+    DistributionBinding, DistributionSnapshot, DistributionView,
+};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
 use thiserror::Error;
@@ -22,7 +26,6 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 use crate::node::usage_stats::usage_complete;
 use crate::replication::members::bound_record;
-use crate::storage_read::scan_all;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageError {
@@ -228,7 +231,7 @@ pub async fn replica_share(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<(RangeCounters, Option<(Ulid, u64)>), UsageError> {
-    let Some((binding, snapshot)) = bound_record(context, bucket)
+    let Some((binding, _)) = bound_record(context, bucket)
         .await
         .map_err(UsageError::Record)?
     else {
@@ -244,11 +247,29 @@ pub async fn replica_share(
             return Err(StorageError::ReadError(format!("unexpected answer {other:?}")).into());
         }
     };
-    let share = copied_rows(context, (&binding, &snapshot), txn_id).await;
+    let share = binding_share(context, &binding, txn_id).await;
     (context.storage_handle)
         .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
         .await;
-    Ok((share?, Some((binding.set_id, snapshot.number))))
+    share
+}
+
+/// A bound bucket's share and its record number, both read in `txn_id`.
+async fn binding_share(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    txn_id: TxnId,
+) -> Result<(RangeCounters, Option<(Ulid, u64)>), UsageError> {
+    let read = vec![(
+        DISTRIBUTION_KEYSPACE.to_string(),
+        binding.set_id.to_bytes().to_vec().into(),
+    )];
+    let Some(Some(value)) = batch_read(context, read, txn_id).await?.pop() else {
+        return Ok((RangeCounters::default(), None));
+    };
+    let snapshot = DistributionView::from_bytes(&value)?.head.snapshot;
+    let share = copied_rows(context, (binding, &snapshot), txn_id).await?;
+    Ok((share, Some((binding.set_id, snapshot.number))))
 }
 
 /// The charged rows of every local account of the set less those of the coordinated ranges, so
@@ -292,12 +313,33 @@ async fn local_accounts(
     set_id: Ulid,
     txn_id: TxnId,
 ) -> Result<Vec<(Ulid, RangeAccount)>, UsageError> {
+    let prefix = Some(set_id.to_bytes().to_vec().into());
     let mut accounts = Vec::new();
+    for (key, value) in scan_in(context, RANGE_ACCOUNT_KEYSPACE, prefix, txn_id).await? {
+        let Some(range_id) = key.get(16..).and_then(|id| <[u8; 16]>::try_from(id).ok()) else {
+            continue;
+        };
+        accounts.push((
+            Ulid::from_bytes(range_id),
+            RangeAccount::from_bytes(&value)?,
+        ));
+    }
+    Ok(accounts)
+}
+
+/// Every row of `key_space` under `prefix`, read in `txn_id`.
+async fn scan_in(
+    context: &DriverContext,
+    key_space: &str,
+    prefix: Option<Key>,
+    txn_id: TxnId,
+) -> Result<Vec<(Key, Value)>, UsageError> {
+    let mut rows = Vec::new();
     let mut start = None;
     loop {
         let iter = StorageEffect::Iter {
-            key_space: RANGE_ACCOUNT_KEYSPACE.to_string(),
-            prefix: Some(set_id.to_bytes().to_vec().into()),
+            key_space: key_space.to_string(),
+            prefix: prefix.clone(),
             start: start.map(IterStart::After),
             limit: 1_000,
             txn_id: Some(txn_id),
@@ -312,38 +354,28 @@ async fn local_accounts(
                 return Err(StorageError::ReadError(format!("unexpected answer {other:?}")).into());
             }
         };
-        for (key, value) in values {
-            let Some(range_id) = key.get(16..).and_then(|id| <[u8; 16]>::try_from(id).ok()) else {
-                continue;
-            };
-            accounts.push((
-                Ulid::from_bytes(range_id),
-                RangeAccount::from_bytes(&value)?,
-            ));
-        }
+        rows.extend(values);
         match next {
             Some(next) => start = Some(next),
-            None => return Ok(accounts),
+            None => return Ok(rows),
         }
     }
 }
 
-/// Each group's replica share on this node, summed over its local distributed buckets. A share
-/// that cannot be read fails the whole run, so the publish keeps its markers and retries.
+/// Each group's replica share on this node, summed over its local distributed buckets and read
+/// in `txn_id`. A share that cannot be read fails the whole run, so the publish retries.
 pub async fn replica_shares(
     context: &DriverContext,
+    txn_id: TxnId,
 ) -> Result<BTreeMap<GroupId, GroupShare>, UsageError> {
-    let buckets = scan_all(&context.storage_handle, S3_BUCKET_KEYSPACE, None)
-        .await
-        .map_err(UsageError::Record)?;
+    let buckets = scan_in(context, S3_BUCKET_KEYSPACE, None, txn_id).await?;
     let mut shares: BTreeMap<GroupId, GroupShare> = BTreeMap::new();
-    for (key, value) in buckets {
+    for (_, value) in buckets {
         let info = BucketInfo::from_bytes(value.as_ref())?;
-        if info.distribution.is_none() {
+        let Some(binding) = &info.distribution else {
             continue;
-        }
-        let bucket = String::from_utf8_lossy(key.as_ref()).into_owned();
-        let (share, revision) = replica_share(context, &bucket).await?;
+        };
+        let (share, revision) = binding_share(context, binding, txn_id).await?;
         let count = |value: i128| u64::try_from(value.max(0)).unwrap_or(u64::MAX);
         let counters = UsageCounters {
             objects: count(share.objects),
@@ -589,7 +621,23 @@ mod tests {
             replica_share(&context, "spire").await.unwrap().0,
             counted(3, 15, 7)
         );
-        let shares = replica_shares(&context).await.unwrap();
+        let txn_id = match handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: true })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected answer {other:?}"),
+        };
+        // A purge after the snapshot opened does not reach the shares read in it.
+        let purge = StorageEffect::BatchDelete {
+            deletes: vec![(
+                RANGE_ACCOUNT_KEYSPACE.to_string(),
+                account_key(set_id, purged).into(),
+            )],
+            txn_id: None,
+        };
+        handle.send_storage_effect(purge).await;
+        let shares = replica_shares(&context, txn_id).await.unwrap();
         let expected = UsageCounters {
             objects: 3,
             logical_bytes: 15,
@@ -604,6 +652,10 @@ mod tests {
         assert_eq!(
             shares,
             BTreeMap::from([(snapshot.config.owner_group, share)])
+        );
+        assert_eq!(
+            replica_share(&context, "spire").await.unwrap().0,
+            counted(1, 10, 7)
         );
     }
 
@@ -642,7 +694,13 @@ mod tests {
             replica_share(&context, "spire").await.unwrap().0,
             objects(-1)
         );
-        let shares = replica_shares(&context).await.unwrap();
+        let start = StorageEffect::StartTransaction { read: true };
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) =
+            handle.send_storage_effect(start).await
+        else {
+            panic!("no read transaction");
+        };
+        let shares = replica_shares(&context, txn_id).await.unwrap();
         assert!(
             shares.values().all(|share| share.replicas.objects == 0),
             "a negative share reads as zero"
