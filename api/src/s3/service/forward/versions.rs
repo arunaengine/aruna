@@ -129,7 +129,9 @@ impl ArunaS3Service {
         base.extend(markers.1.map(|id| ("version-id-marker", id)));
         let query = range_query(&base, range);
         let request = ("ListObjectVersions", input.bucket.as_str(), query);
-        let body = self.ask_holders(user, context, range, request).await?;
+        let body = self
+            .ask_holders(user, context, (range, false), request)
+            .await?;
         let url_encoded = url_of(input);
         let mut part = VersionsPart::default();
         for entry in elements(&body, "Version") {

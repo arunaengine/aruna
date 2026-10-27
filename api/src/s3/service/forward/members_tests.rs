@@ -11,6 +11,7 @@ use s3s::{S3, S3Request};
 
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 
+use super::reads::STALE_HEADER;
 use crate::tests::members::{BUCKET, Members, members};
 
 /// A request the access hook admitted for `user` on `bucket`.
@@ -1194,4 +1195,70 @@ async fn uploads_need_caller() {
         .await
         .unwrap_err();
     assert_eq!(*error.code(), missing);
+}
+
+// While a range's coordinator is down, its copy answers reads and listings marked stale, and
+// a copy's miss says the key may exist; node 1 coordinates range [h, p), node 2 copies it.
+#[tokio::test]
+async fn copies_answer_stale() {
+    let mut members = members(3, &["h", "p"], 1).await;
+    put(&members, 0, "k/1", b"k/1").await;
+    copy_rows(&members, 1, 2).await;
+    members.nodes[1].stop().await;
+    let binding = members.nodes[2].bucket().await.distribution.unwrap();
+    let snapshot = members.nodes[2].service.snapshot(&binding).await.unwrap();
+    let range_id = snapshot.config.ranges[1].range_id;
+    let stale = format!("range={range_id}");
+    for on in [0, 2] {
+        let node = &members.nodes[on];
+        let input = s3s::dto::HeadObjectInput {
+            bucket: BUCKET.to_string(),
+            key: "k/1".to_string(),
+            ..Default::default()
+        };
+        let head = request(
+            input,
+            Method::HEAD,
+            members.user_on(on),
+            node.bucket().await,
+        );
+        let answer = node.service.head_object(head).await.unwrap();
+        assert_eq!(answer.output.content_length, Some(3));
+        assert_eq!(answer.headers.get(STALE_HEADER).unwrap(), stale.as_str());
+
+        let error = get_error(&members, on, "k/none").await;
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NoSuchKey);
+        assert!(
+            error
+                .message()
+                .is_some_and(|text| text.contains("may be behind"))
+        );
+        let headers = error.headers().unwrap();
+        assert_eq!(headers.get(STALE_HEADER).unwrap(), stale.as_str());
+
+        let input = s3s::dto::ListObjectsV2Input {
+            prefix: Some("k/".to_string()),
+            ..list_input(100)
+        };
+        let list = request(input, Method::GET, members.user_on(on), node.bucket().await);
+        let answer = node.service.list_objects_v2(list).await.unwrap();
+        let keys: Vec<String> = (answer.output.contents.unwrap_or_default().into_iter())
+            .filter_map(|object| object.key)
+            .collect();
+        assert_eq!(keys, ["k/1"]);
+        assert_eq!(answer.headers.get(STALE_HEADER).unwrap(), stale.as_str());
+    }
+    // A range whose coordinator answers is never marked.
+    put(&members, 0, "a/1", b"a/1").await;
+    let (keys, _, _) = page(
+        &members,
+        0,
+        s3s::dto::ListObjectsV2Input {
+            prefix: Some("a/".to_string()),
+            ..list_input(100)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(keys, ["a/1"]);
 }
