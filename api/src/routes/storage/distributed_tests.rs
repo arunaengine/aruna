@@ -6,8 +6,9 @@ use aruna_core::NodeId;
 use aruna_core::structs::storage::distribution::{DistributionError, DistributionRevision};
 use aruna_operations::distribution::index_feed::IndexProgress;
 use aruna_operations::distribution::status::{
-    DeletionStatus, LifecycleStatus, MemberStatus, RangeStatus, TransferStatus,
+    CopyStatus, DeletionStatus, LifecycleStatus, MemberStatus, RangeStatus, TransferStatus,
 };
+use aruna_operations::replication::members::CopyLag;
 
 use super::*;
 
@@ -124,6 +125,14 @@ fn degraded_names_coordinator() {
                 indexed: 3,
                 keys: 8,
             }),
+            copies: vec![CopyStatus {
+                member_id: Ulid::from_bytes([5; 16]),
+                bytes: true,
+                lag: CopyLag {
+                    pending: 2,
+                    oldest_ms: Some(0),
+                },
+            }],
         }],
         recommended_grant: "/r/g/9/data/*/spire/**".to_string(),
         lifecycle: LifecycleStatus {
@@ -141,6 +150,7 @@ fn degraded_names_coordinator() {
             fenced_ranges: vec![Ulid::from_bytes([3; 16])],
             publications_closed: false,
         },
+        copies_counted: true,
     };
     let response = status_response(status);
     assert!(response.configuration_changes_unavailable);
@@ -158,6 +168,11 @@ fn degraded_names_coordinator() {
     assert!(response.deletion.is_none());
     let index = response.ranges[0].search_index.as_ref().unwrap();
     assert_eq!((index.ready, index.indexed_keys, index.keys), (false, 3, 8));
+    let copy = &response.ranges[0].copies[0];
+    assert!(!copy.caught_up && copy.bytes);
+    assert_eq!(copy.pending_versions, 2);
+    assert!(copy.oldest_lag_ms.is_some_and(|lag| lag > 0));
+    assert!(response.copies_behind && response.copies_counted);
 }
 
 #[test]
@@ -187,6 +202,7 @@ fn deletion_names_phase() {
             fenced_ranges: Vec::new(),
             publications_closed: true,
         },
+        copies_counted: true,
     };
     let deletion = |committed, fenced: Vec<Ulid>, waiting: Vec<Ulid>| DeletionStatus {
         committed,
