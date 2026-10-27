@@ -369,7 +369,8 @@ impl FjallStorage {
                     );
                     return;
                 }
-                self.compactor.submit(key_space, deletes, keyspace);
+                self.compactor
+                    .submit(key_space, deletes, self.store.db.clone(), keyspace);
             }
             Err(error) => warn!(
                 event = "storage.keyspace.compact_failed",

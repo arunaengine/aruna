@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::tests_rebuild::{first_dropped, seal_journal};
 use super::{FjallPersistPolicy, FjallStorage, StorageHandle};
 use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
@@ -2593,4 +2594,36 @@ async fn aborted_usage_discarded() {
     abort_transaction(&handle, txn_id).await;
 
     assert_eq!(read_usage(&handle, None).await, None);
+}
+
+/// Compaction that empties a keyspace, or keeps only older rows, still lets Fjall delete a
+/// journal that another keyspace held meanwhile.
+#[tokio::test]
+async fn compaction_drops_journals() {
+    for keep in [false, true] {
+        let dir = tempdir().unwrap();
+        let (handle, _receivers) = StorageHandle::new();
+        let mut storage = worker(&dir, &handle);
+        let jobs = stub_compactor(&mut storage);
+        let db = storage.store.db.clone();
+        let open = |name| {
+            db.keyspace(name, fjall::KeyspaceCreateOptions::default)
+                .unwrap()
+        };
+        let drained = open("dht_meta_v2");
+        if keep {
+            drained.inner().insert("older", "row").unwrap();
+        }
+        for index in 0..crate::compaction::DELETE_THRESHOLD {
+            drained.inner().insert(index.to_string(), "row").unwrap();
+        }
+        storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
+        // An unflushed row holds the first journal while the compaction runs.
+        let pending = open("pending");
+        pending.inner().insert("pending", "row").unwrap();
+        seal_journal(&db);
+        (jobs.try_recv().expect("compaction is queued").run)().unwrap();
+        pending.inner().rotate_memtable_and_wait().unwrap();
+        first_dropped(dir.path()).await;
+    }
 }

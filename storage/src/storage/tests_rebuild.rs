@@ -409,7 +409,7 @@ async fn resume_reads_start() {
 }
 
 /// Fills the first journal past Fjall's 64 MB rotation with rows below its compression threshold.
-fn seal_journal(db: &OptimisticTxDatabase) {
+pub(super) fn seal_journal(db: &OptimisticTxDatabase) {
     let bulk = db.keyspace(SOURCE, KeyspaceCreateOptions::default).unwrap();
     for index in 0..17_000_u32 {
         bulk.inner()
@@ -421,7 +421,7 @@ fn seal_journal(db: &OptimisticTxDatabase) {
 }
 
 /// Waits until Fjall deletes the first journal in `dir`.
-async fn first_dropped(dir: &Path) {
+pub(super) async fn first_dropped(dir: &Path) {
     let cap = Instant::now() + Duration::from_secs(120);
     while dir.join("0.jnl").exists() {
         assert!(Instant::now() < cap, "the first journal is never deleted");
@@ -458,6 +458,31 @@ async fn restart_drops_journals() {
         open(SPACE).inner().insert("pending", "row").unwrap();
         seal_journal(&db);
         assert!(dir.path().join("1.jnl").exists());
+    }
+    let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    first_dropped(dir.path()).await;
+    handle.close().await;
+}
+
+/// A restart replays the rows of a keyspace that compaction left older than a sealed journal,
+/// so Fjall deletes that journal once they flush again.
+#[tokio::test]
+async fn restart_heals_compaction() {
+    let dir = tempdir().unwrap();
+    {
+        let db = OptimisticTxDatabase::builder(dir.path())
+            .manual_journal_persist(true)
+            .open()
+            .unwrap();
+        let open = |name| db.keyspace(name, KeyspaceCreateOptions::default).unwrap();
+        let drained = open("drained");
+        drained.inner().insert("older", "row").unwrap();
+        drained.inner().insert("newer", "row").unwrap();
+        drained.inner().remove("newer").unwrap();
+        open(SPACE).inner().insert("pending", "row").unwrap();
+        seal_journal(&db);
+        drained.inner().rotate_memtable_and_wait().unwrap();
+        drained.inner().major_compact().unwrap();
     }
     let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     first_dropped(dir.path()).await;

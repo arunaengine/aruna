@@ -9,11 +9,13 @@ use std::thread;
 use std::time::Instant;
 
 use aruna_core::telemetry::duration_ms;
-use fjall::OptimisticTxKeyspace;
+use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use tracing::{debug, warn};
 
 pub(crate) const DELETE_THRESHOLD: u64 = 5_000;
 pub(crate) const MAX_KEYSPACE_BYTES: u64 = 256 * 1024 * 1024;
+/// Key a checkpoint writes back unchanged, or removes while it is absent.
+const CHECKPOINT: &[u8] = b"\xffcheckpoint";
 
 pub(crate) struct CompactionJob {
     pub(crate) key_space: String,
@@ -71,7 +73,13 @@ impl Compactor {
         }
     }
 
-    pub(crate) fn submit(&self, key_space: &str, deletes: u64, keyspace: OptimisticTxKeyspace) {
+    pub(crate) fn submit(
+        &self,
+        key_space: &str,
+        deletes: u64,
+        db: OptimisticTxDatabase,
+        keyspace: OptimisticTxKeyspace,
+    ) {
         let Some(sender) = self.sender.as_ref() else {
             return;
         };
@@ -87,9 +95,10 @@ impl Compactor {
             key_space: key_space.to_string(),
             deletes,
             run: Box::new(move || {
-                let keyspace: &fjall::Keyspace = keyspace.as_ref();
-                keyspace.rotate_memtable_and_wait()?;
-                keyspace.major_compact()
+                let inner: &fjall::Keyspace = keyspace.as_ref();
+                inner.rotate_memtable_and_wait()?;
+                inner.major_compact()?;
+                checkpoint(&db, &keyspace)
             }),
         };
         if sender.send(job).is_err() {
@@ -117,6 +126,20 @@ impl Drop for Compactor {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Flushes a write newer than every journal holding `keyspace`. Compaction can drop its newest
+/// rows, and Fjall keeps those journals until the keyspace has a table that new again.
+fn checkpoint(db: &OptimisticTxDatabase, keyspace: &OptimisticTxKeyspace) -> fjall::Result<()> {
+    let mut tx = db.write_tx()?;
+    // The read turns a concurrent write of the key into a conflict, so no row ever changes.
+    match tx.get(keyspace, CHECKPOINT)? {
+        Some(value) => tx.insert(keyspace, CHECKPOINT, value),
+        None => tx.remove(keyspace, CHECKPOINT),
+    }
+    // After a conflict the other write is newer still, so the flush covers it as well.
+    tx.commit()?.ok();
+    keyspace.inner().rotate_memtable().map(drop)
 }
 
 pub(crate) fn compactable(disk_space: u64) -> bool {
