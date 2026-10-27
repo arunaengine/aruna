@@ -6,7 +6,8 @@
 use super::*;
 use crate::mcp::data::{WriteObjectInput, store_text};
 use crate::tests::distributed::{
-    BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api, write,
+    BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
+    replicate, write,
 };
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
@@ -164,6 +165,20 @@ async fn relays_to_holder() {
     hop.insert(RELAY_HOP_HEADER, "peer".parse().unwrap());
     let local = origin(&node, &node.owner, hop, BUCKET, "z.md", None).await;
     assert!(matches!(local, Err(ServerError::NotFound)));
+    assert_eq!(peer.paths.lock().unwrap().len(), 1);
+}
+
+// A copy that has not received the version yet asks the range's coordinator.
+#[tokio::test]
+async fn copy_miss_relays() {
+    let node = node_state().await;
+    replicate(&node.state, node.group_id, BUCKET).await;
+    let peer = mock_peer(StatusCode::OK, &answer()).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let relayed = origin(&node, &node.owner, HeaderMap::new(), BUCKET, "a.md", None)
+        .await
+        .unwrap();
+    assert_eq!(relayed.created_by, "peer-user");
     assert_eq!(peer.paths.lock().unwrap().len(), 1);
 }
 

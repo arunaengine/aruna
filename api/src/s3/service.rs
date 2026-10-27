@@ -1976,8 +1976,34 @@ impl S3 for ArunaS3Service {
             }
             _ => get_object_token(&self.state, input, restrictions, token).await,
         }
-        .map_err(IntoS3Error::into_s3_error)
-        .map_err(|error| forward::catch_up_miss(error, catching_up, bucket_info.as_ref()))?;
+        .map_err(IntoS3Error::into_s3_error);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let miss = self
+                    .copy_miss(&req.extensions, bucket_info.as_ref(), &response_key, &error)
+                    .await?;
+                let Some(coordinator) = miss else {
+                    return Err(forward::catch_up_miss(
+                        error,
+                        catching_up,
+                        bucket_info.as_ref(),
+                    ));
+                };
+                let request = forward::reads::read_request(
+                    http::Method::GET,
+                    "GetObject",
+                    &response_bucket,
+                    &response_key,
+                    req.uri.query(),
+                    &req.headers,
+                );
+                let response = self
+                    .forward_read(&user_access, &coordinator, request)
+                    .await?;
+                return Ok(forward::reads::forwarded_get(response));
+            }
+        };
         self.record_touch(
             &user_access.access_key,
             &response_bucket,
@@ -2205,10 +2231,34 @@ impl S3 for ArunaS3Service {
             version_id,
         });
 
-        let result = drive(operation, &self.state)
-            .await
-            .map_err(IntoS3Error::into_s3_error)
-            .map_err(|error| forward::catch_up_miss(error, catching_up, bucket_info.as_ref()))?;
+        let result = match drive(operation, &self.state).await {
+            Ok(result) => result,
+            Err(error) => {
+                let error = error.into_s3_error();
+                let miss = self
+                    .copy_miss(&req.extensions, bucket_info.as_ref(), &key, &error)
+                    .await?;
+                let Some(coordinator) = miss else {
+                    return Err(forward::catch_up_miss(
+                        error,
+                        catching_up,
+                        bucket_info.as_ref(),
+                    ));
+                };
+                let request = forward::reads::read_request(
+                    http::Method::HEAD,
+                    "HeadObject",
+                    &bucket,
+                    &key,
+                    req.uri.query(),
+                    &req.headers,
+                );
+                let response = self
+                    .forward_read(&user_access, &coordinator, request)
+                    .await?;
+                return Ok(forward::reads::forwarded_head(&response));
+            }
+        };
 
         // A reference answers from its source observation without opening a source read.
         let remote_info = if result.location.is_none() && result.source_metadata.is_none() {

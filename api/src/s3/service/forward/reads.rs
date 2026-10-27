@@ -20,7 +20,7 @@ use s3s::dto::{
     ChecksumType, ETag, GetObjectOutput, HeadObjectOutput, StreamingBlob, Timestamp,
     TimestampFormat,
 };
-use s3s::{S3Error, S3Response, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 
 use super::{Forward, ForwardBody, ForwardRequest, header, passed_headers, passed_query};
 use crate::s3::auth::DelegatedRequest;
@@ -193,6 +193,38 @@ impl ArunaS3Service {
             node_id,
         };
         Ok(Some((holder, coordinator)))
+    }
+
+    /// The coordinator a local miss goes on to when this member only keeps a copy of the
+    /// key's range, since the copy may lag behind it. A delegated read is never sent on.
+    pub(in crate::s3::service) async fn copy_miss(
+        &self,
+        extensions: &http::Extensions,
+        bucket: Option<&BucketInfo>,
+        key: &str,
+        error: &S3Error,
+    ) -> S3Result<Option<Forward>> {
+        let missing = matches!(
+            error.code(),
+            S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion
+        );
+        let binding = bucket.and_then(|bucket| bucket.distribution.as_ref());
+        let Some(binding) = binding.filter(|_| missing) else {
+            return Ok(None);
+        };
+        if extensions.get::<DelegatedRequest>().is_some() {
+            return Ok(None);
+        }
+        let snapshot = self.snapshot(binding).await?;
+        let range = snapshot.range_for(key);
+        let Some(range) = range.filter(|range| range.coordinator != binding.member_id) else {
+            return Ok(None);
+        };
+        Ok(snapshot.member(range.coordinator).map(|member| Forward {
+            set_id: binding.set_id,
+            range_id: range.range_id,
+            node_id: member.node_id,
+        }))
     }
 
     /// Sends a GET or HEAD to the chosen holder; a replica's miss goes on to the coordinator.

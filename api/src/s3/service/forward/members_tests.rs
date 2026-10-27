@@ -740,6 +740,38 @@ async fn copies_defer_listing() {
     }
 }
 
+// A miss on a copy that has not received the key yet goes on to the range's coordinator.
+#[tokio::test]
+async fn copy_miss_forwards() {
+    let members = members(3, &["h", "p"], 1).await;
+    for key in SPREAD {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    for on in 0..3 {
+        let node = &members.nodes[on];
+        for key in SPREAD {
+            assert_eq!(read(&members, on, key).await.0, key.as_bytes());
+            let input = s3s::dto::HeadObjectInput {
+                bucket: BUCKET.to_string(),
+                key: key.to_string(),
+                ..Default::default()
+            };
+            let head = request(
+                input,
+                Method::HEAD,
+                members.user_on(on),
+                node.bucket().await,
+            );
+            let output = node.service.head_object(head).await.unwrap().output;
+            assert_eq!(output.content_length, Some(key.len() as i64));
+        }
+    }
+    assert_eq!(
+        *get_error(&members, 0, "q/none").await.code(),
+        s3s::S3ErrorCode::NoSuchKey
+    );
+}
+
 // Versions list across ranges newest first per key, delete markers included, and the
 // markers of a short page resume the next one.
 #[tokio::test]
