@@ -19,10 +19,10 @@ use aruna_core::structs::storage::usage::{
     BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
     SUMMARY_GROUP_PREFIX, USAGE_COMPLETE_KEY, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX,
     USAGE_GROUP_PREFIX, USAGE_REBUILD_KEY, UsageCounterError, UsageCounters, UsageDelta,
-    dirty_group_id, dirty_group_key, dirty_share_key, global_group_key, global_shard_key,
-    global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key, usage_bucket_key,
-    usage_global_key, usage_group_id, usage_group_key, usage_group_prefix, usage_node_id,
-    usage_snapshot_key, usage_summary_key,
+    dirty_group_id, dirty_group_key, dirty_share_id, dirty_share_key, global_group_key,
+    global_shard_key, global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key,
+    usage_bucket_key, usage_global_key, usage_group_id, usage_group_key, usage_group_prefix,
+    usage_node_id, usage_snapshot_key, usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -1024,6 +1024,9 @@ async fn publish_retaining_markers(
         if key.as_ref() == DIRTY_GLOBAL_KEY {
             global = true;
         } else if let Some(group_id) = dirty_group_id(key.as_ref()) {
+            groups.insert(group_id);
+        } else if let Some(group_id) = dirty_share_id(key.as_ref()) {
+            // A share marker the scan saw without its group's marker still needs a publish.
             groups.insert(group_id);
         }
     }
@@ -2813,6 +2816,31 @@ mod tests {
             read_node_stat(&ctx, dirty_group_key(group_id))
                 .await
                 .is_some()
+        );
+    }
+
+    // A paged marker scan can pass a group's marker before it is written and then see the
+    // group's share marker: the group is published in that run, so clearing the marker is safe.
+    #[tokio::test]
+    async fn share_marker_publishes() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let group_id = Ulid::from_bytes([5; 16]);
+        write_counters(&ctx, usage_group_key(group_id), logical(7)).await;
+        write_node_stat(&ctx, dirty_share_key(group_id), vec![1]).await;
+
+        let published = publish_usage_snapshots(&ctx, node(1), RealmId([4; 32]), false)
+            .await
+            .unwrap();
+
+        assert_eq!(published.groups, vec![group_id]);
+        let snapshot = read_node_stat(&ctx, usage_snapshot_key(group_id, node(1))).await;
+        let snapshot = NodeUsageSnapshot::from_bytes(&snapshot.unwrap()).unwrap();
+        assert_eq!(snapshot.counters.logical_bytes, 7);
+        assert!(
+            read_node_stat(&ctx, dirty_share_key(group_id))
+                .await
+                .is_none()
         );
     }
 

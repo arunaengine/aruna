@@ -153,6 +153,12 @@ pub fn dirty_share_key(group_id: GroupId) -> Vec<u8> {
     [DIRTY_SHARE_PREFIX, &group_id.to_bytes()].concat()
 }
 
+/// Recovers the group id from a `dirty/share/<ulid>` marker key.
+pub fn dirty_share_id(key: &[u8]) -> Option<GroupId> {
+    let tail = key.strip_prefix(DIRTY_SHARE_PREFIX)?;
+    Some(GroupId::from_bytes(tail.try_into().ok()?))
+}
+
 /// Recovers the group id from a `dirty/group/<ulid>` marker key.
 pub fn dirty_group_id(key: &[u8]) -> Option<GroupId> {
     let tail = key.strip_prefix(DIRTY_GROUP_PREFIX)?;
