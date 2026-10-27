@@ -301,7 +301,7 @@ impl ArunaS3Service {
                 headers: Vec::new(),
                 body: ForwardBody::Empty,
             };
-            let answer = match self.forward_write(user, &forward, request).await {
+            let answer = match self.forward_read(user, &forward, request).await {
                 Ok(response) => answer_text(response).await,
                 Err(error) => Err(error),
             };
