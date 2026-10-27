@@ -1262,3 +1262,42 @@ async fn copies_answer_stale() {
     .unwrap();
     assert_eq!(keys, ["a/1"]);
 }
+
+// A current read delegated to a member that does not coordinate the key's range is refused,
+// unless the sender asked it as a copy; node 1 coordinates range [h, p), node 2 copies it.
+#[tokio::test]
+async fn copy_read_marked() {
+    use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
+    let members = members(3, &["h", "p"], 1).await;
+    put(&members, 0, "k/1", b"k/1").await;
+    copy_rows(&members, 1, 2).await;
+    let binding = members.nodes[0].bucket().await.distribution.unwrap();
+    let snapshot = members.nodes[0].service.snapshot(&binding).await.unwrap();
+    let copy = super::Forward {
+        set_id: binding.set_id,
+        range_id: snapshot.config.ranges[1].range_id,
+        node_id: members.nodes[2].node_id(),
+    };
+    let read = || {
+        super::reads::read_request(
+            Method::GET,
+            "GetObject",
+            BUCKET,
+            "k/1",
+            None,
+            &HeaderMap::new(),
+        )
+    };
+    let service = &members.nodes[0].service;
+    let error = service
+        .forward_read(&members.user_on(0), &copy, read())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "WrongCoordinator");
+    let mut marked = read();
+    (marked.headers).push((COPY_READ_HEADER.to_string(), "1".to_string()));
+    let answer = service
+        .forward_read(&members.user_on(0), &copy, marked)
+        .await;
+    assert_eq!(answer.unwrap().bytes().await.unwrap().as_ref(), b"k/1");
+}

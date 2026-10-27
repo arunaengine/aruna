@@ -163,7 +163,7 @@ async fn relays_to_holder() {
     assert!(paths[0].starts_with("/api/v1/data/buckets/routed/objects/origin?key=z.md"));
     assert!(paths[0].contains("version_id="));
 
-    // A relayed call is never relayed again: this node holds no such key.
+    // A relayed call is never relayed again: a current read outside this node's ranges fails.
     let mut hop = HeaderMap::new();
     hop.insert(RELAY_HOP_HEADER, "peer".parse().unwrap());
     // Without the set it meant, the bucket of this name may be another one.
@@ -175,7 +175,10 @@ async fn relays_to_holder() {
     assert!(matches!(stranger, Err(ServerError::Conflict(_))));
     hop.insert(RELAY_SET_HEADER, set_id.to_string().parse().unwrap());
     let local = origin(&node, &node.owner, hop, BUCKET, "z.md", None).await;
-    assert!(matches!(local, Err(ServerError::NotFound)));
+    assert!(matches!(
+        local,
+        Err(ServerError::ServiceUnavailableReason(_))
+    ));
     assert_eq!(peer.paths.lock().unwrap().len(), 1);
 }
 
@@ -227,6 +230,26 @@ async fn down_coordinator_copy() {
     };
     assert_eq!((status, code), (StatusCode::NOT_FOUND, "stale_not_found"));
     assert!(message.contains(&range_id));
+}
+
+// A copy refuses a relayed read of the current version unless it was asked as a copy.
+#[tokio::test]
+async fn relayed_copy_read() {
+    let node = node_state().await;
+    store(&node, "a.md").await;
+    let snapshot = replicate(&node.state, node.group_id, BUCKET).await;
+    let mut hop = HeaderMap::new();
+    hop.insert(RELAY_HOP_HEADER, "peer".parse().unwrap());
+    let set_id = snapshot.set_id().to_string();
+    hop.insert(RELAY_SET_HEADER, set_id.parse().unwrap());
+    let refused = origin(&node, &node.owner, hop.clone(), BUCKET, "a.md", None).await;
+    assert!(matches!(
+        refused,
+        Err(ServerError::ServiceUnavailableReason(_))
+    ));
+    hop.insert(COPY_READ_HEADER, "1".parse().unwrap());
+    let answer = origin(&node, &node.owner, hop, BUCKET, "a.md", None).await;
+    assert!(answer.is_ok());
 }
 
 #[tokio::test]

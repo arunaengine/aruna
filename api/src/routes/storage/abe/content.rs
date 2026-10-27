@@ -61,19 +61,19 @@ pub async fn content(
     let auth = crate::auth::require_realm_auth(&state, auth)?;
     let (version, info) = authorize_version(&state, &auth, &query).await?;
     let private = object.0.map_err(|_| ServerError::BadRequest)?;
+    let mut sent = HeaderMap::new();
+    if let Some(range) = headers.get(header::RANGE) {
+        sent.insert(header::RANGE, range.clone());
+    }
+    if let Some(private) = &private {
+        let encoded = zeroize::Zeroizing::new(STANDARD.encode(private.bytes().expose()));
+        let mut value =
+            http::HeaderValue::from_str(&encoded).map_err(|_| ServerError::BadRequest)?;
+        value.set_sensitive(true);
+        sent.insert("x-aruna-object-key", value);
+    }
+    let path = version_path("/data/blobs/content", &query);
     if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
-        let mut sent = HeaderMap::new();
-        if let Some(range) = headers.get(header::RANGE) {
-            sent.insert(header::RANGE, range.clone());
-        }
-        if let Some(private) = &private {
-            let encoded = zeroize::Zeroizing::new(STANDARD.encode(private.bytes().expose()));
-            let mut value =
-                http::HeaderValue::from_str(&encoded).map_err(|_| ServerError::BadRequest)?;
-            value.set_sensitive(true);
-            sent.insert("x-aruna-object-key", value);
-        }
-        let path = version_path("/data/blobs/content", &query);
         return relay_stream(&state, &holders, &path, bearer.as_ref(), sent).await;
     }
     let keyed = private.is_some();
@@ -116,8 +116,14 @@ pub async fn content(
             read_envelope(&state, &query, version).await?;
             return Err(abe_error(AbeError::Required));
         }
-        result => result.map_err(read_error)?,
+        result => result.map_err(read_error),
     };
+    if matches!(result, Err(ServerError::NotFound))
+        && let Some(coordinator) = copy_miss(&state, &info, &query.key, &headers).await?
+    {
+        return relay_stream(&state, &coordinator, &path, bearer.as_ref(), sent).await;
+    }
+    let result = result?;
     let mut response = Response::new(download::body(result.blob, permit));
     let (status, length) = match result.resolved_range {
         Some(range) => {

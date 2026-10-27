@@ -10,10 +10,13 @@ use aruna_core::structs::execution::source_access::{DigestOrigin, DigestScope};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::distribution::ReadRoute;
+use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, VersionOrigin,
 };
-use aruna_operations::distribution::guard::{copy_readers, read_coordinator, route_read};
+use aruna_operations::distribution::guard::{
+    GuardError, copy_readers, read_coordinator, route_read,
+};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
 use aruna_operations::s3::object::origin::{OriginError, OriginView, read_origin};
@@ -286,7 +289,8 @@ pub async fn get_origin(
                 Ok(None) => None,
                 Ok(Some((range_id, node_id))) => {
                     let target = (binding.set_id, range_id, node_id);
-                    Some(relay_origin(&state, target, vec![node_id], &path, bearer.clone()).await)
+                    let path = (path.as_str(), HeaderMap::new());
+                    Some(relay_origin(&state, target, vec![node_id], path, bearer.clone()).await)
                 }
                 Err(error) => Some(Err(error)),
             };
@@ -313,14 +317,23 @@ pub async fn get_origin(
             holders.retain(|holder| *holder != state.get_node_id());
             holders.push(node_id);
             let target = (binding.set_id, range_id, node_id);
-            return relay_origin(
-                &state,
-                target,
-                holders,
-                &origin_path(&bucket, &params),
-                bearer,
-            )
-            .await;
+            let path = origin_path(&bucket, &params);
+            return relay_origin(&state, target, holders, (&path, HeaderMap::new()), bearer).await;
+        }
+    }
+    // A relayed current read sent here as coordinator is refused once this node is none.
+    if let Some(binding) = info.distribution.as_ref()
+        && params.version_id.is_none()
+        && headers.contains_key(RELAY_HOP_HEADER)
+        && !headers.contains_key(COPY_READ_HEADER)
+    {
+        let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
+        if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
+            return Err(map_guard_error(GuardError::NotCoordinator {
+                set_id: binding.set_id,
+                range_id,
+                node_id,
+            }));
         }
     }
     let view = read_origin(
@@ -343,7 +356,14 @@ pub async fn get_origin(
             let path = origin_path(&bucket, &params);
             let target = (binding.set_id, range_id, node_id);
             // While the coordinator cannot answer, this copy's miss stands, marked.
-            return match relay_origin(&state, target, vec![node_id], &path, bearer).await {
+            let asked = relay_origin(
+                &state,
+                target,
+                vec![node_id],
+                (&path, HeaderMap::new()),
+                bearer,
+            );
+            return match asked.await {
                 Err(error) if error.status_code().is_server_error() => Err(stale_miss(range_id)),
                 answer => answer,
             };
@@ -374,7 +394,10 @@ async fn copy_origin(
              {set_id} answered"
         )));
     };
-    match relay_origin(state, (set_id, range_id, last), copies, path, bearer).await {
+    let mut sent = HeaderMap::new();
+    sent.insert(COPY_READ_HEADER, http::HeaderValue::from_static("1"));
+    let target = (set_id, range_id, last);
+    match relay_origin(state, target, copies, (path, sent), bearer).await {
         Ok(Json(mut answer)) => {
             answer.stale_ranges = vec![range_id.to_string()];
             Ok(Json(answer))
@@ -389,7 +412,7 @@ async fn relay_origin(
     state: &ServerState,
     (set_id, range_id, coordinator): (Ulid, Ulid, aruna_core::NodeId),
     holders: Vec<aruna_core::NodeId>,
-    path: &str,
+    (path, sent): (&str, HeaderMap),
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Json<OriginResponse>> {
     for node_id in holders {
@@ -398,7 +421,7 @@ async fn relay_origin(
             range_id,
             node_id,
         };
-        match relay_get(state, &forward, path, bearer.as_ref()).await {
+        match relay_get(state, &forward, path, bearer.as_ref(), sent.clone()).await {
             Ok(Some(answer)) => return Ok(Json(answer)),
             Err(ServerError::NotFound) if node_id != coordinator => {}
             Ok(None) => {}

@@ -113,7 +113,7 @@ pub async fn balance_set(
     let capacity = crate::effect_adapters::routing::node_routing(context)
         .catalog
         .capacity();
-    match crate::node::usage_stats::read_local_global(&context.storage_handle).await {
+    match crate::node::usage_stats::read_local_global(&context.storage_handle, None).await {
         Ok(usage) => match permille(usage.stored_bytes, capacity) {
             Some(own) => fill.insert(local, own),
             None => return,

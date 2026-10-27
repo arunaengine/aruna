@@ -256,7 +256,7 @@ async fn remote_part(
             range_id: range.range_id,
             node_id,
         };
-        if let Some(page) = relay_get(state, &forward, &path, bearer).await? {
+        if let Some(page) = relay_get(state, &forward, &path, bearer, HeaderMap::new()).await? {
             return Ok(page);
         }
     }

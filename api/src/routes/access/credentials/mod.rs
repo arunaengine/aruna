@@ -703,12 +703,24 @@ fn normalize_auth_restrictions(
         return Ok(None);
     };
 
+    // Any-node allows reach other nodes, so denies there are kept up to the group data root.
+    let data_root = match group_root.split('/').collect::<Vec<_>>().as_slice() {
+        ["", _, "g", _, "data", _] => group_root
+            .rsplit_once('/')
+            .map_or(group_root, |(root, _)| root),
+        _ => group_root,
+    };
     let mut normalized = Vec::new();
     for restriction in restrictions {
+        let root = if restriction.permission == Permission::DENY {
+            data_root
+        } else {
+            group_root
+        };
         if let Some(restriction) =
             parse_normalized_restriction(&restriction.pattern, restriction.permission.clone(), node)
         {
-            if let Some(scope) = restriction.scope.intersect_group_root(group_root) {
+            if let Some(scope) = restriction.scope.intersect_group_root(root) {
                 normalized.push(NormalizedRestriction {
                     scope,
                     permission: restriction.permission,
@@ -717,7 +729,7 @@ fn normalize_auth_restrictions(
             continue;
         }
 
-        if pattern_reaches_group(&restriction.pattern, group_root) {
+        if pattern_reaches_group(&restriction.pattern, root) {
             return Err(ServerError::Forbidden);
         }
     }
