@@ -570,6 +570,39 @@ fn broad_scope_narrowed() {
 }
 
 #[test]
+fn remote_denies_kept() {
+    let auth = test_auth_context(Some(vec![
+        PathRestriction {
+            pattern: "/realm/g/group/data/*/**".to_string(),
+            permission: Permission::WRITE,
+        },
+        PathRestriction {
+            pattern: "/realm/g/group/data/other/secret/**".to_string(),
+            permission: Permission::DENY,
+        },
+        PathRestriction {
+            pattern: "/realm/g/group/data/**".to_string(),
+            permission: Permission::DENY,
+        },
+    ]));
+
+    let normalized =
+        normalize_auth_restrictions(&auth, "/realm/g/group/data/node", "node").unwrap();
+    let patterns = serialize_restrictions(&normalized.unwrap())
+        .into_iter()
+        .map(|restriction| restriction.pattern)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        patterns,
+        [
+            "/realm/g/group/data/*/**",
+            "/realm/g/group/data/other/secret/**",
+            "/realm/g/group/data/**",
+        ]
+    );
+}
+
+#[test]
 fn auth_wildcards_rejected() {
     let auth = test_auth_context(Some(vec![PathRestriction {
         pattern: "/realm/g/group/**/node".to_string(),
