@@ -6,7 +6,7 @@
 use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
-use crate::routes::storage::relay::{query_path, read_holders, relay_read};
+use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
@@ -1173,9 +1173,9 @@ pub async fn get_object_placement(
         aruna_core::structs::identity::auth::Permission::READ,
     )
     .await?;
+    let route = format!("/data/buckets/{bucket}/placement/objects");
+    let path = query_path(&route, &[("key", &query.key)]);
     if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
-        let route = format!("/data/buckets/{bucket}/placement/objects");
-        let path = query_path(&route, &[("key", &query.key)]);
         return relay_read(&state, &holders, &path, bearer.as_ref())
             .await
             .map(Json);
@@ -1191,7 +1191,15 @@ pub async fn get_object_placement(
     .map_err(|error| match error {
         ObjectPlacementError::NoSuchKey => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
-    })?;
+    });
+    if matches!(placement, Err(ServerError::NotFound))
+        && let Some(coordinator) = copy_miss(&state, &info, &query.key, &headers).await?
+    {
+        return relay_read(&state, &coordinator, &path, bearer.as_ref())
+            .await
+            .map(Json);
+    }
+    let placement = placement?;
     let policies = named_refs(&state, auth.realm_id, placement.policies).await?;
     Ok(Json(ObjectPlacementView {
         bucket,
