@@ -1510,6 +1510,11 @@ async fn dirty_bound_groups(ctx: &DriverContext) -> Result<(), String> {
     if groups.is_empty() {
         return Ok(());
     }
+    mark_dirty(ctx, groups).await
+}
+
+/// Rows marking `groups` and the global for the next publish, for a caller's transaction.
+pub(crate) fn dirty_rows(groups: impl IntoIterator<Item = GroupId>) -> Vec<(String, Key, Value)> {
     let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
     let marker = |key: Vec<u8>| {
         (
@@ -1518,14 +1523,29 @@ async fn dirty_bound_groups(ctx: &DriverContext) -> Result<(), String> {
             generation.clone(),
         )
     };
-    let mut writes = vec![marker(DIRTY_GLOBAL_KEY.to_vec())];
-    writes.extend(
+    let mut rows = vec![marker(DIRTY_GLOBAL_KEY.to_vec())];
+    rows.extend(
         groups
             .into_iter()
-            .map(|group_id| marker(dirty_group_key(group_id))),
+            .map(|group| marker(dirty_group_key(group))),
     );
+    rows
+}
+
+/// Schedules the publish that consumes committed dirty markers.
+pub(crate) async fn wake_publish(ctx: &DriverContext) {
+    if let Some(task_handle) = ctx.task_handle.as_ref() {
+        task_handle.send_effect(schedule_snapshot_publish()).await;
+    }
+}
+
+/// Marks `groups` and the global for the next publish and schedules it.
+pub(crate) async fn mark_dirty(
+    ctx: &DriverContext,
+    groups: impl IntoIterator<Item = GroupId>,
+) -> Result<(), String> {
     let write = StorageEffect::BatchWrite {
-        writes,
+        writes: dirty_rows(groups),
         txn_id: None,
     };
     match ctx.storage_handle.send_storage_effect(write).await {
@@ -1533,9 +1553,7 @@ async fn dirty_bound_groups(ctx: &DriverContext) -> Result<(), String> {
         Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
         other => return Err(format!("dirty marker write failed: {other:?}")),
     }
-    if let Some(task_handle) = ctx.task_handle.as_ref() {
-        task_handle.send_effect(schedule_snapshot_publish()).await;
-    }
+    wake_publish(ctx).await;
     Ok(())
 }
 
