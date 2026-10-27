@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, pinned_route, pinned_targets,
-    relay_route, relay_targets, relay_url, relayed_headers,
+    API_PREFIX, RELAYED_ROUTES, gateway_failed, may_try_next, may_try_response, pinned_route,
+    pinned_targets, relay_route, relay_targets, relay_url, relayed_headers,
 };
 use crate::error::{ErrorResponse, ServerError};
 use axum::body::to_bytes;
@@ -222,6 +222,10 @@ async fn post_failure_stops() {
     // A failure after the connect succeeded may already have minted a secret.
     assert!(!may_try_next(&Method::POST, false));
     assert!(!may_try_next(&Method::DELETE, false));
+    assert!(!gateway_failed(
+        &Method::POST,
+        StatusCode::SERVICE_UNAVAILABLE
+    ));
 
     let response = ServerError::RelayFailed.into_response();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
