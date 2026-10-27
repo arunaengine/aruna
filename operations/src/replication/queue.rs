@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -42,8 +42,8 @@ use ulid::Ulid;
 
 use super::bootstrap::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
 use super::members::{MemberTarget, bound_record, member_jobs, member_publication};
-use super::page::PAGE_RECORDS;
 use super::page::deliver::{MetadataSender, PageSender, deliver_pages, pageable};
+use super::page::{PAGE_BYTES, PAGE_RECORDS};
 use super::parking::{PARKED_DUE, park_job};
 use super::plaintext::{consent_delete, consent_write, job_consent, plaintext_allowed};
 use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
@@ -2047,8 +2047,9 @@ async fn process_live_obligations(
     Ok(result)
 }
 
-/// Queues `jobs` and deletes each obligation whose continuation is still the one read, with
-/// the obligation cursor moved from `cursor.0` to `cursor.1`, in one transaction.
+/// Queues `jobs` and deletes the obligations, a continued one only while it still holds the
+/// continuation read, with the obligation cursor moved from `cursor.0` to `cursor.1`, in one
+/// transaction.
 async fn retire_obligations(
     storage: &StorageHandle,
     obligations: Vec<(Vec<u8>, Option<LiveReplicationContinuation>)>,
@@ -2062,6 +2063,11 @@ async fn retire_obligations(
         return Ok(());
     }
     let unexpected = |other: Event| BlobQueueError::UnexpectedEvent(format!("{other:?}"));
+    // One drain at a time creates or parks member jobs, so this read needs no transaction.
+    let existing = read_existing_jobs(storage, &jobs).await?;
+    // Only a drain sets continuations; any other rewrite owes just the jobs queued here.
+    let (fresh, obligations): (Vec<_>, Vec<_>) =
+        (obligations.into_iter()).partition(|(_, expected)| expected.is_none());
     let txn_id = match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -2070,20 +2076,17 @@ async fn retire_obligations(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => return Err(unexpected(other)),
     };
-    let mut reads: Vec<_> = (obligations.iter())
+    let reads: Vec<_> = (obligations.iter())
         .map(|(key, _)| {
             let key = ByteView::from(key.clone());
             (REPLICATION_OBLIGATION_KEYSPACE.to_string(), key)
         })
         .collect();
-    for job in &jobs {
-        reads.push((REPLICATION_JOB_KEYSPACE.to_string(), blob_job_key(job)?));
-    }
     let read = StorageEffect::BatchRead {
         reads,
         txn_id: Some(txn_id),
     };
-    let mut values = match storage.send_storage_effect(read).await {
+    let values = match storage.send_storage_effect(read).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         other => {
             abort_cursor(storage, txn_id).await;
@@ -2093,9 +2096,8 @@ async fn retire_obligations(
             });
         }
     };
-    let existing = values.split_off(obligations.len().min(values.len()));
     let mut writes = Vec::with_capacity(jobs.len() + 1);
-    for (job, (_, value)) in jobs.iter().zip(existing) {
+    for (job, value) in jobs.iter().zip(existing) {
         let kept = value
             .as_deref()
             .and_then(|value| BlobJobRecord::from_bytes(value).ok())
@@ -2128,7 +2130,9 @@ async fn retire_obligations(
                     Err(_) => expected.is_none(),
                 })
         })
-        .map(|((key, _), _)| (REPLICATION_OBLIGATION_KEYSPACE.to_string(), key.into()))
+        .map(|((key, _), _)| key)
+        .chain(fresh.into_iter().map(|(key, _)| key))
+        .map(|key| (REPLICATION_OBLIGATION_KEYSPACE.to_string(), key.into()))
         .collect();
     let delete = StorageEffect::BatchDelete {
         deletes,
@@ -2151,6 +2155,58 @@ async fn retire_obligations(
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(unexpected(other)),
+    }
+}
+
+/// The stored row of each job, from one range read while the range holds no other rows, as
+/// lookups key by key cost far more than a range in these churned keyspaces.
+async fn read_existing_jobs(
+    storage: &StorageHandle,
+    jobs: &[BlobJobRecord],
+) -> Result<Vec<Option<ByteView>>, BlobQueueError> {
+    let keys = jobs
+        .iter()
+        .map(blob_job_key)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (Some(first), Some(last)) = (keys.iter().min(), keys.iter().max()) else {
+        return Ok(Vec::new());
+    };
+    let range = StorageEffect::IterRange {
+        key_space: REPLICATION_JOB_KEYSPACE.to_string(),
+        start: IterStart::At(first.clone()),
+        end: IterEnd::Through(last.clone()),
+        limit: keys.len(),
+        max_bytes: PAGE_BYTES,
+        txn_id: None,
+    };
+    match storage.send_storage_effect(range).await {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }) => {
+            let rows: HashMap<_, _> = values.into_iter().collect();
+            return Ok(keys.iter().map(|key| rows.get(key).cloned()).collect());
+        }
+        // A range holding more rows than `jobs` is read key by key.
+        Event::Storage(StorageEvent::IterResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+    }
+    let reads = (keys.into_iter())
+        .map(|key| (REPLICATION_JOB_KEYSPACE.to_string(), key))
+        .collect();
+    match storage
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            Ok(values.into_iter().map(|(_, value)| value).collect())
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
 }
 
@@ -5138,6 +5194,88 @@ mod tests {
             Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty()
         ));
         assert!(read_jobs(&storage).await.is_empty());
+    }
+
+    // Retiring keeps a stored job that is retrying, whether its range holds only the queued jobs
+    // or other jobs too, and keeps an obligation whose continuation changed since it was read.
+    #[tokio::test]
+    async fn retire_keeps_retries() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let job = |key: &str, attempts: u32| {
+            let target = ReplicateScopeTarget::Object {
+                key: key.to_string(),
+            };
+            let input = ReplicateScopeInput {
+                target,
+                ..on_demand_input()
+            };
+            let mut job = BlobJobRecord::new(input, None, 5);
+            job.attempts = attempts;
+            job
+        };
+        let obligation = |key: &str| {
+            LiveObligationRecord::new(
+                node(1),
+                auth_context(),
+                "bucket".to_string(),
+                key.to_string(),
+                Ulid::from_parts(1, 1),
+                false,
+            )
+        };
+        let mut continued = obligation("continued");
+        continued.continuation = Some(LiveReplicationContinuation {
+            relationships_complete: true,
+            ..Default::default()
+        });
+        for record in [obligation("fresh"), continued.clone()] {
+            super::write_live_obligation(&storage, &record)
+                .await
+                .unwrap();
+        }
+        write_blob_job(&storage, &job("a", 3)).await.unwrap();
+        let retired = vec![
+            (
+                live_obligation_key(&obligation("fresh")).unwrap().to_vec(),
+                None,
+            ),
+            (
+                live_obligation_key(&continued).unwrap().to_vec(),
+                Some(LiveReplicationContinuation::default()),
+            ),
+        ];
+        let queued = || vec![job("a", 0), job("c", 0)];
+        retire_obligations(&storage, retired, queued(), (None, None))
+            .await
+            .unwrap();
+        write_blob_job(&storage, &job("b", 0)).await.unwrap();
+        write_blob_job(&storage, &job("c", 2)).await.unwrap();
+        retire_obligations(&storage, Vec::new(), queued(), (None, None))
+            .await
+            .unwrap();
+
+        let attempts: Vec<_> = (read_jobs(&storage).await.into_iter())
+            .map(|(_, job)| job.attempts)
+            .collect();
+        assert_eq!(attempts, [3, 0, 2], "retrying jobs a and c are kept");
+        let remaining = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 8,
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = remaining else {
+            panic!("obligations are readable");
+        };
+        let kept: Vec<_> = (values.iter())
+            .map(|(_, value)| LiveObligationRecord::from_bytes(value).unwrap().key)
+            .collect();
+        assert_eq!(kept, ["continued"], "only the changed obligation stays");
     }
 
     #[tokio::test]
