@@ -3,10 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Pure: the walker reads each hop with the caller's credential and feeds the answers here.
-// A hop the caller may not read is named by its global id or the digest that referred to it.
+// The walker reads each hop with the caller's credential and feeds the answers here. A hop the
+// caller may not read is named by its global id or the digest that referred to it. The working
+// state is kept on disk, so an export holds no more in memory than the record it reads.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::io::Write;
+
+use self::spool::{Spool, SpoolResult};
 
 use aruna_core::structs::storage::data::identity::text_values;
 use aruna_core::structs::storage::replication::W3idIdentifier;
@@ -44,10 +48,8 @@ pub struct CrateFile {
 
 #[derive(Debug)]
 pub struct ProvenanceCrate {
-    entities: BTreeMap<String, Map<String, Value>>,
-    /// The entity each asked id became, so a repeated id links without a second read.
-    labels: BTreeMap<String, String>,
-    parts: BTreeSet<String>,
+    /// The entities, the id each asked id became, the root's parts and the links to read.
+    spool: Spool,
     start: String,
     published: String,
     hidden: usize,
@@ -56,16 +58,28 @@ pub struct ProvenanceCrate {
 
 impl ProvenanceCrate {
     /// A crate about `start`, published at `published` (an ISO 8601 date-time).
-    pub fn new(start: &str, published: &str) -> Self {
-        Self {
-            entities: BTreeMap::new(),
-            labels: BTreeMap::new(),
-            parts: BTreeSet::new(),
+    pub fn new(start: &str, published: &str) -> Result<Self, fjall::Error> {
+        Ok(Self {
+            spool: Spool::open()?,
             start: start.to_string(),
             published: published.to_string(),
             hidden: 0,
             stopped: None,
+        })
+    }
+
+    /// Queues links to read after every one queued before.
+    pub fn push(&mut self, hops: impl IntoIterator<Item = Hop>) {
+        for hop in hops {
+            let pushed = self.spool.push(&hop);
+            self.keep(pushed);
         }
+    }
+
+    /// The next link to read, if any.
+    pub fn pop(&mut self) -> Option<Hop> {
+        let popped = self.spool.pop();
+        self.keep(popped).flatten()
     }
 
     /// The first hop of a version start.
@@ -81,7 +95,7 @@ impl ProvenanceCrate {
     /// Links a hop whose target was read before; `false` when it still has to be read.
     pub fn known(&mut self, hop: &Hop) -> bool {
         let asked = asked(&hop.target);
-        match self.labels.get(&asked).cloned() {
+        match self.label(&asked) {
             Some(entity) => {
                 self.link(hop, &entity);
                 true
@@ -94,8 +108,9 @@ impl ProvenanceCrate {
     pub fn version(&mut self, hop: &Hop, origin: &Value) -> Vec<Hop> {
         let asked = asked(&hop.target);
         let id = origin["global_id"].as_str().unwrap_or(&asked).to_string();
-        self.labels.insert(asked.clone(), id.clone());
-        let duplicate = self.labels.insert(id.clone(), id.clone()).is_some() && id != asked;
+        let duplicate = id != asked && self.label(&id).is_some();
+        self.set_label(&asked, &id);
+        self.set_label(&id, &id);
         self.link(hop, &id);
         if duplicate {
             return Vec::new();
@@ -117,13 +132,13 @@ impl ProvenanceCrate {
             property.insert("name".into(), json!(name));
             property.insert("value".into(), json!(value));
             property.insert("url".into(), found["url"].clone());
-            self.entities.insert(key.clone(), property);
+            self.put(&key, &property);
             identifiers.push(json!({ "@id": key }));
         }
         if !identifiers.is_empty() {
             file.insert("identifier".into(), Value::Array(identifiers));
         }
-        self.entities.insert(id.clone(), file);
+        self.put(&id, &file);
         let mut next = Vec::new();
         let based_on = |target: &str| Hop {
             target: Target::Version(target.to_string()),
@@ -159,7 +174,7 @@ impl ProvenanceCrate {
             let mut database = entity(&key, "Dataset");
             database.insert("name".into(), json!("Database (current listing)"));
             database.insert("identifier".into(), json!(entry));
-            self.entities.insert(key.clone(), database);
+            self.put(&key, &database);
             self.add_ref(id, "isPartOf", &key);
         }
     }
@@ -170,10 +185,10 @@ impl ProvenanceCrate {
             return (Vec::new(), None);
         };
         let key = format!("#run-{run_id}");
-        self.labels.insert(asked(&hop.target), key.clone());
+        self.set_label(&asked(&hop.target), &key);
         let mut run = entity(&key, "CreateAction");
         run.insert("name".into(), json!(format!("Run {run_id}")));
-        self.entities.insert(key.clone(), run);
+        self.put(&key, &run);
         // A run is linked from the file it made, as that file's `result` side.
         self.add_ref(&key, "result", &hop.from);
         let Some(run_crate) = run_crate else {
@@ -184,8 +199,8 @@ impl ProvenanceCrate {
         let mut nested = entity(&folder, "Dataset");
         nested.insert("name".into(), json!(format!("Run crate of {run_id}")));
         nested.insert("conformsTo".into(), json!({ "@id": NESTED_CRATE }));
-        self.entities.insert(folder.clone(), nested);
-        self.parts.insert(folder.clone());
+        self.put(&folder, &nested);
+        self.add_part(&folder);
         self.add_ref(&key, "subjectOf", &folder);
         let hops = inputs(run_crate)
             .into_iter()
@@ -213,8 +228,8 @@ impl ProvenanceCrate {
         let mut nested = entity(&folder, "Dataset");
         nested.insert("name".into(), json!("The dataset"));
         nested.insert("conformsTo".into(), json!({ "@id": NESTED_CRATE }));
-        self.entities.insert(folder.clone(), nested);
-        self.parts.insert(folder.clone());
+        self.put(&folder, &nested);
+        self.add_part(&folder);
         self.add_ref("./", "mainEntity", &folder);
         let mut hops = Vec::new();
         for node in graph(document) {
@@ -249,23 +264,23 @@ impl ProvenanceCrate {
                 format!("#hidden-{}", self.hidden)
             }
         };
-        self.labels.insert(asked, id.clone());
+        self.set_label(&asked, &id);
         let mut file = entity(&id, "File");
         file.insert("name".into(), json!("Not visible to you"));
-        self.entities.entry(id.clone()).or_insert(file);
+        self.put_new(&id, &file);
         self.link(hop, &id);
     }
 
     /// A hop whose node did not answer; the crate is then incomplete.
     pub fn unreachable(&mut self, hop: &Hop) {
         let asked = asked(&hop.target);
-        self.labels.insert(asked.clone(), asked.clone());
+        self.set_label(&asked, &asked);
         let mut file = entity(&asked, "File");
         file.insert(
             "description".into(),
             json!("The node holding it did not answer"),
         );
-        self.entities.entry(asked.clone()).or_insert(file);
+        self.put_new(&asked, &file);
         self.link(hop, &asked);
         self.incomplete("some nodes did not answer");
     }
@@ -280,8 +295,8 @@ impl ProvenanceCrate {
         self.stopped = Some(reason.to_string());
     }
 
-    /// The root `ro-crate-metadata.json`.
-    pub fn finish(self) -> Value {
+    /// Writes the root `ro-crate-metadata.json` one entity at a time.
+    pub fn write_root(mut self, out: &mut impl Write) -> std::io::Result<()> {
         let mut root = entity("./", "Dataset");
         root.insert(
             "name".into(),
@@ -292,34 +307,48 @@ impl ProvenanceCrate {
             json!("Where the data came from, as far as the exporting user may read it."),
         );
         root.insert("datePublished".into(), json!(self.published));
+        for (key, value) in self.get("./").into_iter().flatten() {
+            if key != "@id" {
+                root.insert(key, value);
+            }
+        }
         let status = match &self.stopped {
             None => "Complete".to_string(),
             Some(reason) => format!("Incomplete: {reason}"),
         };
         root.insert("creativeWorkStatus".into(), json!(status));
-        let parts: Vec<Value> = (self.parts.iter()).map(|id| json!({ "@id": id })).collect();
-        root.insert("hasPart".into(), Value::Array(parts));
-        let mut entities = self.entities;
-        if let Some(own) = entities.remove("./") {
-            for (key, value) in own.into_iter().filter(|(key, _)| key != "@id") {
-                root.insert(key, value);
-            }
-        }
         let descriptor = json!({
             "@id": "ro-crate-metadata.json",
             "@type": "CreativeWork",
             "conformsTo": { "@id": CRATE_SPEC },
             "about": { "@id": "./" }
         });
-        let mut graph = vec![descriptor, Value::Object(root)];
-        graph.extend(entities.into_values().map(Value::Object));
-        json!({ "@context": CRATE_CONTEXT, "@graph": graph })
+        let failed = std::io::Error::other;
+        write!(out, "{{\"@context\":{},\"@graph\":[", json!(CRATE_CONTEXT))?;
+        serde_json::to_writer(&mut *out, &descriptor)?;
+        // The root object without its closing brace, so its parts follow as they are read.
+        let root = serde_json::to_string(&root)?;
+        write!(out, ",{},\"hasPart\":[", &root[..root.len() - 1])?;
+        for (index, part) in self.spool.parts().enumerate() {
+            let part = part.map_err(failed)?;
+            let separator = if index == 0 { "" } else { "," };
+            write!(out, "{separator}{}", json!({ "@id": part }))?;
+        }
+        out.write_all(b"]}")?;
+        for entity in self.spool.entities() {
+            let entity = entity.map_err(failed)?;
+            if entity["@id"] != "./" {
+                out.write_all(b",")?;
+                serde_json::to_writer(&mut *out, &entity)?;
+            }
+        }
+        out.write_all(b"]}")
     }
 
     fn unversioned(&mut self, from: &str, id: &str) {
         let mut file = entity(id, "File");
         file.insert("description".into(), json!("No exact version recorded"));
-        self.entities.entry(id.to_string()).or_insert(file);
+        self.put_new(id, &file);
         let property = if from.starts_with("#run-") {
             "object"
         } else {
@@ -337,10 +366,7 @@ impl ProvenanceCrate {
     }
 
     fn add_ref(&mut self, from: &str, property: &str, to: &str) {
-        let source = self
-            .entities
-            .entry(from.to_string())
-            .or_insert_with(|| entity(from, "Dataset"));
+        let mut source = self.get(from).unwrap_or_else(|| entity(from, "Dataset"));
         let reference = json!({ "@id": to });
         match source.get_mut(property) {
             Some(Value::Array(values)) if !values.contains(&reference) => values.push(reference),
@@ -349,12 +375,57 @@ impl ProvenanceCrate {
                 source.insert(property.to_string(), json!([reference]));
             }
         }
+        self.put(from, &source);
     }
 
     fn add_text(&mut self, id: &str, property: &str, value: &str) {
-        if let Some(target) = self.entities.get_mut(id) {
+        if let Some(mut target) = self.get(id) {
             target.insert(property.to_string(), json!(value));
+            self.put(id, &target);
         }
+    }
+
+    /// A failed read or write of the working state leaves the crate incomplete.
+    fn keep<T>(&mut self, result: SpoolResult<T>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(_) => {
+                self.incomplete("the export could not keep its working state");
+                None
+            }
+        }
+    }
+
+    fn label(&mut self, asked: &str) -> Option<String> {
+        let label = self.spool.label(asked);
+        self.keep(label).flatten()
+    }
+
+    fn set_label(&mut self, asked: &str, id: &str) {
+        let set = self.spool.set_label(asked, id);
+        self.keep(set);
+    }
+
+    fn get(&mut self, id: &str) -> Option<Map<String, Value>> {
+        let found = self.spool.entity(id);
+        self.keep(found).flatten()
+    }
+
+    fn put(&mut self, id: &str, entity: &Map<String, Value>) {
+        let put = self.spool.put_entity(id, entity);
+        self.keep(put);
+    }
+
+    /// Stores an entity only when none of its id is stored yet.
+    fn put_new(&mut self, id: &str, entity: &Map<String, Value>) {
+        if self.get(id).is_none() {
+            self.put(id, entity);
+        }
+    }
+
+    fn add_part(&mut self, id: &str) {
+        let added = self.spool.add_part(id);
+        self.keep(added);
     }
 }
 
@@ -440,6 +511,9 @@ fn inputs(run_crate: &Value) -> Vec<(String, Option<String>)> {
     }
     found
 }
+
+#[path = "provenance_spool.rs"]
+mod spool;
 
 #[cfg(test)]
 #[path = "provenance_tests.rs"]

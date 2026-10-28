@@ -22,29 +22,40 @@ fn copied(from: &str) -> Value {
     json!({ "created_at": "2026-10-27T10:00:00Z", "origin": { "kind": "copy", "from": from } })
 }
 
+/// The root metadata as the export writes it.
+fn root(built: ProvenanceCrate) -> Value {
+    let mut out = Vec::new();
+    built.write_root(&mut out).unwrap();
+    serde_json::from_slice(&out).unwrap()
+}
+
 /// Reads hops the way the route does, from `answers` by asked id; a missing answer is hidden.
 fn walk(start: &str, answers: &BTreeMap<String, Value>) -> (Value, Vec<String>, usize) {
-    let mut built = ProvenanceCrate::new(start, "2026-10-27T12:00:00Z");
-    let mut queue = vec![built.version_start()];
+    let mut built = ProvenanceCrate::new(start, "2026-10-27T12:00:00Z").unwrap();
+    let first = built.version_start();
+    built.push([first]);
     let (mut files, mut reads) = (Vec::new(), 0);
-    while let Some(hop) = queue.pop() {
+    while let Some(hop) = built.pop() {
         if built.known(&hop) {
             continue;
         }
         reads += 1;
         match &hop.target {
             Target::Version(id) => match answers.get(id) {
-                Some(origin) => queue.extend(built.version(&hop, origin)),
+                Some(origin) => {
+                    let next = built.version(&hop, origin);
+                    built.push(next);
+                }
                 None => built.hidden(&hop),
             },
             Target::Run(run_id) => {
                 let (next, file) = built.run(&hop, answers.get(&format!("run:{run_id}")));
-                queue.extend(next);
+                built.push(next);
                 files.extend(file.map(|file| file.path));
             }
         }
     }
-    (built.finish(), files, reads)
+    (root(built), files, reads)
 }
 
 fn node<'a>(document: &'a Value, id: &str) -> &'a Value {
@@ -131,7 +142,7 @@ fn hidden_hops_private() {
     assert!(text.contains("#hidden-1"));
     assert!(!text.contains("x/y.txt") && !text.contains(&arn(8, "x/y.txt")));
 
-    let mut built = ProvenanceCrate::new(&output, "2026-10-27T12:00:00Z");
+    let mut built = ProvenanceCrate::new(&output, "2026-10-27T12:00:00Z").unwrap();
     let run = Hop {
         target: Target::Run(run_id),
         from: output.clone(),
@@ -145,7 +156,7 @@ fn hidden_hops_private() {
         ..next[0].clone()
     };
     built.unreachable(&unreachable);
-    let document = built.finish();
+    let document = root(built);
     assert_eq!(node(&document, &digest)["name"], "Not visible to you");
     assert!(!document["@graph"].to_string().contains(&secret));
     let status = node(&document, "./")["creativeWorkStatus"]
@@ -164,12 +175,12 @@ fn stored_dataset_parts() {
         { "@id": "#a", "@type": "MediaObject", "contentUrl": [exact, "s3://bucket/in.txt"] },
         { "@id": "#b", "@type": "MediaObject", "contentUrl": "s3://bucket/old.txt" }
     ]});
-    let mut built = ProvenanceCrate::new("dataset", "2026-10-27T12:00:00Z");
+    let mut built = ProvenanceCrate::new("dataset", "2026-10-27T12:00:00Z").unwrap();
     let (hops, file) = built.dataset(&document);
     assert_eq!(hops.len(), 1);
     assert_eq!(hops[0].target, Target::Version(exact));
     assert_eq!(file.path, "dataset/ro-crate-metadata.json");
-    let root = built.finish();
+    let root = root(built);
     assert_eq!(
         node(&root, "#b")["description"],
         "No exact version recorded"
@@ -200,4 +211,37 @@ fn run_results_all_linked() {
     results.sort_by_key(|id| id.to_string());
     assert_eq!(results, vec![json!(first), json!(second)]);
     assert_eq!(reads, 3, "the run is read once");
+}
+
+#[test]
+fn spooled_state_streams() {
+    // The working state lives on disk: links come back in the order queued, every entity is
+    // written into the root, and the working folder is gone once the crate is written.
+    let mut built = ProvenanceCrate::new("start", "2026-10-27T12:00:00Z").unwrap();
+    let hops: Vec<_> = (0..500)
+        .map(|index| Hop {
+            target: Target::Version(arn(1, &format!("f{index}"))),
+            from: "./".to_string(),
+            property: "hasPart",
+            digest: None,
+        })
+        .collect();
+    built.push(hops.clone());
+    let mut popped = Vec::new();
+    while let Some(hop) = built.pop() {
+        built.hidden(&hop);
+        popped.push(hop);
+    }
+    assert_eq!(popped, hops);
+    let folder = built.spool.path.clone();
+    assert!(folder.exists());
+    let document = root(built);
+    assert!(!folder.exists());
+    let graph = document["@graph"].as_array().unwrap();
+    let hidden = graph
+        .iter()
+        .filter(|node| node["name"] == "Not visible to you")
+        .count();
+    assert_eq!(hidden, 500);
+    assert_eq!(node(&document, "./")["hasPart"], json!([]));
 }

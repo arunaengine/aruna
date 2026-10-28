@@ -6,7 +6,6 @@
 // Each hop is read with the caller's credential on the node that holds it, exactly as the
 // origin and run routes answer it; the crate shows only what those reads show.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,11 +20,13 @@ use axum::response::Response;
 use axum::{Extension, Json};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
+use futures_util::io::AsyncWriteExt;
 use serde::Deserialize;
 use tokio::io::DuplexStream;
 use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
 use utoipa::{IntoParams, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -134,10 +135,17 @@ fn export_deadline(now: Instant, unix_now: u64, expires_at_secs: u64) -> Instant
 
 /// Starts the walk and answers with the ZIP stream it writes.
 fn start_export(caller: Caller, start: Start) -> ServerResult<Response> {
+    let published = chrono::Utc::now().to_rfc3339();
+    let named = match &start {
+        Start::Version(id) | Start::Dataset(id) => id,
+    };
+    // The export keeps its working state on disk; without room for it nothing starts.
+    let built = ProvenanceCrate::new(named, &published)
+        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
     let (writer, reader) = tokio::io::duplex(PIPE_BYTES);
     let gone = CancellationToken::new();
     let guard = gone.clone().drop_guard();
-    tokio::spawn(async move { walk(caller, start, writer, gone).await });
+    tokio::spawn(async move { walk(caller, start, built, writer, gone).await });
     // Dropping the body, as a disconnect does, stops the walk.
     let body = ReaderStream::new(reader).map(move |chunk| {
         let _ = &guard;
@@ -188,18 +196,20 @@ enum Read {
     Silent,
 }
 
-async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: CancellationToken) {
+async fn walk(
+    caller: Caller,
+    start: Start,
+    mut built: ProvenanceCrate,
+    writer: DuplexStream,
+    gone: CancellationToken,
+) {
     let mut zip = ZipFileWriter::with_tokio(writer);
-    let published = chrono::Utc::now().to_rfc3339();
-    let mut queue = VecDeque::new();
-    let mut built = match &start {
-        Start::Version(version) => {
-            let built = ProvenanceCrate::new(version, &published);
-            queue.push_back(built.version_start());
-            built
+    match &start {
+        Start::Version(_) => {
+            let first = built.version_start();
+            built.push([first]);
         }
         Start::Dataset(document) => {
-            let mut built = ProvenanceCrate::new(document, &published);
             let Some(auth) = caller.current(&gone).await else {
                 built.stop(REVOKED);
                 return finish(&caller, &gone, zip, built).await;
@@ -210,16 +220,15 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
                     if !write(&caller, &gone, &mut zip, file).await {
                         return;
                     }
-                    queue.extend(hops);
+                    built.push(hops);
                 }
                 Some(Read::Hidden) => built.stop("the dataset is not readable"),
                 Some(Read::Silent) => built.stop("the dataset did not answer"),
                 None => built.stop("stopped before the dataset was read"),
             }
-            built
         }
-    };
-    while let Some(hop) = queue.pop_front() {
+    }
+    while let Some(hop) = built.pop() {
         if built.known(&hop) {
             continue;
         }
@@ -233,7 +242,8 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
         };
         match (&hop.target, read) {
             (Target::Version(_), Read::Answer(origin)) => {
-                queue.extend(built.version(&hop, &origin))
+                let next = built.version(&hop, &origin);
+                built.push(next);
             }
             (Target::Run(_), Read::Answer(run)) => {
                 let read = match run["run_crate"].as_str() {
@@ -249,7 +259,7 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
                 {
                     return;
                 }
-                queue.extend(hops);
+                built.push(hops);
                 if !go_on {
                     break;
                 }
@@ -264,17 +274,56 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
     finish(&caller, &gone, zip, built).await
 }
 
-/// Writes the root metadata and closes the ZIP.
+/// Writes the root metadata and closes the ZIP. The root is written to a temporary file first
+/// and copied into the ZIP in pieces, so it is never held in memory whole.
 async fn finish(
     caller: &Caller,
     gone: &CancellationToken,
     mut zip: ZipFileWriter<DuplexStream>,
     built: ProvenanceCrate,
 ) {
-    let root = serde_json::to_vec_pretty(&built.finish()).unwrap_or_default();
-    let path = "ro-crate-metadata.json".to_string();
-    if write(caller, gone, &mut zip, CrateFile { path, bytes: root }).await {
+    let spooled =
+        Spooled(std::env::temp_dir().join(format!("aruna-provenance-{}.json", Ulid::generate())));
+    let path = spooled.0.clone();
+    let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        built.write_root(&mut out)?;
+        std::io::Write::flush(&mut out)
+    });
+    if !matches!(bounded(caller, gone, written).await, Some(Ok(Ok(())))) {
+        return;
+    }
+    let copied = async {
+        let mut file = tokio::fs::File::open(&spooled.0).await?;
+        let entry = ZipEntryBuilder::new(
+            "ro-crate-metadata.json".to_string().into(),
+            Compression::Stored,
+        );
+        let mut entry = zip
+            .write_entry_stream(entry)
+            .await
+            .map_err(std::io::Error::other)?;
+        let mut chunk = vec![0u8; PIPE_BYTES];
+        loop {
+            let read = tokio::io::AsyncReadExt::read(&mut file, &mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            entry.write_all(&chunk[..read]).await?;
+        }
+        entry.close().await.map_err(std::io::Error::other)
+    };
+    if matches!(bounded(caller, gone, copied).await, Some(Ok(()))) {
         let _ = bounded(caller, gone, zip.close()).await;
+    }
+}
+
+/// A temporary file removed when the export ends, however it ends.
+struct Spooled(std::path::PathBuf);
+
+impl Drop for Spooled {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 

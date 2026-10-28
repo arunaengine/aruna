@@ -204,9 +204,11 @@ async fn silent_crate_incomplete() {
         digest: None,
     };
     let status = |read: Option<Read>| {
-        let mut built = ProvenanceCrate::new("file", "2026-10-28T00:00:00Z");
+        let mut built = ProvenanceCrate::new("file", "2026-10-28T00:00:00Z").unwrap();
         let (_, _, go_on) = record_run(&mut built, &hop, read);
-        let root = built.finish();
+        let mut out = Vec::new();
+        built.write_root(&mut out).unwrap();
+        let root: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let graph = root["@graph"].as_array().unwrap().clone();
         let status =
             graph.iter().find(|node| node["@id"] == "./").unwrap()["creativeWorkStatus"].clone();
