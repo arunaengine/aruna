@@ -309,7 +309,13 @@ for.
 - A run without a local crate, such as a notebook session or a run still being finished, is 404."#,
     params(("job_id" = String, Path, description = "Job id of the local run: a 26-character ULID; an unparseable id is 404")),
     responses(
-        (status = 200, description = "The crate JSON-LD", body = Object),
+        (status = 200, description = "The crate JSON-LD", body = Object, example = json!({
+            "@context": ["https://w3id.org/ro/crate/1.2/context"],
+            "@graph": [
+                {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"}},
+                {"@id": "./", "@type": "Dataset", "name": "Run bakta", "mentions": {"@id": "#run-01JZ7Q3V4K8M2N6P0R5S9T1W3X"}}
+            ]
+        })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the device owner", body = ErrorResponse),
         (status = 404, description = "No such local run or no crate for it, or this node is not a user node", body = ErrorResponse),
