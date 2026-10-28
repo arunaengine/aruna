@@ -44,6 +44,7 @@ use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
 use crate::metadata::api::{ReferenceNodeExecution, ReferenceNodeRequest, RoCrateExportView};
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::update_document::UpdateDocumentMutation;
+use crate::s3::bucket::release::{MembershipQuery, RangeMembers};
 use crate::s3::bucket::search::BucketSearchHit;
 use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
 
@@ -624,6 +625,17 @@ pub enum MetadataTransportMessage {
     PromotionCheck,
     PromotionReady {
         result: Result<bool, MetadataReadError>,
+    },
+    /// Release membership of exact versions, asked of a record holder of the named ranges with
+    /// the caller's bearer, which the holder validates itself.
+    ReleaseMembers {
+        auth_token: Option<AuthToken>,
+        bucket: String,
+        range_ids: Vec<Ulid>,
+        queries: Vec<MembershipQuery>,
+    },
+    ReleaseMembersResults {
+        result: Result<RangeMembers, MetadataReadError>,
     },
 }
 

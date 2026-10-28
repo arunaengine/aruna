@@ -18,7 +18,7 @@ use aruna_net::streams::BiStream;
 use tracing::{Span, field};
 
 use super::effects::metadata_read_error;
-use super::peer_auth::{bucket_search_auth, config_digest_matches};
+use super::peer_auth::{bucket_search_auth, config_digest_matches, release_auth};
 use super::query::query_local_graphs;
 use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
@@ -32,6 +32,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::release::holder_members;
 use crate::s3::bucket::search::{SearchBucketsInput, search_local_buckets};
 use crate::s3::object::search::{SearchObjectsInput, search_local_objects};
 use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
@@ -529,6 +530,29 @@ impl MetadataHandle {
                 })
                 .await
             }
+            MetadataTransportMessage::ReleaseMembers {
+                auth_token,
+                bucket,
+                range_ids,
+                queries,
+            } => {
+                let result = Box::pin(async {
+                    let realm_id = self.inner.net_handle.as_ref().map(|net| *net.realm_id());
+                    let storage = &self.inner.storage_handle;
+                    let validation = &self.inner.auth_validation;
+                    let auth =
+                        release_auth(validation, storage, peer, realm_id, auth_token).await?;
+                    let net_handle =
+                        (self.inner.net_handle.as_ref()).ok_or(MetadataReadError::Unavailable)?;
+                    let scope = (*net_handle.realm_id(), net_handle.node_id());
+                    let asked = (bucket.as_str(), range_ids.as_slice(), queries.as_slice());
+                    holder_members(context.as_ref(), scope, &auth, asked)
+                        .await
+                        .map_err(|_| MetadataReadError::Unavailable)
+                })
+                .await;
+                MetadataTransportMessage::ReleaseMembersResults { result }
+            }
             _ => unreachable!("request family routed incorrectly"),
         }
     }
@@ -1013,7 +1037,8 @@ impl MetadataHandle {
                 (self.preflight_request(context, peer, message).await, None)
             }
             message @ (MetadataTransportMessage::SearchBuckets { .. }
-            | MetadataTransportMessage::SearchObjects { .. }) => {
+            | MetadataTransportMessage::SearchObjects { .. }
+            | MetadataTransportMessage::ReleaseMembers { .. }) => {
                 (self.bucket_request(context, peer, message).await, None)
             }
             MetadataTransportMessage::LookupIdentifier {

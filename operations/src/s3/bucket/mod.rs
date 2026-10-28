@@ -16,6 +16,7 @@ pub mod linked;
 pub mod list;
 pub mod metadata;
 pub mod placement;
+pub mod release;
 pub mod remap;
 pub mod rename;
 pub mod rotate;

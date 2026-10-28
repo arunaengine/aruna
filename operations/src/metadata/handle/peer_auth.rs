@@ -228,6 +228,30 @@ where
     Ok(auth)
 }
 
+/// A release membership request: a bearer this node validates itself, from a realm
+/// infrastructure node only, never a device.
+pub(super) async fn release_auth<S>(
+    state: &S,
+    storage_handle: &StorageHandle,
+    peer: NodeId,
+    local_realm_id: Option<RealmId>,
+    auth_token: Option<AuthToken>,
+) -> Result<AuthContext, MetadataReadError>
+where
+    S: ArunaValidationState + ?Sized,
+{
+    let auth = bucket_search_auth(state, storage_handle, peer, local_realm_id, auth_token).await?;
+    ensure_peer_configured(
+        storage_handle,
+        peer,
+        auth.realm_id,
+        PeerTrust::Vouched(None),
+    )
+    .await
+    .map_err(|_| MetadataReadError::Forbidden)?;
+    Ok(auth)
+}
+
 pub(super) async fn authorize_peer<S>(
     state: &S,
     storage_handle: &StorageHandle,

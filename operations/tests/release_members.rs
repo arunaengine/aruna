@@ -1,0 +1,250 @@
+//! Tests release membership: a tagged release crate pins exact versions, only for callers who
+//! may read it, and a holder answers another node only for a bearer it validates itself.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::topology;
+
+use std::collections::HashMap;
+use std::time::SystemTime;
+
+use aruna_core::metadata::AuthToken;
+use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::types::GroupId;
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::MetadataReadError;
+use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::bucket::release::{
+    BucketScope, MembershipCaller, MembershipQuery, release_members,
+};
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use serde_json::json;
+use topology::{TestResult, Topology};
+use ulid::Ulid;
+
+const BUCKET: &str = "bakta-db";
+
+async fn put(
+    context: &DriverContext,
+    realm: &Topology,
+    group_id: GroupId,
+    (key, bytes): (&str, Vec<u8>),
+    metadata: HashMap<String, String>,
+) -> TestResult<Ulid> {
+    let node_id = context.net_handle.as_ref().ok_or("a realm node")?.node_id();
+    let length = bytes.len() as u64;
+    let body = futures_util::stream::iter([Ok::<_, StreamError>(bytes::Bytes::from(bytes))]);
+    let result = drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: realm.user_id,
+            group_id,
+            realm_id: realm.realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: BUCKET.to_string(),
+                key: key.to_string(),
+                content_length: Some(length),
+                body: Some(BackendStream::new(body)),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        })
+        .with_metadata(metadata),
+        context,
+    )
+    .await?;
+    Ok(result.version_id)
+}
+
+/// The releases that pin `queries` for a caller this node validated, asking no other node.
+async fn ask(
+    context: &DriverContext,
+    scope: BucketScope<'_>,
+    auth: AuthContext,
+    queries: &[MembershipQuery],
+) -> TestResult<Vec<aruna_operations::s3::bucket::release::ReleaseMembers>> {
+    let caller = MembershipCaller {
+        auth: &auth,
+        bearer: None,
+    };
+    Ok(release_members(context, scope, caller, queries).await?)
+}
+
+#[tokio::test]
+async fn releases_pin_versions() -> TestResult<()> {
+    let realm = Topology::spawn(2, 1, 1).await?;
+    let group_id = realm.seed_group().await?;
+    let holder = realm.node(0);
+    let context = holder.context.as_ref();
+    let info = BucketInfo {
+        group_id,
+        created_at: SystemTime::now(),
+        created_by: realm.user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: None,
+    };
+    drive(
+        CreateBucketOperation::new(BUCKET.to_string(), info.clone()),
+        context,
+    )
+    .await?;
+    let pinned = put(
+        context,
+        &realm,
+        group_id,
+        ("db/a.fasta", b">a".to_vec()),
+        HashMap::new(),
+    )
+    .await?;
+    let exact = |key: &str, version_id| {
+        VersionedObjectArn::new(realm.realm_id, holder.node_id(), BUCKET, key, version_id)
+            .map(|arn| arn.to_w3id())
+    };
+    let release = json!({"@graph": [
+        {"@id": "./", "@type": "Dataset", "identifier": [{"@id": "#upstream-0"}]},
+        {"@id": "#upstream-0", "@type": "PropertyValue", "name": "DOI",
+         "value": "10.5281/zenodo.1", "url": "https://doi.org/10.5281/zenodo.1"},
+        {"@id": exact("db/a.fasta", pinned)?, "@type": "File"}
+    ]});
+    let tags = HashMap::from([
+        (RELEASE_TAG.to_string(), "6.0".to_string()),
+        (RELEASE_PREFIX_TAG.to_string(), "db/".to_string()),
+    ]);
+    let crate_bytes = serde_json::to_vec(&release)?;
+    put(
+        context,
+        &realm,
+        group_id,
+        ("db/release.json", crate_bytes),
+        tags,
+    )
+    .await?;
+    let newer = put(
+        context,
+        &realm,
+        group_id,
+        ("db/a.fasta", b">b".to_vec()),
+        HashMap::new(),
+    )
+    .await?;
+
+    let scope = BucketScope {
+        realm_id: realm.realm_id,
+        node_id: holder.node_id(),
+        bucket: BUCKET,
+        info: &info,
+    };
+    let queries = [
+        MembershipQuery {
+            key: "db/a.fasta".to_string(),
+            version_id: pinned,
+        },
+        MembershipQuery {
+            key: "db/a.fasta".to_string(),
+            version_id: newer,
+        },
+        MembershipQuery {
+            key: "other/a.fasta".to_string(),
+            version_id: pinned,
+        },
+    ];
+    let answers = ask(context, scope, realm.auth_context(), &queries).await?;
+    assert_eq!(answers[0].releases.len(), 1);
+    assert_eq!(answers[0].releases[0].label, "6.0");
+    assert_eq!(answers[0].releases[0].upstream[0].value, "10.5281/zenodo.1");
+    assert!(
+        answers[1].releases.is_empty(),
+        "a newer version is not pinned"
+    );
+    assert!(
+        answers[2].releases.is_empty(),
+        "a key outside the prefix is no member"
+    );
+    assert!(answers.iter().all(|answer| answer.complete));
+
+    // A token restricted to the file, not the release crate, learns of no release.
+    let file_path = object_permission_path(
+        realm.realm_id,
+        group_id,
+        holder.node_id(),
+        BUCKET,
+        "db/a.fasta",
+    );
+    let restricted = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: file_path,
+            permission: Permission::READ,
+        }]),
+        ..realm.auth_context()
+    };
+    let answers = ask(context, scope, restricted, &queries).await?;
+    assert!(answers[0].releases.is_empty());
+    let stranger = realm.auth_for(aruna_core::UserId::local(
+        Ulid::from(77u128),
+        realm.realm_id,
+    ));
+    assert!(
+        ask(context, scope, stranger, &queries).await?[0]
+            .releases
+            .is_empty()
+    );
+
+    // Another node asks with a bearer the holder validates; a forged one or a device is refused.
+    let handle = realm
+        .node(1)
+        .context
+        .metadata_handle
+        .as_ref()
+        .ok_or("handle")?;
+    let request = || {
+        (
+            BUCKET.to_string(),
+            vec![Ulid::from(5u128)],
+            queries.to_vec(),
+        )
+    };
+    let answer = handle
+        .request_release_members(holder.node_id(), Some(realm.bearer_token()), request())
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    assert_eq!(
+        answer.refused,
+        vec![Ulid::from(5u128)],
+        "an ordinary bucket has no ranges"
+    );
+    let forged = AuthToken::bearer("forged").map_err(|error| format!("{error:?}"))?;
+    let refused = handle
+        .request_release_members(holder.node_id(), Some(forged), request())
+        .await;
+    assert_eq!(refused, Err(MetadataReadError::Unauthorized));
+    let missing = handle
+        .request_release_members(holder.node_id(), None, request())
+        .await;
+    assert_eq!(missing, Err(MetadataReadError::Unauthorized));
+    let device = realm
+        .user_node()
+        .context
+        .metadata_handle
+        .as_ref()
+        .ok_or("handle")?;
+    let from_device = device
+        .request_release_members(holder.node_id(), Some(realm.bearer_token()), request())
+        .await;
+    assert!(from_device.is_err(), "a device is no infrastructure peer");
+    Ok(())
+}

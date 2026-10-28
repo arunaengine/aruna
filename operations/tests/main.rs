@@ -38,6 +38,7 @@ mod propagation_tail;
 mod quarantine_capacity;
 mod query_concurrency;
 mod read_through;
+mod release_members;
 mod restart_persistence;
 mod restart_traffic;
 mod rocrate_drivers;
