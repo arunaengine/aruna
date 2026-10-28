@@ -88,6 +88,8 @@ pub struct ManagementUrlCache {
     urls: Vec<String>,
     owner: Option<RequestOwner>,
     refreshed_at: Option<Instant>,
+    /// Targets whose last connect failed, and when; they are tried last while fresh.
+    failed: BTreeMap<String, Instant>,
 }
 
 /// The first management node in node-id order, which keeps every database request, and its
@@ -130,7 +132,7 @@ pub(crate) async fn relay_middleware(
     }
     let targets = match pinned_route(route) {
         true => pinned_targets(owner, urls, !state.is_user_node()),
-        false => urls,
+        false => healthy_first(urls, &state.management_url_cache().read().await.failed),
     };
     relay(&state, route, targets, request).await
 }
@@ -225,7 +227,9 @@ async fn relay(
         for (name, value) in &preconditions {
             outgoing = outgoing.header(name, value.clone());
         }
-        match outgoing.send().await {
+        let sent = outgoing.send().await;
+        record_outcome(state, target, &sent).await;
+        match sent {
             Ok(response)
                 if may_try_response(route, response.status())
                     || gateway_failed(&method, response.status()) =>
@@ -249,6 +253,35 @@ async fn relay(
 
     warn!(route, "No management node answered a relayed route");
     ServerError::NoManagementNode.into_response()
+}
+
+/// Targets with a fresh connect failure move last; the order is kept otherwise.
+fn healthy_first(mut targets: Vec<String>, failed: &BTreeMap<String, Instant>) -> Vec<String> {
+    targets.sort_by_key(|target| is_fresh(failed.get(target).copied()));
+    targets
+}
+
+/// Remembers a connect failure of a target; any answer from it clears the mark.
+async fn record_outcome(
+    state: &Arc<ServerState>,
+    target: &str,
+    sent: &Result<reqwest::Response, reqwest::Error>,
+) {
+    let failed = sent.as_ref().is_err_and(reqwest::Error::is_connect);
+    let cache = state.management_url_cache();
+    if !failed && !cache.read().await.failed.contains_key(target) {
+        return;
+    }
+    let mut cached = cache.write().await;
+    match failed {
+        true => {
+            cached.failed.retain(|_, at| is_fresh(Some(*at)));
+            cached.failed.insert(target.to_string(), Instant::now());
+        }
+        false => {
+            cached.failed.remove(target);
+        }
+    }
 }
 
 /// Whether a send failure may be retried against the next target. A connect

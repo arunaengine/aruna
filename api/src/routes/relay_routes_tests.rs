@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use super::{RELAY_HOP_HEADER, relay_middleware};
+use super::{RELAY_HOP_HEADER, healthy_first, relay_middleware};
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -175,6 +175,31 @@ async fn stopped_management_skipped() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(&body[..], b"{\"relayed\":true}");
     ingress.abort();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn refused_target_demoted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let refused = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let (upstream, handle) = fake_upstream().await;
+    let fixture = setup(vec![refused.clone(), upstream.clone()]).await;
+    let response = relay_app(fixture.state.clone())
+        .oneshot(token_request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // The next call tries the healthy target first and the refused one only after it.
+    let cache = fixture.state.management_url_cache().read().await;
+    let order = healthy_first(cache.urls.clone(), &cache.failed);
+    assert_eq!(order, [upstream, refused]);
+    drop(cache);
+    let response = relay_app(fixture.state.clone())
+        .oneshot(token_request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     handle.abort();
 }
 

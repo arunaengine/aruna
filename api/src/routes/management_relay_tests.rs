@@ -3,13 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    API_PREFIX, RELAYED_ROUTES, gateway_failed, may_try_next, may_try_response, pinned_route,
-    pinned_targets, relay_route, relay_targets, relay_url, relayed_headers,
+    API_PREFIX, MANAGEMENT_URL_TTL, RELAYED_ROUTES, gateway_failed, healthy_first, may_try_next,
+    may_try_response, pinned_route, pinned_targets, relay_route, relay_targets, relay_url,
+    relayed_headers,
 };
 use crate::error::{ErrorResponse, ServerError};
 use axum::body::to_bytes;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::IntoResponse;
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[test]
 fn matches_allowlisted_routes() {
@@ -174,6 +177,17 @@ fn requests_stay_pinned() {
 fn connect_failure_advances() {
     assert!(may_try_next(&Method::POST, true));
     assert!(may_try_next(&Method::GET, true));
+}
+
+#[test]
+fn failed_target_last() {
+    let targets = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let failed = BTreeMap::from([("a".to_string(), Instant::now())]);
+    assert_eq!(healthy_first(targets.clone(), &failed), ["b", "c", "a"]);
+    // An old failure no longer demotes its target.
+    let old = Instant::now().checked_sub(MANAGEMENT_URL_TTL).unwrap();
+    let failed = BTreeMap::from([("a".to_string(), old)]);
+    assert_eq!(healthy_first(targets, &failed), ["a", "b", "c"]);
 }
 
 #[test]
