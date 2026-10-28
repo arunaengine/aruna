@@ -711,6 +711,7 @@ pub async fn record_attempt_intent(
     token: Ulid,
     draft: AttemptIntent,
     execution_id: Option<Ulid>,
+    launch: Option<&LaunchRecord>,
     now_ms: u64,
 ) -> Result<AttemptCommit, JobMutationError> {
     for attempt in 0..MUTATE_MAX_ATTEMPTS {
@@ -773,6 +774,18 @@ pub async fn record_attempt_intent(
                         .map_err(|error| JobMutationError::Storage(error.to_string()))?,
                 ),
             ));
+            // The launch facts belong to exactly the epoch this guarded commit assigns.
+            if let Some(launch) = launch {
+                writes.push((
+                    LAUNCH_RECORD_KEYSPACE.to_string(),
+                    ByteView::from(attempt_control_key(job_id, epoch)),
+                    ByteView::from(
+                        launch
+                            .to_bytes()
+                            .map_err(|error| JobMutationError::Storage(error.to_string()))?,
+                    ),
+                ));
+            }
             batch_write(storage, writes, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;

@@ -11,13 +11,13 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE,
     DEDUP_INDEX_KEYSPACE, JOB_CLAIM_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
-    JOB_STATE_KEYSPACE, KEY_WAIT_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE,
-    RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
+    JOB_STATE_KEYSPACE, KEY_WAIT_KEYSPACE, LAUNCH_RECORD_KEYSPACE, OUTPUT_RECORD_KEYSPACE,
+    PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
     JobErrorKind, JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope,
-    JobRecordError, JobResultPayload, JobState, JobTransitionError, RunCrateStatus,
+    JobRecordError, JobResultPayload, JobState, JobTransitionError, LaunchRecord, RunCrateStatus,
     attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_dedup_key, crate_job_id,
     due_index_key, encode_dedup_value, job_active_key, job_entry_key, job_entry_prefix,
     job_owner_cursor, job_prune_key, job_record_key, job_wait_key, lease_index_key,
@@ -275,6 +275,10 @@ pub fn prune_delete_entries(record: &JobRecord) -> JobDeletes {
         ));
         deletes.push((
             OUTPUT_RECORD_KEYSPACE.to_string(),
+            ByteView::from(attempt_control_key(record.job_id, epoch)),
+        ));
+        deletes.push((
+            LAUNCH_RECORD_KEYSPACE.to_string(),
             ByteView::from(attempt_control_key(record.job_id, epoch)),
         ));
     }

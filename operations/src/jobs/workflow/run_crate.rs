@@ -12,7 +12,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, RunCrateStatus, RunLink,
+    JobResultPayload, JobState, LaunchRecord, RunCrateStatus, RunLink,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -22,6 +22,7 @@ use aruna_core::structs::storage::data::identity::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::json;
 use ulid::Ulid;
 
@@ -30,11 +31,13 @@ const CRATE_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
 const WORKFLOW_RUN_CONTEXT: &str = "https://w3id.org/ro/terms/workflow-run/context";
 const CRATE_PROFILE: &str = "https://w3id.org/ro/crate/1.2";
 pub(crate) const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5";
+const TERMS: &str = "https://w3id.org/aruna/terms/";
 const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{
-    put_crate_outcome, put_crate_status, read_crate_status, read_job_record, read_run_link,
+    put_crate_outcome, put_crate_status, read_crate_status, read_job_record, read_launch_record,
+    read_run_link,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
@@ -233,7 +236,21 @@ pub(crate) async fn record_crate(
         }
     };
     let realm_id = driver.serving_realm(parent.created_by.realm_id);
-    let jsonld = build_crate_jsonld(parent, spec, (realm_id, document_id), &devices);
+    let launch = match read_launch_record(storage, parent).await {
+        Ok(launch) => launch,
+        Err(error) => {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "run crate launch record read failed: {error}"
+            )));
+        }
+    };
+    let jsonld = build_crate_jsonld(
+        parent,
+        spec,
+        (realm_id, Some(document_id)),
+        &devices,
+        launch.as_ref(),
+    );
 
     let (status, resource, written) = match route_metadata_create(
         CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
@@ -411,6 +428,63 @@ async fn remote_device(
     }
 }
 
+/// The contextual entity naming the node and site an execution ran on.
+const SITE_ID: &str = "#execution-site";
+
+fn env_entity(name: &str) -> String {
+    format!("#env-{}", utf8_percent_encode(name, NON_ALPHANUMERIC))
+}
+
+/// Granted limits and the working directory as PropertyValues; unbounded dimensions are omitted.
+fn launch_properties(launch: &LaunchRecord) -> Vec<serde_json::Value> {
+    let resources = &launch.resources;
+    let cores = resources
+        .nano_cpus
+        .map(|nanos| (nanos as f64 / 1e9).to_string());
+    let values = [
+        ("cpu-cores", "CPU cores", cores),
+        (
+            "ram-bytes",
+            "Memory bytes",
+            resources.ram_bytes.map(|v| v.to_string()),
+        ),
+        (
+            "disk-bytes",
+            "Disk bytes",
+            resources.disk_bytes.map(|v| v.to_string()),
+        ),
+        (
+            "workspace-bytes",
+            "Workspace bytes",
+            resources.workspace_bytes.map(|v| v.to_string()),
+        ),
+        (
+            "walltime-ms",
+            "Walltime milliseconds",
+            resources.walltime_ms.map(|v| v.to_string()),
+        ),
+        (
+            "working-directory",
+            "Working directory",
+            launch.workdir.clone(),
+        ),
+    ];
+    values
+        .into_iter()
+        .filter_map(|(term, name, value)| {
+            value.map(|value| {
+                json!({
+                    "@id": format!("#{term}"),
+                    "@type": "PropertyValue",
+                    "name": name,
+                    "propertyID": format!("{TERMS}{term}"),
+                    "value": value
+                })
+            })
+        })
+        .collect()
+}
+
 /// The contextual entity id of one device an input came from.
 fn device_entity(device: &str) -> String {
     format!("#device-{device}")
@@ -421,10 +495,15 @@ fn device_entity(device: &str) -> String {
 fn build_crate_jsonld(
     record: &JobRecord,
     spec: &ExecutionSpec,
-    (realm_id, document_id): (RealmId, Ulid),
+    (realm_id, document_id): (RealmId, Option<Ulid>),
     devices: &BTreeMap<String, String>,
+    launch: Option<&LaunchRecord>,
 ) -> String {
-    let root = format!("https://w3id.org/aruna/{document_id}");
+    // A local crate has no realm document yet, so its root is the crate folder itself.
+    let root = document_id.map_or_else(
+        || "./".to_string(),
+        |document_id| format!("https://w3id.org/aruna/{document_id}"),
+    );
     let action_id = format!("#run-{}", record.job_id);
     let agent_id = format!("#agent-{}", record.created_by);
     let software_id = format!("#software-{}", record.job_id);
@@ -574,6 +653,8 @@ fn build_crate_jsonld(
             "value": bucket
         })
     });
+    let mut properties: Vec<serde_json::Value> = workspace_property.into_iter().collect();
+    properties.extend(launch.map(launch_properties).unwrap_or_default());
 
     let mut action = json!({
         "@id": action_id.clone(),
@@ -587,11 +668,23 @@ fn build_crate_jsonld(
         "actionStatus": {"@id": action_status}
     });
     if let Some(map) = action.as_object_mut() {
-        if workspace_property.is_some() {
-            map.insert(
-                "additionalProperty".to_string(),
-                json!([{"@id": "#workspace-bucket"}]),
-            );
+        if !properties.is_empty() {
+            let ids: Vec<_> = properties
+                .iter()
+                .map(|property| json!({ "@id": property["@id"].clone() }))
+                .collect();
+            map.insert("additionalProperty".to_string(), json!(ids));
+        }
+        if let Some(launch) = launch {
+            map.insert("location".to_string(), json!({ "@id": SITE_ID }));
+            let environment: Vec<_> = launch
+                .env
+                .keys()
+                .map(|name| json!({ "@id": env_entity(name) }))
+                .collect();
+            if !environment.is_empty() {
+                map.insert("environment".to_string(), json!(environment));
+            }
         }
         if !command.is_empty() {
             map.insert("description".to_string(), json!(command));
@@ -688,8 +781,26 @@ fn build_crate_jsonld(
             "identifier": device
         })
     }));
-    if let Some(property) = workspace_property {
-        graph.push(property);
+    graph.extend(properties);
+    if let Some(launch) = launch {
+        let mut site = json!({
+            "@id": SITE_ID,
+            "@type": "Place",
+            "identifier": launch.node_id.to_string(),
+            "additionalType": launch.executor_kind
+        });
+        if !launch.location.is_empty() {
+            site["name"] = json!(launch.location);
+        }
+        graph.push(site);
+        graph.extend(launch.env.iter().map(|(name, value)| {
+            json!({
+                "@id": env_entity(name),
+                "@type": "PropertyValue",
+                "name": name,
+                "value": value
+            })
+        }));
     }
 
     json!({
@@ -700,7 +811,8 @@ fn build_crate_jsonld(
                 "containerImage": "https://w3id.org/ro/terms/workflow-run#containerImage",
                 "registry": "https://w3id.org/ro/terms/workflow-run#registry",
                 "tag": "https://w3id.org/ro/terms/workflow-run#tag",
-                "sha256": "https://w3id.org/ro/terms/workflow-run#sha256"
+                "sha256": "https://w3id.org/ro/terms/workflow-run#sha256",
+                "environment": "https://w3id.org/ro/terms/workflow-run#environment"
             }
         ],
         "@graph": graph
@@ -904,8 +1016,9 @@ mod pure_tests {
         serde_json::from_str(&build_crate_jsonld(
             record,
             spec,
-            (record.created_by.realm_id, doc),
+            (record.created_by.realm_id, Some(doc)),
             &BTreeMap::new(),
+            None,
         ))
         .unwrap()
     }
@@ -1115,8 +1228,9 @@ mod tests {
         let jsonld = build_crate_jsonld(
             &record,
             &spec,
-            (record.created_by.realm_id, document_id),
+            (record.created_by.realm_id, Some(document_id)),
             &BTreeMap::new(),
+            None,
         );
         let directory = tempfile::tempdir().unwrap();
         let node = craqle::CraqleNode::open(directory.path()).unwrap();
@@ -1186,8 +1300,9 @@ mod tests {
         let jsonld: Value = serde_json::from_str(&build_crate_jsonld(
             &record,
             &spec,
-            (record.created_by.realm_id, document_id),
+            (record.created_by.realm_id, Some(document_id)),
             &devices,
+            None,
         ))
         .unwrap();
         let graph = jsonld["@graph"].as_array().unwrap();
@@ -1207,10 +1322,74 @@ mod tests {
         let plain = build_crate_jsonld(
             &record,
             &spec,
-            (record.created_by.realm_id, document_id),
+            (record.created_by.realm_id, Some(document_id)),
             &BTreeMap::new(),
+            None,
         );
         assert!(!plain.contains("IndividualProduct"));
+    }
+
+    fn launch() -> LaunchRecord {
+        LaunchRecord {
+            node_id: iroh::SecretKey::from_bytes(&[9; 32]).public(),
+            executor_kind: "kubernetes".to_string(),
+            location: "giessen".to_string(),
+            resources: aruna_core::compute::GrantedResources {
+                nano_cpus: Some(1_500_000_000),
+                ram_bytes: Some(9 << 30),
+                disk_bytes: None,
+                workspace_bytes: Some(10 << 30),
+                walltime_ms: Some(86_400_000),
+            },
+            workdir: Some("/work".to_string()),
+            env: BTreeMap::from([
+                ("API_TOKEN".to_string(), "hidden".to_string()),
+                ("THREADS".to_string(), "8".to_string()),
+            ]),
+            started_at_ms: Some(1),
+        }
+    }
+
+    #[test]
+    fn names_execution_site() {
+        // The executing node, its site, the granted limits and the environment are recorded.
+        let (record, spec) = execution_record();
+        let document_id = Ulid::from_bytes(record.job_id.to_bytes());
+        let launch = launch();
+        let jsonld: Value = serde_json::from_str(&build_crate_jsonld(
+            &record,
+            &spec,
+            (record.created_by.realm_id, Some(document_id)),
+            &BTreeMap::new(),
+            Some(&launch),
+        ))
+        .unwrap();
+        let graph = jsonld["@graph"].as_array().unwrap();
+        let find = |id: &str| graph.iter().find(|entity| entity["@id"] == id).unwrap();
+        let action = graph
+            .iter()
+            .find(|entity| entity["@type"] == "CreateAction")
+            .unwrap();
+        assert_eq!(entity_id(&action["location"]), Some(SITE_ID));
+        let site = find(SITE_ID);
+        assert_eq!(site["name"], "giessen");
+        assert_eq!(site["identifier"], launch.node_id.to_string());
+        assert_eq!(site["additionalType"], "kubernetes");
+        assert_eq!(find("#cpu-cores")["value"], "1.5");
+        assert_eq!(find("#ram-bytes")["value"], (9u64 << 30).to_string());
+        assert_eq!(find("#working-directory")["value"], "/work");
+        assert!(graph.iter().all(|entity| entity["@id"] != "#disk-bytes"));
+        let properties: Vec<_> = action["additionalProperty"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(entity_id)
+            .collect();
+        assert!(properties.contains(&"#workspace-bucket"));
+        assert!(properties.contains(&"#walltime-ms"));
+        assert_eq!(find("#env-API%5FTOKEN")["value"], "hidden");
+        assert_eq!(find("#env-THREADS")["value"], "8");
+        assert_eq!(action["environment"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -1226,8 +1405,9 @@ mod tests {
         let jsonld = build_crate_jsonld(
             &record,
             &spec,
-            (record.created_by.realm_id, document_id),
+            (record.created_by.realm_id, Some(document_id)),
             &devices,
+            Some(&launch()),
         );
         let directory = tempfile::tempdir().unwrap();
         let engine = ProfileShaclEngine::open(directory.path()).unwrap();

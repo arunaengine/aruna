@@ -332,7 +332,7 @@ async fn ready_with_intent(storage: &StorageHandle) -> (JobRecord, ulid::Ulid, A
                 .to_string(),
         attempt_epoch: 0,
     };
-    let record = record_attempt_intent(storage, job_id, token, intent, None, 5)
+    let record = record_attempt_intent(storage, job_id, token, intent, None, None, 5)
         .await
         .unwrap();
     (record.record, token, attempt)

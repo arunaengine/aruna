@@ -214,6 +214,7 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
             attempt_epoch: 0,
         },
         None,
+        None,
         unix_timestamp_millis(),
     )
     .await
