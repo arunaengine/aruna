@@ -1417,11 +1417,29 @@ impl ExecutorBackend for KubernetesBackend {
     }
 
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {
-        let mut job = self.get_job(context).await?;
+        let mut job = match self.get_job(context).await {
+            Ok(job) => job,
+            // A submit that failed before its Job still leaves what it created first.
+            Err(BackendError::NotFound(reason)) => {
+                self.remove_accessories(context).await?;
+                return Err(BackendError::NotFound(reason));
+            }
+            Err(error) => return Err(error),
+        };
         if job_state(&job) != Some("tombstone") {
             job = self.patch_state(context, "tombstone", true).await?;
         }
         self.strip_finalizer(context, &job).await?;
+        self.remove_accessories(context).await?;
+        // The Job goes last: deleting it earlier makes a cleanup retry observe
+        // NotFound, which discharges the obligation and leaks the PVC and Secret.
+        delete_named(self.jobs(), &context.attempt.external_name()).await
+    }
+}
+
+impl KubernetesBackend {
+    /// Everything an attempt owns besides its Job.
+    async fn remove_accessories(&self, context: &FenceContext) -> Result<(), BackendError> {
         self.remove_helpers(context).await?;
         self.delete_tasks(context).await?;
         self.remove_mounts(context).await?;
@@ -1440,10 +1458,7 @@ impl ExecutorBackend for KubernetesBackend {
             self.markers(),
             &marker_name(&context.attempt.external_name()),
         )
-        .await?;
-        // The Job goes last: deleting it earlier makes a cleanup retry observe
-        // NotFound, which discharges the obligation and leaks the PVC and Secret.
-        delete_named(self.jobs(), &context.attempt.external_name()).await
+        .await
     }
 }
 
@@ -2406,6 +2421,65 @@ mod tests {
             seen.last().map(String::as_str),
             Some("DELETE /apis/batch/v1/namespaces/compute/jobs/aruna-job-a1")
         );
+    }
+
+    #[tokio::test]
+    async fn cleans_without_job() {
+        // A submit that failed before its Job leaves a DataNode and the run Secret, which
+        // cleanup deletes before it reports the Job absent; this fake has them gone already.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let nodes = "/apis/kubedal.arunaengine.org/v1alpha1/namespaces/compute/datanodes";
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record request")
+                .push(format!("{method} {path}"));
+            let empty = |kind: &str| json!({"apiVersion": "v1", "kind": kind, "items": []});
+            match (method, path) {
+                ("GET", "/api/v1/namespaces/compute/pods") => (200, empty("PodList")),
+                ("GET", "/api/v1/namespaces/compute/persistentvolumeclaims") => {
+                    (200, empty("PersistentVolumeClaimList"))
+                }
+                ("GET", "/api/v1/persistentvolumes") => (200, empty("PersistentVolumeList")),
+                ("GET", path) if path == nodes => (
+                    200,
+                    json!({
+                        "apiVersion": "kubedal.arunaengine.org/v1alpha1", "kind": "DataNodeList",
+                        "items": [{
+                            "apiVersion": "kubedal.arunaengine.org/v1alpha1", "kind": "DataNode",
+                            "metadata": {"name": "in-job", "namespace": "compute"}
+                        }]
+                    }),
+                ),
+                _ => (404, status_json(404)),
+            }
+        });
+        let mut config = test_config();
+        config.kubedal = Some(Box::new(crate::executor::config::KubedalMount {
+            driver: "kubedal.arunaengine.org".to_string(),
+            endpoint: "https://s3.example".to_string(),
+            region: String::new(),
+        }));
+        let backend = KubernetesBackend {
+            client,
+            config,
+            policies: Vec::new(),
+        };
+
+        let result = backend.cleanup(&context()).await;
+
+        assert!(
+            matches!(result, Err(BackendError::NotFound(_))),
+            "{result:?}"
+        );
+        let seen = seen.lock().expect("read requests").clone();
+        for accessory in [
+            format!("DELETE {nodes}/in-job"),
+            "DELETE /api/v1/namespaces/compute/secrets/aruna-job-a1-env".to_string(),
+        ] {
+            assert!(seen.contains(&accessory), "{accessory}");
+        }
     }
 
     #[tokio::test]
