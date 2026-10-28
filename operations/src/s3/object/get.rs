@@ -1275,6 +1275,11 @@ impl GetObjectOperation {
                 if self.reference_explicit {
                     return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                 }
+                // Recorded digests bind the bytes, so a drifted source never replaces them.
+                let bound = self.reference_cached.as_ref();
+                if bound.is_some_and(|stored| !stored.enforced_checksums().is_empty()) {
+                    return self.emit_error(GetObjectError::ReferenceSourceChanged);
+                }
                 // Current drift records a same-binding successor, but repeated
                 // change fails rather than serving mismatched bytes.
                 if self.drift_attempts < MAX_DRIFT_ATTEMPTS {

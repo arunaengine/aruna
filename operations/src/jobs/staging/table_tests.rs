@@ -522,7 +522,8 @@ async fn list_columns_recorded() {
         "url,name,bytes,md5,time,note\n\
          {COLI}md5checksums.txt,good.txt,4,{good},2025-11-17T17:38:21Z,coli sums\n\
          {HUMAN}README.txt,wrong.txt,6,{wrong},,human readme\n\
-         {HUMAN}README.txt,bad.txt,six,{good},,broken size\n"
+         {HUMAN}README.txt,bad.txt,six,{good},,broken size\n\
+         {COLI}md5checksums.txt,drift.txt,5,{good},,size off\n"
     );
     let ctx = fixture.context(30).await;
     let lists = drive(
@@ -537,7 +538,7 @@ async fn list_columns_recorded() {
         .ok()
         .unwrap();
 
-    assert_eq!(fixture.run(31).await, (2, 1));
+    assert_eq!(fixture.run(31).await, (3, 1));
     assert_eq!(
         site.count(&Method::HEAD, &format!("{COLI}md5checksums.txt")),
         0
@@ -545,6 +546,12 @@ async fn list_columns_recorded() {
     assert_eq!(site.count(&Method::HEAD, &format!("{HUMAN}README.txt")), 0);
     assert_eq!(fixture.read("files/good.txt").await.unwrap(), b"sums");
     assert!(fixture.read("files/wrong.txt").await.is_err());
+    // A source whose size differs is refused; no successor drops the list's checksum.
+    let bucket = fixture.spec.bucket.clone();
+    let before = fixture.head(&bucket, "files/drift.txt").await.unwrap().0;
+    assert!(fixture.read("files/drift.txt").await.is_err());
+    let after = fixture.head(&bucket, "files/drift.txt").await.unwrap().0;
+    assert_eq!(before, after);
 
     let hits = fixture.hits("sums").await;
     assert_eq!(hits.len(), 1);
