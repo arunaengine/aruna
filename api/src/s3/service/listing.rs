@@ -9,14 +9,14 @@ use crate::s3::scope::SubpathScope;
 use crate::s3::util::{map_checksum_algorithm, map_checksum_type};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::blob::BlobHeadKey;
-use aruna_operations::driver::drive;
+use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::multipart::parts::ListPartsResult;
 use aruna_operations::s3::multipart::uploads::ListUploadsResult;
-use aruna_operations::s3::object::list::{
-    ListBucketInput as LOV2I, ListBucketOperation, ListContinuationToken,
-};
+use aruna_operations::s3::object::list::ListedObject;
+use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListContinuationToken};
 use aruna_operations::s3::object::versions::{ListVersionsItem, ListVersionsResult};
+use aruna_operations::s3::object::visible::{HiddenCursor, NextPage, VisibleError, visible_page};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use percent_encoding::utf8_percent_encode;
@@ -35,6 +35,8 @@ pub(super) struct ObjectListingPage {
     pub(super) contents: Vec<Object>,
     pub(super) common_prefixes: Vec<CommonPrefix>,
     pub(super) continuation_token: Option<ListContinuationToken>,
+    /// A sealed cursor in place of the token, when the page stopped among hidden entries.
+    pub(super) sealed: Option<String>,
 }
 
 /// Resumes a delimited ListObjects page past the group the marker collapses
@@ -114,96 +116,46 @@ impl ArunaS3Service {
             .transpose()
     }
 
-    async fn readable_prefix(
-        &self,
-        input: &LOV2I,
-        prefix: String,
-        scope: &SubpathScope,
-        remaining_pages: &mut usize,
-    ) -> S3Result<bool> {
-        let mut input = LOV2I {
-            prefix: Some(prefix),
-            delimiter: None,
-            continuation_token: None,
-            start_after: None,
-            max_keys: None,
-            ..input.clone()
-        };
-        loop {
-            consume_scope_page(remaining_pages)?;
-            let result = drive(ListBucketOperation::new(input.clone()), &self.state)
-                .await
-                .map_err(IntoS3Error::into_s3_error)?;
-            if result
-                .objects
-                .iter()
-                .any(|object| scope.allows_key(&object.head.key))
-            {
-                return Ok(true);
-            }
-            let Some(token) = result.continuation_token else {
-                return Ok(false);
-            };
-            input.continuation_token = Some(token);
-        }
-    }
-
-    /// Runs one listing page shared by ListObjects and ListObjectsV2.
+    /// Runs one listing page shared by ListObjects and ListObjectsV2. Only entries the reader
+    /// may see show, a common prefix once one below it does; a page that stopped among hidden
+    /// entries continues from a sealed cursor.
     pub(super) async fn run_object_listing(
         &self,
-        mut input: LOV2I,
-        owner: Option<Owner>,
+        input: LOV2I,
+        (owner, reader): (Option<Owner>, Option<&UserAccess>),
         url_encoded: bool,
         scope: Option<&SubpathScope>,
-        bounds: Option<(String, Option<String>)>,
+        (bounds, hidden): (Option<(String, Option<String>)>, Option<HiddenCursor>),
     ) -> S3Result<ObjectListingPage> {
-        let mut remaining_pages = 100;
-        if scope.is_some() {
-            input.max_keys = Some(
-                input
-                    .max_keys
-                    .unwrap_or(ListBucketOperation::DEFAULT_MAX_KEYS)
-                    .min(remaining_pages - 1),
-            );
-        }
-        let result = loop {
-            consume_scope_page(&mut remaining_pages)?;
-            let operation = match bounds.clone() {
-                Some((lower, upper)) => {
-                    ListBucketOperation::new(input.clone()).with_bounds(lower, upper)
-                }
-                None => ListBucketOperation::new(input.clone()),
-            };
-            let mut result = drive(operation, &self.state)
-                .await
-                .map_err(IntoS3Error::into_s3_error)?;
-
-            if let Some(scope) = scope {
-                result
-                    .objects
-                    .retain(|object| scope.allows_key(&object.head.key));
-                let mut prefixes = Vec::new();
-                for prefix in result.common_prefixes {
-                    if scope.allows_prefix(&prefix)
-                        && self
-                            .readable_prefix(&input, prefix.clone(), scope, &mut remaining_pages)
-                            .await?
-                    {
-                        prefixes.push(prefix);
+        let bucket = input.bucket.clone();
+        let groups = |prefix: &str| scope.is_none_or(|scope| scope.allows_prefix(prefix));
+        let listed = visible_page(
+            self.state.as_ref(),
+            input,
+            (hidden, bounds),
+            |object: &ListedObject| {
+                let object = object.clone();
+                let bucket = &bucket;
+                Box::pin(async move {
+                    if !scope.is_none_or(|scope| scope.allows_key(&object.head.key)) {
+                        return Ok(false);
                     }
-                }
-                result.common_prefixes = prefixes;
-            }
-
-            if !result.objects.is_empty()
-                || !result.common_prefixes.is_empty()
-                || result.continuation_token.is_none()
-            {
-                break result;
-            }
-            input.continuation_token = result.continuation_token;
-            input.start_after = None;
+                    self.link_listable(reader, bucket, &object).await
+                })
+            },
+            groups,
+        );
+        let page = listed.await.map_err(|error| match error {
+            VisibleError::List(error) => error.into_s3_error(),
+            VisibleError::Shows(error) => error,
+            VisibleError::Cursor => s3_error!(InternalError, "The listing cursor was not sealed"),
+        })?;
+        let (continuation_token, sealed) = match page.next {
+            Some(NextPage::After(token)) => (Some(token), None),
+            Some(NextPage::Sealed(sealed)) => (None, Some(sealed)),
+            None => (None, None),
         };
+        let result = (page.objects, page.prefixes);
 
         let encode_field = |value: String| -> String {
             if url_encoded {
@@ -213,18 +165,7 @@ impl ArunaS3Service {
             }
         };
 
-        let scoped_token = if scope.is_some() && result.continuation_token.is_some() {
-            scoped_marker(
-                &input.bucket,
-                result.objects.last().map(|object| object.head.key.as_str()),
-                result.common_prefixes.last().map(String::as_str),
-            )?
-        } else {
-            None
-        };
-        let contents: Vec<Object> = result
-            .objects
-            .into_iter()
+        let contents: Vec<Object> = (result.0.into_iter())
             .map(|object| {
                 let response_fields = self.build_response_fields(
                     object.location.as_ref(),
@@ -244,9 +185,7 @@ impl ArunaS3Service {
                 }
             })
             .collect();
-        let common_prefixes: Vec<CommonPrefix> = result
-            .common_prefixes
-            .into_iter()
+        let common_prefixes: Vec<CommonPrefix> = (result.1.into_iter())
             .map(|prefix| CommonPrefix {
                 prefix: Some(encode_field(prefix)),
             })
@@ -255,21 +194,10 @@ impl ArunaS3Service {
         Ok(ObjectListingPage {
             contents,
             common_prefixes,
-            continuation_token: scope
-                .map(|_| scoped_token)
-                .unwrap_or(result.continuation_token),
+            continuation_token,
+            sealed,
         })
     }
-}
-
-fn consume_scope_page(remaining_pages: &mut usize) -> S3Result<()> {
-    *remaining_pages = remaining_pages.checked_sub(1).ok_or_else(|| {
-        s3_error!(
-            SlowDown,
-            "Listing scan limit reached; request a narrower prefix"
-        )
-    })?;
-    Ok(())
 }
 
 pub(super) fn scoped_marker(
@@ -471,6 +399,7 @@ impl ArunaS3Service {
                     location,
                     source_metadata,
                     created_at,
+                    ..
                 } => {
                     let response_fields = self.build_response_fields(
                         location.as_ref(),
@@ -541,27 +470,8 @@ impl ArunaS3Service {
 
 #[cfg(test)]
 mod tests {
-    use super::{consume_scope_page, scoped_marker};
+    use super::scoped_marker;
     use aruna_core::structs::storage::blob::BlobHeadKey;
-
-    #[test]
-    fn scoped_scan_bounded() {
-        let mut remaining = 100;
-        for _ in 0..100 {
-            consume_scope_page(&mut remaining).unwrap();
-        }
-        let error = consume_scope_page(&mut remaining).unwrap_err();
-        assert_eq!(error.code(), &s3s::S3ErrorCode::SlowDown);
-    }
-
-    #[test]
-    fn prefix_pages_progress() {
-        let mut remaining = 100;
-        for expected in (97..100).rev() {
-            consume_scope_page(&mut remaining).unwrap();
-            assert_eq!(remaining, expected);
-        }
-    }
 
     #[test]
     fn prefix_token_precedence() {

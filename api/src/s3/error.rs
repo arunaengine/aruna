@@ -601,6 +601,10 @@ impl IntoS3Error for GetObjectError {
                 "The security token does not open the bucket key"
             ),
             GetObjectError::NoSuchVersion => missing_version_error(),
+            // The gateway follows links before this point; anything else may not read them.
+            GetObjectError::Link(_) => {
+                s3_error!(NotImplemented, "This read does not follow links")
+            }
             GetObjectError::Abe(AbeError::Pending | AbeError::Required) => bucket_locked_error(),
             GetObjectError::Abe(AbeError::WrongKey) => {
                 s3_error!(AccessDenied, "The object key does not match this version")

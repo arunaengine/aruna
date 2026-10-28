@@ -473,10 +473,11 @@ pub(crate) fn build_source_access(
 ) -> Result<ResolvedSourceAccess, SourceResolutionError> {
     validate_source_path(source_path, allow_root)?;
 
-    if kind == SourceConnectorKind::ArunaNative {
-        return Err(SourceResolutionError::UnsupportedConnectorKind(
-            SourceConnectorKind::ArunaNative,
-        ));
+    if matches!(
+        kind,
+        SourceConnectorKind::ArunaNative | SourceConnectorKind::ArunaLink
+    ) {
+        return Err(SourceResolutionError::UnsupportedConnectorKind(kind));
     }
 
     let mut config = public_config.clone();

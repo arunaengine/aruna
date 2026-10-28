@@ -1793,6 +1793,7 @@ mod tests {
                 admitted_at_ms: 1_000,
             },
             captured_inputs: Vec::new(),
+            input_pages: None,
             output_policies: Vec::new(),
             placement: PlacementRef::NIL,
         }

@@ -1552,6 +1552,192 @@ async fn subpath_hides_siblings() {
     assert_eq!(keys, vec!["imaging/scan-a", "imaging/scan-b"]);
 }
 
+/// Writes a link at `study/<at>` to `bucket/key` of `group_id`, recording `etag`.
+async fn write_link(
+    service: &ArunaS3Service,
+    (user_access, at): (&UserAccess, &str),
+    (bucket, key, group_id): (&str, &str, Ulid),
+    etag: &str,
+) {
+    let target = aruna_core::structs::storage::link::LinkTarget {
+        arn: aruna_core::structs::storage::replication::VersionedObjectArn {
+            realm_id: service.realm_id,
+            node_id: service.node_id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version: Ulid::generate(),
+        },
+        group_id,
+    };
+    write_link_to(service, (user_access, at), target, etag).await;
+}
+
+/// Writes a link at `study/<at>` to `target`, recording `etag`.
+async fn write_link_to(
+    service: &ArunaS3Service,
+    (user_access, at): (&UserAccess, &str),
+    target: aruna_core::structs::storage::link::LinkTarget,
+    etag: &str,
+) {
+    let version_id = Ulid::generate();
+    let version = BlobVersion::reference(
+        target.binding(),
+        source_metadata(4, etag),
+        UNIX_EPOCH,
+        user_access.user_identity,
+        UNIX_EPOCH,
+    );
+    write_storage_value(
+        &service.state.storage_handle,
+        BLOB_VERSIONS_KEYSPACE,
+        VersionKey::new("study", at, version_id).to_bytes().unwrap(),
+        version.to_bytes().unwrap(),
+    )
+    .await;
+    write_head(&service.state.storage_handle, "study", at, version_id).await;
+}
+
+#[tokio::test]
+async fn relinked_get_fails() {
+    // A GET naming the ETag of an earlier target fails once the key links elsewhere, so
+    // ranged reads never mix the bytes of two targets.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let link = (&user_access, "links/db");
+    write_link(&service, link, ("study", "imaging/scan-a", group_id), "v2").await;
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let request = S3Request {
+        input: s3s::dto::GetObjectInput {
+            bucket: "study".to_string(),
+            key: "links/db".to_string(),
+            if_match: Some(s3s::dto::ETagCondition::ETag(s3s::dto::ETag::Strong(
+                "v1".to_string(),
+            ))),
+            ..Default::default()
+        },
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let error = service.get_object(request).await.unwrap_err();
+    assert_eq!(error.code(), &s3s::S3ErrorCode::PreconditionFailed);
+}
+
+#[tokio::test]
+async fn remote_relink_asks_target() {
+    // A wrong ETag for a target on another node is answered only after that node admits the
+    // GET; here it cannot be reached, so the caller learns nothing about the ETag.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let target = aruna_core::structs::storage::link::LinkTarget {
+        arn: aruna_core::structs::storage::replication::VersionedObjectArn {
+            realm_id: service.realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[77; 32]).public(),
+            bucket: "study".to_string(),
+            key: "imaging/scan-a".to_string(),
+            version: Ulid::generate(),
+        },
+        group_id,
+    };
+    write_link_to(&service, (&user_access, "links/db"), target, "v2").await;
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let request = S3Request {
+        input: s3s::dto::GetObjectInput {
+            bucket: "study".to_string(),
+            key: "links/db".to_string(),
+            if_match: Some(s3s::dto::ETagCondition::ETag(s3s::dto::ETag::Strong(
+                "v1".to_string(),
+            ))),
+            ..Default::default()
+        },
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let error = service.get_object(request).await.unwrap_err();
+    assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+}
+
+#[tokio::test]
+async fn denied_relink_hides_length() {
+    // A wrong ETag with an unsatisfiable range is refused for a caller the target denies, so
+    // the range answer never tells such a caller the recorded length.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let link = (&user_access, "links/db");
+    write_link(&service, link, ("hidden", "db", Ulid::generate()), "v2").await;
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let request = S3Request {
+        input: s3s::dto::GetObjectInput {
+            bucket: "study".to_string(),
+            key: "links/db".to_string(),
+            if_match: Some(s3s::dto::ETagCondition::ETag(s3s::dto::ETag::Strong(
+                "v1".to_string(),
+            ))),
+            range: Some(s3s::dto::Range::Int {
+                first: 100,
+                last: Some(200),
+            }),
+            ..Default::default()
+        },
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let error = service.get_object(request).await.unwrap_err();
+    assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+}
+
+#[tokio::test]
+async fn hides_link_prefixes() {
+    // A folder that holds only a link to an unreadable target is no common prefix.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let link = (&user_access, "links/db");
+    write_link(&service, link, ("hidden", "db", Ulid::generate()), "etag").await;
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let input = ListObjectsV2Input {
+        bucket: "study".to_string(),
+        delimiter: Some("/".to_string()),
+        ..Default::default()
+    };
+    let output = service
+        .list_objects_v2(list_request(extensions, input))
+        .await
+        .unwrap()
+        .output;
+    let prefixes: Vec<String> = output
+        .common_prefixes
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|prefix| prefix.prefix)
+        .collect();
+    assert_eq!(prefixes, vec!["imaging/", "sequencing/"]);
+}
+
 async fn paged_request(
     service: &ArunaS3Service,
     user_access: &UserAccess,
@@ -1709,8 +1895,13 @@ async fn denied_listing_keys() {
 
 #[tokio::test]
 async fn scoped_scan_bounded() {
+    // Past more hidden keys than one request examines, a page ends empty with a sealed token
+    // that names none of them, and the next page goes on to the first key the caller sees.
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
     let (_storage_dir, service, user_access, group_id) = subpath_node().await;
-    let keys: Vec<_> = (0..101).map(|index| format!("hidden/{index:03}")).collect();
+    let keys: Vec<_> = (0..SCAN_BUDGET + 5)
+        .map(|index| format!("hidden/{index:05}"))
+        .collect();
     seed_materialized_keys(
         &service.state.storage_handle,
         "study",
@@ -1720,8 +1911,277 @@ async fn scoped_scan_bounded() {
     )
     .await;
     let request = paged_request(&service, &user_access, group_id, None).await;
-    let error = service.list_objects_v2(request).await.unwrap_err();
-    assert_eq!(error.code(), &s3s::S3ErrorCode::SlowDown);
+    let first = service.list_objects_v2(request).await.unwrap().output;
+    assert!(first.contents.unwrap_or_default().is_empty());
+    assert_eq!(first.is_truncated, Some(true));
+    let token = first.next_continuation_token.expect("a sealed token");
+    assert!(token.starts_with('~'), "{token}");
+    let request = paged_request(&service, &user_access, group_id, Some(token)).await;
+    let second = service.list_objects_v2(request).await.unwrap().output;
+    let keys: Vec<_> = (second.contents.unwrap_or_default().into_iter())
+        .filter_map(|object| object.key)
+        .collect();
+    assert_eq!(keys, vec!["imaging/scan-a"]);
+}
+
+#[tokio::test]
+async fn hides_link_only_prefix() {
+    // A prefix holding more unreadable links than one request examines never shows; the page
+    // that stops inside it is empty and sealed, and the listing resumes past it.
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    for index in 0..=SCAN_BUDGET {
+        let at = format!("links/{index:05}");
+        let target = ("hidden", "db", Ulid::from_parts(9, 9));
+        write_link(&service, (&user_access, &at), target, "etag").await;
+    }
+    let (mut token, mut names, mut sealed) = (None, Vec::new(), 0);
+    for _ in 0..8 {
+        let mut extensions = Extensions::new();
+        extensions.insert(user_access.clone());
+        extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+        let input = ListObjectsV2Input {
+            bucket: "study".to_string(),
+            delimiter: Some("/".to_string()),
+            max_keys: Some(1),
+            continuation_token: token.take(),
+            ..Default::default()
+        };
+        let output = service
+            .list_objects_v2(list_request(extensions, input))
+            .await
+            .unwrap()
+            .output;
+        let prefixes = (output.common_prefixes.unwrap_or_default().into_iter())
+            .filter_map(|prefix| prefix.prefix);
+        let keys =
+            (output.contents.unwrap_or_default().into_iter()).filter_map(|object| object.key);
+        let page: Vec<String> = prefixes.chain(keys).collect();
+        token = output.next_continuation_token;
+        if page.is_empty() && token.as_deref().is_some_and(|token| token.starts_with('~')) {
+            sealed += 1;
+        }
+        names.extend(page);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(names, vec!["imaging/", "notes.txt", "sequencing/"]);
+    assert_eq!(sealed, 1);
+}
+
+/// The versions of `study` a request lists, as the owner, with its next markers.
+async fn listed_versions(
+    service: &ArunaS3Service,
+    (user_access, group_id): (&UserAccess, Ulid),
+    input: s3s::dto::ListObjectVersionsInput,
+) -> s3s::dto::ListObjectVersionsOutput {
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let request = S3Request {
+        input,
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    service.list_object_versions(request).await.unwrap().output
+}
+
+#[tokio::test]
+async fn hides_link_versions() {
+    // A prefix holding only an unreadable link version is no common prefix, and a page that
+    // passed the link resumes after the last version it showed.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let link = (&user_access, "links/db");
+    write_link(&service, link, ("hidden", "db", Ulid::generate()), "etag").await;
+    let grouped = s3s::dto::ListObjectVersionsInput {
+        bucket: "study".to_string(),
+        delimiter: Some("/".to_string()),
+        ..Default::default()
+    };
+    let output = listed_versions(&service, (&user_access, group_id), grouped).await;
+    let prefixes: Vec<_> = (output.common_prefixes.unwrap_or_default().into_iter())
+        .filter_map(|prefix| prefix.prefix)
+        .collect();
+    assert_eq!(prefixes, vec!["imaging/", "sequencing/"]);
+    let paged = s3s::dto::ListObjectVersionsInput {
+        bucket: "study".to_string(),
+        key_marker: Some("imaging/scan-a".to_string()),
+        max_keys: Some(2),
+        ..Default::default()
+    };
+    let output = listed_versions(&service, (&user_access, group_id), paged).await;
+    let keys: Vec<_> = (output.versions.unwrap_or_default().into_iter())
+        .filter_map(|version| version.key)
+        .collect();
+    assert_eq!(keys, vec!["imaging/scan-b"]);
+    assert_eq!(output.next_key_marker.as_deref(), Some("imaging/scan-b"));
+}
+
+#[tokio::test]
+async fn resumed_prefix_fills_page() {
+    // A prefix found after a sealed page fills a page of one by itself, for objects and for
+    // versions alike, and the listing goes on after it.
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    for index in 0..SCAN_BUDGET {
+        let at = format!("links/{index:05}");
+        let target = ("hidden", "db", Ulid::from_parts(9, 9));
+        write_link(&service, (&user_access, &at), target, "etag").await;
+    }
+    let storage = &service.state.storage_handle;
+    seed_materialized_keys(
+        storage,
+        "study",
+        &["links/zz"],
+        user_access.user_identity,
+        UNIX_EPOCH,
+    )
+    .await;
+    let expected = vec!["imaging/", "links/", "notes.txt", "sequencing/"];
+    let (mut token, mut names) = (None, Vec::new());
+    for _ in 0..8 {
+        let mut extensions = Extensions::new();
+        extensions.insert(user_access.clone());
+        extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+        let input = ListObjectsV2Input {
+            bucket: "study".to_string(),
+            delimiter: Some("/".to_string()),
+            max_keys: Some(1),
+            continuation_token: token.take(),
+            ..Default::default()
+        };
+        let output = service
+            .list_objects_v2(list_request(extensions, input))
+            .await
+            .unwrap()
+            .output;
+        let prefixes = (output.common_prefixes.unwrap_or_default().into_iter())
+            .filter_map(|prefix| prefix.prefix);
+        let keys =
+            (output.contents.unwrap_or_default().into_iter()).filter_map(|object| object.key);
+        let page: Vec<String> = prefixes.chain(keys).collect();
+        assert!(page.len() <= 1, "{page:?}");
+        names.extend(page);
+        token = output.next_continuation_token;
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(names, expected);
+    let (mut marker, mut names) = (None, Vec::new());
+    for _ in 0..8 {
+        let input = s3s::dto::ListObjectVersionsInput {
+            bucket: "study".to_string(),
+            delimiter: Some("/".to_string()),
+            max_keys: Some(1),
+            key_marker: marker.take(),
+            ..Default::default()
+        };
+        let output = listed_versions(&service, (&user_access, group_id), input).await;
+        let prefixes = (output.common_prefixes.unwrap_or_default().into_iter())
+            .filter_map(|prefix| prefix.prefix);
+        let keys =
+            (output.versions.unwrap_or_default().into_iter()).filter_map(|version| version.key);
+        let page: Vec<String> = prefixes.chain(keys).collect();
+        assert!(page.len() <= 1, "{page:?}");
+        names.extend(page);
+        if output.is_truncated != Some(true) {
+            break;
+        }
+        marker = output.next_key_marker;
+    }
+    assert_eq!(names, expected);
+}
+
+#[tokio::test]
+async fn refuses_stale_markers() {
+    // A sealed marker this node cannot open, as after its restart, is refused by ListObjects and
+    // ListObjectVersions instead of being read as a key that sorts past every object.
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let stale = format!("~{}", URL_SAFE_NO_PAD.encode([0xFF; 64]));
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let request = S3Request {
+        input: s3s::dto::ListObjectsInput {
+            bucket: "study".to_string(),
+            marker: Some(stale.clone()),
+            ..Default::default()
+        },
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions: extensions.clone(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let error = service.list_objects(request).await.unwrap_err();
+    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument);
+    let request = S3Request {
+        input: s3s::dto::ListObjectVersionsInput {
+            bucket: "study".to_string(),
+            key_marker: Some(stale),
+            ..Default::default()
+        },
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let error = service.list_object_versions(request).await.unwrap_err();
+    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument);
+}
+
+#[tokio::test]
+async fn cursor_names_shown() {
+    // A page that also passed a hidden link continues after the last key it showed, so its
+    // token never names the hidden one.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let link = (&user_access, "imaging/scan-a2");
+    write_link(&service, link, ("hidden", "db", Ulid::generate()), "etag").await;
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let input = ListObjectsV2Input {
+        bucket: "study".to_string(),
+        max_keys: Some(2),
+        ..Default::default()
+    };
+    let output = service
+        .list_objects_v2(list_request(extensions, input))
+        .await
+        .unwrap()
+        .output;
+    let keys: Vec<_> = (output.contents.unwrap_or_default().into_iter())
+        .filter_map(|object| object.key)
+        .collect();
+    assert_eq!(keys, vec!["imaging/scan-a"]);
+    let token = output.next_continuation_token.expect("more keys follow");
+    let token = ArunaS3Service::decode_list_token(Some(&token))
+        .unwrap()
+        .unwrap();
+    let last = BlobHeadKey::from_bytes(&token.last_key).unwrap().key;
+    assert_eq!(last, "imaging/scan-a");
 }
 
 #[tokio::test]

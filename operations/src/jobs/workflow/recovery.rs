@@ -19,7 +19,7 @@ use super::super::store::{
 };
 use super::compute::{RecoveryAction, recovery_action};
 use super::finalize::{cleanup_and_crate, fail_and_crate, finalize_attempt, finalize_cancel};
-use super::prepare::{build_task_spec, prepare_inputs};
+use super::prepare::{build_task_spec, job_bucket, prepare_attempt};
 use crate::driver::DriverContext;
 
 /// A submit error after the write-ahead intent is ambiguous: the container may
@@ -218,7 +218,8 @@ async fn retry_same_submit(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or_else(|| BackendError::Unavailable("execution needs a net handle".to_string()))?;
-    let prepared = Box::pin(prepare_inputs(context, spec, record, node_id))
+    let bucket = job_bucket(record);
+    let prepared = Box::pin(prepare_attempt(context, spec, record, node_id, &bucket))
         .await
         .map_err(|error| BackendError::Unavailable(error.message))?;
     let pinned_image = record

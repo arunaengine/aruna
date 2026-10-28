@@ -164,6 +164,48 @@ pub(crate) async fn node_state() -> Node {
     }
 }
 
+/// Writes a link at `key` to a target in a group the owner cannot read.
+pub(crate) async fn hidden_link(node: &Node, key: &str) {
+    use aruna_core::structs::storage::link::LinkTarget;
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    let target = LinkTarget {
+        arn: VersionedObjectArn {
+            realm_id: node.owner.realm_id,
+            node_id: node.state.get_node_id(),
+            bucket: "other".to_string(),
+            key: "x".to_string(),
+            version: ulid::Ulid::from_parts(5, 5),
+        },
+        group_id: ulid::Ulid::from_parts(9, 9),
+    };
+    let write = ReferenceWrite {
+        preassigned_version_id: None,
+        group_id: node.group_id,
+        user_id: node.owner.user_id,
+        realm_id: node.owner.realm_id,
+        node_id: node.state.get_node_id(),
+        bucket: BUCKET.to_string(),
+        key: key.to_string(),
+        expected_bucket: None,
+        version_source: target.binding(),
+        metadata: aruna_core::structs::execution::source_access::SourceMetadata {
+            content_length: 1,
+            content_type: None,
+            etag: Some(target.arn.version.to_string()),
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        },
+        inherited_policies: Vec::new(),
+        connector_guard: None,
+        restrictions: None,
+    };
+    write_reference_version(&node.state.get_ctx(), write)
+        .await
+        .unwrap();
+}
+
 pub(crate) fn bucket_info(group_id: Ulid, distribution: Option<DistributionBinding>) -> BucketInfo {
     BucketInfo {
         group_id,

@@ -241,16 +241,26 @@ async fn capture_inputs(
                 .resolved_version_id
                 .or(head.version_id)
                 .expect("input has a version"),
-            blake3: <[u8; 32]>::try_from(
-                location
-                    .hashes
-                    .get(HASH_BLAKE3)
-                    .expect("blake3 is stored")
-                    .as_slice(),
-            )
-            .expect("blake3 is 32 bytes"),
+            content: aruna_core::structs::execution::job::InputContent::Blake3(
+                <[u8; 32]>::try_from(
+                    location
+                        .hashes
+                        .get(HASH_BLAKE3)
+                        .expect("blake3 is stored")
+                        .as_slice(),
+                )
+                .expect("blake3 is 32 bytes"),
+            ),
             bytes: location.blob_size,
             policies: head.source_policies.clone(),
+            source_group_id: Default::default(),
+            public: false,
+            link: None,
+            source_pin: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
         });
     }
     captured

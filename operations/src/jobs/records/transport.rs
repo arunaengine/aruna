@@ -362,6 +362,7 @@ async fn accept_record(
         return Err(ServeError::Refused(JobRecordRejection::Invalid));
     }
     let rearms = rearms_witness(record.envelope());
+    let paged = binds_pages(&record.envelope().record).then(|| record.envelope().record.clone());
     let now_ms = aruna_core::time::unix_timestamp_millis();
     let outcome = drive(
         AppendRecordOperation::new(AppendRecordConfig {
@@ -395,6 +396,15 @@ async fn accept_record(
     }
     match outcome.admission {
         Admission::Authentic | Admission::Duplicate => {
+            // The publisher retries until this holder keeps the pages the record binds.
+            if let Some(record) = &paged {
+                super::pages::keep_pages(context.as_ref(), record, peer)
+                    .await
+                    .map_err(|error| {
+                        warn!(error = %error, "Job record input pages unavailable");
+                        ServeError::Unavailable
+                    })?;
+            }
             let cancels = load_kind_complete(context.as_ref(), family, JobRecordKind::Cancel)
                 .await
                 .map_err(|_| ServeError::Unavailable)?;
@@ -417,6 +427,14 @@ async fn accept_record(
             | JobRecordError::Unauthorized,
         ) => Err(ServeError::Refused(JobRecordRejection::Unauthorized)),
         Admission::Rejected(_) => Err(ServeError::Refused(JobRecordRejection::Invalid)),
+    }
+}
+
+fn binds_pages(record: &JobFamilyRecord) -> bool {
+    match record {
+        JobFamilyRecord::Spec(spec) => spec.input_pages.is_some(),
+        JobFamilyRecord::Launch(launch) => launch.input_pages.is_some(),
+        _ => false,
     }
 }
 

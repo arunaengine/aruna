@@ -44,6 +44,7 @@ use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive, gate_context, now_ms};
+use crate::jobs::records::pages::{planned_inputs, with_inputs};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{
@@ -93,6 +94,12 @@ pub async fn admit_launch(
         records = family_records(context, family).await?;
     }
     let spec = spec_of(&records, &intent)?;
+    // Paged inputs are read once here, so every check below sees the full lists; the signed
+    // launch itself stays as offered, because its receipt binds that exact record.
+    let spec = with_inputs(context.as_ref(), &spec).await.ok()?;
+    let mut planned = intent.clone();
+    planned.inputs = planned_inputs(context.as_ref(), &intent).await.ok()?;
+    planned.input_pages = None;
     // The launch becomes a retained record before it can be receipted; missing
     // family evidence is fetched before the offer is answered as undecidable.
     let origin = RecordOrigin::Peer(intent.scheduler_node_id);
@@ -114,7 +121,7 @@ pub async fn admit_launch(
     if already_running(family, &records, local) {
         return Some(Err(LaunchDecline::AlreadyRunning));
     }
-    let capability = match local_capability(context.as_ref(), &config, local, &intent, &spec).await
+    let capability = match local_capability(context.as_ref(), &config, local, &planned, &spec).await
     {
         Ok(capability) => capability,
         Err(decline) => return Some(Err(decline)),
@@ -129,7 +136,7 @@ pub async fn admit_launch(
     if let Err(decline) = authorize_submitter(context.as_ref(), &spec, local).await {
         return Some(Err(decline));
     }
-    match placement_verdict(context.as_ref(), &spec, &intent, &capability.subject).await {
+    match placement_verdict(context.as_ref(), &spec, &planned, &capability.subject).await {
         Ok(Some(decision)) => {
             return Some(Err(match DeclinedPolicy::new(decision) {
                 Ok(policy) => LaunchDecline::Policy(policy),
@@ -153,6 +160,7 @@ pub async fn admit_launch(
             local,
             spec,
             intent,
+            planned,
             capability,
             limits,
         },
@@ -181,6 +189,8 @@ struct ReceiptRound {
     local: NodeId,
     spec: LogicalJobSpec,
     intent: LaunchIntent,
+    /// The launch with its planned inputs inline, for the local job record.
+    planned: LaunchIntent,
     capability: ExecutorCapability,
     limits: ResourceEnvelope,
 }
@@ -230,7 +240,7 @@ async fn store_receipt(
     .map_err(|_| LaunchDecline::Draining)?;
     let record = materialize_local(
         &round.spec,
-        &round.intent,
+        &round.planned,
         physical_job_id,
         round.local,
         now,
@@ -667,18 +677,18 @@ async fn authorize_submitter(
     .map_err(|_| LaunchDecline::Unauthorized)
 }
 
-/// Whether one pinned input still describes the captured input it names. Any node
-/// may be the pinned source, because a registered copy serves the read; version,
-/// hash, and size bind the content, and the local target is not a remote read.
+/// Whether one pinned input still describes the captured input it names, resolved at
+/// `source`. Any node may be the pinned holder, because a registered copy serves the read;
+/// version, content and size bind the bytes, and the local target is not a remote read.
 pub(crate) fn pin_matches(
     captured: &CapturedInput,
     pin: &PlannedInput,
-    ingress: NodeId,
+    source: NodeId,
     local: NodeId,
 ) -> bool {
-    captured.source_node_id == ingress
+    captured.source_node_id == source
         && captured.version_id == pin.version_id
-        && captured.blake3 == pin.blake3
+        && captured.content == pin.content
         && captured.bytes == pin.bytes
         && pin.source_node_id != Some(local)
 }
@@ -719,15 +729,18 @@ async fn placement_verdict(
             .iter()
             .find(|captured| captured.destination_key == input.dest_key)
             .ok_or(LaunchDecline::Unauthorized)?;
-        if !pin_matches(captured, pin, spec.ingress_node_id, subject.node_id) {
+        let source = input.source_node_id.unwrap_or(spec.ingress_node_id);
+        if !pin_matches(captured, pin, source, subject.node_id) {
             return Err(LaunchDecline::Unauthorized);
         }
         let version = Some(captured.version_id);
-        let hash = captured.blake3;
         let mut policies = captured.policies.clone();
         policies.sort_unstable();
         policies.dedup();
-        if version != Some(pin.version_id) || hash != pin.blake3 || policies != pin.policies {
+        if version != Some(pin.version_id)
+            || captured.content != pin.content
+            || policies != pin.policies
+        {
             return Err(LaunchDecline::Unauthorized);
         }
         inputs.push(policies);
@@ -946,7 +959,7 @@ mod pure_tests {
         launch.inputs.push(PlannedInput {
             destination_key: "reads.fastq".to_string(),
             version_id,
-            blake3: [12u8; 32],
+            content: aruna_core::structs::execution::job::InputContent::Blake3([12u8; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_node_id: None,

@@ -267,7 +267,7 @@ pub struct SubmitExecutionRequest {
     /// Optional executor selector. Leave unset unless the realm documents one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_constraint: Option<String>,
-    /// Objects staged into the container before the run, at most 512.
+    /// Objects staged into or mounted for the run.
     #[serde(default)]
     pub inputs: Vec<ExecutionInputRequest>,
     /// Container paths captured after the run, at most 1024. Each names the
@@ -955,7 +955,7 @@ pub(crate) fn map_submit_error(
             ServerError::ServiceUnavailableReason("job_placement_unavailable".to_string())
         }
         SubmitJobError::QuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
-        SubmitJobError::AuthorityDenied => ServerError::Forbidden,
+        SubmitJobError::AuthorityDenied | SubmitJobError::InputDenied(_) => ServerError::Forbidden,
         moving @ SubmitJobError::RangeMoving(_) => {
             ServerError::ServiceUnavailableReason(moving.to_string())
         }
@@ -1175,7 +1175,7 @@ additionally need WRITE on that bucket, which must belong to the same group.
   image, entrypoint or command.
 - A `session_mount.prefix` that is absolute or carries an empty or `..` segment, or a
   `session_mount.path` that is not a folder below the working directory or lies under `.aruna`.
-- More than 512 inputs, more than 1024 outputs, or more than 32 output prefixes.
+- More than 1024 outputs or more than 32 output prefixes.
 - An empty `dest_key`, or a container path that is not absolute and traversal-free.
 - An output without a `bucket` under `workspace.mode` `none`, named in the message.
 - Two inputs sharing a container path, or two outputs sharing a container path or one destination.

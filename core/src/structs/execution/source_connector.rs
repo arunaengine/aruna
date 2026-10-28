@@ -26,6 +26,9 @@ pub enum SourceConnectorKind {
     /// A file of an Invenio record read through a repository connector. It is
     /// only created by reference imports, never registered as a source connector.
     Invenio,
+    /// A link to one exact Aruna version elsewhere. Every read is authorized at the target for
+    /// the caller; the link itself grants nothing.
+    ArunaLink,
 }
 
 impl SourceConnectorKind {
@@ -50,6 +53,7 @@ impl SourceConnectorKind {
             Self::ArunaNative => "aruna_native",
             Self::LocalDirectory => "local_directory",
             Self::Invenio => "invenio",
+            Self::ArunaLink => "aruna_link",
         }
     }
 }
@@ -87,7 +91,9 @@ pub fn source_namespace(
         SourceConnectorKind::Ftp => "user",
         SourceConnectorKind::S3 => "access_key_id",
         SourceConnectorKind::ArunaNative => "access_key",
-        SourceConnectorKind::LocalDirectory | SourceConnectorKind::Invenio => return None,
+        SourceConnectorKind::LocalDirectory
+        | SourceConnectorKind::Invenio
+        | SourceConnectorKind::ArunaLink => return None,
     };
     let principal = secret_config.get(field).filter(|value| !value.is_empty())?;
     let mut hasher = blake3::Hasher::new();

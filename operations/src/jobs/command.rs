@@ -201,7 +201,7 @@ pub struct SubmitExecutionCommand {
     /// Optional executor selector. Leave unset unless the realm documents one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_constraint: Option<String>,
-    /// Objects staged into the container before the run, at most 512.
+    /// Objects staged into or mounted for the run.
     #[serde(default)]
     pub inputs: Vec<ExecutionInput>,
     /// Container paths captured after the run, at most 1024. Each names the

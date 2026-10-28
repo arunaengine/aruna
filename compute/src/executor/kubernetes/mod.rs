@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES,
-    NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec,
-    TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
+    ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, NOBODY, OutputMatcher,
+    ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, TombstoneEvidence,
+    TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -49,10 +49,10 @@ mod session;
 mod status;
 
 use manifest::{
-    HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_pv_manifest, data_pvc_manifest,
-    helper_pod, job_manifest, marker_manifest, marker_name, mount_buckets, mount_pv_manifest,
-    mount_pvc_manifest, needs_workspace, network_policies, policy_manifests, pvc_manifest,
-    secret_manifest, secret_name, session_mount, workspace_name,
+    HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_node_manifest, data_pv_manifest,
+    data_pvc_manifest, helper_pod, job_manifest, marker_manifest, marker_name, mount_buckets,
+    mount_pv_manifest, mount_pvc_manifest, needs_workspace, network_policies, policy_manifests,
+    pvc_manifest, secret_manifest, secret_name, session_mount, workspace_name,
 };
 use status::{
     job_pending, job_status, pod_started, pod_stuck_reason, task_started, task_state,
@@ -221,6 +221,51 @@ impl KubernetesBackend {
         Ok(())
     }
 
+    /// One KubeDAL DataNode per mounted bucket; a node left by this same attempt is reused.
+    async fn ensure_data_nodes(
+        &self,
+        context: &FenceContext,
+        layout: &StageLayout,
+    ) -> Result<(), BackendError> {
+        for (index, bucket) in mount_buckets(layout).iter().enumerate() {
+            let value = data_node_manifest(context, &self.config, index, bucket)?;
+            let node: DynamicObject = serde_json::from_value(value)
+                .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
+            let name = node.name_any();
+            match self
+                .data_nodes()
+                .create(&PostParams::default(), &node)
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if api_code(&error) == Some(409) => {
+                    let existing = self.data_nodes().get(&name).await.map_err(kube_error)?;
+                    let epoch = existing
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.get(EPOCH_ANNOTATION))
+                        .and_then(|epoch| epoch.parse::<u64>().ok());
+                    let same = epoch == Some(context.attempt_epoch)
+                        && existing.data["spec"]["config"]["bucket"].as_str() == Some(bucket);
+                    if !same {
+                        return Err(BackendError::Conflict(format!(
+                            "DataNode `{name}` belongs to another attempt"
+                        )));
+                    }
+                }
+                Err(error) => return Err(kube_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn data_nodes(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk("kubedal.arunaengine.org", "v1alpha1", "DataNode");
+        let resource = kube::api::ApiResource::from_gvk_with_plural(&gvk, "datanodes");
+        Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
+    }
+
     async fn ensure_data(
         &self,
         context: &FenceContext,
@@ -324,6 +369,20 @@ impl KubernetesBackend {
             .map_err(kube_error)?
         {
             delete_named(self.pvs(), &pv.name_any()).await?;
+        }
+        if self.config.kubedal.is_some() {
+            let params = ListParams::default().labels(&selector);
+            for node in self.data_nodes().list(&params).await.map_err(kube_error)? {
+                match self
+                    .data_nodes()
+                    .delete(&node.name_any(), &DeleteParams::default())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) if api_code(&error) == Some(404) => {}
+                    Err(error) => return Err(kube_error(error)),
+                }
+            }
         }
         Ok(())
     }
@@ -929,7 +988,7 @@ impl ExecutorBackend for KubernetesBackend {
         BackendCaps {
             file_staging: true,
             direct_s3: !self.config.s3_cidrs.is_empty(),
-            s3_mount: self.config.s3_mount_driver.is_some(),
+            s3_mount: self.config.mounts_inputs(),
             network_policy: worker_site.is_some(),
             local_site: false,
             worker_site,
@@ -954,9 +1013,12 @@ impl ExecutorBackend for KubernetesBackend {
             .get(&self.config.storage_class)
             .await
             .map_err(kube_error)?;
+        let drivers: Api<CSIDriver> = Api::all(self.client.clone());
         if let Some(driver) = &self.config.s3_mount_driver {
-            let drivers: Api<CSIDriver> = Api::all(self.client.clone());
             drivers.get(driver).await.map_err(kube_error)?;
+        }
+        if let Some(kubedal) = &self.config.kubedal {
+            drivers.get(&kubedal.driver).await.map_err(kube_error)?;
         }
         let accounts: Api<ServiceAccount> =
             Api::namespaced(self.client.clone(), &self.config.namespace);
@@ -964,9 +1026,10 @@ impl ExecutorBackend for KubernetesBackend {
             .get(&self.config.service_account)
             .await
             .map_err(kube_error)?;
-        for (group, resource, subresource, verb) in
-            session::required_access(self.config.s3_mount_driver.is_some())
-        {
+        for (group, resource, subresource, verb) in session::required_access(
+            self.config.s3_mount_driver.is_some(),
+            self.config.kubedal.is_some(),
+        ) {
             session::check_access(
                 self.client.clone(),
                 &self.config.namespace,
@@ -1036,25 +1099,20 @@ impl ExecutorBackend for KubernetesBackend {
         }
         match spec.staging_mode {
             StagingMode::Files => {
-                self.ensure_pvc(
-                    context,
-                    spec.resources.disk_bytes.unwrap_or(DEFAULT_WORKSPACE_BYTES),
-                )
-                .await?;
+                self.ensure_pvc(context, workspace_bytes(spec)).await?;
                 self.stage(context, spec, cancel).await?;
             }
             StagingMode::DirectS3 => self.ensure_secret(context, spec).await?,
             StagingMode::S3Mount => {
                 if !spec.s3_mounts.is_empty() {
                     self.ensure_secret(context, spec).await?;
-                    self.ensure_mounts(context, &layout).await?;
+                    match self.config.kubedal.is_some() {
+                        true => self.ensure_data_nodes(context, &layout).await?,
+                        false => self.ensure_mounts(context, &layout).await?,
+                    }
                 }
                 if needs_workspace(spec) {
-                    self.ensure_pvc(
-                        context,
-                        spec.resources.disk_bytes.unwrap_or(DEFAULT_WORKSPACE_BYTES),
-                    )
-                    .await?;
+                    self.ensure_pvc(context, workspace_bytes(spec)).await?;
                     self.stage(context, spec, cancel).await?;
                 }
             }
@@ -1359,11 +1417,29 @@ impl ExecutorBackend for KubernetesBackend {
     }
 
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {
-        let mut job = self.get_job(context).await?;
+        let mut job = match self.get_job(context).await {
+            Ok(job) => job,
+            // A submit that failed before its Job still leaves what it created first.
+            Err(BackendError::NotFound(reason)) => {
+                self.remove_accessories(context).await?;
+                return Err(BackendError::NotFound(reason));
+            }
+            Err(error) => return Err(error),
+        };
         if job_state(&job) != Some("tombstone") {
             job = self.patch_state(context, "tombstone", true).await?;
         }
         self.strip_finalizer(context, &job).await?;
+        self.remove_accessories(context).await?;
+        // The Job goes last: deleting it earlier makes a cleanup retry observe
+        // NotFound, which discharges the obligation and leaks the PVC and Secret.
+        delete_named(self.jobs(), &context.attempt.external_name()).await
+    }
+}
+
+impl KubernetesBackend {
+    /// Everything an attempt owns besides its Job.
+    async fn remove_accessories(&self, context: &FenceContext) -> Result<(), BackendError> {
         self.remove_helpers(context).await?;
         self.delete_tasks(context).await?;
         self.remove_mounts(context).await?;
@@ -1382,10 +1458,7 @@ impl ExecutorBackend for KubernetesBackend {
             self.markers(),
             &marker_name(&context.attempt.external_name()),
         )
-        .await?;
-        // The Job goes last: deleting it earlier makes a cleanup retry observe
-        // NotFound, which discharges the obligation and leaks the PVC and Secret.
-        delete_named(self.jobs(), &context.attempt.external_name()).await
+        .await
     }
 }
 
@@ -1415,7 +1488,25 @@ impl KubernetesBackend {
             .list(&ListParams::default().labels(&mount_selector))
             .await
             .map_err(kube_error)?;
-        if pods.items.is_empty() && pvc.is_none() && marker.is_none() && mounts.items.is_empty() {
+        // A DataNode left alone is still this attempt's, so cleanup must not skip it.
+        let data_nodes = match self.config.kubedal.is_some() {
+            true => {
+                let params = ListParams::default().labels(&mount_selector);
+                self.data_nodes()
+                    .list(&params)
+                    .await
+                    .map_err(kube_error)?
+                    .items
+                    .len()
+            }
+            false => 0,
+        };
+        if pods.items.is_empty()
+            && pvc.is_none()
+            && marker.is_none()
+            && mounts.items.is_empty()
+            && data_nodes == 0
+        {
             return Ok(None);
         }
         let reference = pods
@@ -1492,7 +1583,7 @@ fn validate_spec(
             "Kubernetes tasks must run as 65534:65534".to_string(),
         ));
     }
-    if spec.staging_mode == StagingMode::S3Mount && config.s3_mount_driver.is_none() {
+    if spec.staging_mode == StagingMode::S3Mount && !config.mounts_inputs() {
         return Err(BackendError::InvalidSpec(
             "S3 mounts are disabled on this backend".to_string(),
         ));
@@ -1727,20 +1818,26 @@ where
     }
 }
 
+/// The workspace volume of a run: its disk request, else its staged inputs plus room to work.
+fn workspace_bytes(spec: &TaskSpec) -> u64 {
+    spec.resources.disk_bytes.unwrap_or_else(|| {
+        spec.inputs
+            .iter()
+            .fold(DEFAULT_WORKSPACE_BYTES, |total, input| {
+                total.saturating_add(input.size())
+            })
+    })
+}
+
 fn build_archive(
     tx: mpsc::Sender<Result<Bytes, BackendError>>,
     plan: StagePlan,
 ) -> Result<(), BackendError> {
-    let total = plan
-        .entries
+    // The workspace volume is sized for the inputs; their sum only must not wrap.
+    plan.entries
         .iter()
         .try_fold(0u64, |total, entry| total.checked_add(entry.size))
         .ok_or_else(|| BackendError::InvalidSpec("staged input size overflows".to_string()))?;
-    if total > MAX_TRANSFER_BYTES {
-        return Err(BackendError::InvalidSpec(
-            "staged inputs exceed the transfer limit".to_string(),
-        ));
-    }
     let writer = ArchiveWriter { tx };
     let mut builder = tar::Builder::new(writer);
     for output in &plan.layout.output_parents {
@@ -1896,13 +1993,13 @@ where
     Ok((parse_header(&header_bytes, path)?, join))
 }
 
-/// Check the header describes the requested file within the transfer bound.
+/// Check the header describes the requested regular file.
 fn parse_header(header_bytes: &[u8; 512], path: &str) -> Result<u64, BackendError> {
     let header = tar::Header::from_byte_slice(header_bytes);
     let size = header
         .size()
         .map_err(|error| BackendError::Api(format!("invalid fetch archive size: {error}")))?;
-    if size > MAX_TRANSFER_BYTES || !header.entry_type().is_file() {
+    if !header.entry_type().is_file() {
         return Err(BackendError::InvalidSpec(
             "fetch archive is not a bounded regular file".to_string(),
         ));
@@ -2324,6 +2421,65 @@ mod tests {
             seen.last().map(String::as_str),
             Some("DELETE /apis/batch/v1/namespaces/compute/jobs/aruna-job-a1")
         );
+    }
+
+    #[tokio::test]
+    async fn cleans_without_job() {
+        // A submit that failed before its Job leaves a DataNode and the run Secret, which
+        // cleanup deletes before it reports the Job absent; this fake has them gone already.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let nodes = "/apis/kubedal.arunaengine.org/v1alpha1/namespaces/compute/datanodes";
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record request")
+                .push(format!("{method} {path}"));
+            let empty = |kind: &str| json!({"apiVersion": "v1", "kind": kind, "items": []});
+            match (method, path) {
+                ("GET", "/api/v1/namespaces/compute/pods") => (200, empty("PodList")),
+                ("GET", "/api/v1/namespaces/compute/persistentvolumeclaims") => {
+                    (200, empty("PersistentVolumeClaimList"))
+                }
+                ("GET", "/api/v1/persistentvolumes") => (200, empty("PersistentVolumeList")),
+                ("GET", path) if path == nodes => (
+                    200,
+                    json!({
+                        "apiVersion": "kubedal.arunaengine.org/v1alpha1", "kind": "DataNodeList",
+                        "items": [{
+                            "apiVersion": "kubedal.arunaengine.org/v1alpha1", "kind": "DataNode",
+                            "metadata": {"name": "in-job", "namespace": "compute"}
+                        }]
+                    }),
+                ),
+                _ => (404, status_json(404)),
+            }
+        });
+        let mut config = test_config();
+        config.kubedal = Some(Box::new(crate::executor::config::KubedalMount {
+            driver: "kubedal.arunaengine.org".to_string(),
+            endpoint: "https://s3.example".to_string(),
+            region: String::new(),
+        }));
+        let backend = KubernetesBackend {
+            client,
+            config,
+            policies: Vec::new(),
+        };
+
+        let result = backend.cleanup(&context()).await;
+
+        assert!(
+            matches!(result, Err(BackendError::NotFound(_))),
+            "{result:?}"
+        );
+        let seen = seen.lock().expect("read requests").clone();
+        for accessory in [
+            format!("DELETE {nodes}/in-job"),
+            "DELETE /api/v1/namespaces/compute/secrets/aruna-job-a1-env".to_string(),
+        ] {
+            assert!(seen.contains(&accessory), "{accessory}");
+        }
     }
 
     #[tokio::test]

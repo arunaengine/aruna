@@ -76,7 +76,9 @@ impl RootEntry {
         }
         if matches!(
             descriptor.kind,
-            SourceConnectorKind::ArunaNative | SourceConnectorKind::LocalDirectory
+            SourceConnectorKind::ArunaNative
+                | SourceConnectorKind::LocalDirectory
+                | SourceConnectorKind::ArunaLink
         ) {
             return None;
         }

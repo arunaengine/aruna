@@ -361,10 +361,22 @@ fn resolves_task_group() {
 
 #[test]
 fn caps_task_io() {
-    // Input and output counts are bounded before quadratic validation.
+    // Any number of distinct inputs maps; outputs keep their bound.
     let group = Ulid::from_bytes([5u8; 16]);
     let mut task = sample_task(group);
-    task.inputs = vec![task.inputs[0].clone(); MAX_TASK_IO + 1];
+    let template = task.inputs[0].clone();
+    task.inputs = (0..600)
+        .map(|index| TesInput {
+            path: format!("/inputs/{index}.fq"),
+            ..template.clone()
+        })
+        .collect();
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).expect("inputs map");
+    assert_eq!(spec.inputs.len(), 600);
+    task.inputs.push(TesInput {
+        path: "/inputs/0.fq".to_string(),
+        ..template
+    });
     let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
 
@@ -652,7 +664,10 @@ fn rejects_unsupported_fields() {
     assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
     task.id = None;
     task.inputs[0].kind = TesFileType::Directory;
-    assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
+    let (spec, _) =
+        map_execution_spec(&task, None, ExecutionTarget::Realm).expect("directory maps");
+    let InputSource::S3 { key, .. } = &spec.inputs[0].source;
+    assert!(key.ends_with('/') && spec.inputs[0].dest_key.ends_with('/'));
     task.inputs[0].kind = TesFileType::File;
     task.executors[0].stdout = Some("/logs/out".to_string());
     assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
@@ -922,7 +937,12 @@ fn view_projections() {
     )
     .unwrap();
     let mut record = execution_record(JobId::from_bytes([2u8; 16]), user(2), spec);
-    let queued = project_task(&record, &TaskDetails::default(), TesView::Full, "http://x");
+    let queued = project_task(
+        &record,
+        &TaskDetails::default(),
+        TesView::Full,
+        ("http://x", realm()),
+    );
     assert!(queued.logs[0].start_time.is_none());
     assert!(queued.logs[0].logs.is_empty());
     record.state = JobState::Succeeded;
@@ -968,13 +988,18 @@ fn view_projections() {
         &record,
         &TaskDetails::default(),
         TesView::Minimal,
-        "http://x",
+        ("http://x", realm()),
     );
     assert!(minimal.executors.is_empty());
     assert!(minimal.logs.is_empty());
     assert_eq!(minimal.state, Some(TesState::Complete));
 
-    let basic = project_task(&record, &TaskDetails::default(), TesView::Basic, "http://x");
+    let basic = project_task(
+        &record,
+        &TaskDetails::default(),
+        TesView::Basic,
+        ("http://x", realm()),
+    );
     assert_eq!(basic.name.as_deref(), Some("align reads"));
     assert_eq!(basic.description.as_deref(), Some("sample task"));
     assert_eq!(basic.tags.get("project").map(String::as_str), Some("alpha"));
@@ -997,7 +1022,12 @@ fn view_projections() {
     assert_eq!(basic.resources.as_ref().unwrap().disk_gb, Some(8.0));
     assert_eq!(basic.resources.as_ref().unwrap().preemptible, Some(true));
 
-    let full = project_task(&record, &TaskDetails::default(), TesView::Full, "http://x");
+    let full = project_task(
+        &record,
+        &TaskDetails::default(),
+        TesView::Full,
+        ("http://x", realm()),
+    );
     assert_eq!(full.logs.len(), 1);
     assert_eq!(full.logs[0].logs[0].exit_code, Some(0));
     assert_eq!(full.logs[0].logs[0].stdout.as_deref(), Some("hello"));
@@ -1084,6 +1114,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
             admitted_at_ms: 10,
         },
         captured_inputs: Vec::new(),
+        input_pages: None,
         output_policies: Vec::new(),
         placement: PlacementRef::NIL,
     };
@@ -1161,7 +1192,7 @@ fn family_preserves_versions() {
         &family_record(&report),
         &TaskDetails::from_report(&report),
         TesView::Full,
-        "http://x",
+        ("http://x", realm()),
     );
 
     assert_eq!(task.state, Some(TesState::Complete));
@@ -1180,7 +1211,7 @@ fn family_preserves_versions() {
         &family_record(&running),
         &TaskDetails::from_report(&running),
         TesView::Full,
-        "http://x",
+        ("http://x", realm()),
     );
     assert_eq!(pending.state, Some(TesState::Running));
     assert!(pending.logs[0].outputs.is_empty());
@@ -1198,7 +1229,7 @@ fn derives_family_tags() {
         &family_record(&report),
         &TaskDetails::from_report(&report),
         TesView::Basic,
-        "http://x",
+        ("http://x", realm()),
     );
     assert_eq!(
         unplaced.tags.get(ID_TAG_KEY).map(String::as_str),
@@ -1229,7 +1260,7 @@ fn derives_family_tags() {
     let details = TaskDetails::from_report(&report);
     let record = family_record(&report);
     for view in [TesView::Basic, TesView::Full] {
-        let task = project_task(&record, &details, view, "http://x");
+        let task = project_task(&record, &details, view, ("http://x", realm()));
         assert_eq!(
             task.tags.get(KIND_TAG_KEY).map(String::as_str),
             Some("docker")
@@ -1239,7 +1270,7 @@ fn derives_family_tags() {
             Some("4096")
         );
     }
-    let minimal = project_task(&record, &details, TesView::Minimal, "http://x");
+    let minimal = project_task(&record, &details, TesView::Minimal, ("http://x", realm()));
     assert!(minimal.tags.is_empty());
 }
 
@@ -1442,12 +1473,22 @@ fn projects_full_command() {
         collision_policy: Default::default(),
     };
     let record = execution_record(JobId::from_bytes([3u8; 16]), user(2), spec.clone());
-    let task = project_task(&record, &TaskDetails::default(), TesView::Basic, "http://x");
+    let task = project_task(
+        &record,
+        &TaskDetails::default(),
+        TesView::Basic,
+        ("http://x", realm()),
+    );
     assert_eq!(task.executors[0].command, vec!["/bin/tool", "--flag", "x"]);
 
     spec.entrypoint = None;
     let record = execution_record(JobId::from_bytes([4u8; 16]), user(2), spec);
-    let task = project_task(&record, &TaskDetails::default(), TesView::Basic, "http://x");
+    let task = project_task(
+        &record,
+        &TaskDetails::default(),
+        TesView::Basic,
+        ("http://x", realm()),
+    );
     assert_eq!(task.executors[0].command, vec!["--flag", "x"]);
 }
 
@@ -1880,5 +1921,92 @@ fn openapi_has_tes() {
         openapi
             .components
             .is_some_and(|components| components.security_schemes.contains_key("basic_auth"))
+    );
+}
+
+#[test]
+fn projects_input_identity() {
+    // A finished task names each input by the node and version the run captured, as a
+    // submission accepts it, so saving or repeating it reads the same data.
+    let (holder, version) = (node_id(), Ulid::from_bytes([31u8; 16]));
+    let spec = ExecutionSpec {
+        group_id: Ulid::from_bytes([5u8; 16]),
+        name: None,
+        description: None,
+        tags: BTreeMap::new(),
+        image: "img".to_string(),
+        entrypoint: None,
+        command: vec!["true".to_string()],
+        workdir: None,
+        env: BTreeMap::new(),
+        resources: ComputeResources::default(),
+        executor_constraint: None,
+        inputs: Vec::new(),
+        file_outputs: Vec::new(),
+        workspace_outputs: Vec::new(),
+        output_prefixes: Vec::new(),
+        collision_policy: Default::default(),
+    };
+    let spec = ExecutionSpec {
+        inputs: vec![InputSelection {
+            source: InputSource::S3 {
+                bucket: "src".to_string(),
+                key: "in/data.csv".to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: "in/data.csv".to_string(),
+            mode: InputMode::Snapshot,
+            container_path: Some("/in/data.csv".to_string()),
+            name: None,
+            description: None,
+        }],
+        ..spec
+    };
+    let mut record = execution_record(JobId::from_bytes([6u8; 16]), user(2), spec);
+    let unpinned = project_task(
+        &record,
+        &TaskDetails::default(),
+        TesView::Basic,
+        ("http://x", realm()),
+    );
+    assert_eq!(
+        unpinned.inputs[0].url.as_deref(),
+        Some("s3://src/in/data.csv")
+    );
+    record.captured_inputs = vec![aruna_core::structs::execution::job::CapturedInput {
+        destination_key: "in/data.csv".to_string(),
+        source_node_id: holder,
+        version_id: version,
+        content: aruna_core::structs::execution::job::InputContent::Blake3([1; 32]),
+        bytes: 1,
+        policies: Vec::new(),
+        source_group_id: Ulid::from_bytes([5u8; 16]),
+        public: false,
+        link: None,
+        source_pin: None,
+        database: None,
+        releases: Vec::new(),
+        releases_complete: false,
+        grant: None,
+    }];
+    let task = project_task(
+        &record,
+        &TaskDetails::default(),
+        TesView::Basic,
+        ("http://x", realm()),
+    );
+    let url = task.inputs[0].url.clone().expect("an input url");
+    let arn = VersionedObjectArn::new(realm(), holder, "src", "in/data.csv", version).unwrap();
+    assert_eq!(url, arn.to_string());
+    let (source, node) = parse_input_url(&url).unwrap();
+    assert_eq!(node, Some(holder));
+    assert_eq!(
+        source,
+        InputSource::S3 {
+            bucket: "src".to_string(),
+            key: "in/data.csv".to_string(),
+            version_id: Some(version.to_string()),
+        }
     );
 }

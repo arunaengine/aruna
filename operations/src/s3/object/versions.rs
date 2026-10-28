@@ -107,6 +107,8 @@ pub enum ListVersionsItem {
         location: Option<BackendLocation>,
         source_metadata: Option<SourceMetadata>,
         created_at: SystemTime,
+        /// A link's binding, so a listing shows it only to callers who may read its target.
+        link: Option<aruna_core::structs::execution::staging::VersionSourceBinding>,
     },
     DeleteMarker {
         key: String,
@@ -533,8 +535,13 @@ impl ListVersionsOperation {
                     continue;
                 }
                 BlobVersionState::Reference {
-                    cached_metadata, ..
+                    cached_metadata,
+                    source,
+                    ..
                 } => {
+                    let link = (source.descriptor.kind
+                        == aruna_core::structs::execution::source_connector::SourceConnectorKind::ArunaLink)
+                        .then_some(source);
                     pending.push(PendingItem::Ready(ListVersionsItem::Version {
                         key: key.clone(),
                         version_id,
@@ -542,6 +549,7 @@ impl ListVersionsOperation {
                         location: None,
                         source_metadata: Some(cached_metadata),
                         created_at: version.created_at,
+                        link,
                     }));
                     continue;
                 }
@@ -689,6 +697,7 @@ impl ListVersionsOperation {
                         location: described.then_some(location),
                         source_metadata: None,
                         created_at,
+                        link: None,
                     }
                 }
             };

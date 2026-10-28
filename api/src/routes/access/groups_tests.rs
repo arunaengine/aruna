@@ -1258,7 +1258,7 @@ mod distributed {
     use crate::mcp::data::{WriteObjectInput, store_text};
     use crate::routes::storage::deletion::bucket_info;
     use crate::tests::distributed::{
-        BUCKET, PEER, distribute, mock_peer, node_id, node_state, publish_api,
+        BUCKET, PEER, distribute, hidden_link, mock_peer, node_id, node_state, publish_api,
     };
     use aruna_core::structs::storage::blob::group_permission_path;
     use axum::Extension;
@@ -1267,6 +1267,108 @@ mod distributed {
     use axum::http::StatusCode;
 
     /// Browsing a distributed bucket lists its own range here and the peer's range there.
+    /// Denies every role of the node's group the key `key` of the test bucket.
+    async fn deny_key(node: &crate::tests::distributed::Node, key: &str) {
+        use aruna_core::events::{Event, StorageEvent};
+        use aruna_core::structs::identity::auth::{Actor, Permission};
+        use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+        let state = &node.state;
+        let read = aruna_core::effects::StorageEffect::Read {
+            key_space: aruna_core::keyspaces::AUTH_KEYSPACE.to_string(),
+            key: node.group_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        };
+        let event = state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(read)
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) = event
+        else {
+            panic!("the group authorization document: {event:?}");
+        };
+        let mut document = GroupAuthorizationDocument::from_bytes(bytes.as_ref()).unwrap();
+        let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+        let path = aruna_core::structs::storage::blob::object_permission_path(
+            realm_id,
+            node.group_id,
+            node_id,
+            BUCKET,
+            key,
+        );
+        for role in document.roles.values_mut() {
+            role.permissions.insert(path.clone(), Permission::DENY);
+        }
+        let actor = Actor {
+            node_id,
+            user_id: node.owner.user_id,
+            realm_id,
+        };
+        let key = node.group_id.to_bytes().to_vec();
+        let value = document.to_bytes(&actor).unwrap();
+        let keyspace = aruna_core::keyspaces::AUTH_KEYSPACE;
+        crate::tests::distributed::write(state, keyspace, key, value).await;
+    }
+
+    #[tokio::test]
+    async fn hides_unreadable_paths() {
+        // Neither a link to a target the caller cannot read nor a key a role denies shows as a
+        // data path of an ordinary bucket, on any page, and no token names either of them.
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let node = node_state().await;
+        let info = bucket_info(&node.state, BUCKET).await.unwrap();
+        for key in ["a.md", "secret.md", "z.md"] {
+            let input = WriteObjectInput {
+                bucket: BUCKET.to_string(),
+                key: key.to_string(),
+                text: "x".to_string(),
+                content_type: None,
+            };
+            store_text(&node.state, &node.owner, &info, input)
+                .await
+                .unwrap();
+        }
+        hidden_link(&node, "link.md").await;
+        deny_key(&node, "secret.md").await;
+        let state = &node.state;
+        let root = group_permission_path(state.get_realm_id(), node.group_id, state.get_node_id());
+        let (mut token, mut names) = (None, Vec::new());
+        for _ in 0..6 {
+            let (_, Json(paths)) = list_data_paths(
+                State(state.clone()),
+                Extension(Some(node.owner.clone())),
+                Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+                Path(node.group_id.to_string()),
+                Query(DataPathsQuery {
+                    prefix: Some(format!("{root}/{BUCKET}/")),
+                    delimiter: Some("/".to_string()),
+                    continuation_token: token.take(),
+                    limit: Some(2),
+                }),
+            )
+            .await
+            .unwrap();
+            names.extend((paths.entries.iter()).map(|entry| {
+                entry
+                    .permission_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            }));
+            token = paths.continuation_token;
+            let Some(token) = &token else { break };
+            let bytes = URL_SAFE_NO_PAD.decode(token).unwrap_or_default();
+            for hidden in [&b"secret"[..], b"link"] {
+                assert!(!bytes.windows(hidden.len()).any(|window| window == hidden));
+            }
+        }
+        assert_eq!(names, vec!["a.md", "z.md"]);
+    }
+
     #[tokio::test]
     async fn browses_distributed_bucket() {
         let node = node_state().await;
@@ -1282,9 +1384,12 @@ mod distributed {
                 .await
                 .unwrap();
         }
+        // A link to a target the caller cannot read stays out of the local range's entries.
+        hidden_link(&node, "c.md").await;
         distribute(&node.state, node.group_id, BUCKET).await;
         let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
-            "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+            "last_modified":null,"content_type":null,"referenced":false,"content_id":null,
+            "version_id":"01K8Y0000000000000000000AB"}],
             "prefixes":[],"next_cursor":"more"}"#;
         let peer = mock_peer(StatusCode::OK, answer).await;
         publish_api(&node.state, node_id(PEER), &peer.url).await;

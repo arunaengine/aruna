@@ -18,8 +18,19 @@ use ulid::Ulid;
 /// The group owner may write everywhere in the group except below `denied`.
 pub(crate) async fn seed_access(
     context: &DriverContext,
+    scope: (RealmId, GroupId, NodeId),
+    denied: &str,
+) -> AuthContext {
+    seed_open_access(context, scope, denied, None, Vec::new()).await
+}
+
+/// Like `seed_access`, plus a role that lets everyone read `public` and realm request policies.
+pub(crate) async fn seed_open_access(
+    context: &DriverContext,
     (realm_id, group_id, node_id): (RealmId, GroupId, NodeId),
     denied: &str,
+    public: Option<&str>,
+    policies: Vec<aruna_core::request_policy::RequestPolicy>,
 ) -> AuthContext {
     let owner = UserId::local(Ulid::from_parts(5, 5), realm_id);
     let actor = Actor {
@@ -32,6 +43,21 @@ pub(crate) async fn seed_access(
         role.permissions
             .insert(denied.to_string(), Permission::DENY);
     }
+    if let Some(public) = public {
+        let role_id = Ulid::from_parts(6, 6);
+        document.roles.insert(
+            role_id,
+            aruna_core::structs::identity::auth::Role {
+                role_id,
+                name: "public".to_string(),
+                permissions: std::collections::HashMap::from([(
+                    public.to_string(),
+                    Permission::READ,
+                )]),
+                assigned_users: std::collections::HashSet::from([UserId::nil(realm_id)]),
+            },
+        );
+    }
     let group = Group {
         display_name: "Lab".to_string(),
         group_id,
@@ -39,7 +65,8 @@ pub(crate) async fn seed_access(
         roles: document.roles.keys().copied().collect(),
         owner,
     };
-    let config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+    config.request_policies = policies;
     let realm_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
     let (realm_key, group_key) = (realm_id.as_bytes().to_vec(), group_id.to_bytes().to_vec());
     let rows = [

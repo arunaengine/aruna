@@ -429,6 +429,9 @@ pub const JOB_ENTRY_KEYSPACE: &str = "job_entries";
 /// written once: the same digest replays as a no-op and a different digest is
 /// retained in the conflict keyspace instead of overwriting it.
 pub const FAMILY_RECORD_KEYSPACE: &str = "job_family_records";
+/// Input pages of stored specs and launches, keyed by family and page digest. They sit apart
+/// from the family records, so no family read bound or lifecycle evidence counts them.
+pub const INPUT_PAGE_KEYSPACE: &str = "job_input_pages";
 /// Bounded records whose predecessor evidence, or whose local holder view, is
 /// not available yet. A pending record is never projected or relayed.
 pub const FAMILY_PENDING_KEYSPACE: &str = "job_family_pending";
@@ -723,6 +726,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     OUTPUT_RECORD_KEYSPACE,
     JOB_ENTRY_KEYSPACE,
     FAMILY_RECORD_KEYSPACE,
+    INPUT_PAGE_KEYSPACE,
     FAMILY_PENDING_KEYSPACE,
     FAMILY_CONFLICT_KEYSPACE,
     FAMILY_ALIAS_KEYSPACE,

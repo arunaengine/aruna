@@ -525,6 +525,10 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::RealmKeyStored { .. } => "realm_key_stored",
         MetadataTransportMessage::PromotionCheck => "promotion_check",
         MetadataTransportMessage::PromotionReady { .. } => "promotion_ready",
+        MetadataTransportMessage::JobInputPage { .. } => "job_input_page",
+        MetadataTransportMessage::JobInputPageResult { .. } => "job_input_page_result",
+        MetadataTransportMessage::ResolveJobInputs { .. } => "resolve_job_inputs",
+        MetadataTransportMessage::ResolvedJobInputs { .. } => "resolved_job_inputs",
     }
 }
 
@@ -707,6 +711,54 @@ impl MetadataHandle {
         {
             MetadataTransportMessage::StagingSpecResult { result } => result.map(|spec| *spec),
             _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// Asks the node holding some inputs to resolve and grant them for the bearer's caller.
+    pub async fn request_input_resolve(
+        &self,
+        node_id: NodeId,
+        auth_token: AuthToken,
+        request: crate::jobs::lifecycle::ingress::InputResolveRequest,
+    ) -> Result<
+        Result<
+            Vec<(
+                aruna_core::structs::execution::job::InputSelection,
+                aruna_core::structs::execution::job::CapturedInput,
+            )>,
+            crate::jobs::lifecycle::ingress::SubmissionRefusal,
+        >,
+        String,
+    > {
+        let request = MetadataTransportMessage::ResolveJobInputs {
+            auth_token,
+            request: Box::new(request),
+        };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
+            Ok(MetadataTransportMessage::ResolvedJobInputs { result }) => Ok(result),
+            Ok(other) => Err(format!(
+                "the node answered {}",
+                transport_message_kind(&other)
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// One input page of a job family from `node_id`; `None` when it does not keep it.
+    pub async fn request_input_page(
+        &self,
+        node_id: NodeId,
+        submission: aruna_core::structs::execution::job::SubmissionId,
+        digest: [u8; 32],
+    ) -> Result<Option<aruna_core::structs::execution::job::InputPage>, String> {
+        let request = MetadataTransportMessage::JobInputPage { submission, digest };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
+            Ok(MetadataTransportMessage::JobInputPageResult { page }) => Ok(page.map(|page| *page)),
+            Ok(other) => Err(format!(
+                "the node answered {}",
+                transport_message_kind(&other)
+            )),
+            Err(error) => Err(error.to_string()),
         }
     }
 
