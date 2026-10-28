@@ -110,13 +110,14 @@ pub struct InputResolveRequest {
 }
 
 /// Resolves inputs this node holds for an ingress. The caller's bearer is validated here, so
-/// the grants vouch for an identity this node checked, never for one a peer asserted.
+/// the grants vouch for an identity this node checked, never for one a peer asserted. Each
+/// answer is the input after its links, pinned to its target here, with that capture.
 pub async fn serve_input_resolve(
     context: &Arc<DriverContext>,
     peer: NodeId,
     auth_token: AuthToken,
     request: InputResolveRequest,
-) -> Result<Vec<CapturedInput>, SubmissionRefusal> {
+) -> Result<Vec<(InputSelection, CapturedInput)>, SubmissionRefusal> {
     let Some(metadata) = context.metadata_handle.as_ref() else {
         return Err(SubmissionRefusal::Unavailable);
     };
@@ -150,9 +151,61 @@ pub async fn serve_input_resolve(
         request.submission_id,
         request.expires_at.min(bound),
     );
-    capture_inputs(context, &request.inputs, caller, local)
-        .await
-        .map_err(refusal_of)
+    let mut answers = Vec::with_capacity(request.inputs.len());
+    for input in request.inputs {
+        let (mut input, link) = follow_link(context, input, caller.0, local)
+            .await
+            .map_err(refusal_of)?;
+        if input.source_node_id.is_some_and(|node| node != local) {
+            return Err(SubmissionRefusal::Invalid {
+                reason: format!("{}: a link here names another node", input.dest_key),
+            });
+        }
+        input.source_node_id = Some(local);
+        let captured = capture_inputs(context, std::slice::from_ref(&input), caller, local)
+            .await
+            .map_err(refusal_of)?;
+        let Some(mut captured) = captured.into_iter().next() else {
+            return Err(SubmissionRefusal::Unavailable);
+        };
+        captured.link = link;
+        answers.push((input, captured));
+    }
+    Ok(answers)
+}
+
+/// Whether `node` answered `asked` faithfully: the same destination, pinned to the version it
+/// captured there, and a new source only behind a link that names the asked version there.
+fn answers_input(
+    asked: &InputSelection,
+    (selection, captured): &(InputSelection, CapturedInput),
+    node: NodeId,
+) -> bool {
+    use aruna_core::structs::execution::job::InputSource;
+    let pin = |input: &InputSelection| {
+        let InputSource::S3 { version_id, .. } = &input.source;
+        version_id
+            .as_deref()
+            .and_then(|v| Ulid::from_string(v).ok())
+    };
+    let InputSource::S3 { bucket, key, .. } = &asked.source;
+    let source_kept = match &captured.link {
+        None => selection.source == asked.source,
+        Some(link) => {
+            link.node_id == node
+                && link.bucket == *bucket
+                && link.key == *key
+                && Some(link.version) == pin(asked)
+        }
+    };
+    source_kept
+        && pin(selection) == Some(captured.version_id)
+        && selection.dest_key == asked.dest_key
+        && selection.mode == asked.mode
+        && selection.container_path == asked.container_path
+        && selection.source_node_id == Some(node)
+        && captured.destination_key == asked.dest_key
+        && captured.source_node_id == node
 }
 
 /// Whether a validated bearer may have inputs resolved and granted for it: its own user, this
@@ -420,8 +473,10 @@ async fn resolve_inputs(
     let mut captured = capture_inputs(context, &here, caller, local).await?;
     let mut remote_inputs = Vec::new();
     for (node, inputs) in remote {
-        captured.extend(remote_captures(context, node, &inputs, caller, auth_token).await?);
-        remote_inputs.extend(inputs);
+        for (input, capture) in remote_captures(context, node, &inputs, caller, auth_token).await? {
+            remote_inputs.push(input);
+            captured.push(capture);
+        }
     }
     let mut by_key: std::collections::BTreeMap<String, CapturedInput> = captured
         .into_iter()
@@ -432,7 +487,8 @@ async fn resolve_inputs(
         .chain(remote_inputs.iter())
         .filter_map(|input| by_key.remove(&input.dest_key))
         .map(|mut captured: CapturedInput| {
-            captured.link = links.remove(&captured.destination_key);
+            // The first link the walk met wins, here or at the source node.
+            captured.link = links.remove(&captured.destination_key).or(captured.link);
             captured
         })
         .collect();
@@ -619,22 +675,22 @@ async fn expand_directory(
 }
 
 /// The inputs of another node, resolved and granted by that node for the caller's own bearer.
-/// Every input must name its exact version, so nothing depends on a remote head.
+/// Every input must name its exact version, so nothing depends on a remote head; the answer
+/// is each input after the links that node followed, with its capture.
 async fn remote_captures(
     context: &DriverContext,
     node: NodeId,
     inputs: &[InputSelection],
     (created_by, submission_id, expires_at): (UserId, SubmissionId, u64),
     auth_token: Option<&AuthToken>,
-) -> Result<Vec<CapturedInput>, SubmitJobError> {
-    let mut versions = Vec::with_capacity(inputs.len());
+) -> Result<Vec<(InputSelection, CapturedInput)>, SubmitJobError> {
     for input in inputs {
         let aruna_core::structs::execution::job::InputSource::S3 {
             bucket,
             key,
             version_id,
         } = &input.source;
-        let version = version_id
+        version_id
             .as_deref()
             .and_then(|version| Ulid::from_string(version).ok())
             .ok_or_else(|| {
@@ -642,7 +698,6 @@ async fn remote_captures(
                     "s3://{bucket}/{key}: an input on another node must name its exact version"
                 ))
             })?;
-        versions.push((input.dest_key.clone(), version));
     }
     let (Some(metadata), Some(AuthToken::Bearer(token))) =
         (context.metadata_handle.as_ref(), auth_token)
@@ -679,16 +734,9 @@ async fn remote_captures(
             )));
         }
     };
-    // The node answers for exactly the asked versions, each held by itself.
-    let exact = captured.len() == versions.len()
-        && captured
-            .iter()
-            .zip(&versions)
-            .all(|(captured, (dest_key, version))| {
-                captured.destination_key == *dest_key
-                    && captured.version_id == *version
-                    && captured.source_node_id == node
-            });
+    // The node answers for exactly the asked inputs, each pinned to a version it holds.
+    let exact = captured.len() == inputs.len()
+        && (captured.iter().zip(inputs)).all(|(answer, asked)| answers_input(asked, answer, node));
     match exact {
         true => Ok(captured),
         false => Err(SubmitJobError::PlacementUnavailable(format!(
@@ -1784,6 +1832,51 @@ mod tests {
             releases_complete: false,
             grant: None,
         }
+    }
+
+    #[test]
+    fn answers_pins() {
+        // A source node may change an input only behind a link that names the asked version,
+        // and must pin what it answers to the version it captured.
+        let node_id = node(2);
+        let version = Ulid::from_parts(1, 1);
+        let mut asked = s3_input("db", "bakta.db", Some(&version.to_string()));
+        asked.source_node_id = Some(node_id);
+        let plain = (asked.clone(), captured_from(&asked, node_id));
+        assert!(answers_input(&asked, &plain, node_id));
+        let target_version = Ulid::from_parts(2, 2);
+        let mut target = s3_input("raw", "bakta-v6.db", Some(&target_version.to_string()));
+        target.source_node_id = Some(node_id);
+        let mut linked = captured_from(&asked, node_id);
+        linked.version_id = target_version;
+        assert!(!answers_input(
+            &asked,
+            &(target.clone(), linked.clone()),
+            node_id
+        ));
+        linked.link = Some(VersionedObjectArn {
+            realm_id: RealmId::from_bytes([1; 32]),
+            node_id,
+            bucket: "db".to_string(),
+            key: "bakta.db".to_string(),
+            version,
+        });
+        assert!(answers_input(
+            &asked,
+            &(target.clone(), linked.clone()),
+            node_id
+        ));
+        let mut repinned = target.clone();
+        repinned.source = s3_input(
+            "raw",
+            "bakta-v6.db",
+            Some(&Ulid::from_parts(3, 3).to_string()),
+        )
+        .source;
+        assert!(!answers_input(&asked, &(repinned, linked.clone()), node_id));
+        let mut stale = linked;
+        stale.link.as_mut().expect("link").version = Ulid::from_parts(9, 9);
+        assert!(!answers_input(&asked, &(target, stale), node_id));
     }
 
     #[test]

@@ -722,7 +722,10 @@ impl MetadataHandle {
         request: crate::jobs::lifecycle::ingress::InputResolveRequest,
     ) -> Result<
         Result<
-            Vec<aruna_core::structs::execution::job::CapturedInput>,
+            Vec<(
+                aruna_core::structs::execution::job::InputSelection,
+                aruna_core::structs::execution::job::CapturedInput,
+            )>,
             crate::jobs::lifecycle::ingress::SubmissionRefusal,
         >,
         String,
