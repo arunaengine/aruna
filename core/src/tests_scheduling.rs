@@ -80,7 +80,7 @@ pub(crate) fn resolved_input(key: &str, seed: u8) -> ResolvedInput {
             version,
         },
         version_id: version,
-        blake3: [seed; 32],
+        content: crate::structs::execution::job::InputContent::Blake3([seed; 32]),
         bytes: 1_000,
         policies: Vec::new(),
         holders: Vec::new(),

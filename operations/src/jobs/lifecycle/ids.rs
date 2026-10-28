@@ -72,6 +72,9 @@ pub struct SubmissionRequest {
     pub ingress_node_id: NodeId,
     pub captured_inputs: Vec<CapturedInput>,
     pub output_policies: Vec<PlacementPolicyRef>,
+    /// Inputs too large to travel inline: the lists are empty and the sender keeps the pages.
+    /// The identity is always computed from the full lists.
+    pub input_pages: Option<aruna_core::structs::execution::job::PageManifest>,
 }
 
 /// The replicated identity of one request.
@@ -94,10 +97,7 @@ impl SubmissionRequest {
     /// Derives the opaque submission identity and the normalized request digest.
     /// Both sides of a forwarding hop run this and compare.
     pub fn identity(&self) -> Result<RequestIdentity, ConversionError> {
-        let submission_id = match &self.scope {
-            SubmissionScope::Keyed(key) => SubmissionId::keyed(self.created_by, key.as_bytes()),
-            SubmissionScope::Unkeyed(nonce) => SubmissionId::unkeyed(*nonce),
-        };
+        let submission_id = submission_of(self.created_by, &self.scope);
         Ok(RequestIdentity {
             submission_id,
             request_digest: request_digest(
@@ -108,6 +108,14 @@ impl SubmissionRequest {
                 &self.output_policies,
             )?,
         })
+    }
+}
+
+/// The submission id `created_by` asks under `scope`, known before any input resolves.
+pub fn submission_of(created_by: UserId, scope: &SubmissionScope) -> SubmissionId {
+    match scope {
+        SubmissionScope::Keyed(key) => SubmissionId::keyed(created_by, key.as_bytes()),
+        SubmissionScope::Unkeyed(nonce) => SubmissionId::unkeyed(*nonce),
     }
 }
 
@@ -123,7 +131,22 @@ fn request_digest(
     hasher.update(&created_by.to_storage_key());
     hasher.update(&postcard::to_allocvec(spec)?);
     hasher.update(ingress_node_id.as_bytes());
-    hasher.update(&postcard::to_allocvec(captured_inputs)?);
+    // Only the exact pins identify the request; metadata, grants and public reads may change.
+    let pins: Vec<_> = captured_inputs
+        .iter()
+        .map(|captured| {
+            (
+                &captured.destination_key,
+                captured.source_node_id.as_bytes(),
+                captured.version_id,
+                &captured.content,
+                captured.bytes,
+                &captured.policies,
+                &captured.link,
+            )
+        })
+        .collect();
+    hasher.update(&postcard::to_allocvec(&pins)?);
     hasher.update(&postcard::to_allocvec(output_policies)?);
     Ok(*hasher.finalize().as_bytes())
 }

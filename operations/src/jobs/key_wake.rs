@@ -88,7 +88,11 @@ pub(crate) async fn locked_inputs(
         .iter()
         .filter(|input| input.source_node_id == node_id)
     {
-        let alias = find_alias(context, &input.blake3, input.version_id, node_id).await?;
+        // A reference has no stored bytes here, so no local key can lock it.
+        let Some(blake3) = input.content.blake3() else {
+            continue;
+        };
+        let alias = find_alias(context, &blake3, input.version_id, node_id).await?;
         if let Some(alias) = alias
             && let Some(wait) = alias_wait(context, &alias).await?
             && !waits.contains(&wait)
@@ -530,9 +534,17 @@ mod tests {
             destination_key: "in".to_string(),
             source_node_id: node,
             version_id: Ulid::from_bytes([6; 16]),
-            blake3: [9; 32],
+            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
             bytes: 100,
             policies: Vec::new(),
+            source_group_id: Default::default(),
+            public: false,
+            link: None,
+            source_pin: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
         };
 
         let waits = locked_inputs(&context, &[input], node).await.unwrap();
@@ -550,9 +562,17 @@ mod tests {
             destination_key: "in".to_string(),
             source_node_id,
             version_id: Ulid::from_bytes([6; 16]),
-            blake3,
+            content: aruna_core::structs::execution::job::InputContent::Blake3(blake3),
             bytes: 100,
             policies: Vec::new(),
+            source_group_id: Default::default(),
+            public: false,
+            link: None,
+            source_pin: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
         };
         let remote = iroh::SecretKey::from_bytes(&[2; 32]).public();
         let inputs = [
@@ -596,9 +616,17 @@ mod tests {
             destination_key: "in".to_string(),
             source_node_id: node,
             version_id: Ulid::from_bytes([6; 16]),
-            blake3: [9; 32],
+            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
             bytes: 100,
             policies: Vec::new(),
+            source_group_id: Default::default(),
+            public: false,
+            link: None,
+            source_pin: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
         });
         insert_job(storage, &record).await.unwrap();
         let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node, 2_000).await.unwrap()

@@ -220,12 +220,14 @@ pub(crate) async fn remote_waits(
 ) -> Vec<KeyWait> {
     let mut by_node: BTreeMap<NodeId, Vec<WaitTarget>> = BTreeMap::new();
     for input in &record.captured_inputs {
-        if input.source_node_id != node_id {
+        if let Some(blake3) = input.content.blake3()
+            && input.source_node_id != node_id
+        {
             by_node
                 .entry(input.source_node_id)
                 .or_default()
                 .push(WaitTarget::Captured {
-                    blake3: input.blake3,
+                    blake3,
                     version_id: input.version_id,
                 });
         }

@@ -184,9 +184,47 @@ pub struct CapturedInput {
     pub destination_key: String,
     pub source_node_id: crate::NodeId,
     pub version_id: Ulid,
-    pub blake3: [u8; 32],
+    pub content: InputContent,
     pub bytes: u64,
     pub policies: Vec<PlacementPolicyRef>,
+    /// The group of the source bucket, under whose path the creator's READ admitted it.
+    pub source_group_id: GroupId,
+    /// The Everyone principal may read the source as well.
+    pub public: bool,
+    /// The link version the input named, when admission followed one to this source.
+    pub link: Option<crate::structs::storage::replication::VersionedObjectArn>,
+    /// The external source of a reference version.
+    pub source_pin: Option<crate::structs::storage::origin::SourcePin>,
+    /// The source bucket's metadata at admission.
+    pub database: Option<crate::structs::storage::bucket_metadata::BucketMetadata>,
+    pub releases: Vec<crate::structs::storage::bucket_metadata::ReleaseRef>,
+    /// Release membership was checked; false means `releases` proves nothing.
+    pub releases_complete: bool,
+    /// The source node's grant for exact reads of this input by the creator.
+    pub grant: Option<crate::structs::storage::read_grant::SignedGrant>,
+}
+
+/// What binds the bytes of one captured input version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputContent {
+    /// The BLAKE3 of the stored bytes.
+    Blake3([u8; 32]),
+    /// A reference version, bound to the source observation its record keeps.
+    Reference {
+        etag: Option<String>,
+        /// Every ranged read is bound to that observation, so the input may be mounted.
+        range_bound: bool,
+    },
+}
+
+impl InputContent {
+    /// The content hash, which only a stored copy has.
+    pub fn blake3(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Blake3(hash) => Some(*hash),
+            Self::Reference { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

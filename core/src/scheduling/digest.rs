@@ -5,6 +5,7 @@
 use crate::compute::ResourceEnvelope;
 use crate::scheduling::cost::InputRoute;
 use crate::scheduling::inputs::{PlanRequest, TargetCandidate, TargetScore};
+use crate::structs::execution::job::InputContent;
 
 pub const PLAN_DIGEST_DOMAIN: &[u8] = b"aruna-execution-plan-v1";
 
@@ -42,7 +43,7 @@ pub fn plan_digest(
     for (input, route) in request.inputs.iter().zip(routes) {
         field(&mut hasher, Some(&input.destination_key));
         hasher.update(&input.version_id.to_bytes());
-        hasher.update(&input.blake3);
+        content(&mut hasher, &input.content);
         hasher.update(&input.bytes.to_le_bytes());
         count(&mut hasher, input.policies.len());
         for policy in &input.policies {
@@ -118,6 +119,21 @@ fn field(hasher: &mut blake3::Hasher, value: Option<&str>) {
         }
         None => {
             hasher.update(&[0]);
+        }
+    }
+}
+
+/// A tag per content kind, so a hash and an ETag never encode alike.
+fn content(hasher: &mut blake3::Hasher, value: &InputContent) {
+    match value {
+        InputContent::Blake3(hash) => {
+            hasher.update(&[0]);
+            hasher.update(hash);
+        }
+        InputContent::Reference { etag, range_bound } => {
+            hasher.update(&[1]);
+            field(hasher, etag.as_deref());
+            flag(hasher, *range_bound);
         }
     }
 }

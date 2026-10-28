@@ -4,7 +4,7 @@
 
 use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
-use crate::structs::execution::job::{EffectiveResources, SubmissionId};
+use crate::structs::execution::job::{EffectiveResources, InputContent, SubmissionId};
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::compute_config::ComputeConfigError;
 use crate::structs::placement::policy::{
@@ -75,7 +75,7 @@ pub struct ResolvedInput {
     pub destination_key: String,
     pub source: VersionedObjectArn,
     pub version_id: Ulid,
-    pub blake3: [u8; 32],
+    pub content: InputContent,
     pub bytes: u64,
     pub policies: Vec<PlacementPolicyRef>,
     pub holders: Vec<InputHolder>,
