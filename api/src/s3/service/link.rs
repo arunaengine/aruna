@@ -13,7 +13,7 @@ use aruna_operations::jobs::source_read::HEAD_OPERATION;
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::link::{
-    LinkCaller, LinkError, LinkSource, authorize_target, create_link, read_target,
+    LinkCaller, LinkError, LinkSource, authorize_target, create_link, read_target, target_visible,
 };
 use s3s::dto::{ETag, GetObjectOutput, StreamingBlob};
 use s3s::{S3Response, S3Result, s3_error};
@@ -49,10 +49,7 @@ impl ArunaS3Service {
         {
             auth.path_restrictions = None;
         }
-        LinkCaller {
-            auth,
-            access: access.clone(),
-        }
+        LinkCaller::of_access(auth, access)
     }
 
     /// Refuses a link the caller may not read the target of; other versions pass.
@@ -192,14 +189,52 @@ impl ArunaS3Service {
         let Some(target) = LinkTarget::of(binding, self.realm_id) else {
             return Ok(false);
         };
-        let auth = match reader {
-            Some(access) => self.link_caller(access, bucket).await.auth,
-            None => AuthContext::anonymous(self.realm_id),
+        let caller = match reader {
+            Some(access) => self.link_caller(access, bucket).await,
+            None => LinkCaller {
+                auth: AuthContext::anonymous(self.realm_id),
+                credential: (String::new(), ulid::Ulid::nil(), 0),
+            },
         };
-        match authorize_target(&self.state, &auth, &target, HEAD_OPERATION).await {
-            Ok(()) => Ok(true),
-            Err(LinkError::Denied | LinkError::NotFound) => Ok(false),
-            Err(error) => Err(link_error(error)),
+        target_visible(&self.state, &caller, &target)
+            .await
+            .map_err(link_error)
+    }
+}
+
+impl ArunaS3Service {
+    /// The version page without links whose target the reader may not read.
+    pub(super) async fn visible_versions(
+        &self,
+        access: &UserAccess,
+        bucket: &str,
+        mut result: aruna_operations::s3::object::versions::ListVersionsResult,
+    ) -> S3Result<aruna_operations::s3::object::versions::ListVersionsResult> {
+        use aruna_operations::s3::object::versions::ListVersionsItem;
+        let caller = self.link_caller(access, bucket).await;
+        let mut items = Vec::with_capacity(result.items.len());
+        for item in std::mem::take(&mut result.items) {
+            let target = match &item {
+                ListVersionsItem::Version {
+                    link: Some(binding),
+                    ..
+                } => LinkTarget::of(binding, self.realm_id),
+                _ => {
+                    items.push(item);
+                    continue;
+                }
+            };
+            let visible = match target {
+                Some(target) => target_visible(&self.state, &caller, &target)
+                    .await
+                    .map_err(link_error)?,
+                None => false,
+            };
+            if visible {
+                items.push(item);
+            }
         }
+        result.items = items;
+        Ok(result)
     }
 }

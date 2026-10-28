@@ -41,7 +41,35 @@ pub enum LinkError {
 #[derive(Clone, Debug)]
 pub struct LinkCaller {
     pub auth: AuthContext,
-    pub access: UserAccess,
+    /// The verified credential's id, group and expiry in Unix seconds, for delegations.
+    pub credential: (String, GroupId, u64),
+}
+
+impl LinkCaller {
+    /// The caller of an S3 request signed with `access`.
+    pub fn of_access(auth: AuthContext, access: &UserAccess) -> Self {
+        let expiry = access
+            .expiry
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        Self {
+            auth,
+            credential: (access.access_key.clone(), access.group_id, expiry),
+        }
+    }
+}
+
+/// Whether a listing may show a link: the caller may read its target.
+pub async fn target_visible(
+    context: &DriverContext,
+    caller: &LinkCaller,
+    target: &LinkTarget,
+) -> Result<bool, LinkError> {
+    match authorize_target(context, &caller.auth, target, HEAD_OPERATION).await {
+        Ok(()) => Ok(true),
+        Err(LinkError::Denied | LinkError::NotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether the caller may read the target, evaluated here from the target's recorded group
@@ -124,18 +152,14 @@ pub async fn read_target(
 
 /// The verified caller a delegation carries; the read fills in what it binds.
 fn delegation(caller: &LinkCaller, target: NodeId) -> DelegationInput {
-    let expiry = caller
-        .access
-        .expiry
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
+    let (credential_id, group_id, expiry) = caller.credential.clone();
     DelegationInput {
         set_id: Ulid::nil(),
         range_id: Ulid::nil(),
         target,
         user_id: caller.auth.user_id,
-        group_id: caller.access.group_id,
-        credential_id: caller.access.access_key.clone(),
+        group_id,
+        credential_id,
         restrictions: caller.auth.path_restrictions.clone(),
         credential_expiry: expiry,
         operation: String::new(),

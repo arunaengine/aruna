@@ -328,3 +328,63 @@ async fn unanswered_range_fails() {
         Err(ServerError::Forbidden)
     ));
 }
+
+/// Writes a link at `key` in the test bucket to `target`, as the owner.
+async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link::LinkTarget) {
+    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    let write = ReferenceWrite {
+        preassigned_version_id: None,
+        group_id: node.group_id,
+        user_id: node.owner.user_id,
+        realm_id: node.owner.realm_id,
+        node_id: node.state.get_node_id(),
+        bucket: BUCKET.to_string(),
+        key: key.to_string(),
+        expected_bucket: None,
+        version_source: target.binding(),
+        metadata: aruna_core::structs::execution::source_access::SourceMetadata {
+            content_length: 1,
+            content_type: None,
+            etag: Some(target.arn.version.to_string()),
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        },
+        inherited_policies: Vec::new(),
+        connector_guard: None,
+        restrictions: None,
+    };
+    write_reference_version(&node.state.get_ctx(), write)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn hides_unreadable_links() {
+    // A link names a target the caller cannot read: its key stays out of the listing, while a
+    // link to a readable target shows like any object.
+    let node = node_state().await;
+    store(&node, &["a.md"]).await;
+    let target =
+        |bucket: &str, key: &str, group_id| aruna_core::structs::storage::link::LinkTarget {
+            arn: aruna_core::structs::storage::replication::VersionedObjectArn {
+                realm_id: node.owner.realm_id,
+                node_id: node.state.get_node_id(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version: ulid::Ulid::from_parts(5, 5),
+            },
+            group_id,
+        };
+    link(&node, "open.md", target(BUCKET, "a.md", node.group_id)).await;
+    link(
+        &node,
+        "secret.md",
+        target("other", "x", ulid::Ulid::from_parts(9, 9)),
+    )
+    .await;
+    let page = list(&node, &node.owner, HeaderMap::new(), query(None, None, 10))
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["a.md", "open.md"]);
+}

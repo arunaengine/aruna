@@ -481,6 +481,7 @@ impl ArunaS3Service {
                     location,
                     source_metadata,
                     created_at,
+                    ..
                 } => {
                     let response_fields = self.build_response_fields(
                         location.as_ref(),

@@ -2670,6 +2670,8 @@ impl S3 for ArunaS3Service {
         )
         .await
         .map_err(IntoS3Error::into_s3_error)?;
+        // A link version shows only to a caller who may read its target.
+        let result = self.visible_versions(&user_access, &bucket, result).await?;
 
         Ok(self.list_versions_output(req.input, group_id, max_keys, result))
     }

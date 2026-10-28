@@ -98,6 +98,9 @@ pub struct ObjectOutput {
     /// Content address `https://w3id.org/aruna/data/<blake3>` to use as a File entity `@id`.
     /// Absent for a reference whose bytes were never read.
     pub content_id: Option<String>,
+    /// A link's binding, kept to check its target before the entry is shown; never sent.
+    #[serde(skip)]
+    pub link: Option<aruna_core::structs::execution::staging::VersionSourceBinding>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -772,6 +775,7 @@ pub(crate) fn object_output(object: &ListedObject) -> ObjectOutput {
         content_type,
         referenced: object.referenced,
         content_id,
+        link: object.link.clone(),
     }
 }
 

@@ -12,12 +12,14 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, KeyRange,
 };
+use aruna_core::structs::storage::link::LinkTarget;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::distribution::guard::{
     bound_view, copies_interval, lists_interval, local_fence,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::s3::listing::common_prefix_of;
+use aruna_operations::s3::object::link::{LinkCaller, target_visible};
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
@@ -576,6 +578,27 @@ async fn readable_page(
     let readable = |key: &str| access.allows(Some(key), &Permission::READ);
     page.objects.retain(|object| readable(&object.key));
     page.prefixes.retain(|prefix| readable(prefix));
+    // A link also needs its target readable, or its name and metadata stay hidden.
+    let caller = LinkCaller {
+        auth: auth.clone(),
+        credential: (String::new(), info.group_id, 0),
+    };
+    let mut visible = Vec::with_capacity(page.objects.len());
+    for object in std::mem::take(&mut page.objects) {
+        let shown = match object.link.as_ref() {
+            None => true,
+            Some(binding) => match LinkTarget::of(binding, realm_id) {
+                Some(target) => target_visible(&state.get_ctx(), &caller, &target)
+                    .await
+                    .map_err(|error| ServerError::InternalError(error.to_string()))?,
+                None => false,
+            },
+        };
+        if shown {
+            visible.push(object);
+        }
+    }
+    page.objects = visible;
     Ok(page)
 }
 
