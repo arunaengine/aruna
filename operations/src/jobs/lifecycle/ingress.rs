@@ -16,8 +16,10 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
+use aruna_core::structs::storage::blob::{
+    BucketInfo, bucket_permission_path, group_permission_path,
+};
+use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, ReleaseRef};
 use aruna_core::structs::storage::origin::{SourcePin, public_source_url, publishable};
 use aruna_core::structs::storage::read_grant::{GrantScope, ReadGrant};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -911,7 +913,7 @@ async fn capture_inputs(
         let info = drive(GetBucketOperation::new(bucket.clone()), context)
             .await
             .map_err(|error| unavailable(error.to_string()))?;
-        let database = bucket_metadata(context, bucket, &info)
+        let database = readable_metadata(context, (&auth, local), bucket, &info)
             .await
             .map_err(unavailable)?;
         let scope = BucketScope {
@@ -960,6 +962,32 @@ async fn capture_inputs(
         });
     }
     Ok(captured_inputs)
+}
+
+/// The bucket's metadata when the caller may read the bucket itself, checked like the metadata
+/// route; READ on one key alone shows none of it, and the run still starts.
+async fn readable_metadata(
+    context: &DriverContext,
+    (auth, local): (&AuthContext, NodeId),
+    bucket: &str,
+    info: &BucketInfo,
+) -> Result<Option<BucketMetadata>, String> {
+    let path = bucket_permission_path(auth.realm_id, info.group_id, local, bucket);
+    let extras = PolicyRequestExtras::rest();
+    match authorize(
+        context,
+        auth.realm_id,
+        auth,
+        &path,
+        &Permission::READ,
+        extras,
+    )
+    .await
+    {
+        Ok(()) => bucket_metadata(context, bucket, info).await,
+        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// The releases that pin one input version, checked with the caller's own access; a check that

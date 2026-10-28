@@ -8,10 +8,13 @@ use crate::topology;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+use aruna_core::effects::StorageEffect;
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{InputMode, InputSelection, InputSource, SubmissionId};
-use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission, Role};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{
     BucketMetadata, RELEASE_PREFIX_TAG, RELEASE_TAG,
@@ -197,7 +200,7 @@ async fn releases_pin_versions() -> TestResult<()> {
     );
     let restricted = AuthContext {
         path_restrictions: Some(vec![PathRestriction {
-            pattern: file_path,
+            pattern: file_path.clone(),
             permission: Permission::READ,
         }]),
         ..realm.auth_context()
@@ -285,6 +288,41 @@ async fn releases_pin_versions() -> TestResult<()> {
     assert_eq!(captured.releases.len(), 1);
     assert_eq!(captured.releases[0].label, "6.0");
     assert!(captured.releases_complete);
+
+    // READ on the one input key admits it but shows nothing of the bucket's metadata.
+    let one_key = aruna_core::UserId::local(Ulid::from(78u128), realm.realm_id);
+    let bytes = topology::read_group_auth(holder, group_id)
+        .await?
+        .ok_or("the group's authorization document")?;
+    let mut doc: GroupAuthorizationDocument = postcard::from_bytes(&bytes)?;
+    let role_id = Ulid::from(79u128);
+    doc.roles.insert(
+        role_id,
+        Role {
+            role_id,
+            name: "one-key".to_string(),
+            permissions: HashMap::from([(file_path.clone(), Permission::READ)]),
+            assigned_users: std::collections::HashSet::from([one_key]),
+        },
+    );
+    let write = StorageEffect::Write {
+        key_space: AUTH_KEYSPACE.to_string(),
+        key: group_id.to_bytes().to_vec().into(),
+        value: postcard::to_allocvec(&doc)?.into(),
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(write).await;
+    let request = InputResolveRequest {
+        created_by: one_key,
+        submission_id: SubmissionId([8; 32]),
+        expires_at: u64::MAX,
+        inputs: resolved.iter().map(|(input, _)| input.clone()).collect(),
+    };
+    let resolved = handle
+        .request_input_resolve(holder.node_id(), realm.bearer_for(one_key), request)
+        .await?
+        .map_err(|refusal| format!("{refusal:?}"))?;
+    assert_eq!(resolved[0].1.database, None, "no bucket READ, no metadata");
 
     // The holder reads a tagged crate version for the caller; an untagged version is none.
     let crate_ask = |key: &str, version_id| HolderAsk::Crate {
