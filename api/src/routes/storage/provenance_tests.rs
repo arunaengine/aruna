@@ -125,21 +125,28 @@ async fn silent_node_incomplete() {
     assert!(status.starts_with("Incomplete"));
     assert!(entity(&root, &start).is_some());
 
-    let export = |bearer: Option<ValidatedBearer>| {
+    let export = |bearer: Option<ValidatedBearer>, version: Option<String>| {
         export_provenance(
             State(node.state.clone()),
             Extension(Some(node.owner.clone())),
             Extension(bearer),
             Query(ExportParams {
-                version: None,
+                version,
                 dataset: None,
             }),
         )
     };
-    let neither = export(Some(ValidatedBearer::new_for_test("caller-token"))).await;
+    let token = || Some(ValidatedBearer::new_for_test("caller-token"));
+    let neither = export(token(), None).await;
     assert!(matches!(neither, Err(ServerError::BadRequestReason(_))));
+    // A bare version id names no node or realm, so it is refused as `/data/origin` does.
+    let bare = export(token(), Some(Ulid::from_bytes([3; 16]).to_string())).await;
+    assert!(matches!(bare, Err(ServerError::BadRequestReason(_))));
     // Each hop checks the token again, so an export without one is refused.
-    assert!(matches!(export(None).await, Err(ServerError::Unauthorized)));
+    assert!(matches!(
+        export(None, None).await,
+        Err(ServerError::Unauthorized)
+    ));
 }
 
 #[tokio::test]

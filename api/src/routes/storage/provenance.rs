@@ -12,6 +12,8 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_operations::metadata::provenance::{
     CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
 };
@@ -108,7 +110,12 @@ pub async fn export_provenance(
     // Every hop checks this token again, so an export needs one.
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let start = match (params.version, params.dataset) {
-        (Some(version), None) => Start::Version(version),
+        (Some(version), None) if is_version_id(&version) => Start::Version(version),
+        (Some(_), None) => {
+            return Err(ServerError::BadRequestReason(
+                "not a version id".to_string(),
+            ));
+        }
         (None, Some(dataset)) => Start::Dataset(dataset),
         _ => {
             return Err(ServerError::BadRequestReason(
@@ -293,6 +300,14 @@ async fn walk(
         }
     }
     finish(&caller, &gone, zip, built).await
+}
+
+/// Whether `id` names one exact version, as `/data/origin` accepts it.
+fn is_version_id(id: &str) -> bool {
+    matches!(
+        W3idIdentifier::parse(id),
+        Ok(W3idIdentifier::VersionedObject(_) | W3idIdentifier::Global(GlobalId::Version { .. }))
+    )
 }
 
 /// Writes the root metadata and closes the ZIP within the finishing window. The root goes to a
