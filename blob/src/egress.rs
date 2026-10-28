@@ -27,7 +27,7 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle bound, not a deadline: it resets on every byte, so a stalled tenant
 /// endpoint is dropped while a multi-gigabyte transfer keeps running.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
-const REDIRECT_HOPS: usize = 5;
+pub(crate) const REDIRECT_HOPS: usize = 5;
 
 type LookupFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
 type Lookup = Arc<dyn Fn(String) -> LookupFuture + Send + Sync>;
@@ -240,6 +240,23 @@ impl EgressGuard {
             .ok_or_else(|| EgressError::MissingHost(url.to_string()))?;
         screen_host(&self.policy, host)?;
         Ok(self.plain.get(url))
+    }
+
+    /// Screened GET builder that follows no redirect, for callers that follow each hop
+    /// themselves; `visited` are the earlier hops, and a hop may not leave HTTPS.
+    pub fn hop_request(
+        &self,
+        url: Url,
+        visited: &[Url],
+    ) -> Result<reqwest::RequestBuilder, EgressError> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| EgressError::MissingHost(url.to_string()))?;
+        screen_host(&self.policy, host)?;
+        if scheme_downgraded(visited, &url) {
+            return Err(EgressError::SchemeDowngrade(url.to_string()));
+        }
+        Ok(self.opendal.get(url))
     }
 
     /// Screens repository requests and refuses redirects for authenticated writes.

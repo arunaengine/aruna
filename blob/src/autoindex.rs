@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::egress::EgressGuard;
+use crate::egress::{EgressGuard, REDIRECT_HOPS};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
 use reqwest::StatusCode;
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
@@ -149,25 +149,39 @@ impl<'guard> HttpIndexClient<'guard> {
         })
     }
 
+    /// Follows redirects hop by hop, so each hop is screened and paced as its own request.
     async fn fetch_index(&self, path: &str) -> Result<(String, String), StagingSourceError> {
-        let url = join_directory(&self.base, path)?;
-        let mut request = self
-            .guard
-            .request(url)?
-            .timeout(FETCH_TIMEOUT)
-            .header(ACCEPT, "text/html");
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        } else if let Some(username) = &self.username {
-            request = request.basic_auth(username, self.password.as_deref());
-        }
-        crate::pace::turn().await;
-        let mut response = request.send().await.map_err(|error| {
-            StagingSourceError::ListError(format!("http request failed: {}", error.without_url()))
-        })?;
+        let mut url = join_directory(&self.base, path)?;
+        let mut visited = Vec::new();
+        let mut response = loop {
+            let mut request = (self.guard.hop_request(url.clone(), &visited)?)
+                .timeout(FETCH_TIMEOUT)
+                .header(ACCEPT, "text/html");
+            // Credentials go only to the connector's own origin, as an automatic redirect does.
+            let own = url.origin() == self.base.origin();
+            if let Some(token) = self.token.as_ref().filter(|_| own) {
+                request = request.bearer_auth(token);
+            } else if let Some(username) = self.username.as_ref().filter(|_| own) {
+                request = request.basic_auth(username, self.password.as_deref());
+            }
+            crate::pace::turn().await;
+            let response = request.send().await.map_err(|error| {
+                let error = error.without_url();
+                StagingSourceError::ListError(format!("http request failed: {error}"))
+            })?;
+            crate::pace::answered(response.status(), response.headers());
+            let next = (response.status().is_redirection() && visited.len() < REDIRECT_HOPS)
+                .then(|| response.headers().get(LOCATION))
+                .flatten()
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| url.join(location).ok());
+            match next {
+                Some(next) => visited.push(std::mem::replace(&mut url, next)),
+                None => break response,
+            }
+        };
 
         let status = response.status();
-        crate::pace::answered(status, response.headers());
         if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
             return Err(StagingSourceError::NotFound);
         }
@@ -789,6 +803,9 @@ mod tests {
                         .iter()
                         .find(|(route_path, ..)| *route_path == path)
                     {
+                        Some((_, "redirect", location)) => format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        ),
                         Some((_, content_type, body)) => format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
@@ -850,6 +867,37 @@ mod tests {
         assert_eq!(entries[0].name, "b.txt");
         assert!(!truncated);
 
+        server.abort();
+        let _ = server.await;
+    }
+
+    // A redirected index fetch of a paced task takes one token per hop.
+    #[tokio::test]
+    async fn redirect_hops_paced() {
+        use crate::pace::{Pace, paced};
+        let rows = "<a href=\"a.txt\">a.txt</a>               19-Jul-2026 10:01       10\n";
+        let (server, endpoint) = spawn_index_server(vec![
+            ("/data/", "redirect", "/moved/".to_string()),
+            ("/moved/", "text/html", index_page("/moved/", rows)),
+        ])
+        .await;
+        let config = HashMap::from([
+            ("endpoint".to_string(), endpoint),
+            ("root".to_string(), "data".to_string()),
+        ]);
+        let pace = Pace {
+            key: ulid::Ulid::from_bytes([4; 16]),
+            rate: 4,
+        };
+        let start = std::time::Instant::now();
+        let listed = paced(pace, async {
+            list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false).await
+        })
+        .await;
+        let (entries, _) = listed.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "a.txt");
+        assert!(start.elapsed() >= Duration::from_millis(250));
         server.abort();
         let _ = server.await;
     }
