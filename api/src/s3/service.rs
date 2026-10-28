@@ -869,11 +869,13 @@ impl S3 for ArunaS3Service {
             ),
             None => None,
         };
-        // In a distributed bucket a marker may be a merged token that resumes inside a range.
+        // In a distributed bucket a marker may be the sealed position this listing issued; any
+        // other token, such as a ListObjectsV2 one, stays a plain key.
         let query = (prefix.as_deref(), delimiter.as_deref());
         let resumed = (merged.as_ref().zip(marker.as_deref()))
             .and_then(|(binding, marker)| decode_bound(binding.set_id, query, Some(marker)).ok())
-            .flatten();
+            .flatten()
+            .filter(|resume| matches!(resume, Resume::Sealed { .. }));
         let key_marker = marker
             .as_deref()
             .filter(|_| hidden.is_none() && resumed.is_none());

@@ -790,6 +790,31 @@ async fn resumed_copy_stale() {
     }
 }
 
+// A ListObjects marker that happens to equal a ListObjectsV2 token is a plain key, so the
+// listing starts after it instead of from the first key.
+#[tokio::test]
+async fn v1_marker_stays_key() {
+    use s3s::dto::ListObjectsInput;
+    let members = members(3, &["h", "p"], 0).await;
+    for key in ["!a", "~z"] {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    let (keys, _, token) = page(&members, 0, list_input(1)).await.unwrap();
+    assert_eq!(keys, ["!a"]);
+    let node = &members.nodes[0];
+    let input = ListObjectsInput {
+        bucket: BUCKET.to_string(),
+        marker: token,
+        ..Default::default()
+    };
+    let list = request(input, Method::GET, members.user_on(0), node.bucket().await);
+    let output = node.service.list_objects(list).await.unwrap().output;
+    let keys: Vec<String> = (output.contents.unwrap_or_default().into_iter())
+        .filter_map(|object| object.key)
+        .collect();
+    assert_eq!(keys, ["~z"]);
+}
+
 // Prefixes group keys across ranges once each, and a token of another query is refused.
 #[tokio::test]
 async fn listing_groups_prefixes() {
