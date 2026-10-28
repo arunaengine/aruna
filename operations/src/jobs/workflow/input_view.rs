@@ -15,6 +15,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures_util::future::BoxFuture;
 use thiserror::Error;
 
 use crate::driver::{DriverContext, drive};
@@ -22,6 +23,7 @@ use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION, SourceReadError, 
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
+use crate::s3::object::visible::SCAN_BUDGET;
 use crate::staging::native_source::{body_stream, granted_read};
 
 /// Keys one listing page returns at most, as S3 does.
@@ -106,33 +108,53 @@ pub fn view_entries(record: &JobRecord) -> Result<Vec<ViewEntry>, ViewError> {
     Ok(entries)
 }
 
+/// Where a view page resumes: after a marker, or among hidden entries after the last one
+/// examined, inside the common prefix whose shown entry is still sought.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ViewFrom {
+    After(String),
+    Hidden { at: String, pending: Option<String> },
+}
+
 /// One ListObjectsV2 page: entry indices, common prefixes, and where the next page resumes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ViewListing {
     pub objects: Vec<usize>,
     pub prefixes: Vec<String>,
-    pub next: Option<String>,
+    pub next: Option<ViewFrom>,
 }
 
-/// Lists `entries` (in key order) below `prefix` after the marker `after`. A common prefix
-/// counts once toward `max_keys`, and a marker that is one resumes after all of its keys.
-pub fn list_page(
+/// Lists `entries` (in key order) below `prefix` from `from`, asking `shows` about each
+/// candidate in turn, so nothing before the position or past the page is checked. A common
+/// prefix shows once one of its entries does and counts once toward `max_keys`.
+pub async fn list_shown<'s, E, F>(
     entries: &[ViewEntry],
-    prefix: &str,
-    delimiter: Option<&str>,
-    after: Option<&str>,
+    (prefix, delimiter): (&str, Option<&str>),
+    from: Option<ViewFrom>,
     max_keys: usize,
-) -> ViewListing {
+    mut shows: F,
+) -> Result<ViewListing, E>
+where
+    F: FnMut(&ViewEntry) -> BoxFuture<'s, Result<bool, E>>,
+{
     let mut listing = ViewListing::default();
     let max_keys = max_keys.min(MAX_VIEW_KEYS);
+    let mut budget = SCAN_BUDGET;
+    let (after, marker, pending) = match from {
+        None => (None, false, None),
+        Some(ViewFrom::After(after)) => (Some(after), true, None),
+        Some(ViewFrom::Hidden { at, pending }) => (Some(at), false, pending),
+    };
+    // The common prefix last met, and whether it showed.
+    let mut current: Option<(String, bool)> = pending.map(|group| (group, false));
     let mut last: Option<String> = None;
     for (index, entry) in entries.iter().enumerate() {
         let Some(rest) = entry.key.strip_prefix(prefix) else {
             continue;
         };
-        if after.is_some_and(|after| {
+        if after.as_deref().is_some_and(|after| {
             entry.key.as_str() <= after
-                || (is_prefix(after, delimiter) && entry.key.starts_with(after))
+                || (marker && is_prefix(after, delimiter) && entry.key.starts_with(after))
         }) {
             continue;
         }
@@ -140,43 +162,44 @@ pub fn list_page(
             .filter(|delimiter| !delimiter.is_empty())
             .and_then(|delimiter| rest.find(delimiter).map(|at| at + delimiter.len()))
             .map(|end| format!("{prefix}{}", &rest[..end]));
-        if group.is_some() && group == last {
+        if group.is_some()
+            && current.as_ref().is_some_and(|(shown_group, shown)| {
+                *shown && group.as_deref() == Some(shown_group.as_str())
+            })
+        {
             continue;
         }
         if listing.objects.len() + listing.prefixes.len() == max_keys {
-            listing.next = last;
-            return listing;
+            listing.next = last.map(ViewFrom::After);
+            return Ok(listing);
         }
-        match group {
-            Some(group) => {
+        let shown = shows(entry).await?;
+        match (&group, shown) {
+            (Some(group), true) => {
                 listing.prefixes.push(group.clone());
-                last = Some(group);
+                last = Some(group.clone());
             }
-            None => {
+            (None, true) => {
                 listing.objects.push(index);
                 last = Some(entry.key.clone());
             }
+            (_, false) => budget = budget.saturating_sub(1),
+        }
+        if let Some(group) = &group {
+            current = Some((group.clone(), shown));
+        }
+        if budget == 0 {
+            listing.next = Some(match &last {
+                Some(last) => ViewFrom::After(last.clone()),
+                None => ViewFrom::Hidden {
+                    at: entry.key.clone(),
+                    pending: group,
+                },
+            });
+            return Ok(listing);
         }
     }
-    listing
-}
-
-/// Lists only the entries `visible` marks, so a denied entry never becomes a key, a common
-/// prefix or a continuation marker. Indices point into `entries`.
-pub fn list_visible(
-    entries: &[ViewEntry],
-    visible: &[bool],
-    (prefix, delimiter): (&str, Option<&str>),
-    after: Option<&str>,
-    max_keys: usize,
-) -> ViewListing {
-    let shown: Vec<usize> = (0..entries.len())
-        .filter(|index| visible.get(*index).copied().unwrap_or(false))
-        .collect();
-    let subset: Vec<ViewEntry> = shown.iter().map(|index| entries[*index].clone()).collect();
-    let mut listing = list_page(&subset, prefix, delimiter, after, max_keys);
-    listing.objects = listing.objects.iter().map(|index| shown[*index]).collect();
-    listing
+    Ok(listing)
 }
 
 fn is_prefix(marker: &str, delimiter: Option<&str>) -> bool {
@@ -417,27 +440,45 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn pages_across_prefixes() {
+    /// One page of `entries`, asking `shows` which ones the caller may see.
+    async fn page(
+        entries: &[ViewEntry],
+        scope: (&str, Option<&str>),
+        from: Option<ViewFrom>,
+        max_keys: usize,
+        shows: impl Fn(&ViewEntry) -> bool,
+    ) -> ViewListing {
+        let shows = |entry: &ViewEntry| -> BoxFuture<'static, Result<bool, ()>> {
+            let shown = shows(entry);
+            Box::pin(async move { Ok(shown) })
+        };
+        list_shown(entries, scope, from, max_keys, shows)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pages_across_prefixes() {
         // One key per page walks every key and common prefix exactly once, in order.
         let entries = entries();
         let mut seen = Vec::new();
-        let mut after: Option<String> = None;
+        let mut from: Option<ViewFrom> = None;
         loop {
-            let page = list_page(&entries, "db/", Some("/"), after.as_deref(), 1);
-            assert!(page.objects.len() + page.prefixes.len() <= 1);
-            seen.extend(keys(&entries, &page));
-            seen.extend(page.prefixes.clone());
-            match page.next {
-                Some(next) => after = Some(next),
+            let listed = page(&entries, ("db/", Some("/")), from.take(), 1, |_| true).await;
+            assert!(listed.objects.len() + listed.prefixes.len() <= 1);
+            seen.extend(keys(&entries, &listed));
+            seen.extend(listed.prefixes.clone());
+            match listed.next {
+                Some(next) => from = Some(next),
                 None => break,
             }
         }
         assert_eq!(seen, ["db/a.dmnd", "db/b.sqlite", "db/sub/"]);
-        let flat = list_page(&entries, "", None, None, 2);
+        let flat = page(&entries, ("", None), None, 2, |_| true).await;
         assert_eq!(keys(&entries, &flat), ["db/a.dmnd", "db/b.sqlite"]);
-        assert_eq!(flat.next.as_deref(), Some("db/b.sqlite"));
-        let rest = list_page(&entries, "", None, flat.next.as_deref(), 1000);
+        let after = Some(ViewFrom::After("db/b.sqlite".to_string()));
+        assert_eq!(flat.next, after);
+        let rest = page(&entries, ("", None), after, 1000, |_| true).await;
         assert_eq!(
             keys(&entries, &rest),
             ["db/sub/c", "db/sub/d", "genome.fna"]
@@ -445,47 +486,74 @@ mod tests {
         assert!(rest.next.is_none());
     }
 
-    #[test]
-    fn groups_root_prefixes() {
+    #[tokio::test]
+    async fn groups_root_prefixes() {
         // At the root one prefix stands for all its keys, and a marker resumes after it.
         let entries = entries();
-        let root = list_page(&entries, "", Some("/"), None, 1000);
+        let root = page(&entries, ("", Some("/")), None, 1000, |_| true).await;
         assert_eq!(root.prefixes, ["db/"]);
         assert_eq!(keys(&entries, &root), ["genome.fna"]);
-        let first = list_page(&entries, "", Some("/"), None, 1);
+        let first = page(&entries, ("", Some("/")), None, 1, |_| true).await;
         assert_eq!(first.prefixes, ["db/"]);
-        assert_eq!(first.next.as_deref(), Some("db/"));
-        let second = list_page(&entries, "", Some("/"), first.next.as_deref(), 1);
+        assert_eq!(first.next, Some(ViewFrom::After("db/".to_string())));
+        let second = page(&entries, ("", Some("/")), first.next, 1, |_| true).await;
         assert_eq!(keys(&entries, &second), ["genome.fna"]);
         assert!(second.next.is_none());
     }
 
-    #[test]
-    fn denied_stays_unlisted() {
+    #[tokio::test]
+    async fn denied_stays_unlisted() {
         // A denied entry is never a key, a prefix or a cursor, on any page.
         let entries = entries();
         let denied = ["db/b.sqlite", "db/sub/c", "db/sub/d"];
-        let visible: Vec<bool> = entries
-            .iter()
-            .map(|entry| !denied.contains(&entry.key.as_str()))
-            .collect();
+        let shows = |entry: &ViewEntry| !denied.contains(&entry.key.as_str());
         for (prefix, expected) in [("", vec!["db/", "genome.fna"]), ("db/", vec!["db/a.dmnd"])] {
             let mut seen = Vec::new();
-            let mut after: Option<String> = None;
+            let mut from: Option<ViewFrom> = None;
             loop {
-                let scope = (prefix, Some("/"));
-                let page = list_visible(&entries, &visible, scope, after.as_deref(), 1);
-                seen.extend(keys(&entries, &page));
-                seen.extend(page.prefixes.clone());
-                let Some(next) = page.next else { break };
-                assert!(
-                    !denied.iter().any(|key| next.starts_with(key)),
-                    "cursor {next}"
-                );
-                after = Some(next);
+                let listed = page(&entries, (prefix, Some("/")), from.take(), 1, shows).await;
+                seen.extend(keys(&entries, &listed));
+                seen.extend(listed.prefixes.clone());
+                let Some(next) = listed.next else { break };
+                if let ViewFrom::After(next) = &next {
+                    assert!(!denied.iter().any(|key| next.starts_with(key)), "{next}");
+                }
+                from = Some(next);
             }
             assert_eq!(seen, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn authorizes_from_position() {
+        // A page checks only entries after its position and stops at the first it can return;
+        // past the scan budget of hidden entries it resumes from a hidden position.
+        let entries = entries();
+        let mut checked = Vec::new();
+        let from = Some(ViewFrom::After("db/b.sqlite".to_string()));
+        let shows = |entry: &ViewEntry| -> BoxFuture<'static, Result<bool, ()>> {
+            checked.push(entry.key.clone());
+            Box::pin(async { Ok(true) })
+        };
+        let listed = list_shown(&entries, ("", None), from, 1, shows)
+            .await
+            .unwrap();
+        assert_eq!(keys(&entries, &listed), ["db/sub/c"]);
+        assert_eq!(checked, ["db/sub/c"]);
+        let many: Vec<ViewEntry> = (0..=SCAN_BUDGET)
+            .map(|index| entry(&format!("h/{index:05}")))
+            .chain([entry("z.txt")])
+            .collect();
+        let shows = |entry: &ViewEntry| entry.key == "z.txt";
+        let first = page(&many, ("", Some("/")), None, 10, shows).await;
+        assert!(first.objects.is_empty() && first.prefixes.is_empty());
+        let Some(ViewFrom::Hidden { pending, .. }) = &first.next else {
+            panic!("a hidden position: {:?}", first.next);
+        };
+        assert_eq!(pending.as_deref(), Some("h/"));
+        let second = page(&many, ("", Some("/")), first.next, 10, shows).await;
+        assert_eq!(keys(&many, &second), ["z.txt"]);
+        assert!(second.prefixes.is_empty() && second.next.is_none());
     }
 
     #[test]

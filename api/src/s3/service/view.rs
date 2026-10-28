@@ -6,10 +6,11 @@
 use aruna_core::structs::execution::job::{JobId, JobRecord};
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::jobs::workflow::input_view::{
-    MAX_VIEW_KEYS, ViewEntry, ViewError, decode_token, encode_token, head_entry, list_visible,
-    read_entry, view_bucket, view_entries,
+    MAX_VIEW_KEYS, ViewEntry, ViewError, ViewFrom, decode_token, encode_token, head_entry,
+    list_shown, read_entry, view_bucket, view_entries,
 };
 use aruna_operations::s3::object::get::GetObjectError;
+use aruna_operations::s3::object::visible::{is_sealed, open_cursor, seal_cursor};
 use percent_encoding::utf8_percent_encode;
 use s3s::dto::{
     CommonPrefix, ETag, ETagCondition, EncodingType, GetObjectInput, GetObjectOutput,
@@ -102,28 +103,41 @@ impl ArunaS3Service {
                 .min(MAX_VIEW_KEYS),
             None => MAX_VIEW_KEYS,
         };
-        let after =
-            match input.continuation_token.as_deref() {
-                Some(token) => Some(decode_token(&bucket, token).ok_or_else(|| {
-                    s3_error!(InvalidArgument, "The continuation token is invalid")
-                })?),
-                None => input.start_after.clone(),
-            };
-        // Entries are authorized before paging, so cursors and prefixes come from visible ones.
-        let mut visible = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            let shown = match entry.key.starts_with(&prefix) {
-                false => false,
-                true => match head_entry(&self.state, &record, entry, self.node_id).await {
-                    Ok(()) => true,
-                    Err(ViewError::Denied | ViewError::NotFound) => false,
-                    Err(error) => return Err(view_error(error)),
-                },
-            };
-            visible.push(shown);
-        }
+        // A sealed token resumes among entries the caller may not see, bound to this view.
+        let invalid = || s3_error!(InvalidArgument, "The continuation token is invalid");
+        let from = match input.continuation_token.as_deref() {
+            Some(token) if is_sealed(token) => match open_cursor::<(String, ViewFrom)>(token) {
+                Some((owner, from)) if owner == bucket => Some(from),
+                _ => return Err(invalid()),
+            },
+            Some(token) => Some(ViewFrom::After(
+                decode_token(&bucket, token).ok_or_else(invalid)?,
+            )),
+            None => input.start_after.clone().map(ViewFrom::After),
+        };
+        // Each candidate is authorized in key order from the position, as a HEAD of it would be.
         let scope = (prefix.as_str(), input.delimiter.as_deref());
-        let page = list_visible(&entries, &visible, scope, after.as_deref(), max_keys);
+        let (state, record_ref, node_id) = (&self.state, &record, self.node_id);
+        let page = list_shown(&entries, scope, from, max_keys, |entry: &ViewEntry| {
+            let entry = entry.clone();
+            Box::pin(async move {
+                match head_entry(state, record_ref, &entry, node_id).await {
+                    Ok(()) => Ok(true),
+                    Err(ViewError::Denied | ViewError::NotFound) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            })
+        })
+        .await
+        .map_err(view_error)?;
+        let next_continuation_token = match &page.next {
+            Some(ViewFrom::After(marker)) => Some(encode_token(&bucket, marker)),
+            Some(from) => Some(
+                seal_cursor(&(bucket.clone(), from.clone()))
+                    .ok_or_else(|| s3_error!(InternalError, "The view cursor was not sealed"))?,
+            ),
+            None => None,
+        };
         let encode = |value: &str| match &input.encoding_type {
             Some(kind) if kind.as_str() == EncodingType::URL => {
                 utf8_percent_encode(value, URL_ENCODE_SET).to_string()
@@ -161,7 +175,7 @@ impl ArunaS3Service {
             key_count: i32::try_from(key_count).ok(),
             is_truncated: Some(page.next.is_some()),
             continuation_token: input.continuation_token.clone(),
-            next_continuation_token: page.next.map(|next| encode_token(&bucket, &next)),
+            next_continuation_token,
             start_after: input.start_after.clone(),
             contents: Some(contents),
             common_prefixes: Some(prefixes),
