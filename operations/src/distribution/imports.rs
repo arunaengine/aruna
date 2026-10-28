@@ -512,6 +512,7 @@ mod tests {
                 target_prefix: String::new(),
             }],
             checksum_manifest: None,
+            table: None,
         }
     }
 
@@ -576,6 +577,7 @@ mod tests {
                 from: Some("k".to_string()),
             }),
             manifest: None,
+            table: None,
             queue_head: 0,
             queue_tail: 0,
             items_current: 7,

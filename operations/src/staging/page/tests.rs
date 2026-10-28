@@ -89,6 +89,7 @@ fn entry(path: &str) -> PageEntry {
         source_path: format!("data/{path}"),
         target_key: path.to_string(),
         observation: observation(path),
+        metadata: Default::default(),
     }
 }
 
@@ -100,6 +101,7 @@ fn checkpoint() -> StagingJobCheckpoint {
         prefixes_done: 1,
         walk: None,
         manifest: None,
+        table: None,
         queue_head: 0,
         queue_tail: 0,
         items_current: 0,
@@ -976,6 +978,7 @@ fn bakrep_entry(index: usize) -> PageEntry {
             source_version: None,
             digests: Default::default(),
         },
+        metadata: Default::default(),
     }
 }
 

@@ -46,6 +46,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::abe::{
@@ -2376,6 +2377,7 @@ impl IncomingVersionOperation {
                 referenced: self.is_reference_item(),
                 identity: self.written_identity,
                 pending: self.written_pending,
+                searchable: searchable(&self.manifest.metadata),
             },
         };
         let head = self.installed_head.is_some();

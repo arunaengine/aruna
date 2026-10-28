@@ -13,9 +13,12 @@ use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, SEARCH_FEED_KEYSPACE,
+    SEARCH_INDEX_KEYSPACE,
 };
 use aruna_core::shutdown::Shutdown;
+use aruna_core::structs::execution::table::search_terms;
+use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
 use aruna_core::structs::storage::distribution::accounting::{Charge, RangeAccount};
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, Position, range_interval,
@@ -31,7 +34,7 @@ use ulid::Ulid;
 use super::feed_store::{
     Located, delete_row, drop_settled, iter, locate, put_row, read_many, split_key, storage_error,
 };
-use super::key_index::{IndexedKey, KeyChange, KeyIndexError, RangeIndexes};
+use super::key_index::{IndexedKey, KeyChange, KeyIndexError, MetaTerms, RangeIndexes};
 use super::usage::{held_ranges, sum_held};
 use crate::driver::DriverContext;
 use crate::replication::members::read_record;
@@ -103,7 +106,7 @@ impl Feeder {
         let storage = context.storage_handle.bulk();
         let mut changed = 0;
         for (walk, result) in [
-            ("feed", self.feed_page(&storage).await),
+            ("feed", self.feed_page(context, &storage).await),
             ("open", self.open_page(context, &storage).await),
             ("build", self.state_page(context, &storage).await),
         ] {
@@ -117,7 +120,11 @@ impl Feeder {
 
     /// Applies a page of feed rows to their ranges' indexes, then drops the applied rows
     /// that no writer changed meanwhile.
-    async fn feed_page(&mut self, storage: &StorageHandle) -> Result<usize, FeedError> {
+    async fn feed_page(
+        &mut self,
+        context: &DriverContext,
+        storage: &StorageHandle,
+    ) -> Result<usize, FeedError> {
         let (rows, next) = iter(
             storage,
             SEARCH_FEED_KEYSPACE,
@@ -202,6 +209,8 @@ impl Feeder {
                 }
                 Some(IndexState::Ready { generation }) => (generation, (changes, rows)),
             };
+            let mut changes = changes;
+            describe(context, set_id, &mut changes).await?;
             match self
                 .indexes
                 .apply(set_id, range_id, generation, changes)
@@ -303,7 +312,7 @@ impl Feeder {
                         range_id,
                         generation,
                     };
-                    let ready = self.build(storage, &build, &account, cursor).await?;
+                    let ready = self.build(context, &build, &account, cursor).await?;
                     if !ready {
                         self.states = previous;
                         return Ok(changed + 1);
@@ -322,11 +331,12 @@ impl Feeder {
     /// true once the walk reached the range's end and the index switched to ready.
     async fn build(
         &self,
-        storage: &StorageHandle,
+        context: &DriverContext,
         build: &Build,
         account: &RangeAccount,
         mut cursor: Option<Vec<u8>>,
     ) -> Result<bool, FeedError> {
+        let storage = &context.storage_handle.bulk();
         let (lower, end) = range_interval(build.set_id, &account.lower, account.upper.as_deref());
         let mut changes = Vec::new();
         let mut done = false;
@@ -366,6 +376,7 @@ impl Feeder {
             }
         }
         let (set_id, range_id, generation) = (build.set_id, build.range_id, build.generation);
+        describe(context, set_id, &mut changes).await?;
         self.indexes
             .apply(set_id, range_id, generation, changes)
             .await?;
@@ -496,9 +507,48 @@ fn change_of(key: String, head: Option<HeadEntry>) -> KeyChange {
             key,
             size: head.version.size,
             version_id: head.version_id,
+            terms: head.version.searchable.then(MetaTerms::default),
         }),
         _ => KeyChange::Remove(key),
     }
+}
+
+/// Fills the search terms of searchable versions from their own version rows, one point read
+/// each; a version row this node lacks leaves its terms empty.
+async fn describe(
+    context: &DriverContext,
+    set_id: Ulid,
+    changes: &mut [KeyChange],
+) -> Result<(), FeedError> {
+    let mut wanted: Vec<&mut IndexedKey> = (changes.iter_mut())
+        .filter_map(|change| match change {
+            KeyChange::Put(indexed) if indexed.terms.is_some() => Some(indexed),
+            _ => None,
+        })
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let Some(view) = read_record(context, set_id)
+        .await
+        .map_err(FeedError::Storage)?
+    else {
+        return Ok(());
+    };
+    let bucket = &view.snapshot().config.bucket;
+    let keys = (wanted.iter())
+        .map(|indexed| VersionKey::new(bucket, &indexed.key, indexed.version_id).to_bytes())
+        .collect::<Result<Vec<_>, _>>()?;
+    let storage = context.storage_handle.bulk();
+    let versions = read_many(&storage, BLOB_VERSIONS_KEYSPACE, keys).await?;
+    for (indexed, version) in wanted.iter_mut().zip(versions) {
+        let Some(version) = version else {
+            continue;
+        };
+        let (text, exact) = search_terms(&BlobVersion::from_bytes(&version)?.metadata);
+        indexed.terms = Some(MetaTerms { text, exact });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

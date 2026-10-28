@@ -459,3 +459,17 @@ async fn sdk_client_screens() {
         vec![loopback.ip()]
     );
 }
+
+// A refused redirect hop names its host, never the path or query it was sent to.
+#[test]
+fn hop_errors_hide_paths() {
+    let guard = EgressGuard::new(EgressPolicy::loopback()).unwrap();
+    let visited = [Url::parse("https://127.0.0.1/index/").unwrap()];
+    let hop = Url::parse("http://127.0.0.1/moved/?token=secret-canary").unwrap();
+    let refused = guard.hop_request(hop, &visited).unwrap_err().to_string();
+    assert!(refused.contains("127.0.0.1"));
+    assert!(!refused.contains("secret-canary") && !refused.contains("moved"));
+    let hostless = Url::parse("data:text/plain,secret-canary").unwrap();
+    let refused = guard.hop_request(hostless, &[]).unwrap_err().to_string();
+    assert!(!refused.contains("secret-canary"));
+}

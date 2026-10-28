@@ -43,6 +43,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
+use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -1643,6 +1644,7 @@ impl PutObjectOperation {
                     .get_blake3()
                     .and_then(|hash| <[u8; 32]>::try_from(hash).ok()),
                 pending: false,
+                searchable: searchable(&self.metadata),
             },
         });
         let head = self.head_pointer.is_some();

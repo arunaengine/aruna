@@ -119,6 +119,8 @@ pub enum ObjectMatchMode {
     #[default]
     Substring,
     Prefix,
+    /// Searchable object metadata: free text plus `column=value` filters.
+    Metadata,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -498,14 +500,20 @@ restrictions and request policies before it can be returned.
   `coverage.index_progress` lists the keys indexed so far and the range's key count for each
   such range whose coordinator answered. `distributed_strict` answers 503 while any remain, and
   the error message says how many ranges and about how many keys are still to be indexed.
+- `match=metadata` matches object metadata instead of keys, for objects whose version names
+  searchable columns in `aruna-search-text` and `aruna-search-exact` (table imports set both).
+  Words of `q` must all appear in the text columns (case-insensitive, whole words); terms
+  `column=value` must equal an exact column, with quotes around values with spaces, as in
+  `coli taxid=562 assembly_level="Complete Genome"`. A distributed bucket walks only its
+  searchable keys, a bounded number per page, so a rare match may take many pages.
 - A search without `bucket` skips distributed buckets, which only their key indexes cover;
   each skipped bucket counts in `coverage.incomplete_ranges`.
 - A cursor that continues after keys the caller may not see carries them sealed; a restart of
   the node that sealed it makes such a cursor invalid."#,
     params(
-        ("q" = String, Query, description = "Case-sensitive key substring or prefix; trimmed, minimum 2 characters"),
+        ("q" = String, Query, description = "Case-sensitive key substring or prefix, or a metadata query; trimmed, minimum 2 characters"),
         ("bucket" = Option<String>, Query, description = "Optional exact bucket name"),
-        ("match" = Option<ObjectMatchMode>, Query, description = "Key match mode: substring (default) or prefix"),
+        ("match" = Option<ObjectMatchMode>, Query, description = "Match mode: substring (default) or prefix on keys, or metadata"),
         ("mode" = Option<ObjectMode>, Query, description = "Coverage mode: distributed_best_effort (default), distributed_strict, or local"),
         ("limit" = Option<usize>, Query, description = "Maximum merged hits (default 10, clamped to 1..=100)"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same query, bucket, match type, and mode")
@@ -585,6 +593,7 @@ pub async fn object_search(
     let key_match = match params.match_mode.unwrap_or_default() {
         ObjectMatchMode::Substring => ObjectKeyMatch::Substring,
         ObjectMatchMode::Prefix => ObjectKeyMatch::Prefix,
+        ObjectMatchMode::Metadata => ObjectKeyMatch::Metadata,
     };
     let result = search_objects(
         state.get_ctx().as_ref(),

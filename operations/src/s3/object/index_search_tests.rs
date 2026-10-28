@@ -62,6 +62,7 @@ async fn distributed(state: IndexState, keys: &[&str]) -> Distributed {
             key: key.to_string(),
             size: 42,
             version_id: Ulid::nil(),
+            terms: None,
         }));
     }
     let set_id = binding.set_id;
@@ -369,4 +370,68 @@ async fn realm_skips_distributed() {
         page.incomplete_ranges, 1,
         "the skipped bucket is not covered"
     );
+}
+
+// Metadata search goes through the same authorization and sealed continuation: a caller who
+// may not read the folders sees no hit and no key, the owner finds them by their terms.
+#[tokio::test]
+async fn metadata_hits_authorized() {
+    use crate::distribution::key_index::MetaTerms;
+    let ready = IndexState::Ready { generation: 1 };
+    let folders = ["a/", "b/", "c/"];
+    let test = distributed(ready, &folders).await;
+    let described = (folders.iter()).map(|key| {
+        let organism = match *key {
+            "b/" => "salmonella",
+            _ => "escherichia",
+        };
+        KeyChange::Put(IndexedKey {
+            key: key.to_string(),
+            size: 0,
+            version_id: Ulid::nil(),
+            terms: Some(MetaTerms {
+                text: [organism.to_string()].into(),
+                exact: [format!("taxid={}", key.len())].into(),
+            }),
+        })
+    });
+    let set_id = test.binding.set_id;
+    (test
+        .indexes
+        .apply(set_id, test.lower, 1, described.collect()))
+    .await
+    .unwrap();
+    let metadata = |auth, query: &str| {
+        let mut input = test.input(auth, query);
+        input.key_match = ObjectKeyMatch::Metadata;
+        input
+    };
+    let fixture = &test.fixture;
+    let found = test
+        .search(metadata(owner(fixture), "Escherichia taxid=2"), 10)
+        .await;
+    assert_eq!(keys(&found), ["a/", "c/"]);
+
+    let elsewhere = object_permission_path(
+        fixture.realm_id,
+        fixture.visible_group,
+        fixture.node_id,
+        "spire",
+        "x",
+    );
+    let denied = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: elsewhere,
+            permission: Permission::READ,
+        }]),
+        ..owner(fixture)
+    };
+    let first = test.search(metadata(denied, "escherichia"), 2).await;
+    assert!(first.hits.is_empty());
+    let cursor = first
+        .next_start_after
+        .expect("the budget ends the page early");
+    assert!(sealed_position(&cursor));
+    let last = BlobHeadKey::new("spire", "b/").to_bytes().unwrap();
+    assert_eq!(open_position(&cursor).unwrap(), last);
 }

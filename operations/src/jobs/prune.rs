@@ -495,6 +495,7 @@ mod tests {
                 current: 1,
                 total: Some(1),
                 unit: "entries".to_string(),
+                paused_until: None,
             },
             unix_timestamp_millis().saturating_sub(2),
         )

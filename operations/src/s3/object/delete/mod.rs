@@ -1060,6 +1060,7 @@ impl DeleteObjectOperation {
                 referenced: false,
                 identity: None,
                 pending: false,
+                searchable: false,
             },
         };
         version_written(self.binding.as_ref(), &self.input.key, added, true)
