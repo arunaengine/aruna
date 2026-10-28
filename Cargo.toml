@@ -91,6 +91,7 @@ crc-fast = "1.10.0"
 croner = { version = "4.0.1", default-features = false, features = ["chrono"] }
 crossfire = "3.1.20"
 crypto_box = "0.9.1"
+csv = "1.4.0"
 dirs = "7.0.0"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "3.0.0", features = ["pem"] }
