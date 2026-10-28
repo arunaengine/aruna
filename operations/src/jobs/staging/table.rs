@@ -40,7 +40,7 @@ use crate::s3::object::get::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
 };
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 
@@ -624,9 +624,7 @@ async fn write_object(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
-    let result = drive(operation, &ctx.driver)
-        .await
-        .map_err(|error| ItemFailure::Stage(format!("object not written: {error}")))?;
+    let result = drive(operation, &ctx.driver).await.map_err(put_failure)?;
     drive(
         LiveVersionOperation::new(LiveVersionInput {
             local_node_id: spec.node_id,
@@ -643,9 +641,43 @@ async fn write_object(
     .map_err(|error| ItemFailure::Stage(format!("replication queue failed: {error}")))
 }
 
+/// A put that fails the same way again fails its row; any other retries the chunk, which keeps
+/// its checkpoint, so no folder is queued without its folder object.
+fn put_failure(error: PutObjectError) -> ItemFailure {
+    let message = format!("object not written: {error}");
+    let lasting = matches!(
+        error,
+        PutObjectError::QuotaExceeded { .. }
+            | PutObjectError::QuotaGateError(_)
+            | PutObjectError::Unmapped
+            | PutObjectError::RoutingFailed(_)
+            | PutObjectError::PolicyError(_)
+            | PutObjectError::PolicyGate(_)
+            | PutObjectError::PurgeFence(_)
+            | PutObjectError::ObjectExists
+            | PutObjectError::ConversionError(_)
+    );
+    match lasting {
+        true => ItemFailure::Stage(message),
+        false => ItemFailure::System(message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Storage hiccups and usage rebuilds retry the chunk; a full quota fails the row.
+    #[test]
+    fn put_failures_classified() {
+        use aruna_core::errors::StorageError;
+        let retried = |error| matches!(put_failure(error), ItemFailure::System(_));
+        assert!(retried(PutObjectError::UsageRebuilding));
+        assert!(retried(PutObjectError::FenceTaken));
+        assert!(retried(PutObjectError::StorageError(StorageError::Timeout)));
+        let quota = PutObjectError::QuotaExceeded { limit: 1, usage: 2 };
+        assert!(matches!(put_failure(quota), ItemFailure::Stage(_)));
+    }
 
     // Rows naming one key alike import once; rows naming it differently fail, not overwrite.
     #[test]
