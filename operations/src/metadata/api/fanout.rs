@@ -5,7 +5,7 @@
 use super::field;
 
 use super::{
-    ApiQueryMode, Arc, AuthToken, BoxFuture, BucketSearchExecution, BucketSearchHit,
+    ApiQueryMode, Arc, AuthToken, BoxFuture, BucketPage, BucketSearchExecution,
     BucketSearchRequest, DISTRIBUTED_QUERY_DEADLINE, DriverContext, HashSet, Instant,
     MetadataApiError, MetadataReadError, NodeId, QUERY_FANOUT_LIMIT, QUERY_MAX_BYTES,
     QUERY_MAX_NODES, QUERY_MAX_ROWS, RealmId, SearchBucketsInput, Span, debug_span,
@@ -13,7 +13,7 @@ use super::{
     record_elapsed_ms, search_local_buckets, select_fanout_nodes, short_display_id, stream, warn,
 };
 
-use super::bucket_page::{NodePosition, decode_cursor, encode_cursor, merge_pages};
+use super::bucket_page::{NodePosition, decode_cursor, encode_cursor, merge_pages, retired_nodes};
 use super::distributed::record_bucket_result;
 use futures_util::StreamExt;
 use futures_util::future::FutureExt;
@@ -396,6 +396,7 @@ where
         discovery_failed: scope_discovery_failed,
         subject: request_subject,
         deadline: scope_deadline,
+        skip,
     } = scope;
     let deadline =
         scope_deadline.unwrap_or_else(|| tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE);
@@ -418,6 +419,7 @@ where
                 nodes_failed: 0,
                 failed_partitions: Vec::new(),
                 discovery_failed: false,
+                omitted: Vec::new(),
             };
             match result {
                 Ok(result) => Ok((vec![(local_node_id, result)], fanout_stats)),
@@ -436,11 +438,12 @@ where
             .await;
             let discovery_failed = scope_discovery_failed || discovery.failed;
             let mut nodes = discovery.nodes;
+            nodes.retain(|node_id| !skip.contains(node_id));
             if discovery_failed && !allow_partial {
                 return Err(MetadataApiError::ServiceUnavailable);
             }
             let failed_partitions = Vec::new();
-            let mut omitted_nodes = 0usize;
+            let mut omitted = Vec::new();
             if nodes.len() > QUERY_MAX_NODES {
                 let mut subject = Vec::with_capacity(32 + operation.label().len() + 32 + 1);
                 subject.extend_from_slice(realm_id.as_bytes());
@@ -450,9 +453,12 @@ where
                 }
                 subject.extend_from_slice(local_node_id.as_bytes());
                 let selected = select_fanout_nodes(&nodes, local_node_id, &subject);
-                omitted_nodes = nodes.len().saturating_sub(selected.len());
+                omitted = (nodes.iter().copied())
+                    .filter(|node_id| !selected.contains(node_id))
+                    .collect();
                 nodes = selected;
             }
+            let omitted_nodes = omitted.len();
             span.record("node_count", nodes.len() as u64);
             let mut fanout_stats = MetadataFanoutStats {
                 nodes_queried: nodes.len(),
@@ -461,6 +467,7 @@ where
                     + usize::from(discovery_failed),
                 failed_partitions,
                 discovery_failed,
+                omitted,
             };
             let fanout_started = Instant::now();
             let mut node_parts = Vec::new();
@@ -601,7 +608,12 @@ pub async fn search_buckets_distributed(
     let remote_auth_token = fanout_bearer(request.bearer_token.as_deref());
     let positions = decode_cursor(request.cursor.as_deref())?;
     let group_id = request.group_id;
-    let local_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
+    let database = request.database;
+    let done = (positions.iter())
+        .filter(|entry| entry.done)
+        .filter_map(|entry| NodeId::from_bytes(&entry.node_id).ok())
+        .collect();
+    let local_call: MetadataNodeCall<BucketPage> = metadata_node_call(
         (
             context.clone(),
             request.auth,
@@ -612,7 +624,7 @@ pub async fn search_buckets_distributed(
         ),
         move |(context, auth, realm_id, query, limit, positions), node_id| async move {
             let Some(start_after) = start_after(&positions, node_id) else {
-                return Ok(Vec::new());
+                return Ok(BucketPage::default());
             };
             search_local_buckets(
                 &context,
@@ -623,14 +635,15 @@ pub async fn search_buckets_distributed(
                     query,
                     limit,
                     group_id,
-                    start_after: start_after.map(|after| after.into_bytes().into()),
+                    start_after: start_after.map(Into::into),
+                    database,
                 },
             )
             .await
             .map_err(|_| MetadataReadError::Unavailable)
         },
     );
-    let remote_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
+    let remote_call: MetadataNodeCall<BucketPage> = metadata_node_call(
         (
             handle,
             remote_auth_token,
@@ -640,20 +653,27 @@ pub async fn search_buckets_distributed(
         ),
         move |(handle, auth_token, query, limit, positions), node_id| async move {
             let Some(start_after) = start_after(&positions, node_id) else {
-                return Ok(Vec::new());
+                return Ok(BucketPage::default());
             };
             handle
-                .request_bucket_search(node_id, auth_token, query, limit, group_id, start_after)
+                .request_bucket_search(
+                    node_id,
+                    auth_token,
+                    (query, limit),
+                    (group_id, database),
+                    start_after,
+                )
                 .await
         },
     );
-    let (parts, fanout_stats) = run_metadata_fanout(
+    let (parts, mut fanout_stats) = run_metadata_fanout(
         context,
         realm_id,
         local_node_id,
         MetadataFanoutScope::new(Some(ApiQueryMode::Distributed), request.target_nodes, true)
             .with_subject(subject)
-            .with_deadline(deadline),
+            .with_deadline(deadline)
+            .with_skip(done),
         MetadataFanoutOperation::BucketSearch,
         local_call,
         remote_call,
@@ -661,8 +681,15 @@ pub async fn search_buckets_distributed(
         map_read_error,
     )
     .await?;
-    let failed = &fanout_stats.failed_partitions;
-    let (hits, positions) = merge_pages(parts, failed, positions, limit);
+    let asked = (
+        &fanout_stats.failed_partitions[..],
+        &fanout_stats.omitted[..],
+    );
+    let retired = retired_nodes(&parts);
+    let (hits, positions) = merge_pages(parts, asked, positions, limit);
+    // A retired node's part ended early, so the page is partial though its scan is done.
+    fanout_stats.nodes_failed += retired.len();
+    fanout_stats.failed_partitions.extend(retired);
     Ok(BucketSearchExecution {
         hits,
         next_cursor: encode_cursor(&positions),
@@ -671,7 +698,7 @@ pub async fn search_buckets_distributed(
 }
 
 /// Where a node's next page starts; `None` for a node that already reached its end.
-fn start_after(positions: &[NodePosition], node_id: NodeId) -> Option<Option<String>> {
+fn start_after(positions: &[NodePosition], node_id: NodeId) -> Option<Option<Vec<u8>>> {
     match NodePosition::of(positions, node_id) {
         Some(entry) if entry.done => None,
         entry => Some(entry.and_then(|entry| entry.after.clone())),
@@ -757,6 +784,8 @@ pub struct MetadataFanoutStats {
     pub nodes_failed: usize,
     pub failed_partitions: Vec<NodeId>,
     pub discovery_failed: bool,
+    /// Nodes left out by the fanout cap, for a cursor to ask on a later page.
+    pub omitted: Vec<NodeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -773,6 +802,8 @@ pub(super) struct MetadataFanoutScope {
     pub(super) discovery_failed: bool,
     pub(super) subject: Option<[u8; 32]>,
     pub(super) deadline: Option<tokio::time::Instant>,
+    /// Discovered nodes not to ask, such as those a cursor says are done.
+    pub(super) skip: Vec<NodeId>,
 }
 
 impl MetadataFanoutScope {
@@ -788,7 +819,13 @@ impl MetadataFanoutScope {
             discovery_failed: false,
             subject: None,
             deadline: None,
+            skip: Vec::new(),
         }
+    }
+
+    pub(super) fn with_skip(mut self, skip: Vec<NodeId>) -> Self {
+        self.skip = skip;
+        self
     }
 
     pub(super) fn with_discovery_failed(mut self, discovery_failed: bool) -> Self {

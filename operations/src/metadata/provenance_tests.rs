@@ -53,6 +53,10 @@ fn walk(start: &str, answers: &BTreeMap<String, Value>) -> (Value, Vec<String>, 
                 built.push(next);
                 files.extend(file.map(|file| file.path));
             }
+            Target::Release(id) => {
+                let file = built.release(&hop, answers.get(&format!("release:{id}")));
+                files.extend(file.map(|file| file.path));
+            }
         }
     }
     (root(built), files, reads)
@@ -284,4 +288,66 @@ fn crashed_scratch_reclaimed() {
     assert!(live.exists() && other.exists());
     std::fs::remove_dir(&live).unwrap();
     std::fs::remove_file(&other).unwrap();
+}
+
+#[test]
+fn unwritten_run_status() {
+    // A run whose crate was denied says so instead of reading as not visible.
+    let output = arn(1, "out.txt");
+    let run_id = Ulid::from_bytes([5; 16]).to_string();
+    let mut built = ProvenanceCrate::new(&output, "2026-10-27T12:00:00Z").unwrap();
+    let run = Hop {
+        target: Target::Run(run_id.clone()),
+        from: output.clone(),
+        property: "result",
+        digest: None,
+    };
+    assert!(built.unwritten(&run, "denied", Some("metadata write access denied")));
+    assert!(!built.unwritten(&run, "written", None));
+    let document = root(built);
+    let entity = node(&document, &format!("#run-{run_id}"));
+    assert_eq!(entity["creativeWorkStatus"], "RunRecordDenied");
+    assert_eq!(entity["description"], "metadata write access denied");
+}
+
+#[test]
+fn releases_join_export() {
+    // A version names the release that pins it, and says when membership was not checked
+    // everywhere.
+    let version = arn(1, "db/a.fasta");
+    let release = arn(2, "db/release.json");
+    let origin = json!({
+        "created_at": "2026-10-27T10:00:00Z",
+        "releases": [{
+            "crate_version": release,
+            "label": "6.0",
+            "upstream": [{"name": "DOI", "value": "10.5281/zenodo.1", "url": "https://doi.org/10.5281/zenodo.1"}]
+        }],
+        "releases_complete": false
+    });
+    let release_crate = json!({"@graph": [{"@id": "./", "@type": "Dataset"}]});
+    let answers = BTreeMap::from([
+        (version.clone(), origin),
+        (format!("release:{release}"), release_crate),
+    ]);
+    let (document, files, _) = walk(&version, &answers);
+    assert_eq!(
+        node(&document, &version)["isPartOf"][0]["@id"],
+        release.as_str()
+    );
+    // The readable release crate is nested and named from the release.
+    let [nested] = files.as_slice() else {
+        panic!("one nested crate: {files:?}");
+    };
+    let folder = nested.trim_end_matches("ro-crate-metadata.json");
+    assert!(folder.starts_with("releases/"));
+    let entity = node(&document, &release);
+    assert_eq!(entity["subjectOf"][0]["@id"], folder);
+    assert_eq!(entity["version"], "6.0");
+    assert_eq!(
+        entity["isBasedOn"][0]["@id"],
+        "https://doi.org/10.5281/zenodo.1"
+    );
+    let marker = node(&document, &format!("{version}#release-membership"));
+    assert_eq!(marker["value"], "incomplete");
 }

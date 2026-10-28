@@ -128,9 +128,11 @@ async fn run_read_rights() {
     let own = read(auth(submitter, realm_id), run_id).await.unwrap();
     assert_eq!(own.logical_job_id, link.logical_job_id);
     assert_eq!(own.run_crate, Some(document_id));
+    assert_eq!(own.run_crate_status, Some(status.to_public_json()));
     let shown = read(auth(reader, realm_id), run_id).await.unwrap();
     assert_eq!(shown.logical_job_id, None);
     assert_eq!(shown.run_crate, Some(document_id));
+    assert_eq!(shown.run_crate_status, None);
     assert!(matches!(
         read(auth(other, realm_id), run_id).await,
         Err(RunReadError::NotFound)
@@ -148,6 +150,23 @@ async fn run_read_rights() {
         read(restricted(&elsewhere), run_id).await,
         Err(RunReadError::NotFound)
     ));
+    // A denied crate tells the submitter why it is missing.
+    let denied_run = JobId::from_bytes([12; 16]);
+    let denied = RunCrateStatus::Denied {
+        message: "metadata write access denied".to_string(),
+    };
+    let missing = RunLink {
+        run_crate: None,
+        ..link.clone()
+    };
+    put_crate_outcome(&context.storage_handle, denied_run, &denied, &missing)
+        .await
+        .unwrap();
+    let own = read(auth(submitter, realm_id), denied_run).await.unwrap();
+    assert_eq!(own.run_crate, None);
+    let shown = own.run_crate_status.unwrap();
+    assert_eq!(shown["status"], "denied");
+    assert_eq!(shown["message"], "metadata write access denied");
     let unknown = JobId::from_bytes([11; 16]);
     assert!(matches!(
         read(auth(submitter, realm_id), unknown).await,

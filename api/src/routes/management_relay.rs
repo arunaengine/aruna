@@ -41,13 +41,10 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/access/devices/{node_id}"),
     ("DELETE", "/access/onboarding/secrets/{id}"),
     ("DELETE", "/access/users/me/devices/{id}"),
-    ("DELETE", "/system/realm/databases/requests/{request_id}"),
-    ("DELETE", "/system/realm/databases/{entry_id}"),
     ("GET", "/access/groups/{id}/service-accounts"),
     ("GET", "/access/onboarding/secrets"),
     ("GET", "/access/onboarding/secrets/{id}/status"),
     ("GET", "/access/token"),
-    ("GET", "/system/realm/databases/requests"),
     ("GET", "/system/realm/placement"),
     ("PATCH", "/system/realm/placement"),
     ("POST", "/access/groups/{id}/service-accounts"),
@@ -59,17 +56,11 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/access/onboarding/secrets"),
     ("POST", "/access/sessions"),
     ("POST", "/access/users/register"),
-    ("POST", "/system/realm/databases"),
     ("POST", "/system/realm/nodes/{node_id}/promote"),
-    (
-        "POST",
-        "/system/realm/databases/requests/{request_id}/approve",
-    ),
     ("PUT", "/access/policies/realm"),
     ("PUT", "/access/users/{id}/status"),
     ("PUT", "/compute/config"),
     ("PUT", "/system/realm/federation"),
-    ("PUT", "/system/realm/databases/{entry_id}/parser"),
     ("PUT", "/system/realm/portal-features"),
     ("PUT", "/system/realm/quota"),
 ];
@@ -86,15 +77,10 @@ static RELAY_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 #[derive(Debug, Default)]
 pub struct ManagementUrlCache {
     urls: Vec<String>,
-    owner: Option<RequestOwner>,
     refreshed_at: Option<Instant>,
     /// Targets whose last connect failed, and when; they are tried last while fresh.
     failed: BTreeMap<String, Instant>,
 }
-
-/// The first management node in node-id order, which keeps every database request, and its
-/// published api url.
-type RequestOwner = (NodeId, Option<String>);
 
 pub(crate) async fn relay_middleware(
     State(state): State<Arc<ServerState>>,
@@ -113,32 +99,15 @@ pub(crate) async fn relay_middleware(
         has_hop,
     );
     let Some(route) = route else {
-        // A relayed database request is kept by its owner only, never by a node fallen back to.
-        let pinned = relay_route(request.method(), matched.as_deref(), true, false).is_some();
-        if has_hop && pinned {
-            let (_, owner) = management_targets(&state).await;
-            if owner.is_none_or(|(owner, _)| owner != state.get_node_id()) {
-                return ServerError::NoManagementNode.into_response();
-            }
-        }
         return next.run(request).await;
     };
-    let (urls, owner) = management_targets(&state).await;
-    if owner
-        .as_ref()
-        .is_some_and(|(owner, _)| *owner == state.get_node_id())
-    {
-        return next.run(request).await;
-    }
-    let targets = match pinned_route(route) {
-        true => pinned_targets(owner, urls, !state.is_user_node()),
-        false => healthy_first(urls, &state.management_url_cache().read().await.failed),
-    };
+    let urls = management_targets(&state).await;
+    let targets = healthy_first(urls, &state.management_url_cache().read().await.failed);
     relay(&state, route, targets, request).await
 }
 
 /// The allowlisted route this request must be relayed for, if any. A management node relays
-/// only routes pinned to the request owner.
+/// none.
 fn relay_route(
     method: &Method,
     matched: Option<&str>,
@@ -154,22 +123,7 @@ fn relay_route(
         .iter()
         .find(|(route_method, route)| method.as_str() == *route_method && path == *route)
         .map(|(_, route)| *route)
-        .filter(|route| !is_management || pinned_route(route))
-}
-
-/// The target of a pinned route: the request owner, whatever node was asked. A realm node
-/// refuses when the owner published no url; a device holds no node-info document, so it uses
-/// its realm's installed urls.
-fn pinned_targets(
-    owner: Option<RequestOwner>,
-    urls: Vec<String>,
-    holds_documents: bool,
-) -> Vec<String> {
-    match owner {
-        Some((_, Some(url))) => vec![url],
-        _ if holds_documents => Vec::new(),
-        _ => urls,
-    }
+        .filter(|_| !is_management)
 }
 
 async fn relay(
@@ -207,12 +161,8 @@ async fn relay(
 
     // Targets are tried in order, but only a failure that provably predates
     // processing may move a non-idempotent request on to the next target.
-    let limit = match pinned_route(route) {
-        true => 1,
-        false => RELAY_TARGET_LIMIT,
-    };
     let mut unknown = None;
-    for target in targets.iter().take(limit) {
+    for target in targets.iter().take(RELAY_TARGET_LIMIT) {
         let url = relay_url(target, &uri);
         let mut outgoing = RELAY_CLIENT
             .request(method.clone(), &url)
@@ -304,12 +254,6 @@ fn gateway_failed(method: &Method, status: StatusCode) -> bool {
         )
 }
 
-/// Routes whose state lives in one management node's local store: a database request is kept
-/// on the request owner, so a fallback node would hide it or start a second, unseen one.
-fn pinned_route(route: &str) -> bool {
-    route.starts_with("/system/realm/databases/requests") || route == "/system/realm/databases"
-}
-
 /// Whether a node-local enrollment miss may be tried on the next target.
 fn may_try_response(route: &str, status: StatusCode) -> bool {
     matches!(
@@ -371,20 +315,20 @@ fn relayed_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
         .collect()
 }
 
-/// Cached management targets and request owner; a stale window triggers a realm-config read,
+/// Cached management targets; a stale window triggers a realm-config read,
 /// and a failed read reuses the last known set rather than dropping every target.
-async fn management_targets(state: &Arc<ServerState>) -> (Vec<String>, Option<RequestOwner>) {
+async fn management_targets(state: &Arc<ServerState>) -> Vec<String> {
     let cache = state.management_url_cache();
     {
         let cached = cache.read().await;
         if is_fresh(cached.refreshed_at) {
-            return (cached.urls.clone(), cached.owner.clone());
+            return cached.urls.clone();
         }
     }
 
     let mut cached = cache.write().await;
     if is_fresh(cached.refreshed_at) {
-        return (cached.urls.clone(), cached.owner.clone());
+        return cached.urls.clone();
     }
     match drive(
         GetConfigOperation::new(state.get_realm_id()),
@@ -397,13 +341,11 @@ async fn management_targets(state: &Arc<ServerState>) -> (Vec<String>, Option<Re
             let peers = peer_management_urls(state.get_node_id(), &config, &documents);
             let installed = installed_management_urls(&state.get_ctx(), state.get_realm_id()).await;
             cached.urls = relay_targets(peers, installed);
-            let managers = management_node_urls(&config, &documents).into_iter();
-            cached.owner = managers.min_by_key(|(node_id, _)| *node_id);
         }
         Err(error) => debug!(error = %error, "Management relay reuses cached management urls"),
     }
     cached.refreshed_at = Some(Instant::now());
-    (cached.urls.clone(), cached.owner.clone())
+    cached.urls.clone()
 }
 
 fn is_fresh(refreshed_at: Option<Instant>) -> bool {

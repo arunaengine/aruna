@@ -14,13 +14,12 @@ use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 pub mod access;
 pub mod assistant;
 pub mod audit;
-pub mod database_types;
-pub mod databases;
 pub mod device;
 pub mod drs;
 pub mod execution;
 pub mod federation;
 pub mod git;
+pub mod identifiers;
 pub mod info;
 pub mod link_routes;
 pub mod management_relay;
@@ -63,13 +62,15 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::blobs::router())
         .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
+        .merge(storage::bucket_metadata::router())
+        .merge(storage::releases::router())
         .merge(storage::moves::router())
         .merge(storage::rename::router())
         .merge(storage::checks::router())
         .merge(storage::encryption::router())
         .merge(storage::abe::router())
         .merge(storage::bucket::keys::router())
-        .merge(databases::router())
+        .merge(identifiers::router())
         .merge(drs::router())
         .merge(staging::router())
         .merge(storage::deletion::router())
@@ -272,24 +273,18 @@ pub(crate) mod tests {
         ("GET", "/data/blobs/locations"),
         ("GET", "/data/buckets/{bucket}/distribution"),
         ("GET", "/data/buckets/{bucket}/datasets"),
+        ("GET", "/data/buckets/{bucket}/metadata"),
+        ("PUT", "/data/buckets/{bucket}/metadata"),
+        ("GET", "/data/buckets/{bucket}/releases"),
+        ("POST", "/data/buckets/{bucket}/releases"),
         ("GET", "/data/buckets/{bucket}/objects"),
         ("GET", "/data/buckets/{bucket}/objects/origin"),
         ("GET", "/data/origin"),
         ("GET", "/data/provenance/crate"),
         ("GET", "/data/buckets/{bucket}/objects/part-of"),
         ("GET", "/data/buckets/{bucket}/sources"),
-        ("GET", "/data/databases"),
-        ("POST", "/system/realm/databases"),
+        ("POST", "/data/identifier-rules/test"),
         ("POST", "/system/realm/nodes/{node_id}/promote"),
-        ("DELETE", "/system/realm/databases/{entry_id}"),
-        ("PUT", "/system/realm/databases/{entry_id}/parser"),
-        ("POST", "/system/realm/databases/parser/test"),
-        ("GET", "/system/realm/databases/requests"),
-        (
-            "POST",
-            "/system/realm/databases/requests/{request_id}/approve",
-        ),
-        ("DELETE", "/system/realm/databases/requests/{request_id}"),
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),
@@ -306,6 +301,7 @@ pub(crate) mod tests {
         ("GET", "/data/sync/relationships"),
         ("GET", "/data/sync/relationships/{id}"),
         ("GET", "/device/compute"),
+        ("GET", "/device/compute/runs/{job_id}/crate"),
         ("GET", "/device/documents"),
         ("GET", "/device/drafts"),
         ("GET", "/device/drafts/{draft_id}"),

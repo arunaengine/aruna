@@ -30,7 +30,7 @@ async fn store(node: &Node, key: &str) {
         text: "x".to_string(),
         content_type: None,
     };
-    store_text(&node.state, &node.owner, &info, input)
+    store_text(&node.state, &node.owner, &info, input, Default::default())
         .await
         .unwrap();
 }
@@ -303,6 +303,7 @@ fn view_keeps_fields() {
         source: Some(aruna_operations::s3::object::origin::SourceView {
             url: Some("https://s3.example.org/a".to_string()),
             path: "a".to_string(),
+            version: None,
             etag: Some("etag".to_string()),
             digests: vec![
                 (ChecksumAlgorithm::Md5, digest),
@@ -318,9 +319,10 @@ fn view_keeps_fields() {
                 run_id: Ulid::from_bytes([48; 16]),
             },
         ],
-        database_entry: None,
+        bucket_metadata: None,
         identifiers: Vec::new(),
         content_hash: None,
+        size: None,
     };
     let response = OriginResponse::from(view);
     assert_eq!(response.global_id, Some(global.to_url()));
@@ -364,9 +366,7 @@ fn origin_kinds_named() {
     };
     let kinds = [
         upload,
-        VersionOrigin::Source {
-            database: Some(Ulid::from_bytes([49; 16])),
-        },
+        VersionOrigin::Source,
         VersionOrigin::Storage {
             backend_id: Ulid::from_bytes([50; 16]),
             key: "share/a.txt".to_string(),
@@ -384,9 +384,10 @@ fn origin_kinds_named() {
         hop: None,
         source: None,
         projection: Vec::new(),
-        database_entry: None,
+        bucket_metadata: None,
         identifiers: Vec::new(),
         content_hash: None,
+        size: None,
     };
     let bodies: Vec<_> = kinds
         .into_iter()
@@ -396,12 +397,7 @@ fn origin_kinds_named() {
         &bodies[0],
         OriginBody::Upload { device: Some(device), .. } if device == "laptop"
     ));
-    assert!(matches!(
-        &bodies[1],
-        OriginBody::Source {
-            database_entry: Some(_)
-        }
-    ));
+    assert!(matches!(&bodies[1], OriginBody::Source));
     assert!(matches!(
         &bodies[2],
         OriginBody::Storage { key, .. } if key == "share/a.txt"

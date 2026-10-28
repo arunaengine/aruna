@@ -11,8 +11,8 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, RunCrateStatus, RunLink,
+    CapturedInput, ExecutionSpec, InputContent, InputSource, JobError, JobId, JobPayload,
+    JobRecord, JobResultPayload, JobState, LaunchRecord, LocalCrate, RunCrateStatus, RunLink,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -22,6 +22,9 @@ use aruna_core::structs::storage::data::identity::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+
+use crate::metadata::provenance::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};
 use serde_json::json;
 use ulid::Ulid;
 
@@ -30,12 +33,14 @@ const CRATE_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
 const WORKFLOW_RUN_CONTEXT: &str = "https://w3id.org/ro/terms/workflow-run/context";
 const CRATE_PROFILE: &str = "https://w3id.org/ro/crate/1.2";
 pub(crate) const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5";
+const TERMS: &str = "https://w3id.org/aruna/terms/";
 const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
 const LINK_PROPERTY: &str = "https://w3id.org/aruna/terms/link";
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{
-    put_crate_outcome, put_crate_status, read_crate_status, read_job_record, read_run_link,
+    put_crate_outcome, put_crate_status, put_local_crate, read_crate_status, read_job_record,
+    read_launch_record, read_run_link,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
@@ -110,10 +115,10 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
     };
     if device {
         if saved_id.is_none()
-            && let Err(error) = put_crate_status(storage, for_job, &RunCrateStatus::Local).await
+            && let Err(error) = keep_local_crate(ctx, &parent, spec).await
         {
             return JobRunOutcome::Failed(JobError::retryable(format!(
-                "run crate status write failed: {error}"
+                "local run crate write failed: {error}"
             )));
         }
         return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
@@ -121,6 +126,31 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         });
     }
     record_crate(&ctx.driver, for_job, &parent, spec, saved_id).await
+}
+
+/// Builds the crate of a device run and keeps it here with the `Local` status; it names this
+/// device's own versions and leaves the device only through publication.
+async fn keep_local_crate(
+    ctx: &JobContext,
+    parent: &JobRecord,
+    spec: &ExecutionSpec,
+) -> Result<(), String> {
+    let context = ctx.driver.as_ref();
+    let storage = &context.storage_handle;
+    let launch = read_launch_record(storage, parent).await?;
+    let realm_id = ctx.driver.serving_realm(parent.created_by.realm_id);
+    let jsonld = build_crate_jsonld(
+        parent,
+        spec,
+        (realm_id, None),
+        &BTreeMap::new(),
+        launch.as_ref(),
+    );
+    let local = LocalCrate {
+        owner: parent.created_by,
+        jsonld,
+    };
+    put_local_crate(storage, parent.job_id, &local).await
 }
 
 /// The owner this node is bound to, `None` for realm infrastructure. A node the stored realm
@@ -234,7 +264,21 @@ pub(crate) async fn record_crate(
         }
     };
     let realm_id = driver.serving_realm(parent.created_by.realm_id);
-    let jsonld = build_crate_jsonld(parent, spec, (realm_id, document_id), &devices);
+    let launch = match read_launch_record(storage, parent).await {
+        Ok(launch) => launch,
+        Err(error) => {
+            return JobRunOutcome::Failed(JobError::retryable(format!(
+                "run crate launch record read failed: {error}"
+            )));
+        }
+    };
+    let jsonld = build_crate_jsonld(
+        parent,
+        spec,
+        (realm_id, Some(document_id)),
+        &devices,
+        launch.as_ref(),
+    );
 
     let (status, resource, written) = match route_metadata_create(
         CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
@@ -412,9 +456,171 @@ async fn remote_device(
     }
 }
 
+/// The contextual entity naming the node and site an execution ran on.
+const SITE_ID: &str = "#execution-site";
+
+fn env_entity(name: &str) -> String {
+    format!("#env-{}", utf8_percent_encode(name, NON_ALPHANUMERIC))
+}
+
+/// Granted limits and the working directory as PropertyValues; unbounded dimensions are omitted.
+fn launch_properties(launch: &LaunchRecord) -> Vec<serde_json::Value> {
+    let resources = &launch.resources;
+    let cores = resources
+        .nano_cpus
+        .map(|nanos| (nanos as f64 / 1e9).to_string());
+    let values = [
+        ("cpu-cores", "CPU cores", cores),
+        (
+            "ram-bytes",
+            "Memory bytes",
+            resources.ram_bytes.map(|v| v.to_string()),
+        ),
+        (
+            "disk-bytes",
+            "Disk bytes",
+            resources.disk_bytes.map(|v| v.to_string()),
+        ),
+        (
+            "workspace-bytes",
+            "Workspace bytes",
+            resources.workspace_bytes.map(|v| v.to_string()),
+        ),
+        (
+            "walltime-ms",
+            "Walltime milliseconds",
+            resources.walltime_ms.map(|v| v.to_string()),
+        ),
+        (
+            "working-directory",
+            "Working directory",
+            launch.workdir.clone(),
+        ),
+    ];
+    values
+        .into_iter()
+        .filter_map(|(term, name, value)| {
+            value.map(|value| {
+                json!({
+                    "@id": format!("#{term}"),
+                    "@type": "PropertyValue",
+                    "name": name,
+                    "propertyID": format!("{TERMS}{term}"),
+                    "value": value
+                })
+            })
+        })
+        .collect()
+}
+
 /// The contextual entity id of one device an input came from.
 fn group_entity(group_id: Ulid) -> String {
     format!("#group-{group_id}")
+}
+
+/// What admission captured about an input beyond its bytes, as entities next to the file `id`:
+/// a public source's pin, the bucket's metadata then, the releases that pin the version, and
+/// whether that membership was checked everywhere.
+fn capture_entities(
+    id: &str,
+    captured: &CapturedInput,
+    file: &mut serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let mut entities = Vec::new();
+    let mut properties: Vec<serde_json::Value> = match file["additionalProperty"].take() {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(values) => values,
+        value => vec![value],
+    };
+    let mut property = |term: &str, name: &str, value: String| {
+        let property_id = format!("{id}#{term}");
+        properties.push(json!({ "@id": property_id.clone() }));
+        json!({ "@id": property_id, "@type": "PropertyValue", "name": name, "value": value })
+    };
+    // A private source stays unnamed, its path included.
+    if let Some(pin) = (captured.source_pin.as_ref()).filter(|pin| pin.url.is_some()) {
+        let etag = match &captured.content {
+            InputContent::Reference { etag, .. } => etag.clone(),
+            InputContent::Blake3(_) => None,
+        };
+        let pinned = [
+            ("source-path", "Source path", Some(pin.path.clone())),
+            (
+                "source-version",
+                "Source version",
+                pin.source_version.clone(),
+            ),
+            ("source-etag", "Source ETag", etag),
+        ];
+        for (term, name, value) in pinned {
+            entities.extend(value.map(|value| property(term, name, value)));
+        }
+    }
+    if !captured.releases_complete {
+        let mut marker = property(
+            "release-membership",
+            "Release membership",
+            "incomplete".into(),
+        );
+        marker["propertyID"] = json!(RELEASE_MEMBERSHIP);
+        marker["description"] = json!(RELEASE_INCOMPLETE);
+        entities.push(marker);
+    }
+    let mut part_of = Vec::new();
+    if let Some(metadata) = &captured.database {
+        let snapshot = serde_json::to_value(metadata).unwrap_or_default();
+        let digest = blake3::hash(snapshot.to_string().as_bytes()).to_hex();
+        let database_id = format!("#bucket-metadata-{}", &digest[..16]);
+        let title = metadata.title.as_deref().unwrap_or("Bucket metadata");
+        let mut database = json!({
+            "@id": database_id.clone(),
+            "@type": "Dataset",
+            "name": format!("{title} (at admission)")
+        });
+        for (name, value) in [
+            ("version", &metadata.version),
+            ("license", &metadata.license),
+            ("description", &metadata.description),
+        ] {
+            if let Some(value) = value {
+                database[name] = json!(value);
+            }
+        }
+        let links: Vec<_> = (metadata.identifiers.iter())
+            .map(|identifier| json!(identifier.url))
+            .collect();
+        if !links.is_empty() {
+            database["identifier"] = json!(links);
+        }
+        part_of.push(json!({ "@id": database_id }));
+        entities.push(database);
+    }
+    for release in &captured.releases {
+        let release_id = release.crate_version.to_id();
+        let upstream: Vec<_> = (release.upstream.iter())
+            .map(|identifier| json!({ "@id": identifier.url }))
+            .collect();
+        let mut entity = json!({
+            "@id": release_id.clone(),
+            "@type": "Dataset",
+            "name": format!("Release {}", release.label),
+            "version": release.label
+        });
+        if !upstream.is_empty() {
+            entity["isBasedOn"] = json!(upstream);
+        }
+        part_of.push(json!({ "@id": release_id }));
+        entities.push(entity);
+    }
+    if !part_of.is_empty() {
+        file["isPartOf"] = json!(part_of);
+    }
+    match properties.len() {
+        0 => {}
+        1 => file["additionalProperty"] = properties.remove(0),
+        _ => file["additionalProperty"] = json!(properties),
+    }
+    entities
 }
 
 fn device_entity(device: &str) -> String {
@@ -426,10 +632,15 @@ fn device_entity(device: &str) -> String {
 fn build_crate_jsonld(
     record: &JobRecord,
     spec: &ExecutionSpec,
-    (realm_id, document_id): (RealmId, Ulid),
+    (realm_id, document_id): (RealmId, Option<Ulid>),
     devices: &BTreeMap<String, String>,
+    launch: Option<&LaunchRecord>,
 ) -> String {
-    let root = format!("https://w3id.org/aruna/{document_id}");
+    // A local crate has no realm document yet, so its root is the crate folder itself.
+    let root = document_id.map_or_else(
+        || "./".to_string(),
+        |document_id| format!("https://w3id.org/aruna/{document_id}"),
+    );
     let action_id = format!("#run-{}", record.job_id);
     let agent_id = format!("#agent-{}", record.created_by);
     let software_id = format!("#software-{}", record.job_id);
@@ -491,11 +702,14 @@ fn build_crate_jsonld(
     };
     let mut entity = |location: ObjectLocation,
                       hash: Option<[u8; 32]>,
-                      version: Option<String>,
+                      (version, by_version): (Option<String>, bool),
                       file: serde_json::Value| {
-        let id = match hash {
-            Some(hash) => normalized_id(hash, &location, &mut used),
-            None => location.to_url(),
+        // Without a hash, a captured input's exact version keeps same-named inputs of two
+        // nodes apart.
+        let id = match (hash, &version) {
+            (Some(hash), _) => normalized_id(hash, &location, &mut used),
+            (None, Some(version)) if by_version => version.clone(),
+            _ => location.to_url(),
         };
         let mut file = file.as_object().cloned().unwrap_or_default();
         DataEntity {
@@ -516,6 +730,7 @@ fn build_crate_jsonld(
     let mut used_devices = BTreeSet::new();
     let mut source_groups = BTreeSet::new();
     let mut link_properties = Vec::new();
+    let mut context_entities = BTreeMap::new();
     let mut object_ids = Vec::with_capacity(spec.inputs.len());
     let mut part_ids = Vec::new();
     let mut files = Vec::new();
@@ -566,7 +781,16 @@ fn build_crate_jsonld(
         let version = captured
             .and_then(|captured| exact(captured.source_node_id, &location, captured.version_id));
         let hash = captured.and_then(|captured| captured.content.blake3());
-        let (id, file) = entity(location, hash, version, file);
+        let (id, mut file) = entity(location, hash, (version, captured.is_some()), file);
+        if let Some(captured) = captured {
+            for context_entity in capture_entities(&id, captured, &mut file) {
+                let context_id = context_entity["@id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                context_entities.entry(context_id).or_insert(context_entity);
+            }
+        }
         object_ids.push(json!({ "@id": id.clone() }));
         files.push(file);
         part_ids.push(id);
@@ -586,7 +810,7 @@ fn build_crate_jsonld(
         };
         let hash = output.digest.as_deref().and_then(parse_hash);
         let version = exact(output.node_id, &location, output.version_id);
-        let (id, file) = entity(location, hash, version, file);
+        let (id, file) = entity(location, hash, (version, false), file);
         result_ids.push(json!({ "@id": id.clone() }));
         files.push(file);
         part_ids.push(id);
@@ -605,6 +829,8 @@ fn build_crate_jsonld(
             "value": bucket
         })
     });
+    let mut properties: Vec<serde_json::Value> = workspace_property.into_iter().collect();
+    properties.extend(launch.map(launch_properties).unwrap_or_default());
 
     let mut action = json!({
         "@id": action_id.clone(),
@@ -618,11 +844,23 @@ fn build_crate_jsonld(
         "actionStatus": {"@id": action_status}
     });
     if let Some(map) = action.as_object_mut() {
-        if workspace_property.is_some() {
-            map.insert(
-                "additionalProperty".to_string(),
-                json!([{"@id": "#workspace-bucket"}]),
-            );
+        if !properties.is_empty() {
+            let ids: Vec<_> = properties
+                .iter()
+                .map(|property| json!({ "@id": property["@id"].clone() }))
+                .collect();
+            map.insert("additionalProperty".to_string(), json!(ids));
+        }
+        if let Some(launch) = launch {
+            map.insert("location".to_string(), json!({ "@id": SITE_ID }));
+            let environment: Vec<_> = launch
+                .env
+                .keys()
+                .map(|name| json!({ "@id": env_entity(name) }))
+                .collect();
+            if !environment.is_empty() {
+                map.insert("environment".to_string(), json!(environment));
+            }
         }
         if !command.is_empty() {
             map.insert("description".to_string(), json!(command));
@@ -728,8 +966,27 @@ fn build_crate_jsonld(
         })
     }));
     graph.extend(link_properties);
-    if let Some(property) = workspace_property {
-        graph.push(property);
+    graph.extend(context_entities.into_values());
+    graph.extend(properties);
+    if let Some(launch) = launch {
+        let mut site = json!({
+            "@id": SITE_ID,
+            "@type": "Place",
+            "identifier": launch.node_id.to_string(),
+            "additionalType": launch.executor_kind
+        });
+        if !launch.location.is_empty() {
+            site["name"] = json!(launch.location);
+        }
+        graph.push(site);
+        graph.extend(launch.env.iter().map(|(name, value)| {
+            json!({
+                "@id": env_entity(name),
+                "@type": "PropertyValue",
+                "name": name,
+                "value": value
+            })
+        }));
     }
 
     json!({
@@ -740,7 +997,8 @@ fn build_crate_jsonld(
                 "containerImage": "https://w3id.org/ro/terms/workflow-run#containerImage",
                 "registry": "https://w3id.org/ro/terms/workflow-run#registry",
                 "tag": "https://w3id.org/ro/terms/workflow-run#tag",
-                "sha256": "https://w3id.org/ro/terms/workflow-run#sha256"
+                "sha256": "https://w3id.org/ro/terms/workflow-run#sha256",
+                "environment": "https://w3id.org/ro/terms/workflow-run#environment"
             }
         ],
         "@graph": graph
@@ -944,8 +1202,9 @@ mod pure_tests {
         serde_json::from_str(&build_crate_jsonld(
             record,
             spec,
-            (record.created_by.realm_id, doc),
+            (record.created_by.realm_id, Some(doc)),
             &BTreeMap::new(),
+            None,
         ))
         .unwrap()
     }
@@ -1070,7 +1329,7 @@ mod pure_tests {
             source_pin: None,
             database: None,
             releases: Vec::new(),
-            releases_complete: false,
+            releases_complete: true,
             grant: None,
         });
         let value = parse(&record, &spec);
@@ -1098,6 +1357,163 @@ mod pure_tests {
                 .as_str()
                 .is_some_and(|value| value.contains("work"))
         );
+    }
+
+    #[test]
+    fn names_captured_context() {
+        // Admission's capture names a public source's pin, the bucket's metadata then and the
+        // releases that pin the input; unchecked membership is marked on the file.
+        use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
+        use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, ReleaseRef};
+        use aruna_core::structs::storage::origin::{OriginVersion, SourcePin};
+        let (mut record, spec) = execution_record();
+        let doi = Identifier {
+            name: "DOI".to_string(),
+            value: "10.5281/zenodo.1".to_string(),
+            url: "https://doi.org/10.5281/zenodo.1".to_string(),
+            target: IdentifierTarget::Key,
+        };
+        let crate_version = OriginVersion::Node(VersionedObjectArn {
+            realm_id: record.created_by.realm_id,
+            node_id: record.owner_node_id,
+            bucket: "bakta-db".to_string(),
+            key: "db/release.json".to_string(),
+            version: Ulid::from_bytes([15; 16]),
+        });
+        let captured = |releases_complete| CapturedInput {
+            destination_key: "inputs/in.txt".to_string(),
+            source_node_id: record.owner_node_id,
+            version_id: Ulid::from_bytes([13; 16]),
+            content: InputContent::Reference {
+                etag: Some("\"abc\"".to_string()),
+                range_bound: true,
+            },
+            bytes: 3,
+            policies: Vec::new(),
+            source_group_id: Ulid::from_bytes([21; 16]),
+            public: false,
+            link: None,
+            source_pin: Some(SourcePin {
+                url: Some("https://example.org/db/in.txt".to_string()),
+                path: "db/in.txt".to_string(),
+                source_version: Some("v6".to_string()),
+            }),
+            database: Some(BucketMetadata {
+                database: true,
+                title: Some("Bakta".to_string()),
+                version: Some("6.0".to_string()),
+                identifiers: vec![doi.clone()],
+                ..BucketMetadata::default()
+            }),
+            releases: vec![ReleaseRef {
+                crate_version: crate_version.clone(),
+                label: "6.0".to_string(),
+                upstream: vec![doi.clone()],
+            }],
+            releases_complete,
+            grant: None,
+        };
+        record.captured_inputs.push(captured(true));
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let find = |id: &serde_json::Value| graph.iter().find(|entity| entity["@id"] == *id);
+        let input = graph
+            .iter()
+            .find(|entity| entity["name"] == "Input sample")
+            .expect("input entity");
+        let properties = input["additionalProperty"]
+            .as_array()
+            .expect("pin properties");
+        let values: Vec<_> = (properties.iter())
+            .map(|property| find(&property["@id"]).unwrap()["value"].clone())
+            .collect();
+        assert_eq!(values, [json!("db/in.txt"), json!("v6"), json!("\"abc\"")]);
+        let part_of = input["isPartOf"].as_array().expect("part of");
+        let database = find(&part_of[0]["@id"]).expect("metadata snapshot");
+        assert_eq!(database["name"], "Bakta (at admission)");
+        assert_eq!(database["version"], "6.0");
+        assert_eq!(database["identifier"][0], doi.url.as_str());
+        let release = find(&part_of[1]["@id"]).expect("release");
+        assert_eq!(release["@id"], crate_version.to_id().as_str());
+        assert_eq!(release["version"], "6.0");
+        assert_eq!(release["isBasedOn"][0]["@id"], doi.url.as_str());
+
+        // Membership that was not checked everywhere is marked; a private source stays unnamed.
+        let mut unchecked = captured(false);
+        (unchecked.source_pin.as_mut().unwrap()).url = None;
+        record.captured_inputs = vec![unchecked];
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let input = graph
+            .iter()
+            .find(|entity| entity["name"] == "Input sample")
+            .expect("input entity");
+        let marker = graph
+            .iter()
+            .find(|entity| entity["@id"] == input["additionalProperty"]["@id"])
+            .expect("membership marker");
+        assert_eq!(marker["propertyID"], RELEASE_MEMBERSHIP);
+        assert_eq!(marker["value"], "incomplete");
+        assert!(!value.to_string().contains("db/in.txt"));
+    }
+
+    #[test]
+    fn references_stay_apart() {
+        // Two references with one bucket and key on two nodes are two files, each with its
+        // own source version.
+        use aruna_core::structs::storage::origin::SourcePin;
+        let (mut record, mut spec) = execution_record();
+        let mut second = spec.inputs[0].clone();
+        second.dest_key = "inputs/in2.txt".to_string();
+        second.name = Some("Second sample".to_string());
+        spec.inputs.push(second);
+        let other_node = iroh::SecretKey::from_bytes(&[33; 32]).public();
+        for (destination, node, seed, source_version) in [
+            ("inputs/in.txt", record.owner_node_id, 13, "v1"),
+            ("inputs/in2.txt", other_node, 14, "v2"),
+        ] {
+            record.captured_inputs.push(CapturedInput {
+                destination_key: destination.to_string(),
+                source_node_id: node,
+                version_id: Ulid::from_bytes([seed; 16]),
+                content: InputContent::Reference {
+                    etag: Some(format!("\"{source_version}\"")),
+                    range_bound: true,
+                },
+                bytes: 3,
+                policies: Vec::new(),
+                source_group_id: Ulid::from_bytes([21; 16]),
+                public: false,
+                link: None,
+                source_pin: Some(SourcePin {
+                    url: Some("https://example.org/in.txt".to_string()),
+                    path: "in.txt".to_string(),
+                    source_version: Some(source_version.to_string()),
+                }),
+                database: None,
+                releases: Vec::new(),
+                releases_complete: true,
+                grant: None,
+            });
+        }
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let version_of = |name: &str| {
+            let file = graph
+                .iter()
+                .find(|entity| entity["name"] == name)
+                .expect("input entity");
+            let property = (file["additionalProperty"].as_array().unwrap().iter())
+                .map(|property| graph.iter().find(|entity| entity["@id"] == property["@id"]))
+                .find(|entity| entity.is_some_and(|entity| entity["name"] == "Source version"))
+                .flatten()
+                .expect("source version");
+            (file["@id"].clone(), property["value"].clone())
+        };
+        let (first_id, first) = version_of("Input sample");
+        let (second_id, second) = version_of("Second sample");
+        assert_ne!(first_id, second_id);
+        assert_eq!((first, second), (json!("v1"), json!("v2")));
     }
 
     #[test]
@@ -1217,8 +1633,9 @@ mod tests {
         let jsonld = build_crate_jsonld(
             &record,
             &spec,
-            (record.created_by.realm_id, document_id),
+            (record.created_by.realm_id, Some(document_id)),
             &BTreeMap::new(),
+            None,
         );
         let directory = tempfile::tempdir().unwrap();
         let node = craqle::CraqleNode::open(directory.path()).unwrap();
@@ -1288,8 +1705,9 @@ mod tests {
         let jsonld: Value = serde_json::from_str(&build_crate_jsonld(
             &record,
             &spec,
-            (record.created_by.realm_id, document_id),
+            (record.created_by.realm_id, Some(document_id)),
             &devices,
+            None,
         ))
         .unwrap();
         let graph = jsonld["@graph"].as_array().unwrap();
@@ -1309,10 +1727,74 @@ mod tests {
         let plain = build_crate_jsonld(
             &record,
             &spec,
-            (record.created_by.realm_id, document_id),
+            (record.created_by.realm_id, Some(document_id)),
             &BTreeMap::new(),
+            None,
         );
         assert!(!plain.contains("IndividualProduct"));
+    }
+
+    fn launch() -> LaunchRecord {
+        LaunchRecord {
+            node_id: iroh::SecretKey::from_bytes(&[9; 32]).public(),
+            executor_kind: "kubernetes".to_string(),
+            location: "giessen".to_string(),
+            resources: aruna_core::compute::GrantedResources {
+                nano_cpus: Some(1_500_000_000),
+                ram_bytes: Some(9 << 30),
+                disk_bytes: None,
+                workspace_bytes: Some(10 << 30),
+                walltime_ms: Some(86_400_000),
+            },
+            workdir: Some("/work".to_string()),
+            env: BTreeMap::from([
+                ("API_TOKEN".to_string(), "hidden".to_string()),
+                ("THREADS".to_string(), "8".to_string()),
+            ]),
+            started_at_ms: Some(1),
+        }
+    }
+
+    #[test]
+    fn names_execution_site() {
+        // The executing node, its site, the granted limits and the environment are recorded.
+        let (record, spec) = execution_record();
+        let document_id = Ulid::from_bytes(record.job_id.to_bytes());
+        let launch = launch();
+        let jsonld: Value = serde_json::from_str(&build_crate_jsonld(
+            &record,
+            &spec,
+            (record.created_by.realm_id, Some(document_id)),
+            &BTreeMap::new(),
+            Some(&launch),
+        ))
+        .unwrap();
+        let graph = jsonld["@graph"].as_array().unwrap();
+        let find = |id: &str| graph.iter().find(|entity| entity["@id"] == id).unwrap();
+        let action = graph
+            .iter()
+            .find(|entity| entity["@type"] == "CreateAction")
+            .unwrap();
+        assert_eq!(entity_id(&action["location"]), Some(SITE_ID));
+        let site = find(SITE_ID);
+        assert_eq!(site["name"], "giessen");
+        assert_eq!(site["identifier"], launch.node_id.to_string());
+        assert_eq!(site["additionalType"], "kubernetes");
+        assert_eq!(find("#cpu-cores")["value"], "1.5");
+        assert_eq!(find("#ram-bytes")["value"], (9u64 << 30).to_string());
+        assert_eq!(find("#working-directory")["value"], "/work");
+        assert!(graph.iter().all(|entity| entity["@id"] != "#disk-bytes"));
+        let properties: Vec<_> = action["additionalProperty"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(entity_id)
+            .collect();
+        assert!(properties.contains(&"#workspace-bucket"));
+        assert!(properties.contains(&"#walltime-ms"));
+        assert_eq!(find("#env-API%5FTOKEN")["value"], "hidden");
+        assert_eq!(find("#env-THREADS")["value"], "8");
+        assert_eq!(action["environment"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -1328,8 +1810,9 @@ mod tests {
         let jsonld = build_crate_jsonld(
             &record,
             &spec,
-            (record.created_by.realm_id, document_id),
+            (record.created_by.realm_id, Some(document_id)),
             &devices,
+            Some(&launch()),
         );
         let directory = tempfile::tempdir().unwrap();
         let engine = ProfileShaclEngine::open(directory.path()).unwrap();

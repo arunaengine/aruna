@@ -11,12 +11,22 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::NodeId;
+use aruna_core::metadata::AuthToken;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::bucket_metadata::RELEASE_TAG;
 use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::release::{
+    CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk,
+};
 use aruna_core::structs::storage::replication::W3idIdentifier;
+use aruna_operations::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version};
+use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::provenance::{
     CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
 };
+use aruna_operations::s3::bucket::release_publish::read_crate;
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use axum::body::Body;
@@ -32,15 +42,17 @@ use tokio::io::DuplexStream;
 use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
 use utoipa::{IntoParams, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, bearer_auth, require_realm_auth};
+use crate::auth::{ValidatedBearer, bearer_auth, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{MetadataRoCrateResponse, RoCrateExportParams};
 use crate::routes::execution::runs::run_answer;
 use crate::routes::metadata::rocrate::export_metadata_rocrate;
+use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::origin::version_answer;
 use crate::server::state::ServerState;
 
@@ -83,6 +95,9 @@ it, as the origin and run routes do.
 - The root `ro-crate-metadata.json` lists versions, runs, sources, database identifiers and
   their links. Each readable run crate is a nested crate under `runs/{run_id}/`; a dataset
   start is nested under `dataset/`. File bytes are referenced, not included.
+- Each release that pins a version is nested under `releases/`, read from its exact tagged
+  crate version with this token, on the node that holds it. A holder that does not answer
+  marks the crate incomplete.
 - A hop the caller may not read is named by its global id or the digest that referred to it,
   never by bucket or key. A node that does not answer is listed, and the crate is incomplete.
 - Each version and run is read once per export, so cycles end.
@@ -279,7 +294,15 @@ async fn walk(
                             break;
                         }
                     },
-                    None => Some(Read::Hidden),
+                    None => {
+                        let status = &run["run_crate_status"];
+                        if let Some(state) = status["status"].as_str()
+                            && built.unwritten(&hop, state, status["message"].as_str())
+                        {
+                            continue;
+                        }
+                        Some(Read::Hidden)
+                    }
                 };
                 let (hops, file, go_on) = record_run(&mut built, &hop, read);
                 if let Some(file) = file
@@ -294,6 +317,19 @@ async fn walk(
             }
             (Target::Run(_), Read::Hidden) => {
                 built.run(&hop, None);
+            }
+            (Target::Release(_), Read::Answer(release)) => {
+                if let Some(file) = built.release(&hop, Some(&release))
+                    && !write(&caller, &gone, &mut zip, file).await
+                {
+                    return;
+                }
+            }
+            (Target::Release(_), read) => {
+                built.release(&hop, None);
+                if matches!(read, Read::Silent) {
+                    built.incomplete("a release crate did not answer");
+                }
             }
             (_, Read::Hidden) => built.hidden(&hop),
             (_, Read::Silent) => built.unreachable(&hop),
@@ -447,8 +483,121 @@ async fn read_hop(caller: &Caller, auth: &AuthContext, hop: &Hop) -> Read {
                 .await
                 .and_then(|Json(run)| to_value(&run))
         }
+        Target::Release(version) => release_crate(state, (auth, &caller.bearer), version).await,
     };
     classify(answer)
+}
+
+/// A release crate's exact version, read with the caller's identity on this node or, through
+/// a holder request with the caller's token, on the node that holds it; it has to carry the
+/// release tag still.
+async fn release_crate(
+    state: &Arc<ServerState>,
+    (auth, bearer): (&AuthContext, &ValidatedBearer),
+    version: &str,
+) -> ServerResult<serde_json::Value> {
+    let context = state.get_ctx();
+    let unavailable = || ServerError::ServiceUnavailableReason("no holder is known".to_string());
+    let local = state.get_node_id();
+    let (holder, bucket, key, version_id) = match W3idIdentifier::parse(version) {
+        Ok(W3idIdentifier::VersionedObject(arn)) if arn.realm_id == state.get_realm_id() => {
+            (arn.node_id, arn.bucket, arn.key, arn.version)
+        }
+        Ok(W3idIdentifier::Global(GlobalId::Version {
+            realm_id,
+            version_id,
+        })) if realm_id == state.get_realm_id() => {
+            let deadline = Instant::now() + RESOLVE_BUDGET;
+            match resolve_version(context.as_ref(), version_id, deadline).await {
+                GlobalResolution::Found(found) => {
+                    // Holders come coordinator first.
+                    let holder = match found.local {
+                        true => local,
+                        false => *found.holders.first().ok_or_else(unavailable)?,
+                    };
+                    (holder, found.bucket, found.key, version_id)
+                }
+                GlobalResolution::NotFound => return Err(ServerError::NotFound),
+                _ => return Err(unavailable()),
+            }
+        }
+        _ => return Err(ServerError::NotFound),
+    };
+    if holder != local {
+        return remote_crate(state, bearer, (holder, bucket, key, version_id)).await;
+    }
+    let info = bucket_info(state, &bucket).await?;
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let path = object_permission_path(realm_id, info.group_id, node_id, &bucket, &key);
+    ensure_permission(state, auth, path, Permission::READ).await?;
+    let read = CrateRead {
+        bucket,
+        key,
+        version_id,
+        group_id: info.group_id,
+        auth: auth.clone(),
+        realm_id,
+        node_id,
+    };
+    match read_crate(context.as_ref(), read).await {
+        Ok(found) if found.metadata.contains_key(RELEASE_TAG) => {
+            serde_json::from_slice(&found.bytes)
+                .map_err(|error| ServerError::InternalError(error.to_string()))
+        }
+        Ok(_) | Err(CrateReadError::Missing) => Err(ServerError::NotFound),
+        Err(CrateReadError::Failed(reason)) => Err(ServerError::ServiceUnavailableReason(reason)),
+    }
+}
+
+/// Asks `holder` for a release crate chunk by chunk; it validates the token and checks READ
+/// and the release tag on each ask.
+async fn remote_crate(
+    state: &Arc<ServerState>,
+    bearer: &ValidatedBearer,
+    (holder, bucket, key, version_id): (NodeId, String, String, Ulid),
+) -> ServerResult<serde_json::Value> {
+    let context = state.get_ctx();
+    let handle = context.metadata_handle.as_ref().ok_or_else(holder_silent)?;
+    let token = AuthToken::bearer(bearer.as_str().to_string()).map_err(|_| holder_silent())?;
+    let mut bytes = Vec::new();
+    loop {
+        let ask = HolderAsk::Crate {
+            key: key.clone(),
+            version_id,
+            offset: bytes.len() as u64,
+        };
+        let answer = handle
+            .request_release_holder(holder, Some(token.clone()), bucket.clone(), ask)
+            .await;
+        let chunk = holder_chunk(answer)?;
+        // A chunk that adds nothing before the end would never finish.
+        if chunk.bytes.is_empty() && (bytes.len() as u64) < chunk.size {
+            return Err(holder_silent());
+        }
+        bytes.extend(chunk.bytes);
+        if bytes.len() as u64 >= chunk.size {
+            break;
+        }
+    }
+    serde_json::from_slice(&bytes).map_err(|error| ServerError::InternalError(error.to_string()))
+}
+
+fn holder_silent() -> ServerError {
+    ServerError::ServiceUnavailableReason("the holder did not answer".to_string())
+}
+
+/// A holder's crate reply: a chunk, a gone or untagged version, a refusal, or no answer.
+fn holder_chunk(answer: Result<HolderAnswer, MetadataReadError>) -> ServerResult<CrateChunk> {
+    match answer {
+        Ok(HolderAnswer::Crate(Some(chunk))) => Ok(chunk),
+        Ok(HolderAnswer::Crate(None)) | Err(MetadataReadError::NotFound) => {
+            Err(ServerError::NotFound)
+        }
+        Err(MetadataReadError::Forbidden | MetadataReadError::Unauthorized) => {
+            Err(ServerError::Forbidden)
+        }
+        _ => Err(holder_silent()),
+    }
 }
 
 /// A refusal hides a hop; any other failure means it did not answer.

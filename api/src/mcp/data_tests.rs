@@ -306,7 +306,7 @@ async fn lists_readable_objects() {
             text: "x".to_string(),
             content_type: None,
         };
-        store_text(&node.state, &node.owner, &info, input)
+        store_text(&node.state, &node.owner, &info, input, Default::default())
             .await
             .unwrap();
     }

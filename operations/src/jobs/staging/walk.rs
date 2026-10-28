@@ -49,7 +49,6 @@ use crate::distribution::guard::{
 use crate::driver::drive;
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::store::{batch_delete, iter_prefix_page, read_state};
-use crate::s3::object::origin::database_entry;
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
 use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
@@ -861,13 +860,6 @@ pub(super) async fn import_page(
         (None, Some(entry)) => resolved_source(ctx, spec, &entry.source_path).await?,
     };
     let (connector, secret_fingerprint) = source;
-    let database = database_entry(
-        &ctx.driver,
-        (spec.auth_context.realm_id, spec.node_id),
-        &spec.bucket,
-        (bucket.distribution.as_ref()).map(|binding| binding.set_id),
-    )
-    .await;
     let input = PageImportInput {
         job_id: ctx.job_id,
         claim_token: ctx.claim_token,
@@ -886,7 +878,6 @@ pub(super) async fn import_page(
         writes,
         deletes,
         now: SystemTime::now(),
-        database,
         ranges: None,
     };
     let result = {

@@ -18,7 +18,9 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::{RemoteBinding, SyncRefusal};
 use aruna_core::types::GroupId;
-use aruna_operations::device::publish_run::{PublishRunError, PublishRunInput, publish_run};
+use aruna_operations::device::publish_run::{
+    PublishRunError, PublishRunInput, local_run_crate, publish_run,
+};
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
@@ -298,6 +300,21 @@ async fn crate_stays_local() -> TestResult<()> {
         read_crate_status(storage, job_id).await?,
         Some(RunCrateStatus::Local)
     );
+    // The device keeps the run's crate itself, rooted at the crate folder.
+    let local = local_run_crate(&device.context, job_id, record.created_by).await?;
+    let root = local["@graph"]
+        .as_array()
+        .ok_or("the crate has a graph")?
+        .iter()
+        .find(|entity| entity["conformsTo"]["@id"] == "https://w3id.org/ro/wfrun/process/0.5")
+        .ok_or("the crate has a root")?;
+    assert_eq!(root["@id"], "./");
+    let stranger = aruna_core::UserId::local(Ulid::from(9u128), realm.realm_id);
+    assert!(
+        local_run_crate(&device.context, job_id, stranger)
+            .await
+            .is_err()
+    );
 
     put_crate_status(storage, job_id, &RunCrateStatus::Pending).await?;
     let target = DocumentTarget::RealmConfig {
@@ -317,6 +334,20 @@ async fn crate_stays_local() -> TestResult<()> {
     assert_eq!(
         read_crate_status(storage, job_id).await?,
         Some(RunCrateStatus::Pending)
+    );
+    // Pruning the job record leaves the local crate readable by its owner.
+    storage
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: aruna_core::keyspaces::JOB_KEYSPACE.to_string(),
+            key: aruna_core::structs::execution::job::job_record_key(job_id),
+            txn_id: None,
+        })
+        .await;
+    assert!(read_job_record(storage, job_id, None).await?.is_none());
+    assert!(
+        local_run_crate(&device.context, job_id, record.created_by)
+            .await
+            .is_ok()
     );
     Ok(())
 }

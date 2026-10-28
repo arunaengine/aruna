@@ -44,8 +44,9 @@ use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
 use crate::metadata::api::{ReferenceNodeExecution, ReferenceNodeRequest, RoCrateExportView};
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::update_document::UpdateDocumentMutation;
-use crate::s3::bucket::search::BucketSearchHit;
+use crate::s3::bucket::search::BucketPage;
 use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
+use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
 pub use aruna_core::metadata::{AuthToken, AuthTokenError};
 
@@ -159,11 +160,13 @@ pub enum MetadataTransportMessage {
         query: String,
         limit: usize,
         group_id: Option<GroupId>,
-        /// Continues after this bucket name.
-        start_after: Option<String>,
+        /// Continues after this bucket name or this node's sealed scan position.
+        start_after: Option<Vec<u8>>,
+        /// Only buckets whose metadata marks them as a database.
+        database: bool,
     },
     BucketSearchResults {
-        result: Result<Vec<BucketSearchHit>, MetadataReadError>,
+        result: Result<BucketPage, MetadataReadError>,
     },
     CreateSyncMirror {
         auth_token: Option<AuthToken>,
@@ -645,6 +648,16 @@ pub enum MetadataTransportMessage {
             crate::jobs::lifecycle::ingress::SubmissionRefusal,
         >,
     },
+    /// Release membership or release files of some ranges, asked of their coordinator with the
+    /// caller's bearer, which the holder validates itself.
+    ReleaseHolder {
+        auth_token: Option<AuthToken>,
+        bucket: String,
+        ask: HolderAsk,
+    },
+    ReleaseHolderResults {
+        result: Result<HolderAnswer, MetadataReadError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.
@@ -1040,6 +1053,7 @@ mod tests {
             limit: 10,
             group_id: None,
             start_after: None,
+            database: false,
         });
         assert_auth_token(MetadataTransportMessage::SearchObjects {
             auth_token: Some(AuthToken::bearer("object-token").unwrap()),
@@ -1245,9 +1259,10 @@ mod tests {
                 limit: 0,
                 group_id: None,
                 start_after: None,
+                database: false,
             })
             .unwrap(),
-            vec![12, 0, 0, 0, 0, 0]
+            vec![12, 0, 0, 0, 0, 0, 0]
         );
     }
 

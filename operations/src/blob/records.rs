@@ -6,14 +6,15 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, COPY_OWNER_KEYSPACE,
-    PATHS_INDEX_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE,
+    COPY_OWNER_KEYSPACE, PATHS_INDEX_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CopyOwner,
     CurrentVersionPointer, HashIndex, VersionKey,
 };
+use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -191,6 +192,24 @@ pub fn write_version_effect(
         value: version.to_bytes()?.into(),
         txn_id,
     }))
+}
+
+/// The release row a version's own tags declare: written in the same transaction as the
+/// version, on every node that commits it, so a tagged release is never missing its row.
+pub fn release_row_effect(
+    version_key: &VersionKey,
+    version: &BlobVersion,
+    txn_id: Option<TxnId>,
+) -> Result<Option<Effect>, ConversionError> {
+    let Some(pointer) = ReleasePointer::of(&version_key.key, &version.metadata) else {
+        return Ok(None);
+    };
+    Ok(Some(Effect::Storage(StorageEffect::Write {
+        key_space: BUCKET_RELEASE_KEYSPACE.to_string(),
+        key: release_key(&version_key.bucket, version_key.version_id).into(),
+        value: pointer.to_bytes()?.into(),
+        txn_id,
+    })))
 }
 
 pub fn delete_version_effect(

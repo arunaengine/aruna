@@ -21,7 +21,8 @@ use std::time::Duration;
 use aruna_compute::ExecutorBackend;
 use aruna_core::compute::{AttemptRef, BackendError, ExecutorKind, FenceContext};
 use aruna_core::structs::execution::job::{
-    AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, PhysicalExecutionState,
+    AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, LaunchRecord,
+    PhysicalExecutionState, recorded_env,
 };
 use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
@@ -209,6 +210,23 @@ pub async fn run_execution_job(
             prepared,
             backend.run_identity(),
         );
+        let launch = match backend.granted(&task_spec) {
+            Ok(resources) => {
+                Box::pin(launch_record(&context, &backend, node_id, &spec, resources)).await
+            }
+            Err(error) => {
+                let job_error = if error.retryable() {
+                    JobError::retryable(format!("submit failed: {error}"))
+                } else {
+                    JobError::permanent(format!("submit failed: {error}"))
+                };
+                Box::pin(pre_submit_failure(
+                    &context, job_id, token, &record, job_error, true,
+                ))
+                .await;
+                return AttemptOutcome::Stopped;
+            }
+        };
 
         // A receipted execution already has its identity: the fenced attempt
         // binds that exact ExecutionId so its outputs chain to the receipt.
@@ -233,6 +251,7 @@ pub async fn run_execution_job(
             token,
             intent,
             receipted,
+            Some(&launch),
             unix_timestamp_millis(),
         ))
         .await
@@ -464,6 +483,38 @@ pub async fn resolve_backend(
         Err(error) => Err(JobError::permanent(format!(
             "no eligible executor for job: {error}"
         ))),
+    }
+}
+
+/// Where and with what this attempt is launched; planned until the backend accepts it.
+async fn launch_record(
+    context: &DriverContext,
+    backend: &Arc<dyn ExecutorBackend>,
+    node_id: aruna_core::NodeId,
+    spec: &ExecutionSpec,
+    resources: aruna_core::compute::GrantedResources,
+) -> LaunchRecord {
+    let caps = backend.capabilities();
+    let location = match caps.local_site {
+        true => read_local_subject(context)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.subject.location)
+            .unwrap_or_default(),
+        false => caps
+            .worker_site
+            .map(|site| site.location)
+            .unwrap_or_default(),
+    };
+    LaunchRecord {
+        node_id,
+        executor_kind: backend.kind().as_wire(),
+        location,
+        resources,
+        workdir: spec.workdir.clone(),
+        env: recorded_env(&spec.env),
+        started_at_ms: None,
     }
 }
 

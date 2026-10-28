@@ -29,8 +29,9 @@ use crate::metadata::protocol::{
     read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
     write_message,
 };
-use crate::s3::bucket::search::BucketSearchHit;
+use crate::s3::bucket::search::BucketPage;
 use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
+use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
 #[tracing::instrument(
     name = "metadata.remote.request",
@@ -411,6 +412,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::SearchResults { .. } => "search_results",
         MetadataTransportMessage::SearchBuckets { .. } => "search_buckets",
         MetadataTransportMessage::BucketSearchResults { .. } => "bucket_search_results",
+        MetadataTransportMessage::ReleaseHolder { .. } => "release_holder",
+        MetadataTransportMessage::ReleaseHolderResults { .. } => "release_holder_results",
         MetadataTransportMessage::SearchObjects { .. } => "search_objects",
         MetadataTransportMessage::ObjectSearchResults { .. } => "object_search_results",
         MetadataTransportMessage::CreateSyncMirror { .. } => "create_sync_mirror",
@@ -829,6 +832,33 @@ impl MetadataHandle {
         }
     }
 
+    /// Asks a range coordinator about releases or release files in its ranges.
+    pub async fn request_release_holder(
+        &self,
+        node_id: NodeId,
+        auth_token: Option<AuthToken>,
+        bucket: String,
+        ask: HolderAsk,
+    ) -> Result<HolderAnswer, MetadataReadError> {
+        let span = Span::current();
+        match send_remote_request(
+            &self.inner,
+            &span,
+            node_id,
+            MetadataTransportMessage::ReleaseHolder {
+                auth_token,
+                bucket,
+                ask,
+            },
+        )
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ReleaseHolderResults { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
     #[tracing::instrument(
         name = "metadata.bucket_search.remote",
         level = "debug",
@@ -846,11 +876,10 @@ impl MetadataHandle {
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
-        query: String,
-        limit: usize,
-        group_id: Option<GroupId>,
-        start_after: Option<String>,
-    ) -> Result<Vec<BucketSearchHit>, MetadataReadError> {
+        (query, limit): (String, usize),
+        (group_id, database): (Option<GroupId>, bool),
+        start_after: Option<Vec<u8>>,
+    ) -> Result<BucketPage, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();
         let result = match send_remote_request(
@@ -863,6 +892,7 @@ impl MetadataHandle {
                 limit,
                 group_id,
                 start_after,
+                database,
             },
         )
         .await
@@ -873,9 +903,9 @@ impl MetadataHandle {
         };
         record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
-            Ok(hits) => {
+            Ok(page) => {
                 span.record("result", "ok");
-                span.record("hit_count", hits.len() as u64);
+                span.record("hit_count", page.hits.len() as u64);
             }
             Err(error) => record_error(&span, &format!("{error:?}")),
         }

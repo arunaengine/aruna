@@ -59,30 +59,6 @@ impl AdminDocumentState {
                 let value = replicas_value(replicas);
                 self.apply_config_setting(event, CONFIG_REPLICAS_PATH, value);
             }
-            AdminDocumentOperation::DatabaseSet {
-                entry,
-                predecessor,
-                consent,
-            } => {
-                let path = database_path(entry.entry_id);
-                // A consent holds for the one publication on the version it names.
-                if consent.is_some() && !self.consent_current(event, &path, predecessor.as_ref()) {
-                    return Ok(AdminApplyStatus::Redundant);
-                }
-                let value = serde_json::to_string(entry)
-                    .map_err(|_| AdminDocumentError::InvalidDatabase)?;
-                self.apply_register(event, &path, Some(value));
-            }
-            AdminDocumentOperation::DatabaseRemoved { entry_id } => {
-                self.apply_register(event, &database_path(*entry_id), None);
-            }
-            AdminDocumentOperation::DatabaseParserSet { entry_id, parser } => {
-                let value = (parser.as_ref())
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(|_| AdminDocumentError::InvalidDatabase)?;
-                self.apply_register(event, &database_parser_path(*entry_id), value);
-            }
             AdminDocumentOperation::ConfigPoliciesSet { policies } => {
                 self.apply_config_setting(event, CONFIG_POLICIES_PATH, policies_value(policies));
             }
@@ -102,28 +78,5 @@ impl AdminDocumentState {
             _ => return self.apply_placement(event, realm_id),
         }
         Ok(AdminApplyStatus::Applied)
-    }
-
-    /// Whether `event` publishes on `predecessor`: it observes that version and no other
-    /// version of `path` this state holds. Versions it does not observe are concurrent.
-    fn consent_current(
-        &self,
-        event: &AdminDocumentEvent,
-        path: &str,
-        predecessor: Option<&AdminDocumentDot>,
-    ) -> bool {
-        if predecessor.is_some_and(|dot| !event_observes_dot(event, dot)) {
-            return false;
-        }
-        let version = self.user_subject_ids.get(path);
-        // Equal values written concurrently share the version the consent names.
-        let named = version.is_some_and(|version| Some(&version.dot) == predecessor);
-        let equal = self.equivalent_value_dots.get(path).into_iter().flatten();
-        let held =
-            (version.map(|version| &version.dot).into_iter().chain(equal)).filter(|_| !named);
-        let conflicts = self.conflicts.get(path).into_iter();
-        let mut dots = held
-            .chain(conflicts.flat_map(|conflict| conflict.values.iter().map(|value| &value.dot)));
-        !dots.any(|dot| Some(dot) != predecessor && event_observes_dot(event, dot))
     }
 }

@@ -9,12 +9,17 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, DISTRIBUTION_KEYSPACE, GROUP_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
+};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
+use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path, incarnation};
+use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, StoredMetadata};
+use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
@@ -26,6 +31,7 @@ use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
 use crate::driver::{DriverContext, drive};
+use crate::s3::object::search::{open_position, seal_position};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchBucketsInput {
@@ -39,6 +45,8 @@ pub struct SearchBucketsInput {
     /// Resumes the raw bucket scan after this key so a filtering caller can fill
     /// one page across several drives.
     pub start_after: Option<Key>,
+    /// Keeps only buckets whose metadata marks them as a database, with that metadata.
+    pub database: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,6 +59,19 @@ pub struct SearchBucketsOutput {
     pub scanned_rows: usize,
 }
 
+/// One node's page: its readable hits, and where its scan stopped when the row budget ran out
+/// before the end.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketPage {
+    pub hits: Vec<BucketSearchHit>,
+    /// The last bucket scanned, past every hit, sealed so only this node reads it; `None` when
+    /// the scan was not cut.
+    pub scanned_to: Option<Vec<u8>>,
+    /// The cursor's position no longer opens here, for example after a restart, so this node's
+    /// part of the listing ends incomplete.
+    pub retired: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketSearchHit {
     pub arn: String,
@@ -61,6 +82,10 @@ pub struct BucketSearchHit {
     pub created_at: SystemTime,
     /// The distributed bucket this local bucket is a member of; `None` for an ordinary bucket.
     pub set_id: Option<ulid::Ulid>,
+    /// The bucket's metadata, read for a database search only.
+    pub metadata: Option<BucketMetadata>,
+    /// Anyone, also without a login, may read the bucket; set for a database search only.
+    pub public: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +100,7 @@ enum SearchBucketsState {
     ScanBuckets,
     CheckPermission,
     ReadGroup,
+    ReadMetadata,
     Finish,
     Error,
 }
@@ -97,6 +123,8 @@ pub enum SearchBucketsError {
     NotFinished,
     #[error("bucket search scan budget exhausted")]
     Unavailable,
+    #[error("bucket search position is not valid here")]
+    Position,
 }
 
 #[derive(Debug, PartialEq)]
@@ -105,6 +133,8 @@ pub struct SearchBucketsOperation {
     state: SearchBucketsState,
     candidates: VecDeque<BucketCandidate>,
     current: Option<BucketCandidate>,
+    /// A readable hit of a database search, waiting for its metadata.
+    pending: Option<BucketSearchHit>,
     hits: Vec<BucketSearchHit>,
     next_start_after: Option<Key>,
     last_decided: Option<Key>,
@@ -131,6 +161,7 @@ impl SearchBucketsOperation {
             state: SearchBucketsState::Init,
             candidates: VecDeque::new(),
             current: None,
+            pending: None,
             hits: Vec::new(),
             next_start_after,
             last_decided: None,
@@ -155,11 +186,10 @@ impl SearchBucketsOperation {
     }
 
     fn emit_bucket_scan(&mut self) -> Effects {
-        let Some(remaining) = self.max_scan_rows.checked_sub(self.scanned_rows) else {
-            return self.fail(SearchBucketsError::Unavailable);
-        };
+        // A used-up budget ends the page at the scan position, so the next page goes on there.
+        let remaining = self.max_scan_rows.saturating_sub(self.scanned_rows);
         if remaining == 0 {
-            return self.fail(SearchBucketsError::Unavailable);
+            return self.finish();
         }
         self.state = SearchBucketsState::ScanBuckets;
         smallvec![Effect::Storage(StorageEffect::Iter {
@@ -293,19 +323,75 @@ impl SearchBucketsOperation {
                 Ok(arn) => arn.to_string(),
                 Err(error) => return self.fail(error.into()),
             };
-        self.hits.push(BucketSearchHit {
+        let set_id = (candidate.info.distribution.as_ref()).map(|binding| binding.set_id);
+        let hit = BucketSearchHit {
             arn,
             bucket: candidate.bucket,
             node_id: self.input.node_id,
             group_id: candidate.info.group_id,
             group_name,
             created_at: candidate.info.created_at,
-            set_id: candidate
-                .info
-                .distribution
-                .as_ref()
-                .map(|binding| binding.set_id),
-        });
+            set_id,
+            metadata: None,
+            public: false,
+        };
+        if !self.input.database {
+            self.hits.push(hit);
+            return self.continue_search();
+        }
+        self.state = SearchBucketsState::ReadMetadata;
+        let key: Key = hit.bucket.as_bytes().to_vec().into();
+        let reads = match set_id {
+            Some(set_id) => vec![(
+                DISTRIBUTION_KEYSPACE.to_string(),
+                set_id.to_bytes().to_vec().into(),
+            )],
+            None => vec![
+                (BUCKET_METADATA_KEYSPACE.to_string(), key.clone()),
+                (BUCKET_CREATION_KEYSPACE.to_string(), key),
+            ],
+        };
+        self.pending = Some(hit);
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None
+        })]
+    }
+
+    /// Keeps a pending hit only when its current metadata marks it as a database.
+    fn handle_metadata_read(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected("Event::Storage(StorageEvent::BatchReadResult)", got);
+        };
+        let Some(mut hit) = self.pending.take() else {
+            return self.fail(SearchBucketsError::NotFinished);
+        };
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let metadata = match hit.set_id {
+            Some(_) => match values.next().flatten() {
+                Some(value) => match DistributionView::from_bytes(value.as_ref()) {
+                    Ok(view) => {
+                        (view.snapshot().config.settings.metadata.clone()).map(|metadata| *metadata)
+                    }
+                    Err(error) => return self.fail(error.into()),
+                },
+                None => None,
+            },
+            None => match (values.next().flatten(), values.next().flatten()) {
+                (Some(row), creation) => match StoredMetadata::from_bytes(row.as_ref()) {
+                    Ok(stored) => (stored.incarnation
+                        == incarnation(creation.as_ref().map(|value| value.as_ref())))
+                    .then_some(stored.metadata),
+                    Err(error) => return self.fail(error.into()),
+                },
+                (None, _) => None,
+            },
+        };
+        if metadata.as_ref().is_some_and(|metadata| metadata.database) {
+            hit.metadata = metadata;
+            self.hits.push(hit);
+        }
         self.continue_search()
     }
 
@@ -333,7 +419,7 @@ impl SearchBucketsOperation {
 pub async fn search_local_buckets(
     context: &DriverContext,
     input: SearchBucketsInput,
-) -> Result<Vec<BucketSearchHit>, SearchBucketsError> {
+) -> Result<BucketPage, SearchBucketsError> {
     search_with_budget(context, input, SearchBucketsOperation::MAX_SCAN_ROWS).await
 }
 
@@ -341,20 +427,23 @@ async fn search_with_budget(
     context: &DriverContext,
     input: SearchBucketsInput,
     max_scan_rows: usize,
-) -> Result<Vec<BucketSearchHit>, SearchBucketsError> {
+) -> Result<BucketPage, SearchBucketsError> {
     let limit = input.limit.clamp(1, SearchBucketsOperation::MAX_LIMIT);
     let mut evaluators: HashMap<(RealmId, GroupId), PolicyEvaluator> = HashMap::new();
     let mut visible: Vec<BucketSearchHit> = Vec::with_capacity(limit);
-    let mut start_after = input.start_after.clone();
+    // A cut scan's position comes back sealed, as it may name a bucket the caller cannot read.
+    let opened = (input.start_after.as_ref()).map(|after| open_position(after));
+    let Ok(opened) = opened.transpose() else {
+        return Ok(BucketPage {
+            retired: true,
+            ..BucketPage::default()
+        });
+    };
+    let mut start_after = opened.map(Key::from);
     let mut scanned_rows = 0;
+    let budget = max_scan_rows.min(SearchBucketsOperation::MAX_SCAN_ROWS);
     loop {
-        let remaining = max_scan_rows
-            .min(SearchBucketsOperation::MAX_SCAN_ROWS)
-            .checked_sub(scanned_rows)
-            .ok_or(SearchBucketsError::Unavailable)?;
-        if remaining == 0 {
-            return Err(SearchBucketsError::Unavailable);
-        }
+        let remaining = budget.saturating_sub(scanned_rows);
         let output = drive(
             SearchBucketsOperation::with_budget(
                 SearchBucketsInput {
@@ -375,20 +464,60 @@ async fn search_with_budget(
             .map(|group_id| (input.realm_id, group_id))
             .collect::<Vec<_>>();
         evaluators.extend(PolicyEvaluator::load_bulk(context, pending).await?);
-        for hit in output.hits {
+        for mut hit in output.hits {
             if !policy_allows(&evaluators, &input, &hit) {
                 continue;
             }
+            if input.database {
+                hit.public = anonymous_reads(context, &input, &hit).await;
+            }
             visible.push(hit);
             if visible.len() >= limit {
-                return Ok(visible);
+                return Ok(BucketPage {
+                    hits: visible,
+                    ..BucketPage::default()
+                });
             }
         }
         match output.next_start_after {
+            Some(key) if scanned_rows >= budget => {
+                let scanned_to = seal_position(&key).map_err(|_| SearchBucketsError::Position)?;
+                return Ok(BucketPage {
+                    hits: visible,
+                    scanned_to: Some(scanned_to),
+                    retired: false,
+                });
+            }
             Some(key) => start_after = Some(key),
-            None => return Ok(visible),
+            None => {
+                return Ok(BucketPage {
+                    hits: visible,
+                    ..BucketPage::default()
+                });
+            }
         }
     }
+}
+
+/// Whether a caller without a login may read the bucket, deny policies included.
+async fn anonymous_reads(
+    context: &DriverContext,
+    input: &SearchBucketsInput,
+    hit: &BucketSearchHit,
+) -> bool {
+    let path = bucket_permission_path(input.realm_id, hit.group_id, hit.node_id, &hit.bucket);
+    let anonymous = AuthContext::anonymous(input.realm_id);
+    let extras = PolicyRequestExtras::operation("s3.ListBuckets");
+    crate::auth::request_authorization::authorize(
+        context,
+        input.realm_id,
+        &anonymous,
+        &path,
+        &Permission::READ,
+        extras,
+    )
+    .await
+    .is_ok()
 }
 
 /// Evaluates the loaded policies for one hit on the path the RBAC check used,
@@ -427,6 +556,7 @@ impl Operation for SearchBucketsOperation {
             SearchBucketsState::ScanBuckets => self.handle_bucket_scan(event),
             SearchBucketsState::CheckPermission => self.handle_permission(event),
             SearchBucketsState::ReadGroup => self.handle_group_read(event),
+            SearchBucketsState::ReadMetadata => self.handle_metadata_read(event),
             SearchBucketsState::Init | SearchBucketsState::Finish | SearchBucketsState::Error => {
                 smallvec![]
             }
@@ -458,13 +588,15 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+        AUTH_KEYSPACE, BUCKET_METADATA_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        S3_BUCKET_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::{Actor, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
     use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
     use aruna_core::structs::storage::distribution::DistributionBinding;
     use aruna_storage::storage;
     use tempfile::tempdir;
@@ -487,6 +619,7 @@ mod tests {
             limit,
             group_id: None,
             start_after: None,
+            database: false,
         }
     }
 
@@ -510,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_budget_fails() {
+    fn scan_budget_keeps_position() {
         let mut operation = SearchBucketsOperation::new(scan_input("missing", 1));
         operation.start();
         let mut remaining = SearchBucketsOperation::MAX_SCAN_ROWS;
@@ -533,7 +666,11 @@ mod tests {
             page += 1;
         }
 
-        assert_eq!(operation.finalize(), Err(SearchBucketsError::Unavailable));
+        // The used-up budget ends the page where the scan stopped, not with an error.
+        let output = operation.finalize().unwrap();
+        assert!(output.hits.is_empty());
+        assert_eq!(output.next_start_after, Some(b"cursor-1".to_vec().into()));
+        assert_eq!(output.scanned_rows, SearchBucketsOperation::MAX_SCAN_ROWS);
     }
 
     #[test]
@@ -783,10 +920,12 @@ mod tests {
                 limit: 50,
                 group_id: None,
                 start_after: None,
+                database: false,
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .hits;
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].bucket, "data-public");
@@ -797,5 +936,89 @@ mod tests {
                 .unwrap()
                 .to_string()
         );
+
+        // A database search keeps only buckets whose metadata marks them, and says who reads.
+        for (bucket, database) in [("data-public", true), ("data-private", false)] {
+            let stored = aruna_core::structs::storage::bucket_metadata::StoredMetadata {
+                incarnation: 0,
+                metadata: BucketMetadata {
+                    database,
+                    title: Some(bucket.to_string()),
+                    ..BucketMetadata::default()
+                },
+            };
+            write_value(
+                &context,
+                BUCKET_METADATA_KEYSPACE,
+                bucket.as_bytes().to_vec(),
+                stored.to_bytes().unwrap(),
+            )
+            .await;
+        }
+        let databases = search_local_buckets(
+            &context,
+            SearchBucketsInput {
+                auth: AuthContext {
+                    user_id: owner,
+                    realm_id,
+                    path_restrictions: None,
+                    session: None,
+                },
+                realm_id,
+                node_id,
+                query: String::new(),
+                limit: 50,
+                group_id: None,
+                start_after: None,
+                database: true,
+            },
+        )
+        .await
+        .unwrap()
+        .hits;
+        assert_eq!(databases.len(), 1);
+        assert_eq!(databases[0].bucket, "data-public");
+        assert!(databases[0].public);
+        let metadata = databases[0].metadata.as_ref().unwrap();
+        assert_eq!(metadata.title.as_deref(), Some("data-public"));
+
+        // A cut scan seals its position, which names the unreadable bucket it stopped at.
+        let input = SearchBucketsInput {
+            auth: AuthContext {
+                user_id: outsider,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            realm_id,
+            node_id,
+            query: "DATA".to_string(),
+            limit: 50,
+            group_id: None,
+            start_after: None,
+            database: false,
+        };
+        let cut = search_with_budget(&context, input.clone(), 1)
+            .await
+            .unwrap();
+        assert!(cut.hits.is_empty());
+        let sealed = cut.scanned_to.expect("the scan was cut");
+        assert!(!sealed.windows(12).any(|window| window == b"data-private"));
+        let resumed = SearchBucketsInput {
+            start_after: Some(sealed.clone().into()),
+            ..input.clone()
+        };
+        let rest = search_local_buckets(&context, resumed).await.unwrap();
+        let names: Vec<_> = rest.hits.iter().map(|hit| hit.bucket.as_str()).collect();
+        assert_eq!(names, ["data-public"]);
+        let mut forged = sealed;
+        *forged.last_mut().unwrap() ^= 1;
+        let forged = SearchBucketsInput {
+            start_after: Some(forged.into()),
+            ..input
+        };
+        // A position this node cannot open retires its scan instead of failing every page.
+        let retired = search_local_buckets(&context, forged).await.unwrap();
+        assert!(retired.retired && retired.hits.is_empty() && retired.scanned_to.is_none());
     }
 }

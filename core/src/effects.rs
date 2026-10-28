@@ -723,6 +723,8 @@ pub enum NetEffect {
     SnapshotSign(Box<crate::structs::storage::distribution::snapshot::SnapshotClaim>),
     /// Signs a member statement; only a claim naming this node as signer.
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
+    /// Reads a release crate version or asks a range holder about releases.
+    Release(Box<crate::structs::storage::release::ReleaseEffect>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

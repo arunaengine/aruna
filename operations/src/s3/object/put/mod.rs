@@ -8,8 +8,8 @@ use crate::blob::managed_copy::{
     split_serve_reads, validate_registration,
 };
 use crate::blob::records::{
-    HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,
-    write_location_effect, write_version_effect,
+    HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, release_row_effect,
+    write_head_effect, write_location_effect, write_version_effect,
 };
 use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
 use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, version_written};
@@ -1459,7 +1459,7 @@ impl PutObjectOperation {
             .with_metadata(self.metadata.clone())
             .with_origin(Some(self.version_origin.clone().unwrap_or(
                 match self.config.version_source {
-                    Some(_) => VersionOrigin::Source { database: None },
+                    Some(_) => VersionOrigin::Source,
                     None => VersionOrigin::Upload {
                         node_id: self.config.node_id,
                         device: None,
@@ -1488,15 +1488,42 @@ impl PutObjectOperation {
                 Ok(effect) => effect,
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
             };
+            let release = match release_row_effect(&version_key, &version, self.txn_id) {
+                Ok(release) => release,
+                Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+            };
             self.state = PutObjectState::CreateVersionRecord;
-            smallvec![effect]
+            match (effect, release) {
+                // A tagged release crate commits its release row with the version.
+                (
+                    Effect::Storage(StorageEffect::Write {
+                        key_space,
+                        key,
+                        value,
+                        txn_id,
+                    }),
+                    Some(Effect::Storage(StorageEffect::Write {
+                        key_space: row_space,
+                        key: row_key,
+                        value: row_value,
+                        ..
+                    })),
+                ) => smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                    writes: vec![(key_space, key, value), (row_space, row_key, row_value)],
+                    txn_id,
+                })],
+                (effect, _) => smallvec![effect],
+            }
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
     }
 
     fn version_created(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
+        if let Event::Storage(
+            StorageEvent::WriteResult { .. } | StorageEvent::BatchWriteResult { .. },
+        ) = event
+        {
             self.store_envelope()
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)

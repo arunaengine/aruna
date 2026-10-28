@@ -35,6 +35,7 @@ use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBind
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::bucket_metadata::strip_release_keys;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::global_id::GlobalId;
@@ -351,7 +352,9 @@ async fn copy_inner(
                 ..binding
             })
     };
-    let metadata = input.metadata.unwrap_or(source.metadata);
+    let mut metadata = input.metadata.unwrap_or(source.metadata);
+    // A copy is never a release, even of a release crate.
+    strip_release_keys(&mut metadata);
     let routing = routing_snapshot(context, input.group_id, &input.dest_bucket).await?;
     // Bytes the destination's backend already holds in the destination's encoding
     // are adopted, not streamed; another encoding gets its own copy. A key under a

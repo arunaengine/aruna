@@ -16,7 +16,10 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::storage::blob::group_permission_path;
+use aruna_core::structs::storage::blob::{
+    BucketInfo, bucket_permission_path, group_permission_path,
+};
+use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, ReleaseRef};
 use aruna_core::structs::storage::origin::{SourcePin, public_source_url, publishable};
 use aruna_core::structs::storage::read_grant::{GrantScope, ReadGrant};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -35,7 +38,7 @@ use super::ids::{
 use super::witness::arm_family;
 use super::{LifecycleError, ids};
 use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::PolicyRequestExtras;
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::jobs::records::keys::{family_prefix, kind_prefix};
@@ -52,6 +55,8 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{AuthToken, WritePeerError};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::metadata::bucket_metadata;
+use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
@@ -149,9 +154,11 @@ pub async fn serve_input_resolve(
     let Some(metadata) = context.metadata_handle.as_ref() else {
         return Err(SubmissionRefusal::Unavailable);
     };
-    if !matches!(auth_token, AuthToken::Bearer(_)) {
+    let AuthToken::Bearer(bearer) = &auth_token else {
         return Err(SubmissionRefusal::Unauthorized);
-    }
+    };
+    // Kept to ask range coordinators about release membership for the same caller.
+    let bearer = bearer.as_str().to_string();
     let auth = metadata
         .authorize_write_peer(peer, Some(auth_token))
         .await
@@ -191,7 +198,8 @@ pub async fn serve_input_resolve(
             });
         }
         input.source_node_id = Some(local);
-        let captured = capture_inputs(context, std::slice::from_ref(&input), caller, local)
+        let here = (local, Some(bearer.as_str()));
+        let captured = capture_inputs(context, std::slice::from_ref(&input), caller, here)
             .await
             .map_err(refusal_of)?;
         let Some(mut captured) = captured.into_iter().next() else {
@@ -508,7 +516,11 @@ async fn resolve_inputs(
             None => here.push(input),
         }
     }
-    let mut captured = capture_inputs(context, &here, caller, local).await?;
+    let bearer = match auth_token {
+        Some(AuthToken::Bearer(token)) => Some(token.as_str()),
+        _ => None,
+    };
+    let mut captured = capture_inputs(context, &here, caller, (local, bearer)).await?;
     let mut remote_inputs = Vec::new();
     for (node, inputs) in remote {
         for (input, capture) in remote_captures(context, node, &inputs, caller, auth_token).await? {
@@ -807,12 +819,13 @@ fn resolve_answer(
 }
 
 /// Captures inputs this node holds: each is read like an S3 GET by the caller, pinned to an
-/// exact version and granted for later exact reads.
+/// exact version and granted for later exact reads, with its bucket's metadata and the releases
+/// that pin it. `bearer` lets range coordinators answer release membership.
 async fn capture_inputs(
     context: &DriverContext,
     inputs: &[InputSelection],
     (created_by, submission_id, expires_at): (UserId, SubmissionId, u64),
-    local: NodeId,
+    (local, bearer): (NodeId, Option<&str>),
 ) -> Result<Vec<CapturedInput>, SubmitJobError> {
     let mut captured_inputs = Vec::with_capacity(inputs.len());
     for input in inputs {
@@ -895,6 +908,22 @@ async fn capture_inputs(
         let public = public_read(context, realm_id, (local, source_group_id), object)
             .await
             .map_err(|error| source_error(&reference, error))?;
+        let unavailable =
+            |error: String| SubmitJobError::PlacementUnavailable(format!("{reference}: {error}"));
+        let info = drive(GetBucketOperation::new(bucket.clone()), context)
+            .await
+            .map_err(|error| unavailable(error.to_string()))?;
+        let database = readable_metadata(context, (&auth, local), bucket, &info)
+            .await
+            .map_err(unavailable)?;
+        let scope = BucketScope {
+            realm_id,
+            node_id: local,
+            bucket,
+            info: &info,
+        };
+        let (releases, releases_complete) =
+            input_releases(context, scope, (&auth, bearer), (key.as_str(), version)).await;
         // This node validated the caller itself, so its grant vouches for exact reads later.
         let grant = issue_grant(
             context,
@@ -926,14 +955,65 @@ async fn capture_inputs(
             public,
             link: None,
             source_pin,
-            database: None,
-            releases: Vec::new(),
-            // Release membership is not checked until the provenance lookup lands.
-            releases_complete: false,
+            database,
+            releases,
+            releases_complete,
             grant,
         });
     }
     Ok(captured_inputs)
+}
+
+/// The bucket's metadata when the caller may read the bucket itself, checked like the metadata
+/// route; READ on one key alone shows none of it, and the run still starts.
+async fn readable_metadata(
+    context: &DriverContext,
+    (auth, local): (&AuthContext, NodeId),
+    bucket: &str,
+    info: &BucketInfo,
+) -> Result<Option<BucketMetadata>, String> {
+    let path = bucket_permission_path(auth.realm_id, info.group_id, local, bucket);
+    let extras = PolicyRequestExtras::rest();
+    match authorize(
+        context,
+        auth.realm_id,
+        auth,
+        &path,
+        &Permission::READ,
+        extras,
+    )
+    .await
+    {
+        Ok(()) => bucket_metadata(context, bucket, info).await,
+        // Only a refusal omits the metadata; unreadable policy state stays a retryable failure.
+        Err(
+            AuthorizeError::PermissionDenied
+            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
+        ) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// The releases that pin one input version, checked with the caller's own access; a check that
+/// fails leaves them unproven rather than refusing the run.
+async fn input_releases(
+    context: &DriverContext,
+    scope: BucketScope<'_>,
+    (auth, bearer): (&AuthContext, Option<&str>),
+    (key, version_id): (&str, Ulid),
+) -> (Vec<ReleaseRef>, bool) {
+    let caller = MembershipCaller { auth, bearer };
+    let query = MembershipQuery {
+        key: key.to_string(),
+        version_id,
+    };
+    match release_members(context, scope, caller, &[query]).await {
+        Ok(found) => match found.answers.into_iter().next() {
+            Some(answer) => (answer.releases, answer.complete),
+            None => (Vec::new(), false),
+        },
+        Err(_) => (Vec::new(), false),
+    }
 }
 
 /// The placement refs of every bucket the run writes into; all live on the ingress node.

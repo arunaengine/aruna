@@ -337,6 +337,33 @@ pub struct FenceContext {
     pub controller_generation: u64,
 }
 
+/// The limits a backend enforces for one exact task; `None` means it bounds no such dimension.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantedResources {
+    pub nano_cpus: Option<u64>,
+    pub ram_bytes: Option<u64>,
+    /// Container disk, such as Docker's storage size or Kubernetes ephemeral storage.
+    pub disk_bytes: Option<u64>,
+    /// Size of the workspace volume the backend creates for the task.
+    pub workspace_bytes: Option<u64>,
+    pub walltime_ms: Option<u64>,
+}
+
+impl GrantedResources {
+    /// The task's own ceilings, for a backend that adds no defaults of its own.
+    pub fn requested(resources: &ResourceRequest) -> Self {
+        Self {
+            nano_cpus: resources
+                .cpu_cores
+                .map(|cores| u64::from(cores) * 1_000_000_000),
+            ram_bytes: resources.ram_bytes,
+            disk_bytes: resources.disk_bytes,
+            workspace_bytes: None,
+            walltime_ms: resources.max_walltime.map(crate::telemetry::duration_ms),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRequest {
     pub cpu_cores: Option<u32>,

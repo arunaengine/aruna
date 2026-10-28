@@ -611,7 +611,6 @@ mod tests {
             writes: Vec::new(),
             deletes: Vec::new(),
             now: std::time::SystemTime::now(),
-            database: None,
             ranges: None,
         }
     }

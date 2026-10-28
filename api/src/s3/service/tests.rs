@@ -118,6 +118,28 @@ fn tracks_content_type() {
     );
 }
 
+#[test]
+fn hides_server_tags() {
+    // A release tag holds `/`, which no `x-amz-meta-` header may carry; GET and HEAD drop it.
+    let (_dir, service) = parser_service(
+        RealmId([1u8; 32]),
+        iroh::SecretKey::from_bytes(&[2u8; 32]).public(),
+    );
+    let stored = HashMap::from([
+        ("aruna-engine.org/release".to_string(), "6.0".to_string()),
+        (
+            "aruna-engine.org/origin-device".to_string(),
+            "device".to_string(),
+        ),
+        ("user".to_string(), "value".to_string()),
+    ]);
+    let fields = service.build_response_fields(None, None, Some(&stored), None, None, None);
+    assert_eq!(
+        fields.metadata,
+        Some(HashMap::from([("user".to_string(), "value".to_string())]))
+    );
+}
+
 // A holder-backed read has no location, so ObjectInfo supplies its fields.
 #[test]
 fn info_supplies_fields() {

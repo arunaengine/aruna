@@ -961,6 +961,7 @@ fn search_maps_partiality() {
             nodes_failed: 1,
             failed_partitions: vec![failed],
             discovery_failed: false,
+            omitted: Vec::new(),
         },
         omitted_partitions: 0,
         incomplete_ranges: 0,
@@ -996,6 +997,7 @@ fn passes_documents_truncated() {
             nodes_failed: 0,
             failed_partitions: Vec::new(),
             discovery_failed: false,
+            omitted: Vec::new(),
         },
     };
     let section = map_documents_section(result);

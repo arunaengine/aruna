@@ -360,6 +360,7 @@ async fn preflight_stage_failures() {
             nodes_failed: 1,
             failed_partitions: vec![local_node_id],
             discovery_failed: false,
+            omitted: Vec::new(),
         },
     );
     assert!(matches!(denied, Err(MetadataApiError::ServiceUnavailable)));

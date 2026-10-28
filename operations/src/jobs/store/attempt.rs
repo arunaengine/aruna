@@ -249,7 +249,8 @@ pub async fn begin_external_running(
     started_at_ms: Option<u64>,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
+    let attempt_started = started_at_ms.unwrap_or(now_ms);
+    mutate_marking_start(storage, job_id, attempt_started, |record| {
         guard_token(record, token)?;
         if record.cancel_requested {
             return Ok(JobMutation::Skip);
@@ -285,6 +286,107 @@ pub async fn record_attempt_started(
         Ok(JobMutation::Persist)
     })
     .await
+}
+
+/// `mutate_job`, then in the same transaction marks the launch record of the current attempt
+/// as executed: its guard passed, so the backend accepted this epoch, even when a cancellation
+/// keeps the job from running.
+async fn mutate_marking_start<F>(
+    storage: &StorageHandle,
+    job_id: JobId,
+    started_at_ms: u64,
+    mut mutate: F,
+) -> Result<JobRecord, JobMutationError>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+{
+    for attempt in 0..MUTATE_MAX_ATTEMPTS {
+        let txn_id = start_write_txn(storage)
+            .await
+            .map_err(JobMutationError::Storage)?;
+        let result = async {
+            let record =
+                Box::pin(mutate_in_txn(storage, txn_id, job_id, &mut mutate, None)).await?;
+            mark_launch_started(storage, txn_id, &record, started_at_ms).await?;
+            Ok(record)
+        }
+        .await;
+        match result {
+            Ok(record) => match commit_write(
+                storage,
+                txn_id,
+                attempt,
+                "job mutation exhausted conflict retries",
+            )
+            .await?
+            {
+                CommitStep::Committed => return Ok(record),
+                CommitStep::Retry => continue,
+            },
+            Err(error) => {
+                abort_txn(storage, txn_id).await;
+                return Err(error);
+            }
+        }
+    }
+    Err(JobMutationError::Storage(
+        "job mutation exhausted conflict retries".to_string(),
+    ))
+}
+
+async fn mark_launch_started(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    record: &JobRecord,
+    started_at_ms: u64,
+) -> Result<(), JobMutationError> {
+    let Some(intent) = &record.attempt_intent else {
+        return Ok(());
+    };
+    let key = ByteView::from(attempt_control_key(record.job_id, intent.attempt_epoch));
+    let storage_error = |error: String| JobMutationError::Storage(error);
+    let Some(value) = read_raw(storage, LAUNCH_RECORD_KEYSPACE, key.clone(), Some(txn_id))
+        .await
+        .map_err(storage_error)?
+    else {
+        return Ok(());
+    };
+    let mut launch = LaunchRecord::from_bytes(value.as_ref())
+        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    if launch.started_at_ms.is_some() {
+        return Ok(());
+    }
+    launch.started_at_ms = Some(started_at_ms);
+    let value = launch
+        .to_bytes()
+        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    batch_write(
+        storage,
+        vec![(
+            LAUNCH_RECORD_KEYSPACE.to_string(),
+            key,
+            ByteView::from(value),
+        )],
+        Some(txn_id),
+    )
+    .await
+    .map_err(storage_error)
+}
+
+/// The executed launch record of the record's final attempt, if any.
+pub async fn read_launch_record(
+    storage: &StorageHandle,
+    record: &JobRecord,
+) -> Result<Option<LaunchRecord>, String> {
+    let Some(intent) = &record.attempt_intent else {
+        return Ok(None);
+    };
+    let key = ByteView::from(attempt_control_key(record.job_id, intent.attempt_epoch));
+    let Some(value) = read_raw(storage, LAUNCH_RECORD_KEYSPACE, key, None).await? else {
+        return Ok(None);
+    };
+    let launch = LaunchRecord::from_bytes(value.as_ref()).map_err(|error| error.to_string())?;
+    Ok(launch.started_at_ms.is_some().then_some(launch))
 }
 
 /// `Running/Indeterminate -> Cancelling`: a durable cancel intent precedes the
@@ -518,6 +620,53 @@ pub async fn put_crate_outcome(
         None,
     )
     .await
+}
+
+/// Stores the crate of an unpublished local run with its `Local` status in one batch.
+pub async fn put_local_crate(
+    storage: &StorageHandle,
+    job_id: JobId,
+    local: &aruna_core::structs::execution::job::LocalCrate,
+) -> Result<(), String> {
+    let key = aruna_core::structs::execution::job::run_crate_key(job_id);
+    let status = RunCrateStatus::Local
+        .to_bytes()
+        .map_err(|error| error.to_string())?;
+    batch_write(
+        storage,
+        vec![
+            (
+                RUN_CRATE_KEYSPACE.to_string(),
+                key.clone(),
+                ByteView::from(status),
+            ),
+            (
+                aruna_core::keyspaces::LOCAL_CRATE_KEYSPACE.to_string(),
+                key,
+                ByteView::from(local.to_bytes().map_err(|error| error.to_string())?),
+            ),
+        ],
+        None,
+    )
+    .await
+}
+
+/// The crate of a local run and its owner, while this device keeps one.
+pub async fn read_local_crate(
+    storage: &StorageHandle,
+    job_id: JobId,
+) -> Result<Option<aruna_core::structs::execution::job::LocalCrate>, String> {
+    let key = aruna_core::structs::execution::job::run_crate_key(job_id);
+    read_raw(
+        storage,
+        aruna_core::keyspaces::LOCAL_CRATE_KEYSPACE,
+        key,
+        None,
+    )
+    .await?
+    .map(|value| aruna_core::structs::execution::job::LocalCrate::from_bytes(value.as_ref()))
+    .transpose()
+    .map_err(|error| error.to_string())
 }
 
 /// Read the run link of a physical job id, if recorded.

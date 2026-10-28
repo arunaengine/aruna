@@ -29,6 +29,7 @@ pub mod multipart;
 pub mod node_info;
 pub mod origin;
 pub mod read_grant;
+pub mod release;
 pub mod replication;
 pub mod routing;
 pub mod storage_purge;

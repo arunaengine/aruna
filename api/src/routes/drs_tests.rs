@@ -809,7 +809,7 @@ mod global {
             text: "bytes".to_string(),
             content_type: None,
         };
-        let output = store_text(&node.state, &node.owner, &info, input)
+        let output = store_text(&node.state, &node.owner, &info, input, Default::default())
             .await
             .unwrap();
         let version_id = output.version_id.parse().unwrap();

@@ -6,6 +6,7 @@
 pub mod abe;
 pub mod blobs;
 pub mod bucket;
+pub mod bucket_metadata;
 pub mod checks;
 pub mod compression;
 pub mod connectors;
@@ -21,6 +22,7 @@ pub mod organize;
 pub mod origin;
 pub mod provenance;
 pub mod relay;
+pub mod releases;
 pub mod rename;
 pub mod routing;
 pub mod set_changes;

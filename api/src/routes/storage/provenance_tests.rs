@@ -86,7 +86,7 @@ async fn exports_local_version() {
         text: "x".to_string(),
         content_type: None,
     };
-    let stored = store_text(&node.state, &node.owner, &info, input)
+    let stored = store_text(&node.state, &node.owner, &info, input, Default::default())
         .await
         .unwrap();
     let version = Ulid::from_string(&stored.version_id).unwrap();
@@ -160,7 +160,7 @@ async fn revoked_token_stops() {
         text: "x".to_string(),
         content_type: None,
     };
-    let stored = store_text(&node.state, &node.owner, &info, input)
+    let stored = store_text(&node.state, &node.owner, &info, input, Default::default())
         .await
         .unwrap();
     let version = Ulid::from_string(&stored.version_id).unwrap();
@@ -314,4 +314,101 @@ fn stopped_root_removed() {
         .join(format!("{}.json", scratch_name()));
     assert!(spool_root(built, path.clone(), &|| true).is_err());
     assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn nests_release_crates() {
+    use crate::routes::storage::releases::{PublishReleaseRequest, publish_release};
+    let node = node_state().await;
+    let info = bucket_info(&node.state, BUCKET).await.unwrap();
+    let input = WriteObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "db/a.fasta".to_string(),
+        text: ">a".to_string(),
+        content_type: None,
+    };
+    let stored = store_text(&node.state, &node.owner, &info, input, Default::default())
+        .await
+        .unwrap();
+    let request = PublishReleaseRequest {
+        key: "db/release.json".to_string(),
+        label: "6.0".to_string(),
+        prefix: "db/".to_string(),
+        upstream: Vec::new(),
+        preparation: Vec::new(),
+    };
+    let Json(_) = publish_release(
+        State(node.state.clone()),
+        Extension(Some(node.owner.clone())),
+        Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+        HeaderMap::new(),
+        Path(BUCKET.to_string()),
+        Json(request),
+    )
+    .await
+    .unwrap();
+    let version = Ulid::from_string(&stored.version_id).unwrap();
+    let start = arn(&node, node_id(LOCAL), "db/a.fasta", version);
+
+    let caller = caller(&node, recheck(&node.owner, usize::MAX));
+    let response = start_export(caller, Start::Version(start.clone())).unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let nested: Vec<String> = (archive.file_names())
+        .map(|name| name.unwrap().to_string())
+        .filter(|name| name.starts_with("releases/"))
+        .collect();
+    assert_eq!(nested.len(), 1, "the release crate is nested");
+    let mut text = String::new();
+    let mut file = archive.by_name(&nested[0]).unwrap();
+    file.read_to_string(&mut text).unwrap();
+    assert!(
+        text.contains(&stored.version_id),
+        "it pins the file's version"
+    );
+    drop(file);
+    let root = exported(&node, &node.owner, &start).await;
+    let folder = nested[0].trim_end_matches("ro-crate-metadata.json");
+    let release = (root["@graph"].as_array().unwrap().iter())
+        .find(|entity| entity["version"] == "6.0")
+        .expect("the release is in the crate");
+    assert_eq!(release["subjectOf"][0]["@id"], folder);
+    assert_eq!(
+        entity(&root, "./").unwrap()["creativeWorkStatus"],
+        "Complete"
+    );
+}
+
+#[test]
+fn holder_replies_classified() {
+    // A holder's crate reply: bytes are read, a gone version or a refusal hides the release,
+    // and anything else is a holder that did not answer.
+    let chunk = CrateChunk {
+        bytes: b"{}".to_vec(),
+        size: 2,
+    };
+    let answer = Ok(HolderAnswer::Crate(Some(chunk.clone())));
+    assert_eq!(holder_chunk(answer).unwrap(), chunk);
+    let hidden = [
+        Ok(HolderAnswer::Crate(None)),
+        Err(MetadataReadError::NotFound),
+        Err(MetadataReadError::Forbidden),
+        Err(MetadataReadError::Unauthorized),
+    ];
+    for answer in hidden {
+        let read = classify(holder_chunk(answer).map(|_| serde_json::Value::Null));
+        assert!(matches!(read, Read::Hidden));
+    }
+    let members = HolderAnswer::Members(aruna_core::structs::storage::release::RangeMembers {
+        answers: Vec::new(),
+        releases: Vec::new(),
+        complete: true,
+        refused: Vec::new(),
+    });
+    for answer in [Err(MetadataReadError::Unavailable), Ok(members)] {
+        let read = classify(holder_chunk(answer).map(|_| serde_json::Value::Null));
+        assert!(matches!(read, Read::Silent));
+    }
 }

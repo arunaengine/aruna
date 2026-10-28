@@ -22,12 +22,18 @@ const CRATE_SPEC: &str = "https://w3id.org/ro/crate/1.2";
 /// Marks a folder as a nested crate (RO-Crate 1.2).
 const NESTED_CRATE: &str = "https://w3id.org/ro/crate";
 
+/// Marks an entity whose release membership could not be checked everywhere.
+pub const RELEASE_MEMBERSHIP: &str = "https://w3id.org/aruna/terms/release-membership";
+pub const RELEASE_INCOMPLETE: &str = "Release membership could not be checked everywhere";
+
 /// What a hop reads next.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Target {
     /// An exact version id: a global id URL or a versioned object w3id.
     Version(String),
     Run(String),
+    /// A release crate's exact version, read as a nested crate.
+    Release(String),
 }
 
 /// One link to follow: the entity that refers to it, by which property, and the digest it
@@ -162,21 +168,112 @@ impl ProvenanceCrate {
         if let Some(from) = origin["hop"]["from"].as_str() {
             next.push(based_on(from));
         }
+        self.database(&id, &origin["bucket_metadata"]);
+        next.extend(self.releases(&id, origin));
         next
     }
 
-    /// The external source and the database that list the version now.
+    /// The releases that pin the version, and whether that could be checked everywhere; returns
+    /// the release crates to read.
+    fn releases(&mut self, id: &str, origin: &Value) -> Vec<Hop> {
+        let mut crates = Vec::new();
+        for release in origin["releases"].as_array().into_iter().flatten() {
+            let Some(key) = release["crate_version"].as_str() else {
+                continue;
+            };
+            let mut entity = entity(key, "Dataset");
+            entity.insert(
+                "name".into(),
+                json!(format!("Release {}", text(&release["label"]))),
+            );
+            entity.insert("version".into(), release["label"].clone());
+            let links: Vec<Value> = (release["upstream"].as_array().into_iter().flatten())
+                .filter_map(|identifier| identifier["url"].as_str())
+                .map(|url| json!({ "@id": url }))
+                .collect();
+            if !links.is_empty() {
+                entity.insert("isBasedOn".into(), Value::Array(links));
+            }
+            self.put_new(key, &entity);
+            self.add_ref(id, "isPartOf", key);
+            crates.push(Hop {
+                target: Target::Release(key.to_string()),
+                from: key.to_string(),
+                property: "subjectOf",
+                digest: None,
+            });
+        }
+        if origin["releases_complete"] == json!(false) {
+            let key = format!("{id}#release-membership");
+            let mut property = entity(&key, "PropertyValue");
+            property.insert("propertyID".into(), json!(RELEASE_MEMBERSHIP));
+            property.insert("value".into(), json!("incomplete"));
+            property.insert("description".into(), json!(RELEASE_INCOMPLETE));
+            self.put(&key, &property);
+            self.add_ref(id, "additionalProperty", &key);
+        }
+        crates
+    }
+
+    /// Records a release crate, written as a nested crate when the caller may read it.
+    pub fn release(&mut self, hop: &Hop, release_crate: Option<&Value>) -> Option<CrateFile> {
+        let Target::Release(version) = &hop.target else {
+            return None;
+        };
+        let digest = blake3::hash(version.as_bytes()).to_hex();
+        let folder = format!("releases/{}/", &digest[..16]);
+        self.set_label(&asked(&hop.target), &folder);
+        let Some(release_crate) = release_crate else {
+            self.add_text(
+                version,
+                "description",
+                "The release crate is not visible to you",
+            );
+            return None;
+        };
+        let mut nested = entity(&folder, "Dataset");
+        nested.insert("name".into(), json!(format!("Release crate {version}")));
+        nested.insert("conformsTo".into(), json!({ "@id": NESTED_CRATE }));
+        self.put(&folder, &nested);
+        self.add_part(&folder);
+        self.link(hop, &folder);
+        let bytes = serde_json::to_vec_pretty(release_crate).unwrap_or_default();
+        let path = format!("{folder}ro-crate-metadata.json");
+        Some(CrateFile { path, bytes })
+    }
+
+    /// The bucket's database metadata now, as a Dataset the version is part of.
+    fn database(&mut self, id: &str, metadata: &Value) {
+        if metadata["database"] != json!(true) {
+            return;
+        }
+        let digest = blake3::hash(metadata.to_string().as_bytes()).to_hex();
+        let key = format!("#database-{}", &digest[..16]);
+        let mut database = entity(&key, "Dataset");
+        let title = metadata["title"]
+            .as_str()
+            .unwrap_or("Bucket with database metadata");
+        database.insert("name".into(), json!(format!("{title} (current metadata)")));
+        for property in ["version", "license", "description"] {
+            if let Some(value) = metadata[property].as_str() {
+                database.insert(property.into(), json!(value));
+            }
+        }
+        let links: Vec<Value> = (metadata["identifiers"].as_array().into_iter().flatten())
+            .filter_map(|identifier| identifier["url"].as_str())
+            .map(|url| json!(url))
+            .collect();
+        if !links.is_empty() {
+            database.insert("identifier".into(), Value::Array(links));
+        }
+        self.put(&key, &database);
+        self.add_ref(id, "isPartOf", &key);
+    }
+
+    /// The external source the version was registered from.
     fn source(&mut self, id: &str, origin: &Value) {
         if let Some(url) = origin["source"]["url"].as_str() {
             self.add_ref(id, "isBasedOn", url);
-        }
-        if let Some(entry) = origin["database_entry"].as_str() {
-            let key = format!("#database-{entry}");
-            let mut database = entity(&key, "Dataset");
-            database.insert("name".into(), json!("Database (current listing)"));
-            database.insert("identifier".into(), json!(entry));
-            self.put(&key, &database);
-            self.add_ref(id, "isPartOf", &key);
         }
     }
 
@@ -221,6 +318,29 @@ impl ProvenanceCrate {
         let bytes = serde_json::to_vec_pretty(run_crate).unwrap_or_default();
         let path = format!("{folder}ro-crate-metadata.json");
         (hops, Some(CrateFile { path, bytes }))
+    }
+
+    /// Records a run whose crate was not written, with the state its node reported. `false`
+    /// when the state names no such outcome.
+    pub fn unwritten(&mut self, hop: &Hop, status: &str, message: Option<&str>) -> bool {
+        let state = match status {
+            "denied" => "RunRecordDenied",
+            "failed" => "RunRecordFailed",
+            "local" => "RunRecordLocal",
+            _ => return false,
+        };
+        self.run(hop, None);
+        let Target::Run(run_id) = &hop.target else {
+            return false;
+        };
+        let key = format!("#run-{run_id}");
+        self.add_text(&key, "creativeWorkStatus", state);
+        let text = match status {
+            "local" => "The run record is kept on the device that ran it",
+            _ => message.unwrap_or("The run record was not written"),
+        };
+        self.add_text(&key, "description", text);
+        true
     }
 
     /// Records a dataset start: the dataset as a nested crate and its parts with exact ids.
@@ -373,7 +493,7 @@ impl ProvenanceCrate {
         // A run names the file it made from its own side.
         match hop.target {
             Target::Run(_) => self.add_ref(to, "result", &hop.from),
-            Target::Version(_) => self.add_ref(&hop.from, hop.property, to),
+            Target::Version(_) | Target::Release(_) => self.add_ref(&hop.from, hop.property, to),
         }
     }
 
@@ -452,6 +572,7 @@ fn asked(target: &Target) -> String {
     match target {
         Target::Version(id) => id.clone(),
         Target::Run(run_id) => format!("run:{run_id}"),
+        Target::Release(id) => format!("release:{id}"),
     }
 }
 

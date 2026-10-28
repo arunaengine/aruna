@@ -359,6 +359,8 @@ pub(crate) fn settings_of(request: &SettingsRequest) -> DistributionSettings {
         public: request.public,
         split_objects: request.split_objects,
         split_bytes: request.split_bytes,
+        // Set through the bucket metadata route; a settings change keeps the stored value.
+        metadata: None,
     }
 }
 

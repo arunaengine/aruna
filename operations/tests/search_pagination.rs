@@ -158,6 +158,7 @@ async fn distributed_search_routes() -> TestResult<()> {
             group_id: None,
             cursor: None,
             target_nodes: Some(vec![origin.node_id()]),
+            database: false,
         },
     )
     .await?;

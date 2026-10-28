@@ -1327,7 +1327,7 @@ mod distributed {
                 text: "x".to_string(),
                 content_type: None,
             };
-            store_text(&node.state, &node.owner, &info, input)
+            store_text(&node.state, &node.owner, &info, input, Default::default())
                 .await
                 .unwrap();
         }
@@ -1380,7 +1380,7 @@ mod distributed {
                 text: "x".to_string(),
                 content_type: None,
             };
-            store_text(&node.state, &node.owner, &info, input)
+            store_text(&node.state, &node.owner, &info, input, Default::default())
                 .await
                 .unwrap();
         }

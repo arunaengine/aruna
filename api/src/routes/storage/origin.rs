@@ -37,14 +37,19 @@ use utoipa_axum::routes;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::database_types::IdentifierView;
+use crate::routes::identifiers::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
+use crate::routes::storage::bucket_metadata::{BucketIdentifierBody, BucketMetadataBody};
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
 use crate::routes::storage::relay::{
     self, RestForward, node_directed, node_read, relay_get, relayed_set, stale_miss,
 };
 use crate::server::state::ServerState;
+use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
+use aruna_operations::s3::bucket::release::{
+    BucketScope, MembershipCaller, MembershipQuery, release_members,
+};
 
 /// How long an origin read directed at another node may take, body included.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -77,8 +82,8 @@ pub enum OriginBody {
         node_id: String,
         device: Option<String>,
     },
-    /// From an external source or a database; details are under `source`.
-    Source { database_entry: Option<String> },
+    /// From an external source; details are under `source`.
+    Source,
     /// Copied from another exact version (global id or versioned node ARN as w3id).
     Copy { from: String },
     /// Registered in place from a storage backend folder.
@@ -144,9 +149,9 @@ pub struct OriginResponse {
     pub source: Option<SourceBody>,
     /// The publication-safe projection: uploads and imports in place give none.
     pub projection: Vec<ProjectionBody>,
-    /// The database entry that lists the bucket now; it may change after the version was made.
-    pub database_entry: Option<String>,
-    /// Links the current database entry's parser finds in the key and source URL.
+    /// The bucket's metadata now; it may have changed since the version was made.
+    pub bucket_metadata: Option<BucketMetadataBody>,
+    /// Links the bucket metadata's identifier rules find in the key and source URL.
     #[serde(default)]
     pub identifiers: Vec<IdentifierView>,
     /// The content id of the bytes, from their BLAKE3; absent for versions not stored here
@@ -155,6 +160,40 @@ pub struct OriginResponse {
     /// Ranges a copy answered for because their coordinator could not; it may be behind.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_ranges: Vec<String>,
+    /// Releases of the bucket that pin exactly this version and the caller may read.
+    #[serde(default)]
+    pub releases: Vec<ReleaseView>,
+    /// `false` when release membership could not be checked everywhere, so one may be missing.
+    #[serde(default = "complete_default")]
+    pub releases_complete: bool,
+}
+
+fn complete_default() -> bool {
+    true
+}
+
+/// A release that pins a version: its release crate's exact version, label and upstream ids.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReleaseView {
+    pub crate_version: String,
+    pub label: String,
+    pub upstream: Vec<BucketIdentifierBody>,
+}
+
+impl From<ReleaseRef> for ReleaseView {
+    fn from(release: ReleaseRef) -> Self {
+        Self {
+            crate_version: release.crate_version.to_id(),
+            label: release.label,
+            upstream: (release.upstream.into_iter())
+                .map(|identifier| BucketIdentifierBody {
+                    name: identifier.name,
+                    value: identifier.value,
+                    url: identifier.url,
+                })
+                .collect(),
+        }
+    }
 }
 
 fn version_id(version: &OriginVersion) -> String {
@@ -173,9 +212,7 @@ impl From<OriginView> for OriginResponse {
                     node_id: node_id.to_string(),
                     device,
                 },
-                VersionOrigin::Source { database } => OriginBody::Source {
-                    database_entry: database.map(|entry| entry.to_string()),
-                },
+                VersionOrigin::Source => OriginBody::Source,
                 VersionOrigin::Copy { from } => OriginBody::Copy {
                     from: version_id(&from),
                 },
@@ -233,10 +270,12 @@ impl From<OriginView> for OriginResponse {
                     }
                 })
                 .collect(),
-            database_entry: view.database_entry.map(|entry| entry.to_string()),
+            bucket_metadata: view.bucket_metadata.map(Into::into),
             identifiers: view.identifiers.into_iter().map(Into::into).collect(),
             content_id: view.content_hash.map(content_id),
             stale_ranges: Vec::new(),
+            releases: Vec::new(),
+            releases_complete: true,
         }
     }
 }
@@ -259,8 +298,12 @@ impl From<OriginView> for OriginResponse {
   the synced source version when it is a version of a distributed bucket (a node ARN names
   its bucket and key, so it is left out); `CreateAction` for job results; nothing for
   uploads and imports in place; `identifier` for each link the database's parser finds.
-- `database_entry` and `identifiers` come from the database entry that lists the bucket now,
-  not from when the version was made; a removed entry gives none.
+- `bucket_metadata` and `identifiers` come from the bucket's metadata now, not from when the
+  version was made; a bucket without metadata gives none.
+- `releases` lists the bucket's releases whose release crate names exactly this version, among
+  those the caller may read. `releases_complete` is `false` when membership could not be
+  checked everywhere (a range holder of a distributed bucket did not answer), so a release may
+  be missing.
 - Without `version_id` the range's coordinator answers. While it cannot, a ready copy answers
   and `stale_ranges` names the range, since the copy may be behind; a 404 from a copy has the
   code `stale_not_found` and says the version may exist.
@@ -282,7 +325,7 @@ impl From<OriginView> for OriginResponse {
             "hop": null,
             "source": null,
             "projection": [{"property": "isBasedOn", "id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"}],
-            "database_entry": null,
+            "bucket_metadata": null,
             "identifiers": [],
             "content_id": "https://w3id.org/aruna/data/af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         })),
@@ -425,8 +468,32 @@ async fn origin_answer(
         (OriginError::BucketMissing | OriginError::VersionMissing, _) => ServerError::NotFound,
         (OriginError::Storage(reason), _) => ServerError::InternalError(reason),
     })?;
+    let version_id = view.version_id;
     let mut answer = OriginResponse::from(view);
     answer.stale_ranges = stale.iter().map(ToString::to_string).collect();
+    // Only releases the caller may read count; any other node is asked with its own bearer.
+    let scope = BucketScope {
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        bucket: &bucket,
+        info: &info,
+    };
+    let caller = MembershipCaller {
+        auth,
+        bearer: bearer.as_ref().map(ValidatedBearer::as_str),
+    };
+    let query = [MembershipQuery {
+        key: params.key.clone(),
+        version_id,
+    }];
+    match release_members(state.get_ctx().as_ref(), scope, caller, &query).await {
+        Ok(mut found) => {
+            let members = found.answers.remove(0);
+            answer.releases = members.releases.into_iter().map(Into::into).collect();
+            answer.releases_complete = members.complete;
+        }
+        Err(_) => answer.releases_complete = false,
+    }
     Ok(Json(answer))
 }
 
@@ -493,7 +560,7 @@ pub struct VersionOriginParams {
             "hop": null,
             "source": null,
             "projection": [{"property": "CreateAction", "run_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2"}],
-            "database_entry": null,
+            "bucket_metadata": null,
             "identifiers": [],
             "content_id": null
         })),

@@ -241,7 +241,14 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::StatementSign(_) => NetEvent::StatementSign(StatementSignEvent::Unavailable(
             "statement signing must be dispatched by the operations runner".to_string(),
         )),
+        NetEffect::Release(_) => NetEvent::Release(release_unavailable()),
     }
+}
+
+/// Release reads and holder requests run in the operations runner, never here.
+fn release_unavailable() -> aruna_core::structs::storage::release::ReleaseEvent {
+    let reason = "release reads must be dispatched by the operations runner".to_string();
+    aruna_core::structs::storage::release::ReleaseEvent::Holder(Err(reason))
 }
 
 fn audit_fallback(nodes: Vec<NodeId>, limit: usize) -> AuditPageBatch {
@@ -516,6 +523,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::VaultSign(_) => "vault_sign",
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",
+        NetEffect::Release(_) => "release",
     }
 }
 

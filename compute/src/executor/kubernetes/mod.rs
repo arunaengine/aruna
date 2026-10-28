@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, NOBODY, OutputMatcher,
-    ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, TombstoneEvidence,
-    TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
+    ExecutorKind, FenceContext, GrantedResources, LogLimits, LogTails, MAX_OUTPUT_MATCHES, NOBODY,
+    OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec,
+    TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -997,6 +997,10 @@ impl ExecutorBackend for KubernetesBackend {
         }
     }
 
+    fn granted(&self, spec: &TaskSpec) -> Result<GrantedResources, BackendError> {
+        manifest::granted_resources(spec, &self.config)
+    }
+
     /// The pod securityContext switches users at launch, so the identity is pinned.
     fn run_identity(&self) -> UserSpec {
         NOBODY
@@ -1099,7 +1103,8 @@ impl ExecutorBackend for KubernetesBackend {
         }
         match spec.staging_mode {
             StagingMode::Files => {
-                self.ensure_pvc(context, workspace_bytes(spec)).await?;
+                self.ensure_pvc(context, manifest::workspace_bytes(spec))
+                    .await?;
                 self.stage(context, spec, cancel).await?;
             }
             StagingMode::DirectS3 => self.ensure_secret(context, spec).await?,
@@ -1112,7 +1117,8 @@ impl ExecutorBackend for KubernetesBackend {
                     }
                 }
                 if needs_workspace(spec) {
-                    self.ensure_pvc(context, workspace_bytes(spec)).await?;
+                    self.ensure_pvc(context, manifest::workspace_bytes(spec))
+                        .await?;
                     self.stage(context, spec, cancel).await?;
                 }
             }
@@ -1816,17 +1822,6 @@ where
         Err(error) if api_code(&error) == Some(404) => Ok(()),
         Err(error) => Err(kube_error(error)),
     }
-}
-
-/// The workspace volume of a run: its disk request, else its staged inputs plus room to work.
-fn workspace_bytes(spec: &TaskSpec) -> u64 {
-    spec.resources.disk_bytes.unwrap_or_else(|| {
-        spec.inputs
-            .iter()
-            .fold(DEFAULT_WORKSPACE_BYTES, |total, input| {
-                total.saturating_add(input.size())
-            })
-    })
 }
 
 fn build_archive(

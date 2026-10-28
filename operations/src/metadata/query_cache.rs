@@ -330,6 +330,7 @@ pub(super) fn cached_stats(cached: &CachedQuery) -> MetadataFanoutStats {
         nodes_failed: 0,
         failed_partitions: Vec::new(),
         discovery_failed: false,
+        omitted: Vec::new(),
     }
 }
 
@@ -392,6 +393,7 @@ mod pure_tests {
             nodes_failed: 0,
             failed_partitions: Vec::new(),
             discovery_failed: false,
+            omitted: Vec::new(),
         }
     }
 

@@ -23,7 +23,6 @@ use super::links::apply_link_event;
 use super::materialize::reduced_admin_target;
 use super::metadata::{MetadataOutcome, apply_metadata_event, apply_policy_event};
 use super::parked::Handled;
-use super::parked_parsers::{ParkedParser, park_parser, parked_parsers, unpark_parser};
 use super::satisfied_dependencies;
 use super::shared::{SharedOutcome, apply_shared_event, apply_watch_event};
 use super::validate::{AdminEventValidation, ConfigValidationCache, validate_admin_event};
@@ -49,8 +48,6 @@ struct DeferredAdmin {
     signature: iroh::Signature,
     dependency: Option<DocumentSyncDependency>,
     reason: String,
-    /// The parked row it came from, dropped once the event applies or is refused.
-    parked: Option<byteview::ByteView>,
 }
 
 pub(super) struct BatchState {
@@ -329,7 +326,6 @@ pub(super) async fn apply_admin_event(
                 signature: origin_signature,
                 dependency,
                 reason,
-                parked: None,
             });
             return Ok(());
         }
@@ -365,22 +361,6 @@ pub(super) async fn retry_admin(
     state: &mut BatchState,
 ) -> Result<()> {
     let mut pending = std::mem::take(&mut state.deferred_admin);
-    // Parser events parked by earlier batches of this topic are tried again with this one.
-    for (key, parked) in parked_parsers(&service.storage, &topic_id).await? {
-        pending.push(DeferredAdmin {
-            target: parked.target,
-            event: parked.event,
-            placement: parked.placement,
-            identity: parked.identity,
-            signature: parked.signature,
-            dependency: None,
-            reason: String::new(),
-            parked: Some(key),
-        });
-    }
-    if pending.is_empty() {
-        return Ok(());
-    }
     loop {
         let mut progressed = false;
         let mut retry = Vec::new();
@@ -406,18 +386,12 @@ pub(super) async fn retry_admin(
                         deferred.event,
                     )
                     .await?;
-                    if let Some(key) = deferred.parked.clone() {
-                        unpark_parser(&service.storage, key).await?;
-                    }
                     state.validation_cache.invalidate();
                     state.outcome.satisfied.extend(dependencies);
                     state.add_target(deferred.target);
                     progressed = true;
                 }
                 AdminEventValidation::Rejected(reason) => {
-                    if let Some(key) = deferred.parked.clone() {
-                        unpark_parser(&service.storage, key).await?;
-                    }
                     warn!(
                         %topic_id,
                         event_id = %deferred.event.event_id,
@@ -445,7 +419,7 @@ pub(super) async fn retry_admin(
             }
         }
         if !progressed {
-            reject_unresolved(service, topic_id, retry, state).await?;
+            reject_unresolved(topic_id, retry, state);
             break;
         }
         pending = retry;
@@ -456,37 +430,12 @@ pub(super) async fn retry_admin(
     Ok(())
 }
 
-async fn reject_unresolved(
-    service: &DocumentSyncService,
+fn reject_unresolved(
     topic_id: ::irokle::TopicId,
     retry: Vec<DeferredAdmin>,
     state: &mut BatchState,
-) -> Result<()> {
+) {
     for deferred in retry {
-        // A parser event whose entry is not here yet waits apart, so replay moves past it.
-        let parser = matches!(
-            deferred.event.op,
-            aruna_core::admin_documents::AdminDocumentOperation::DatabaseParserSet { .. }
-        );
-        if deferred.parked.is_some() {
-            continue;
-        }
-        if parser
-            && matches!(
-                deferred.dependency,
-                Some(DocumentSyncDependency::RealmConfig(_))
-            )
-        {
-            let parked = ParkedParser {
-                target: deferred.target,
-                event: deferred.event,
-                placement: deferred.placement,
-                identity: deferred.identity,
-                signature: deferred.signature,
-            };
-            park_parser(&service.storage, &parked).await?;
-            continue;
-        }
         if let Some(dependency) = deferred.dependency {
             state.add_dependency(dependency);
         } else {
@@ -508,5 +457,4 @@ async fn reject_unresolved(
             ));
         }
     }
-    Ok(())
 }

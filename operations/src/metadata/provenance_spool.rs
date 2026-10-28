@@ -15,7 +15,14 @@ use ulid::Ulid;
 use super::{Hop, Target};
 
 /// Properties a link may name; a stored link is read back to one of these.
-const PROPERTIES: [&str; 5] = ["mainEntity", "isBasedOn", "result", "object", "hasPart"];
+const PROPERTIES: [&str; 6] = [
+    "mainEntity",
+    "isBasedOn",
+    "result",
+    "object",
+    "hasPart",
+    "subjectOf",
+];
 
 pub(super) struct Spool {
     // Keeps the database open; it removes its folder when dropped.
@@ -86,6 +93,7 @@ impl Spool {
         let (kind, id) = match &hop.target {
             Target::Version(id) => ("version", id),
             Target::Run(id) => ("run", id),
+            Target::Release(id) => ("release", id),
         };
         let record = json!({
             "kind": kind, "id": id, "from": hop.from, "property": hop.property, "digest": hop.digest,
@@ -106,6 +114,7 @@ impl Spool {
         let id = record["id"].as_str().unwrap_or_default().to_string();
         let target = match record["kind"].as_str() {
             Some("run") => Target::Run(id),
+            Some("release") => Target::Release(id),
             _ => Target::Version(id),
         };
         let named = record["property"].as_str().unwrap_or_default();
