@@ -632,7 +632,23 @@ pub(crate) async fn spawn_compute_seed(compute: Arc<ExecutorRegistry>) -> TestRe
 /// A full seed in `root` with fixed keys; `reopen` starts it again on the state a process left.
 #[allow(dead_code)]
 pub(crate) async fn spawn_fixed_seed(root: &Path, reopen: bool) -> TestResult<SeedNode> {
-    spawn_seed_at(NodeServiceMode::Full, None, Some((root, reopen))).await
+    spawn_seed_at(NodeServiceMode::Full, None, Some((root, reopen)), None).await
+}
+
+/// Its node id starts with three zero bytes, so a random joiner sorts above it.
+const LOW_SEED_KEY: [u8; 32] = {
+    let mut key = [0; 32];
+    key[0] = 165;
+    key[24] = 183;
+    key[25] = 8;
+    key[26] = 13;
+    key
+};
+
+/// A full seed whose node id sorts below a joiner's, so it keeps the database requests.
+#[allow(dead_code)]
+pub(crate) async fn spawn_low_seed() -> TestResult<SeedNode> {
+    spawn_seed_at(NodeServiceMode::Full, None, None, Some(LOW_SEED_KEY)).await
 }
 
 pub(crate) async fn create_onboarding_secret(
@@ -691,13 +707,14 @@ async fn spawn_seed_mode(
     mode: NodeServiceMode,
     compute: Option<Arc<ExecutorRegistry>>,
 ) -> TestResult<SeedNode> {
-    spawn_seed_at(mode, compute, None).await
+    spawn_seed_at(mode, compute, None, None).await
 }
 
 async fn spawn_seed_at(
     mode: NodeServiceMode,
     compute: Option<Arc<ExecutorRegistry>>,
     fixed: Option<(&Path, bool)>,
+    net_key: Option<[u8; 32]>,
 ) -> TestResult<SeedNode> {
     let temp_dir = fixed.is_none().then(tempfile::tempdir).transpose()?;
     let root = match (fixed, temp_dir.as_ref()) {
@@ -721,7 +738,9 @@ async fn spawn_seed_at(
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-            secret_key: fixed.map(|_| iroh::SecretKey::from_bytes(&[13; 32])),
+            secret_key: net_key
+                .or(fixed.map(|_| [13; 32]))
+                .map(|key| iroh::SecretKey::from_bytes(&key)),
             realm_id,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,

@@ -11,15 +11,19 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::StatusCode;
 use shared::{
     TestResult, create_bearer_token, create_onboarding_secret, spawn_complete_joiner,
-    spawn_complete_seed,
+    spawn_low_seed,
 };
 
 #[tokio::test(flavor = "multi_thread")]
 async fn promoted_node_signs() -> TestResult<()> {
-    let seed = spawn_complete_seed().await?;
+    let seed = spawn_low_seed().await?;
     let secret = create_onboarding_secret(&seed, OnboardingMode::Server).await?;
     let joiner = spawn_complete_joiner(&seed, secret).await?;
     let joiner_id = joiner.config.node_id;
+    assert!(
+        joiner_id > seed.net.node_id(),
+        "the seed keeps the database requests"
+    );
     let NodeCapabilities::Management {
         realm_verifying_key,
         ..

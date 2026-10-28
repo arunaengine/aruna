@@ -58,6 +58,9 @@ other node relays the call to one.
   Calling it again for an already promoted node is accepted.
 - If the node's answer is lost, the call fails with `realm_key_uncertain`: the node may already hold
   the key, which cannot be taken back. Repeat the call to finish the promotion.
+- The management node with the lowest node id keeps the realm's database requests. A node whose
+  id is lower than that owner's is refused before any key is sent, because its promotion would
+  strand those requests on the former owner.
 - A management node cannot be demoted here: a copied key cannot be taken back."#,
     params(("node_id" = String, Path, description = "Node id of the server node, as the realm configuration lists it")),
     responses(
@@ -66,7 +69,7 @@ other node relays the call to one.
         (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "The caller lacks WRITE on the realm's onboarding administration path", body = crate::error::ErrorResponse),
         (status = 404, description = "No realm node carries this node id", body = crate::error::ErrorResponse),
-        (status = 409, description = "The node is a device or the serving node itself, a group deletion is pending, or another update of the realm configuration won the race; retry", body = crate::error::ErrorResponse),
+        (status = 409, description = "The node is a device or the serving node itself, its id is lower than that of the management node keeping the database requests, a group deletion is pending, or another update of the realm configuration won the race; retry", body = crate::error::ErrorResponse),
         (status = 502, description = "The node's answer to the key hand-off was lost, so it may already hold the realm key while the realm configuration is unchanged; repeat the call (code `realm_key_uncertain`). Or a relayed call failed after the management node may already have applied it (code `relay_failed`)", body = crate::error::ErrorResponse),
         (status = 503, description = "The node could not be reached or refused the key, or no management node was reachable to serve the relayed call; retry", body = crate::error::ErrorResponse)
     ),
@@ -113,6 +116,7 @@ fn map_promote_error(error: PromoteNodeError) -> ServerError {
         PromoteNodeError::NotServer => {
             ServerError::Conflict("only another server node can be promoted".to_string())
         }
+        error @ PromoteNodeError::OwnerChange => ServerError::Conflict(error.to_string()),
         PromoteNodeError::Unreachable(_) | PromoteNodeError::Refused(_) => {
             ServerError::ServiceUnavailableReason(
                 "the node did not take the realm key; the realm is unchanged, retry".to_string(),

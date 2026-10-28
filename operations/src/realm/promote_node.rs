@@ -46,6 +46,11 @@ pub enum PromoteNodeError {
     NodeNotFound { node_id: NodeId },
     #[error("only another server node can be promoted")]
     NotServer,
+    #[error(
+        "the node would take over the database requests the current owner keeps, \
+         and moving them is not supported yet"
+    )]
+    OwnerChange,
     #[error("the node could not be reached: {0}")]
     Unreachable(String),
     #[error("the answer of the node was lost; it may hold the realm key: {0}")]
@@ -167,8 +172,23 @@ fn check_target(
         None => Err(PromoteNodeError::NodeNotFound { node_id: target }),
         Some(RealmNodeKind::User { .. }) => Err(PromoteNodeError::NotServer),
         Some(_) if target == actor => Err(PromoteNodeError::NotServer),
+        Some(RealmNodeKind::Server)
+            if request_owner(document).is_some_and(|owner| target < owner) =>
+        {
+            Err(PromoteNodeError::OwnerChange)
+        }
         Some(RealmNodeKind::Server | RealmNodeKind::Management) => Ok(()),
     }
+}
+
+/// The lowest management node id keeps every database request (see the management relay).
+fn request_owner(document: &RealmConfigDocument) -> Option<NodeId> {
+    document
+        .nodes
+        .iter()
+        .filter(|node| node.kind == RealmNodeKind::Management)
+        .filter_map(|node| node.node_id.parse::<NodeId>().ok())
+        .min()
 }
 
 /// Stores a handed realm key for the next start of this node.
@@ -258,8 +278,13 @@ mod tests {
     use aruna_core::keys::generate_signing_key;
     use aruna_core::metadata::MetadataError;
 
-    fn node(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    /// Node ids in ascending order of `rank`, so a test knows which one owns database requests.
+    fn node(rank: u8) -> NodeId {
+        let mut nodes: Vec<NodeId> = (1..=10)
+            .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        nodes.sort();
+        nodes[usize::from(rank)]
     }
 
     fn realm() -> (SigningKey, RealmId, RealmConfigDocument) {
@@ -297,6 +322,21 @@ mod tests {
             check_target(&document, node(2), node(1)),
             Err(PromoteNodeError::NotManagementNode)
         ));
+    }
+
+    #[test]
+    fn owner_change_refused() {
+        let (_, _, mut document) = realm();
+        document.ensure_node(node(0), RealmNodeKind::Server);
+        assert!(matches!(
+            check_target(&document, node(1), node(0)),
+            Err(PromoteNodeError::OwnerChange)
+        ));
+        document.ensure_node(node(0), RealmNodeKind::Management);
+        assert!(
+            check_target(&document, node(1), node(0)).is_ok(),
+            "a node that already owns the requests is accepted again"
+        );
     }
 
     #[test]
