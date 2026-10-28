@@ -171,3 +171,22 @@ async fn silent_crate_incomplete() {
     ));
     assert!(matches!(classify(Err(ServerError::NotFound)), Read::Hidden));
 }
+
+#[tokio::test]
+async fn stalled_client_ends_write() {
+    // A client that stops reading cannot hold the export past its deadline.
+    let node = node_state().await;
+    let caller = Caller {
+        state: node.state.clone(),
+        auth: node.owner.clone(),
+        bearer: None,
+        deadline: Instant::now() + std::time::Duration::from_millis(50),
+    };
+    let (writer, _reader) = tokio::io::duplex(16);
+    let mut zip = ZipFileWriter::with_tokio(writer);
+    let file = CrateFile {
+        path: "big.json".to_string(),
+        bytes: vec![b'x'; 64 * 1024],
+    };
+    assert!(!write(&caller, &CancellationToken::new(), &mut zip, file).await);
+}

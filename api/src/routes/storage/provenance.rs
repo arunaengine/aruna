@@ -163,7 +163,7 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
             match bounded(&caller, &gone, crate_document(&caller, document)).await {
                 Some(Read::Answer(dataset)) => {
                     let (hops, file) = built.dataset(&dataset);
-                    if !write(&mut zip, file).await {
+                    if !write(&caller, &gone, &mut zip, file).await {
                         return;
                     }
                     queue.extend(hops);
@@ -196,7 +196,7 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
                 };
                 let (hops, file, go_on) = record_run(&mut built, &hop, read);
                 if let Some(file) = file
-                    && !write(&mut zip, file).await
+                    && !write(&caller, &gone, &mut zip, file).await
                 {
                     return;
                 }
@@ -214,8 +214,8 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
     }
     let root = serde_json::to_vec_pretty(&built.finish()).unwrap_or_default();
     let path = "ro-crate-metadata.json".to_string();
-    if write(&mut zip, CrateFile { path, bytes: root }).await {
-        let _ = zip.close().await;
+    if write(&caller, &gone, &mut zip, CrateFile { path, bytes: root }).await {
+        let _ = bounded(&caller, &gone, zip.close()).await;
     }
 }
 
@@ -315,10 +315,17 @@ async fn crate_document(caller: &Caller, document_id: &str) -> Read {
     }))
 }
 
-/// Writes one file into the ZIP; `false` when the client is gone.
-async fn write(zip: &mut ZipFileWriter<DuplexStream>, file: CrateFile) -> bool {
+/// Writes one file into the ZIP; `false` when the client is gone, stopped reading or the
+/// export reached its time limit.
+async fn write(
+    caller: &Caller,
+    gone: &CancellationToken,
+    zip: &mut ZipFileWriter<DuplexStream>,
+    file: CrateFile,
+) -> bool {
     let entry = ZipEntryBuilder::new(file.path.into(), Compression::Stored);
-    zip.write_entry_whole(entry, &file.bytes).await.is_ok()
+    let written = bounded(caller, gone, zip.write_entry_whole(entry, &file.bytes)).await;
+    matches!(written, Some(Ok(_)))
 }
 
 #[cfg(test)]
