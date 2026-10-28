@@ -50,6 +50,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
 };
+use aruna_core::structs::storage::bucket_metadata::strip_release_keys;
 use aruna_core::structs::storage::distribution::{OriginalEpoch, Publication};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::format::Compression;
@@ -2098,8 +2099,12 @@ impl ReplicateObjectOperation {
             blob,
             source,
             reference,
-            metadata,
+            mut metadata,
         } = self.manifest_version(version, reference_intent)?;
+        // Release tags travel only with a coordinator's publication inside its own set.
+        if (self.sync.as_ref()).is_none_or(|sync| sync.distribution.is_none()) {
+            strip_release_keys(&mut metadata);
+        }
 
         let multipart = self
             .multipart_summary

@@ -6,6 +6,7 @@ use super::*;
 use crate::driver::{DriverContext, drive};
 use aruna_core::keyspaces::COPY_OWNER_KEYSPACE;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+use aruna_core::structs::storage::bucket_metadata::RELEASE_TAG;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
 use aruna_storage::storage::{self, StorageHandle};
@@ -133,7 +134,10 @@ async fn pending_alias_shared() {
         None,
     );
     source.metadata = HashMap::from([("color".to_string(), "blue".to_string())]);
-    seed(&context.storage_handle, source_id, &source).await;
+    let mut tagged = source.clone();
+    // A release tag stays behind: a copy of a release crate is no release.
+    (tagged.metadata).insert(RELEASE_TAG.to_string(), "6.0".to_string());
+    seed(&context.storage_handle, source_id, &tagged).await;
 
     let result = drive(
         SealedCopyOperation::new(input(&location, source_id)),

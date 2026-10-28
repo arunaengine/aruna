@@ -532,7 +532,9 @@ impl SealedCopyOperation {
             }
             _ => return Err(SealedCopyError::SourceChanged),
         };
-        let metadata = self.input.metadata.clone().unwrap_or(source.metadata);
+        let mut metadata = self.input.metadata.clone().unwrap_or(source.metadata);
+        // A copy is never a release, even of a release crate.
+        aruna_core::structs::storage::bucket_metadata::strip_release_keys(&mut metadata);
         let mut version = BlobVersion::deleted(SystemTime::now(), self.input.user_id);
         version.state = state;
         self.version = Some(

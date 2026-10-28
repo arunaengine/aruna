@@ -6,7 +6,7 @@ use crate::abe::copies::copy_row;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, build_transition_effects,
-    write_location_effect, write_version_effect,
+    release_row_effect, write_location_effect, write_version_effect,
 };
 use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
@@ -56,6 +56,7 @@ use aruna_core::structs::storage::blob::{
     BlobVersionState, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
     VersionKey, WriteOwner, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::bucket_metadata::strip_release_keys;
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::distribution::inventory::{VersionEntry, logical_identity};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
@@ -2131,6 +2132,12 @@ impl IncomingVersionOperation {
         if let Some(receipt) = self.pull_receipt() {
             self.pending_version_effects.push_back(receipt);
         }
+        // Only a same-set publication keeps release tags; its row commits with the version.
+        match release_row_effect(&version_key, &version, self.txn_id) {
+            Ok(Some(row)) => self.pending_version_effects.push_back(row),
+            Ok(None) => {}
+            Err(err) => return self.fail(err.into()),
+        }
         // The envelope, its mappings and usage are published with the version they name.
         if let (Some(envelope), Some(received)) = (&self.envelope, &self.received_blob) {
             let rows = (
@@ -2733,6 +2740,10 @@ impl IncomingVersionOperation {
         self.destination_binding = bucket_info.distribution.clone();
         if self.destination_bound != self.manifest.distribution.is_some() {
             return self.reject_negotiation(IncomingVersionError::ForeignPublication);
+        }
+        // A version from another bucket is never a release here.
+        if self.manifest.distribution.is_none() {
+            strip_release_keys(&mut self.manifest.metadata);
         }
         let Some(key) = settings
             .active_key()

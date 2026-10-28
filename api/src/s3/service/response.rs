@@ -42,6 +42,8 @@ pub(super) fn object_metadata(
     mut metadata: std::collections::HashMap<String, String>,
     content_type: Option<&str>,
 ) -> std::collections::HashMap<String, String> {
+    // Keys under the reserved prefix, such as release tags, are set by the server only.
+    metadata.retain(|key, _| !key.starts_with(aruna_core::user::validation::RESERVED_PREFIX));
     if let Some(content_type) = content_type {
         metadata.insert(CONTENT_TYPE_KEY.to_string(), content_type.to_string());
     }
