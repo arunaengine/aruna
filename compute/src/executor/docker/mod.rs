@@ -57,8 +57,8 @@ mod control;
 mod session;
 
 use archive::{
-    ArchivePlan, BuildError, build_archive, container_path, count_limited, list_archive,
-    output_spec, stream_output,
+    ArchivePlan, BuildError, UPLOAD_LIMIT, build_archive, container_path, count_limited,
+    list_archive, output_spec, stream_output,
 };
 use control::{ControlGuard, ControlRecord, DaemonLock};
 pub use session::session_gateway;
@@ -346,9 +346,8 @@ impl DockerBackend {
         let directories = directories.clone();
         let handle = Handle::current();
         let (tx, rx) = mpsc::channel(4);
-        let budget = plan.budget;
         let builder = tokio::task::spawn_blocking(move || {
-            build_archive(tx, handle, &directories, files, budget)
+            build_archive(tx, handle, &directories, files, UPLOAD_LIMIT)
         });
         let options = UploadToContainerOptionsBuilder::new()
             .path("/")
@@ -2203,6 +2202,30 @@ mod tests {
                 "declared {declared} actual {actual} must fail"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn exact_budget_uploads() {
+        // Inputs that fill the disk request exactly still stage, although the tar stream that
+        // carries them is larger by its headers and padding.
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.resources.disk_bytes = Some(1000);
+        let full = Bytes::from(vec![7u8; 1000]);
+        spec.inputs
+            .push(TaskInput::from_bytes("/data/in.bin", full));
+        let plan = ArchivePlan::new(&spec).unwrap();
+        let bytes = collect_archive(&plan, &plan.directories, UPLOAD_LIMIT)
+            .await
+            .unwrap();
+        assert!(bytes.len() > 1000);
+        spec.inputs.push(TaskInput::from_bytes(
+            "/data/more.bin",
+            Bytes::from_static(b"x"),
+        ));
+        assert!(matches!(
+            ArchivePlan::new(&spec),
+            Err(BackendError::InvalidSpec(_))
+        ));
     }
 
     #[test]

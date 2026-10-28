@@ -53,9 +53,11 @@ pub(super) struct ArchivePlan<'a> {
     pub(super) inputs: BTreeMap<PathBuf, &'a TaskInput>,
     pub(super) outputs: BTreeSet<PathBuf>,
     pub(super) directories: BTreeMap<PathBuf, u32>,
-    /// Staged input bytes the run's disk request allows; no request sets no bound.
-    pub(super) budget: u64,
 }
+
+/// The bound on a staged upload's tar stream. The plan bounds the payload by the disk request
+/// and each entry streams its exact size, so headers and padding never count against it.
+pub(super) const UPLOAD_LIMIT: u64 = u64::MAX;
 
 impl<'a> ArchivePlan<'a> {
     pub(super) fn new(spec: &'a TaskSpec) -> Result<Self, BackendError> {
@@ -124,7 +126,6 @@ impl<'a> ArchivePlan<'a> {
             inputs,
             outputs,
             directories,
-            budget,
         })
     }
 }
