@@ -7,16 +7,12 @@ use crate::shared;
 use aruna::identity::IdentityStore;
 use aruna_core::onboarding::OnboardingMode;
 use aruna_core::structs::identity::auth::NodeCapabilities;
-use aruna_core::structs::identity::realm::RealmNodeKind;
-use aruna_operations::driver::drive;
-use aruna_operations::realm::get_config::GetConfigOperation;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::StatusCode;
 use shared::{
     TestResult, create_bearer_token, create_onboarding_secret, spawn_complete_joiner,
-    spawn_complete_seed, wait_until,
+    spawn_complete_seed,
 };
-use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn promoted_node_signs() -> TestResult<()> {
@@ -47,29 +43,11 @@ async fn promoted_node_signs() -> TestResult<()> {
         .bearer_auth(&admin_token)
         .send()
         .await?;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-
+    // The route answers only once the joiner's own config lists it, so no wait is needed here.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["ready"], true);
     let realm_id = seed.realm_id;
-    let context = joiner.context.clone();
-    wait_until(
-        "the joiner seeing itself as management",
-        Duration::from_secs(120),
-        Duration::from_millis(100),
-        || {
-            let context = context.clone();
-            async move {
-                drive(GetConfigOperation::new(realm_id), context.as_ref())
-                    .await
-                    .is_ok_and(|config| {
-                        config.nodes.iter().any(|node| {
-                            node.node_id == joiner_id.to_string()
-                                && node.kind == RealmNodeKind::Management
-                        })
-                    })
-            }
-        },
-    )
-    .await?;
 
     // The harness cannot reopen a joiner; its next start runs exactly this step.
     let store = IdentityStore::from_storage(joiner.context.storage_handle.clone());

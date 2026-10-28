@@ -523,6 +523,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ReferencePageAnswer { .. } => "reference_page_answer",
         MetadataTransportMessage::HandRealmKey { .. } => "hand_realm_key",
         MetadataTransportMessage::RealmKeyStored { .. } => "realm_key_stored",
+        MetadataTransportMessage::PromotionCheck => "promotion_check",
+        MetadataTransportMessage::PromotionReady { .. } => "promotion_ready",
     }
 }
 

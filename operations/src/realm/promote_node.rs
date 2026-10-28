@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
@@ -22,7 +23,7 @@ use thiserror::Error;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::handle::{MetadataRequestDelivery, MetadataRequestError};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, RealmKeyPem};
-use crate::metadata::transport_message_kind;
+use crate::metadata::{MetadataHandle, transport_message_kind};
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
 use crate::realm::mutate_placement::{is_management, node_kind};
@@ -57,12 +58,17 @@ pub enum PromoteNodeError {
     Ensure(#[from] EnsureConfigError),
 }
 
+/// Asks of the node's own config after the change, about 30 seconds in all.
+const READY_CHECKS: u32 = 60;
+const READY_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Hands the key first: an unreachable node leaves the realm unchanged and the call can be
-/// repeated. Only a confirmed hand-off marks the node as management.
+/// repeated. Only a confirmed hand-off marks the node as management. `Ok(true)` means the
+/// node's own config lists it, so its next start applies the promotion.
 pub async fn promote_node(
     context: &Arc<DriverContext>,
     config: PromoteNodeConfig,
-) -> Result<(), PromoteNodeError> {
+) -> Result<bool, PromoteNodeError> {
     let document = load_realm_config(context, config.actor.realm_id)
         .await
         .ok_or(PromoteNodeError::ConfigMissing)?;
@@ -82,6 +88,7 @@ pub async fn promote_node(
         .request_forwarded_write(config.node_id, message)
         .await;
     handoff_outcome(reply)?;
+    let target = config.node_id;
     drive(
         EnsureConfigOperation::new(EnsureConfigParams {
             actor: config.actor,
@@ -95,7 +102,32 @@ pub async fn promote_node(
         context.as_ref(),
     )
     .await?;
-    Ok(())
+    Ok(wait_ready(READY_CHECKS, READY_INTERVAL, || ask_ready(metadata, target)).await)
+}
+
+async fn ask_ready(metadata: &MetadataHandle, node_id: NodeId) -> bool {
+    let check = MetadataTransportMessage::PromotionCheck;
+    matches!(
+        metadata.request_forwarded_write(node_id, check).await,
+        Ok(MetadataTransportMessage::PromotionReady { result: Ok(true) })
+    )
+}
+
+/// The config change reaches the node by replication, which may lag behind the local write.
+async fn wait_ready<F, R>(checks: u32, interval: Duration, mut ready: F) -> bool
+where
+    F: FnMut() -> R,
+    R: Future<Output = bool>,
+{
+    for check in 0..checks {
+        if ready().await {
+            return true;
+        }
+        if check + 1 < checks {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    false
 }
 
 /// A lost answer can follow a stored key, which no later call can take back.
@@ -162,6 +194,35 @@ pub(crate) async fn serve_realm_key(
     };
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        _ => Err(MetadataReadError::Unavailable),
+    }
+}
+
+/// Whether this node's own config lists it as management while it holds a handed key.
+pub(crate) async fn serve_promotion_check(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+) -> Result<bool, MetadataReadError> {
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or(MetadataReadError::Unavailable)?;
+    let document = load_realm_config(context, *net_handle.realm_id())
+        .await
+        .ok_or(MetadataReadError::Unavailable)?;
+    if !is_management(&document, peer) {
+        return Err(MetadataReadError::Forbidden);
+    }
+    if !is_management(&document, net_handle.node_id()) {
+        return Ok(false);
+    }
+    let read = StorageEffect::Read {
+        key_space: NODE_STATE_KEYSPACE.to_string(),
+        key: ByteView::from(PROMOTED_KEY_ROW),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
         _ => Err(MetadataReadError::Unavailable),
     }
 }
@@ -298,6 +359,25 @@ mod tests {
             handoff_outcome(Ok(refused)),
             Err(PromoteNodeError::Refused(MetadataReadError::Forbidden))
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waits_for_replication() {
+        let asked = std::cell::Cell::new(0);
+        let ready = wait_ready(5, Duration::from_secs(1), || {
+            asked.set(asked.get() + 1);
+            let replicated = asked.get() >= 3;
+            async move { replicated }
+        })
+        .await;
+        assert!(ready, "a lagging config change is waited for");
+        assert_eq!(asked.get(), 3);
+
+        let lagging = wait_ready(3, Duration::from_secs(1), || async { false }).await;
+        assert!(
+            !lagging,
+            "a change that never arrives is reported as not ready"
+        );
     }
 
     #[test]

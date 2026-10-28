@@ -618,6 +618,11 @@ pub enum MetadataTransportMessage {
     RealmKeyStored {
         result: Result<(), MetadataReadError>,
     },
+    /// Asks a node being promoted whether its next start applies the handed realm key.
+    PromotionCheck,
+    PromotionReady {
+        result: Result<bool, MetadataReadError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.
