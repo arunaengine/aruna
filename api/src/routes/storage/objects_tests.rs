@@ -520,3 +520,19 @@ async fn copy_cursor_names_copy() {
         "{resume:?}"
     );
 }
+
+#[tokio::test]
+async fn resumed_copy_stale() {
+    // A range resumed at a copy is marked stale like the page that first listed the copy.
+    let (node, cursor, range_id) = sealed_copy_page().await;
+    let page = list(
+        &node,
+        &node.owner,
+        HeaderMap::new(),
+        query(None, Some(cursor), 10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(keys(&page), vec!["z.md"]);
+    assert_eq!(page.stale_ranges, [range_id]);
+}

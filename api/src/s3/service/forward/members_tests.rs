@@ -772,6 +772,24 @@ async fn sealed_copy_continues() {
     assert_eq!((keys, next), (vec!["k/zz".to_string()], None));
 }
 
+// A range resumed at a copy is marked stale like the page that first listed the copy, on
+// the copy itself and through another member.
+#[tokio::test]
+async fn resumed_copy_stale() {
+    let (members, token) = sealed_copy().await;
+    for on in [2, 0] {
+        let node = &members.nodes[on];
+        let input = s3s::dto::ListObjectsV2Input {
+            prefix: Some("k/".to_string()),
+            continuation_token: Some(token.clone()),
+            ..list_input(100)
+        };
+        let list = request(input, Method::GET, members.user_on(on), node.bucket().await);
+        let answer = node.service.list_objects_v2(list).await.unwrap();
+        assert!(answer.headers.get(STALE_HEADER).is_some(), "node {on}");
+    }
+}
+
 // Prefixes group keys across ranges once each, and a token of another query is refused.
 #[tokio::test]
 async fn listing_groups_prefixes() {

@@ -478,6 +478,10 @@ impl ArunaS3Service {
             }
             let (context, shape) = ((binding, &snapshot), (owner.as_ref(), url_encoded));
             let resumed = resumed.take();
+            // A copy may be behind its coordinator, so a range resumed at one is marked stale.
+            if resumed.as_ref().is_some_and(|(_, copy, _)| *copy) {
+                stale.push(range.range_id);
+            }
             let local = match &resumed {
                 Some((node, ..)) => *node == self.node_id,
                 None => snapshot.lists_locally(binding.member_id, range, &fence),

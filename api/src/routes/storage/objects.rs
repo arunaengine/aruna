@@ -455,6 +455,10 @@ async fn merged_page(
             ..request.clone()
         };
         let resumed = resumed.take();
+        // A copy may be behind its coordinator, so a range resumed at one is marked stale.
+        if resumed.as_ref().is_some_and(|(_, copy, _)| *copy) {
+            page.stale_ranges.push(range.range_id.to_string());
+        }
         let local = match &resumed {
             Some((node, ..)) => *node == state.get_node_id(),
             None => snapshot.lists_locally(binding.member_id, range, &fence),
