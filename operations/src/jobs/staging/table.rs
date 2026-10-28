@@ -18,6 +18,7 @@ use aruna_core::structs::execution::table::{
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::storage::routing::RoutingError;
 use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::StreamExt;
@@ -33,6 +34,9 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
 use crate::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use crate::jobs::executor::JobContext;
+use crate::node::usage_stats::QuotaGateError;
+use crate::placement::policy::gate::PolicyGateError;
+use crate::placement::policy::read::ReadPolicyError;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -41,6 +45,7 @@ use crate::s3::object::get::{
 };
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::purge_fence::PurgeFenceError;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 
@@ -645,21 +650,101 @@ async fn write_object(
 /// its checkpoint, so no folder is queued without its folder object.
 fn put_failure(error: PutObjectError) -> ItemFailure {
     let message = format!("object not written: {error}");
-    let lasting = matches!(
-        error,
-        PutObjectError::QuotaExceeded { .. }
-            | PutObjectError::QuotaGateError(_)
-            | PutObjectError::Unmapped
-            | PutObjectError::RoutingFailed(_)
-            | PutObjectError::PolicyError(_)
-            | PutObjectError::PolicyGate(_)
-            | PutObjectError::PurgeFence(_)
-            | PutObjectError::ObjectExists
-            | PutObjectError::ConversionError(_)
-    );
-    match lasting {
+    match lasting_put(&error) {
         true => ItemFailure::Stage(message),
         false => ItemFailure::System(message),
+    }
+}
+
+/// Whether a put fails the same way when it runs again.
+fn lasting_put(error: &PutObjectError) -> bool {
+    use PutObjectError as Put;
+    match error {
+        Put::QuotaExceeded { .. }
+        | Put::Unmapped
+        | Put::PolicyError(_)
+        | Put::ObjectExists
+        | Put::ConversionError(_) => true,
+        Put::QuotaGateError(error) => match error {
+            QuotaGateError::ConversionError(_) => true,
+            QuotaGateError::UnexpectedEvent(_) => false,
+        },
+        Put::RoutingFailed(error) => match error {
+            RoutingError::BackendFull(_) => false,
+            RoutingError::UnknownBackend(_)
+            | RoutingError::GroupEgressDisabled
+            | RoutingError::DuplicateRule(_)
+            | RoutingError::InvalidClass(_)
+            | RoutingError::OperatorBackendTarget
+            | RoutingError::ForeignBackend(_)
+            | RoutingError::AmbiguousRules { .. } => true,
+        },
+        Put::PolicyGate(error) => lasting_gate(error),
+        Put::PurgeFence(error) => match error {
+            PurgeFenceError::Invalid => true,
+            PurgeFenceError::Suspended
+            | PurgeFenceError::Busy
+            | PurgeFenceError::Storage(_)
+            | PurgeFenceError::Unexpected(_)
+            | PurgeFenceError::Distribution(_) => false,
+        },
+        Put::StorageError(_)
+        | Put::InvalidOperationState
+        | Put::NoTransactionFound
+        | Put::MissingOutput
+        | Put::MissingHash(_)
+        | Put::MissingBody
+        | Put::IncompleteBody
+        | Put::MissingExpectedChecksum(_)
+        | Put::ChecksumMismatch(_)
+        | Put::WriteFailed(_)
+        | Put::BlobWriteFailed(_)
+        | Put::InvalidPreassignedVersion
+        | Put::UsageUpdateError(_)
+        | Put::BackendFenceError(_)
+        | Put::ManagedCopyError(_)
+        | Put::Distribution(_)
+        | Put::PutObjectFailed
+        | Put::HeadChanged
+        | Put::ImportRemoved
+        | Put::VersionExists
+        | Put::HistoryDeleted
+        | Put::FenceTaken
+        | Put::UsageRebuilding => false,
+    }
+}
+
+/// Whether a placement policy gate refuses the same way again; a stopped admission, missing
+/// policies or a storage failure pass.
+fn lasting_gate(error: &PolicyGateError) -> bool {
+    match error {
+        PolicyGateError::NoSubject
+        | PolicyGateError::Denied { .. }
+        | PolicyGateError::ForeignPolicy { .. }
+        | PolicyGateError::Invalid
+        | PolicyGateError::Required { .. }
+        | PolicyGateError::Conversion(_)
+        | PolicyGateError::Policy(_) => true,
+        PolicyGateError::Unavailable { .. }
+        | PolicyGateError::Drift
+        | PolicyGateError::AdmissionStopped
+        | PolicyGateError::InvalidEvent => false,
+        PolicyGateError::Read(error) => match error {
+            ReadPolicyError::Conversion(_)
+            | ReadPolicyError::Policy(_)
+            | ReadPolicyError::Authority(_)
+            | ReadPolicyError::NotFound { .. }
+            | ReadPolicyError::DigestMismatch
+            | ReadPolicyError::RealmMismatch
+            | ReadPolicyError::UnexpectedPublisher => true,
+            ReadPolicyError::Storage(_)
+            | ReadPolicyError::RealmConfigMissing
+            | ReadPolicyError::PlacementUnavailable
+            | ReadPolicyError::PlacementResolve(_)
+            | ReadPolicyError::Unavailable(_)
+            | ReadPolicyError::NotFinished
+            | ReadPolicyError::UnexpectedEvent { .. } => false,
+        },
     }
 }
 
@@ -677,6 +762,22 @@ mod tests {
         assert!(retried(PutObjectError::StorageError(StorageError::Timeout)));
         let quota = PutObjectError::QuotaExceeded { limit: 1, usage: 2 };
         assert!(matches!(put_failure(quota), ItemFailure::Stage(_)));
+        // Temporary refusals inside the gate and the purge fence retry too.
+        assert!(retried(PolicyGateError::AdmissionStopped.into()));
+        assert!(retried(
+            PurgeFenceError::Storage(StorageError::Timeout).into()
+        ));
+        assert!(retried(
+            RoutingError::BackendFull(
+                aruna_core::structs::storage::blob::BackendRef::node_default()
+            )
+            .into()
+        ));
+        let denied = PolicyGateError::Denied {
+            policy_ids: Vec::new(),
+        };
+        assert!(!retried(denied.into()));
+        assert!(!retried(RoutingError::GroupEgressDisabled.into()));
     }
 
     // Rows naming one key alike import once; rows naming it differently fail, not overwrite.
