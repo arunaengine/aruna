@@ -67,6 +67,9 @@ pub struct BucketPage {
     /// The last bucket scanned, past every hit, sealed so only this node reads it; `None` when
     /// the scan was not cut.
     pub scanned_to: Option<Vec<u8>>,
+    /// The cursor's position no longer opens here, for example after a restart, so this node's
+    /// part of the listing ends incomplete.
+    pub retired: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,10 +433,13 @@ async fn search_with_budget(
     let mut visible: Vec<BucketSearchHit> = Vec::with_capacity(limit);
     // A cut scan's position comes back sealed, as it may name a bucket the caller cannot read.
     let opened = (input.start_after.as_ref()).map(|after| open_position(after));
-    let mut start_after = opened
-        .transpose()
-        .map_err(|_| SearchBucketsError::Position)?
-        .map(Key::from);
+    let Ok(opened) = opened.transpose() else {
+        return Ok(BucketPage {
+            retired: true,
+            ..BucketPage::default()
+        });
+    };
+    let mut start_after = opened.map(Key::from);
     let mut scanned_rows = 0;
     let budget = max_scan_rows.min(SearchBucketsOperation::MAX_SCAN_ROWS);
     loop {
@@ -469,7 +475,7 @@ async fn search_with_budget(
             if visible.len() >= limit {
                 return Ok(BucketPage {
                     hits: visible,
-                    scanned_to: None,
+                    ..BucketPage::default()
                 });
             }
         }
@@ -479,13 +485,14 @@ async fn search_with_budget(
                 return Ok(BucketPage {
                     hits: visible,
                     scanned_to: Some(scanned_to),
+                    retired: false,
                 });
             }
             Some(key) => start_after = Some(key),
             None => {
                 return Ok(BucketPage {
                     hits: visible,
-                    scanned_to: None,
+                    ..BucketPage::default()
                 });
             }
         }
@@ -1010,9 +1017,8 @@ mod tests {
             start_after: Some(forged.into()),
             ..input
         };
-        assert_eq!(
-            search_local_buckets(&context, forged).await.unwrap_err(),
-            SearchBucketsError::Position
-        );
+        // A position this node cannot open retires its scan instead of failing every page.
+        let retired = search_local_buckets(&context, forged).await.unwrap();
+        assert!(retired.retired && retired.hits.is_empty() && retired.scanned_to.is_none());
     }
 }

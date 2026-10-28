@@ -13,7 +13,7 @@ use super::{
     record_elapsed_ms, search_local_buckets, select_fanout_nodes, short_display_id, stream, warn,
 };
 
-use super::bucket_page::{NodePosition, decode_cursor, encode_cursor, merge_pages};
+use super::bucket_page::{NodePosition, decode_cursor, encode_cursor, merge_pages, retired_nodes};
 use super::distributed::record_bucket_result;
 use futures_util::StreamExt;
 use futures_util::future::FutureExt;
@@ -666,7 +666,7 @@ pub async fn search_buckets_distributed(
                 .await
         },
     );
-    let (parts, fanout_stats) = run_metadata_fanout(
+    let (parts, mut fanout_stats) = run_metadata_fanout(
         context,
         realm_id,
         local_node_id,
@@ -685,7 +685,11 @@ pub async fn search_buckets_distributed(
         &fanout_stats.failed_partitions[..],
         &fanout_stats.omitted[..],
     );
+    let retired = retired_nodes(&parts);
     let (hits, positions) = merge_pages(parts, asked, positions, limit);
+    // A retired node's part ended early, so the page is partial though its scan is done.
+    fanout_stats.nodes_failed += retired.len();
+    fanout_stats.failed_partitions.extend(retired);
     Ok(BucketSearchExecution {
         hits,
         next_cursor: encode_cursor(&positions),

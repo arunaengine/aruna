@@ -47,6 +47,12 @@ pub(super) fn encode_cursor(positions: &[NodePosition]) -> Option<String> {
     Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// The nodes whose scan ended because the cursor's position no longer opens there.
+pub(super) fn retired_nodes(parts: &[(NodeId, BucketPage)]) -> Vec<NodeId> {
+    let retired = parts.iter().filter(|(_, page)| page.retired);
+    retired.map(|(node_id, _)| *node_id).collect()
+}
+
 /// Orders node pages by bucket name and node, cuts them to `limit` and moves each node past
 /// its hits on this page, or past its scan when it showed every hit and its scan was cut. A
 /// node with fewer than `limit` hits, all shown and an uncut scan, is done. A failed node keeps
@@ -97,7 +103,8 @@ pub(super) fn merge_pages(
             (_, Some(last)) => entry.after = Some(last.bucket.clone().into_bytes()),
             _ => {}
         }
-        entry.done |= given.scanned_to.is_none() && given.hits.len() < limit && all_shown;
+        entry.done |=
+            given.retired || (given.scanned_to.is_none() && given.hits.len() < limit && all_shown);
     }
     (hits, positions)
 }
@@ -152,7 +159,7 @@ mod tests {
                 };
                 let page = BucketPage {
                     hits,
-                    scanned_to: None,
+                    ..BucketPage::default()
                 };
                 (*node_id, page)
             })
@@ -225,6 +232,7 @@ mod tests {
         let cut = BucketPage {
             hits: vec![hit("b", node(1))],
             scanned_to: Some(b"k".to_vec()),
+            retired: false,
         };
         let (hits, positions) = merge_pages(vec![(node(1), cut)], (&[], &[]), Vec::new(), 5);
         assert_eq!(hits.len(), 1);
@@ -263,5 +271,25 @@ mod tests {
         assert!(cursor.len() > 16 * 1024);
         assert_eq!(decode_cursor(Some(&cursor)).unwrap(), positions);
         assert!(decode_cursor(Some("not a cursor")).is_err());
+    }
+
+    #[test]
+    fn retired_node_ends() {
+        // A node whose position no longer opens ends its part, so the listing can end.
+        let stale = NodePosition {
+            node_id: *node(1).as_bytes(),
+            after: Some(vec![0xFF, 1, 2]),
+            done: false,
+        };
+        let retired = BucketPage {
+            retired: true,
+            ..BucketPage::default()
+        };
+        let parts = vec![(node(1), retired)];
+        assert_eq!(retired_nodes(&parts), [node(1)]);
+        let (hits, positions) = merge_pages(parts, (&[], &[]), vec![stale], 5);
+        assert!(hits.is_empty());
+        assert!(NodePosition::of(&positions, node(1)).is_some_and(|entry| entry.done));
+        assert_eq!(encode_cursor(&positions), None);
     }
 }
