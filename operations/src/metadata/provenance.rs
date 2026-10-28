@@ -326,10 +326,10 @@ impl ProvenanceCrate {
 
     fn link(&mut self, hop: &Hop, to: &str) {
         // A run names the file it made from its own side.
-        if matches!(hop.target, Target::Run(_)) {
-            return;
+        match hop.target {
+            Target::Run(_) => self.add_ref(to, "result", &hop.from),
+            Target::Version(_) => self.add_ref(&hop.from, hop.property, to),
         }
-        self.add_ref(&hop.from, hop.property, to);
     }
 
     fn add_ref(&mut self, from: &str, property: &str, to: &str) {

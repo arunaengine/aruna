@@ -175,3 +175,29 @@ fn stored_dataset_parts() {
         "No exact version recorded"
     );
 }
+
+#[test]
+fn run_results_all_linked() {
+    // Two outputs of one run, the second reached from the first, are both results of the run.
+    let (first, second) = (arn(1, "a.txt"), arn(2, "b.txt"));
+    let run_id = Ulid::from_bytes([5; 16]).to_string();
+    let job = json!({ "origin": { "kind": "job", "run_id": run_id } });
+    let mut first_origin = job.clone();
+    first_origin["hop"] = json!({ "from": second });
+    let answers = BTreeMap::from([
+        (first.clone(), first_origin),
+        (second.clone(), job),
+        (format!("run:{run_id}"), json!({ "@graph": [] })),
+    ]);
+    let (document, _, reads) = walk(&first, &answers);
+    let run = node(&document, &format!("#run-{run_id}"));
+    let mut results: Vec<_> = run["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["@id"].clone())
+        .collect();
+    results.sort_by_key(|id| id.to_string());
+    assert_eq!(results, vec![json!(first), json!(second)]);
+    assert_eq!(reads, 3, "the run is read once");
+}
