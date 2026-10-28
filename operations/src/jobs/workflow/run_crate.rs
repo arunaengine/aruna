@@ -702,11 +702,14 @@ fn build_crate_jsonld(
     };
     let mut entity = |location: ObjectLocation,
                       hash: Option<[u8; 32]>,
-                      version: Option<String>,
+                      (version, by_version): (Option<String>, bool),
                       file: serde_json::Value| {
-        let id = match hash {
-            Some(hash) => normalized_id(hash, &location, &mut used),
-            None => location.to_url(),
+        // Without a hash, a captured input's exact version keeps same-named inputs of two
+        // nodes apart.
+        let id = match (hash, &version) {
+            (Some(hash), _) => normalized_id(hash, &location, &mut used),
+            (None, Some(version)) if by_version => version.clone(),
+            _ => location.to_url(),
         };
         let mut file = file.as_object().cloned().unwrap_or_default();
         DataEntity {
@@ -778,7 +781,7 @@ fn build_crate_jsonld(
         let version = captured
             .and_then(|captured| exact(captured.source_node_id, &location, captured.version_id));
         let hash = captured.and_then(|captured| captured.content.blake3());
-        let (id, mut file) = entity(location, hash, version, file);
+        let (id, mut file) = entity(location, hash, (version, captured.is_some()), file);
         if let Some(captured) = captured {
             for context_entity in capture_entities(&id, captured, &mut file) {
                 let context_id = context_entity["@id"]
@@ -807,7 +810,7 @@ fn build_crate_jsonld(
         };
         let hash = output.digest.as_deref().and_then(parse_hash);
         let version = exact(output.node_id, &location, output.version_id);
-        let (id, file) = entity(location, hash, version, file);
+        let (id, file) = entity(location, hash, (version, false), file);
         result_ids.push(json!({ "@id": id.clone() }));
         files.push(file);
         part_ids.push(id);
@@ -1452,6 +1455,65 @@ mod pure_tests {
         assert_eq!(marker["propertyID"], RELEASE_MEMBERSHIP);
         assert_eq!(marker["value"], "incomplete");
         assert!(!value.to_string().contains("db/in.txt"));
+    }
+
+    #[test]
+    fn references_stay_apart() {
+        // Two references with one bucket and key on two nodes are two files, each with its
+        // own source version.
+        use aruna_core::structs::storage::origin::SourcePin;
+        let (mut record, mut spec) = execution_record();
+        let mut second = spec.inputs[0].clone();
+        second.dest_key = "inputs/in2.txt".to_string();
+        second.name = Some("Second sample".to_string());
+        spec.inputs.push(second);
+        let other_node = iroh::SecretKey::from_bytes(&[33; 32]).public();
+        for (destination, node, seed, source_version) in [
+            ("inputs/in.txt", record.owner_node_id, 13, "v1"),
+            ("inputs/in2.txt", other_node, 14, "v2"),
+        ] {
+            record.captured_inputs.push(CapturedInput {
+                destination_key: destination.to_string(),
+                source_node_id: node,
+                version_id: Ulid::from_bytes([seed; 16]),
+                content: InputContent::Reference {
+                    etag: Some(format!("\"{source_version}\"")),
+                    range_bound: true,
+                },
+                bytes: 3,
+                policies: Vec::new(),
+                source_group_id: Ulid::from_bytes([21; 16]),
+                public: false,
+                link: None,
+                source_pin: Some(SourcePin {
+                    url: Some("https://example.org/in.txt".to_string()),
+                    path: "in.txt".to_string(),
+                    source_version: Some(source_version.to_string()),
+                }),
+                database: None,
+                releases: Vec::new(),
+                releases_complete: true,
+                grant: None,
+            });
+        }
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let version_of = |name: &str| {
+            let file = graph
+                .iter()
+                .find(|entity| entity["name"] == name)
+                .expect("input entity");
+            let property = (file["additionalProperty"].as_array().unwrap().iter())
+                .map(|property| graph.iter().find(|entity| entity["@id"] == property["@id"]))
+                .find(|entity| entity.is_some_and(|entity| entity["name"] == "Source version"))
+                .flatten()
+                .expect("source version");
+            (file["@id"].clone(), property["value"].clone())
+        };
+        let (first_id, first) = version_of("Input sample");
+        let (second_id, second) = version_of("Second sample");
+        assert_ne!(first_id, second_id);
+        assert_eq!((first, second), (json!("v1"), json!("v2")));
     }
 
     #[test]
