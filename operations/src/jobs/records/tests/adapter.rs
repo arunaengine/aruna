@@ -179,6 +179,7 @@ async fn holds_bound_pages() {
     let (manifest, pages) = paginate(&[pair], PageEntries::Spec).expect("pages");
     let mut spec = family.spec();
     spec.input_pages = Some(manifest);
+    let spec = spec.store_digest().expect("spec digest stored");
     let record = JobFamilyRecord::Spec(Box::new(spec.clone()));
     let record = JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded");
     let publish = || MetadataTransportMessage::ForwardJobRecord {

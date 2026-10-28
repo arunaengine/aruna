@@ -1280,11 +1280,7 @@ async fn recovery_reuses_credential() {
     .await
     .unwrap();
     assert_eq!(first.mounts.len(), 1);
-    let fence = FenceContext {
-        attempt,
-        attempt_epoch: 0,
-        controller_generation: 1,
-    };
+    let fence = fence(&attempt);
     let dyn_backend: Arc<dyn ExecutorBackend> = backend.clone();
     recover_failed_submit(
         &ctx,
