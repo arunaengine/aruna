@@ -93,13 +93,6 @@ impl ArunaS3Service {
             None | Some(ETagCondition::Any) => true,
             Some(ETagCondition::ETag(etag)) => recorded_etag == Some(etag.value()),
         };
-        if !held {
-            // Only a caller who may read the target learns that its ETag differs.
-            authorize_target(&self.state, &caller.auth, &target, READ_OPERATION)
-                .await
-                .map_err(link_error)?;
-            return Err(s3_error!(PreconditionFailed, "The ETag does not match"));
-        }
         let resolved = range
             .map(object_range_request)
             .map(|range| range.resolve(recorded.content_length))
@@ -111,6 +104,18 @@ impl ArunaS3Service {
                 _ => s3_error!(InvalidArgument, "The range is invalid"),
             })?;
         let asked = resolved.as_ref().map(|resolved| resolved.range.clone());
+        if !held {
+            // Only a caller the target's GET admits learns that its ETag differs: here the local
+            // check decides; elsewhere the target node opens the read, which is dropped.
+            match target.arn.node_id == self.node_id {
+                true => authorize_target(&self.state, &caller.auth, &target, READ_OPERATION).await,
+                false => read_target(&self.state, &caller, &target, (self.node_id, asked))
+                    .await
+                    .map(drop),
+            }
+            .map_err(link_error)?;
+            return Err(s3_error!(PreconditionFailed, "The ETag does not match"));
+        }
         let blob = read_target(&self.state, &caller, &target, (self.node_id, asked))
             .await
             .map_err(link_error)?;

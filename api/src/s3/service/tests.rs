@@ -1569,6 +1569,16 @@ async fn write_link(
         },
         group_id,
     };
+    write_link_to(service, (user_access, at), target, etag).await;
+}
+
+/// Writes a link at `study/<at>` to `target`, recording `etag`.
+async fn write_link_to(
+    service: &ArunaS3Service,
+    (user_access, at): (&UserAccess, &str),
+    target: aruna_core::structs::storage::link::LinkTarget,
+    etag: &str,
+) {
     let version_id = Ulid::generate();
     let version = BlobVersion::reference(
         target.binding(),
@@ -1618,6 +1628,48 @@ async fn relinked_get_fails() {
     };
     let error = service.get_object(request).await.unwrap_err();
     assert_eq!(error.code(), &s3s::S3ErrorCode::PreconditionFailed);
+}
+
+#[tokio::test]
+async fn remote_relink_asks_target() {
+    // A wrong ETag for a target on another node is answered only after that node admits the
+    // GET; here it cannot be reached, so the caller learns nothing about the ETag.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let target = aruna_core::structs::storage::link::LinkTarget {
+        arn: aruna_core::structs::storage::replication::VersionedObjectArn {
+            realm_id: service.realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[77; 32]).public(),
+            bucket: "study".to_string(),
+            key: "imaging/scan-a".to_string(),
+            version: Ulid::generate(),
+        },
+        group_id,
+    };
+    write_link_to(&service, (&user_access, "links/db"), target, "v2").await;
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let request = S3Request {
+        input: s3s::dto::GetObjectInput {
+            bucket: "study".to_string(),
+            key: "links/db".to_string(),
+            if_match: Some(s3s::dto::ETagCondition::ETag(s3s::dto::ETag::Strong(
+                "v1".to_string(),
+            ))),
+            ..Default::default()
+        },
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let error = service.get_object(request).await.unwrap_err();
+    assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
 }
 
 #[tokio::test]
