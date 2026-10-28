@@ -364,6 +364,7 @@ impl ArunaS3Service {
             contents,
             common_prefixes,
             continuation_token,
+            sealed: None,
         })
     }
 
@@ -398,6 +399,7 @@ impl ArunaS3Service {
             contents: Vec::new(),
             common_prefixes: Vec::new(),
             continuation_token: None,
+            sealed: None,
         };
         let mut last_prefix = resume.as_ref().and_then(|(_, group)| group.clone());
         // Only entries of this page move its token on; a resumed prefix would repeat it.
@@ -482,8 +484,17 @@ impl ArunaS3Service {
                     }
                     let bounds = Some((range.lower.clone(), range.upper.clone()));
                     let reader = (owner.clone(), Some(user));
-                    self.run_object_listing(sub, reader, url_encoded, scope, bounds)
-                        .await?
+                    let part =
+                        self.run_object_listing(sub, reader, url_encoded, scope, (bounds, None));
+                    let part = part.await?;
+                    // A merged cursor cannot carry a member's sealed one.
+                    if part.sealed.is_some() {
+                        return Err(s3_error!(
+                            SlowDown,
+                            "Listing scan limit reached; request a narrower prefix"
+                        ));
+                    }
+                    part
                 }
             };
             first = false;
@@ -605,6 +616,7 @@ mod tests {
                 prefix: Some("private/".to_string()),
             }],
             continuation_token: None,
+            sealed: None,
         };
         // A scope without grants hides what the holder listed under its own rules.
         scope_part(&mut part, &SubpathScope::default(), false);

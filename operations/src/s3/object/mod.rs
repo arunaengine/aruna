@@ -18,3 +18,4 @@ mod refresh_mint;
 mod refresh_observe;
 pub mod search;
 pub mod versions;
+pub mod visible;

@@ -222,7 +222,7 @@ static POSITION_KEY: LazyLock<[u8; 32]> = LazyLock::new(rand::random);
 
 /// A head key position encrypted and authenticated with this node's key, so a cursor carries
 /// no key name; only this node opens it again.
-pub(super) fn seal_position(position: &[u8]) -> Result<Vec<u8>, SearchObjectsError> {
+pub(crate) fn seal_position(position: &[u8]) -> Result<Vec<u8>, SearchObjectsError> {
     let nonce: [u8; 24] = rand::random();
     let cipher = XChaCha20Poly1305::new((&*POSITION_KEY).into());
     let sealed = (cipher.encrypt(&XNonce::from(nonce), position))
@@ -231,7 +231,7 @@ pub(super) fn seal_position(position: &[u8]) -> Result<Vec<u8>, SearchObjectsErr
 }
 
 /// The head key of a position: a sealed one is opened, a plain one is passed on.
-pub(super) fn open_position(position: &[u8]) -> Result<Vec<u8>, SearchObjectsError> {
+pub(crate) fn open_position(position: &[u8]) -> Result<Vec<u8>, SearchObjectsError> {
     let Some(sealed) = position.strip_prefix(&[SEALED]) else {
         return Ok(position.to_vec());
     };
