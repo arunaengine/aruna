@@ -11,8 +11,8 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, LaunchRecord, LocalCrate, RunCrateStatus, RunLink,
+    CapturedInput, ExecutionSpec, InputContent, InputSource, JobError, JobId, JobPayload,
+    JobRecord, JobResultPayload, JobState, LaunchRecord, LocalCrate, RunCrateStatus, RunLink,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -23,6 +23,8 @@ use aruna_core::structs::storage::data::identity::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+
+use crate::metadata::provenance::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};
 use serde_json::json;
 use ulid::Ulid;
 
@@ -516,6 +518,111 @@ fn group_entity(group_id: Ulid) -> String {
     format!("#group-{group_id}")
 }
 
+/// What admission captured about an input beyond its bytes, as entities next to the file `id`:
+/// a public source's pin, the bucket's metadata then, the releases that pin the version, and
+/// whether that membership was checked everywhere.
+fn capture_entities(
+    id: &str,
+    captured: &CapturedInput,
+    file: &mut serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let mut entities = Vec::new();
+    let mut properties: Vec<serde_json::Value> = match file["additionalProperty"].take() {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(values) => values,
+        value => vec![value],
+    };
+    let mut property = |term: &str, name: &str, value: String| {
+        let property_id = format!("{id}#{term}");
+        properties.push(json!({ "@id": property_id.clone() }));
+        json!({ "@id": property_id, "@type": "PropertyValue", "name": name, "value": value })
+    };
+    // A private source stays unnamed, its path included.
+    if let Some(pin) = (captured.source_pin.as_ref()).filter(|pin| pin.url.is_some()) {
+        let etag = match &captured.content {
+            InputContent::Reference { etag, .. } => etag.clone(),
+            InputContent::Blake3(_) => None,
+        };
+        let pinned = [
+            ("source-path", "Source path", Some(pin.path.clone())),
+            (
+                "source-version",
+                "Source version",
+                pin.source_version.clone(),
+            ),
+            ("source-etag", "Source ETag", etag),
+        ];
+        for (term, name, value) in pinned {
+            entities.extend(value.map(|value| property(term, name, value)));
+        }
+    }
+    if !captured.releases_complete {
+        let mut marker = property(
+            "release-membership",
+            "Release membership",
+            "incomplete".into(),
+        );
+        marker["propertyID"] = json!(RELEASE_MEMBERSHIP);
+        marker["description"] = json!(RELEASE_INCOMPLETE);
+        entities.push(marker);
+    }
+    let mut part_of = Vec::new();
+    if let Some(metadata) = &captured.database {
+        let snapshot = serde_json::to_value(metadata).unwrap_or_default();
+        let digest = blake3::hash(snapshot.to_string().as_bytes()).to_hex();
+        let database_id = format!("#bucket-metadata-{}", &digest[..16]);
+        let title = metadata.title.as_deref().unwrap_or("Bucket metadata");
+        let mut database = json!({
+            "@id": database_id.clone(),
+            "@type": "Dataset",
+            "name": format!("{title} (at admission)")
+        });
+        for (name, value) in [
+            ("version", &metadata.version),
+            ("license", &metadata.license),
+            ("description", &metadata.description),
+        ] {
+            if let Some(value) = value {
+                database[name] = json!(value);
+            }
+        }
+        let links: Vec<_> = (metadata.identifiers.iter())
+            .map(|identifier| json!(identifier.url))
+            .collect();
+        if !links.is_empty() {
+            database["identifier"] = json!(links);
+        }
+        part_of.push(json!({ "@id": database_id }));
+        entities.push(database);
+    }
+    for release in &captured.releases {
+        let release_id = release.crate_version.to_id();
+        let upstream: Vec<_> = (release.upstream.iter())
+            .map(|identifier| json!({ "@id": identifier.url }))
+            .collect();
+        let mut entity = json!({
+            "@id": release_id.clone(),
+            "@type": "Dataset",
+            "name": format!("Release {}", release.label),
+            "version": release.label
+        });
+        if !upstream.is_empty() {
+            entity["isBasedOn"] = json!(upstream);
+        }
+        part_of.push(json!({ "@id": release_id }));
+        entities.push(entity);
+    }
+    if !part_of.is_empty() {
+        file["isPartOf"] = json!(part_of);
+    }
+    match properties.len() {
+        0 => {}
+        1 => file["additionalProperty"] = properties.remove(0),
+        _ => file["additionalProperty"] = json!(properties),
+    }
+    entities
+}
+
 fn device_entity(device: &str) -> String {
     format!("#device-{device}")
 }
@@ -620,6 +727,7 @@ fn build_crate_jsonld(
     let mut used_devices = BTreeSet::new();
     let mut source_groups = BTreeSet::new();
     let mut link_properties = Vec::new();
+    let mut context_entities = BTreeMap::new();
     let mut object_ids = Vec::with_capacity(spec.inputs.len());
     let mut part_ids = Vec::new();
     let mut files = Vec::new();
@@ -670,7 +778,16 @@ fn build_crate_jsonld(
         let version = captured
             .and_then(|captured| exact(captured.source_node_id, &location, captured.version_id));
         let hash = captured.and_then(|captured| captured.content.blake3());
-        let (id, file) = entity(location, hash, version, file);
+        let (id, mut file) = entity(location, hash, version, file);
+        if let Some(captured) = captured {
+            for context_entity in capture_entities(&id, captured, &mut file) {
+                let context_id = context_entity["@id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                context_entities.entry(context_id).or_insert(context_entity);
+            }
+        }
         object_ids.push(json!({ "@id": id.clone() }));
         files.push(file);
         part_ids.push(id);
@@ -846,6 +963,7 @@ fn build_crate_jsonld(
         })
     }));
     graph.extend(link_properties);
+    graph.extend(context_entities.into_values());
     graph.extend(properties);
     if let Some(launch) = launch {
         let mut site = json!({
@@ -1208,7 +1326,7 @@ mod pure_tests {
             source_pin: None,
             database: None,
             releases: Vec::new(),
-            releases_complete: false,
+            releases_complete: true,
             grant: None,
         });
         let value = parse(&record, &spec);
@@ -1236,6 +1354,104 @@ mod pure_tests {
                 .as_str()
                 .is_some_and(|value| value.contains("work"))
         );
+    }
+
+    #[test]
+    fn names_captured_context() {
+        // Admission's capture names a public source's pin, the bucket's metadata then and the
+        // releases that pin the input; unchecked membership is marked on the file.
+        use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
+        use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, ReleaseRef};
+        use aruna_core::structs::storage::origin::{OriginVersion, SourcePin};
+        let (mut record, spec) = execution_record();
+        let doi = Identifier {
+            name: "DOI".to_string(),
+            value: "10.5281/zenodo.1".to_string(),
+            url: "https://doi.org/10.5281/zenodo.1".to_string(),
+            target: IdentifierTarget::Key,
+        };
+        let crate_version = OriginVersion::Node(VersionedObjectArn {
+            realm_id: record.created_by.realm_id,
+            node_id: record.owner_node_id,
+            bucket: "bakta-db".to_string(),
+            key: "db/release.json".to_string(),
+            version: Ulid::from_bytes([15; 16]),
+        });
+        let captured = |releases_complete| CapturedInput {
+            destination_key: "inputs/in.txt".to_string(),
+            source_node_id: record.owner_node_id,
+            version_id: Ulid::from_bytes([13; 16]),
+            content: InputContent::Reference {
+                etag: Some("\"abc\"".to_string()),
+                range_bound: true,
+            },
+            bytes: 3,
+            policies: Vec::new(),
+            source_group_id: Ulid::from_bytes([21; 16]),
+            public: false,
+            link: None,
+            source_pin: Some(SourcePin {
+                url: Some("https://example.org/db/in.txt".to_string()),
+                path: "db/in.txt".to_string(),
+                source_version: Some("v6".to_string()),
+            }),
+            database: Some(BucketMetadata {
+                database: true,
+                title: Some("Bakta".to_string()),
+                version: Some("6.0".to_string()),
+                identifiers: vec![doi.clone()],
+                ..BucketMetadata::default()
+            }),
+            releases: vec![ReleaseRef {
+                crate_version: crate_version.clone(),
+                label: "6.0".to_string(),
+                upstream: vec![doi.clone()],
+            }],
+            releases_complete,
+            grant: None,
+        };
+        record.captured_inputs.push(captured(true));
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let find = |id: &serde_json::Value| graph.iter().find(|entity| entity["@id"] == *id);
+        let input = graph
+            .iter()
+            .find(|entity| entity["name"] == "Input sample")
+            .expect("input entity");
+        let properties = input["additionalProperty"]
+            .as_array()
+            .expect("pin properties");
+        let values: Vec<_> = (properties.iter())
+            .map(|property| find(&property["@id"]).unwrap()["value"].clone())
+            .collect();
+        assert_eq!(values, [json!("db/in.txt"), json!("v6"), json!("\"abc\"")]);
+        let part_of = input["isPartOf"].as_array().expect("part of");
+        let database = find(&part_of[0]["@id"]).expect("metadata snapshot");
+        assert_eq!(database["name"], "Bakta (at admission)");
+        assert_eq!(database["version"], "6.0");
+        assert_eq!(database["identifier"][0], doi.url.as_str());
+        let release = find(&part_of[1]["@id"]).expect("release");
+        assert_eq!(release["@id"], crate_version.to_id().as_str());
+        assert_eq!(release["version"], "6.0");
+        assert_eq!(release["isBasedOn"][0]["@id"], doi.url.as_str());
+
+        // Membership that was not checked everywhere is marked; a private source stays unnamed.
+        let mut unchecked = captured(false);
+        (unchecked.source_pin.as_mut().unwrap()).url = None;
+        record.captured_inputs = vec![unchecked];
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let input = graph
+            .iter()
+            .find(|entity| entity["name"] == "Input sample")
+            .expect("input entity");
+        let marker = graph
+            .iter()
+            .find(|entity| entity["@id"] == input["additionalProperty"]["@id"])
+            .expect("membership marker");
+        assert_eq!(marker["propertyID"], RELEASE_MEMBERSHIP);
+        assert_eq!(marker["value"], "incomplete");
+        assert!(!value.to_string().contains("db/in.txt"));
     }
 
     #[test]
