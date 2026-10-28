@@ -678,9 +678,21 @@ fn connector_path(value: &str, base: Option<&str>) -> Result<String, String> {
     let base = base.ok_or_else(outside)?;
     let base = base.trim_end_matches('/');
     match value.strip_prefix(base) {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => Ok(rest.to_string()),
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => decoded(rest)
+            .ok_or_else(|| format!("the source `{value}` holds an invalid escaped segment")),
         _ => Err(outside()),
     }
+}
+
+/// A URL path with each segment decoded once; an escaped `/` would change its structure.
+fn decoded(path: &str) -> Option<String> {
+    let segments = path.split('/').map(|segment| {
+        let segment = percent_encoding::percent_decode_str(segment)
+            .decode_utf8()
+            .ok()?;
+        (!segment.contains('/')).then(|| segment.into_owned())
+    });
+    Some(segments.collect::<Option<Vec<_>>>()?.join("/"))
 }
 
 /// The path without leading and trailing `/`; `None` for empty, `.` or `..` segments.

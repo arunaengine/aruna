@@ -105,10 +105,16 @@ fn foreign_paths_fail() {
     );
     assert_eq!(entry.metadata["sample"], "s1");
     assert!(!entry.metadata.contains_key("description"));
+    // URL segments are decoded once, so the connector does not encode them a second time.
+    let spaced = imported(mapper.map(&row("https://data.example.org/files/a%20b.fq"), base));
+    assert_eq!(spaced.source_path, "a b.fq");
     for bad in [
         "https://other.example.org/files/a.fq",
         "https://data.example.org/filesx/a.fq",
         "https://data.example.org/files/../a.fq",
+        "https://data.example.org/files/%2e%2e/a.fq",
+        "https://data.example.org/files/a%2Fb.fq",
+        "https://data.example.org/files/%ff.fq",
         "a//b.fq",
     ] {
         assert!(
