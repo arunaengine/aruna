@@ -299,6 +299,39 @@ impl Fixture {
         page.hits.into_iter().map(|hit| hit.hit).collect()
     }
 
+    /// The source observation stored on the current reference version of `key`.
+    async fn observation(
+        &self,
+        key: &str,
+    ) -> aruna_core::structs::execution::source_access::SourceMetadata {
+        use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+        use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
+        let bucket = self.spec.bucket.clone();
+        let (version_id, _) = self.head(&bucket, key).await.unwrap();
+        let read = aruna_core::effects::StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: VersionKey::new(&bucket, key, version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+            txn_id: None,
+        };
+        let event = self.driver.storage_handle.send_storage_effect(read).await;
+        let aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+            value: Some(value),
+            ..
+        }) = event
+        else {
+            panic!("the version must exist");
+        };
+        match BlobVersion::from_bytes(&value).unwrap().state {
+            BlobVersionState::Reference {
+                cached_metadata, ..
+            } => cached_metadata,
+            _ => panic!("the version must be a reference"),
+        }
+    }
+
     /// The whole object read through the ordinary read, or why it was refused.
     async fn read(&self, key: &str) -> Result<Vec<u8>, String> {
         use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
@@ -523,7 +556,8 @@ async fn list_columns_recorded() {
          {COLI}md5checksums.txt,good.txt,4,{good},2025-11-17T17:38:21Z,coli sums\n\
          {HUMAN}README.txt,wrong.txt,6,{wrong},,human readme\n\
          {HUMAN}README.txt,bad.txt,six,{good},,broken size\n\
-         {COLI}md5checksums.txt,drift.txt,5,{good},,size off\n"
+         {COLI}md5checksums.txt,drift.txt,5,{good},,size off\n\
+         {COLI}GCF_000005845.2_ASM584v2_genomic.fna.gz,timed.fna,,,2020-01-02T03:04:05Z,headed\n"
     );
     let ctx = fixture.context(30).await;
     let lists = drive(
@@ -538,12 +572,18 @@ async fn list_columns_recorded() {
         .ok()
         .unwrap();
 
-    assert_eq!(fixture.run(31).await, (3, 1));
+    assert_eq!(fixture.run(31).await, (4, 1));
     assert_eq!(
         site.count(&Method::HEAD, &format!("{COLI}md5checksums.txt")),
         0
     );
     assert_eq!(site.count(&Method::HEAD, &format!("{HUMAN}README.txt")), 0);
+    // A row without a size is headed, and keeps the time the list gives.
+    let headed = format!("{COLI}GCF_000005845.2_ASM584v2_genomic.fna.gz");
+    assert_eq!(site.count(&Method::HEAD, &headed), 1);
+    let timed = fixture.observation("files/timed.fna").await;
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_934_245);
+    assert_eq!((timed.content_length, timed.last_modified), (4, Some(at)));
     assert_eq!(fixture.read("files/good.txt").await.unwrap(), b"sums");
     assert!(fixture.read("files/wrong.txt").await.is_err());
     // A source whose size differs is refused; no successor drops the list's checksum.

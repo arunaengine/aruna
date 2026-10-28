@@ -463,6 +463,7 @@ async fn file_rows(
             }),
             manifest: entry.digests,
             metadata: entry.metadata,
+            modified: entry.modified,
         })
         .collect();
     let rows = (files, Vec::new(), Vec::new());

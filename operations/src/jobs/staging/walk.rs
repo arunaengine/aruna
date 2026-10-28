@@ -213,6 +213,8 @@ pub(super) struct StagedFile {
     /// Shipped digests, from a checksum manifest or a table row.
     pub(super) manifest: Vec<ManifestDigest>,
     pub(super) metadata: BTreeMap<String, String>,
+    /// A table row's modification time; it replaces the one a HEAD reports.
+    pub(super) modified: Option<SystemTime>,
 }
 
 /// Lists one page of the current walk and records it, with the walk's next position and the
@@ -832,7 +834,10 @@ pub(super) async fn import_page(
                 Some(observation) => Ok(observation),
                 None => head_observation(ctx, spec, &file.source_path, &mut source).await,
             }
-            .map(|observation| with_manifest(observation, file.manifest)),
+            .map(|mut observation| {
+                observation.last_modified = file.modified.or(observation.last_modified);
+                with_manifest(observation, file.manifest)
+            }),
             Err(failure) => Err(failure),
         };
         match observation {
@@ -1135,6 +1140,7 @@ fn map_source_entry(
             observation: entry.observation().filter(|_| exact),
             manifest: Vec::new(),
             metadata: BTreeMap::new(),
+            modified: None,
             source_path: entry_path,
             target_key: target,
             size: entry.size,
