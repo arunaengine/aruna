@@ -14,8 +14,8 @@ use std::sync::Arc;
 use aruna_blob::pace::{Pace, paced};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    JobError, JobId, JobResultPayload, ManifestRead, StagingJobCheckpoint, StagingJobPhase,
-    StagingJobSpec,
+    JobError, JobErrorKind, JobId, JobResultPayload, ManifestRead, StagingJobCheckpoint,
+    StagingJobPhase, StagingJobSpec,
 };
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -96,7 +96,12 @@ async fn stopped_outcome(ctx: &JobContext, outcome: JobRunOutcome) -> JobRunOutc
         clear_queue(ctx).await;
         return JobRunOutcome::Cancelled;
     }
-    match ctx.shutdown.is_cancelled() {
+    // A permanent failure already cleared the job's rows, so it stays terminal.
+    let permanent = matches!(
+        &outcome,
+        JobRunOutcome::Failed(error) if error.kind == JobErrorKind::Permanent
+    );
+    match ctx.shutdown.is_cancelled() && !permanent {
         true => JobRunOutcome::Interrupted,
         false => outcome,
     }

@@ -454,3 +454,20 @@ async fn paused_job_stops() {
     }
     server.abort();
 }
+
+// A shutdown during the cleanup of a permanent failure leaves it failed, since its queue rows
+// are gone; a retryable failure under shutdown is still interrupted.
+#[tokio::test]
+async fn shutdown_keeps_permanent() {
+    use aruna_core::structs::execution::job::{JobError, JobErrorKind};
+    let fixture = Fixture::new("http://127.0.0.1:9", summary_table()).await;
+    let ctx = fixture.context(22).await;
+    ctx.shutdown.cancel();
+    let stopped = |error| crate::jobs::staging::stopped_outcome(&ctx, JobRunOutcome::Failed(error));
+    let permanent = stopped(JobError::permanent("bucket replaced")).await;
+    assert!(
+        matches!(permanent, JobRunOutcome::Failed(error) if error.kind == JobErrorKind::Permanent)
+    );
+    let retryable = stopped(JobError::retryable("reset")).await;
+    assert!(matches!(retryable, JobRunOutcome::Interrupted));
+}
