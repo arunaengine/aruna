@@ -470,17 +470,35 @@ pub fn parse_rows(
         let end = reader.position().byte() as usize;
         rows.push((parse_fields(format, width, &record), end));
     }
-    if !complete {
-        rows.pop();
-        if rows.is_empty() && bytes.len() >= TABLE_CHUNK {
-            return Err(TableError::RowTooLong);
-        }
+    if complete {
+        return Ok((rows, bytes.len()));
     }
-    let used = match complete {
-        true => bytes.len(),
-        false => rows.last().map_or(0, |(_, end)| *end),
-    };
+    // Only a record reaching the chunk's end may be cut; one followed by more bytes is whole.
+    if rows.last().is_some_and(|(_, end)| *end >= bytes.len()) {
+        rows.pop();
+    }
+    let used = skip_lines(format, bytes, rows.last().map_or(0, |(_, end)| *end));
+    if used == 0 && bytes.len() >= TABLE_CHUNK {
+        return Err(TableError::RowTooLong);
+    }
     Ok((rows, used))
+}
+
+/// The offset after the whole comment and blank lines that start at `at`.
+fn skip_lines(format: &TableFormat, bytes: &[u8], mut at: usize) -> usize {
+    loop {
+        let rest = &bytes[at..];
+        let blank = rest.starts_with(b"\n") || rest.starts_with(b"\r\n");
+        let comment =
+            (format.comment).is_some_and(|comment| rest.first() == Some(&(comment as u8)));
+        let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
+            return at;
+        };
+        if !blank && !comment {
+            return at;
+        }
+        at += newline + 1;
+    }
 }
 
 fn parse_fields(format: &TableFormat, width: Option<usize>, record: &csv::ByteRecord) -> ParsedRow {

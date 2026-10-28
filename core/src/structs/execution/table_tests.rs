@@ -163,6 +163,25 @@ fn bad_rows_reported() {
     assert!(rows[0].0.is_err());
 }
 
+// A stretch of comment lines longer than a chunk is consumed; only a cut line waits.
+#[test]
+fn comment_stretch_consumed() {
+    let format = TableFormat {
+        comment: Some('#'),
+        ..TableFormat::default()
+    };
+    let mut bytes = b"a\n".to_vec();
+    while bytes.len() < TABLE_CHUNK {
+        bytes.extend_from_slice(b"#note\n");
+    }
+    bytes.truncate(TABLE_CHUNK);
+    let (rows, used) = parse_rows(&format, Some(1), &bytes, false).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(used > TABLE_CHUNK - 6 && bytes[..used].ends_with(b"\n"));
+    let (rows, used) = parse_rows(&format, Some(1), &bytes[2..], false).unwrap();
+    assert!(rows.is_empty() && used > TABLE_CHUNK - 8);
+}
+
 #[test]
 fn headers_by_row() {
     let mut format = TableFormat {
