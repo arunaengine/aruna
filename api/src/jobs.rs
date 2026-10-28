@@ -9,7 +9,6 @@ use aruna_compute::session::Session;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::MOUNT_PREFIX_TAG;
 use aruna_core::id::NodeId;
-use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::execution::job::{
     CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode, InputSelection,
     InputSource, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
@@ -200,7 +199,7 @@ pub(crate) async fn admit_execution(
     .await
     .map_err(JobRequestError::from_server)?;
 
-    if command.inputs.len() > MAX_PLAN_INPUTS || command.outputs.len() > MAX_EXECUTION_OUTPUTS {
+    if command.outputs.len() > MAX_EXECUTION_OUTPUTS {
         return Err(JobRequestError::BadRequest);
     }
     // Destination-key overlaps are the composition's collision policy to resolve.

@@ -13,7 +13,7 @@ pub use cost::{InputRoute, UNKNOWN_PERMILLE};
 pub use digest::{PLAN_DIGEST_DOMAIN, plan_digest};
 pub use eligibility::{PolicyVerdict, RejectionVerdict};
 pub use inputs::{
-    InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES, MAX_PLAN_INPUTS,
+    InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES,
     MAX_PLAN_REJECTIONS, MAX_TARGET_SCAN, PlanError, PlanRequest, ResolvedInput, TargetCandidate,
     TargetScore,
 };

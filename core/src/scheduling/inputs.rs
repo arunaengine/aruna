@@ -19,8 +19,6 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Maximum inputs one plan pins.
-pub const MAX_PLAN_INPUTS: usize = 512;
 /// Maximum registered holders considered per input.
 pub const MAX_INPUT_HOLDERS: usize = 32;
 /// Maximum advertisements one planning page screens. A scan continues in the
@@ -38,8 +36,6 @@ pub const MAX_PLAN_REJECTIONS: usize = 32;
 pub enum PlanError {
     #[error("the job has no durable logical admission record")]
     NotAdmitted,
-    #[error("a plan pins at most {MAX_PLAN_INPUTS} inputs")]
-    InputCount,
     #[error("an input resolves at most {MAX_INPUT_HOLDERS} holders")]
     HolderCount,
     #[error("one planning page screens at most {MAX_TARGET_SCAN} advertised targets")]
@@ -129,9 +125,6 @@ impl PlanRequest {
     pub fn canonical(&self) -> Result<Self, PlanError> {
         if !self.admitted {
             return Err(PlanError::NotAdmitted);
-        }
-        if self.inputs.len() > MAX_PLAN_INPUTS {
-            return Err(PlanError::InputCount);
         }
         if self.required_labels.len() > MAX_SELECTOR_LABELS {
             return Err(PlanError::LabelCount);

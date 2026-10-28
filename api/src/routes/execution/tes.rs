@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path as FilePath;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -69,8 +69,6 @@ const DERIVED_TAG_KEYS: [&str; 4] = [ID_TAG_KEY, STATE_TAG_KEY, KIND_TAG_KEY, TR
 
 const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;
-/// Bounds the quadratic input/output path-overlap validation.
-const MAX_TASK_IO: usize = 512;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -579,8 +577,10 @@ naming a different one; a bearer token requires that tag.
   `reserved_tag`.
 - Input urls must be `s3://bucket/key` or a versioned object ARN, output urls `s3://bucket/key`;
   container paths must be absolute, canonical and
-  may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound
-  the immutable output record carries.
+  may not overlap between inputs and outputs; at most 1024 outputs, the same bound the immutable
+  output record carries.
+- A `DIRECTORY` input names an `s3://bucket/prefix`; admission pins every object below the prefix
+  at its current version and places it below the input path.
 - An output path with POSIX wildcards additionally requires `path_prefix`, the literal ancestor
   stripped from each match before it is appended to the destination url. Such outputs may share
   one url. A pattern that matches a directory captures every file below it, and a staged input it
@@ -1332,20 +1332,28 @@ fn validate_task_shape(task: &TesTask) -> Result<&TesExecutor, TesError> {
 }
 
 fn map_task_inputs(task: &TesTask, input_mode: InputMode) -> Result<Vec<InputSelection>, TesError> {
-    if task.inputs.len() > MAX_TASK_IO {
-        return Err(TesError::bad_request("too many task inputs"));
-    }
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(task.inputs.len());
+    let mut paths = BTreeSet::new();
     for input in &task.inputs {
         let input = map_input(input, input_mode)?;
-        if inputs
-            .iter()
-            .any(|existing| existing.container_path == input.container_path)
+        if let Some(path) = input.container_path.clone()
+            && !paths.insert(path)
         {
             return Err(TesError::bad_request("duplicate input path"));
         }
         if let Some(path) = input.container_path.as_deref()
             && inputs.iter().any(|existing| {
+    // An input below another input's path would be hidden by it.
+    let nested = paths.iter().any(|path| {
+        FilePath::new(path)
+            .ancestors()
+            .skip(1)
+            .filter_map(FilePath::to_str)
+            .any(|ancestor| paths.contains(ancestor))
+    });
+    if nested {
+        return Err(TesError::bad_request("input paths overlap"));
+    }
                 existing.container_path.as_deref().is_some_and(|other| {
                     FilePath::new(path).starts_with(other) || FilePath::new(other).starts_with(path)
                 })

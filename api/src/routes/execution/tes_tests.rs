@@ -361,10 +361,22 @@ fn resolves_task_group() {
 
 #[test]
 fn caps_task_io() {
-    // Input and output counts are bounded before quadratic validation.
+    // Any number of distinct inputs maps; outputs keep their bound.
     let group = Ulid::from_bytes([5u8; 16]);
     let mut task = sample_task(group);
-    task.inputs = vec![task.inputs[0].clone(); MAX_TASK_IO + 1];
+    let template = task.inputs[0].clone();
+    task.inputs = (0..600)
+        .map(|index| TesInput {
+            path: format!("/inputs/{index}.fq"),
+            ..template.clone()
+        })
+        .collect();
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).expect("inputs map");
+    assert_eq!(spec.inputs.len(), 600);
+    task.inputs.push(TesInput {
+        path: "/inputs/0.fq".to_string(),
+        ..template
+    });
     let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
 
