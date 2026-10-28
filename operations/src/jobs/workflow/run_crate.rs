@@ -501,7 +501,9 @@ fn build_crate_jsonld(
             encoding_format: None,
         }
         .apply(&mut file);
-        if let (Some(version), Some(url)) = (version, file.remove(CONTENT_URL)) {
+        if let Some(version) = version
+            && let Some(url) = file.remove(CONTENT_URL)
+        {
             file.insert(CONTENT_URL.into(), json!([url, version]));
         }
         (id, serde_json::Value::Object(file))
@@ -1050,6 +1052,19 @@ mod pure_tests {
         let action = graph.iter().find(|e| e["@type"] == "CreateAction").unwrap();
         assert_eq!(action["object"][0]["@id"], content);
         assert!(craqle::validate_rocrate_jsonld(&value.to_string()).is_ok());
+    }
+
+    #[test]
+    fn uncaptured_keeps_location() {
+        // An input without a captured version keeps its location as its only `contentUrl`.
+        let (record, spec) = execution_record();
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let input = graph
+            .iter()
+            .find(|entity| entity["name"] == "Input sample")
+            .expect("input entity");
+        assert_eq!(input["contentUrl"], "s3://src/in.txt");
     }
 
     #[test]
