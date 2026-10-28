@@ -244,3 +244,19 @@ async fn stalled_write_ends() {
     };
     assert!(!write(&caller, &CancellationToken::new(), &mut zip, file).await);
 }
+
+#[tokio::test]
+async fn crate_read_rechecks() {
+    // A token revoked after the run read is checked again before its crate is read.
+    let node = node_state().await;
+    let gone = CancellationToken::new();
+    let revoked = caller(&node, recheck(&node.owner, 0));
+    assert!(
+        crate_read(&revoked, &gone, "01K8W1C0000000000000000000")
+            .await
+            .is_none()
+    );
+    let valid = caller(&node, recheck(&node.owner, 1));
+    let read = crate_read(&valid, &gone, "01K8W1C0000000000000000000").await;
+    assert!(matches!(read, Some(Some(Read::Hidden | Read::Silent))));
+}

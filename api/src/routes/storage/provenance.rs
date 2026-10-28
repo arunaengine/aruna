@@ -247,10 +247,14 @@ async fn walk(
             }
             (Target::Run(_), Read::Answer(run)) => {
                 let read = match run["run_crate"].as_str() {
-                    Some(document) => {
-                        let read = crate_document(&caller, &auth, document);
-                        bounded(&caller, &gone, read).await
-                    }
+                    Some(document) => match crate_read(&caller, &gone, document).await {
+                        Some(read) => read,
+                        None => {
+                            built.run(&hop, None);
+                            built.stop(REVOKED);
+                            break;
+                        }
+                    },
                     None => Some(Read::Hidden),
                 };
                 let (hops, file, go_on) = record_run(&mut built, &hop, read);
@@ -405,6 +409,17 @@ fn classify(answer: ServerResult<serde_json::Value>) -> Read {
 
 fn to_value(answer: &impl serde::Serialize) -> ServerResult<serde_json::Value> {
     serde_json::to_value(answer).map_err(|error| ServerError::InternalError(error.to_string()))
+}
+
+/// A run crate read under the token as it holds now, checked again after the run read;
+/// `None` when the token expired or was revoked in between.
+async fn crate_read(
+    caller: &Caller,
+    gone: &CancellationToken,
+    document: &str,
+) -> Option<Option<Read>> {
+    let auth = caller.current(gone).await?;
+    Some(bounded(caller, gone, crate_document(caller, &auth, document)).await)
 }
 
 /// A metadata document's crate as the caller may read it.
