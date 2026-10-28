@@ -289,7 +289,8 @@ pub async fn record_attempt_started(
 }
 
 /// `mutate_job`, then in the same transaction marks the launch record of the current attempt
-/// as executed when the mutation left the job running.
+/// as executed: its guard passed, so the backend accepted this epoch, even when a cancellation
+/// keeps the job from running.
 async fn mutate_marking_start<F>(
     storage: &StorageHandle,
     job_id: JobId,
@@ -306,9 +307,7 @@ where
         let result = async {
             let record =
                 Box::pin(mutate_in_txn(storage, txn_id, job_id, &mut mutate, None)).await?;
-            if record.state == JobState::Running {
-                mark_launch_started(storage, txn_id, &record, started_at_ms).await?;
-            }
+            mark_launch_started(storage, txn_id, &record, started_at_ms).await?;
             Ok(record)
         }
         .await;

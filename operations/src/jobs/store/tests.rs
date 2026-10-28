@@ -2039,7 +2039,8 @@ async fn launch_marks_executed() {
 
 #[tokio::test]
 async fn stale_launch_refused() {
-    // A claimant whose token lost writes no launch facts, and a cancelled run marks none.
+    // A claimant whose token lost writes no launch facts; an accepted attempt counts as executed
+    // even when a cancellation keeps it from running.
     let (_dir, storage) = temp_storage();
     let job_id = JobId::from_bytes([0xB2; 16]);
     let token = Ulid::generate();
@@ -2077,7 +2078,12 @@ async fn stale_launch_refused() {
     let stored = begin_external_running(&storage, job_id, token, Some(5_500), 6_000)
         .await
         .unwrap();
-    assert_eq!(read_launch_record(&storage, &stored).await, Ok(None));
+    assert_eq!(stored.state, JobState::Ready);
+    let executed = read_launch_record(&storage, &stored)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(executed.started_at_ms, Some(5_500));
 }
 
 #[tokio::test]
