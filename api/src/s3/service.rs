@@ -1986,7 +1986,7 @@ impl S3 for ArunaS3Service {
                 .await;
         }
         let requested_range = req.input.range;
-        let link_range = requested_range;
+        let link_read = (requested_range, req.input.if_match.clone());
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket;
         let key = req.input.key;
@@ -2053,7 +2053,7 @@ impl S3 for ArunaS3Service {
         if let Err(aruna_operations::s3::object::get::GetObjectError::Link(linked)) = &result {
             let bucket = response_bucket.as_str();
             return self
-                .follow_get(&user_access, bucket, linked, link_range)
+                .follow_get(&user_access, bucket, linked, link_read)
                 .await;
         }
         let result = result.map_err(IntoS3Error::into_s3_error);

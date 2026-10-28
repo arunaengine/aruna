@@ -1552,25 +1552,27 @@ async fn subpath_hides_siblings() {
     assert_eq!(keys, vec!["imaging/scan-a", "imaging/scan-b"]);
 }
 
-#[tokio::test]
-async fn hides_link_prefixes() {
-    // A folder that holds only a link to an unreadable target is no common prefix.
-    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
-    grant_group_owner(&service, &user_access, group_id).await;
+/// Writes a link at `study/links/db` to `bucket/key` of `group_id`, recording `etag`.
+async fn write_link(
+    service: &ArunaS3Service,
+    user_access: &UserAccess,
+    (bucket, key, group_id): (&str, &str, Ulid),
+    etag: &str,
+) {
     let target = aruna_core::structs::storage::link::LinkTarget {
         arn: aruna_core::structs::storage::replication::VersionedObjectArn {
             realm_id: service.realm_id,
             node_id: service.node_id,
-            bucket: "hidden".to_string(),
-            key: "db".to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
             version: Ulid::generate(),
         },
-        group_id: Ulid::generate(),
+        group_id,
     };
     let version_id = Ulid::generate();
     let version = BlobVersion::reference(
         target.binding(),
-        source_metadata(4, "etag"),
+        source_metadata(4, etag),
         UNIX_EPOCH,
         user_access.user_identity,
         UNIX_EPOCH,
@@ -1589,6 +1591,58 @@ async fn hides_link_prefixes() {
         "study",
         "links/db",
         version_id,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn relinked_get_fails() {
+    // A GET naming the ETag of an earlier target fails once the key links elsewhere, so
+    // ranged reads never mix the bytes of two targets.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    write_link(
+        &service,
+        &user_access,
+        ("study", "imaging/scan-a", group_id),
+        "v2",
+    )
+    .await;
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let request = S3Request {
+        input: s3s::dto::GetObjectInput {
+            bucket: "study".to_string(),
+            key: "links/db".to_string(),
+            if_match: Some(s3s::dto::ETagCondition::ETag(s3s::dto::ETag::Strong(
+                "v1".to_string(),
+            ))),
+            ..Default::default()
+        },
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let error = service.get_object(request).await.unwrap_err();
+    assert_eq!(error.code(), &s3s::S3ErrorCode::PreconditionFailed);
+}
+
+#[tokio::test]
+async fn hides_link_prefixes() {
+    // A folder that holds only a link to an unreadable target is no common prefix.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    write_link(
+        &service,
+        &user_access,
+        ("hidden", "db", Ulid::generate()),
+        "etag",
     )
     .await;
     let mut extensions = Extensions::new();

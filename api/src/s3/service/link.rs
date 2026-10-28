@@ -9,12 +9,14 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::link::LinkTarget;
+use aruna_operations::jobs::source_read::READ_OPERATION;
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::link::{
-    LinkCaller, LinkError, LinkSource, create_link, head_target, read_target, target_visible,
+    LinkCaller, LinkError, LinkSource, authorize_target, create_link, head_target, read_target,
+    target_visible,
 };
-use s3s::dto::{ETag, GetObjectOutput, StreamingBlob};
+use s3s::dto::{ETag, ETagCondition, GetObjectOutput, StreamingBlob};
 use s3s::{S3Response, S3Result, s3_error};
 
 use super::ArunaS3Service;
@@ -67,18 +69,31 @@ impl ArunaS3Service {
             .map_err(link_error)
     }
 
-    /// A GetObject of a link: the target's bytes, or the asked range of them.
+    /// A GetObject of a link: the target's bytes, or the asked range of them. `If-Match` holds
+    /// against the recorded target, so a read after a relink fails instead of mixing targets.
     pub(super) async fn follow_get(
         &self,
         access: &UserAccess,
         bucket: &str,
         linked: &(VersionSourceBinding, SourceMetadata),
-        range: Option<s3s::dto::Range>,
+        (range, if_match): (Option<s3s::dto::Range>, Option<ETagCondition>),
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let (binding, recorded) = linked;
         let target = LinkTarget::of(binding, self.realm_id)
             .ok_or_else(|| s3_error!(InternalError, "The link record is malformed"))?;
         let caller = self.link_caller(access, bucket).await;
+        let recorded_etag = recorded.etag.as_deref().map(|etag| etag.trim_matches('"'));
+        let held = match &if_match {
+            None | Some(ETagCondition::Any) => true,
+            Some(ETagCondition::ETag(etag)) => recorded_etag == Some(etag.value()),
+        };
+        if !held {
+            // Only a caller who may read the target learns that its ETag differs.
+            authorize_target(&self.state, &caller.auth, &target, READ_OPERATION)
+                .await
+                .map_err(link_error)?;
+            return Err(s3_error!(PreconditionFailed, "The ETag does not match"));
+        }
         let resolved = range
             .map(object_range_request)
             .map(|range| range.resolve(recorded.content_length))
