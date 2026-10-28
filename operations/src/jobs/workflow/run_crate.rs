@@ -36,8 +36,8 @@ const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket"
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{
-    put_crate_outcome, put_crate_status, read_crate_status, read_job_record, read_launch_record,
-    read_run_link,
+    put_crate_outcome, put_crate_status, put_local_crate, read_crate_status, read_job_record,
+    read_launch_record, read_run_link,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
@@ -112,10 +112,10 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
     };
     if device {
         if saved_id.is_none()
-            && let Err(error) = put_crate_status(storage, for_job, &RunCrateStatus::Local).await
+            && let Err(error) = keep_local_crate(ctx, &parent, spec).await
         {
             return JobRunOutcome::Failed(JobError::retryable(format!(
-                "run crate status write failed: {error}"
+                "local run crate write failed: {error}"
             )));
         }
         return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
@@ -123,6 +123,27 @@ pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome 
         });
     }
     record_crate(&ctx.driver, for_job, &parent, spec, saved_id).await
+}
+
+/// Builds the crate of a device run and keeps it here with the `Local` status; it names this
+/// device's own versions and leaves the device only through publication.
+async fn keep_local_crate(
+    ctx: &JobContext,
+    parent: &JobRecord,
+    spec: &ExecutionSpec,
+) -> Result<(), String> {
+    let context = ctx.driver.as_ref();
+    let storage = &context.storage_handle;
+    let launch = read_launch_record(storage, parent).await?;
+    let realm_id = ctx.driver.serving_realm(parent.created_by.realm_id);
+    let jsonld = build_crate_jsonld(
+        parent,
+        spec,
+        (realm_id, None),
+        &BTreeMap::new(),
+        launch.as_ref(),
+    );
+    put_local_crate(storage, parent.job_id, &jsonld).await
 }
 
 /// The owner this node is bound to, `None` for realm infrastructure. A node the stored realm

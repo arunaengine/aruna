@@ -17,7 +17,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{RemoteBinding, SyncRefusal};
 use aruna_operations::device::compute::{ComputeStatus, compute_status};
 use aruna_operations::device::publish_run::{
-    PublishRunError, PublishRunInput, PublishedRun, publish_run,
+    PublishRunError, PublishRunInput, PublishedRun, local_run_crate, publish_run,
 };
 
 use crate::auth::require_owner;
@@ -34,6 +34,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(DeviceComputeDoc::openapi())
         .routes(routes!(get_device_compute))
         .routes(routes!(publish_device_run))
+        .routes(routes!(get_local_crate))
 }
 
 /// The local executor and the owner's runs on it.
@@ -288,6 +289,45 @@ async fn publish_device_run(
     .await
     .map_err(map_publish_error)?;
     Ok(Json(published.into()))
+}
+
+#[utoipa::path(
+    get,
+    path = "/device/compute/runs/{job_id}/crate",
+    tag = "device",
+    summary = "Read the run crate of a local run",
+    description = r#"Returns the RO-Crate this device wrote for one of its finished local runs.
+
+**Authentication**: unrestricted realm bearer token belonging to the user this device is enrolled
+for.
+
+**Behavior**
+- Every finished local run gets this crate automatically. It stays on the device: its root is
+  `./`, and its inputs and outputs name this device's exact versions.
+- Publishing the run writes a separate crate in the realm that names the realm copies; this one
+  stays on the device.
+- A run without a local crate, such as a notebook session or a run still being finished, is 404."#,
+    params(("job_id" = String, Path, description = "Job id of the local run: a 26-character ULID; an unparseable id is 404")),
+    responses(
+        (status = 200, description = "The crate JSON-LD", body = Object),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller is not the device owner", body = ErrorResponse),
+        (status = 404, description = "No such local run or no crate for it, or this node is not a user node", body = ErrorResponse),
+        (status = 503, description = "This device could not read its state now", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_local_crate(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(job_id): Path<String>,
+) -> ServerResult<Json<serde_json::Value>> {
+    let auth = require_owner(&state, auth).await?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let jsonld = local_run_crate(&state.get_ctx(), job_id, auth.user_id)
+        .await
+        .map_err(map_publish_error)?;
+    Ok(Json(jsonld))
 }
 
 #[cfg(test)]

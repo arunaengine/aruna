@@ -623,6 +623,52 @@ pub async fn put_crate_outcome(
     .await
 }
 
+/// Stores the crate of an unpublished local run with its `Local` status in one batch.
+pub async fn put_local_crate(
+    storage: &StorageHandle,
+    job_id: JobId,
+    jsonld: &str,
+) -> Result<(), String> {
+    let key = aruna_core::structs::execution::job::run_crate_key(job_id);
+    let status = RunCrateStatus::Local
+        .to_bytes()
+        .map_err(|error| error.to_string())?;
+    batch_write(
+        storage,
+        vec![
+            (
+                RUN_CRATE_KEYSPACE.to_string(),
+                key.clone(),
+                ByteView::from(status),
+            ),
+            (
+                aruna_core::keyspaces::LOCAL_CRATE_KEYSPACE.to_string(),
+                key,
+                ByteView::from(jsonld.as_bytes().to_vec()),
+            ),
+        ],
+        None,
+    )
+    .await
+}
+
+/// The crate JSON-LD of a local run, while this device keeps one.
+pub async fn read_local_crate(
+    storage: &StorageHandle,
+    job_id: JobId,
+) -> Result<Option<String>, String> {
+    let key = aruna_core::structs::execution::job::run_crate_key(job_id);
+    read_raw(
+        storage,
+        aruna_core::keyspaces::LOCAL_CRATE_KEYSPACE,
+        key,
+        None,
+    )
+    .await?
+    .map(|value| String::from_utf8(value.to_vec()).map_err(|error| error.to_string()))
+    .transpose()
+}
+
 /// Read the run link of a physical job id, if recorded.
 pub async fn read_run_link(
     storage: &StorageHandle,

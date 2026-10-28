@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 use crate::device::sync::pull::forward_pull;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::JobRunOutcome;
-use crate::jobs::store::{read_crate_status, read_job_record};
+use crate::jobs::store::{read_crate_status, read_job_record, read_local_crate};
 use crate::jobs::workflow::run_crate::record_crate;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::get_config::GetConfigOperation;
@@ -177,6 +177,27 @@ pub async fn publish_run(
         outputs: copies,
         run_crate,
     })
+}
+
+/// The crate this device keeps for one of the owner's local runs.
+pub async fn local_run_crate(
+    context: &DriverContext,
+    job_id: JobId,
+    owner: UserId,
+) -> Result<serde_json::Value, PublishRunError> {
+    let storage = &context.storage_handle;
+    let record = read_job_record(storage, job_id, None)
+        .await
+        .map_err(PublishRunError::Unavailable)?
+        .ok_or(PublishRunError::NotFound)?;
+    if record.created_by != owner {
+        return Err(PublishRunError::NotFound);
+    }
+    let jsonld = read_local_crate(storage, job_id)
+        .await
+        .map_err(PublishRunError::Unavailable)?
+        .ok_or(PublishRunError::NotFound)?;
+    serde_json::from_str(&jsonld).map_err(|error| PublishRunError::Unavailable(error.to_string()))
 }
 
 /// The target one publish froze before its first copy, and the copies once all are made.

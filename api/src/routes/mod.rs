@@ -306,6 +306,7 @@ pub(crate) mod tests {
         ("GET", "/data/sync/relationships"),
         ("GET", "/data/sync/relationships/{id}"),
         ("GET", "/device/compute"),
+        ("GET", "/device/compute/runs/{job_id}/crate"),
         ("GET", "/device/documents"),
         ("GET", "/device/drafts"),
         ("GET", "/device/drafts/{draft_id}"),
