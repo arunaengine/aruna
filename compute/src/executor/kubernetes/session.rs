@@ -82,6 +82,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for SessionReader<R> {
 
 pub(super) fn required_access(
     s3_mount: bool,
+    kubedal: bool,
 ) -> Vec<(
     &'static str,
     &'static str,
@@ -125,8 +126,13 @@ pub(super) fn required_access(
         ("networking.k8s.io", "networkpolicies", None, "patch"),
         ("storage.k8s.io", "storageclasses", None, "get"),
     ];
-    if s3_mount {
+    if s3_mount || kubedal {
         access.push(("storage.k8s.io", "csidrivers", None, "get"));
+    }
+    if kubedal {
+        for verb in ["create", "get", "list", "delete"] {
+            access.push(("kubedal.arunaengine.org", "datanodes", None, verb));
+        }
     }
     access
 }

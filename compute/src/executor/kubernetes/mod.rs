@@ -49,10 +49,10 @@ mod session;
 mod status;
 
 use manifest::{
-    HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_pv_manifest, data_pvc_manifest,
-    helper_pod, job_manifest, marker_manifest, marker_name, mount_buckets, mount_pv_manifest,
-    mount_pvc_manifest, needs_workspace, network_policies, policy_manifests, pvc_manifest,
-    secret_manifest, secret_name, session_mount, workspace_name,
+    HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_node_manifest, data_pv_manifest,
+    data_pvc_manifest, helper_pod, job_manifest, marker_manifest, marker_name, mount_buckets,
+    mount_pv_manifest, mount_pvc_manifest, needs_workspace, network_policies, policy_manifests,
+    pvc_manifest, secret_manifest, secret_name, session_mount, workspace_name,
 };
 use status::{
     job_pending, job_status, pod_started, pod_stuck_reason, task_started, task_state,
@@ -221,6 +221,51 @@ impl KubernetesBackend {
         Ok(())
     }
 
+    /// One KubeDAL DataNode per mounted bucket; a node left by this same attempt is reused.
+    async fn ensure_data_nodes(
+        &self,
+        context: &FenceContext,
+        layout: &StageLayout,
+    ) -> Result<(), BackendError> {
+        for (index, bucket) in mount_buckets(layout).iter().enumerate() {
+            let value = data_node_manifest(context, &self.config, index, bucket)?;
+            let node: DynamicObject = serde_json::from_value(value)
+                .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
+            let name = node.name_any();
+            match self
+                .data_nodes()
+                .create(&PostParams::default(), &node)
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if api_code(&error) == Some(409) => {
+                    let existing = self.data_nodes().get(&name).await.map_err(kube_error)?;
+                    let epoch = existing
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.get(EPOCH_ANNOTATION))
+                        .and_then(|epoch| epoch.parse::<u64>().ok());
+                    let same = epoch == Some(context.attempt_epoch)
+                        && existing.data["spec"]["config"]["bucket"].as_str() == Some(bucket);
+                    if !same {
+                        return Err(BackendError::Conflict(format!(
+                            "DataNode `{name}` belongs to another attempt"
+                        )));
+                    }
+                }
+                Err(error) => return Err(kube_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn data_nodes(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk("kubedal.arunaengine.org", "v1alpha1", "DataNode");
+        let resource = kube::api::ApiResource::from_gvk_with_plural(&gvk, "datanodes");
+        Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
+    }
+
     async fn ensure_data(
         &self,
         context: &FenceContext,
@@ -324,6 +369,20 @@ impl KubernetesBackend {
             .map_err(kube_error)?
         {
             delete_named(self.pvs(), &pv.name_any()).await?;
+        }
+        if self.config.kubedal.is_some() {
+            let params = ListParams::default().labels(&selector);
+            for node in self.data_nodes().list(&params).await.map_err(kube_error)? {
+                match self
+                    .data_nodes()
+                    .delete(&node.name_any(), &DeleteParams::default())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) if api_code(&error) == Some(404) => {}
+                    Err(error) => return Err(kube_error(error)),
+                }
+            }
         }
         Ok(())
     }
@@ -929,7 +988,7 @@ impl ExecutorBackend for KubernetesBackend {
         BackendCaps {
             file_staging: true,
             direct_s3: !self.config.s3_cidrs.is_empty(),
-            s3_mount: self.config.s3_mount_driver.is_some(),
+            s3_mount: self.config.mounts_inputs(),
             network_policy: worker_site.is_some(),
             local_site: false,
             worker_site,
@@ -954,9 +1013,12 @@ impl ExecutorBackend for KubernetesBackend {
             .get(&self.config.storage_class)
             .await
             .map_err(kube_error)?;
+        let drivers: Api<CSIDriver> = Api::all(self.client.clone());
         if let Some(driver) = &self.config.s3_mount_driver {
-            let drivers: Api<CSIDriver> = Api::all(self.client.clone());
             drivers.get(driver).await.map_err(kube_error)?;
+        }
+        if let Some(kubedal) = &self.config.kubedal {
+            drivers.get(&kubedal.driver).await.map_err(kube_error)?;
         }
         let accounts: Api<ServiceAccount> =
             Api::namespaced(self.client.clone(), &self.config.namespace);
@@ -964,9 +1026,10 @@ impl ExecutorBackend for KubernetesBackend {
             .get(&self.config.service_account)
             .await
             .map_err(kube_error)?;
-        for (group, resource, subresource, verb) in
-            session::required_access(self.config.s3_mount_driver.is_some())
-        {
+        for (group, resource, subresource, verb) in session::required_access(
+            self.config.s3_mount_driver.is_some(),
+            self.config.kubedal.is_some(),
+        ) {
             session::check_access(
                 self.client.clone(),
                 &self.config.namespace,
@@ -1043,7 +1106,10 @@ impl ExecutorBackend for KubernetesBackend {
             StagingMode::S3Mount => {
                 if !spec.s3_mounts.is_empty() {
                     self.ensure_secret(context, spec).await?;
-                    self.ensure_mounts(context, &layout).await?;
+                    match self.config.kubedal.is_some() {
+                        true => self.ensure_data_nodes(context, &layout).await?,
+                        false => self.ensure_mounts(context, &layout).await?,
+                    }
                 }
                 if needs_workspace(spec) {
                     self.ensure_pvc(context, workspace_bytes(spec)).await?;
@@ -1407,7 +1473,25 @@ impl KubernetesBackend {
             .list(&ListParams::default().labels(&mount_selector))
             .await
             .map_err(kube_error)?;
-        if pods.items.is_empty() && pvc.is_none() && marker.is_none() && mounts.items.is_empty() {
+        // A DataNode left alone is still this attempt's, so cleanup must not skip it.
+        let data_nodes = match self.config.kubedal.is_some() {
+            true => {
+                let params = ListParams::default().labels(&mount_selector);
+                self.data_nodes()
+                    .list(&params)
+                    .await
+                    .map_err(kube_error)?
+                    .items
+                    .len()
+            }
+            false => 0,
+        };
+        if pods.items.is_empty()
+            && pvc.is_none()
+            && marker.is_none()
+            && mounts.items.is_empty()
+            && data_nodes == 0
+        {
             return Ok(None);
         }
         let reference = pods
@@ -1484,7 +1568,7 @@ fn validate_spec(
             "Kubernetes tasks must run as 65534:65534".to_string(),
         ));
     }
-    if spec.staging_mode == StagingMode::S3Mount && config.s3_mount_driver.is_none() {
+    if spec.staging_mode == StagingMode::S3Mount && !config.mounts_inputs() {
         return Err(BackendError::InvalidSpec(
             "S3 mounts are disabled on this backend".to_string(),
         ));
@@ -1719,6 +1803,17 @@ where
     }
 }
 
+/// The workspace volume of a run: its disk request, else its staged inputs plus room to work.
+fn workspace_bytes(spec: &TaskSpec) -> u64 {
+    spec.resources.disk_bytes.unwrap_or_else(|| {
+        spec.inputs
+            .iter()
+            .fold(DEFAULT_WORKSPACE_BYTES, |total, input| {
+                total.saturating_add(input.size())
+            })
+    })
+}
+
 fn build_archive(
     tx: mpsc::Sender<Result<Bytes, BackendError>>,
     plan: StagePlan,
@@ -1798,17 +1893,6 @@ impl<R: Read> Read for ExactReader<R> {
             .min(buffer.len());
         let read = self.inner.read(&mut buffer[..limit])?;
         self.remaining = self.remaining.saturating_sub(read as u64);
-/// The workspace volume of a run: its disk request, else its staged inputs plus room to work.
-fn workspace_bytes(spec: &TaskSpec) -> u64 {
-    spec.resources.disk_bytes.unwrap_or_else(|| {
-        spec.inputs
-            .iter()
-            .fold(DEFAULT_WORKSPACE_BYTES, |total, input| {
-                total.saturating_add(input.size())
-            })
-    })
-}
-
         Ok(read)
     }
 }

@@ -39,6 +39,18 @@ pub(super) async fn build(
             },
             s3_port,
             s3_mount_driver,
+            // The region the existing S3 mounts sign with.
+            kubedal: kubernetes
+                .kubedal_driver
+                .clone()
+                .zip(workspace.clone())
+                .map(|(driver, endpoint)| {
+                    Box::new(aruna_compute::KubedalMount {
+                        driver,
+                        endpoint,
+                        region: "us-east-1".to_string(),
+                    })
+                }),
             policy_manifests: kubernetes.policy_manifests.clone(),
             service_account: kubernetes.service_account.clone(),
             execution_location: kubernetes.execution_location.clone(),
