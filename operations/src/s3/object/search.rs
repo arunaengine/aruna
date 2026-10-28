@@ -33,6 +33,7 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 mod index_search;
 
 pub use index_search::sealed_position;
+pub(crate) use index_search::{open_position, seal_position};
 
 const HEAD_SCAN_BATCH: usize = 1_000;
 pub const SEARCH_MAX_LIMIT: usize = 100;

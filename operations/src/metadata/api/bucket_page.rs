@@ -6,11 +6,12 @@ use super::{BucketPage, BucketSearchHit, MetadataApiError, NodeId};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-/// Scan position of one node: the last bucket it gave, and whether it reached its end.
+/// Scan position of one node: the last bucket it gave or its sealed scan position, and whether
+/// it reached its end.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct NodePosition {
     pub(super) node_id: [u8; 32],
-    pub(super) after: Option<String>,
+    pub(super) after: Option<Vec<u8>>,
     pub(super) done: bool,
 }
 
@@ -93,7 +94,7 @@ pub(super) fn merge_pages(
         let all_shown = taken.len() == given.hits.len();
         match (&given.scanned_to, taken.last()) {
             (Some(scanned_to), _) if all_shown => entry.after = Some(scanned_to.clone()),
-            (_, Some(last)) => entry.after = Some(last.bucket.clone()),
+            (_, Some(last)) => entry.after = Some(last.bucket.clone().into_bytes()),
             _ => {}
         }
         entry.done |= given.scanned_to.is_none() && given.hits.len() < limit && all_shown;
@@ -140,7 +141,11 @@ mod tests {
                     true => Vec::new(),
                     false => buckets
                         .iter()
-                        .filter(|bucket| after.as_deref().is_none_or(|after| **bucket > after))
+                        .filter(|bucket| {
+                            after
+                                .as_deref()
+                                .is_none_or(|after| bucket.as_bytes() > after)
+                        })
                         .take(limit)
                         .map(|bucket| hit(bucket, *node_id))
                         .collect(),
@@ -195,7 +200,7 @@ mod tests {
         // A node that left the realm ends its listing instead of keeping the cursor open.
         let gone = NodePosition {
             node_id: *node(9).as_bytes(),
-            after: Some("m".to_string()),
+            after: Some(b"m".to_vec()),
             done: false,
         };
         let stores = [(node(1), vec!["a"])];
@@ -207,7 +212,7 @@ mod tests {
         // A failed node that is still a member keeps its position for the next page.
         let failed = NodePosition {
             node_id: *node(2).as_bytes(),
-            after: Some("c".to_string()),
+            after: Some(b"c".to_vec()),
             done: false,
         };
         let (_, positions) = merge_pages(Vec::new(), (&[node(2)], &[]), vec![failed.clone()], 5);
@@ -219,16 +224,19 @@ mod tests {
         // A node whose scan was cut moves past its scan, not to its end.
         let cut = BucketPage {
             hits: vec![hit("b", node(1))],
-            scanned_to: Some("k".to_string()),
+            scanned_to: Some(b"k".to_vec()),
         };
         let (hits, positions) = merge_pages(vec![(node(1), cut)], (&[], &[]), Vec::new(), 5);
         assert_eq!(hits.len(), 1);
         let entry = NodePosition::of(&positions, node(1)).unwrap();
-        assert_eq!((entry.after.as_deref(), entry.done), (Some("k"), false));
+        assert_eq!(
+            (entry.after.as_deref(), entry.done),
+            (Some(&b"k"[..]), false)
+        );
         // A node left out by the fanout cap stays in the cursor, and a done node stays done.
         let done = NodePosition {
             node_id: *node(3).as_bytes(),
-            after: Some("z".to_string()),
+            after: Some(b"z".to_vec()),
             done: true,
         };
         let parts = vec![(node(1), BucketPage::default())];
@@ -247,7 +255,7 @@ mod tests {
                 node_id: *iroh::SecretKey::from_bytes(&[(index % 250) as u8 + 1; 32])
                     .public()
                     .as_bytes(),
-                after: Some(format!("bucket-{index:04}-{}", "x".repeat(40))),
+                after: Some(format!("bucket-{index:04}-{}", "x".repeat(40)).into_bytes()),
                 done: false,
             })
             .collect();

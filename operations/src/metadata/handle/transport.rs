@@ -826,7 +826,7 @@ impl MetadataHandle {
         auth_token: Option<AuthToken>,
         (query, limit): (String, usize),
         (group_id, database): (Option<GroupId>, bool),
-        start_after: Option<String>,
+        start_after: Option<Vec<u8>>,
     ) -> Result<BucketPage, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();

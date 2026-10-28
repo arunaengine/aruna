@@ -160,8 +160,8 @@ pub enum MetadataTransportMessage {
         query: String,
         limit: usize,
         group_id: Option<GroupId>,
-        /// Continues after this bucket name.
-        start_after: Option<String>,
+        /// Continues after this bucket name or this node's sealed scan position.
+        start_after: Option<Vec<u8>>,
         /// Only buckets whose metadata marks them as a database.
         database: bool,
     },

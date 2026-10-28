@@ -635,7 +635,7 @@ pub async fn search_buckets_distributed(
                     query,
                     limit,
                     group_id,
-                    start_after: start_after.map(|after| after.into_bytes().into()),
+                    start_after: start_after.map(Into::into),
                     database,
                 },
             )
@@ -694,7 +694,7 @@ pub async fn search_buckets_distributed(
 }
 
 /// Where a node's next page starts; `None` for a node that already reached its end.
-fn start_after(positions: &[NodePosition], node_id: NodeId) -> Option<Option<String>> {
+fn start_after(positions: &[NodePosition], node_id: NodeId) -> Option<Option<Vec<u8>>> {
     match NodePosition::of(positions, node_id) {
         Some(entry) if entry.done => None,
         entry => Some(entry.and_then(|entry| entry.after.clone())),

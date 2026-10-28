@@ -31,6 +31,7 @@ use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
 use crate::driver::{DriverContext, drive};
+use crate::s3::object::search::{open_position, seal_position};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchBucketsInput {
@@ -63,8 +64,9 @@ pub struct SearchBucketsOutput {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketPage {
     pub hits: Vec<BucketSearchHit>,
-    /// The last bucket scanned, past every hit; `None` when the scan was not cut.
-    pub scanned_to: Option<String>,
+    /// The last bucket scanned, past every hit, sealed so only this node reads it; `None` when
+    /// the scan was not cut.
+    pub scanned_to: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +120,8 @@ pub enum SearchBucketsError {
     NotFinished,
     #[error("bucket search scan budget exhausted")]
     Unavailable,
+    #[error("bucket search position is not valid here")]
+    Position,
 }
 
 #[derive(Debug, PartialEq)]
@@ -424,7 +428,12 @@ async fn search_with_budget(
     let limit = input.limit.clamp(1, SearchBucketsOperation::MAX_LIMIT);
     let mut evaluators: HashMap<(RealmId, GroupId), PolicyEvaluator> = HashMap::new();
     let mut visible: Vec<BucketSearchHit> = Vec::with_capacity(limit);
-    let mut start_after = input.start_after.clone();
+    // A cut scan's position comes back sealed, as it may name a bucket the caller cannot read.
+    let opened = (input.start_after.as_ref()).map(|after| open_position(after));
+    let mut start_after = opened
+        .transpose()
+        .map_err(|_| SearchBucketsError::Position)?
+        .map(Key::from);
     let mut scanned_rows = 0;
     let budget = max_scan_rows.min(SearchBucketsOperation::MAX_SCAN_ROWS);
     loop {
@@ -466,7 +475,7 @@ async fn search_with_budget(
         }
         match output.next_start_after {
             Some(key) if scanned_rows >= budget => {
-                let scanned_to = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
+                let scanned_to = seal_position(&key).map_err(|_| SearchBucketsError::Position)?;
                 return Ok(BucketPage {
                     hits: visible,
                     scanned_to: Some(scanned_to),
@@ -965,5 +974,45 @@ mod tests {
         assert!(databases[0].public);
         let metadata = databases[0].metadata.as_ref().unwrap();
         assert_eq!(metadata.title.as_deref(), Some("data-public"));
+
+        // A cut scan seals its position, which names the unreadable bucket it stopped at.
+        let input = SearchBucketsInput {
+            auth: AuthContext {
+                user_id: outsider,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            realm_id,
+            node_id,
+            query: "DATA".to_string(),
+            limit: 50,
+            group_id: None,
+            start_after: None,
+            database: false,
+        };
+        let cut = search_with_budget(&context, input.clone(), 1)
+            .await
+            .unwrap();
+        assert!(cut.hits.is_empty());
+        let sealed = cut.scanned_to.expect("the scan was cut");
+        assert!(!sealed.windows(12).any(|window| window == b"data-private"));
+        let resumed = SearchBucketsInput {
+            start_after: Some(sealed.clone().into()),
+            ..input.clone()
+        };
+        let rest = search_local_buckets(&context, resumed).await.unwrap();
+        let names: Vec<_> = rest.hits.iter().map(|hit| hit.bucket.as_str()).collect();
+        assert_eq!(names, ["data-public"]);
+        let mut forged = sealed;
+        *forged.last_mut().unwrap() ^= 1;
+        let forged = SearchBucketsInput {
+            start_after: Some(forged.into()),
+            ..input
+        };
+        assert_eq!(
+            search_local_buckets(&context, forged).await.unwrap_err(),
+            SearchBucketsError::Position
+        );
     }
 }

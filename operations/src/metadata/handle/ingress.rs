@@ -452,7 +452,7 @@ impl MetadataHandle {
                                     query,
                                     limit,
                                     group_id,
-                                    start_after: start_after.map(|after| after.into_bytes().into()),
+                                    start_after: start_after.map(Into::into),
                                     database,
                                 },
                             )
