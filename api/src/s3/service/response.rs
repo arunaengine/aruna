@@ -11,6 +11,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
+use aruna_core::user::validation::RESERVED_PREFIX;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::multipart::complete::CompleteUploadResult;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteOutcome;
@@ -43,7 +44,7 @@ pub(super) fn object_metadata(
     content_type: Option<&str>,
 ) -> std::collections::HashMap<String, String> {
     // Keys under the reserved prefix, such as release tags, are set by the server only.
-    metadata.retain(|key, _| !key.starts_with(aruna_core::user::validation::RESERVED_PREFIX));
+    metadata.retain(|key, _| !key.starts_with(RESERVED_PREFIX));
     if let Some(content_type) = content_type {
         metadata.insert(CONTENT_TYPE_KEY.to_string(), content_type.to_string());
     }
@@ -320,6 +321,8 @@ impl ArunaS3Service {
         version_created_at: Option<SystemTime>,
     ) -> ObjectResponseFields {
         let mut response_metadata = metadata.cloned().unwrap_or_default();
+        // Server tags such as release labels name `/`, which no S3 header may carry.
+        response_metadata.retain(|key, _| !key.starts_with(RESERVED_PREFIX));
         let content_type = response_metadata.remove(CONTENT_TYPE_KEY);
         if let Some(source_headers) = source_metadata
             .and_then(|metadata| self.source_metadata_headers(metadata, last_refresh))
