@@ -58,6 +58,15 @@ pub struct SearchBucketsOutput {
     pub scanned_rows: usize,
 }
 
+/// One node's page: its readable hits, and where its scan stopped when the row budget ran out
+/// before the end.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketPage {
+    pub hits: Vec<BucketSearchHit>,
+    /// The last bucket scanned, past every hit; `None` when the scan was not cut.
+    pub scanned_to: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketSearchHit {
     pub arn: String,
@@ -170,11 +179,10 @@ impl SearchBucketsOperation {
     }
 
     fn emit_bucket_scan(&mut self) -> Effects {
-        let Some(remaining) = self.max_scan_rows.checked_sub(self.scanned_rows) else {
-            return self.fail(SearchBucketsError::Unavailable);
-        };
+        // A used-up budget ends the page at the scan position, so the next page goes on there.
+        let remaining = self.max_scan_rows.saturating_sub(self.scanned_rows);
         if remaining == 0 {
-            return self.fail(SearchBucketsError::Unavailable);
+            return self.finish();
         }
         self.state = SearchBucketsState::ScanBuckets;
         smallvec![Effect::Storage(StorageEffect::Iter {
@@ -404,7 +412,7 @@ impl SearchBucketsOperation {
 pub async fn search_local_buckets(
     context: &DriverContext,
     input: SearchBucketsInput,
-) -> Result<Vec<BucketSearchHit>, SearchBucketsError> {
+) -> Result<BucketPage, SearchBucketsError> {
     search_with_budget(context, input, SearchBucketsOperation::MAX_SCAN_ROWS).await
 }
 
@@ -412,20 +420,15 @@ async fn search_with_budget(
     context: &DriverContext,
     input: SearchBucketsInput,
     max_scan_rows: usize,
-) -> Result<Vec<BucketSearchHit>, SearchBucketsError> {
+) -> Result<BucketPage, SearchBucketsError> {
     let limit = input.limit.clamp(1, SearchBucketsOperation::MAX_LIMIT);
     let mut evaluators: HashMap<(RealmId, GroupId), PolicyEvaluator> = HashMap::new();
     let mut visible: Vec<BucketSearchHit> = Vec::with_capacity(limit);
     let mut start_after = input.start_after.clone();
     let mut scanned_rows = 0;
+    let budget = max_scan_rows.min(SearchBucketsOperation::MAX_SCAN_ROWS);
     loop {
-        let remaining = max_scan_rows
-            .min(SearchBucketsOperation::MAX_SCAN_ROWS)
-            .checked_sub(scanned_rows)
-            .ok_or(SearchBucketsError::Unavailable)?;
-        if remaining == 0 {
-            return Err(SearchBucketsError::Unavailable);
-        }
+        let remaining = budget.saturating_sub(scanned_rows);
         let output = drive(
             SearchBucketsOperation::with_budget(
                 SearchBucketsInput {
@@ -455,12 +458,27 @@ async fn search_with_budget(
             }
             visible.push(hit);
             if visible.len() >= limit {
-                return Ok(visible);
+                return Ok(BucketPage {
+                    hits: visible,
+                    scanned_to: None,
+                });
             }
         }
         match output.next_start_after {
+            Some(key) if scanned_rows >= budget => {
+                let scanned_to = String::from_utf8(key.to_vec()).map_err(ConversionError::from)?;
+                return Ok(BucketPage {
+                    hits: visible,
+                    scanned_to: Some(scanned_to),
+                });
+            }
             Some(key) => start_after = Some(key),
-            None => return Ok(visible),
+            None => {
+                return Ok(BucketPage {
+                    hits: visible,
+                    scanned_to: None,
+                });
+            }
         }
     }
 }
@@ -609,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_budget_fails() {
+    fn scan_budget_keeps_position() {
         let mut operation = SearchBucketsOperation::new(scan_input("missing", 1));
         operation.start();
         let mut remaining = SearchBucketsOperation::MAX_SCAN_ROWS;
@@ -632,7 +650,11 @@ mod tests {
             page += 1;
         }
 
-        assert_eq!(operation.finalize(), Err(SearchBucketsError::Unavailable));
+        // The used-up budget ends the page where the scan stopped, not with an error.
+        let output = operation.finalize().unwrap();
+        assert!(output.hits.is_empty());
+        assert_eq!(output.next_start_after, Some(b"cursor-1".to_vec().into()));
+        assert_eq!(output.scanned_rows, SearchBucketsOperation::MAX_SCAN_ROWS);
     }
 
     #[test]
@@ -886,7 +908,8 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .hits;
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].bucket, "data-public");
@@ -935,7 +958,8 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .hits;
         assert_eq!(databases.len(), 1);
         assert_eq!(databases[0].bucket, "data-public");
         assert!(databases[0].public);

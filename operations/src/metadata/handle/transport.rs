@@ -29,7 +29,7 @@ use crate::metadata::protocol::{
     read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
     write_message,
 };
-use crate::s3::bucket::search::BucketSearchHit;
+use crate::s3::bucket::search::BucketPage;
 use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
@@ -827,7 +827,7 @@ impl MetadataHandle {
         (query, limit): (String, usize),
         (group_id, database): (Option<GroupId>, bool),
         start_after: Option<String>,
-    ) -> Result<Vec<BucketSearchHit>, MetadataReadError> {
+    ) -> Result<BucketPage, MetadataReadError> {
         let started = Instant::now();
         let span = Span::current();
         let result = match send_remote_request(
@@ -851,9 +851,9 @@ impl MetadataHandle {
         };
         record_elapsed_ms(&span, "elapsed_ms", started);
         match &result {
-            Ok(hits) => {
+            Ok(page) => {
                 span.record("result", "ok");
-                span.record("hit_count", hits.len() as u64);
+                span.record("hit_count", page.hits.len() as u64);
             }
             Err(error) => record_error(&span, &format!("{error:?}")),
         }
