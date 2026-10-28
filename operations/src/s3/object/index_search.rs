@@ -52,7 +52,9 @@ pub(super) async fn search_ranges(
     let indexes = search.indexes.clone();
     let mut unready = Vec::new();
     let mut page = range_page(context, input, search, &mut unready).await?;
-    page.partial_ranges = partial_ranges(context, input, &unready).await?;
+    page.partial_ranges = (unready.iter())
+        .filter_map(|(range_id, partial)| Some((*range_id, partial.clone()?)))
+        .collect();
     if let (Some(indexes), false) = (indexes, unready.is_empty()) {
         let bucket = input.bucket.as_deref().unwrap_or_default();
         // Progress is a hint, so a failed read leaves it out.
@@ -62,26 +64,6 @@ pub(super) async fn search_ranges(
             .collect();
     }
     Ok(page)
-}
-
-/// The partial ranges of `unready` with the key each is indexed through, shown only if the
-/// caller may read it, so a partial range never names a hidden key.
-async fn partial_ranges(
-    context: &DriverContext,
-    input: &SearchObjectsInput,
-    unready: &[(Ulid, Option<String>)],
-) -> Result<Vec<(Ulid, Option<String>)>, SearchObjectsError> {
-    let bucket = input.bucket.as_deref().unwrap_or_default();
-    let mut evaluators = HashMap::new();
-    let mut partial = Vec::new();
-    for (range_id, through) in unready {
-        let Some(through) = through else {
-            continue;
-        };
-        let shown = readable(context, input, bucket, &mut evaluators, through).await?;
-        partial.push((*range_id, shown.then(|| through.clone())));
-    }
-    Ok(partial)
 }
 
 /// Whether the caller may read `key`, a building index's cursor.
@@ -100,11 +82,12 @@ async fn readable(
     Ok(false)
 }
 
+/// Adds each incomplete range to `unready`, a partial one with the cursor key it may show.
 async fn range_page(
     context: &DriverContext,
     input: &SearchObjectsInput,
     search: RangeSearch,
-    unready: &mut Vec<(Ulid, Option<String>)>,
+    unready: &mut Vec<(Ulid, Option<Option<String>>)>,
 ) -> Result<SearchNodePage, SearchObjectsError> {
     let bucket = input.bucket.clone().unwrap_or_default();
     let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
@@ -150,13 +133,13 @@ async fn range_page(
                 incomplete += 1;
                 continue;
             };
-            // Coverage below a hidden cursor would reveal where the cursor is.
-            if let Some(through) = through
-                && (!ends_by(&end, &through)
-                    || !readable(context, input, &bucket, &mut evaluators, &through).await?)
-            {
-                unready.push((*range_id, Some(through)));
-                incomplete += 1;
+            // Checked once wherever the query ends, so neither coverage nor timing shows the cursor.
+            if let Some(through) = through {
+                let shown = readable(context, input, &bucket, &mut evaluators, &through).await?;
+                if !shown || !ends_by(&end, &through) {
+                    unready.push((*range_id, Some(shown.then_some(through))));
+                    incomplete += 1;
+                }
             }
             examined += found.examined;
             let (mut keys, last) = (found.keys, found.last);

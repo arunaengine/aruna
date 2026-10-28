@@ -57,7 +57,7 @@ pub(crate) fn searched() -> (DistributionSnapshot, Vec<u8>) {
     with_settings(true, 0, settings)
 }
 
-fn with_settings(
+pub(crate) fn with_settings(
     active: bool,
     replicas: usize,
     settings: DistributionSettings,

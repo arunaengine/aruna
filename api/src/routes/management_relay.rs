@@ -225,7 +225,10 @@ async fn relay(
             outgoing = outgoing.header(name, value.clone());
         }
         match outgoing.send().await {
-            Ok(response) if may_try_response(route, response.status()) => {
+            Ok(response)
+                if may_try_response(route, response.status())
+                    || gateway_failed(&method, response.status()) =>
+            {
                 unknown = Some((url, response));
             }
             Ok(response) => return relayed_response(route, &url, response).await,
@@ -252,6 +255,16 @@ async fn relay(
 /// any processing; later failures are only safe to repeat for an idempotent method.
 fn may_try_next(method: &Method, is_connect: bool) -> bool {
     is_connect || method == Method::GET
+}
+
+/// Whether a gateway answer may move a GET on: an ingress in front of a stopped management node
+/// answers 502, 503 or 504 instead of refusing the connection.
+fn gateway_failed(method: &Method, status: StatusCode) -> bool {
+    method == Method::GET
+        && matches!(
+            status,
+            StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+        )
 }
 
 /// Routes whose state lives in one management node's local store: a database request is kept

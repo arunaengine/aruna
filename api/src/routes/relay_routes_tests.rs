@@ -155,6 +155,30 @@ async fn relays_to_management() {
 }
 
 #[tokio::test]
+async fn stopped_management_skipped() {
+    // An ingress answers 503 for a stopped management node; the next one mints the token.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stopped = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE });
+    let ingress = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    let (upstream, handle) = fake_upstream().await;
+    let fixture = setup(vec![stopped, upstream]).await;
+    let response = relay_app(fixture.state.clone())
+        .oneshot(token_request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"{\"relayed\":true}");
+    ingress.abort();
+    handle.abort();
+}
+
+#[tokio::test]
 async fn relays_preconditions() {
     // Precondition headers reach the management node and its `ETag` comes back.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
