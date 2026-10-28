@@ -98,6 +98,8 @@ pub enum SubmitJobError {
     /// The routed authority refused the caller's permission on the document.
     #[error("persistent id submission is not authorized")]
     AuthorityDenied,
+    #[error("{0}: input read denied")]
+    InputDenied(String),
     #[error("idempotency key already bound to job {existing_job_id} with a different plan")]
     JobPlanConflict { existing_job_id: JobId },
     #[error("invalid workspace: {0}")]

@@ -111,7 +111,7 @@ impl JobRequestError {
                 Self::ServiceUnavailableReason("job_placement_unavailable".to_string())
             }
             SubmitJobError::QuotaDenied(denied) => Self::ComputeQuotaDenied(denied),
-            SubmitJobError::AuthorityDenied => Self::Forbidden,
+            SubmitJobError::AuthorityDenied | SubmitJobError::InputDenied(_) => Self::Forbidden,
             other => Self::InternalError(other.to_string()),
         }
     }

@@ -955,7 +955,7 @@ pub(crate) fn map_submit_error(
             ServerError::ServiceUnavailableReason("job_placement_unavailable".to_string())
         }
         SubmitJobError::QuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
-        SubmitJobError::AuthorityDenied => ServerError::Forbidden,
+        SubmitJobError::AuthorityDenied | SubmitJobError::InputDenied(_) => ServerError::Forbidden,
         moving @ SubmitJobError::RangeMoving(_) => {
             ServerError::ServiceUnavailableReason(moving.to_string())
         }

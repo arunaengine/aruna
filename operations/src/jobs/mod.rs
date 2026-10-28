@@ -29,6 +29,7 @@ mod route;
 pub mod runs;
 pub mod runtime;
 pub mod service;
+pub mod source_read;
 pub mod staging;
 pub mod store;
 pub mod submit;
