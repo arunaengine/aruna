@@ -305,3 +305,34 @@ fn unwritten_run_status() {
     assert_eq!(entity["creativeWorkStatus"], "RunRecordDenied");
     assert_eq!(entity["description"], "metadata write access denied");
 }
+
+#[test]
+fn releases_join_export() {
+    // A version names the release that pins it, and says when membership was not checked
+    // everywhere.
+    let version = arn(1, "db/a.fasta");
+    let release = arn(2, "db/release.json");
+    let origin = json!({
+        "created_at": "2026-10-27T10:00:00Z",
+        "releases": [{
+            "crate_version": release,
+            "label": "6.0",
+            "upstream": [{"name": "DOI", "value": "10.5281/zenodo.1", "url": "https://doi.org/10.5281/zenodo.1"}]
+        }],
+        "releases_complete": false
+    });
+    let answers = BTreeMap::from([(version.clone(), origin)]);
+    let (document, _, _) = walk(&version, &answers);
+    assert_eq!(
+        node(&document, &version)["isPartOf"][0]["@id"],
+        release.as_str()
+    );
+    let entity = node(&document, &release);
+    assert_eq!(entity["version"], "6.0");
+    assert_eq!(
+        entity["isBasedOn"][0]["@id"],
+        "https://doi.org/10.5281/zenodo.1"
+    );
+    let marker = node(&document, &format!("{version}#release-membership"));
+    assert_eq!(marker["value"], "incomplete");
+}

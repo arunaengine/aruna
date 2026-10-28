@@ -22,6 +22,10 @@ const CRATE_SPEC: &str = "https://w3id.org/ro/crate/1.2";
 /// Marks a folder as a nested crate (RO-Crate 1.2).
 const NESTED_CRATE: &str = "https://w3id.org/ro/crate";
 
+/// Marks an entity whose release membership could not be checked everywhere.
+pub const RELEASE_MEMBERSHIP: &str = "https://w3id.org/aruna/terms/release-membership";
+pub const RELEASE_INCOMPLETE: &str = "Release membership could not be checked everywhere";
+
 /// What a hop reads next.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Target {
@@ -163,7 +167,41 @@ impl ProvenanceCrate {
             next.push(based_on(from));
         }
         self.database(&id, &origin["bucket_metadata"]);
+        self.releases(&id, origin);
         next
+    }
+
+    /// The releases that pin the version, and whether that could be checked everywhere.
+    fn releases(&mut self, id: &str, origin: &Value) {
+        for release in origin["releases"].as_array().into_iter().flatten() {
+            let Some(key) = release["crate_version"].as_str() else {
+                continue;
+            };
+            let mut entity = entity(key, "Dataset");
+            entity.insert(
+                "name".into(),
+                json!(format!("Release {}", text(&release["label"]))),
+            );
+            entity.insert("version".into(), release["label"].clone());
+            let links: Vec<Value> = (release["upstream"].as_array().into_iter().flatten())
+                .filter_map(|identifier| identifier["url"].as_str())
+                .map(|url| json!({ "@id": url }))
+                .collect();
+            if !links.is_empty() {
+                entity.insert("isBasedOn".into(), Value::Array(links));
+            }
+            self.put_new(key, &entity);
+            self.add_ref(id, "isPartOf", key);
+        }
+        if origin["releases_complete"] == json!(false) {
+            let key = format!("{id}#release-membership");
+            let mut property = entity(&key, "PropertyValue");
+            property.insert("propertyID".into(), json!(RELEASE_MEMBERSHIP));
+            property.insert("value".into(), json!("incomplete"));
+            property.insert("description".into(), json!(RELEASE_INCOMPLETE));
+            self.put(&key, &property);
+            self.add_ref(id, "additionalProperty", &key);
+        }
     }
 
     /// The bucket's database metadata now, as a Dataset the version is part of.
