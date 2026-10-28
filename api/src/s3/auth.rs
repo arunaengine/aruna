@@ -8,6 +8,7 @@ use super::service::forwarded_digest;
 use super::util::{anonymous_read_allowed, operation_permission};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
+use crate::s3::service::InputView;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use aruna_core::errors::StorageError;
@@ -30,6 +31,7 @@ use aruna_operations::auth::request_policy::{
 use aruna_operations::distribution::delegate::{DelegateError, accept_delegation};
 use aruna_operations::distribution::guard::{delegated_range, delegated_read};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::jobs::workflow::input_view::view_job;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -242,6 +244,18 @@ impl S3Access for AuthProvider {
         }
         self.check_cutoff(&access_key_id, &user_access.user_identity)
             .await?;
+
+        // A run's own credential reads its input view; each read is authorized at its source.
+        let view =
+            (cx.s3_path().get_bucket_name()).and_then(|bucket| view_job(&access_key_id, bucket));
+        if let Some(job_id) = view {
+            if !matches!(action, Action::Read) {
+                return Err(s3_error!(AccessDenied, "The input view is read only"));
+            }
+            cx.extensions_mut().insert(InputView { job_id });
+            cx.extensions_mut().insert(user_access);
+            return Ok(());
+        }
 
         let required_permission = match &action {
             Action::Read => Permission::READ,

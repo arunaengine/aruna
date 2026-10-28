@@ -23,6 +23,9 @@ mod multipart;
 mod object;
 mod response;
 
+mod view;
+
+pub(crate) use self::view::InputView;
 use self::attributes::{
     RequestedAttributes, attributes_checksum, attributes_output, attributes_parts, parse_max_parts,
     parse_part_marker,
@@ -398,6 +401,9 @@ impl S3 for ArunaS3Service {
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
         debug!(bucket = %req.input.bucket, "Received HEAD BUCKET Request");
+        if let Some(view) = req.extensions.get::<InputView>().copied() {
+            return self.view_head_bucket(view).await;
+        }
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -649,6 +655,9 @@ impl S3 for ArunaS3Service {
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         debug!(
+        if let Some(view) = req.extensions.get::<InputView>().copied() {
+            return self.view_list(view, req.input).await;
+        }
             bucket = %req.input.bucket,
             prefix = ?req.input.prefix,
             max_keys = ?req.input.max_keys,
@@ -1948,6 +1957,9 @@ impl S3 for ArunaS3Service {
                 .unwrap_or(user_access.group_id);
             return self
                 .folder_index(&req.extensions, group_id, &req.input.bucket, &req.input.key)
+        if let Some(view) = req.extensions.get::<InputView>().copied() {
+            return self.view_get(view, req.input).await;
+        }
                 .await;
         }
         let requested_range = req.input.range;
@@ -2260,6 +2272,9 @@ impl S3 for ArunaS3Service {
                 &key,
                 req.uri.query(),
                 &req.headers,
+        if let Some(view) = req.extensions.get::<InputView>().copied() {
+            return self.view_head(view, req.input).await;
+        }
             )
         };
         let pinned = version_id.is_some();
