@@ -540,6 +540,7 @@ pub fn release_crate(spec: &ReleaseSpec, files: &[ReleaseFile]) -> Vec<u8> {
             }
             let id = file.version.to_id();
             let pins = [
+                ("source-path", Some(&pin.path)),
                 ("source-etag", etag.as_ref()),
                 ("source-version", pin.source_version.as_ref()),
             ];
@@ -611,17 +612,13 @@ pub async fn release_files(
             let Some(version) = scope.exact(&key, origin.version_id) else {
                 continue;
             };
-            let size = (object.location.as_ref().map(|location| location.blob_size))
-                .or(object
-                    .source_metadata
-                    .as_ref()
-                    .map(|metadata| metadata.content_length))
-                .unwrap_or_default();
+            // Every field comes from the one version the origin read pinned.
+            let size = origin.size.unwrap_or_default();
             let pin = origin.source.map(|source| {
                 let pin = SourcePin {
                     url: source.url,
                     path: source.path,
-                    source_version: None,
+                    source_version: source.version,
                 };
                 (pin, source.etag)
             });
@@ -682,7 +679,7 @@ mod tests {
                     SourcePin {
                         url: Some("https://zenodo.org/records/1/files/b.tsv".to_string()),
                         path: "b.tsv".to_string(),
-                        source_version: None,
+                        source_version: Some("3".to_string()),
                     },
                     Some("\"abc\"".to_string()),
                 )),
@@ -706,5 +703,11 @@ mod tests {
             .find(|entity| entity["@id"] == etag.as_str())
             .unwrap();
         assert_eq!(property["value"], "\"abc\"");
+        // The stored pin keeps its path and source version.
+        for (term, value) in [("source-path", "b.tsv"), ("source-version", "3")] {
+            let id = format!("{}#{term}", version(3).to_id());
+            let entity = graph(&crate_json).find(|entity| entity["@id"] == id.as_str());
+            assert_eq!(entity.unwrap()["value"], value);
+        }
     }
 }

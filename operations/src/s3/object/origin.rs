@@ -7,13 +7,13 @@ use std::time::SystemTime;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::source_access::SourceDigest;
 use aruna_core::structs::identity::identifier::{CompiledParser, Identifier};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
+    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
 use aruna_core::structs::storage::global_id::GlobalId;
@@ -43,6 +43,8 @@ pub enum OriginError {
 pub struct SourceView {
     pub url: Option<String>,
     pub path: String,
+    /// The source's own version the binding names, when it names one.
+    pub version: Option<String>,
     pub etag: Option<String>,
     pub digests: Vec<(ChecksumAlgorithm, SourceDigest)>,
 }
@@ -66,6 +68,8 @@ pub struct OriginView {
     pub identifiers: Vec<Identifier>,
     /// The BLAKE3 of the bytes, for a materialized version only; never a reference identity.
     pub content_hash: Option<[u8; 32]>,
+    /// The size of exactly this version: its stored blob, or a reference's observed length.
+    pub size: Option<u64>,
 }
 
 /// Reads the origin of `version_id`, or of the current version, of a local bucket's key.
@@ -118,7 +122,9 @@ pub async fn read_origin(
     let parser = (metadata.as_ref())
         .and_then(|metadata| metadata.parser.as_ref())
         .and_then(|parser| CompiledParser::compile(parser).ok());
+    let size = version_size(context, &version).await?;
     let mut view = view(version_id, global, version);
+    view.size = size;
     let source_url = view
         .source
         .as_ref()
@@ -160,6 +166,7 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         } => Some(SourceView {
             url: public_source_url(&source.descriptor),
             path: source.descriptor.source_path.clone(),
+            version: source.descriptor.version_selector.clone(),
             etag: cached_metadata.etag.clone(),
             digests: cached_metadata
                 .digests
@@ -177,6 +184,7 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         } => Some(SourceView {
             url: public_source_url(&source.descriptor),
             path: source.descriptor.source_path.clone(),
+            version: source.descriptor.version_selector.clone(),
             etag: None,
             digests: Vec::new(),
         }),
@@ -200,7 +208,30 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         projection,
         bucket_metadata: None,
         identifiers: Vec::new(),
+        size: None,
     }
+}
+
+/// The size of one version: its blob location row, or a reference's cached observation.
+async fn version_size(
+    context: &DriverContext,
+    version: &BlobVersion,
+) -> Result<Option<u64>, OriginError> {
+    if let BlobVersionState::Reference {
+        cached_metadata, ..
+    } = &version.state
+    {
+        return Ok(Some(cached_metadata.content_length));
+    }
+    let Some(location) = version.location_key() else {
+        return Ok(None);
+    };
+    let Some(value) = read(context, BLOB_LOCATIONS_KEYSPACE, location.to_bytes()).await? else {
+        return Ok(None);
+    };
+    let location = BackendLocation::from_bytes(&value)
+        .map_err(|error| OriginError::Storage(error.to_string()))?;
+    Ok(Some(location.blob_size))
 }
 
 async fn read(

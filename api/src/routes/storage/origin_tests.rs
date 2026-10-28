@@ -303,6 +303,7 @@ fn view_keeps_fields() {
         source: Some(aruna_operations::s3::object::origin::SourceView {
             url: Some("https://s3.example.org/a".to_string()),
             path: "a".to_string(),
+            version: None,
             etag: Some("etag".to_string()),
             digests: vec![
                 (ChecksumAlgorithm::Md5, digest),
@@ -321,6 +322,7 @@ fn view_keeps_fields() {
         bucket_metadata: None,
         identifiers: Vec::new(),
         content_hash: None,
+        size: None,
     };
     let response = OriginResponse::from(view);
     assert_eq!(response.global_id, Some(global.to_url()));
@@ -385,6 +387,7 @@ fn origin_kinds_named() {
         bucket_metadata: None,
         identifiers: Vec::new(),
         content_hash: None,
+        size: None,
     };
     let bodies: Vec<_> = kinds
         .into_iter()
