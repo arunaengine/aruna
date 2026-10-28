@@ -703,6 +703,39 @@ async fn success_clears_error() {
     assert!(done.last_error.is_none());
 }
 
+// A pause shown while the attempt runs is gone once the attempt fails or is cancelled.
+#[tokio::test]
+async fn pause_cleared_on_finish() {
+    let (_dir, storage) = temp_storage();
+    let paused = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(60));
+    for (seed, cancel) in [(0x46u8, false), (0x47u8, true)] {
+        let job_id = JobId::from_bytes([seed; 16]);
+        insert_job(&storage, &queued_record(job_id)).await.unwrap();
+        let ClaimOutcome::Claimed(record) = claim_job(&storage, job_id, node_id(3), 5_000)
+            .await
+            .unwrap()
+        else {
+            panic!("job must be claimed")
+        };
+        let token = record.claim.unwrap().claim_token;
+        transition_to_running(&storage, job_id, token, 5_500)
+            .await
+            .unwrap();
+        let mut progress = JobProgress::new("items");
+        progress.paused_until = paused;
+        renew_lease(&storage, job_id, token, 6_000, Some(progress))
+            .await
+            .unwrap();
+        let stored = read_job_record(&storage, job_id, None).await.unwrap();
+        assert_eq!(stored.unwrap().progress.paused_until, paused);
+        let finished = match cancel {
+            true => cancel_running_job(&storage, job_id, token, 7_000).await,
+            false => fail_job(&storage, job_id, token, JobError::retryable("x"), 7_000).await,
+        };
+        assert_eq!(finished.unwrap().progress.paused_until, None);
+    }
+}
+
 // Retried payload work starts over, so persisted progress must start over too.
 #[tokio::test]
 async fn retry_resets_progress() {
