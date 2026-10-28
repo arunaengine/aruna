@@ -64,6 +64,8 @@ pub const DISTRIBUTION_ACCEPT_KEYSPACE: &str = "distribution_accepted";
 pub const DISTRIBUTION_PUBLISHER_KEYSPACE: &str = "distribution_publishers";
 /// Snapshots whose publisher the realm config does not know yet, by publisher and set id.
 pub const DISTRIBUTION_PARKED_KEYSPACE: &str = "distribution_parked";
+/// Database parser events waiting for their entry, by topic and event; replay moves past them.
+pub const PARKED_PARSER_KEYSPACE: &str = "document_sync_parked_parsers";
 /// The revision number of each parked snapshot, so the bound is counted without the bodies.
 pub const PARKED_INDEX_KEYSPACE: &str = "distribution_parked_index";
 /// Ordered inventory of each distributed bucket: head and version rows by set id and position.
@@ -551,6 +553,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DISTRIBUTION_ACCEPT_KEYSPACE,
     DISTRIBUTION_PUBLISHER_KEYSPACE,
     DISTRIBUTION_PARKED_KEYSPACE,
+    PARKED_PARSER_KEYSPACE,
     PARKED_INDEX_KEYSPACE,
     INVENTORY_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE,
