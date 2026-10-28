@@ -37,6 +37,7 @@ fn caller(node: &Node, recheck: Recheck) -> Caller {
         bearer: ValidatedBearer::new_for_test("caller-token"),
         recheck,
         deadline: Instant::now() + EXPORT_DEADLINE,
+        finish_by: Instant::now() + EXPORT_DEADLINE,
     }
 }
 
@@ -263,6 +264,32 @@ async fn crate_read_rechecks() {
     let valid = caller(&node, recheck(&node.owner, 1));
     let read = crate_read(&valid, &gone, "01K8W1C0000000000000000000").await;
     assert!(matches!(read, Some(Some(Read::Hidden | Read::Silent))));
+}
+
+#[tokio::test]
+async fn finish_window_kept() {
+    // A walk that used up its time still writes the root, which says it is incomplete.
+    let node = node_state().await;
+    let caller = Caller {
+        deadline: Instant::now(),
+        finish_by: Instant::now() + std::time::Duration::from_secs(30),
+        ..caller(&node, recheck(&node.owner, usize::MAX))
+    };
+    let start = arn(&node, node_id(LOCAL), "a.md", Ulid::from_bytes([5; 16]));
+    let root = exported_by(caller, &start).await;
+    let status = entity(&root, "./").unwrap()["creativeWorkStatus"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(status.starts_with("Incomplete"), "{status}");
+    let now = Instant::now();
+    let finish_by = now + std::time::Duration::from_secs(20);
+    assert_eq!(
+        walk_deadline(now, finish_by),
+        now + std::time::Duration::from_secs(15)
+    );
+    let far = now + EXPORT_DEADLINE;
+    assert_eq!(walk_deadline(now, far), far - FINISH_WINDOW);
 }
 
 #[test]

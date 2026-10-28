@@ -44,6 +44,8 @@ use crate::server::state::ServerState;
 
 /// The technical time limit of one export; the crate is marked incomplete when it is reached.
 const EXPORT_DEADLINE: Duration = Duration::from_secs(15 * 60);
+/// The most time kept back for writing the root and closing the ZIP.
+const FINISH_WINDOW: Duration = Duration::from_secs(60);
 /// Why a walk ends when the caller's token no longer holds.
 const REVOKED: &str = "the token expired or was revoked";
 /// Bytes buffered between the walk and the client.
@@ -114,10 +116,12 @@ pub async fn export_provenance(
             ));
         }
     };
-    let unix_now = aruna_core::time::unix_timestamp_secs();
+    let (now, unix_now) = (Instant::now(), aruna_core::time::unix_timestamp_secs());
+    let finish_by = export_deadline(now, unix_now, bearer.expires_at_secs());
     let caller = Caller {
         state,
-        deadline: export_deadline(Instant::now(), unix_now, bearer.expires_at_secs()),
+        deadline: walk_deadline(now, finish_by),
+        finish_by,
         bearer,
         recheck: Arc::new(|state, bearer| {
             Box::pin(async move {
@@ -134,6 +138,13 @@ pub async fn export_provenance(
 fn export_deadline(now: Instant, unix_now: u64, expires_at_secs: u64) -> Instant {
     let left = Duration::from_secs(expires_at_secs.saturating_sub(unix_now));
     now + left.min(EXPORT_DEADLINE)
+}
+
+/// The walk ends early enough to leave a finishing window: a quarter of the time, at most
+/// `FINISH_WINDOW`.
+fn walk_deadline(now: Instant, finish_by: Instant) -> Instant {
+    let left = finish_by.saturating_duration_since(now);
+    finish_by - (left / 4).min(FINISH_WINDOW)
 }
 
 /// Starts the walk and answers with the ZIP stream it writes.
@@ -181,7 +192,10 @@ struct Caller {
     state: Arc<ServerState>,
     bearer: ValidatedBearer,
     recheck: Recheck,
+    /// The walk ends here, leaving the finishing window for the root and the ZIP close.
     deadline: Instant,
+    /// The hard end of the export.
+    finish_by: Instant,
 }
 
 impl Caller {
@@ -281,8 +295,8 @@ async fn walk(
     finish(&caller, &gone, zip, built).await
 }
 
-/// Writes the root metadata and closes the ZIP. The root goes to a private temporary file first
-/// and is copied into the ZIP in pieces, never held whole.
+/// Writes the root metadata and closes the ZIP within the finishing window. The root goes to a
+/// private temporary file first and is copied into the ZIP in pieces, never held whole.
 async fn finish(
     caller: &Caller,
     gone: &CancellationToken,
@@ -297,7 +311,7 @@ async fn finish(
     let halt = stop.clone();
     let worker =
         tokio::task::spawn_blocking(move || spool_root(built, path, &|| halt.load(Relaxed)));
-    let spooled = match bounded(caller, gone, worker).await {
+    let spooled = match until(caller.finish_by, gone, worker).await {
         Some(Ok(Ok(spooled))) => spooled,
         // The worker owns its file and removes it once it sees the stop.
         _ => {
@@ -325,8 +339,8 @@ async fn finish(
         }
         entry.close().await.map_err(std::io::Error::other)
     };
-    if matches!(bounded(caller, gone, copied).await, Some(Ok(()))) {
-        let _ = bounded(caller, gone, zip.close()).await;
+    if matches!(until(caller.finish_by, gone, copied).await, Some(Ok(()))) {
+        let _ = until(caller.finish_by, gone, zip.close()).await;
     }
 }
 
@@ -382,15 +396,24 @@ fn record_run(
     }
 }
 
-/// Runs `read` until the export deadline or a disconnect; `None` when either came first.
+/// Runs `read` until the walk's deadline or a disconnect; `None` when either came first.
 async fn bounded<T>(
     caller: &Caller,
     gone: &CancellationToken,
     read: impl Future<Output = T>,
 ) -> Option<T> {
+    until(caller.deadline, gone, read).await
+}
+
+/// Runs `work` until `deadline` or a disconnect; `None` when either came first.
+async fn until<T>(
+    deadline: Instant,
+    gone: &CancellationToken,
+    work: impl Future<Output = T>,
+) -> Option<T> {
     tokio::select! {
         _ = gone.cancelled() => None,
-        answer = tokio::time::timeout_at(caller.deadline, read) => answer.ok(),
+        answer = tokio::time::timeout_at(deadline, work) => answer.ok(),
     }
 }
 
