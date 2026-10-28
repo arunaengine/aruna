@@ -340,6 +340,7 @@ dependencies = [
  "aruna-operations",
  "aruna-storage",
  "aruna-tasks",
+ "astral_async_zip",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -388,6 +389,7 @@ dependencies = [
  "utoipa-swagger-ui",
  "uuid",
  "zeroize",
+ "zip 9.0.3",
 ]
 
 [[package]]
@@ -514,6 +516,7 @@ dependencies = [
  "postcard",
  "prometheus-client",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -674,6 +677,7 @@ dependencies = [
  "quick-xml 0.42.0",
  "rand 0.10.3",
  "reqwest 0.13.5",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",

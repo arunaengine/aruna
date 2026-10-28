@@ -16,7 +16,7 @@ use aruna_operations::distribution::guard::{read_coordinator, route_read, route_
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::status::node_reach;
 use axum::body::Body;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -35,6 +35,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// The distributed bucket a relayed request is meant for; its target refuses another bucket.
 pub(crate) const RELAY_SET_HEADER: &str = "x-aruna-relay-set";
+/// The node a node-directed read is meant for; the target refuses a header naming another node.
+pub(crate) const RELAY_NODE_HEADER: &str = "x-aruna-relay-node";
 /// Bytes of a node's answer read at most; a longer answer fails instead of filling memory.
 pub(crate) const MAX_ANSWER_BYTES: usize = 16 * 1024 * 1024;
 
@@ -379,10 +381,29 @@ async fn send_get(
     forward: &RestForward,
     path: &str,
     bearer: Option<&ValidatedBearer>,
+    mut sent: HeaderMap,
+) -> ServerResult<Option<reqwest::Response>> {
+    let hop = HeaderValue::try_from(state.get_node_id().to_string());
+    let set = HeaderValue::try_from(forward.set_id.to_string());
+    let (Ok(hop), Ok(set)) = (hop, set) else {
+        return Err(ServerError::InternalError("relay header".to_string()));
+    };
+    sent.insert(RELAY_HOP_HEADER, hop);
+    sent.insert(RELAY_SET_HEADER, set);
+    get_node(state, forward.node_id, path, bearer, sent).await
+}
+
+/// Sends a GET of `path` with the caller's token and `sent` headers to `node_id`; `None` when
+/// it did not answer.
+pub(crate) async fn get_node(
+    state: &ServerState,
+    node_id: NodeId,
+    path: &str,
+    bearer: Option<&ValidatedBearer>,
     sent: HeaderMap,
 ) -> ServerResult<Option<reqwest::Response>> {
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
-    let urls = node_urls(state.get_ctx().as_ref(), forward.node_id).await;
+    let urls = node_urls(state.get_ctx().as_ref(), node_id).await;
     let Some(base) = urls.and_then(|urls| urls.api) else {
         return Ok(None);
     };
@@ -390,28 +411,70 @@ async fn send_get(
         .get(relay_url(&base, path))
         .headers(sent)
         .header(header::AUTHORIZATION, format!("Bearer {}", bearer.as_str()))
-        .header(RELAY_HOP_HEADER, state.get_node_id().to_string())
-        .header(RELAY_SET_HEADER, forward.set_id.to_string())
         .send();
     match tokio::time::timeout(ANSWER_TIMEOUT, response).await {
         Ok(Ok(response)) => Ok(Some(response)),
         Err(_) => {
             warn!(
-                node_id = %forward.node_id,
-                "A distributed bucket holder did not start answering a relayed read in time"
+                node_id = %node_id,
+                "A node did not start answering a relayed read in time"
             );
             Ok(None)
         }
         Ok(Err(error)) => {
             warn!(
-                node_id = %forward.node_id,
+                node_id = %node_id,
                 connect = error.is_connect(),
                 error = %error,
-                "A distributed bucket holder did not take a relayed read"
+                "A node did not take a relayed read"
             );
             Ok(None)
         }
     }
+}
+
+/// Asks `node_id` itself for the JSON answer of `path` before `deadline`, marked with the node
+/// header so the target answers for its own records and never directs the read on.
+pub(crate) async fn node_read<T: DeserializeOwned>(
+    state: &ServerState,
+    node_id: NodeId,
+    path: &str,
+    bearer: Option<&ValidatedBearer>,
+    deadline: tokio::time::Instant,
+) -> ServerResult<T> {
+    let silent = || ServerError::ServiceUnavailableReason(format!("node {node_id} did not answer"));
+    let mut sent = HeaderMap::new();
+    let named = HeaderValue::try_from(node_id.to_string())
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    sent.insert(RELAY_NODE_HEADER, named);
+    let forward = RestForward {
+        set_id: Ulid::nil(),
+        range_id: Ulid::nil(),
+        node_id,
+    };
+    // The deadline covers the answer's body too, not only the connection.
+    let read = async {
+        let response = get_node(state, node_id, path, bearer, sent).await?;
+        let response = response.ok_or_else(silent)?;
+        Ok(answer(&forward, response).await?.1)
+    };
+    tokio::time::timeout_at(deadline, read)
+        .await
+        .unwrap_or_else(|_| Err(silent()))
+}
+
+/// Whether a node-directed read reached its target: `Ok(true)` when it names this node,
+/// `Ok(false)` when the request carries no node header, and a refusal for another node.
+pub(crate) fn node_directed(state: &ServerState, headers: &HeaderMap) -> ServerResult<bool> {
+    let Some(named) = headers.get(RELAY_NODE_HEADER) else {
+        return Ok(false);
+    };
+    if named.to_str().ok() == Some(state.get_node_id().to_string().as_str()) {
+        return Ok(true);
+    }
+    Err(ServerError::Conflict(
+        "the read was directed at another node".to_string(),
+    ))
 }
 
 #[cfg(test)]

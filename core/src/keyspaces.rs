@@ -64,6 +64,8 @@ pub const DISTRIBUTION_ACCEPT_KEYSPACE: &str = "distribution_accepted";
 pub const DISTRIBUTION_PUBLISHER_KEYSPACE: &str = "distribution_publishers";
 /// Snapshots whose publisher the realm config does not know yet, by publisher and set id.
 pub const DISTRIBUTION_PARKED_KEYSPACE: &str = "distribution_parked";
+/// Database parser events waiting for their entry, by topic and event; replay moves past them.
+pub const PARKED_PARSER_KEYSPACE: &str = "document_sync_parked_parsers";
 /// The revision number of each parked snapshot, so the bound is counted without the bodies.
 pub const PARKED_INDEX_KEYSPACE: &str = "distribution_parked_index";
 /// Ordered inventory of each distributed bucket: head and version rows by set id and position.
@@ -410,6 +412,8 @@ pub const JOB_INDEX_KEYSPACE: &str = "job_owner_index";
 pub const ACTIVE_USER_KEYSPACE: &str = "job_active_user";
 pub const DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const RUN_CRATE_KEYSPACE: &str = "job_run_crate";
+/// `RunLink` rows by physical job id; job pruning keeps them.
+pub const RUN_LINK_KEYSPACE: &str = "job_run_links";
 
 /// The realm target a device froze for publishing one local run, and the copies it made,
 /// keyed like `job_run_crate`. Device-local and never replicated.
@@ -551,6 +555,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DISTRIBUTION_ACCEPT_KEYSPACE,
     DISTRIBUTION_PUBLISHER_KEYSPACE,
     DISTRIBUTION_PARKED_KEYSPACE,
+    PARKED_PARSER_KEYSPACE,
     PARKED_INDEX_KEYSPACE,
     INVENTORY_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE,
@@ -711,6 +716,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ACTIVE_USER_KEYSPACE,
     DEDUP_INDEX_KEYSPACE,
     RUN_CRATE_KEYSPACE,
+    RUN_LINK_KEYSPACE,
     RUN_PUBLISH_KEYSPACE,
     ATTEMPT_CONTROL_KEYSPACE,
     JOB_CLAIM_KEYSPACE,

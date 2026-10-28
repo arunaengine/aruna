@@ -7,11 +7,12 @@ use std::sync::Arc;
 
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::identifier::CompiledParser;
 use aruna_operations::realm::database::list::{Caller, DatabaseServiceError, list_databases};
 use aruna_operations::realm::database::publish::PublishDatabaseError;
 use aruna_operations::realm::database::{
     MarkInput, MarkOutcome, approve_request, list_requests, mark_database, reject_request,
-    remove_database,
+    remove_database, set_parser,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -28,8 +29,9 @@ use crate::server::state::ServerState;
 
 pub use super::database_types::{
     DatabaseEntryView, DatabaseListParams, DatabaseListResponse, DatabaseRequestList,
-    DatabaseRequestView, DatabaseTargetBody, DatabaseView, MarkDatabaseRequest,
-    MarkDatabaseResponse,
+    DatabaseRequestView, DatabaseTargetBody, DatabaseView, IdentifierParserBody,
+    IdentifierRuleBody, IdentifierTargetBody, IdentifierView, MarkDatabaseRequest,
+    MarkDatabaseResponse, ParserTestRequest, ParserTestResponse, SetParserRequest,
 };
 
 #[derive(OpenApi)]
@@ -41,6 +43,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_databases))
         .routes(routes!(mark))
         .routes(routes!(remove))
+        .routes(routes!(put_parser))
+        .routes(routes!(test_parser))
         .routes(routes!(get_requests))
         .routes(routes!(approve))
         .routes(routes!(reject))
@@ -69,8 +73,12 @@ fn map_error(error: DatabaseServiceError) -> ServerError {
             PublishDatabaseError::Unauthorized => ServerError::Forbidden,
             PublishDatabaseError::NotManagementNode => ServerError::NoManagementNode,
             PublishDatabaseError::NotFound(_) => ServerError::NotFound,
-            PublishDatabaseError::PredecessorChanged(_) => ServerError::Conflict(error.to_string()),
-            PublishDatabaseError::Database(_) => ServerError::BadRequestReason(error.to_string()),
+            PublishDatabaseError::PredecessorChanged(_) | PublishDatabaseError::OwnerChanged(_) => {
+                ServerError::Conflict(error.to_string())
+            }
+            PublishDatabaseError::Database(_) | PublishDatabaseError::Parser(_) => {
+                ServerError::BadRequestReason(error.to_string())
+            }
             PublishDatabaseError::Storage(StorageError::TransactionConflict) => {
                 ServerError::Conflict("concurrent realm configuration update; retry".to_string())
             }
@@ -97,6 +105,7 @@ fn list_example() -> serde_json::Value {
     view["graph_iri"] = "https://w3id.org/aruna/01K8Z0DB0SP1RE000000000004".into();
     view["document_path"] = "databases/spire".into();
     view["public"] = true.into();
+    view["parser"] = parser_example();
     serde_json::json!({"databases": [view], "next_after": null})
 }
 
@@ -278,6 +287,119 @@ pub async fn remove(
     .await
     .map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn parser_example() -> serde_json::Value {
+    serde_json::json!({"rules": [{
+        "name": "BioSample",
+        "pattern": "(?P<id>SAM(?:N|EA|D)\\d+)",
+        "target": "key",
+        "url_template": "https://www.ebi.ac.uk/biosamples/samples/{id}"
+    }]})
+}
+
+#[utoipa::path(
+    put,
+    path = "/system/realm/databases/{entry_id}/parser",
+    tag = "data/databases",
+    summary = "Set the identifier parser of a database",
+    description = r#"Sets or clears the rules that turn a database's keys and source URLs into links to public records.
+
+**Authentication**: realm bearer token with WRITE on `/{realm-id}/admin/databases`, or admin
+WRITE on the group that owns the bucket. A management node serves the call and every other
+node relays it to one.
+
+**Behavior**
+- Example: BioSample accessions in object keys link to their BioSample page.
+- Each rule is a Rust regex with a capture group named `id`, applied to the key or the source
+  URL, and a link template with `{id}` that gives an http or https URL.
+- A parser grants nothing, so no owner consent is needed. `null` clears the parser.
+- Origin reads of the database's files apply the parser of the entry that lists the bucket.
+
+**Limits**
+- No count limit; each pattern must compile within the regex engine's own size limits."#,
+    params(("entry_id" = String, Path, description = "Database entry id")),
+    request_body(content = SetParserRequest, example = json!({"parser": parser_example()})),
+    responses(
+        (status = 204, description = "Parser set or cleared"),
+        (status = 400, description = "Malformed entry id or invalid rule", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Neither curator nor admin of the owning group", body = ErrorResponse),
+        (status = 404, description = "No such entry", body = ErrorResponse),
+        (status = 409, description = "A concurrent realm configuration update won; retry", body = ErrorResponse),
+        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
+        (status = 503, description = "No management node was reachable; code `no_management_node`", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn put_parser(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    Path(entry_id): Path<String>,
+    Json(request): Json<SetParserRequest>,
+) -> ServerResult<StatusCode> {
+    let auth = require_realm_auth(&state, auth)?;
+    set_parser(
+        state.get_ctx().as_ref(),
+        state.get_realm_id(),
+        state.get_node_id(),
+        &caller(auth, bearer),
+        parse_id(&entry_id, "entry_id")?,
+        request.parser.map(Into::into),
+    )
+    .await
+    .map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/system/realm/databases/parser/test",
+    tag = "data/databases",
+    summary = "Try an identifier parser",
+    description = r#"Applies a parser to a sample key and source URL and returns the links it finds.
+
+**Authentication**: realm bearer token.
+
+**Behavior**
+- Stores nothing.
+- Uses the same regex engine as origin reads, so the result matches what file details show.
+- Returns 400 with the first invalid rule.
+
+**Limits**
+- One parser per call."#,
+    request_body(content = ParserTestRequest, example = json!({
+        "parser": parser_example(),
+        "key": "SAMN02138552/contigs.fna.gz",
+        "source_url": null
+    })),
+    responses(
+        (status = 200, description = "Identifiers found", body = ParserTestResponse, example = json!({
+            "identifiers": [{
+                "name": "BioSample",
+                "value": "SAMN02138552",
+                "url": "https://www.ebi.ac.uk/biosamples/samples/SAMN02138552",
+                "target": "key"
+            }]
+        })),
+        (status = 400, description = "Invalid rule", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn test_parser(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<ParserTestRequest>,
+) -> ServerResult<Json<ParserTestResponse>> {
+    require_realm_auth(&state, auth)?;
+    let parser = CompiledParser::compile(&request.parser.into())
+        .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+    let found = parser.find(&request.key, request.source_url.as_deref());
+    Ok(Json(ParserTestResponse {
+        identifiers: found.into_iter().map(Into::into).collect(),
+    }))
 }
 
 #[utoipa::path(

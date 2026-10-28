@@ -826,6 +826,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::ConfigReplicasSet { .. }
             | AdminDocumentOperation::DatabaseSet { .. }
             | AdminDocumentOperation::DatabaseRemoved { .. }
+            | AdminDocumentOperation::DatabaseParserSet { .. }
             | AdminDocumentOperation::ConfigTokenRevoked { .. }
     )
 }

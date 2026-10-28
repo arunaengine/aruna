@@ -1,4 +1,5 @@
-//! Serves the database list: marks, owner consent, removal and the reader-filtered listing.
+//! Serves the database list: marks, owner consent, removal, parsers and the reader-filtered
+//! listing.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -20,6 +21,7 @@ use aruna_core::structs::identity::database::{
     ConsentClaim, DatabaseConsent, DatabaseEntry, DatabaseRequest, DatabaseTarget,
     database_admin_path, owner_admin_path,
 };
+use aruna_core::structs::identity::identifier::IdentifierParser;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::types::GroupId;
@@ -29,7 +31,7 @@ use self::list::{Caller, DatabaseServiceError, allowed, read};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::forwarded_bearer;
 use crate::realm::database::publish::{
-    DatabaseChange, PublishDatabaseConfig, PublishDatabaseOperation,
+    DatabaseChange, PublishDatabaseConfig, PublishDatabaseError, PublishDatabaseOperation,
 };
 use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -347,6 +349,18 @@ pub async fn remove_database(
     caller: &Caller,
     entry_id: Ulid,
 ) -> Result<(), DatabaseServiceError> {
+    let change = |owner| DatabaseChange::Remove { entry_id, owner };
+    publish_checked(context, (realm_id, node_id), caller, entry_id, change).await
+}
+
+/// The path whose WRITE allows removing an entry or changing its parser: the curator path, or
+/// else the owning group's admin path, with that group.
+async fn change_path(
+    context: &DriverContext,
+    realm_id: RealmId,
+    caller: &Caller,
+    entry_id: Ulid,
+) -> Result<(String, Option<GroupId>), DatabaseServiceError> {
     let config = drive(GetConfigOperation::new(realm_id), context)
         .await
         .map_err(|error| DatabaseServiceError::Unavailable(error.to_string()))?;
@@ -355,27 +369,67 @@ pub async fn remove_database(
         .iter()
         .find(|entry| entry.entry_id == entry_id)
         .ok_or_else(|| DatabaseServiceError::NotFound(format!("database {entry_id} not found")))?;
-    let auth = &caller.auth;
     let curator_path = database_admin_path(realm_id);
-    let path = if allowed(context, realm_id, auth, &curator_path, Permission::WRITE).await? {
-        curator_path
-    } else {
-        owner_admin_path(realm_id, entry.owner_group)
-    };
-    drive(
-        PublishDatabaseOperation::new(PublishDatabaseConfig {
-            actor: Actor {
-                node_id,
-                user_id: auth.user_id,
-                realm_id,
-            },
-            checks: vec![(auth.clone(), path)],
-            change: DatabaseChange::Remove { entry_id },
-        }),
-        context,
+    let auth = &caller.auth;
+    Ok(
+        if allowed(context, realm_id, auth, &curator_path, Permission::WRITE).await? {
+            (curator_path, None)
+        } else {
+            let owner = entry.owner_group;
+            (owner_admin_path(realm_id, owner), Some(owner))
+        },
     )
-    .await?;
-    Ok(())
+}
+
+/// Publishes a removal or parser change with the right of the caller. The transaction refuses it
+/// when the entry changed its owner group since the check; the right is then checked once more.
+async fn publish_checked(
+    context: &DriverContext,
+    (realm_id, node_id): (RealmId, NodeId),
+    caller: &Caller,
+    entry_id: Ulid,
+    change: impl Fn(Option<GroupId>) -> DatabaseChange,
+) -> Result<(), DatabaseServiceError> {
+    let auth = &caller.auth;
+    let mut checked_again = false;
+    loop {
+        let (path, owner) = change_path(context, realm_id, caller, entry_id).await?;
+        let published = drive(
+            PublishDatabaseOperation::new(PublishDatabaseConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: auth.user_id,
+                    realm_id,
+                },
+                checks: vec![(auth.clone(), path)],
+                change: change(owner),
+            }),
+            context,
+        )
+        .await;
+        match published {
+            Err(PublishDatabaseError::OwnerChanged(_)) if !checked_again => checked_again = true,
+            other => return other.map(|_| ()).map_err(Into::into),
+        }
+    }
+}
+
+/// Sets or clears an entry's identifier parser: a curator or an admin of the owning group may.
+/// No owner consent, because a parser grants nothing.
+pub async fn set_parser(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    caller: &Caller,
+    entry_id: Ulid,
+    parser: Option<IdentifierParser>,
+) -> Result<(), DatabaseServiceError> {
+    let change = |owner| DatabaseChange::Parser {
+        entry_id,
+        parser: parser.clone(),
+        owner,
+    };
+    publish_checked(context, (realm_id, node_id), caller, entry_id, change).await
 }
 
 async fn register_version(

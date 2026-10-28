@@ -81,6 +81,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::objects::router())
         .merge(storage::organize::router())
         .merge(storage::origin::router())
+        .merge(storage::provenance::router())
         .merge(storage::routing::router())
         .merge(sync::router())
         .merge(sync::quarantine::router())
@@ -93,6 +94,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(access::group_join::router())
         .merge(execution::job::session::router())
         .merge(execution::jobs::router())
+        .merge(execution::runs::router())
         .merge(execution::job::audit::router())
         .merge(metadata::router())
         .merge(git::router())
@@ -272,12 +274,16 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/links"),
         ("GET", "/data/buckets/{bucket}/objects"),
         ("GET", "/data/buckets/{bucket}/objects/origin"),
+        ("GET", "/data/origin"),
+        ("GET", "/data/provenance/crate"),
         ("GET", "/data/buckets/{bucket}/objects/part-of"),
         ("GET", "/data/buckets/{bucket}/sources"),
         ("GET", "/data/databases"),
         ("POST", "/system/realm/databases"),
         ("POST", "/system/realm/nodes/{node_id}/promote"),
         ("DELETE", "/system/realm/databases/{entry_id}"),
+        ("PUT", "/system/realm/databases/{entry_id}/parser"),
+        ("POST", "/system/realm/databases/parser/test"),
         ("GET", "/system/realm/databases/requests"),
         (
             "POST",
@@ -400,6 +406,7 @@ pub(crate) mod tests {
         ("GET", "/compute/jobs"),
         ("DELETE", "/compute/jobs/{job_id}"),
         ("GET", "/compute/jobs/{job_id}"),
+        ("GET", "/compute/runs/{run_id}"),
         ("GET", "/compute/jobs/{job_id}/artifacts/rocrate"),
         ("GET", "/compute/jobs/{job_id}/audit"),
         ("GET", "/compute/jobs/{job_id}/report"),

@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::identity::database::{DatabaseEntry, DatabaseRequest, DatabaseTarget};
+use aruna_core::structs::identity::identifier::{
+    Identifier, IdentifierParser, IdentifierRule, IdentifierTarget,
+};
 use aruna_operations::realm::database::list::{DatabaseListing, DatabaseState};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -86,6 +89,8 @@ pub struct DatabaseView {
     pub document_path: Option<String>,
     /// Anyone, also without a login, may read the bucket; otherwise realm users with access.
     pub public: bool,
+    /// The identifier parser of this database, if one is set.
+    pub parser: Option<IdentifierParserBody>,
 }
 
 impl From<DatabaseListing> for DatabaseView {
@@ -104,6 +109,7 @@ impl From<DatabaseListing> for DatabaseView {
             graph_iri: listing.graph_iri,
             document_path: listing.document_path,
             public: listing.public,
+            parser: listing.parser.map(Into::into),
         }
     }
 }
@@ -167,6 +173,119 @@ impl From<&DatabaseRequest> for DatabaseRequestView {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DatabaseRequestList {
     pub requests: Vec<DatabaseRequestView>,
+}
+
+/// What a rule reads: the object key or the recorded source URL.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentifierTargetBody {
+    Key,
+    SourceUrl,
+}
+
+/// One identifier rule of a database.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct IdentifierRuleBody {
+    /// Shown to users, for example `BioSample`.
+    pub name: String,
+    /// A Rust regex with one capture group named `id`.
+    pub pattern: String,
+    pub target: IdentifierTargetBody,
+    /// The landing page with `{id}`; it must give an http or https URL.
+    pub url_template: String,
+}
+
+/// The identifier rules of a database, applied in order.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct IdentifierParserBody {
+    pub rules: Vec<IdentifierRuleBody>,
+}
+
+impl From<IdentifierTargetBody> for IdentifierTarget {
+    fn from(target: IdentifierTargetBody) -> Self {
+        match target {
+            IdentifierTargetBody::Key => Self::Key,
+            IdentifierTargetBody::SourceUrl => Self::SourceUrl,
+        }
+    }
+}
+
+impl From<IdentifierTarget> for IdentifierTargetBody {
+    fn from(target: IdentifierTarget) -> Self {
+        match target {
+            IdentifierTarget::Key => Self::Key,
+            IdentifierTarget::SourceUrl => Self::SourceUrl,
+        }
+    }
+}
+
+impl From<IdentifierParserBody> for IdentifierParser {
+    fn from(body: IdentifierParserBody) -> Self {
+        let rules = body.rules.into_iter().map(|rule| IdentifierRule {
+            name: rule.name,
+            pattern: rule.pattern,
+            target: rule.target.into(),
+            url_template: rule.url_template,
+        });
+        Self {
+            rules: rules.collect(),
+        }
+    }
+}
+
+impl From<IdentifierParser> for IdentifierParserBody {
+    fn from(parser: IdentifierParser) -> Self {
+        let rules = parser.rules.into_iter().map(|rule| IdentifierRuleBody {
+            name: rule.name,
+            pattern: rule.pattern,
+            target: rule.target.into(),
+            url_template: rule.url_template,
+        });
+        Self {
+            rules: rules.collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetParserRequest {
+    /// The new parser; `null` clears it.
+    pub parser: Option<IdentifierParserBody>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ParserTestRequest {
+    pub parser: IdentifierParserBody,
+    /// An object key to try the key rules on.
+    #[serde(default)]
+    pub key: String,
+    /// A source URL to try the source URL rules on.
+    pub source_url: Option<String>,
+}
+
+/// One identifier found in a key or source URL.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct IdentifierView {
+    pub name: String,
+    pub value: String,
+    pub url: String,
+    pub target: IdentifierTargetBody,
+}
+
+impl From<Identifier> for IdentifierView {
+    fn from(found: Identifier) -> Self {
+        Self {
+            name: found.name,
+            value: found.value,
+            url: found.url,
+            target: found.target.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ParserTestResponse {
+    pub identifiers: Vec<IdentifierView>,
 }
 
 #[cfg(test)]

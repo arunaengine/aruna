@@ -73,6 +73,7 @@ fn listing_states_named() {
             graph_iri: Some("https://w3id.org/aruna/x".to_string()),
             document_path: Some("databases/spire".to_string()),
             public: true,
+            parser: None,
         };
         let view = DatabaseView::from(listing);
         assert_eq!(view.state, name);

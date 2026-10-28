@@ -8,6 +8,7 @@ mod cancel;
 mod capacity;
 mod family_reads;
 mod report;
+mod run_link;
 mod scheduling;
 mod terminal;
 mod uncertain_commit;

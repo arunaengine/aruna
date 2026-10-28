@@ -343,6 +343,21 @@ impl AdminDocumentState {
         entries
     }
 
+    /// The identifier parser of a database entry, if one is set and not in conflict.
+    pub fn database_parser(
+        &self,
+        entry_id: Ulid,
+    ) -> Option<crate::structs::identity::identifier::IdentifierParser> {
+        let path = database_parser_path(entry_id);
+        if self.conflicts.contains_key(&path) {
+            return None;
+        }
+        self.user_subject_ids
+            .get(&path)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| serde_json::from_str(value).ok())
+    }
+
     /// The register version of a database entry, which a consent names as its predecessor.
     pub fn database_version(&self, entry_id: Ulid) -> Option<AdminDocumentDot> {
         self.user_subject_ids

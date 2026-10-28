@@ -76,6 +76,13 @@ impl AdminDocumentState {
             AdminDocumentOperation::DatabaseRemoved { entry_id } => {
                 self.apply_register(event, &database_path(*entry_id), None);
             }
+            AdminDocumentOperation::DatabaseParserSet { entry_id, parser } => {
+                let value = (parser.as_ref())
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidDatabase)?;
+                self.apply_register(event, &database_parser_path(*entry_id), value);
+            }
             AdminDocumentOperation::ConfigPoliciesSet { policies } => {
                 self.apply_config_setting(event, CONFIG_POLICIES_PATH, policies_value(policies));
             }

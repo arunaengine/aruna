@@ -6,4 +6,5 @@ pub mod compute;
 pub mod device_compute;
 pub mod job;
 pub mod jobs;
+pub mod runs;
 pub mod tes;

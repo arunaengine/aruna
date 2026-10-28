@@ -14,6 +14,7 @@ use aruna_core::reducer::AdminDocumentState;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::database::{DatabaseEntry, DatabaseTarget, database_admin_path};
+use aruna_core::structs::identity::identifier::IdentifierParser;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::DistributionView;
@@ -275,6 +276,7 @@ pub struct DatabaseListing {
     pub document_path: Option<String>,
     /// Anyone, also without a login, may read the bucket.
     pub public: bool,
+    pub parser: Option<IdentifierParser>,
 }
 
 /// Databases after `after` the caller may see: entries whose bucket the caller may read and
@@ -356,7 +358,9 @@ pub async fn list_databases(
         let public = can_read_bucket(context, realm_id, &anonymous, &entry)
             .await?
             .is_some();
+        let parser = (versions.as_ref()).and_then(|state| state.database_parser(entry.entry_id));
         listed.push(DatabaseListing {
+            parser,
             entry,
             bucket,
             state,

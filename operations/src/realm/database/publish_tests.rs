@@ -117,6 +117,7 @@ async fn mark_then_remove() {
     let removed = drive(
         publish(DatabaseChange::Remove {
             entry_id: entry().entry_id,
+            owner: None,
         }),
         &ctx,
     )
@@ -133,6 +134,7 @@ async fn removal_needs_entry() {
     let error = drive(
         publish(DatabaseChange::Remove {
             entry_id: entry().entry_id,
+            owner: None,
         }),
         &ctx,
     )
@@ -191,4 +193,142 @@ fn denied_check_terminal() {
         operation.finalize(),
         Err(PublishDatabaseError::Unauthorized)
     );
+}
+
+#[tokio::test]
+async fn parser_change_rights() {
+    // A curator or an admin of the owning group may set a parser; nobody else may.
+    use crate::realm::database::list::{Caller, DatabaseServiceError, config_state};
+    use crate::realm::database::set_parser;
+    use aruna_core::structs::identity::auth::Role;
+    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+    use aruna_core::structs::identity::identifier::{
+        IdentifierParser, IdentifierRule, IdentifierTarget,
+    };
+    use std::collections::{HashMap, HashSet};
+    let dir = tempdir().unwrap();
+    let ctx = context(dir.path().to_str().unwrap());
+    let curator = actor();
+    let realm_id = curator.realm_id;
+    seed(&ctx, &curator).await;
+    let group_admin = UserId::local(Ulid::from_bytes([7; 16]), realm_id);
+    let outsider = UserId::local(Ulid::from_bytes([8; 16]), realm_id);
+    let group_id = entry().owner_group;
+    let role_id = Ulid::from_bytes([9; 16]);
+    let group = GroupAuthorizationDocument {
+        group_id,
+        policies: Vec::new(),
+        roles: HashMap::from([(
+            role_id,
+            Role {
+                role_id,
+                name: "admin".to_string(),
+                permissions: HashMap::from([(
+                    format!("/{realm_id}/g/{group_id}/admin"),
+                    Permission::WRITE,
+                )]),
+                assigned_users: HashSet::from([group_admin]),
+            },
+        )]),
+    };
+    let target = DocumentTarget::GroupAuthorization { group_id };
+    let value = group.to_bytes(&curator).unwrap();
+    write(&ctx, target.storage_keyspace(), target.storage_key(), value).await;
+    let parser = |pattern: &str| {
+        Some(IdentifierParser {
+            rules: vec![IdentifierRule {
+                name: "BioSample".to_string(),
+                pattern: pattern.to_string(),
+                target: IdentifierTarget::Key,
+                url_template: "https://example.org/{id}".to_string(),
+            }],
+        })
+    };
+    let caller = |user_id| Caller {
+        auth: AuthContext {
+            user_id,
+            ..auth(&curator)
+        },
+        bearer: None,
+    };
+    let entry_id = entry().entry_id;
+    let (ctx, node_id) = (&ctx, curator.node_id);
+    let set = |user_id, parser| {
+        let caller = caller(user_id);
+        async move { set_parser(ctx, realm_id, node_id, &caller, entry_id, parser).await }
+    };
+
+    let unknown = set(curator.user_id, parser("(?P<id>a)")).await;
+    assert!(matches!(unknown, Err(DatabaseServiceError::NotFound(_))));
+    drive(
+        publish(DatabaseChange::Set {
+            entry: entry(),
+            consent: None,
+        }),
+        ctx,
+    )
+    .await
+    .expect("mark publishes");
+    set(curator.user_id, parser("(?P<id>a)"))
+        .await
+        .expect("curator sets");
+    set(group_admin, parser("(?P<id>b)"))
+        .await
+        .expect("group admin sets");
+    let refused = set(outsider, parser("(?P<id>c)")).await;
+    assert!(matches!(
+        refused,
+        Err(DatabaseServiceError::Publish(
+            PublishDatabaseError::Unauthorized
+        ))
+    ));
+    let invalid = set(curator.user_id, parser("(?P<other>a)")).await;
+    assert!(matches!(
+        invalid,
+        Err(DatabaseServiceError::Publish(PublishDatabaseError::Parser(
+            _
+        )))
+    ));
+    let state = config_state(ctx, realm_id).await.unwrap().unwrap();
+    assert_eq!(state.database_parser(entry_id), parser("(?P<id>b)"));
+    set(group_admin, None).await.expect("group admin clears");
+    let state = config_state(ctx, realm_id).await.unwrap().unwrap();
+    assert_eq!(state.database_parser(entry_id), None);
+}
+
+#[tokio::test]
+async fn owner_fenced_change() {
+    // A right checked against the owner group before the transaction holds only while the
+    // entry still names that group.
+    let dir = tempdir().unwrap();
+    let ctx = context(dir.path().to_str().unwrap());
+    seed(&ctx, &actor()).await;
+    let mark = DatabaseChange::Set {
+        entry: entry(),
+        consent: None,
+    };
+    drive(publish(mark), &ctx).await.expect("mark publishes");
+    let former = Some(Ulid::from_bytes([99; 16]));
+    let parser = |owner| DatabaseChange::Parser {
+        entry_id: entry().entry_id,
+        parser: None,
+        owner,
+    };
+    let stale = drive(publish(parser(former)), &ctx).await;
+    assert_eq!(
+        stale,
+        Err(PublishDatabaseError::OwnerChanged(entry().entry_id))
+    );
+    let removal = DatabaseChange::Remove {
+        entry_id: entry().entry_id,
+        owner: former,
+    };
+    let stale = drive(publish(removal), &ctx).await;
+    assert_eq!(
+        stale,
+        Err(PublishDatabaseError::OwnerChanged(entry().entry_id))
+    );
+    drive(publish(parser(Some(entry().owner_group))), &ctx)
+        .await
+        .expect("the current owner may change the parser");
 }

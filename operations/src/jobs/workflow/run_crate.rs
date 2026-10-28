@@ -12,15 +12,16 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, RunCrateStatus,
+    JobResultPayload, JobState, RunCrateStatus, RunLink,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_core::structs::storage::data::identity::{
-    DataEntity, ObjectLocation, normalized_id, parse_hash,
+    CONTENT_URL, DataEntity, ObjectLocation, normalized_id, parse_hash,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use serde_json::json;
 use ulid::Ulid;
 
@@ -32,7 +33,9 @@ pub(crate) const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5"
 const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
 
 use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{put_crate_status, read_crate_status, read_job_record};
+use super::super::store::{
+    put_crate_outcome, put_crate_status, read_crate_status, read_job_record, read_run_link,
+};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
@@ -211,7 +214,7 @@ pub(crate) async fn record_crate(
         let status = RunCrateStatus::Denied {
             message: "metadata write access denied".to_string(),
         };
-        if let Err(error) = put_crate_status(storage, for_job, &status).await {
+        if let Err(error) = put_outcome(storage, for_job, parent, spec, &status, None).await {
             return JobRunOutcome::Failed(JobError::retryable(format!(
                 "run crate status write failed: {error}"
             )));
@@ -229,9 +232,10 @@ pub(crate) async fn record_crate(
             )));
         }
     };
-    let jsonld = build_crate_jsonld(parent, spec, document_id, &devices);
+    let realm_id = driver.serving_realm(parent.created_by.realm_id);
+    let jsonld = build_crate_jsonld(parent, spec, (realm_id, document_id), &devices);
 
-    let (status, resource) = match route_metadata_create(
+    let (status, resource, written) = match route_metadata_create(
         CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor,
             group_id: spec.group_id,
@@ -267,6 +271,7 @@ pub(crate) async fn record_crate(
                     resource: resource.clone(),
                 },
                 resource,
+                Some(result.record.document_id),
             )
         }
         // An invalid crate is permanent: record it and discharge the
@@ -281,15 +286,35 @@ pub(crate) async fn record_crate(
                 message: error.to_string(),
             };
             let resource = status.name().to_string();
-            (status, resource)
+            (status, resource, None)
         }
     };
-    if let Err(error) = put_crate_status(storage, for_job, &status).await {
+    if let Err(error) = put_outcome(storage, for_job, parent, spec, &status, written).await {
         return JobRunOutcome::Failed(JobError::retryable(format!(
             "run crate status write failed: {error}"
         )));
     }
     JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource })
+}
+
+/// Records the final crate status with the run link; a link the receipt wrote keeps its family.
+async fn put_outcome(
+    storage: &aruna_storage::storage::StorageHandle,
+    for_job: JobId,
+    parent: &JobRecord,
+    spec: &ExecutionSpec,
+    status: &RunCrateStatus,
+    run_crate: Option<Ulid>,
+) -> Result<(), String> {
+    let known = read_run_link(storage, for_job).await?;
+    let link = RunLink {
+        family: known.as_ref().and_then(|link| link.family),
+        logical_job_id: known.and_then(|link| link.logical_job_id),
+        group_id: spec.group_id,
+        created_by: parent.created_by,
+        run_crate,
+    };
+    put_crate_outcome(storage, for_job, status, &link).await
 }
 
 fn is_transient(error: &MetadataWriteError) -> bool {
@@ -396,7 +421,7 @@ fn device_entity(device: &str) -> String {
 fn build_crate_jsonld(
     record: &JobRecord,
     spec: &ExecutionSpec,
-    document_id: Ulid,
+    (realm_id, document_id): (RealmId, Ulid),
     devices: &BTreeMap<String, String>,
 ) -> String {
     let root = format!("https://w3id.org/aruna/{document_id}");
@@ -447,7 +472,22 @@ fn build_crate_jsonld(
 
     // Inputs are the action `object` and outputs its `result`, named by content where known.
     let mut used = BTreeSet::new();
-    let mut entity = |location: ObjectLocation, hash: Option<[u8; 32]>, file: serde_json::Value| {
+    // The exact version id joins the location as a second `contentUrl`, so readers can follow it.
+    let exact = |node_id, location: &ObjectLocation, version_id| {
+        VersionedObjectArn::new(
+            realm_id,
+            node_id,
+            &location.bucket,
+            &location.key,
+            version_id,
+        )
+        .ok()
+        .map(|arn| arn.to_w3id())
+    };
+    let mut entity = |location: ObjectLocation,
+                      hash: Option<[u8; 32]>,
+                      version: Option<String>,
+                      file: serde_json::Value| {
         let id = match hash {
             Some(hash) => normalized_id(hash, &location, &mut used),
             None => location.to_url(),
@@ -461,6 +501,11 @@ fn build_crate_jsonld(
             encoding_format: None,
         }
         .apply(&mut file);
+        if let Some(version) = version
+            && let Some(url) = file.remove(CONTENT_URL)
+        {
+            file.insert(CONTENT_URL.into(), json!([url, version]));
+        }
         (id, serde_json::Value::Object(file))
     };
     let mut used_devices = BTreeSet::new();
@@ -487,7 +532,10 @@ fn build_crate_jsonld(
             bucket: bucket.clone(),
             key: key.clone(),
         };
-        let (id, file) = entity(location, captured.map(|captured| captured.blake3), file);
+        let version = captured
+            .and_then(|captured| exact(captured.source_node_id, &location, captured.version_id));
+        let hash = captured.map(|captured| captured.blake3);
+        let (id, file) = entity(location, hash, version, file);
         object_ids.push(json!({ "@id": id.clone() }));
         files.push(file);
         part_ids.push(id);
@@ -506,7 +554,8 @@ fn build_crate_jsonld(
             key: output.key.clone(),
         };
         let hash = output.digest.as_deref().and_then(parse_hash);
-        let (id, file) = entity(location, hash, file);
+        let version = exact(output.node_id, &location, output.version_id);
+        let (id, file) = entity(location, hash, version, file);
         result_ids.push(json!({ "@id": id.clone() }));
         files.push(file);
         part_ids.push(id);
@@ -852,7 +901,13 @@ mod pure_tests {
 
     fn parse(record: &JobRecord, spec: &ExecutionSpec) -> serde_json::Value {
         let doc = Ulid::from_bytes(record.job_id.to_bytes());
-        serde_json::from_str(&build_crate_jsonld(record, spec, doc, &BTreeMap::new())).unwrap()
+        serde_json::from_str(&build_crate_jsonld(
+            record,
+            spec,
+            (record.created_by.realm_id, doc),
+            &BTreeMap::new(),
+        ))
+        .unwrap()
     }
 
     pub(super) fn entity_id(value: &Value) -> Option<&str> {
@@ -953,7 +1008,8 @@ mod pure_tests {
 
     #[test]
     fn names_by_content() {
-        // Known digests become content addresses; the same content twice keeps one address.
+        // Known digests become content addresses; the same content twice keeps one address,
+        // and each entity keeps its own exact version as a second `contentUrl`.
         let (mut record, spec) = execution_record();
         record.captured_inputs.push(CapturedInput {
             destination_key: "inputs/in.txt".to_string(),
@@ -971,8 +1027,19 @@ mod pure_tests {
         let by_url = |url: &str| {
             graph
                 .iter()
-                .find(|entity| entity["contentUrl"] == url)
+                .find(|entity| entity["contentUrl"][0] == url)
                 .expect("entity")
+        };
+        let arn = |version: u8| {
+            VersionedObjectArn::new(
+                record.created_by.realm_id,
+                record.owner_node_id,
+                "src",
+                if version == 13 { "in.txt" } else { "out.txt" },
+                Ulid::from_bytes([version; 16]),
+            )
+            .unwrap()
+            .to_w3id()
         };
         let content = aruna_core::structs::storage::data::identity::content_id([9; 32]);
         let input = by_url("s3://src/in.txt");
@@ -980,9 +1047,24 @@ mod pure_tests {
         assert_eq!(input["contentSize"], "3");
         let output = by_url("s3://src/out.txt");
         assert_eq!(output["@id"], "s3://src/out.txt");
+        assert_eq!(input["contentUrl"][1], arn(13));
+        assert_eq!(output["contentUrl"][1], arn(11));
         let action = graph.iter().find(|e| e["@type"] == "CreateAction").unwrap();
         assert_eq!(action["object"][0]["@id"], content);
         assert!(craqle::validate_rocrate_jsonld(&value.to_string()).is_ok());
+    }
+
+    #[test]
+    fn uncaptured_keeps_location() {
+        // An input without a captured version keeps its location as its only `contentUrl`.
+        let (record, spec) = execution_record();
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let input = graph
+            .iter()
+            .find(|entity| entity["name"] == "Input sample")
+            .expect("input entity");
+        assert_eq!(input["contentUrl"], "s3://src/in.txt");
     }
 
     #[test]
@@ -1030,7 +1112,12 @@ mod tests {
         let (record, spec) = execution_record();
         let document_id = Ulid::from_bytes(record.job_id.to_bytes());
         let root_id = format!("https://w3id.org/aruna/{document_id}");
-        let jsonld = build_crate_jsonld(&record, &spec, document_id, &BTreeMap::new());
+        let jsonld = build_crate_jsonld(
+            &record,
+            &spec,
+            (record.created_by.realm_id, document_id),
+            &BTreeMap::new(),
+        );
         let directory = tempfile::tempdir().unwrap();
         let node = craqle::CraqleNode::open(directory.path()).unwrap();
         let graph_id = craqle::GraphId::new(&root_id);
@@ -1096,9 +1183,13 @@ mod tests {
         let (record, spec) = execution_record();
         let devices = BTreeMap::from([("inputs/in.txt".to_string(), device_id())]);
         let document_id = Ulid::from_bytes(record.job_id.to_bytes());
-        let jsonld: Value =
-            serde_json::from_str(&build_crate_jsonld(&record, &spec, document_id, &devices))
-                .unwrap();
+        let jsonld: Value = serde_json::from_str(&build_crate_jsonld(
+            &record,
+            &spec,
+            (record.created_by.realm_id, document_id),
+            &devices,
+        ))
+        .unwrap();
         let graph = jsonld["@graph"].as_array().unwrap();
         let input = graph
             .iter()
@@ -1113,7 +1204,12 @@ mod tests {
         assert_eq!(entity["@type"], "IndividualProduct");
         assert_eq!(entity["identifier"], device_id().as_str());
         // An input from no device names none.
-        let plain = build_crate_jsonld(&record, &spec, document_id, &BTreeMap::new());
+        let plain = build_crate_jsonld(
+            &record,
+            &spec,
+            (record.created_by.realm_id, document_id),
+            &BTreeMap::new(),
+        );
         assert!(!plain.contains("IndividualProduct"));
     }
 
@@ -1127,7 +1223,12 @@ mod tests {
         // An input from a device carries its provenance entity, which the shapes must accept.
         let devices = BTreeMap::from([("inputs/in.txt".to_string(), device_id())]);
         let document_id = Ulid::from_bytes(record.job_id.to_bytes());
-        let jsonld = build_crate_jsonld(&record, &spec, document_id, &devices);
+        let jsonld = build_crate_jsonld(
+            &record,
+            &spec,
+            (record.created_by.realm_id, document_id),
+            &devices,
+        );
         let directory = tempfile::tempdir().unwrap();
         let engine = ProfileShaclEngine::open(directory.path()).unwrap();
         let report = engine

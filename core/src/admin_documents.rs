@@ -415,6 +415,12 @@ pub enum AdminDocumentOperation {
     ConfigReplicasSet {
         replicas: crate::structs::identity::realm::ReplicaQuota,
     },
+    /// Sets or clears the identifier parser of a database entry; it grants nothing.
+    #[serde(rename = "RealmConfigDatabaseParserSet")]
+    DatabaseParserSet {
+        entry_id: Ulid,
+        parser: Option<crate::structs::identity::identifier::IdentifierParser>,
+    },
 }
 
 impl AdminDocumentOperation {

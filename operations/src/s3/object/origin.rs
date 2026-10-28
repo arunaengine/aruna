@@ -11,6 +11,7 @@ use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::source_access::SourceDigest;
 use aruna_core::structs::identity::database::DatabaseTarget;
+use aruna_core::structs::identity::identifier::{CompiledParser, Identifier};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
@@ -59,12 +60,18 @@ pub struct OriginView {
     pub source: Option<SourceView>,
     /// What a dataset may add about the origin: never users, devices or storage paths.
     pub projection: Vec<OriginProjection>,
+    /// The database entry that lists the bucket now, which may differ from the one at minting.
+    pub database_entry: Option<Ulid>,
+    /// What that entry's parser finds in the key and source URL.
+    pub identifiers: Vec<Identifier>,
+    /// The BLAKE3 of the bytes, for a materialized version only; never a reference identity.
+    pub content_hash: Option<[u8; 32]>,
 }
 
 /// Reads the origin of `version_id`, or of the current version, of a local bucket's key.
 pub async fn read_origin(
     context: &DriverContext,
-    (realm_id, _): (RealmId, NodeId),
+    (realm_id, node_id): (RealmId, NodeId),
     bucket: &str,
     key: &str,
     version_id: Option<Ulid>,
@@ -105,7 +112,43 @@ pub async fn read_origin(
         realm_id,
         version_id,
     });
-    Ok(view(version_id, global, version))
+    let set_id = info.distribution.as_ref().map(|binding| binding.set_id);
+    let (entry, parser) = database_context(context, (realm_id, node_id), bucket, set_id).await;
+    let mut view = view(version_id, global, version);
+    let source_url = view
+        .source
+        .as_ref()
+        .and_then(|source| source.url.as_deref());
+    view.identifiers = parser.map_or_else(Vec::new, |parser| parser.find(key, source_url));
+    view.projection.extend(
+        view.identifiers
+            .iter()
+            .map(|found| OriginProjection::Identifier {
+                name: found.name.clone(),
+                value: found.value.clone(),
+                url: found.url.clone(),
+            }),
+    );
+    view.database_entry = entry;
+    Ok(view)
+}
+
+/// The entry that lists the bucket now and its parser, compiled for this read; none on a node
+/// without the realm config state.
+async fn database_context(
+    context: &DriverContext,
+    scope: (RealmId, NodeId),
+    bucket: &str,
+    set_id: Option<Ulid>,
+) -> (Option<Ulid>, Option<CompiledParser>) {
+    let Some(entry_id) = database_entry(context, scope, bucket, set_id).await else {
+        return (None, None);
+    };
+    let state = crate::realm::database::list::config_state(context, scope.0).await;
+    let parser = (state.ok().flatten())
+        .and_then(|state| state.database_parser(entry_id))
+        .and_then(|parser| CompiledParser::compile(&parser).ok());
+    (Some(entry_id), parser)
 }
 
 /// The database list entry a bucket is listed under now: its set's entry, or this node's entry
@@ -179,7 +222,9 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         version.hop.as_ref(),
         (source.as_ref().filter(|_| published)).and_then(|source| source.url.clone()),
     );
+    let content_hash = version.blob_hash().copied();
     OriginView {
+        content_hash,
         version_id,
         global,
         created_by: version.created_by,
@@ -188,6 +233,8 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         hop: version.hop,
         source,
         projection,
+        database_entry: None,
+        identifiers: Vec::new(),
     }
 }
 
@@ -214,3 +261,7 @@ async fn read(
         other => Err(OriginError::Storage(format!("{other:?}"))),
     }
 }
+
+#[cfg(test)]
+#[path = "origin_tests.rs"]
+mod tests;
