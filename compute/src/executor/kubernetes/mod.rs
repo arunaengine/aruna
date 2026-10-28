@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES,
-    NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec,
-    TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
+    ExecutorKind, FenceContext, GrantedResources, LogLimits, LogTails, MAX_OUTPUT_MATCHES,
+    MAX_TRANSFER_BYTES, NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode,
+    TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
+    normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -938,6 +939,10 @@ impl ExecutorBackend for KubernetesBackend {
         }
     }
 
+    fn granted(&self, spec: &TaskSpec) -> Result<GrantedResources, BackendError> {
+        manifest::granted_resources(spec, &self.config)
+    }
+
     /// The pod securityContext switches users at launch, so the identity is pinned.
     fn run_identity(&self) -> UserSpec {
         NOBODY
@@ -1036,11 +1041,8 @@ impl ExecutorBackend for KubernetesBackend {
         }
         match spec.staging_mode {
             StagingMode::Files => {
-                self.ensure_pvc(
-                    context,
-                    spec.resources.disk_bytes.unwrap_or(DEFAULT_WORKSPACE_BYTES),
-                )
-                .await?;
+                self.ensure_pvc(context, manifest::workspace_bytes(spec))
+                    .await?;
                 self.stage(context, spec, cancel).await?;
             }
             StagingMode::DirectS3 => self.ensure_secret(context, spec).await?,
@@ -1050,11 +1052,8 @@ impl ExecutorBackend for KubernetesBackend {
                     self.ensure_mounts(context, &layout).await?;
                 }
                 if needs_workspace(spec) {
-                    self.ensure_pvc(
-                        context,
-                        spec.resources.disk_bytes.unwrap_or(DEFAULT_WORKSPACE_BYTES),
-                    )
-                    .await?;
+                    self.ensure_pvc(context, manifest::workspace_bytes(spec))
+                        .await?;
                     self.stage(context, spec, cancel).await?;
                 }
             }

@@ -11,9 +11,9 @@ use std::time::Duration;
 use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
-    CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails, MAX_TRANSFER_BYTES, NOBODY,
-    NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput,
-    TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
+    CancelEvidence, ExecutorKind, FenceContext, GrantedResources, LogLimits, LogTails,
+    MAX_TRANSFER_BYTES, NOBODY, NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint,
+    StagingMode, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
 };
 use async_trait::async_trait;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
@@ -568,6 +568,31 @@ fn validate_spec(config: &DockerConfig, spec: &TaskSpec) -> Result<(), BackendEr
     Ok(())
 }
 
+/// The limits a container of `spec` is created with; disk only when the backend sets a default.
+fn granted_resources(config: &DockerConfig, spec: &TaskSpec) -> GrantedResources {
+    let positive = |value: i64| u64::try_from(value).ok();
+    GrantedResources {
+        nano_cpus: spec
+            .resources
+            .cpu_cores
+            .map(|cores| u64::from(cores) * 1_000_000_000)
+            .or(config.default_nano_cpus.and_then(positive)),
+        ram_bytes: spec
+            .resources
+            .ram_bytes
+            .or(config.default_mem_bytes.and_then(positive)),
+        disk_bytes: config
+            .default_disk_bytes
+            .map(|default| spec.resources.disk_bytes.unwrap_or(default)),
+        workspace_bytes: None,
+        walltime_ms: spec
+            .resources
+            .max_walltime
+            .or(config.default_max_walltime)
+            .map(aruna_core::telemetry::duration_ms),
+    }
+}
+
 fn build_config(
     config: &DockerConfig,
     context: &FenceContext,
@@ -584,24 +609,16 @@ fn build_config(
         GENERATION_LABEL.to_string(),
         context.controller_generation.to_string(),
     );
-    if let Some(walltime) = spec.resources.max_walltime.or(config.default_max_walltime) {
-        labels.insert(WALLTIME_LABEL.to_string(), walltime.as_millis().to_string());
+    let granted = granted_resources(config, spec);
+    if let Some(walltime) = granted.walltime_ms {
+        labels.insert(WALLTIME_LABEL.to_string(), walltime.to_string());
     }
 
-    let memory = spec
-        .resources
-        .ram_bytes
-        .map(|b| b as i64)
-        .or(config.default_mem_bytes);
-    let nano_cpus = spec
-        .resources
-        .cpu_cores
-        .map(|c| c as i64 * 1_000_000_000)
-        .or(config.default_nano_cpus);
-    let storage_opt = config.default_disk_bytes.map(|default| {
-        let bytes = spec.resources.disk_bytes.unwrap_or(default);
-        HashMap::from([("size".to_string(), bytes.to_string())])
-    });
+    let memory = granted.ram_bytes.map(|bytes| bytes as i64);
+    let nano_cpus = granted.nano_cpus.map(|nanos| nanos as i64);
+    let storage_opt = granted
+        .disk_bytes
+        .map(|bytes| HashMap::from([("size".to_string(), bytes.to_string())]));
 
     let host_config = HostConfig {
         memory,
@@ -693,6 +710,11 @@ impl ExecutorBackend for DockerBackend {
             limits: self.config.envelope,
             ..BackendCaps::default()
         }
+    }
+
+    fn granted(&self, spec: &TaskSpec) -> Result<GrantedResources, BackendError> {
+        validate_spec(&self.config, spec)?;
+        Ok(granted_resources(&self.config, spec))
     }
 
     /// Docker switches users at launch via `--user`, so the identity is pinned.
@@ -1692,6 +1714,32 @@ mod tests {
             host.storage_opt.unwrap().get("size").unwrap(),
             &(2u64 << 30).to_string()
         );
+    }
+
+    #[test]
+    fn granted_matches_container() {
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.resources.ram_bytes = Some(3 << 30);
+        spec.resources.max_walltime = Some(Duration::from_secs(600));
+        for default_disk in [None, Some(2u64 << 30)] {
+            let config = DockerConfig {
+                default_disk_bytes: default_disk,
+                ..DockerConfig::default()
+            };
+            let granted = granted_resources(&config, &spec);
+            let body = build_config(&config, &fence(), &spec);
+            let host = body.host_config.unwrap();
+            assert_eq!(granted.ram_bytes, host.memory.map(|bytes| bytes as u64));
+            assert_eq!(granted.nano_cpus, host.nano_cpus.map(|nanos| nanos as u64));
+            let size = host
+                .storage_opt
+                .and_then(|options| options.get("size").cloned());
+            assert_eq!(granted.disk_bytes.map(|bytes| bytes.to_string()), size);
+            assert_eq!(granted.disk_bytes, default_disk);
+            let walltime = body.labels.unwrap().get(WALLTIME_LABEL).cloned();
+            assert_eq!(walltime.as_deref(), Some("600000"));
+            assert_eq!(granted.walltime_ms, Some(600_000));
+        }
     }
 
     #[test]

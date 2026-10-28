@@ -418,7 +418,11 @@ pub const RUN_LINK_KEYSPACE: &str = "job_run_links";
 /// The realm target a device froze for publishing one local run, and the copies it made,
 /// keyed like `job_run_crate`. Device-local and never replicated.
 pub const RUN_PUBLISH_KEYSPACE: &str = "job_run_publish";
+/// The crate JSON-LD of an unpublished local run, keyed like `job_run_crate`. Device-local.
+pub const LOCAL_CRATE_KEYSPACE: &str = "job_local_run_crates";
 pub const ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
+/// `LaunchRecord` rows keyed like `job_attempt_control`; pruned with the job.
+pub const LAUNCH_RECORD_KEYSPACE: &str = "job_launch_records";
 /// The live claim of an unsettled job, keyed like `jobs`; rewritten only when the claim changes.
 pub const JOB_CLAIM_KEYSPACE: &str = "job_claims";
 /// Signed immutable output records, keyed by ExecutionId.
@@ -718,7 +722,9 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     RUN_CRATE_KEYSPACE,
     RUN_LINK_KEYSPACE,
     RUN_PUBLISH_KEYSPACE,
+    LOCAL_CRATE_KEYSPACE,
     ATTEMPT_CONTROL_KEYSPACE,
+    LAUNCH_RECORD_KEYSPACE,
     JOB_CLAIM_KEYSPACE,
     OUTPUT_RECORD_KEYSPACE,
     JOB_ENTRY_KEYSPACE,

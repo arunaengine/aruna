@@ -37,12 +37,14 @@ mod family;
 mod identity;
 mod input;
 mod key_wait;
+mod launch;
 mod local;
 
 pub use family::*;
 pub use identity::*;
 pub use input::*;
 pub use key_wait::*;
+pub use launch::*;
 pub use local::*;
 
 #[cfg(test)]

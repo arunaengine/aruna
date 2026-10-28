@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use aruna_core::compute::{
-    BackendError, FenceContext, NetworkAccess, SessionMount, StagingMode, TaskSpec,
-    normalize_container_path,
+    BackendError, FenceContext, GrantedResources, NetworkAccess, SessionMount, StagingMode,
+    TaskSpec, normalize_container_path,
 };
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolume, PersistentVolumeClaim, Pod, Secret};
@@ -197,10 +197,7 @@ pub fn job_manifest(
         "terminationMessagePolicy":"FallbackToLogsOnError",
         "volumeMounts":mounts
     });
-    let deadline = spec
-        .resources
-        .max_walltime
-        .map(|duration| i64::try_from(duration.as_secs().max(1)).unwrap_or(i64::MAX));
+    let deadline = deadline_secs(spec);
     serde_json::from_value(json!({
         "apiVersion":"batch/v1",
         "kind":"Job",
@@ -757,15 +754,7 @@ fn resource_limits(
     config: &KubernetesConfig,
 ) -> Result<serde_json::Value, BackendError> {
     let mut limits = BTreeMap::new();
-    limits.insert(
-        "cpu",
-        enforced_limit(
-            spec.resources.cpu_cores.map(u64::from),
-            config.default_cpu_cores.map(u64::from),
-            "cpu",
-        )?
-        .to_string(),
-    );
+    limits.insert("cpu", cpu_cores(spec, config)?.to_string());
     limits.insert(
         "memory",
         enforced_limit(spec.resources.ram_bytes, config.default_mem_bytes, "memory")?.to_string(),
@@ -774,6 +763,46 @@ fn resource_limits(
         limits.insert("ephemeral-storage", disk.to_string());
     }
     Ok(json!({"limits":limits,"requests":limits}))
+}
+
+fn cpu_cores(spec: &TaskSpec, config: &KubernetesConfig) -> Result<u64, BackendError> {
+    enforced_limit(
+        spec.resources.cpu_cores.map(u64::from),
+        config.default_cpu_cores.map(u64::from),
+        "cpu",
+    )
+}
+
+/// Seconds of the Job's `activeDeadlineSeconds`, at least one.
+fn deadline_secs(spec: &TaskSpec) -> Option<i64> {
+    spec.resources
+        .max_walltime
+        .map(|duration| i64::try_from(duration.as_secs().max(1)).unwrap_or(i64::MAX))
+}
+
+/// Size of the workspace volume an attempt of `spec` gets.
+pub fn workspace_bytes(spec: &TaskSpec) -> u64 {
+    spec.resources
+        .disk_bytes
+        .unwrap_or(super::DEFAULT_WORKSPACE_BYTES)
+}
+
+/// The limits the task pod and its workspace volume are created with.
+pub fn granted_resources(
+    spec: &TaskSpec,
+    config: &KubernetesConfig,
+) -> Result<GrantedResources, BackendError> {
+    Ok(GrantedResources {
+        nano_cpus: Some(cpu_cores(spec, config)?.saturating_mul(1_000_000_000)),
+        ram_bytes: Some(enforced_limit(
+            spec.resources.ram_bytes,
+            config.default_mem_bytes,
+            "memory",
+        )?),
+        disk_bytes: spec.resources.disk_bytes.or(config.default_disk_bytes),
+        workspace_bytes: needs_workspace(spec).then(|| workspace_bytes(spec)),
+        walltime_ms: deadline_secs(spec).map(|secs| (secs as u64).saturating_mul(1000)),
+    })
 }
 
 /// The selector every task and helper pod carries, so a declared worker site is
@@ -846,6 +875,34 @@ mod tests {
         let plain =
             serde_json::to_value(job_manifest(&context(), &spec, &base, &layout).unwrap()).unwrap();
         assert!(plain["spec"]["template"]["spec"]["nodeSelector"].is_null());
+    }
+
+    #[test]
+    fn granted_matches_manifest() {
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.resources.ram_bytes = Some(2_048);
+        spec.resources.max_walltime = Some(std::time::Duration::from_millis(1_500));
+        let mut config = config();
+        config.default_cpu_cores = Some(3);
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &config, &layout).unwrap())
+            .unwrap();
+        let granted = granted_resources(&spec, &config).unwrap();
+        let limits = &job["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"];
+        assert_eq!(limits["cpu"], "3");
+        assert_eq!(granted.nano_cpus, Some(3_000_000_000));
+        assert_eq!(limits["memory"], "2048");
+        assert_eq!(granted.ram_bytes, Some(2_048));
+        assert!(limits["ephemeral-storage"].is_null());
+        assert_eq!(granted.disk_bytes, None);
+        assert_eq!(job["spec"]["activeDeadlineSeconds"], 1);
+        assert_eq!(granted.walltime_ms, Some(1_000));
+        assert_eq!(granted.workspace_bytes, Some(workspace_bytes(&spec)));
+        spec.staging_mode = StagingMode::DirectS3;
+        assert_eq!(
+            granted_resources(&spec, &config).unwrap().workspace_bytes,
+            None
+        );
     }
 
     #[test]
