@@ -504,7 +504,7 @@ async fn sealed_copy_page() -> (Node, String, String) {
         .unwrap();
     assert!(page.objects.is_empty() && page.prefixes.is_empty());
     let range_id = snapshot.config.ranges[0].range_id.to_string();
-    assert_eq!(page.stale_ranges, [range_id.clone()]);
+    assert_eq!(page.stale_ranges, std::slice::from_ref(&range_id));
     let cursor = page.next_cursor.expect("the copy sealed its range");
     (node, cursor, range_id)
 }
