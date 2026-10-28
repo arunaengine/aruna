@@ -2678,21 +2678,23 @@ impl S3 for ArunaS3Service {
             return Ok(S3Response::new(output));
         }
 
-        let result = drive(
-            ListVersionsOperation::new(LOVI {
-                bucket: bucket.clone(),
-                prefix: prefix.clone(),
-                delimiter: delimiter.clone(),
-                key_marker: key_marker.clone(),
-                version_id_marker,
-                max_keys: Some(max_keys),
-            }),
-            &self.state,
-        )
-        .await
-        .map_err(IntoS3Error::into_s3_error)?;
-        // A link version shows only to a caller who may read its target.
-        let result = self.visible_versions(&user_access, &bucket, result).await?;
+        // A sealed key marker resumes among versions the caller may not see.
+        let hidden = key_marker
+            .as_deref()
+            .and_then(open_cursor::<link::VersionCursor>);
+        let (key_marker, version_id_marker) = match hidden {
+            Some(_) => (None, None),
+            None => (key_marker, version_id_marker),
+        };
+        let input = LOVI {
+            bucket: bucket.clone(),
+            prefix: prefix.clone(),
+            delimiter: delimiter.clone(),
+            key_marker,
+            version_id_marker,
+            max_keys: Some(max_keys),
+        };
+        let result = self.visible_versions(&user_access, input, hidden).await?;
 
         Ok(self.list_versions_output(req.input, group_id, max_keys, result))
     }

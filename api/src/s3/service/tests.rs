@@ -1882,6 +1882,61 @@ async fn hides_link_only_prefix() {
     assert_eq!(sealed, 1);
 }
 
+/// The versions of `study` a request lists, as the owner, with its next markers.
+async fn listed_versions(
+    service: &ArunaS3Service,
+    (user_access, group_id): (&UserAccess, Ulid),
+    input: s3s::dto::ListObjectVersionsInput,
+) -> s3s::dto::ListObjectVersionsOutput {
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let request = S3Request {
+        input,
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    service.list_object_versions(request).await.unwrap().output
+}
+
+#[tokio::test]
+async fn hides_link_versions() {
+    // A prefix holding only an unreadable link version is no common prefix, and a page that
+    // passed the link resumes after the last version it showed.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let link = (&user_access, "links/db");
+    write_link(&service, link, ("hidden", "db", Ulid::generate()), "etag").await;
+    let grouped = s3s::dto::ListObjectVersionsInput {
+        bucket: "study".to_string(),
+        delimiter: Some("/".to_string()),
+        ..Default::default()
+    };
+    let output = listed_versions(&service, (&user_access, group_id), grouped).await;
+    let prefixes: Vec<_> = (output.common_prefixes.unwrap_or_default().into_iter())
+        .filter_map(|prefix| prefix.prefix)
+        .collect();
+    assert_eq!(prefixes, vec!["imaging/", "sequencing/"]);
+    let paged = s3s::dto::ListObjectVersionsInput {
+        bucket: "study".to_string(),
+        key_marker: Some("imaging/scan-a".to_string()),
+        max_keys: Some(2),
+        ..Default::default()
+    };
+    let output = listed_versions(&service, (&user_access, group_id), paged).await;
+    let keys: Vec<_> = (output.versions.unwrap_or_default().into_iter())
+        .filter_map(|version| version.key)
+        .collect();
+    assert_eq!(keys, vec!["imaging/scan-b"]);
+    assert_eq!(output.next_key_marker.as_deref(), Some("imaging/scan-b"));
+}
+
 #[tokio::test]
 async fn cursor_names_shown() {
     // A page that also passed a hidden link continues after the last key it showed, so its

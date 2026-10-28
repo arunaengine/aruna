@@ -406,7 +406,7 @@ impl McpServer {
                 cursor: input.cursor,
                 limit,
             };
-            let page = object_page(&self.state, &bucket_info, bearer.as_ref(), request)
+            let page = object_page(&self.state, &bucket_info, (bearer.as_ref(), None), request)
                 .await
                 .map_err(server_error)?;
             return Ok(Json(ObjectsOutput {

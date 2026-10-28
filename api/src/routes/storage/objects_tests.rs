@@ -388,3 +388,38 @@ async fn hides_unreadable_links() {
         .unwrap();
     assert_eq!(keys(&page), vec!["a.md", "open.md"]);
 }
+
+#[tokio::test]
+async fn hides_link_folders() {
+    // A folder holding only unreadable links is no prefix, and a cursor continues after the last
+    // key a page showed, never after a hidden one.
+    let node = node_state().await;
+    store(&node, &["a.md", "c.md"]).await;
+    let hidden = |key: &str| aruna_core::structs::storage::link::LinkTarget {
+        arn: aruna_core::structs::storage::replication::VersionedObjectArn {
+            realm_id: node.owner.realm_id,
+            node_id: node.state.get_node_id(),
+            bucket: "other".to_string(),
+            key: key.to_string(),
+            version: ulid::Ulid::from_parts(5, 5),
+        },
+        group_id: ulid::Ulid::from_parts(9, 9),
+    };
+    link(&node, "b-secret.md", hidden("x")).await;
+    link(&node, "hidden/x.md", hidden("y")).await;
+    let page = list(&node, &node.owner, HeaderMap::new(), query(None, None, 10))
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["a.md", "c.md"]);
+    assert!(page.prefixes.is_empty());
+    let page = list(&node, &node.owner, HeaderMap::new(), query(None, None, 2))
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["a.md"]);
+    let cursor = page.next_cursor.expect("more entries follow");
+    let after = Resume::After {
+        key: "a.md".to_string(),
+        group: None,
+    };
+    assert_eq!(decode_resume(&cursor).unwrap(), after);
+}

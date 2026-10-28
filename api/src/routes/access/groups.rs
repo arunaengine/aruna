@@ -2245,7 +2245,7 @@ async fn list_bucket_objects(
             cursor: continuation_token.map(str::to_string),
             limit,
         };
-        let page = object_page(state, &info, bearer, request).await?;
+        let page = object_page(state, &info, (bearer, None), request).await?;
         let path = |key: &str| object_permission_path(realm_id, group_id, node_id, bucket, key);
         let folders = page.prefixes.iter().map(|prefix| DataPathEntry {
             permission_path: path(prefix),

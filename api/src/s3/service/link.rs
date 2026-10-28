@@ -9,6 +9,7 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::link::LinkTarget;
+use aruna_operations::driver::drive;
 use aruna_operations::jobs::source_read::READ_OPERATION;
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::s3::object::get::GetObjectError;
@@ -16,11 +17,16 @@ use aruna_operations::s3::object::link::{
     LinkCaller, LinkError, LinkSource, authorize_target, create_link, head_target, read_target,
     target_visible,
 };
+use aruna_operations::s3::object::versions::{
+    ListVersionsInput, ListVersionsItem, ListVersionsOperation, ListVersionsResult,
+};
+use aruna_operations::s3::object::visible::{SCAN_BUDGET, seal_cursor};
 use s3s::dto::{ETag, ETagCondition, GetObjectOutput, StreamingBlob};
 use s3s::{S3Response, S3Result, s3_error};
 
 use super::ArunaS3Service;
 use super::object::object_range_request;
+use crate::s3::error::IntoS3Error;
 
 fn link_error(error: LinkError) -> s3s::S3Error {
     match error {
@@ -217,39 +223,244 @@ impl ArunaS3Service {
     }
 }
 
+/// Where a version listing stands among hidden versions: its markers, and a common prefix whose
+/// shown version is still sought, with that search's own markers.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct VersionCursor {
+    pub(super) key_marker: Option<String>,
+    pub(super) version_marker: Option<ulid::Ulid>,
+    pub(super) pending: Option<(String, Option<String>, Option<ulid::Ulid>)>,
+}
+
+/// The key an item sorts by and the markers that resume after it.
+fn item_marker(item: &ListVersionsItem) -> (String, Option<ulid::Ulid>) {
+    match item {
+        ListVersionsItem::Version {
+            key, version_id, ..
+        }
+        | ListVersionsItem::DeleteMarker {
+            key, version_id, ..
+        } => (key.clone(), Some(*version_id)),
+    }
+}
+
+enum VersionProbe {
+    Shown,
+    Empty,
+    Stopped(VersionCursor),
+}
+
 impl ArunaS3Service {
-    /// The version page without links whose target the reader may not read.
+    /// Whether a listed version may show: every one but a link the reader may not follow.
+    async fn version_shows(&self, caller: &LinkCaller, item: &ListVersionsItem) -> S3Result<bool> {
+        let ListVersionsItem::Version {
+            link: Some(binding),
+            ..
+        } = item
+        else {
+            return Ok(true);
+        };
+        match LinkTarget::of(binding, self.realm_id) {
+            Some(target) => target_visible(&self.state, caller, &target, self.node_id)
+                .await
+                .map_err(link_error),
+            None => Ok(false),
+        }
+    }
+
+    async fn list_versions(&self, input: &ListVersionsInput) -> S3Result<ListVersionsResult> {
+        drive(ListVersionsOperation::new(input.clone()), &self.state)
+            .await
+            .map_err(IntoS3Error::into_s3_error)
+    }
+
+    /// Seeks one shown version below `group` from `at`, spending the budget on hidden ones.
+    async fn probe_versions(
+        &self,
+        (caller, input): (&LinkCaller, &ListVersionsInput),
+        (group, at): (&str, (Option<String>, Option<ulid::Ulid>)),
+        budget: &mut usize,
+    ) -> S3Result<VersionProbe> {
+        // The first page holds one version, as the first one of a prefix usually shows.
+        let mut probe = ListVersionsInput {
+            prefix: Some(group.to_string()),
+            delimiter: None,
+            key_marker: at.0,
+            version_id_marker: at.1,
+            max_keys: Some(1),
+            ..input.clone()
+        };
+        loop {
+            let page = self.list_versions(&probe).await?;
+            for item in &page.items {
+                if self.version_shows(caller, item).await? {
+                    return Ok(VersionProbe::Shown);
+                }
+                *budget = budget.saturating_sub(1);
+                if *budget == 0 {
+                    let (key, version) = item_marker(item);
+                    return Ok(VersionProbe::Stopped(VersionCursor {
+                        pending: Some((group.to_string(), Some(key), version)),
+                        ..Default::default()
+                    }));
+                }
+            }
+            if !page.is_truncated {
+                return Ok(VersionProbe::Empty);
+            }
+            (probe.key_marker, probe.version_id_marker) =
+                (page.next_key_marker, page.next_version_marker);
+            probe.max_keys = None;
+        }
+    }
+
+    /// One version page the reader may see, from `input`'s markers or a sealed `hidden` cursor.
+    /// A link version shows only with its target and a prefix once a version below it does; the
+    /// markers name only shown entries, or are sealed when the page stopped among hidden ones.
     pub(super) async fn visible_versions(
         &self,
         access: &UserAccess,
-        bucket: &str,
-        mut result: aruna_operations::s3::object::versions::ListVersionsResult,
-    ) -> S3Result<aruna_operations::s3::object::versions::ListVersionsResult> {
-        use aruna_operations::s3::object::versions::ListVersionsItem;
-        let caller = self.link_caller(access, bucket).await;
-        let mut items = Vec::with_capacity(result.items.len());
-        for item in std::mem::take(&mut result.items) {
-            let target = match &item {
-                ListVersionsItem::Version {
-                    link: Some(binding),
-                    ..
-                } => LinkTarget::of(binding, self.realm_id),
-                _ => {
-                    items.push(item);
-                    continue;
+        mut input: ListVersionsInput,
+        hidden: Option<VersionCursor>,
+    ) -> S3Result<ListVersionsResult> {
+        let caller = self.link_caller(access, &input.bucket).await;
+        let max = input
+            .max_keys
+            .unwrap_or(ListVersionsOperation::DEFAULT_MAX_KEYS);
+        let mut shown = ListVersionsResult {
+            items: Vec::new(),
+            common_prefixes: Vec::new(),
+            is_truncated: false,
+            next_key_marker: None,
+            next_version_marker: None,
+        };
+        let mut budget = SCAN_BUDGET;
+        let mut last: Option<(String, Option<ulid::Ulid>)> = None;
+        let seal = |shown: &mut ListVersionsResult, cursor: &VersionCursor| -> S3Result<()> {
+            let sealed = seal_cursor(cursor)
+                .ok_or_else(|| s3_error!(InternalError, "The listing cursor was not sealed"))?;
+            (shown.is_truncated, shown.next_key_marker) = (true, Some(sealed));
+            Ok(())
+        };
+        let after = |shown: &mut ListVersionsResult, last: &(String, Option<ulid::Ulid>)| {
+            shown.is_truncated = true;
+            (shown.next_key_marker, shown.next_version_marker) = (Some(last.0.clone()), last.1);
+        };
+        if max == 0 {
+            return Ok(shown);
+        }
+        if let Some(hidden) = hidden {
+            (input.key_marker, input.version_id_marker) =
+                (hidden.key_marker, hidden.version_marker);
+            if let Some((group, key, version)) = hidden.pending {
+                let at = (key, version);
+                match self
+                    .probe_versions((&caller, &input), (&group, at), &mut budget)
+                    .await?
+                {
+                    VersionProbe::Shown => {
+                        shown.common_prefixes.push(group.clone());
+                        last = Some((group.clone(), None));
+                    }
+                    VersionProbe::Empty => {}
+                    VersionProbe::Stopped(stopped) => {
+                        let cursor = VersionCursor {
+                            key_marker: input.key_marker.clone(),
+                            version_marker: input.version_id_marker,
+                            ..stopped
+                        };
+                        seal(&mut shown, &cursor)?;
+                        return Ok(shown);
+                    }
                 }
-            };
-            let visible = match target {
-                Some(target) => target_visible(&self.state, &caller, &target, self.node_id)
-                    .await
-                    .map_err(link_error)?,
-                None => false,
-            };
-            if visible {
-                items.push(item);
+                (input.key_marker, input.version_id_marker) = (Some(group), None);
             }
         }
-        result.items = items;
-        Ok(result)
+        loop {
+            let page = self.list_versions(&input).await?;
+            let mut entries: Vec<(String, Option<ListVersionsItem>)> = (page.items.into_iter())
+                .map(|item| (item_marker(&item).0, Some(item)))
+                .chain(page.common_prefixes.into_iter().map(|group| (group, None)))
+                .collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let count = entries.len();
+            for (index, (name, item)) in entries.into_iter().enumerate() {
+                let position = match &item {
+                    Some(item) => item_marker(item),
+                    None => (name.clone(), None),
+                };
+                // A hidden version costs one; a prefix pays for the hidden ones its probe met.
+                let (visible, cost) = match item {
+                    Some(item) => match self.version_shows(&caller, &item).await? {
+                        true => {
+                            shown.items.push(item);
+                            (true, 0)
+                        }
+                        false => (false, 1),
+                    },
+                    None => {
+                        let at = (None, None);
+                        match self
+                            .probe_versions((&caller, &input), (&name, at), &mut budget)
+                            .await?
+                        {
+                            VersionProbe::Shown => {
+                                shown.common_prefixes.push(name.clone());
+                                (true, 0)
+                            }
+                            VersionProbe::Empty => (false, 0),
+                            VersionProbe::Stopped(stopped) => {
+                                match &last {
+                                    Some(last) => after(&mut shown, last),
+                                    None => seal(
+                                        &mut shown,
+                                        &VersionCursor {
+                                            key_marker: input.key_marker.clone(),
+                                            version_marker: input.version_id_marker,
+                                            ..stopped
+                                        },
+                                    )?,
+                                }
+                                return Ok(shown);
+                            }
+                        }
+                    }
+                };
+                budget = budget.saturating_sub(cost);
+                if visible {
+                    last = Some(position.clone());
+                }
+                let rest = index + 1 < count || page.is_truncated;
+                let full = shown.items.len() + shown.common_prefixes.len() >= max;
+                if (full || budget == 0) && rest {
+                    match &last {
+                        Some(last) => after(&mut shown, last),
+                        None => {
+                            let cursor = VersionCursor {
+                                key_marker: Some(position.0),
+                                version_marker: position.1,
+                                pending: None,
+                            };
+                            seal(&mut shown, &cursor)?;
+                        }
+                    }
+                    return Ok(shown);
+                }
+                if !visible {
+                    (input.key_marker, input.version_id_marker) = (Some(position.0), position.1);
+                }
+            }
+            match (page.is_truncated, &last) {
+                (false, _) => return Ok(shown),
+                (true, Some(last)) => {
+                    after(&mut shown, last);
+                    return Ok(shown);
+                }
+                (true, None) => {
+                    (input.key_marker, input.version_id_marker) =
+                        (page.next_key_marker, page.next_version_marker);
+                }
+            }
+        }
     }
 }
