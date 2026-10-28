@@ -21,6 +21,91 @@ pub const MAX_METADATA_ENTRIES: usize = 128;
 pub const MAX_METADATA_KEY: usize = 128;
 /// Bytes of one metadata value at most.
 pub const MAX_METADATA_VALUE: usize = 4 * 1024;
+/// Whether version metadata names columns that metadata search matches.
+pub fn searchable(metadata: &std::collections::HashMap<String, String>) -> bool {
+    metadata.contains_key(SEARCH_TEXT_KEY) || metadata.contains_key(SEARCH_EXACT_KEY)
+}
+
+/// The lowercase alphanumeric words of `text` that free text search matches.
+pub fn search_tokens(text: &str) -> Vec<String> {
+    (text.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty() && word.len() <= 40)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// The free text tokens and `column=value` terms a version's own selection entries name.
+pub fn search_terms(
+    metadata: &std::collections::HashMap<String, String>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let columns = |key: &str| {
+        let names = metadata.get(key).map(String::as_str).unwrap_or_default();
+        let names: Vec<&str> = names.split(',').filter(|name| !name.is_empty()).collect();
+        (names.into_iter()).filter_map(|name| Some((name, metadata.get(name)?)))
+    };
+    let text = (columns(SEARCH_TEXT_KEY))
+        .flat_map(|(_, value)| search_tokens(value))
+        .collect();
+    let exact = (columns(SEARCH_EXACT_KEY))
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    (text, exact)
+}
+
+/// Splits a metadata query into free text and exact `column=value` terms; a value with spaces
+/// is quoted, as in `assembly_level="Complete Genome"`.
+pub fn query_terms(query: &str) -> (String, Vec<String>) {
+    let (mut text, mut exact) = (Vec::new(), Vec::new());
+    let mut rest = query.trim_start();
+    while !rest.is_empty() {
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..word_end];
+        match word.split_once('=') {
+            Some((column, value)) if !column.is_empty() => {
+                let (value, end) = match value.starts_with('"') {
+                    true => {
+                        let start = word_end - value.len() + 1;
+                        let close = quoted_end(&rest[start..]);
+                        (
+                            &rest[start..start + close],
+                            (start + close + 1).min(rest.len()),
+                        )
+                    }
+                    false => (value, word_end),
+                };
+                exact.push(format!("{}={value}", column.to_ascii_lowercase()));
+                rest = &rest[end..];
+            }
+            _ => {
+                text.push(word);
+                rest = &rest[word_end..];
+            }
+        }
+        rest = rest.trim_start();
+    }
+    (text.join(" "), exact)
+}
+
+fn quoted_end(text: &str) -> usize {
+    text.find('"').unwrap_or(text.len())
+}
+
+/// Whether a version's metadata holds every token of `text` and every exact `column=value`.
+pub fn metadata_matches(
+    metadata: &std::collections::HashMap<String, String>,
+    text: &str,
+    exact: &[String],
+) -> bool {
+    if !searchable(metadata) {
+        return false;
+    }
+    let (tokens, terms) = search_terms(metadata);
+    search_tokens(text)
+        .iter()
+        .all(|token| tokens.contains(token))
+        && exact.iter().all(|term| terms.contains(term))
+}
+
 /// Requests per second one node sends to the read connector unless the import names a rate.
 pub const DEFAULT_TABLE_RATE: u32 = 10;
 
@@ -528,12 +613,9 @@ impl RowMapper {
         else {
             return RowOutcome::Skipped;
         };
-        let source = match connector_path(&source, base) {
+        let source = match source_path(&source, base) {
             Ok(path) => path,
             Err(reason) => return RowOutcome::Failed(reason),
-        };
-        let Some(source) = canonical_path(&source) else {
-            return RowOutcome::Failed(format!("the source `{source}` is not a canonical path"));
         };
         let Some(target) = canonical_path(&target) else {
             return RowOutcome::Failed(format!("the target `{target}` is not a canonical key"));
@@ -582,7 +664,12 @@ fn render<'a>(
     Some(rendered)
 }
 
-/// A source value as a path below the connector: a URL must start with the connector's base.
+/// A source value as a canonical path below the connector, whose base a URL must start with.
+pub fn source_path(value: &str, base: Option<&str>) -> Result<String, String> {
+    let path = connector_path(value, base)?;
+    canonical_path(&path).ok_or_else(|| format!("the source `{value}` is not a canonical path"))
+}
+
 fn connector_path(value: &str, base: Option<&str>) -> Result<String, String> {
     if !value.contains("://") {
         return Ok(value.to_string());

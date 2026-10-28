@@ -266,3 +266,35 @@ fn gzip_windows_resume() {
     truncated.push(&compressed[..compressed.len() / 2]).unwrap();
     assert!(truncated.finish().is_err());
 }
+
+// Search reads the version's own selections: only selected columns match, tax ids exactly.
+#[test]
+fn metadata_search_terms() {
+    let import = ncbi();
+    let bytes = SUMMARY.as_bytes();
+    let (columns, used) = read_header(&import.format, bytes, true).unwrap();
+    let mapper = RowMapper::new(&import.rows, &columns).unwrap();
+    let (rows, _) = parse_rows(&import.format, Some(38), &bytes[used..], true).unwrap();
+    let coli = imported(mapper.map(&rows[1].0.clone().unwrap(), Some(BASE)));
+    let metadata: std::collections::HashMap<_, _> = coli.metadata.into_iter().collect();
+    let taxid = ["taxid=562".to_string()];
+    assert!(!metadata_matches(&metadata, "", &taxid));
+    let species = ["species_taxid=562".to_string()];
+    assert!(metadata_matches(&metadata, "Escherichia K-12", &species));
+    assert!(metadata_matches(&metadata, "samn02604091", &[]));
+    // `asm_submitter` is stored but not selected for search.
+    assert!(!metadata_matches(&metadata, "Wisconsin", &[]));
+    assert!(!metadata_matches(&metadata, "562", &[]));
+    let mut plain = metadata.clone();
+    plain.remove(SEARCH_TEXT_KEY);
+    plain.remove(SEARCH_EXACT_KEY);
+    assert!(!metadata_matches(&plain, "", &[]));
+}
+
+#[test]
+fn queries_split_terms() {
+    let (text, exact) = query_terms(r#"coli  taxid=562 assembly_level="Complete Genome" k-12"#);
+    assert_eq!(text, "coli k-12");
+    assert_eq!(exact, ["taxid=562", "assembly_level=Complete Genome"]);
+    assert_eq!(query_terms("=x a"), ("=x a".to_string(), Vec::new()));
+}

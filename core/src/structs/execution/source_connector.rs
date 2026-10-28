@@ -99,6 +99,22 @@ pub fn source_namespace(
 }
 
 impl SourceConnector {
+    /// The URL an HTTP or WebDAV connector's paths are below, ending with `/`.
+    pub fn base_url(&self) -> Option<String> {
+        if !matches!(
+            self.kind,
+            SourceConnectorKind::Http | SourceConnectorKind::Webdav
+        ) {
+            return None;
+        }
+        let endpoint = self.public_config.get("endpoint")?.trim_end_matches('/');
+        let root = (self.public_config.get("root")).map_or("", |root| root.trim_matches('/'));
+        Some(match root.is_empty() {
+            true => format!("{endpoint}/"),
+            false => format!("{endpoint}/{root}/"),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         connector_id: Ulid,
@@ -213,6 +229,40 @@ mod tests {
 
         assert!(!rendered.contains("canary-7f3a"));
         assert!(rendered.contains("token"));
+    }
+
+    // Table rows name URLs; they resolve below the endpoint and root, S3 has no base URL.
+    #[test]
+    fn base_joins_root() {
+        let config = HashMap::from([
+            (
+                "endpoint".to_string(),
+                "https://ftp.ncbi.nlm.nih.gov/".to_string(),
+            ),
+            ("root".to_string(), "/genomes/".to_string()),
+        ]);
+        let (id, user) = (Ulid::from_bytes([1u8; 16]), test_user_id(3));
+        let at = SystemTime::UNIX_EPOCH;
+        let http = SourceConnector::new(
+            id,
+            id,
+            "ncbi".into(),
+            SourceConnectorKind::Http,
+            config,
+            at,
+            at,
+            user,
+        );
+        let base = http.base_url();
+        assert_eq!(
+            base.as_deref(),
+            Some("https://ftp.ncbi.nlm.nih.gov/genomes/")
+        );
+        let s3 = SourceConnector {
+            kind: SourceConnectorKind::S3,
+            ..http
+        };
+        assert_eq!(s3.base_url(), None);
     }
 
     #[test]
