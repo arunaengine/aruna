@@ -229,7 +229,7 @@ async fn silent_crate_incomplete() {
 }
 
 #[tokio::test]
-async fn stalled_client_ends_write() {
+async fn stalled_write_ends() {
     // A client that stops reading cannot hold the export past its deadline.
     let node = node_state().await;
     let caller = Caller {

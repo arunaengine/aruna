@@ -188,7 +188,7 @@ fn stored_dataset_parts() {
 }
 
 #[test]
-fn run_results_all_linked() {
+fn run_results_linked() {
     // Two outputs of one run, the second reached from the first, are both results of the run.
     let (first, second) = (arn(1, "a.txt"), arn(2, "b.txt"));
     let run_id = Ulid::from_bytes([5; 16]).to_string();
