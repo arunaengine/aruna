@@ -139,3 +139,35 @@ async fn disconnect_stops_reads() {
     .await;
     assert!(late.is_none());
 }
+
+#[tokio::test]
+async fn silent_crate_incomplete() {
+    // A run whose crate does not answer, or answers too late, leaves the export incomplete.
+    let hop = Hop {
+        target: Target::Run("r1".to_string()),
+        from: "file".to_string(),
+        property: "result",
+        digest: None,
+    };
+    let status = |read: Option<Read>| {
+        let mut built = ProvenanceCrate::new("file", "2026-10-28T00:00:00Z");
+        let (_, _, go_on) = record_run(&mut built, &hop, read);
+        let root = built.finish();
+        let graph = root["@graph"].as_array().unwrap().clone();
+        let status =
+            graph.iter().find(|node| node["@id"] == "./").unwrap()["creativeWorkStatus"].clone();
+        (status.as_str().unwrap().to_string(), go_on)
+    };
+    assert_eq!(status(Some(Read::Hidden)), ("Complete".to_string(), true));
+    let (silent, go_on) = status(Some(Read::Silent));
+    assert!(silent.starts_with("Incomplete") && go_on);
+    let (late, go_on) = status(None);
+    assert!(late.starts_with("Incomplete") && !go_on);
+    assert!(matches!(
+        classify(Err(ServerError::ServiceUnavailableReason(
+            "busy".to_string()
+        ))),
+        Read::Silent
+    ));
+    assert!(matches!(classify(Err(ServerError::NotFound)), Read::Hidden));
+}

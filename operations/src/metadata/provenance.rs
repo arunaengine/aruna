@@ -267,8 +267,12 @@ impl ProvenanceCrate {
         );
         self.entities.entry(asked.clone()).or_insert(file);
         self.link(hop, &asked);
-        self.stopped
-            .get_or_insert_with(|| "some nodes did not answer".to_string());
+        self.incomplete("some nodes did not answer");
+    }
+
+    /// Marks the crate incomplete without ending the walk; the first reason is kept.
+    pub fn incomplete(&mut self, reason: &str) {
+        self.stopped.get_or_insert_with(|| reason.to_string());
     }
 
     /// Ends the walk early; the crate says it is incomplete and why.

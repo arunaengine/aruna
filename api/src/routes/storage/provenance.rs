@@ -161,14 +161,15 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
         Start::Dataset(document) => {
             let mut built = ProvenanceCrate::new(document, &published);
             match bounded(&caller, &gone, crate_document(&caller, document)).await {
-                Some(Some(dataset)) => {
+                Some(Read::Answer(dataset)) => {
                     let (hops, file) = built.dataset(&dataset);
                     if !write(&mut zip, file).await {
                         return;
                     }
                     queue.extend(hops);
                 }
-                Some(None) => built.stop("the dataset is not readable"),
+                Some(Read::Hidden) => built.stop("the dataset is not readable"),
+                Some(Read::Silent) => built.stop("the dataset did not answer"),
                 None => built.stop("stopped before the dataset was read"),
             }
             built
@@ -187,21 +188,22 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
                 queue.extend(built.version(&hop, &origin))
             }
             (Target::Run(_), Read::Answer(run)) => {
-                let document = run["run_crate"].as_str().map(str::to_string);
-                let run_crate = match document {
+                let read = match run["run_crate"].as_str() {
                     Some(document) => {
-                        let read = crate_document(&caller, &document);
-                        bounded(&caller, &gone, read).await.flatten()
+                        bounded(&caller, &gone, crate_document(&caller, document)).await
                     }
-                    None => None,
+                    None => Some(Read::Hidden),
                 };
-                let (hops, file) = built.run(&hop, run_crate.as_ref());
+                let (hops, file, go_on) = record_run(&mut built, &hop, read);
                 if let Some(file) = file
                     && !write(&mut zip, file).await
                 {
                     return;
                 }
                 queue.extend(hops);
+                if !go_on {
+                    break;
+                }
             }
             (Target::Run(_), Read::Hidden) => {
                 built.run(&hop, None);
@@ -214,6 +216,35 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
     let path = "ro-crate-metadata.json".to_string();
     if write(&mut zip, CrateFile { path, bytes: root }).await {
         let _ = zip.close().await;
+    }
+}
+
+/// Records a run with what its crate read gave. A crate that did not answer in time leaves the
+/// export incomplete, never "not visible"; `false` ends the walk at the time limit.
+fn record_run(
+    built: &mut ProvenanceCrate,
+    hop: &Hop,
+    read: Option<Read>,
+) -> (Vec<Hop>, Option<CrateFile>, bool) {
+    match read {
+        Some(Read::Answer(run_crate)) => {
+            let (hops, file) = built.run(hop, Some(&run_crate));
+            (hops, file, true)
+        }
+        Some(Read::Hidden) => {
+            built.run(hop, None);
+            (Vec::new(), None, true)
+        }
+        Some(Read::Silent) => {
+            built.run(hop, None);
+            built.incomplete("a run record did not answer");
+            (Vec::new(), None, true)
+        }
+        None => {
+            built.run(hop, None);
+            built.stop("the export stopped at its time limit or on disconnect");
+            (Vec::new(), None, false)
+        }
     }
 }
 
@@ -247,6 +278,11 @@ async fn read_hop(caller: &Caller, hop: &Hop) -> Read {
                 .and_then(|Json(run)| to_value(&run))
         }
     };
+    classify(answer)
+}
+
+/// A refusal hides a hop; any other failure means it did not answer.
+fn classify(answer: ServerResult<serde_json::Value>) -> Read {
     match answer {
         Ok(answer) => Read::Answer(answer),
         Err(
@@ -263,8 +299,8 @@ fn to_value(answer: &impl serde::Serialize) -> ServerResult<serde_json::Value> {
     serde_json::to_value(answer).map_err(|error| ServerError::InternalError(error.to_string()))
 }
 
-/// A metadata document's crate as the caller may read it; `None` when it is not readable.
-async fn crate_document(caller: &Caller, document_id: &str) -> Option<serde_json::Value> {
+/// A metadata document's crate as the caller may read it.
+async fn crate_document(caller: &Caller, document_id: &str) -> Read {
     let answer = export_metadata_rocrate(
         State(caller.state.clone()),
         Extension(Some(caller.auth.clone())),
@@ -273,10 +309,10 @@ async fn crate_document(caller: &Caller, document_id: &str) -> Option<serde_json
         Query(RoCrateExportParams::default()),
     )
     .await;
-    match answer {
-        Ok((_, Json(MetadataRoCrateResponse::Projected(projected)))) => Some(projected.rocrate),
-        _ => None,
-    }
+    classify(answer.and_then(|(_, Json(answer))| match answer {
+        MetadataRoCrateResponse::Projected(projected) => Ok(projected.rocrate),
+        MetadataRoCrateResponse::Raw(_) => Err(ServerError::InternalError("raw view".to_string())),
+    }))
 }
 
 /// Writes one file into the ZIP; `false` when the client is gone.
