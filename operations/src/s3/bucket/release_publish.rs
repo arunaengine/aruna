@@ -41,6 +41,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::local_fence;
 use crate::distribution::status::read_view;
 use crate::driver::{DriverContext, bucket_snapshot, drive, gate_context, now_ms};
+use crate::forward::authorize::is_sync_eligible;
 use crate::metadata::protocol::{AuthToken, MetadataReadError};
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::complete_put;
@@ -724,6 +725,7 @@ async fn read_part(
     Ok((found, size))
 }
 
+/// Asks a holder with the caller's bearer, which goes only to a realm infrastructure node.
 async fn ask_holder(
     context: &DriverContext,
     request: HolderRequest,
@@ -732,6 +734,15 @@ async fn ask_holder(
         .metadata_handle
         .as_ref()
         .ok_or("no metadata handle")?;
+    let realm_id = (context.net_handle.as_ref())
+        .map(|net| *net.realm_id())
+        .ok_or("no realm")?;
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !is_sync_eligible(&config, request.node_id) {
+        return Err(format!("{} is no infrastructure node", request.node_id));
+    }
     let token = AuthToken::bearer(request.bearer).map_err(|error| format!("{error:?}"))?;
     handle
         .request_release_holder(request.node_id, Some(token), request.bucket, request.ask)

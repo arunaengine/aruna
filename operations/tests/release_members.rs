@@ -10,9 +10,12 @@ use std::time::SystemTime;
 
 use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::execution::job::{InputMode, InputSelection, InputSource, SubmissionId};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
+use aruna_core::structs::storage::bucket_metadata::{
+    BucketMetadata, RELEASE_PREFIX_TAG, RELEASE_TAG,
+};
 use aruna_core::structs::storage::distribution::KeyRange;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::release::{CRATE_CHUNK, CrateChunk, HolderAnswer, HolderAsk};
@@ -20,8 +23,10 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::jobs::lifecycle::ingress::InputResolveRequest;
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::bucket::metadata::PutMetadataOperation;
 use aruna_operations::s3::bucket::release::{
     BucketScope, MembershipCaller, MembershipQuery, load_access, release_members,
 };
@@ -238,6 +243,49 @@ async fn releases_pin_versions() -> TestResult<()> {
         vec![Ulid::from(5u128)],
         "an ordinary bucket has no ranges"
     );
+    // Admission on the input's node captures the releases that pin it, checked with the
+    // caller's own access, and the bucket's metadata then.
+    let input = InputSelection {
+        source: InputSource::S3 {
+            bucket: BUCKET.to_string(),
+            key: "db/a.fasta".to_string(),
+            version_id: Some(pinned.to_string()),
+        },
+        source_node_id: Some(holder.node_id()),
+        dest_key: "a.fasta".to_string(),
+        mode: InputMode::Snapshot,
+        container_path: Some("/inputs/a.fasta".to_string()),
+        name: None,
+        description: None,
+    };
+    let metadata = BucketMetadata {
+        database: true,
+        title: Some("Bakta".to_string()),
+        ..BucketMetadata::default()
+    };
+    let set_metadata = PutMetadataOperation::new(
+        (realm.auth_context(), realm.realm_id),
+        BUCKET.to_string(),
+        group_id,
+        Some(metadata.clone()),
+    );
+    drive(set_metadata, context).await?;
+    let request = InputResolveRequest {
+        created_by: realm.user_id,
+        submission_id: SubmissionId([7; 32]),
+        expires_at: u64::MAX,
+        inputs: vec![input],
+    };
+    let resolved = handle
+        .request_input_resolve(holder.node_id(), realm.bearer_token(), request)
+        .await?
+        .map_err(|refusal| format!("{refusal:?}"))?;
+    let captured = &resolved[0].1;
+    assert_eq!(captured.database.as_ref(), Some(&metadata));
+    assert_eq!(captured.releases.len(), 1);
+    assert_eq!(captured.releases[0].label, "6.0");
+    assert!(captured.releases_complete);
+
     // The holder reads a tagged crate version for the caller; an untagged version is none.
     let crate_ask = |key: &str, version_id| HolderAsk::Crate {
         key: key.to_string(),
