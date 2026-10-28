@@ -303,14 +303,12 @@ async fn finish(
     mut zip: ZipFileWriter<DuplexStream>,
     built: ProvenanceCrate,
 ) {
-    let Ok(dir) = scratch_dir() else {
-        return;
-    };
-    let path = dir.join(format!("{}.json", scratch_name()));
     let stop = Arc::new(AtomicBool::new(false));
     let halt = stop.clone();
-    let worker =
-        tokio::task::spawn_blocking(move || spool_root(built, path, &|| halt.load(Relaxed)));
+    let worker = tokio::task::spawn_blocking(move || {
+        let path = scratch_dir()?.join(format!("{}.json", scratch_name()));
+        spool_root(built, path, &|| halt.load(Relaxed))
+    });
     let spooled = match until(caller.finish_by, gone, worker).await {
         Some(Ok(Ok(spooled))) => spooled,
         // The worker owns its file and removes it once it sees the stop.
