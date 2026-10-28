@@ -235,10 +235,12 @@ async fn silent_crate_incomplete() {
 
 #[tokio::test]
 async fn stalled_write_ends() {
-    // A client that stops reading cannot hold the export past its deadline.
+    // A client that stops reading cannot hold the export past its hard deadline.
     let node = node_state().await;
+    let deadline = Instant::now() + std::time::Duration::from_millis(50);
     let caller = Caller {
-        deadline: Instant::now() + std::time::Duration::from_millis(50),
+        deadline,
+        finish_by: deadline,
         ..caller(&node, recheck(&node.owner, usize::MAX))
     };
     let (writer, _reader) = tokio::io::duplex(16);

@@ -490,7 +490,13 @@ async fn write(
     file: CrateFile,
 ) -> bool {
     let entry = ZipEntryBuilder::new(file.path.into(), Compression::Stored);
-    let written = bounded(caller, gone, zip.write_entry_whole(entry, &file.bytes)).await;
+    // A started entry may use the finishing window, so the ZIP never ends inside an entry.
+    let written = until(
+        caller.finish_by,
+        gone,
+        zip.write_entry_whole(entry, &file.bytes),
+    )
+    .await;
     matches!(written, Some(Ok(_)))
 }
 
