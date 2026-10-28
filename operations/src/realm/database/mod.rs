@@ -31,7 +31,7 @@ use self::list::{Caller, DatabaseServiceError, allowed, read};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::forwarded_bearer;
 use crate::realm::database::publish::{
-    DatabaseChange, PublishDatabaseConfig, PublishDatabaseOperation,
+    DatabaseChange, PublishDatabaseConfig, PublishDatabaseError, PublishDatabaseOperation,
 };
 use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -349,32 +349,18 @@ pub async fn remove_database(
     caller: &Caller,
     entry_id: Ulid,
 ) -> Result<(), DatabaseServiceError> {
-    let path = change_path(context, realm_id, caller, entry_id).await?;
-    let auth = &caller.auth;
-    drive(
-        PublishDatabaseOperation::new(PublishDatabaseConfig {
-            actor: Actor {
-                node_id,
-                user_id: auth.user_id,
-                realm_id,
-            },
-            checks: vec![(auth.clone(), path)],
-            change: DatabaseChange::Remove { entry_id },
-        }),
-        context,
-    )
-    .await?;
-    Ok(())
+    let change = |owner| DatabaseChange::Remove { entry_id, owner };
+    publish_checked(context, (realm_id, node_id), caller, entry_id, change).await
 }
 
 /// The path whose WRITE allows removing an entry or changing its parser: the curator path, or
-/// else the owning group's admin path.
+/// else the owning group's admin path, with that group.
 async fn change_path(
     context: &DriverContext,
     realm_id: RealmId,
     caller: &Caller,
     entry_id: Ulid,
-) -> Result<String, DatabaseServiceError> {
+) -> Result<(String, Option<GroupId>), DatabaseServiceError> {
     let config = drive(GetConfigOperation::new(realm_id), context)
         .await
         .map_err(|error| DatabaseServiceError::Unavailable(error.to_string()))?;
@@ -384,21 +370,48 @@ async fn change_path(
         .find(|entry| entry.entry_id == entry_id)
         .ok_or_else(|| DatabaseServiceError::NotFound(format!("database {entry_id} not found")))?;
     let curator_path = database_admin_path(realm_id);
+    let auth = &caller.auth;
     Ok(
-        if allowed(
-            context,
-            realm_id,
-            &caller.auth,
-            &curator_path,
-            Permission::WRITE,
-        )
-        .await?
-        {
-            curator_path
+        if allowed(context, realm_id, auth, &curator_path, Permission::WRITE).await? {
+            (curator_path, None)
         } else {
-            owner_admin_path(realm_id, entry.owner_group)
+            let owner = entry.owner_group;
+            (owner_admin_path(realm_id, owner), Some(owner))
         },
     )
+}
+
+/// Publishes a removal or parser change with the right of the caller. The transaction refuses it
+/// when the entry changed its owner group since the check; the right is then checked once more.
+async fn publish_checked(
+    context: &DriverContext,
+    (realm_id, node_id): (RealmId, NodeId),
+    caller: &Caller,
+    entry_id: Ulid,
+    change: impl Fn(Option<GroupId>) -> DatabaseChange,
+) -> Result<(), DatabaseServiceError> {
+    let auth = &caller.auth;
+    let mut checked_again = false;
+    loop {
+        let (path, owner) = change_path(context, realm_id, caller, entry_id).await?;
+        let published = drive(
+            PublishDatabaseOperation::new(PublishDatabaseConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: auth.user_id,
+                    realm_id,
+                },
+                checks: vec![(auth.clone(), path)],
+                change: change(owner),
+            }),
+            context,
+        )
+        .await;
+        match published {
+            Err(PublishDatabaseError::OwnerChanged(_)) if !checked_again => checked_again = true,
+            other => return other.map(|_| ()).map_err(Into::into),
+        }
+    }
 }
 
 /// Sets or clears an entry's identifier parser: a curator or an admin of the owning group may.
@@ -411,22 +424,12 @@ pub async fn set_parser(
     entry_id: Ulid,
     parser: Option<IdentifierParser>,
 ) -> Result<(), DatabaseServiceError> {
-    let path = change_path(context, realm_id, caller, entry_id).await?;
-    let auth = &caller.auth;
-    drive(
-        PublishDatabaseOperation::new(PublishDatabaseConfig {
-            actor: Actor {
-                node_id,
-                user_id: auth.user_id,
-                realm_id,
-            },
-            checks: vec![(auth.clone(), path)],
-            change: DatabaseChange::Parser { entry_id, parser },
-        }),
-        context,
-    )
-    .await?;
-    Ok(())
+    let change = |owner| DatabaseChange::Parser {
+        entry_id,
+        parser: parser.clone(),
+        owner,
+    };
+    publish_checked(context, (realm_id, node_id), caller, entry_id, change).await
 }
 
 async fn register_version(

@@ -117,6 +117,7 @@ async fn mark_then_remove() {
     let removed = drive(
         publish(DatabaseChange::Remove {
             entry_id: entry().entry_id,
+            owner: None,
         }),
         &ctx,
     )
@@ -133,6 +134,7 @@ async fn removal_needs_entry() {
     let error = drive(
         publish(DatabaseChange::Remove {
             entry_id: entry().entry_id,
+            owner: None,
         }),
         &ctx,
     )
@@ -292,4 +294,41 @@ async fn parser_change_rights() {
     set(group_admin, None).await.expect("group admin clears");
     let state = config_state(ctx, realm_id).await.unwrap().unwrap();
     assert_eq!(state.database_parser(entry_id), None);
+}
+
+#[tokio::test]
+async fn owner_fenced_change() {
+    // A right checked against the owner group before the transaction holds only while the
+    // entry still names that group.
+    let dir = tempdir().unwrap();
+    let ctx = context(dir.path().to_str().unwrap());
+    seed(&ctx, &actor()).await;
+    let mark = DatabaseChange::Set {
+        entry: entry(),
+        consent: None,
+    };
+    drive(publish(mark), &ctx).await.expect("mark publishes");
+    let former = Some(Ulid::from_bytes([99; 16]));
+    let parser = |owner| DatabaseChange::Parser {
+        entry_id: entry().entry_id,
+        parser: None,
+        owner,
+    };
+    let stale = drive(publish(parser(former)), &ctx).await;
+    assert_eq!(
+        stale,
+        Err(PublishDatabaseError::OwnerChanged(entry().entry_id))
+    );
+    let removal = DatabaseChange::Remove {
+        entry_id: entry().entry_id,
+        owner: former,
+    };
+    let stale = drive(publish(removal), &ctx).await;
+    assert_eq!(
+        stale,
+        Err(PublishDatabaseError::OwnerChanged(entry().entry_id))
+    );
+    drive(publish(parser(Some(entry().owner_group))), &ctx)
+        .await
+        .expect("the current owner may change the parser");
 }

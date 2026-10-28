@@ -26,7 +26,7 @@ use aruna_core::structs::identity::identifier::{
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -48,14 +48,35 @@ pub enum DatabaseChange {
         entry: DatabaseEntry,
         consent: Option<Box<DatabaseConsent>>,
     },
+    /// `owner` is the group whose admin right was checked, when that right was the one used.
     Remove {
         entry_id: Ulid,
+        owner: Option<GroupId>,
     },
-    /// Sets or clears an entry's identifier parser.
+    /// Sets or clears an entry's identifier parser; `owner` as for a removal.
     Parser {
         entry_id: Ulid,
         parser: Option<IdentifierParser>,
+        owner: Option<GroupId>,
     },
+}
+
+/// The entry as this transaction reads it, still owned by the group the caller's right was
+/// checked against.
+fn owned_entry(
+    document: &RealmConfigDocument,
+    entry_id: Ulid,
+    owner: Option<GroupId>,
+) -> Result<(), PublishDatabaseError> {
+    let entry = (document.databases.iter())
+        .find(|entry| entry.entry_id == entry_id)
+        .ok_or(PublishDatabaseError::NotFound(entry_id))?;
+    match owner {
+        Some(owner) if owner != entry.owner_group => {
+            Err(PublishDatabaseError::OwnerChanged(entry_id))
+        }
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +110,8 @@ pub enum PublishDatabaseError {
     NotFound(Ulid),
     #[error("database entry {0} changed since the consent was given; ask for a new consent")]
     PredecessorChanged(Ulid),
+    #[error("database entry {0} changed its owner group since the check; check again")]
+    OwnerChanged(Ulid),
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("operation did not finish")]
@@ -209,26 +232,18 @@ impl PublishDatabaseOperation {
                     consent: consent.clone(),
                 })
             }
-            DatabaseChange::Remove { entry_id } => {
-                if !document
-                    .databases
-                    .iter()
-                    .any(|entry| entry.entry_id == *entry_id)
-                {
-                    return Err(PublishDatabaseError::NotFound(*entry_id));
-                }
+            DatabaseChange::Remove { entry_id, owner } => {
+                owned_entry(document, *entry_id, *owner)?;
                 Ok(AdminDocumentOperation::DatabaseRemoved {
                     entry_id: *entry_id,
                 })
             }
-            DatabaseChange::Parser { entry_id, parser } => {
-                if !document
-                    .databases
-                    .iter()
-                    .any(|entry| entry.entry_id == *entry_id)
-                {
-                    return Err(PublishDatabaseError::NotFound(*entry_id));
-                }
+            DatabaseChange::Parser {
+                entry_id,
+                parser,
+                owner,
+            } => {
+                owned_entry(document, *entry_id, *owner)?;
                 if let Some(parser) = parser {
                     validate_parser(parser)?;
                 }

@@ -73,7 +73,9 @@ fn map_error(error: DatabaseServiceError) -> ServerError {
             PublishDatabaseError::Unauthorized => ServerError::Forbidden,
             PublishDatabaseError::NotManagementNode => ServerError::NoManagementNode,
             PublishDatabaseError::NotFound(_) => ServerError::NotFound,
-            PublishDatabaseError::PredecessorChanged(_) => ServerError::Conflict(error.to_string()),
+            PublishDatabaseError::PredecessorChanged(_) | PublishDatabaseError::OwnerChanged(_) => {
+                ServerError::Conflict(error.to_string())
+            }
             PublishDatabaseError::Database(_) | PublishDatabaseError::Parser(_) => {
                 ServerError::BadRequestReason(error.to_string())
             }
