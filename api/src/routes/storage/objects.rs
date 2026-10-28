@@ -12,7 +12,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, KeyRange,
 };
-use aruna_operations::auth::permission_rules::permission_rules;
+use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::distribution::guard::{
     bound_view, copies_interval, lists_interval, local_fence,
 };
@@ -560,7 +560,8 @@ pub async fn list_objects(
 }
 
 /// The page without the keys and prefixes the caller may not read: READ on a listed prefix
-/// covers the literal prefix only, and denies or restrictions below it still apply.
+/// covers the literal prefix only, and denies, restrictions and request policies below it
+/// still apply.
 async fn readable_page(
     state: &ServerState,
     auth: &AuthContext,
@@ -568,13 +569,11 @@ async fn readable_page(
     mut page: ObjectListResponse,
 ) -> ServerResult<ObjectListResponse> {
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
-    let root = bucket_permission_path(realm_id, info.group_id, node_id, &page.bucket);
-    let rules = permission_rules(&state.get_ctx(), auth, &root)
+    let scope = (realm_id, info.group_id, node_id);
+    let access = BucketAccess::load(&state.get_ctx(), auth, scope, &page.bucket)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    let path =
-        |key: &str| object_permission_path(realm_id, info.group_id, node_id, &page.bucket, key);
-    let readable = |key: &str| rules.allows(&path(key), &Permission::READ);
+    let readable = |key: &str| access.allows(Some(key), &Permission::READ);
     page.objects.retain(|object| readable(&object.key));
     page.prefixes.retain(|prefix| readable(prefix));
     Ok(page)

@@ -173,6 +173,7 @@ async fn merges_peer_range() {
     store(&node, &["a.md", "b.md"]).await;
     distribute(&node.state, node.group_id, BUCKET).await;
     let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+        "version_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
         "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
         "prefixes":["y/"],"next_cursor":null}"#;
     let peer = mock_peer(StatusCode::OK, answer).await;
@@ -212,6 +213,7 @@ async fn copy_defers_listing() {
     store(&node, &["a.md"]).await;
     replicate(&node.state, node.group_id, BUCKET).await;
     let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+        "version_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
         "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
         "prefixes":[],"next_cursor":null}"#;
     let peer = mock_peer(StatusCode::OK, answer).await;
@@ -235,6 +237,7 @@ async fn start_after_resumes() {
     assert_eq!(keys(&page), vec!["b.md", "c.md"]);
     distribute(&node.state, node.group_id, BUCKET).await;
     let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+        "version_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
         "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
         "prefixes":[],"next_cursor":null}"#;
     let peer = mock_peer(StatusCode::OK, answer).await;

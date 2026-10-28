@@ -91,6 +91,8 @@ impl ListContinuationToken {
 pub struct ListedObject {
     pub head: BlobHeadKey,
     pub location: Option<BackendLocation>,
+    /// The current version the listing describes, so a caller can pin it.
+    pub version_id: Ulid,
     pub source_metadata: Option<SourceMetadata>,
     pub referenced: bool,
     pub kind: Option<SourceConnectorKind>,
@@ -116,6 +118,7 @@ enum ResolvedEntry {
         version_created_at: std::time::SystemTime,
         /// Registration this node must hold before the governed location may be
         /// described. `None` leaves an ungoverned head unchanged.
+        version_id: Ulid,
         governed: Option<(ManagedCopyKey, Vec<PlacementPolicyRef>)>,
     },
 }
@@ -597,6 +600,7 @@ impl ListBucketOperation {
                                 referenced: true,
                                 kind: Some(descriptor.kind),
                                 source_path: Some(descriptor.source_path),
+                                version_id,
                                 connector_id: source.connector_id,
                                 origin_node_id: descriptor.origin_node_id,
                                 last_refresh: Some(last_refresh),
@@ -644,6 +648,7 @@ impl ListBucketOperation {
                 }
             }
         }
+                        version_id,
 
         if self.round_exhausted {
             return self.finish_scan();
@@ -687,6 +692,7 @@ impl ListBucketOperation {
                     let Some((_key, value)) = locations.next() else {
                         return self.emit_error(ListBucketError::ListObjectsFailed);
                     };
+                    version_id,
                     let registration = match governed.as_ref() {
                         Some(_) => match locations.next() {
                             Some((_, value)) => value,
@@ -717,6 +723,7 @@ impl ListBucketOperation {
                         kind: None,
                         source_path: None,
                         connector_id: None,
+                        version_id,
                         origin_node_id: None,
                         last_refresh: None,
                         version_created_at: Some(version_created_at),

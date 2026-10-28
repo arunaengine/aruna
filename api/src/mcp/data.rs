@@ -88,6 +88,8 @@ pub struct ListObjectsInput {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct ObjectOutput {
     pub key: String,
+    /// The current version, so a selection can pin exactly what was listed.
+    pub version_id: String,
     pub size: Option<u64>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
@@ -763,6 +765,7 @@ pub(crate) fn object_output(object: &ListedObject) -> ObjectOutput {
         entry_time(object).map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
     ObjectOutput {
         key: object.head.key.clone(),
+        version_id: object.version_id.to_string(),
         size,
         etag,
         last_modified,
