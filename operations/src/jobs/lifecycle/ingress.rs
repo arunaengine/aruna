@@ -99,6 +99,34 @@ pub enum SubmissionRefusal {
     Unavailable,
 }
 
+/// What one resolve request or answer may carry: half a transport message, so the bearer and
+/// the envelope always fit beside it.
+const RESOLVE_BATCH_BYTES: usize = crate::metadata::protocol::MAX_MESSAGE_SIZE / 2;
+
+/// Adds `item` to a batch of `size` encoded bytes when it still fits one resolve batch.
+fn fits(size: &mut usize, item: &impl Serialize) -> bool {
+    let bytes = postcard::experimental::serialized_size(item).unwrap_or(usize::MAX);
+    match size
+        .checked_add(bytes)
+        .filter(|total| *total <= RESOLVE_BATCH_BYTES)
+    {
+        Some(total) => {
+            *size = total;
+            true
+        }
+        None => false,
+    }
+}
+
+/// How many leading `items` fit one resolve batch.
+fn batch_len<T: Serialize>(items: &[T]) -> usize {
+    let mut size = 0;
+    items
+        .iter()
+        .take_while(|item| fits(&mut size, *item))
+        .count()
+}
+
 /// The inputs an ingress asks their source node to resolve and grant for one caller.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputResolveRequest {
@@ -109,9 +137,9 @@ pub struct InputResolveRequest {
     pub inputs: Vec<InputSelection>,
 }
 
-/// Resolves inputs this node holds for an ingress. The caller's bearer is validated here, so
-/// the grants vouch for an identity this node checked, never for one a peer asserted. Each
-/// answer is the input after its links, pinned to its target here, with that capture.
+/// Resolves inputs this node holds for an ingress, under a bearer validated here, so grants
+/// vouch only for an identity this node checked. Each answer is an input after its links with
+/// its capture here; the answers that fit one message return, and the ingress asks again.
 pub async fn serve_input_resolve(
     context: &Arc<DriverContext>,
     peer: NodeId,
@@ -152,6 +180,7 @@ pub async fn serve_input_resolve(
         request.expires_at.min(bound),
     );
     let mut answers = Vec::with_capacity(request.inputs.len());
+    let mut size = 0;
     for input in request.inputs {
         let (mut input, link) = follow_link(context, input, caller.0, local)
             .await
@@ -169,7 +198,16 @@ pub async fn serve_input_resolve(
             return Err(SubmissionRefusal::Unavailable);
         };
         captured.link = link;
-        answers.push((input, captured));
+        let answer = (input, captured);
+        if !fits(&mut size, &answer) {
+            if answers.is_empty() {
+                return Err(SubmissionRefusal::Invalid {
+                    reason: format!("{}: the input exceeds one message", answer.0.dest_key),
+                });
+            }
+            break;
+        }
+        answers.push(answer);
     }
     Ok(answers)
 }
@@ -706,18 +744,40 @@ async fn remote_captures(
             "an input on another node needs the caller's bearer token".to_string(),
         ));
     };
-    let request = InputResolveRequest {
-        created_by,
-        submission_id,
-        expires_at,
-        inputs: inputs.to_vec(),
-    };
-    let answer = metadata
-        .request_input_resolve(node, AuthToken::Bearer(token.clone()), request)
-        .await
-        .map_err(|error| {
-            SubmitJobError::PlacementUnavailable(format!("input node {node}: {error}"))
-        })?;
+    // Each request carries the inputs that fit one batch and the node answers a prefix of
+    // them, so the rest go out again until every input is answered.
+    let mut answered = Vec::with_capacity(inputs.len());
+    while answered.len() < inputs.len() {
+        let rest = &inputs[answered.len()..];
+        let batch = &rest[..batch_len(rest)];
+        if batch.is_empty() {
+            return Err(SubmitJobError::InvalidWorkspace(format!(
+                "{}: the input exceeds one message",
+                rest[0].dest_key
+            )));
+        }
+        let request = InputResolveRequest {
+            created_by,
+            submission_id,
+            expires_at,
+            inputs: batch.to_vec(),
+        };
+        let token = AuthToken::Bearer(token.clone());
+        let answer = metadata.request_input_resolve(node, token, request).await;
+        answered.extend(resolve_answer(answer, batch, node)?);
+    }
+    Ok(answered)
+}
+
+/// The answers of one resolve request: a non-empty prefix of `batch`, each faithful to it.
+fn resolve_answer(
+    answer: Result<Result<Vec<(InputSelection, CapturedInput)>, SubmissionRefusal>, String>,
+    batch: &[InputSelection],
+    node: NodeId,
+) -> Result<Vec<(InputSelection, CapturedInput)>, SubmitJobError> {
+    let answer = answer.map_err(|error| {
+        SubmitJobError::PlacementUnavailable(format!("input node {node}: {error}"))
+    })?;
     let captured = match answer {
         Ok(captured) => captured,
         Err(SubmissionRefusal::Invalid { reason }) => {
@@ -734,9 +794,10 @@ async fn remote_captures(
             )));
         }
     };
-    // The node answers for exactly the asked inputs, each pinned to a version it holds.
-    let exact = captured.len() == inputs.len()
-        && (captured.iter().zip(inputs)).all(|(answer, asked)| answers_input(asked, answer, node));
+    // The node answers a prefix of the asked inputs, each pinned to a version it holds.
+    let exact = !captured.is_empty()
+        && captured.len() <= batch.len()
+        && (captured.iter().zip(batch)).all(|(answer, asked)| answers_input(asked, answer, node));
     match exact {
         true => Ok(captured),
         false => Err(SubmitJobError::PlacementUnavailable(format!(
@@ -1832,6 +1893,44 @@ mod tests {
             releases_complete: false,
             grant: None,
         }
+    }
+
+    #[test]
+    fn pages_resolve_messages() {
+        // Answers past one transport message split into pages that each encode within it, and
+        // an answer that stops early is taken as a prefix, leaving the rest to ask again.
+        let node_id = node(2);
+        let long = "k".repeat(64 * 1024);
+        let version = Ulid::from_parts(1, 1).to_string();
+        let answers: Vec<(InputSelection, CapturedInput)> = (0..120u32)
+            .map(|index| {
+                let mut input = s3_input("db", &format!("{index}/{long}"), Some(&version));
+                input.dest_key = format!("{index}/{long}");
+                input.source_node_id = Some(node_id);
+                let captured = captured_from(&input, node_id);
+                (input, captured)
+            })
+            .collect();
+        let inputs: Vec<InputSelection> = answers.iter().map(|(input, _)| input.clone()).collect();
+        let encode = |answers: &[(InputSelection, CapturedInput)]| {
+            let result = Ok(answers.to_vec());
+            crate::metadata::protocol::encode_message(
+                &MetadataTransportMessage::ResolvedJobInputs { result },
+            )
+        };
+        assert!(encode(&answers).is_err());
+        let mut done = 0;
+        let mut pages = 0;
+        while done < answers.len() {
+            let page = &answers[done..][..batch_len(&answers[done..])];
+            assert!(!page.is_empty() && encode(page).is_ok());
+            let taken = resolve_answer(Ok(Ok(page.to_vec())), &inputs[done..], node_id).unwrap();
+            assert_eq!(taken.len(), page.len());
+            done += page.len();
+            pages += 1;
+        }
+        assert!(pages > 1);
+        assert!(resolve_answer(Ok(Ok(Vec::new())), &inputs, node_id).is_err());
     }
 
     #[test]
