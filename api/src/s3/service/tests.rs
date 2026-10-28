@@ -1673,6 +1673,43 @@ async fn remote_relink_asks_target() {
 }
 
 #[tokio::test]
+async fn denied_relink_hides_length() {
+    // A wrong ETag with an unsatisfiable range is refused for a caller the target denies, so
+    // the range answer never tells such a caller the recorded length.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let link = (&user_access, "links/db");
+    write_link(&service, link, ("hidden", "db", Ulid::generate()), "v2").await;
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let request = S3Request {
+        input: s3s::dto::GetObjectInput {
+            bucket: "study".to_string(),
+            key: "links/db".to_string(),
+            if_match: Some(s3s::dto::ETagCondition::ETag(s3s::dto::ETag::Strong(
+                "v1".to_string(),
+            ))),
+            range: Some(s3s::dto::Range::Int {
+                first: 100,
+                last: Some(200),
+            }),
+            ..Default::default()
+        },
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let error = service.get_object(request).await.unwrap_err();
+    assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+}
+
+#[tokio::test]
 async fn hides_link_prefixes() {
     // A folder that holds only a link to an unreadable target is no common prefix.
     let (_storage_dir, service, user_access, group_id) = subpath_node().await;
