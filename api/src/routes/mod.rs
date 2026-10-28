@@ -14,13 +14,12 @@ use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 pub mod access;
 pub mod assistant;
 pub mod audit;
-pub mod database_types;
-pub mod databases;
 pub mod device;
 pub mod drs;
 pub mod execution;
 pub mod federation;
 pub mod git;
+pub mod identifiers;
 pub mod info;
 pub mod link_routes;
 pub mod management_relay;
@@ -70,7 +69,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::encryption::router())
         .merge(storage::abe::router())
         .merge(storage::bucket::keys::router())
-        .merge(databases::router())
+        .merge(identifiers::router())
         .merge(drs::router())
         .merge(staging::router())
         .merge(storage::deletion::router())
@@ -281,18 +280,8 @@ pub(crate) mod tests {
         ("GET", "/data/provenance/crate"),
         ("GET", "/data/buckets/{bucket}/objects/part-of"),
         ("GET", "/data/buckets/{bucket}/sources"),
-        ("GET", "/data/databases"),
-        ("POST", "/system/realm/databases"),
+        ("POST", "/data/identifier-rules/test"),
         ("POST", "/system/realm/nodes/{node_id}/promote"),
-        ("DELETE", "/system/realm/databases/{entry_id}"),
-        ("PUT", "/system/realm/databases/{entry_id}/parser"),
-        ("POST", "/system/realm/databases/parser/test"),
-        ("GET", "/system/realm/databases/requests"),
-        (
-            "POST",
-            "/system/realm/databases/requests/{request_id}/approve",
-        ),
-        ("DELETE", "/system/realm/databases/requests/{request_id}"),
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),

@@ -364,9 +364,7 @@ fn origin_kinds_named() {
     };
     let kinds = [
         upload,
-        VersionOrigin::Source {
-            database: Some(Ulid::from_bytes([49; 16])),
-        },
+        VersionOrigin::Source,
         VersionOrigin::Storage {
             backend_id: Ulid::from_bytes([50; 16]),
             key: "share/a.txt".to_string(),
@@ -396,12 +394,7 @@ fn origin_kinds_named() {
         &bodies[0],
         OriginBody::Upload { device: Some(device), .. } if device == "laptop"
     ));
-    assert!(matches!(
-        &bodies[1],
-        OriginBody::Source {
-            database_entry: Some(_)
-        }
-    ));
+    assert!(matches!(&bodies[1], OriginBody::Source));
     assert!(matches!(
         &bodies[2],
         OriginBody::Storage { key, .. } if key == "share/a.txt"

@@ -898,128 +898,6 @@ pub(in crate::document_sync) async fn validate_group_authority(
     })
 }
 
-/// Database entries need more than a management origin: the actor's current WRITE on the
-/// databases path, and admin WRITE on the owning group from the actor or the consent's
-/// approver. A removal or parser change needs either right (P1 pattern, plan r39 section 20).
-async fn validate_database_actors(
-    storage: &StorageHandle,
-    event: &AdminDocumentEvent,
-    config: Option<&RealmConfigDocument>,
-) -> Result<AdminEventValidation> {
-    use aruna_core::structs::identity::database::{database_admin_path, owner_admin_path};
-    let (group, consent) = match &event.op {
-        AdminDocumentOperation::DatabaseSet { entry, consent, .. } => {
-            (Some(entry.owner_group), consent.as_deref())
-        }
-        AdminDocumentOperation::DatabaseRemoved { entry_id }
-        | AdminDocumentOperation::DatabaseParserSet { entry_id, .. } => (
-            config
-                .and_then(|config| {
-                    config
-                        .databases
-                        .iter()
-                        .find(|entry| entry.entry_id == *entry_id)
-                })
-                .map(|entry| entry.owner_group),
-            None,
-        ),
-        _ => return Ok(AdminEventValidation::Accepted),
-    };
-    if let AdminDocumentOperation::DatabaseSet { entry, .. } = &event.op
-        && !owner_matches(storage, entry).await?
-    {
-        return Ok(AdminEventValidation::Rejected(
-            "the entry names another owner group than its distributed bucket".to_string(),
-        ));
-    }
-    let realm_id = event.actor.realm_id;
-    let Some(realm_auth) = read_realm_authorization(storage, realm_id).await? else {
-        return Ok(AdminEventValidation::Deferred {
-            dependency: Some(DocumentSyncDependency::RealmAuthorization(realm_id)),
-            reason: "realm authorization state is unavailable".to_string(),
-        });
-    };
-    let group_auth = match group {
-        Some(group_id) => {
-            let target = DocumentTarget::GroupAuthorization { group_id };
-            storage_read_from(
-                storage,
-                target.storage_keyspace().to_string(),
-                target.storage_key(),
-            )
-            .await?
-            .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
-            .transpose()
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?
-        }
-        None => None,
-    };
-    let roles = || {
-        realm_auth
-            .roles
-            .values()
-            .chain(group_auth.iter().flat_map(|auth| auth.roles.values()))
-    };
-    let curator =
-        has_write_permission(event.actor.user_id, &database_admin_path(realm_id), roles());
-    let owner = |user_id| {
-        group.is_some_and(|group_id| {
-            has_write_permission(user_id, &owner_admin_path(realm_id, group_id), roles())
-        })
-    };
-    let allowed = match (&event.op, consent) {
-        (AdminDocumentOperation::DatabaseSet { .. }, None) => curator && owner(event.actor.user_id),
-        (AdminDocumentOperation::DatabaseSet { .. }, Some(consent)) => {
-            curator
-                && owner(consent.claim.approver)
-                && config.is_some_and(|config| origin_may_publish(config, &consent.signer))
-        }
-        _ => curator || owner(event.actor.user_id),
-    };
-    // A parser change may arrive before the entry it names; its owner decides once that is here.
-    if !allowed
-        && group.is_none()
-        && matches!(event.op, AdminDocumentOperation::DatabaseParserSet { .. })
-    {
-        return Ok(AdminEventValidation::Deferred {
-            dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
-            reason: "the database entry of the parser is not known here yet".to_string(),
-        });
-    }
-    if let Some(group_id) = group.filter(|_| !allowed && group_auth.is_none()) {
-        return Ok(AdminEventValidation::Deferred {
-            dependency: Some(DocumentSyncDependency::GroupAuthorization(group_id)),
-            reason: "the owning group's authorization state is unavailable".to_string(),
-        });
-    }
-    Ok(if allowed {
-        AdminEventValidation::Accepted
-    } else {
-        AdminEventValidation::Rejected(
-            "actor or consent approver lacks current database authority".to_string(),
-        )
-    })
-}
-
-/// Whether a distributed bucket's entry names the set's owner group; a set fixes its group,
-/// and a set this node does not hold yet passes.
-async fn owner_matches(
-    storage: &StorageHandle,
-    entry: &aruna_core::structs::identity::database::DatabaseEntry,
-) -> Result<bool> {
-    use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
-    use aruna_core::structs::identity::database::DatabaseTarget;
-    use aruna_core::structs::storage::distribution::DistributionView;
-    let DatabaseTarget::Distributed { set_id } = &entry.target else {
-        return Ok(true);
-    };
-    let key = set_id.to_bytes().to_vec().into();
-    let view = storage_read_from(storage, DISTRIBUTION_KEYSPACE.to_string(), key).await?;
-    Ok(view
-        .and_then(|bytes| DistributionView::from_bytes(&bytes).ok())
-        .is_none_or(|view| view.snapshot().root.owner_group == entry.owner_group))
-}
-
 pub(in crate::document_sync) fn has_write_permission<'a>(
     user_id: UserId,
     path: &str,
@@ -1602,27 +1480,6 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err(format!("realm portal features rejected: {error}"));
             }
         }
-        AdminDocumentOperation::DatabaseSet {
-            entry,
-            predecessor,
-            consent,
-        } => {
-            entry
-                .validate()
-                .map_err(|error| format!("database entry rejected: {error}"))?;
-            if let Some(consent) = consent {
-                consent
-                    .verify(event.actor.realm_id, entry, predecessor.as_ref())
-                    .map_err(|error| format!("database consent rejected: {error}"))?;
-            }
-        }
-        AdminDocumentOperation::DatabaseParserSet {
-            parser: Some(parser),
-            ..
-        } => {
-            aruna_core::structs::identity::identifier::validate_parser(parser)
-                .map_err(|error| format!("database parser rejected: {error}"))?;
-        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1841,9 +1698,6 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::ConfigFederationSet { .. }
         | AdminDocumentOperation::ConfigPortalSet { .. }
         | AdminDocumentOperation::ConfigReplicasSet { .. }
-        | AdminDocumentOperation::DatabaseSet { .. }
-        | AdminDocumentOperation::DatabaseRemoved { .. }
-        | AdminDocumentOperation::DatabaseParserSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
         AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };
@@ -1878,10 +1732,6 @@ pub(in crate::document_sync) async fn validate_admin_event(
             let authorized = validate_config_authority(current_config, event, cached_state)?;
             if !matches!(authorized, AdminEventValidation::Accepted) {
                 return Ok(authorized);
-            }
-            let actors = validate_database_actors(storage, event, current_config).await?;
-            if !matches!(actors, AdminEventValidation::Accepted) {
-                return Ok(actors);
             }
             cached_state.cloned()
         }

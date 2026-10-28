@@ -37,7 +37,7 @@ use utoipa_axum::routes;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::database_types::IdentifierView;
+use crate::routes::identifiers::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::bucket_metadata::BucketMetadataBody;
 use crate::routes::storage::deletion::bucket_info;
@@ -78,8 +78,8 @@ pub enum OriginBody {
         node_id: String,
         device: Option<String>,
     },
-    /// From an external source or a database; details are under `source`.
-    Source { database_entry: Option<String> },
+    /// From an external source; details are under `source`.
+    Source,
     /// Copied from another exact version (global id or versioned node ARN as w3id).
     Copy { from: String },
     /// Registered in place from a storage backend folder.
@@ -174,9 +174,7 @@ impl From<OriginView> for OriginResponse {
                     node_id: node_id.to_string(),
                     device,
                 },
-                VersionOrigin::Source { database } => OriginBody::Source {
-                    database_entry: database.map(|entry| entry.to_string()),
-                },
+                VersionOrigin::Source => OriginBody::Source,
                 VersionOrigin::Copy { from } => OriginBody::Copy {
                     from: version_id(&from),
                 },

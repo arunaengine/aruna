@@ -395,31 +395,11 @@ pub enum AdminDocumentOperation {
     DistributionPublished {
         snapshot: Box<crate::structs::storage::distribution::SignedSnapshot>,
     },
-    /// Marks a bucket as a database or retargets an entry. Without a consent the actor must
-    /// also administer the owning group; with one, its approver must.
-    #[serde(rename = "RealmConfigDatabaseSet")]
-    DatabaseSet {
-        entry: crate::structs::identity::database::DatabaseEntry,
-        /// The register version this publication replaces, which the consent names.
-        predecessor: Option<AdminDocumentDot>,
-        consent: Option<Box<crate::structs::identity::database::DatabaseConsent>>,
-    },
-    /// Removes a database entry; the bucket and the dataset stay as they are.
-    #[serde(rename = "RealmConfigDatabaseRemoved")]
-    DatabaseRemoved {
-        entry_id: Ulid,
-    },
     /// Replaces whether replicas count toward group quotas. Its own operation, so quota events
     /// signed before the setting keep their encoding.
     #[serde(rename = "RealmConfigReplicasSet")]
     ConfigReplicasSet {
         replicas: crate::structs::identity::realm::ReplicaQuota,
-    },
-    /// Sets or clears the identifier parser of a database entry; it grants nothing.
-    #[serde(rename = "RealmConfigDatabaseParserSet")]
-    DatabaseParserSet {
-        entry_id: Ulid,
-        parser: Option<crate::structs::identity::identifier::IdentifierParser>,
     },
 }
 

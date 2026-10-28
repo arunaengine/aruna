@@ -26,7 +26,7 @@ use super::distributed::map_create_error;
 use super::routing::ensure_group_admin;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::database_types::IdentifierParserBody;
+use crate::routes::identifiers::IdentifierParserBody;
 use crate::server::state::ServerState;
 
 #[derive(OpenApi)]

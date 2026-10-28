@@ -54,8 +54,6 @@ pub const DOCUMENT_JOB_KEYSPACE: &str = "metadata_materialization_document_jobs"
 pub const DEAD_LETTER_KEYSPACE: &str = "metadata_materialization_dead_letters";
 pub const MATERIALIZATION_PRUNE_KEYSPACE: &str = "metadata_materialization_prunes";
 pub const DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
-/// Database marks waiting for owner consent on this management node, by request id.
-pub const DATABASE_REQUEST_KEYSPACE: &str = "database_requests";
 /// Reduced distribution records by set id, materialized from their admin reducer state.
 pub const DISTRIBUTION_KEYSPACE: &str = "distribution_records";
 /// Requests a set's publisher accepted, by set id and request id, with the revision they made.
@@ -64,8 +62,6 @@ pub const DISTRIBUTION_ACCEPT_KEYSPACE: &str = "distribution_accepted";
 pub const DISTRIBUTION_PUBLISHER_KEYSPACE: &str = "distribution_publishers";
 /// Snapshots whose publisher the realm config does not know yet, by publisher and set id.
 pub const DISTRIBUTION_PARKED_KEYSPACE: &str = "distribution_parked";
-/// Database parser events waiting for their entry, by topic and event; replay moves past them.
-pub const PARKED_PARSER_KEYSPACE: &str = "document_sync_parked_parsers";
 /// The revision number of each parked snapshot, so the bound is counted without the bodies.
 pub const PARKED_INDEX_KEYSPACE: &str = "distribution_parked_index";
 /// Ordered inventory of each distributed bucket: head and version rows by set id and position.
@@ -511,8 +507,6 @@ pub const DOCUMENT_IRI_KEYSPACE: &str = "metadata_document_iris";
 pub const SEARCH_FEED_KEYSPACE: &str = "distribution_search_feed";
 /// The search index state of each range on this member, by set id and range id.
 pub const SEARCH_INDEX_KEYSPACE: &str = "distribution_search_indexes";
-/// The register version of each database entry this node saw unlinked, by entry id.
-pub const DATABASE_UNLINKED_KEYSPACE: &str = "database_unlinked";
 /// The value each row a running usage rebuild reads had when the rebuild began, kept on change.
 pub const USAGE_PREIMAGE_KEYSPACE: &str = "usage_rebuild_preimages";
 /// Bytes this node admitted for distributed bucket members: a member row by set id with its
@@ -558,12 +552,10 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DEAD_LETTER_KEYSPACE,
     MATERIALIZATION_PRUNE_KEYSPACE,
     DOCUMENT_STATE_KEYSPACE,
-    DATABASE_REQUEST_KEYSPACE,
     DISTRIBUTION_KEYSPACE,
     DISTRIBUTION_ACCEPT_KEYSPACE,
     DISTRIBUTION_PUBLISHER_KEYSPACE,
     DISTRIBUTION_PARKED_KEYSPACE,
-    PARKED_PARSER_KEYSPACE,
     PARKED_INDEX_KEYSPACE,
     INVENTORY_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE,
@@ -788,7 +780,6 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DOCUMENT_IRI_KEYSPACE,
     SEARCH_FEED_KEYSPACE,
     SEARCH_INDEX_KEYSPACE,
-    DATABASE_UNLINKED_KEYSPACE,
     USAGE_PREIMAGE_KEYSPACE,
     CAPACITY_RESERVATION_KEYSPACE,
 ];

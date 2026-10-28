@@ -80,7 +80,7 @@ fn node_sources_unpublished() {
 
 #[test]
 fn sources_jobs_project() {
-    let source = VersionOrigin::Source { database: None };
+    let source = VersionOrigin::Source;
     let url = "https://s3.example.org/reads/a.fastq".to_string();
     assert_eq!(
         project(Some(&source), None, Some(url.clone())),

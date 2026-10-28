@@ -36,6 +36,11 @@ pub struct ReleaseRef {
     pub upstream: Vec<Identifier>,
 }
 
+/// The permission path whose WRITE makes a realm curator of database releases.
+pub fn curator_path(realm_id: crate::structs::identity::realm::RealmId) -> String {
+    format!("/{realm_id}/admin/databases")
+}
+
 /// Version metadata key whose value is the release label; only the server sets it.
 pub const RELEASE_TAG: &str = "aruna-engine.org/release";
 /// Version metadata key naming the key prefix a release covers.

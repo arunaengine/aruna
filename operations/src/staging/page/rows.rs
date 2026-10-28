@@ -92,8 +92,6 @@ pub struct PageImportInput {
     pub writes: Vec<(KeySpace, Key, Value)>,
     pub deletes: Vec<(KeySpace, Key)>,
     pub now: SystemTime,
-    /// The bucket's database list entry at registration, kept in every version's origin.
-    pub database: Option<Ulid>,
     /// The ranges whose turns the page holds; a page whose keys lie in others ends unwritten.
     pub ranges: Option<BTreeSet<Ulid>>,
 }
@@ -519,9 +517,7 @@ fn register_rows(
         input.user_id,
         input.now,
     )
-    .with_origin(Some(VersionOrigin::Source {
-        database: input.database,
-    }))
+    .with_origin(Some(VersionOrigin::Source))
     .with_policies(guards.policies.clone())?;
     let version_key = VersionKey::new(&input.bucket, &entry.target_key, version_id);
     let pointer = CurrentVersionPointer::next_for(head, version_id)?;

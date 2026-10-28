@@ -308,7 +308,6 @@ async fn reference_import_counted() {
         writes: Vec::new(),
         deletes: Vec::new(),
         now: SystemTime::UNIX_EPOCH + Duration::from_secs(120),
-        database: None,
         ranges: None,
     };
     drive(PageImportOperation::new(page), ctx.as_ref())

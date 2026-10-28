@@ -10,7 +10,6 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::source_access::SourceDigest;
-use aruna_core::structs::identity::database::DatabaseTarget;
 use aruna_core::structs::identity::identifier::{CompiledParser, Identifier};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
@@ -26,7 +25,6 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::metadata::bucket_metadata;
 
@@ -137,27 +135,6 @@ pub async fn read_origin(
     );
     view.bucket_metadata = metadata;
     Ok(view)
-}
-
-/// The database list entry a bucket is listed under now: its set's entry, or this node's entry
-/// of its name. A source origin records it when the version is minted; none when unreadable.
-pub async fn database_entry(
-    context: &DriverContext,
-    (realm_id, node_id): (RealmId, NodeId),
-    bucket: &str,
-    set_id: Option<Ulid>,
-) -> Option<Ulid> {
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .ok()?;
-    let entry = config.databases.iter().find(|entry| match &entry.target {
-        DatabaseTarget::Distributed { set_id: listed } => set_id == Some(*listed),
-        DatabaseTarget::Ordinary {
-            node_id: entry_node,
-            bucket: name,
-        } => set_id.is_none() && *entry_node == node_id && name == bucket,
-    });
-    entry.map(|entry| entry.entry_id)
 }
 
 fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> OriginView {

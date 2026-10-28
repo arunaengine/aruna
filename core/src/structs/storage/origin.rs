@@ -51,12 +51,9 @@ pub enum VersionOrigin {
         /// The authenticated device the file came from, when known.
         device: Option<String>,
     },
-    /// An external source or a database, registered without copying or copied in. The source
-    /// root, path and observation are the version's own source binding, never copied here.
-    Source {
-        /// The database list entry of the bucket, when the bucket was listed at registration.
-        database: Option<Ulid>,
-    },
+    /// An external source, registered without copying or copied in. The source root, path and
+    /// observation are the version's own source binding, never copied here.
+    Source,
     /// CopyObject or a snapshot copy minted this version from another one.
     Copy { from: OriginVersion },
     /// Registered in place from a storage backend folder of the group.
@@ -76,7 +73,7 @@ impl VersionOrigin {
             Self::Copy {
                 from: OriginVersion::Node(arn),
             } => arn.key.len() <= MAX_KEY_BYTES,
-            Self::Source { .. } | Self::Copy { .. } | Self::Job { .. } => true,
+            Self::Source | Self::Copy { .. } | Self::Job { .. } => true,
         }
     }
 }
@@ -124,7 +121,7 @@ pub fn project(
 ) -> Vec<OriginProjection> {
     let mut projection = Vec::new();
     match origin {
-        Some(VersionOrigin::Source { .. }) => {
+        Some(VersionOrigin::Source) => {
             projection.extend(source_url.map(|id| OriginProjection::BasedOn { id }));
         }
         Some(VersionOrigin::Copy { from }) if from.publishable() => {

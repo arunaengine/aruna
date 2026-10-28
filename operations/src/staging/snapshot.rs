@@ -6,7 +6,6 @@ use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,
 };
-use crate::s3::object::origin::database_entry;
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
@@ -127,9 +126,6 @@ pub async fn stage_snapshot_blob(
     // The staging source is external, so it carries no refs of its own: only
     // the destination default governs the snapshot.
     let gate = gate_context(context, input.realm_id, now_ms()).await?;
-    let set_id = (input.expected_bucket.distribution.as_ref()).map(|binding| binding.set_id);
-    let scope = (input.realm_id, input.node_id);
-    let database = database_entry(context, scope, &input.bucket, set_id).await;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: input.user_id,
         group_id: input.group_id,
@@ -151,7 +147,7 @@ pub async fn stage_snapshot_blob(
     })
     .with_bucket_guard(input.expected_bucket)
     .with_restrictions(input.restrictions.clone())
-    .with_version_origin(Some(VersionOrigin::Source { database }));
+    .with_version_origin(Some(VersionOrigin::Source));
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }

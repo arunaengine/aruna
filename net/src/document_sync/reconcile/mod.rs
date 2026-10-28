@@ -16,7 +16,6 @@ mod materialize;
 mod metadata;
 mod overflow;
 mod parked;
-mod parked_parsers;
 mod registry;
 mod shared;
 mod validate;

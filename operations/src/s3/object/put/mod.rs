@@ -1458,7 +1458,7 @@ impl PutObjectOperation {
             .with_metadata(self.metadata.clone())
             .with_origin(Some(self.version_origin.clone().unwrap_or(
                 match self.config.version_source {
-                    Some(_) => VersionOrigin::Source { database: None },
+                    Some(_) => VersionOrigin::Source,
                     None => VersionOrigin::Upload {
                         node_id: self.config.node_id,
                         device: None,
