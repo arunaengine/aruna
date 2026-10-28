@@ -11,16 +11,18 @@ pub(crate) use enrollment::{
 
 pub use enrollment::{EnrollmentPlan, plan_enrollment};
 
+use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
+use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase, OnboardingSecretError};
 use aruna_core::structs::identity::auth::NodeCapabilities;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
@@ -30,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
 use std::string::FromUtf8Error;
 use thiserror::Error;
+use tracing::{info, warn};
 
 /// A failure while reading, persisting, or enrolling a node identity.
 #[derive(Error, Debug)]
@@ -93,6 +96,93 @@ impl IdentityStore {
     ) -> Result<(RealmId, NodeCapabilities), IdentityError> {
         node_capabilities(state)
     }
+
+    /// Moves a realm key a promotion handed over into the identity once the stored realm config
+    /// lists this node as management. Any other identity drops a leftover key.
+    pub async fn apply_promotion(
+        &self,
+        state: PersistedNodeState,
+        node_id: NodeId,
+    ) -> Result<PersistedNodeState, IdentityError> {
+        let Some(bytes) = read_row(&self.storage, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW).await?
+        else {
+            return Ok(state);
+        };
+        let state = match &state.identity {
+            PersistedNodeIdentity::Server { .. } => {
+                if !listed_management(&self.storage, state.realm_id, node_id).await? {
+                    return Ok(state);
+                }
+                let realm_id = state.realm_id;
+                let pem = String::from_utf8(bytes.to_vec()).ok().filter(|pem| {
+                    SigningKey::from_pkcs8_pem(pem)
+                        .is_ok_and(|key| key.verifying_key().to_bytes() == *realm_id.as_bytes())
+                });
+                match pem {
+                    None => {
+                        warn!("Dropping a handed realm key that is not this realm's key");
+                        state
+                    }
+                    Some(realm_private_pem) => {
+                        let promoted = PersistedNodeState {
+                            identity: PersistedNodeIdentity::Management { realm_private_pem },
+                            ..state
+                        };
+                        self.persist(&promoted).await?;
+                        info!("Applied the promotion to a management node");
+                        promoted
+                    }
+                }
+            }
+            PersistedNodeIdentity::Management { .. } | PersistedNodeIdentity::User { .. } => state,
+        };
+        let delete = StorageEffect::Delete {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(PROMOTED_KEY_ROW),
+            txn_id: None,
+        };
+        match self.storage.send_effect(Effect::Storage(delete)).await {
+            Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(state),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            other => Err(IdentityError::UnexpectedStorageEvent(format!("{other:?}"))),
+        }
+    }
+}
+
+async fn read_row(
+    storage: &StorageHandle,
+    key_space: &str,
+    key: &[u8],
+) -> Result<Option<ByteView>, IdentityError> {
+    let read = StorageEffect::Read {
+        key_space: key_space.to_string(),
+        key: ByteView::from(key),
+        txn_id: None,
+    };
+    match storage.send_effect(Effect::Storage(read)).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(IdentityError::UnexpectedStorageEvent(format!("{other:?}"))),
+    }
+}
+
+/// Whether the realm config this node holds lists it as a management node.
+async fn listed_management(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    node_id: NodeId,
+) -> Result<bool, IdentityError> {
+    let target = DocumentTarget::RealmConfig { realm_id };
+    let Some(bytes) = read_row(storage, target.storage_keyspace(), &target.storage_key()).await?
+    else {
+        return Ok(false);
+    };
+    let document = RealmConfigDocument::from_bytes(&bytes)?;
+    let node_id = node_id.to_string();
+    Ok(document
+        .nodes
+        .iter()
+        .any(|node| node.node_id == node_id && node.kind == RealmNodeKind::Management))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,5 +563,153 @@ mod tests {
             derived, management.realm_id,
             "a mismatched persisted realm must be detectable"
         );
+    }
+
+    async fn write_row(storage: &StorageHandle, key_space: &str, key: &[u8], value: Vec<u8>) {
+        let write = StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: ByteView::from(key),
+            value: ByteView::from(value),
+            txn_id: None,
+        };
+        storage.send_effect(Effect::Storage(write)).await;
+    }
+
+    async fn write_config(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+        node: NodeId,
+        kind: RealmNodeKind,
+    ) {
+        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        document.ensure_node(node, kind);
+        let target = DocumentTarget::RealmConfig { realm_id };
+        let bytes = postcard::to_allocvec(&document).unwrap();
+        write_row(
+            storage,
+            target.storage_keyspace(),
+            &target.storage_key(),
+            bytes,
+        )
+        .await;
+    }
+
+    fn pem(key: &SigningKey) -> Vec<u8> {
+        key.to_pkcs8_pem(LineEnding::default())
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// A server node of the realm `realm_key` signs, its node id and its store.
+    fn server_node(
+        realm_key: &SigningKey,
+    ) -> (
+        PersistedNodeState,
+        NodeId,
+        IdentityStore,
+        StorageHandle,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let state = PersistedNodeState {
+            boot_origin: BootOrigin::Onboarded,
+            status: PersistedNodeStatus::Complete,
+            realm_id: RealmId::from_bytes(realm_key.verifying_key().to_bytes()),
+            net_secret_key: [5; 32],
+            onboarding_phase: None,
+            onboarding_sync_ticket: None,
+            identity: PersistedNodeIdentity::Server {
+                private_key_pem: String::from_utf8(pem(&generate_signing_key())).unwrap(),
+                delegation_signature: "delegation".to_string(),
+            },
+        };
+        let node_id = iroh::SecretKey::from_bytes(&state.net_secret_key).public();
+        let store = IdentityStore::from_storage(storage.clone());
+        (state, node_id, store, storage, dir)
+    }
+
+    #[tokio::test]
+    async fn promotion_needs_config() {
+        let realm_key = generate_signing_key();
+        let (state, node_id, store, storage, _dir) = server_node(&realm_key);
+        write_row(
+            &storage,
+            NODE_STATE_KEYSPACE,
+            PROMOTED_KEY_ROW,
+            pem(&realm_key),
+        )
+        .await;
+
+        let waiting = store.apply_promotion(state.clone(), node_id).await.unwrap();
+        assert_eq!(
+            waiting, state,
+            "no realm config lists the node as management yet"
+        );
+        write_config(&storage, state.realm_id, node_id, RealmNodeKind::Server).await;
+        let waiting = store.apply_promotion(state.clone(), node_id).await.unwrap();
+        assert_eq!(waiting, state, "a server listing keeps the node a server");
+
+        write_config(&storage, state.realm_id, node_id, RealmNodeKind::Management).await;
+        let promoted = store.apply_promotion(state.clone(), node_id).await.unwrap();
+        let (realm_id, capabilities) = store.capabilities(&promoted).unwrap();
+        assert_eq!(realm_id, state.realm_id);
+        assert!(matches!(capabilities, NodeCapabilities::Management { .. }));
+        assert_eq!(store.load().await.unwrap(), Some(promoted.clone()));
+        let row = read_row(&storage, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW)
+            .await
+            .unwrap();
+        assert!(row.is_none(), "the applied key leaves the staging row");
+        let again = store
+            .apply_promotion(promoted.clone(), node_id)
+            .await
+            .unwrap();
+        assert_eq!(again, promoted);
+    }
+
+    #[tokio::test]
+    async fn foreign_key_dropped() {
+        let realm_key = generate_signing_key();
+        let (state, node_id, store, storage, _dir) = server_node(&realm_key);
+        write_config(&storage, state.realm_id, node_id, RealmNodeKind::Management).await;
+        for row in [pem(&generate_signing_key()), b"not a key".to_vec()] {
+            write_row(&storage, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW, row).await;
+            let kept = store.apply_promotion(state.clone(), node_id).await.unwrap();
+            assert_eq!(kept, state, "a bad row never blocks or changes the start");
+            let row = read_row(&storage, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW)
+                .await
+                .unwrap();
+            assert!(row.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn leftover_row_dropped() {
+        let realm_key = generate_signing_key();
+        let (state, node_id, store, storage, _dir) = server_node(&realm_key);
+        let management = PersistedNodeState {
+            identity: PersistedNodeIdentity::Management {
+                realm_private_pem: String::from_utf8(pem(&realm_key)).unwrap(),
+            },
+            ..state
+        };
+        write_row(
+            &storage,
+            NODE_STATE_KEYSPACE,
+            PROMOTED_KEY_ROW,
+            pem(&realm_key),
+        )
+        .await;
+
+        let kept = store
+            .apply_promotion(management.clone(), node_id)
+            .await
+            .unwrap();
+        assert_eq!(kept, management);
+        let row = read_row(&storage, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW)
+            .await
+            .unwrap();
+        assert!(row.is_none());
     }
 }
