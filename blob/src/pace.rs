@@ -23,8 +23,8 @@ pub struct Pace {
 }
 
 static BUCKETS: LazyLock<Mutex<HashMap<Ulid, Bucket>>> = LazyLock::new(Default::default);
-/// The longest pause one `Retry-After` answer sets.
-const MAX_PAUSE: Duration = Duration::from_secs(600);
+/// One sleep of a paced request at most; it then looks at the pause again.
+const LONGEST_SLEEP: Duration = Duration::from_secs(60);
 
 /// Tokens refill at the rate up to one; a request may borrow ahead and waits for it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,7 +32,23 @@ struct Bucket {
     tokens: f64,
     at: Instant,
     /// No request is sent before this, as a `Retry-After` answer asked.
-    until: Option<Instant>,
+    until: Option<Deadline>,
+}
+
+/// The end of a pause a source asked for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Deadline {
+    At(Instant),
+    /// Later than any instant this clock holds.
+    Never,
+}
+
+/// How long the bucket's pause still lasts at `now`, at most one sleep.
+fn paused(bucket: &Bucket, now: Instant) -> Option<Duration> {
+    match bucket.until? {
+        Deadline::At(at) => (at > now).then(|| (at - now).min(LONGEST_SLEEP)),
+        Deadline::Never => Some(LONGEST_SLEEP),
+    }
 }
 
 /// Takes one token at `now` and returns how long the request waits for it.
@@ -42,14 +58,10 @@ fn take(bucket: &mut Bucket, rate: u32, now: Instant) -> Duration {
     bucket.tokens = (bucket.tokens + elapsed * rate).min(1.0);
     bucket.at = now;
     bucket.tokens -= 1.0;
-    let token = match bucket.tokens < 0.0 {
+    match bucket.tokens < 0.0 {
         true => Duration::from_secs_f64(-bucket.tokens / rate),
         false => Duration::ZERO,
-    };
-    let paused = bucket
-        .until
-        .map(|until| until.saturating_duration_since(now));
-    token.max(paused.unwrap_or_default())
+    }
 }
 
 /// The delay a `Retry-After` value asks for: seconds, or an HTTP date after `now`.
@@ -87,8 +99,12 @@ pub(crate) fn answered(status: StatusCode, headers: &HeaderMap) {
         at: now,
         until: None,
     });
-    let until = now + delay.min(MAX_PAUSE);
-    bucket.until = Some(bucket.until.map_or(until, |known| known.max(until)));
+    let until = now.checked_add(delay).map_or(Deadline::Never, Deadline::At);
+    bucket.until = Some(match (bucket.until, until) {
+        (Some(Deadline::Never), _) | (_, Deadline::Never) => Deadline::Never,
+        (Some(Deadline::At(known)), Deadline::At(at)) => Deadline::At(known.max(at)),
+        (None, until) => until,
+    });
 }
 
 /// Runs `future` with every source request it sends paced by `pace`.
@@ -101,18 +117,24 @@ pub(crate) async fn turn() {
     let Ok(pace) = PACE.try_with(|pace| *pace) else {
         return;
     };
-    let wait = {
-        let mut buckets = BUCKETS.lock().unwrap_or_else(|poison| poison.into_inner());
-        let now = Instant::now();
-        let bucket = (buckets.entry(pace.key)).or_insert(Bucket {
-            tokens: 1.0,
-            at: now,
-            until: None,
-        });
-        take(bucket, pace.rate, now)
-    };
-    if !wait.is_zero() {
+    loop {
+        let (wait, paused) = {
+            let mut buckets = BUCKETS.lock().unwrap_or_else(|poison| poison.into_inner());
+            let now = Instant::now();
+            let bucket = (buckets.entry(pace.key)).or_insert(Bucket {
+                tokens: 1.0,
+                at: now,
+                until: None,
+            });
+            match paused(bucket, now) {
+                Some(pause) => (pause, true),
+                None => (take(bucket, pace.rate, now), false),
+            }
+        };
         tokio::time::sleep(wait).await;
+        if !paused {
+            return;
+        }
     }
 }
 
@@ -179,6 +201,38 @@ mod tests {
         })
         .await;
         assert!(Instant::now() - start >= Duration::from_secs(2));
+    }
+
+    // A long `Retry-After` is kept whole, and one beyond any instant pauses for good.
+    #[tokio::test(start_paused = true)]
+    async fn long_pauses_kept() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "3600".parse().unwrap());
+        let pace = Pace {
+            key: Ulid::from_bytes([10; 16]),
+            rate: 10,
+        };
+        let start = Instant::now();
+        paced(pace, async {
+            answered(StatusCode::SERVICE_UNAVAILABLE, &headers);
+            turn().await;
+        })
+        .await;
+        assert!(Instant::now() - start >= Duration::from_secs(3600));
+        let endless = Pace {
+            key: Ulid::from_bytes([11; 16]),
+            rate: 10,
+        };
+        headers.insert(
+            http::header::RETRY_AFTER,
+            u64::MAX.to_string().parse().unwrap(),
+        );
+        let waited = paced(endless, async {
+            answered(StatusCode::TOO_MANY_REQUESTS, &headers);
+            tokio::time::timeout(Duration::from_secs(30 * 86_400), turn()).await
+        })
+        .await;
+        assert!(waited.is_err(), "the pause outlasts any wait");
     }
 
     // Only a paced task waits; one key's pace never slows another key or an unpaced task.
