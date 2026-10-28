@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
@@ -63,8 +64,9 @@ pub enum PromoteNodeError {
     Ensure(#[from] EnsureConfigError),
 }
 
-/// Asks of the node's own config after the change, about 30 seconds in all.
-const READY_CHECKS: u32 = 60;
+/// Time one promotion call may take, readiness checks included. It stays 10 seconds under the
+/// 30 second management relay timeout, so a relayed caller gets the answer.
+pub const CALL_BUDGET: Duration = Duration::from_secs(20);
 const READY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Hands the key first: an unreachable node leaves the realm unchanged and the call can be
@@ -74,6 +76,7 @@ pub async fn promote_node(
     context: &Arc<DriverContext>,
     config: PromoteNodeConfig,
 ) -> Result<bool, PromoteNodeError> {
+    let deadline = Instant::now() + CALL_BUDGET;
     let document = load_realm_config(context, config.actor.realm_id)
         .await
         .ok_or(PromoteNodeError::ConfigMissing)?;
@@ -107,7 +110,7 @@ pub async fn promote_node(
         context.as_ref(),
     )
     .await?;
-    Ok(wait_ready(READY_CHECKS, READY_INTERVAL, || ask_ready(metadata, target)).await)
+    Ok(wait_ready(deadline, READY_INTERVAL, || ask_ready(metadata, target)).await)
 }
 
 async fn ask_ready(metadata: &MetadataHandle, node_id: NodeId) -> bool {
@@ -119,20 +122,22 @@ async fn ask_ready(metadata: &MetadataHandle, node_id: NodeId) -> bool {
 }
 
 /// The config change reaches the node by replication, which may lag behind the local write.
-async fn wait_ready<F, R>(checks: u32, interval: Duration, mut ready: F) -> bool
+/// Checks and pauses all end at `deadline`; a check still waiting then counts as not ready.
+async fn wait_ready<F, R>(deadline: Instant, interval: Duration, mut ready: F) -> bool
 where
     F: FnMut() -> R,
     R: Future<Output = bool>,
 {
-    for check in 0..checks {
-        if ready().await {
+    loop {
+        if matches!(timeout_at(deadline, ready()).await, Ok(true)) {
             return true;
         }
-        if check + 1 < checks {
-            tokio::time::sleep(interval).await;
+        let next = Instant::now() + interval;
+        if next >= deadline {
+            return false;
         }
+        sleep_until(next).await;
     }
-    false
 }
 
 /// A lost answer can follow a stored key, which no later call can take back.
@@ -404,7 +409,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn waits_for_replication() {
         let asked = std::cell::Cell::new(0);
-        let ready = wait_ready(5, Duration::from_secs(1), || {
+        let deadline = Instant::now() + CALL_BUDGET;
+        let ready = wait_ready(deadline, Duration::from_secs(1), || {
             asked.set(asked.get() + 1);
             let replicated = asked.get() >= 3;
             async move { replicated }
@@ -412,11 +418,30 @@ mod tests {
         .await;
         assert!(ready, "a lagging config change is waited for");
         assert_eq!(asked.get(), 3);
+    }
 
-        let lagging = wait_ready(3, Duration::from_secs(1), || async { false }).await;
+    #[tokio::test(start_paused = true)]
+    async fn slow_checks_bounded() {
+        let started = Instant::now();
+        let asked = std::cell::Cell::new(0);
+        let ready = wait_ready(started + CALL_BUDGET, READY_INTERVAL, || {
+            asked.set(asked.get() + 1);
+            let replicated = asked.get() >= 2;
+            async move {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                replicated
+            }
+        })
+        .await;
         assert!(
-            !lagging,
-            "a change that never arrives is reported as not ready"
+            !ready,
+            "a check still waiting at the deadline counts as not ready"
+        );
+        assert_eq!(asked.get(), 2);
+        assert_eq!(
+            started.elapsed(),
+            CALL_BUDGET,
+            "the wait ends at the deadline"
         );
     }
 
