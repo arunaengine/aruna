@@ -426,7 +426,12 @@ pub async fn refresh_with_context(
                 return Err("the refresh carries no observation".to_string());
             };
             let comparison = cached_metadata.compare(&observation);
-            if refresh.refreshed_at > last_refresh && comparison == ObservationMatch::Changed {
+            // A version whose recorded digests bind its bytes gets no successor without them.
+            let bound = !cached_metadata.enforced_checksums().is_empty();
+            if refresh.refreshed_at > last_refresh
+                && comparison == ObservationMatch::Changed
+                && !bound
+            {
                 let mint = MintSuccessorOperation::new(
                     txn_id,
                     refresh.clone(),
@@ -1187,6 +1192,81 @@ mod tests {
         let head = CurrentVersionPointer::from_bytes(&head).unwrap();
         assert_ne!(head.version_id, test.version_id);
         assert_eq!(head.generation, 2);
+    }
+
+    // A version bound by recorded digests stays the head when its source changed: a successor
+    // from the fresh observation would drop the digests that guard its reads.
+    #[tokio::test]
+    async fn digest_bound_kept() {
+        use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
+        use aruna_core::structs::checksum::ChecksumAlgorithm;
+        use aruna_core::structs::execution::source_access::{
+            DigestOrigin, DigestScope, SourceDigest,
+        };
+        use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
+        let test = setup_state();
+        let mut original = source_metadata(10, "original");
+        let digest = SourceDigest {
+            digest: vec![7; 16],
+            scope: DigestScope::FullObject,
+            origin: DigestOrigin::Manifest,
+        };
+        original.digests.insert(ChecksumAlgorithm::Md5, digest);
+        write_reference_version(&test, original.clone(), SystemTime::UNIX_EPOCH, 0).await;
+        let head_key = BlobHeadKey::new(&test.bucket, &test.key)
+            .to_bytes()
+            .unwrap();
+        let pointer = CurrentVersionPointer::new(test.version_id)
+            .to_bytes()
+            .unwrap();
+        // The bucket row lets a successor be minted, as in `change_mints_successor`.
+        let bucket = aruna_core::structs::storage::blob::BucketInfo {
+            group_id: Ulid::from_bytes([1; 16]),
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: test.created_by,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: None,
+        };
+        let writes = vec![
+            (
+                BLOB_HEAD_KEYSPACE.to_string(),
+                head_key.clone().into(),
+                pointer.into(),
+            ),
+            (
+                aruna_core::keyspaces::S3_BUCKET_KEYSPACE.to_string(),
+                test.bucket.as_bytes().to_vec().into(),
+                bucket.to_bytes().unwrap().into(),
+            ),
+        ];
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        test.context.storage_handle.send_storage_effect(write).await;
+        let refreshed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        let changed = refresh(&test, source_metadata(20, "changed"), refreshed_at);
+
+        refresh_with_context(&test.context, changed).await.unwrap();
+
+        assert_reference_state(&test, &original, SystemTime::UNIX_EPOCH).await;
+        let read = StorageEffect::Read {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            key: head_key.into(),
+            txn_id: None,
+        };
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(head), ..
+        }) = test.context.storage_handle.send_storage_effect(read).await
+        else {
+            panic!("the head must exist");
+        };
+        let head = CurrentVersionPointer::from_bytes(&head).unwrap();
+        assert_eq!(head.version_id, test.version_id);
     }
 
     // A request for a version that no longer exists is finished instead of retried forever.

@@ -5,9 +5,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::structs::checksum::ChecksumAlgorithm;
+
+/// What a row says about its file: size, checksums and modification time.
+type Described = (
+    Option<u64>,
+    Vec<(ChecksumAlgorithm, Vec<u8>)>,
+    Option<SystemTime>,
+);
 
 /// Table bytes one step reads; a header and every row must fit into one chunk.
 pub const TABLE_CHUNK: usize = 256 * 1024;
@@ -213,6 +223,33 @@ pub struct TableRows {
     pub text: Vec<String>,
     #[serde(default)]
     pub exact: Vec<String>,
+    /// Column of a file's size in bytes; a row with a size is registered without a HEAD.
+    #[serde(default)]
+    pub size: Option<String>,
+    /// Columns of a file's hex checksums, recorded on the reference and checked on reads.
+    #[serde(default)]
+    pub checksums: Vec<ChecksumColumn>,
+    /// Column of a file's modification time: RFC 3339, or a date that is only checked.
+    #[serde(default)]
+    pub modified: Option<String>,
+}
+
+/// A column holding a file's checksum; `algorithm` is `md5`, `sha1` or `sha256`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecksumColumn {
+    pub algorithm: String,
+    pub column: String,
+}
+
+fn checksum_algorithm(name: &str) -> Result<ChecksumAlgorithm, TableError> {
+    match name {
+        "md5" => Ok(ChecksumAlgorithm::Md5),
+        "sha1" => Ok(ChecksumAlgorithm::Sha1),
+        "sha256" => Ok(ChecksumAlgorithm::Sha256),
+        other => Err(TableError::Mapping(format!(
+            "unknown checksum algorithm `{other}`"
+        ))),
+    }
 }
 
 /// Keeps rows whose column holds one of the values.
@@ -321,6 +358,18 @@ impl TableImport {
             if !parts.iter().any(|part| matches!(part, Part::Column { .. })) {
                 let reason = "source and target templates must name a column";
                 return Err(TableError::Mapping(reason.to_string()));
+            }
+        }
+        let described = rows.size.is_some() || rows.modified.is_some();
+        if rows.kind == RowKind::Folder && (described || !rows.checksums.is_empty()) {
+            let reason = "size, checksums and modified describe file rows only";
+            return Err(TableError::Mapping(reason.to_string()));
+        }
+        let mut algorithms = BTreeSet::new();
+        for checksum in &rows.checksums {
+            if !algorithms.insert(checksum_algorithm(&checksum.algorithm)?) {
+                let reason = format!("checksum `{}` is named twice", checksum.algorithm);
+                return Err(TableError::Mapping(reason));
             }
         }
         if let TableSource::Connector(path) = &self.source
@@ -534,6 +583,11 @@ pub struct TableEntry {
     /// The object key of a file, or the key prefix of a folder without its last `/`.
     pub target: String,
     pub metadata: BTreeMap<String, String>,
+    /// The file's size from the row; the file then needs no HEAD.
+    pub size: Option<u64>,
+    pub digests: Vec<(ChecksumAlgorithm, Vec<u8>)>,
+    /// The file's modification time from the row, when it names one to the second.
+    pub modified: Option<SystemTime>,
 }
 
 /// The row mapping resolved against one table's columns.
@@ -546,6 +600,9 @@ pub struct RowMapper {
     /// Column index and metadata key of each kept column.
     kept: Vec<(usize, String)>,
     selections: Vec<(String, String)>,
+    size: Option<usize>,
+    checksums: Vec<(ChecksumAlgorithm, usize)>,
+    modified: Option<usize>,
 }
 
 impl RowMapper {
@@ -602,6 +659,12 @@ impl RowMapper {
             let reason = format!("at most {MAX_METADATA_ENTRIES} metadata entries fit an object");
             return Err(TableError::Mapping(reason));
         }
+        let checksums = (rows.checksums.iter())
+            .map(|checksum| {
+                let algorithm = checksum_algorithm(&checksum.algorithm)?;
+                Ok((algorithm, index(&checksum.column)?))
+            })
+            .collect::<Result<_, TableError>>()?;
         Ok(Self {
             kind: rows.kind,
             source: resolve(&rows.source)?,
@@ -609,6 +672,9 @@ impl RowMapper {
             filters,
             kept,
             selections,
+            size: rows.size.as_deref().map(index).transpose()?,
+            checksums,
+            modified: rows.modified.as_deref().map(index).transpose()?,
         })
     }
 
@@ -653,11 +719,53 @@ impl RowMapper {
             metadata.insert(key.clone(), value.to_string());
         }
         metadata.extend(self.selections.iter().cloned());
+        let (size, digests, modified) = match self.described(&value) {
+            Ok(described) => described,
+            Err(reason) => return RowOutcome::Failed(reason),
+        };
         RowOutcome::Import(TableEntry {
             source_path,
             target,
             metadata,
+            size,
+            digests,
+            modified,
         })
+    }
+
+    /// The size, checksums and modification time a row gives; a null value gives none.
+    fn described<'a>(
+        &self,
+        value: &impl Fn(usize) -> Option<&'a str>,
+    ) -> Result<Described, String> {
+        let size = (self.size.and_then(value))
+            .map(|size| {
+                size.parse::<u64>()
+                    .map_err(|_| format!("size `{size}` is not a byte count"))
+            })
+            .transpose()?;
+        let mut digests = Vec::new();
+        for (algorithm, index) in &self.checksums {
+            let Some(checksum) = value(*index) else {
+                continue;
+            };
+            let digest = hex::decode(checksum).ok();
+            let Some(digest) = digest.filter(|digest| digest.len() == algorithm.digest_len())
+            else {
+                let name = algorithm.hash_key();
+                return Err(format!("checksum `{checksum}` is not a hex {name} digest"));
+            };
+            digests.push((*algorithm, digest));
+        }
+        let modified = match self.modified.and_then(value) {
+            None => None,
+            Some(time) => match chrono::DateTime::parse_from_rfc3339(time) {
+                Ok(time) => Some(SystemTime::from(time)),
+                Err(_) if chrono::NaiveDate::parse_from_str(time, "%Y-%m-%d").is_ok() => None,
+                Err(_) => return Err(format!("modified `{time}` is no RFC 3339 time or date")),
+            },
+        };
+        Ok((size, digests, modified))
     }
 }
 

@@ -27,7 +27,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::execution::source_connector::SourceConnector;
-use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -35,7 +35,7 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
-use aruna_core::structs::storage::distribution::source_root::SourceRoot;
+use aruna_core::structs::storage::distribution::source_root::{RootEntry, SourceRoot};
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
@@ -389,7 +389,7 @@ fn plan_entry(
     } = &version.state
         && source.connector_id == Some(input.connector.connector_id)
         && source.descriptor.source_path == entry.source_path
-        && cached_metadata.compare(&entry.observation) == ObservationMatch::Same
+        && same_observation(input, entry, (source, cached_metadata))
         && version.metadata.len() == entry.metadata.len()
         && (entry.metadata.iter()).all(|(key, value)| version.metadata.get(key) == Some(value))
     {
@@ -399,6 +399,29 @@ fn plan_entry(
         true => EntryPlan::Kept,
         false => EntryPlan::Register,
     }
+}
+
+/// Whether an import saw the file as stored: equal validators, or, when there are none to
+/// compare, as with a size from a table row, the identical observation of the same source.
+fn same_observation(
+    input: &PageImportInput,
+    entry: &PageEntry,
+    (source, stored): (&VersionSourceBinding, &SourceMetadata),
+) -> bool {
+    if stored.compare(&entry.observation) == ObservationMatch::Same {
+        return true;
+    }
+    // A changed connector endpoint or root binds the file anew, so it is no longer unchanged.
+    let connector = &input.connector;
+    let binding = build_source_binding(
+        StagingStrategy::Reference,
+        connector,
+        &entry.observation,
+        entry.source_path.clone(),
+        Some(input.node_id),
+        Some(connector.connector_id),
+    );
+    stored == &entry.observation && RootEntry::same_source(source, &binding)
 }
 
 /// Builds the page's rows: versions, heads and connector reference rows of new entries,

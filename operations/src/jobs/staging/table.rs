@@ -11,7 +11,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
     StagingJobCheckpoint, StagingJobDirectory, StagingJobPhase, StagingJobSpec, TableRead,
 };
-use aruna_core::structs::execution::source_access::ObservationMatch;
+use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::execution::table::{
     GzipWindow, RowKind, RowMapper, RowOutcome, TABLE_CHUNK, TableEntry, TableImport, TableSource,
     is_gzip, parse_rows, read_header, source_path,
@@ -446,14 +446,24 @@ async fn file_rows(
     next: StagingJobCheckpoint,
     entries: Vec<TableEntry>,
 ) -> Result<(), PageFailure> {
+    // A row with a size is its own observation; its checksums bind the reads without a strong
+    // ETag, and a row without a size is headed.
     let files = (entries.into_iter())
         .map(|entry| StagedFile {
             source_path: entry.source_path,
             target_key: entry.target,
-            size: None,
-            observation: None,
-            manifest: None,
+            size: entry.size,
+            observation: entry.size.map(|content_length| SourceMetadata {
+                content_length,
+                content_type: None,
+                etag: None,
+                last_modified: entry.modified,
+                source_version: None,
+                digests: Default::default(),
+            }),
+            manifest: entry.digests,
             metadata: entry.metadata,
+            modified: entry.modified,
         })
         .collect();
     let rows = (files, Vec::new(), Vec::new());
@@ -787,6 +797,9 @@ mod tests {
             source_path: source.to_string(),
             target: target.to_string(),
             metadata: BTreeMap::new(),
+            size: None,
+            digests: Vec::new(),
+            modified: None,
         };
         let rows = vec![
             entry("a.fq", "x/a.fq"),

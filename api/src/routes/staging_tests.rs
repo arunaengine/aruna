@@ -1186,6 +1186,15 @@ mod distributed {
             let refused = submit(&node, request).await;
             assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
         }
+        // Rows are read through a connector even when the list itself is an uploaded object.
+        let mut unconnected = batch(&node, &[], &[]);
+        unconnected.strategy = ApiStagingStrategy::Reference;
+        unconnected.connector_id = String::new();
+        unconnected.table = table("{url|basename}");
+        let Err(ServerError::BadRequestReason(reason)) = submit(&node, unconnected).await else {
+            panic!("a table without a connector is refused");
+        };
+        assert!(reason.contains("read through a connector"));
         let mut blocking = batch(&node, &[], &[]);
         blocking.table = table("{url|basename}");
         let refused = stage_batch(

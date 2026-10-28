@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use aruna_core::NodeId;
@@ -85,6 +85,9 @@ pub struct ObjectInventoryHit {
     pub checksum: Option<ObjectInventoryChecksum>,
     pub size: Option<u64>,
     pub updated_at: Option<SystemTime>,
+    /// A metadata search hit's kept columns, without the search selections.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -593,11 +596,23 @@ async fn build_hits(
                 checksum,
                 size,
                 updated_at,
+                metadata: match input.key_match {
+                    ObjectKeyMatch::Metadata => kept_metadata(&candidate.version.metadata),
+                    ObjectKeyMatch::Substring | ObjectKeyMatch::Prefix => BTreeMap::new(),
+                },
             },
         });
     }
 
     Ok(candidates)
+}
+
+/// A version's own metadata, without the `aruna-` entries that only steer search.
+fn kept_metadata(metadata: &HashMap<String, String>) -> BTreeMap<String, String> {
+    (metadata.iter())
+        .filter(|(key, _)| !key.starts_with("aruna-"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 async fn batch_read(
