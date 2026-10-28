@@ -7,6 +7,8 @@
 // origin and run routes answer it; the crate shows only what those reads show.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
 use aruna_core::structs::identity::auth::AuthContext;
@@ -280,7 +282,7 @@ async fn walk(
 }
 
 /// Writes the root metadata and closes the ZIP. The root goes to a private temporary file first
-/// and is copied into the ZIP in pieces, so it is never held in memory whole.
+/// and is copied into the ZIP in pieces, never held whole.
 async fn finish(
     caller: &Caller,
     gone: &CancellationToken,
@@ -290,16 +292,19 @@ async fn finish(
     let Ok(dir) = scratch_dir() else {
         return;
     };
-    let spooled = Spooled(dir.join(format!("{}.json", scratch_name())));
-    let path = spooled.0.clone();
-    let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let mut out = std::io::BufWriter::new(scratch_file(&path)?);
-        built.write_root(&mut out)?;
-        std::io::Write::flush(&mut out)
-    });
-    if !matches!(bounded(caller, gone, written).await, Some(Ok(Ok(())))) {
-        return;
-    }
+    let path = dir.join(format!("{}.json", scratch_name()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let halt = stop.clone();
+    let worker =
+        tokio::task::spawn_blocking(move || spool_root(built, path, &|| halt.load(Relaxed)));
+    let spooled = match bounded(caller, gone, worker).await {
+        Some(Ok(Ok(spooled))) => spooled,
+        // The worker owns its file and removes it once it sees the stop.
+        _ => {
+            stop.store(true, Relaxed);
+            return;
+        }
+    };
     let copied = async {
         let mut file = tokio::fs::File::open(&spooled.0).await?;
         let entry = ZipEntryBuilder::new(
@@ -323,6 +328,20 @@ async fn finish(
     if matches!(bounded(caller, gone, copied).await, Some(Ok(()))) {
         let _ = bounded(caller, gone, zip.close()).await;
     }
+}
+
+/// Writes the root to `path`, which only this user may read, and hands back the file. On any
+/// failure or stop the file is removed here, by the worker that made it.
+fn spool_root(
+    built: ProvenanceCrate,
+    path: std::path::PathBuf,
+    stop: &dyn Fn() -> bool,
+) -> std::io::Result<Spooled> {
+    let spooled = Spooled(path);
+    let mut out = std::io::BufWriter::new(scratch_file(&spooled.0)?);
+    built.write_root(&mut out, stop)?;
+    std::io::Write::flush(&mut out)?;
+    Ok(spooled)
 }
 
 /// A temporary file removed when the export ends, however it ends.

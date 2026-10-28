@@ -296,8 +296,17 @@ impl ProvenanceCrate {
         self.stopped = Some(reason.to_string());
     }
 
-    /// Writes the root `ro-crate-metadata.json` one entity at a time.
-    pub fn write_root(mut self, out: &mut impl Write) -> std::io::Result<()> {
+    /// Writes the root `ro-crate-metadata.json` one entity at a time; ends early with
+    /// `Interrupted` once `stop` says so.
+    pub fn write_root(
+        mut self,
+        out: &mut impl Write,
+        stop: &dyn Fn() -> bool,
+    ) -> std::io::Result<()> {
+        let check = || match stop() {
+            true => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            false => Ok(()),
+        };
         let mut root = entity("./", "Dataset");
         root.insert(
             "name".into(),
@@ -331,12 +340,14 @@ impl ProvenanceCrate {
         let root = serde_json::to_string(&root)?;
         write!(out, ",{},\"hasPart\":[", &root[..root.len() - 1])?;
         for (index, part) in self.spool.parts().enumerate() {
+            check()?;
             let part = part.map_err(failed)?;
             let separator = if index == 0 { "" } else { "," };
             write!(out, "{separator}{}", json!({ "@id": part }))?;
         }
         out.write_all(b"]}")?;
         for entity in self.spool.entities() {
+            check()?;
             let entity = entity.map_err(failed)?;
             if entity["@id"] != "./" {
                 out.write_all(b",")?;

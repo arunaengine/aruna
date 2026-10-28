@@ -25,7 +25,7 @@ fn copied(from: &str) -> Value {
 /// The root metadata as the export writes it.
 fn root(built: ProvenanceCrate) -> Value {
     let mut out = Vec::new();
-    built.write_root(&mut out).unwrap();
+    built.write_root(&mut out, &|| false).unwrap();
     serde_json::from_slice(&out).unwrap()
 }
 

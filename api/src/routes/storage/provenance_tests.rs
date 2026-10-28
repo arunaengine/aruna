@@ -211,7 +211,7 @@ async fn silent_crate_incomplete() {
         let mut built = ProvenanceCrate::new("file", "2026-10-28T00:00:00Z").unwrap();
         let (_, _, go_on) = record_run(&mut built, &hop, read);
         let mut out = Vec::new();
-        built.write_root(&mut out).unwrap();
+        built.write_root(&mut out, &|| false).unwrap();
         let root: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let graph = root["@graph"].as_array().unwrap().clone();
         let status =
@@ -263,4 +263,19 @@ async fn crate_read_rechecks() {
     let valid = caller(&node, recheck(&node.owner, 1));
     let read = crate_read(&valid, &gone, "01K8W1C0000000000000000000").await;
     assert!(matches!(read, Some(Some(Read::Hidden | Read::Silent))));
+}
+
+#[test]
+fn stopped_root_removed() {
+    // A root write that is told to stop removes its own file.
+    let built = ProvenanceCrate::new("start", "2026-10-28T00:00:00Z").unwrap();
+    let mut built = built;
+    built.push([built.version_start()]);
+    let hop = built.pop().unwrap();
+    built.hidden(&hop);
+    let path = scratch_dir()
+        .unwrap()
+        .join(format!("{}.json", scratch_name()));
+    assert!(spool_root(built, path.clone(), &|| true).is_err());
+    assert!(!path.exists());
 }
