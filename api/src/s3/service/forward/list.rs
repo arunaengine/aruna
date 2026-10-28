@@ -550,7 +550,9 @@ impl ArunaS3Service {
                     let reader = (owner.clone(), Some(user));
                     let part =
                         self.run_object_listing(sub, reader, url_encoded, scope, (bounds, hidden));
-                    (part.await?, self.node_id, false)
+                    // Listing here instead of the coordinator lists this member's copy.
+                    let copy = resumed.as_ref().map_or(!local, |(_, copy, _)| *copy);
+                    (part.await?, self.node_id, copy)
                 }
             };
             first = false;

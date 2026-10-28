@@ -519,7 +519,9 @@ async fn merged_page(
                 let bounds = Some((range.lower.clone(), range.upper.clone()));
                 let position = (token, None, hidden);
                 let part = local_part(state, (info, caller), &sub, position, bounds).await?;
-                (part, state.get_node_id(), false)
+                // Listing here instead of the coordinator lists this member's copy.
+                let copy = resumed.as_ref().map_or(!local, |(_, copy, _)| *copy);
+                (part, state.get_node_id(), copy)
             }
         };
         // A range that stopped among hidden entries goes on from its member's cursor.

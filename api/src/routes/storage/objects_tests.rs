@@ -477,3 +477,46 @@ async fn merged_passes_hidden_run() {
     assert_eq!(keys(&third), vec!["x.md"]);
     assert!(third.prefixes.is_empty() && third.next_cursor.is_none());
 }
+
+/// A replicated bucket whose coordinator cannot be reached: this member lists its copy, which
+/// starts with more hidden links than one request examines, and seals the range there.
+async fn sealed_copy_page() -> (Node, String, String) {
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let node = node_state().await;
+    store(&node, &["z.md"]).await;
+    let hidden = aruna_core::structs::storage::link::LinkTarget {
+        arn: aruna_core::structs::storage::replication::VersionedObjectArn {
+            realm_id: node.owner.realm_id,
+            node_id: node.state.get_node_id(),
+            bucket: "other".to_string(),
+            key: "x".to_string(),
+            version: ulid::Ulid::from_parts(5, 5),
+        },
+        group_id: ulid::Ulid::from_parts(9, 9),
+    };
+    for index in 0..=SCAN_BUDGET {
+        link(&node, &format!("b/{index:05}"), hidden.clone()).await;
+    }
+    let snapshot = replicate(&node.state, node.group_id, BUCKET).await;
+    publish_api(&node.state, node_id(PEER), CLOSED_API).await;
+    let page = list(&node, &node.owner, HeaderMap::new(), query(None, None, 10))
+        .await
+        .unwrap();
+    assert!(page.objects.is_empty() && page.prefixes.is_empty());
+    let range_id = snapshot.config.ranges[0].range_id.to_string();
+    assert_eq!(page.stale_ranges, [range_id.clone()]);
+    let cursor = page.next_cursor.expect("the copy sealed its range");
+    (node, cursor, range_id)
+}
+
+#[tokio::test]
+async fn copy_cursor_names_copy() {
+    // A copy that sealed its range is named as a copy, so a member resuming there asks it as
+    // one while the coordinator is down.
+    let (_node, cursor, _) = sealed_copy_page().await;
+    let resume = decode_resume(&cursor).unwrap();
+    assert!(
+        matches!(resume, Resume::Hidden { copy: true, .. }),
+        "{resume:?}"
+    );
+}

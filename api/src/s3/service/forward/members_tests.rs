@@ -738,6 +738,40 @@ async fn listing_passes_hidden_runs() {
     assert_eq!(seen, ["a/1", "k/zz", "q/1"]);
 }
 
+/// Node 2 copies range [h, p), which node 1 coordinates and which starts with more hidden
+/// links than one request examines. Node 1 is down, so node 2 lists its copy and seals there.
+async fn sealed_copy() -> (Members, String) {
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let mut members = members(3, &["h", "p"], 1).await;
+    put(&members, 0, "k/zz", b"k").await;
+    for index in 0..=SCAN_BUDGET {
+        hidden_link(&members, 1, &format!("k/{index:05}")).await;
+    }
+    copy_rows(&members, 1, 2).await;
+    members.nodes[1].stop().await;
+    let input = s3s::dto::ListObjectsV2Input {
+        prefix: Some("k/".to_string()),
+        ..list_input(100)
+    };
+    let (keys, _, next) = page(&members, 2, input).await.unwrap();
+    assert!(keys.is_empty());
+    (members, next.expect("the copy sealed its range"))
+}
+
+// A copy that sealed its range is asked as a copy again, so the listing goes on through
+// another member while the coordinator is down.
+#[tokio::test]
+async fn sealed_copy_continues() {
+    let (members, token) = sealed_copy().await;
+    let input = s3s::dto::ListObjectsV2Input {
+        prefix: Some("k/".to_string()),
+        continuation_token: Some(token),
+        ..list_input(100)
+    };
+    let (keys, _, next) = page(&members, 0, input).await.unwrap();
+    assert_eq!((keys, next), (vec!["k/zz".to_string()], None));
+}
+
 // Prefixes group keys across ranges once each, and a token of another query is refused.
 #[tokio::test]
 async fn listing_groups_prefixes() {
@@ -855,28 +889,35 @@ async fn copy_rows(members: &Members, from: usize, to: usize) {
         BLOB_VERSIONS_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE,
     ] {
-        let iter = StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: None,
-            start: None,
-            limit: 1000,
-            txn_id: None,
-        };
-        let storage = &members.nodes[from].context.storage_handle;
-        let Event::Storage(StorageEvent::IterResult { values, .. }) =
-            storage.send_storage_effect(iter).await
-        else {
-            panic!("rows of {key_space} read");
-        };
-        for (key, value) in values {
-            let write = StorageEffect::Write {
+        let mut start = None;
+        loop {
+            let iter = StorageEffect::Iter {
                 key_space: key_space.to_string(),
-                key,
-                value,
+                prefix: None,
+                start: start.take(),
+                limit: 1000,
                 txn_id: None,
             };
-            let storage = &members.nodes[to].context.storage_handle;
-            storage.send_storage_effect(write).await;
+            let storage = &members.nodes[from].context.storage_handle;
+            let Event::Storage(StorageEvent::IterResult { values, .. }) =
+                storage.send_storage_effect(iter).await
+            else {
+                panic!("rows of {key_space} read");
+            };
+            let Some((last, _)) = values.last() else {
+                break;
+            };
+            start = Some(aruna_core::effects::IterStart::After(last.clone()));
+            for (key, value) in values {
+                let write = StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key,
+                    value,
+                    txn_id: None,
+                };
+                let storage = &members.nodes[to].context.storage_handle;
+                storage.send_storage_effect(write).await;
+            }
         }
     }
 }
