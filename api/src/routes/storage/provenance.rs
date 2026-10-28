@@ -11,13 +11,16 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
+use aruna_core::NodeId;
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::bucket_metadata::RELEASE_TAG;
 use aruna_core::structs::storage::global_id::GlobalId;
-use aruna_core::structs::storage::release::{CrateRead, CrateReadError};
+use aruna_core::structs::storage::release::{CrateRead, CrateReadError, HolderAnswer, HolderAsk};
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_operations::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version};
+use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::provenance::{
     CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
 };
@@ -90,8 +93,8 @@ it, as the origin and run routes do.
   their links. Each readable run crate is a nested crate under `runs/{run_id}/`; a dataset
   start is nested under `dataset/`. File bytes are referenced, not included.
 - Each release that pins a version is nested under `releases/`, read from its exact tagged
-  crate version on this node. A release crate this node does not hold marks the crate
-  incomplete.
+  crate version with this token, on the node that holds it. A holder that does not answer
+  marks the crate incomplete.
 - A hop the caller may not read is named by its global id or the digest that referred to it,
   never by bucket or key. A node that does not answer is listed, and the crate is incomplete.
 - Each version and run is read once per export, so cycles end.
@@ -477,25 +480,25 @@ async fn read_hop(caller: &Caller, auth: &AuthContext, hop: &Hop) -> Read {
                 .await
                 .and_then(|Json(run)| to_value(&run))
         }
-        Target::Release(version) => release_crate(state, auth, version).await,
+        Target::Release(version) => release_crate(state, (auth, &caller.bearer), version).await,
     };
     classify(answer)
 }
 
-/// A release crate's exact version, read on this node with the caller's identity; it has to
-/// carry the release tag still.
+/// A release crate's exact version, read with the caller's identity on this node or, through
+/// a holder request with the caller's token, on the node that holds it; it has to carry the
+/// release tag still.
 async fn release_crate(
     state: &Arc<ServerState>,
-    auth: &AuthContext,
+    (auth, bearer): (&AuthContext, &ValidatedBearer),
     version: &str,
 ) -> ServerResult<serde_json::Value> {
     let context = state.get_ctx();
-    let unavailable = || ServerError::ServiceUnavailableReason("not held here".to_string());
-    let (bucket, key, version_id) = match W3idIdentifier::parse(version) {
-        Ok(W3idIdentifier::VersionedObject(arn))
-            if arn.realm_id == state.get_realm_id() && arn.node_id == state.get_node_id() =>
-        {
-            (arn.bucket, arn.key, arn.version)
+    let unavailable = || ServerError::ServiceUnavailableReason("no holder is known".to_string());
+    let local = state.get_node_id();
+    let (holder, bucket, key, version_id) = match W3idIdentifier::parse(version) {
+        Ok(W3idIdentifier::VersionedObject(arn)) if arn.realm_id == state.get_realm_id() => {
+            (arn.node_id, arn.bucket, arn.key, arn.version)
         }
         Ok(W3idIdentifier::Global(GlobalId::Version {
             realm_id,
@@ -503,15 +506,24 @@ async fn release_crate(
         })) if realm_id == state.get_realm_id() => {
             let deadline = Instant::now() + RESOLVE_BUDGET;
             match resolve_version(context.as_ref(), version_id, deadline).await {
-                GlobalResolution::Found(found) if found.local => {
-                    (found.bucket, found.key, version_id)
+                GlobalResolution::Found(found) => {
+                    // Holders come coordinator first.
+                    let holder = match found.local {
+                        true => local,
+                        false => *found.holders.first().ok_or_else(unavailable)?,
+                    };
+                    (holder, found.bucket, found.key, version_id)
                 }
                 GlobalResolution::NotFound => return Err(ServerError::NotFound),
                 _ => return Err(unavailable()),
             }
         }
-        _ => return Err(unavailable()),
+        _ => return Err(ServerError::NotFound),
     };
+    if holder != local {
+        let ask = HolderAsk::Crate { key, version_id };
+        return remote_crate(state, bearer, (holder, bucket, ask)).await;
+    }
     let info = bucket_info(state, &bucket).await?;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     let path = object_permission_path(realm_id, info.group_id, node_id, &bucket, &key);
@@ -532,6 +544,32 @@ async fn release_crate(
         }
         Ok(_) | Err(CrateReadError::Missing) => Err(ServerError::NotFound),
         Err(CrateReadError::Failed(reason)) => Err(ServerError::ServiceUnavailableReason(reason)),
+    }
+}
+
+/// Asks `holder` for a release crate; it validates the token and checks READ itself.
+async fn remote_crate(
+    state: &Arc<ServerState>,
+    bearer: &ValidatedBearer,
+    (holder, bucket, ask): (NodeId, String, HolderAsk),
+) -> ServerResult<serde_json::Value> {
+    let silent = || ServerError::ServiceUnavailableReason("the holder did not answer".to_string());
+    let context = state.get_ctx();
+    let handle = context.metadata_handle.as_ref().ok_or_else(silent)?;
+    let token = AuthToken::bearer(bearer.as_str().to_string()).map_err(|_| silent())?;
+    match handle
+        .request_release_holder(holder, Some(token), bucket, ask)
+        .await
+    {
+        Ok(HolderAnswer::Crate(Some(bytes))) => serde_json::from_slice(&bytes)
+            .map_err(|error| ServerError::InternalError(error.to_string())),
+        Ok(HolderAnswer::Crate(None)) | Err(MetadataReadError::NotFound) => {
+            Err(ServerError::NotFound)
+        }
+        Err(MetadataReadError::Forbidden | MetadataReadError::Unauthorized) => {
+            Err(ServerError::Forbidden)
+        }
+        _ => Err(silent()),
     }
 }
 

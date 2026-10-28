@@ -129,11 +129,11 @@ async fn releases_pin_versions() -> TestResult<()> {
         (RELEASE_PREFIX_TAG.to_string(), "db/".to_string()),
     ]);
     let crate_bytes = serde_json::to_vec(&release)?;
-    put(
+    let crate_version = put(
         context,
         &realm,
         group_id,
-        ("db/release.json", crate_bytes),
+        ("db/release.json", crate_bytes.clone()),
         tags,
     )
     .await?;
@@ -236,6 +236,26 @@ async fn releases_pin_versions() -> TestResult<()> {
         vec![Ulid::from(5u128)],
         "an ordinary bucket has no ranges"
     );
+    // The holder reads a tagged crate version for the caller; an untagged version is none.
+    let crate_ask = |key: &str, version_id| HolderAsk::Crate {
+        key: key.to_string(),
+        version_id,
+    };
+    for (key, version_id, expected) in [
+        ("db/release.json", crate_version, Some(crate_bytes.clone())),
+        ("db/a.fasta", pinned, None),
+    ] {
+        let answer = handle
+            .request_release_holder(
+                holder.node_id(),
+                Some(realm.bearer_token()),
+                bucket(),
+                crate_ask(key, version_id),
+            )
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(answer, HolderAnswer::Crate(expected));
+    }
     let forged = AuthToken::bearer("forged").map_err(|error| format!("{error:?}"))?;
     let refused = handle
         .request_release_holder(holder.node_id(), Some(forged), bucket(), ask())

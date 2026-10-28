@@ -100,12 +100,16 @@ pub enum HolderAsk {
         prefix: String,
         skip: String,
     },
+    /// One release crate version, which the holder reads with the caller's READ checked.
+    Crate { key: String, version_id: Ulid },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum HolderAnswer {
     Members(RangeMembers),
     Files(RangeFiles),
+    /// The crate's bytes; `None` when the version is gone or no longer tagged.
+    Crate(Option<Vec<u8>>),
 }
 
 /// Reads one release crate version on this node with the caller's identity.

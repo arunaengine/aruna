@@ -594,6 +594,27 @@ pub async fn holder_answer(
             }
             Ok(HolderAnswer::Files(RangeFiles { files, refused }))
         }
+        HolderAsk::Crate { key, version_id } => {
+            if !access.0.allows(Some(&key), &Permission::READ) {
+                return Err(PublishError::Forbidden("the release crate is not readable"));
+            }
+            let read = CrateRead {
+                bucket: bucket.to_string(),
+                key,
+                version_id,
+                group_id: info.group_id,
+                auth: auth.clone(),
+                realm_id,
+                node_id,
+            };
+            match read_crate(context, read).await {
+                Ok(found) if found.metadata.contains_key(RELEASE_TAG) => {
+                    Ok(HolderAnswer::Crate(Some(found.bytes)))
+                }
+                Ok(_) | Err(CrateReadError::Missing) => Ok(HolderAnswer::Crate(None)),
+                Err(CrateReadError::Failed(reason)) => Err(PublishError::Unavailable(reason)),
+            }
+        }
     }
 }
 
