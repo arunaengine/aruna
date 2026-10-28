@@ -9,6 +9,7 @@ use crate::s3::scope::SubpathScope;
 use crate::s3::util::{map_checksum_algorithm, map_checksum_type};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::blob::BlobHeadKey;
+use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::multipart::parts::ListPartsResult;
@@ -152,7 +153,7 @@ impl ArunaS3Service {
     pub(super) async fn run_object_listing(
         &self,
         mut input: LOV2I,
-        owner: Option<Owner>,
+        (owner, reader): (Option<Owner>, Option<&UserAccess>),
         url_encoded: bool,
         scope: Option<&SubpathScope>,
         bounds: Option<(String, Option<String>)>,
@@ -194,6 +195,15 @@ impl ArunaS3Service {
                 }
                 result.common_prefixes = prefixes;
             }
+
+            // A link shows only to a caller who may read its target.
+            let mut listed = Vec::with_capacity(result.objects.len());
+            for object in std::mem::take(&mut result.objects) {
+                if self.link_listable(reader, &input.bucket, &object).await? {
+                    listed.push(object);
+                }
+            }
+            result.objects = listed;
 
             if !result.objects.is_empty()
                 || !result.common_prefixes.is_empty()

@@ -642,7 +642,8 @@ async fn build_source_operator<'access>(
                 SourceConnectorKind::Ftp
                 | SourceConnectorKind::ArunaNative
                 | SourceConnectorKind::LocalDirectory
-                | SourceConnectorKind::Invenio => {
+                | SourceConnectorKind::Invenio
+                | SourceConnectorKind::ArunaLink => {
                     return Err(StagingSourceError::UnsupportedKind(kind.to_string()));
                 }
             };

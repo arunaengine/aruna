@@ -481,7 +481,8 @@ impl ArunaS3Service {
                         (sub.continuation_token, sub.start_after) = (None, None);
                     }
                     let bounds = Some((range.lower.clone(), range.upper.clone()));
-                    self.run_object_listing(sub, owner.clone(), url_encoded, scope, bounds)
+                    let reader = (owner.clone(), Some(user));
+                    self.run_object_listing(sub, reader, url_encoded, scope, bounds)
                         .await?
                 }
             };

@@ -1247,6 +1247,8 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
             server_error(crate::error::ServerError::Conflict(error.to_string()))
         }
         GetObjectError::GovernedUnavailable => server_error(crate::error::ServerError::Forbidden),
+        // This tool reads bytes of this bucket only; a link is followed through S3.
+        error @ GetObjectError::Link(_) => bad_request(error),
         GetObjectError::StorageError(error) => internal_error(error),
         GetObjectError::ConversionError(error) => internal_error(error),
         GetObjectError::InvalidState { current, expected } => internal_error(format!(

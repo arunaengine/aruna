@@ -7,6 +7,7 @@ pub mod copy;
 pub mod delete;
 pub mod get;
 pub mod head;
+pub mod link;
 pub mod list;
 mod lookup;
 pub mod metadata;

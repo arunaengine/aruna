@@ -16,6 +16,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
@@ -90,9 +91,9 @@ impl ListContinuationToken {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListedObject {
     pub head: BlobHeadKey,
-    pub location: Option<BackendLocation>,
     /// The current version the listing describes, so a caller can pin it.
     pub version_id: Ulid,
+    pub location: Option<BackendLocation>,
     pub source_metadata: Option<SourceMetadata>,
     pub referenced: bool,
     pub kind: Option<SourceConnectorKind>,
@@ -101,6 +102,8 @@ pub struct ListedObject {
     pub origin_node_id: Option<NodeId>,
     pub last_refresh: Option<std::time::SystemTime>,
     pub version_created_at: Option<std::time::SystemTime>,
+    /// A link's binding, so a listing shows it only to callers who may read its target.
+    pub link: Option<VersionSourceBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,10 +118,10 @@ enum ResolvedEntry {
     Object(ListedObject),
     AwaitingLocation {
         head: BlobHeadKey,
+        version_id: Ulid,
         version_created_at: std::time::SystemTime,
         /// Registration this node must hold before the governed location may be
         /// described. `None` leaves an ungoverned head unchanged.
-        version_id: Ulid,
         governed: Option<(ManagedCopyKey, Vec<PlacementPolicyRef>)>,
     },
 }
@@ -592,19 +595,22 @@ impl ListBucketOperation {
                             last_refresh,
                             ..
                         } => {
+                            let link = (source.descriptor.kind == SourceConnectorKind::ArunaLink)
+                                .then(|| source.clone());
                             let descriptor = source.descriptor;
                             self.resolved.push(ResolvedEntry::Object(ListedObject {
                                 head,
+                                version_id,
                                 location: None,
                                 source_metadata: Some(cached_metadata),
                                 referenced: true,
                                 kind: Some(descriptor.kind),
                                 source_path: Some(descriptor.source_path),
-                                version_id,
                                 connector_id: source.connector_id,
                                 origin_node_id: descriptor.origin_node_id,
                                 last_refresh: Some(last_refresh),
                                 version_created_at: None,
+                                link,
                             }));
                             continue;
                         }
@@ -642,13 +648,13 @@ impl ListBucketOperation {
                     };
                     self.resolved.push(ResolvedEntry::AwaitingLocation {
                         head,
+                        version_id,
                         version_created_at: version.created_at,
                         governed,
                     });
                 }
             }
         }
-                        version_id,
 
         if self.round_exhausted {
             return self.finish_scan();
@@ -686,13 +692,13 @@ impl ListBucketOperation {
                 ResolvedEntry::Object(object) => self.objects.push(object),
                 ResolvedEntry::AwaitingLocation {
                     head,
+                    version_id,
                     version_created_at,
                     governed,
                 } => {
                     let Some((_key, value)) = locations.next() else {
                         return self.emit_error(ListBucketError::ListObjectsFailed);
                     };
-                    version_id,
                     let registration = match governed.as_ref() {
                         Some(_) => match locations.next() {
                             Some((_, value)) => value,
@@ -717,16 +723,17 @@ impl ListBucketOperation {
                     });
                     self.objects.push(ListedObject {
                         head,
+                        version_id,
                         location: described.then_some(location),
                         source_metadata: None,
                         referenced: false,
                         kind: None,
                         source_path: None,
                         connector_id: None,
-                        version_id,
                         origin_node_id: None,
                         last_refresh: None,
                         version_created_at: Some(version_created_at),
+                        link: None,
                     });
                 }
             }

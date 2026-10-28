@@ -19,13 +19,14 @@ use aruna_core::structs::storage::distribution::delegation::{
     COPY_CONTEXT_HEADER, Payload, body_digest,
 };
 use aruna_core::structs::storage::distribution::upload::UploadTag;
+mod link;
 mod multipart;
 mod object;
 mod response;
-
 mod view;
 
 pub(crate) use self::view::InputView;
+
 use self::attributes::{
     RequestedAttributes, attributes_checksum, attributes_output, attributes_parts, parse_max_parts,
     parse_part_marker,
@@ -291,7 +292,7 @@ impl ArunaS3Service {
             }
             None => {
                 let page = self
-                    .run_object_listing(input, None, false, None, None)
+                    .run_object_listing(input, (None, None), false, None, None)
                     .await?;
                 (page, Vec::new())
             }
@@ -400,10 +401,10 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        debug!(bucket = %req.input.bucket, "Received HEAD BUCKET Request");
         if let Some(view) = req.extensions.get::<InputView>().copied() {
             return self.view_head_bucket(view).await;
         }
+        debug!(bucket = %req.input.bucket, "Received HEAD BUCKET Request");
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
@@ -654,10 +655,10 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        debug!(
         if let Some(view) = req.extensions.get::<InputView>().copied() {
             return self.view_list(view, req.input).await;
         }
+        debug!(
             bucket = %req.input.bucket,
             prefix = ?req.input.prefix,
             max_keys = ?req.input.max_keys,
@@ -750,7 +751,13 @@ impl S3 for ArunaS3Service {
             }
             None => {
                 let page = self
-                    .run_object_listing(input, owner, url_encoded, scope.as_ref(), bounds)
+                    .run_object_listing(
+                        input,
+                        (owner, Some(&user_access)),
+                        url_encoded,
+                        scope.as_ref(),
+                        bounds,
+                    )
                     .await?;
                 (page, None, Vec::new())
             }
@@ -888,7 +895,13 @@ impl S3 for ArunaS3Service {
             }
             None => {
                 let page = self
-                    .run_object_listing(input, owner, url_encoded, scope.as_ref(), None)
+                    .run_object_listing(
+                        input,
+                        (owner, Some(&user_access)),
+                        url_encoded,
+                        scope.as_ref(),
+                        None,
+                    )
                     .await?;
                 (page, Vec::new())
             }
@@ -1132,6 +1145,16 @@ impl S3 for ArunaS3Service {
 
         let (source_bucket, source_key, source_version_id) =
             parse_copy_source(&req.input.copy_source)?;
+        // A link copy writes a link to the source's exact version instead of a copy.
+        let mode = req
+            .headers
+            .get(aruna_core::structs::storage::link::COPY_MODE_HEADER);
+        if mode.and_then(|value| value.to_str().ok()) == Some("link") {
+            let source = (source_bucket, source_key, source_version_id);
+            return self
+                .copy_link(&req, &user_access, dest_bucket_info.as_ref(), source)
+                .await;
+        }
         let source_extras = req
             .extensions
             .get::<PolicyRequestExtras>()
@@ -1934,6 +1957,9 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        if let Some(view) = req.extensions.get::<InputView>().copied() {
+            return self.view_get(view, req.input).await;
+        }
         debug!(
             bucket = %req.input.bucket,
             key = %req.input.key,
@@ -1957,12 +1983,10 @@ impl S3 for ArunaS3Service {
                 .unwrap_or(user_access.group_id);
             return self
                 .folder_index(&req.extensions, group_id, &req.input.bucket, &req.input.key)
-        if let Some(view) = req.extensions.get::<InputView>().copied() {
-            return self.view_get(view, req.input).await;
-        }
                 .await;
         }
         let requested_range = req.input.range;
+        let link_range = requested_range;
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket;
         let key = req.input.key;
@@ -2024,8 +2048,15 @@ impl S3 for ArunaS3Service {
                 get_object_keyed(&self.state, input, restrictions, private, limits).await
             }
             _ => get_object_token(&self.state, input, restrictions, token).await,
+        };
+        // A link is read at its target, under the caller's own rights there.
+        if let Err(aruna_operations::s3::object::get::GetObjectError::Link(linked)) = &result {
+            let bucket = response_bucket.as_str();
+            return self
+                .follow_get(&user_access, bucket, linked, link_range)
+                .await;
         }
-        .map_err(IntoS3Error::into_s3_error);
+        let result = result.map_err(IntoS3Error::into_s3_error);
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -2241,6 +2272,9 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
+        if let Some(view) = req.extensions.get::<InputView>().copied() {
+            return self.view_head(view, req.input).await;
+        }
         debug!(
             bucket = %req.input.bucket,
             key = %req.input.key,
@@ -2272,9 +2306,6 @@ impl S3 for ArunaS3Service {
                 &key,
                 req.uri.query(),
                 &req.headers,
-        if let Some(view) = req.extensions.get::<InputView>().copied() {
-            return self.view_head(view, req.input).await;
-        }
             )
         };
         let pinned = version_id.is_some();
@@ -2338,6 +2369,10 @@ impl S3 for ArunaS3Service {
             }
         };
 
+        // A link answers from its recorded target only to a caller who may read the target.
+        if let Some(binding) = result.source_binding.as_ref() {
+            self.check_link(&user_access, &bucket, binding).await?;
+        }
         // A reference answers from its source observation without opening a source read.
         let remote_info = if result.location.is_none() && result.source_metadata.is_none() {
             Some(
