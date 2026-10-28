@@ -694,11 +694,13 @@ async fn flush_keeps_page() {
 }
 
 // An observation with nothing to compare but its size, as a table row gives it, imported
-// again unchanged writes nothing; a different size is no longer unchanged.
+// again unchanged writes nothing; a different size or a moved source is no longer unchanged.
 #[tokio::test]
 async fn bare_size_unchanged() {
+    use crate::connectors::repository::source_connector_key;
     use crate::driver::drive;
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -735,6 +737,40 @@ async fn bare_size_unchanged() {
     );
     let resized = run(page(5, again.checkpoint.clone())).await.unwrap();
     assert_eq!(resized.unchanged, 0);
+
+    // A later job sees the same bare row as unchanged until the connector's endpoint moves;
+    // then it binds the file to the new source.
+    let started = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let started = started.as_millis() as u64 + 1;
+    let job_id = JobId::from_bytes([6; 16]);
+    let mut later = record(token());
+    later.job_id = job_id;
+    (later.created_at_ms, later.updated_at_ms) = (started, started);
+    crate::jobs::store::insert_job(&context.storage_handle, &later)
+        .await
+        .unwrap();
+    let mut moved = connector.clone();
+    let endpoint = "http://127.0.0.1:10".to_string();
+    moved.public_config.insert("endpoint".to_string(), endpoint);
+    let later_page = |connector: &SourceConnector| PageImportInput {
+        job_id,
+        checkpoint_key: ByteView::from(job_id.to_bytes().to_vec()),
+        connector: connector.clone(),
+        ..page(4, checkpoint())
+    };
+    let kept = run(later_page(&connector)).await.unwrap();
+    assert_eq!((kept.registered, kept.unchanged), (0, 1));
+    let write = StorageEffect::Write {
+        key_space: SOURCE_INDEX_KEYSPACE.to_string(),
+        key: source_connector_key(group_id, moved.connector_id),
+        value: moved.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(write).await;
+    let rebound = run(later_page(&moved)).await.unwrap();
+    assert_eq!((rebound.registered, rebound.unchanged), (1, 0));
 }
 
 // Runs the page twice against real storage: the commit is atomic and the replay finds the
