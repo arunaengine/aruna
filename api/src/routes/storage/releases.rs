@@ -3,22 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
-use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::bucket_metadata::{
-    RELEASE_PREFIX_TAG, RELEASE_TAG, curator_path,
+use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, release_members};
+use aruna_operations::s3::bucket::release_publish::{
+    self, PublishError, PublishInput, ReleaseSpec,
 };
-use aruna_operations::auth::request_authorization::authorize;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::distribution::status::read_view;
-use aruna_operations::s3::bucket::release::{
-    BucketScope, ReleaseSpec, release_crate, release_files, release_rows,
-};
-use aruna_operations::s3::object::origin::read_origin;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
@@ -31,10 +23,8 @@ use utoipa_axum::routes;
 use super::bucket_metadata::BucketIdentifierBody;
 use super::deletion::bucket_info;
 use super::relay::{relay_json, rest_target};
-use super::routing::ensure_group_admin;
-use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
+use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::mcp::data::{WriteObjectInput, store_text};
 use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
@@ -97,17 +87,20 @@ pub struct ReleaseListResponse {
     summary = "Publish a database release",
     description = r#"Writes a release crate that pins the current version of every file under `prefix`, as one new version of `key` tagged as a release.
 
-**Authentication**: realm bearer token with WRITE on `key`, and WRITE on the owning group's admin
-path or on the realm's database curator path.
+**Authentication**: realm bearer token with WRITE on the bucket, and WRITE on the owning group's
+admin path or on the realm's database curator path. The caller must be able to read every file
+under `prefix`, or nothing is published.
 
 **Behavior**
 - The crate is an RO-Crate: the release label, the upstream identifiers, the preparation runs,
   and each file by its exact version id with its size, content id or source pin.
 - The tagged version is immutable; a later version of the key is a new release or none. A copy
   of a release crate is no release.
-- Repeating an identical publish answers the existing version with `replayed: true`.
-- In a distributed bucket the coordinator of the key's range writes it; it must hold the
-  records of every range under the prefix.
+- Repeating an identical publish answers the existing version with `replayed: true`. The write
+  is guarded by the key's head, so two concurrent identical publishes make one release.
+- In a distributed bucket the coordinator of the key's range writes it, and each range under the
+  prefix is listed by its own coordinator with the caller's token. A range whose coordinator
+  cannot list it now refuses the publish with 503; a copy that may be behind is never used.
 
 **Limits**
 - The crate is built in memory, so its size grows with the number of files."#,
@@ -129,10 +122,10 @@ path or on the realm's database curator path.
         })),
         (status = 400, description = "Invalid identifier link or run id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "No WRITE on the key, or neither admin nor curator", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the bucket, neither admin nor curator, or a file under the prefix is not readable", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
-        (status = 409, description = "This member does not hold every range under the prefix", body = ErrorResponse),
-        (status = 503, description = "The files could not be listed now", body = ErrorResponse)
+        (status = 409, description = "The key changed while the release was written", body = ErrorResponse),
+        (status = 503, description = "A range could not be listed by its coordinator now", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -147,69 +140,37 @@ pub async fn publish_release(
     let auth = require_realm_auth(&state, auth)?;
     let spec = release_spec(&request)?;
     let info = bucket_info(&state, &bucket).await?;
-    let path = object_permission_path(
-        state.get_realm_id(),
-        info.group_id,
-        state.get_node_id(),
-        &bucket,
-        &request.key,
-    );
-    ensure_permission(&state, &auth, path, Permission::WRITE).await?;
-    if ensure_group_admin(&state, &auth, info.group_id)
-        .await
-        .is_err()
-    {
-        let curator = curator_path(state.get_realm_id());
-        ensure_permission(&state, &auth, curator, Permission::WRITE).await?;
-    }
     // In a distributed bucket the coordinator of the key's range writes it.
     if let Some(forward) = rest_target(&state, &info, &request.key, &headers).await? {
         let path = format!("/data/buckets/{bucket}/releases");
         let (_, answer) = relay_json(&state, &forward, &path, bearer.as_ref(), &request).await?;
         return Ok(Json(answer));
     }
-    holds_prefix(&state, &info, &spec.prefix).await?;
     let scope = BucketScope {
         realm_id: state.get_realm_id(),
         node_id: state.get_node_id(),
         bucket: &bucket,
         info: &info,
     };
-    let context = state.get_ctx();
-    let unavailable =
-        |error: &dyn std::fmt::Display| ServerError::ServiceUnavailableReason(error.to_string());
-    let files = release_files(context.as_ref(), scope, &spec.prefix, &request.key)
-        .await
-        .map_err(|error| unavailable(&error))?;
-    let bytes = release_crate(&spec, &files);
-    let hash = *blake3::hash(&bytes).as_bytes();
-    if let Some(version_id) = current_release(&state, scope, &request.key, (&spec, hash)).await? {
-        return Ok(Json(PublishReleaseResponse {
-            bucket,
-            key: request.key,
-            version_id: version_id.to_string(),
-            files: files.len(),
-            replayed: true,
-        }));
-    }
-    let text = String::from_utf8(bytes).map_err(|error| unavailable(&error))?;
-    let tags = HashMap::from([
-        (RELEASE_TAG.to_string(), spec.label.clone()),
-        (RELEASE_PREFIX_TAG.to_string(), spec.prefix.clone()),
-    ]);
-    let input = WriteObjectInput {
-        bucket: bucket.clone(),
+    let input = PublishInput {
+        auth,
+        bearer: bearer.as_ref().map(|bearer| bearer.as_str().to_string()),
         key: request.key.clone(),
-        text,
-        content_type: Some("application/ld+json".to_string()),
+        spec,
     };
-    let stored = store_text(&state, &auth, &info, input, tags).await?;
+    let published = release_publish::publish_release(state.get_ctx().as_ref(), scope, input)
+        .await
+        .map_err(|error| match error {
+            PublishError::Forbidden(_) => ServerError::Forbidden,
+            PublishError::Conflict(reason) => ServerError::Conflict(reason),
+            PublishError::Unavailable(reason) => ServerError::ServiceUnavailableReason(reason),
+        })?;
     Ok(Json(PublishReleaseResponse {
         bucket,
         key: request.key,
-        version_id: stored.version_id,
-        files: files.len(),
-        replayed: false,
+        version_id: published.version_id.to_string(),
+        files: published.files,
+        replayed: published.replayed,
     }))
 }
 
@@ -240,82 +201,20 @@ fn release_spec(request: &PublishReleaseRequest) -> ServerResult<ReleaseSpec> {
     })
 }
 
-/// A distributed member lists only the records it holds, so it must hold every range that
-/// keys under `prefix` can fall into.
-async fn holds_prefix(state: &ServerState, info: &BucketInfo, prefix: &str) -> ServerResult<()> {
-    let Some(binding) = &info.distribution else {
-        return Ok(());
-    };
-    let view = read_view(state.get_ctx().as_ref(), binding.set_id)
-        .await
-        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?
-        .ok_or(ServerError::NotFound)?;
-    let snapshot = view.snapshot();
-    let held = snapshot.held_ranges(binding.member_id);
-    let missing = (snapshot.config.ranges.iter())
-        .filter(|range| covers(range.lower.as_str(), range.upper.as_deref(), prefix))
-        .any(|range| !held.iter().any(|kept| kept.range_id == range.range_id));
-    match missing {
-        true => Err(ServerError::Conflict(
-            "this member does not hold every range under the prefix".to_string(),
-        )),
-        false => Ok(()),
-    }
-}
-
-/// Whether a range `[lower, upper)` may hold keys that start with `prefix`.
-fn covers(lower: &str, upper: Option<&str>, prefix: &str) -> bool {
-    let below_upper = upper.is_none_or(|upper| prefix < upper);
-    let above_lower = lower <= prefix || lower.starts_with(prefix);
-    below_upper && above_lower
-}
-
-/// The key's current version, when it is already this exact release.
-async fn current_release(
-    state: &ServerState,
-    scope: BucketScope<'_>,
-    key: &str,
-    (spec, hash): (&ReleaseSpec, [u8; 32]),
-) -> ServerResult<Option<Ulid>> {
-    let context = state.get_ctx();
-    let Ok(current) = read_origin(
-        context.as_ref(),
-        (scope.realm_id, scope.node_id),
-        scope.bucket,
-        key,
-        None,
-    )
-    .await
-    else {
-        return Ok(None);
-    };
-    if current.content_hash != Some(hash) {
-        return Ok(None);
-    }
-    let rows = release_rows(context.as_ref(), scope.bucket)
-        .await
-        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
-    let same = rows.iter().any(|(version_id, pointer)| {
-        *version_id == current.version_id
-            && pointer.label == spec.label
-            && pointer.prefix == spec.prefix
-    });
-    Ok(same.then_some(current.version_id))
-}
-
 #[utoipa::path(
     get,
     path = "/data/buckets/{bucket}/releases",
     tag = "data/storage",
     summary = "List a bucket's releases",
-    description = r#"Lists the releases this node holds of a bucket whose release crate the caller may read.
+    description = r#"Lists a bucket's releases whose release crate the caller may read.
 
 **Authentication**: realm bearer token.
 
 **Behavior**
-- Each release is the exact version of its tagged release crate.
-- A member of a distributed bucket lists the releases in the ranges it holds; `complete` is
-  `false` when it does not hold every range."#,
+- Each release is the exact version of its tagged release crate, read and checked: a version
+  that is gone, for example purged or of an earlier bucket of the name, is not listed.
+- In a distributed bucket each range is answered by its coordinator, asked with the caller's
+  token; `complete` is `false` when one did not answer."#,
     params(("bucket" = String, Path, description = "Bucket name on this node")),
     responses(
         (status = 200, description = "The releases", body = ReleaseListResponse, example = json!({
@@ -332,52 +231,36 @@ async fn current_release(
 pub async fn list_releases(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<ReleaseListResponse>> {
     let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
-    let context = state.get_ctx();
-    let rows = release_rows(context.as_ref(), &bucket)
+    let scope = BucketScope {
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        bucket: &bucket,
+        info: &info,
+    };
+    let caller = MembershipCaller {
+        auth: &auth,
+        bearer: bearer.as_ref().map(ValidatedBearer::as_str),
+    };
+    let found = release_members(state.get_ctx().as_ref(), scope, caller, &[])
         .await
         .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
-    let mut releases = Vec::new();
-    for (version_id, pointer) in rows {
-        let path = object_permission_path(
-            state.get_realm_id(),
-            info.group_id,
-            state.get_node_id(),
-            &bucket,
-            &pointer.key,
-        );
-        let extras = PolicyRequestExtras::operation("s3.GetObject");
-        let realm_id = state.get_realm_id();
-        if authorize(&context, realm_id, &auth, &path, &Permission::READ, extras)
-            .await
-            .is_ok()
-        {
-            releases.push(ReleaseItem {
-                key: pointer.key,
-                version_id: version_id.to_string(),
-                label: pointer.label,
-                prefix: pointer.prefix,
-            });
-        }
-    }
-    let complete = match &info.distribution {
-        None => true,
-        Some(binding) => read_view(context.as_ref(), binding.set_id)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|view| {
-                let snapshot = view.snapshot();
-                snapshot.held_ranges(binding.member_id).len() == snapshot.config.ranges.len()
-            }),
-    };
+    let releases = (found.releases.into_iter())
+        .map(|valid| ReleaseItem {
+            key: valid.key,
+            version_id: valid.version_id.to_string(),
+            label: valid.release.label,
+            prefix: valid.prefix,
+        })
+        .collect();
     Ok(Json(ReleaseListResponse {
         bucket,
         releases,
-        complete,
+        complete: found.complete,
     }))
 }
 
