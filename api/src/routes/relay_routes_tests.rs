@@ -180,9 +180,10 @@ async fn stopped_management_skipped() {
 
 #[tokio::test]
 async fn refused_target_demoted() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let refused = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    // A bound socket that never listens keeps its port reserved while connections are refused.
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let refused = format!("http://{}", reserved.local_addr().unwrap());
     let (upstream, handle) = fake_upstream().await;
     let fixture = setup(vec![refused.clone(), upstream.clone()]).await;
     let response = relay_app(fixture.state.clone())
@@ -200,6 +201,7 @@ async fn refused_target_demoted() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    drop(reserved);
     handle.abort();
 }
 
