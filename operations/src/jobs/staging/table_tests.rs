@@ -30,6 +30,8 @@ const STRUCTURE: &str = "GCF_000001405.40_GRCh38.p14_assembly_structure/";
 struct Site {
     files: BTreeMap<String, Vec<u8>>,
     requests: Mutex<Vec<(Method, String)>>,
+    /// Answers every request with 429 and a one hour `Retry-After`.
+    throttled: bool,
 }
 
 impl Site {
@@ -55,6 +57,7 @@ impl Site {
         Self {
             files,
             requests: Mutex::default(),
+            throttled: false,
         }
     }
 
@@ -103,6 +106,13 @@ impl Site {
             .lock()
             .unwrap()
             .push((method.clone(), path.clone()));
+        if self.throttled {
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("retry-after", "3600")
+                .body(Body::empty())
+                .unwrap();
+        }
         let Some(bytes) = self.files.get(&path) else {
             return match self
                 .index(&path)
@@ -412,5 +422,35 @@ async fn uploaded_list_imports() {
         fixture.search("readme sample=s2").await,
         ["samples/README.txt"]
     );
+    server.abort();
+}
+
+// A job cancelled or shut down while its source's `Retry-After` pauses it ends with that stop,
+// not with a failed attempt.
+#[tokio::test]
+async fn paused_job_stops() {
+    let throttled = |endpoint: &str| Site {
+        throttled: true,
+        ..Site::ncbi(endpoint)
+    };
+    let (endpoint, _site, server) = serve(throttled).await;
+    let fixture = Fixture::new(&endpoint, summary_table()).await;
+    for (seed, cancel) in [(20u8, true), (21u8, false)] {
+        let ctx = fixture.context(seed).await;
+        let stop = match cancel {
+            true => ctx.cancel.clone(),
+            false => ctx.shutdown.clone(),
+        };
+        let stopping = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            stop.cancel();
+        };
+        let run = crate::jobs::staging::run_staging_job(&ctx, &fixture.spec);
+        let (outcome, ()) = tokio::join!(run, stopping);
+        match cancel {
+            true => assert!(matches!(outcome, JobRunOutcome::Cancelled)),
+            false => assert!(matches!(outcome, JobRunOutcome::Interrupted)),
+        }
+    }
     server.abort();
 }

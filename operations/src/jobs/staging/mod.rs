@@ -76,9 +76,29 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
                 notice: Some(Arc::new(move |until| progress.set_pause(until))),
                 ..Pace::new(spec.connector_id, table.rate())
             };
-            Box::pin(paced(pace, run_job(ctx, spec))).await
+            let outcome = Box::pin(paced(pace, run_job(ctx, spec))).await;
+            stopped_outcome(ctx, outcome).await
         }
         None => Box::pin(run_job(ctx, spec)).await,
+    }
+}
+
+/// A failure while the job was cancelled or shut down, such as a paced wait the stop ended,
+/// is that stop's outcome and spends no attempt.
+async fn stopped_outcome(ctx: &JobContext, outcome: JobRunOutcome) -> JobRunOutcome {
+    if !matches!(
+        outcome,
+        JobRunOutcome::Failed(_) | JobRunOutcome::Deferred(_)
+    ) {
+        return outcome;
+    }
+    if ctx.cancel.is_cancelled() {
+        clear_queue(ctx).await;
+        return JobRunOutcome::Cancelled;
+    }
+    match ctx.shutdown.is_cancelled() {
+        true => JobRunOutcome::Interrupted,
+        false => outcome,
     }
 }
 
