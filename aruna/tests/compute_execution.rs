@@ -52,6 +52,10 @@ fn job_id() -> JobId {
 async fn docker_or_skip() -> Option<DockerBackend> {
     let config = DockerConfig {
         keep_failed: std::env::var("ARUNA_KEEP_FAILED").is_ok(),
+        // Its own state root, so tests that run at once never contend for one owner lock.
+        state_root: std::env::temp_dir()
+            .join("aruna-compute-tests")
+            .join(ulid::Ulid::generate().to_string()),
         ..DockerConfig::default()
     };
     match DockerBackend::with_config(config) {
