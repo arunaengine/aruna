@@ -98,11 +98,23 @@ pub struct ObjectListResponse {
 }
 
 /// Where a merged page continues: after a listed key or common prefix, or at the first key of
-/// a range when a page visited its bound number of ranges before any entry.
+/// a range when a page visited its bound number of ranges before any entry, or inside the range
+/// starting at `lower`, from the sealed cursor of the member that stopped there among hidden
+/// entries.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum Resume {
-    After { key: String, group: Option<String> },
+    After {
+        key: String,
+        group: Option<String>,
+    },
     From(String),
+    Hidden {
+        lower: String,
+        node: aruna_core::NodeId,
+        copy: bool,
+        cursor: String,
+        group: Option<String>,
+    },
 }
 
 fn invalid_cursor() -> ServerError {
@@ -179,7 +191,7 @@ fn local_token(
             Some(resume_token(&request.bucket, &key, group.as_deref())?),
             None,
         )),
-        Some(Resume::From(_)) => Err(invalid_cursor()),
+        Some(Resume::From(_) | Resume::Hidden { .. }) => Err(invalid_cursor()),
         None => Ok((None, None)),
     }
 }
@@ -335,14 +347,15 @@ fn range_path(
     )
 }
 
-/// One range's page from a holder of the range; only a range nobody answers ends the page.
+/// One range's page from a holder of the range, with the holder that answered; only a range
+/// nobody answers ends the page.
 async fn remote_part(
     state: &ServerState,
     (binding, holders): (&DistributionBinding, Vec<aruna_core::NodeId>),
     (range, copy): (&KeyRange, bool),
     bearer: Option<&ValidatedBearer>,
     (request, cursor): (&ListRequest, Option<String>),
-) -> ServerResult<ObjectListResponse> {
+) -> ServerResult<(ObjectListResponse, aruna_core::NodeId)> {
     let path = range_path(request, cursor.as_deref(), (range, copy));
     for node_id in holders {
         let forward = RestForward {
@@ -351,7 +364,7 @@ async fn remote_part(
             node_id,
         };
         if let Some(page) = relay_get(state, &forward, &path, bearer, HeaderMap::new()).await? {
-            return Ok(page);
+            return Ok((page, node_id));
         }
     }
     Err(ServerError::ServiceUnavailableReason(format!(
@@ -378,17 +391,32 @@ async fn merged_page(
         .await
         .map_err(map_guard_error)?;
     let resume = request.cursor.as_deref().map(decode_resume).transpose()?;
-    let (after, from) = match &resume {
-        Some(Resume::After { key, group }) => (Some((key.clone(), group.clone())), None),
-        Some(Resume::From(lower)) => (None, Some(lower.clone())),
-        None => (None, None),
+    // A sealed position resumes its range at the member that sealed it.
+    let (after, from, mut resumed, hidden_group) = match &resume {
+        Some(Resume::After { key, group }) => {
+            (Some((key.clone(), group.clone())), None, None, None)
+        }
+        Some(Resume::From(lower)) => (None, Some(lower.clone()), None, None),
+        Some(Resume::Hidden {
+            lower,
+            node,
+            copy,
+            cursor,
+            group,
+        }) => (
+            None,
+            Some(lower.clone()),
+            Some((*node, *copy, cursor.clone())),
+            group.clone(),
+        ),
+        None => (None, None, None, None),
     };
     let prefix = request.prefix.clone().unwrap_or_default();
     let mut page = ObjectListResponse {
         bucket: request.bucket.clone(),
         ..Default::default()
     };
-    let mut last_group = after.as_ref().and_then(|(_, group)| group.clone());
+    let mut last_group = (after.as_ref().and_then(|(_, group)| group.clone())).or(hidden_group);
     let mut last_key = after.as_ref().map(|(key, _)| key.clone());
     let ranges = snapshot.listed_ranges(&prefix).into_iter().filter(|range| {
         let past = after.as_ref().is_none_or(|(key, group)| {
@@ -426,9 +454,20 @@ async fn merged_page(
             cursor: None,
             ..request.clone()
         };
-        let remote = match snapshot.lists_locally(binding.member_id, range, &fence) {
-            true => None,
-            false => {
+        let resumed = resumed.take();
+        let local = match &resumed {
+            Some((node, ..)) => *node == state.get_node_id(),
+            None => snapshot.lists_locally(binding.member_id, range, &fence),
+        };
+        let remote = match (local, &resumed) {
+            (true, _) => None,
+            (false, Some((node, copy, cursor))) => {
+                let asked = (&sub, Some(cursor.clone()));
+                let holder = (binding, vec![*node]);
+                let part = remote_part(state, holder, (range, *copy), bearer, asked).await?;
+                Some((part, *copy))
+            }
+            (false, None) => {
                 // The full position, so a common prefix is skipped as a whole.
                 let cursor = (start.clone())
                     .map(|(key, group)| encode_resume(&Resume::After { key, group }))
@@ -442,7 +481,7 @@ async fn merged_page(
                 let holders = others(snapshot.list_holder(range).into_iter().collect());
                 let asked = (&sub, cursor.clone());
                 match remote_part(state, (binding, holders), (range, false), bearer, asked).await {
-                    Ok(part) => Some(part),
+                    Ok(part) => Some((part, false)),
                     // The coordinator cannot answer, so this member's copy or another lists.
                     Err(error) if error.status_code().is_server_error() => {
                         page.stale_ranges.push(range.range_id.to_string());
@@ -460,7 +499,7 @@ async fn merged_page(
                                     bearer,
                                     asked,
                                 );
-                                Some(part.await?)
+                                Some((part.await?, true))
                             }
                         }
                     }
@@ -468,21 +507,32 @@ async fn merged_page(
                 }
             }
         };
-        let part = match remote {
-            Some(part) => part,
+        let (part, lister, copy) = match remote {
+            Some(((part, lister), copy)) => (part, lister, copy),
             None => {
                 let token = (start.as_ref())
                     .map(|(key, group)| resume_token(&request.bucket, key, group.as_deref()))
                     .transpose()?;
+                let hidden = (resumed.as_ref())
+                    .map(|(_, _, cursor)| open_cursor(cursor).ok_or_else(invalid_cursor))
+                    .transpose()?;
                 let bounds = Some((range.lower.clone(), range.upper.clone()));
-                local_part(state, (info, caller), &sub, (token, None, None), bounds).await?
+                let position = (token, None, hidden);
+                let part = local_part(state, (info, caller), &sub, position, bounds).await?;
+                (part, state.get_node_id(), false)
             }
         };
-        // A merged cursor cannot carry a member's sealed one.
-        if part.next_cursor.as_deref().is_some_and(is_sealed) {
-            return Err(ServerError::ServiceUnavailableReason(
-                "the listing passed too many hidden entries; list a narrower prefix".into(),
-            ));
+        // A range that stopped among hidden entries goes on from its member's cursor.
+        if let Some(cursor) = part.next_cursor.clone().filter(|cursor| is_sealed(cursor)) {
+            let next = Resume::Hidden {
+                lower: range.lower.clone(),
+                node: lister,
+                copy,
+                cursor,
+                group: last_group.clone(),
+            };
+            page.next_cursor = Some(encode_resume(&next)?);
+            return Ok(page);
         }
         let keys = (part.objects.iter().map(|object| &object.key)).chain(part.prefixes.iter());
         bytes += keys.map(String::len).sum::<usize>();

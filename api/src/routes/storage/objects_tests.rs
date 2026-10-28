@@ -423,3 +423,57 @@ async fn hides_link_folders() {
     };
     assert_eq!(decode_resume(&cursor).unwrap(), after);
 }
+
+#[tokio::test]
+async fn merged_passes_hidden_run() {
+    // A local range that starts with more hidden entries than one request examines goes on
+    // from this member's sealed cursor inside the merged cursor, then on to the peer's range.
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let node = node_state().await;
+    store(&node, &["a.md"]).await;
+    let hidden = aruna_core::structs::storage::link::LinkTarget {
+        arn: aruna_core::structs::storage::replication::VersionedObjectArn {
+            realm_id: node.owner.realm_id,
+            node_id: node.state.get_node_id(),
+            bucket: "other".to_string(),
+            key: "x".to_string(),
+            version: ulid::Ulid::from_parts(5, 5),
+        },
+        group_id: ulid::Ulid::from_parts(9, 9),
+    };
+    for index in 0..=SCAN_BUDGET {
+        link(&node, &format!("b/{index:05}"), hidden.clone()).await;
+    }
+    distribute(&node.state, node.group_id, BUCKET).await;
+    let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+        "version_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+        "prefixes":[],"next_cursor":null}"#;
+    let peer = mock_peer(StatusCode::OK, answer).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let first = list(&node, &node.owner, HeaderMap::new(), query(None, None, 10))
+        .await
+        .unwrap();
+    assert_eq!(keys(&first), vec!["a.md"]);
+    let second = list(
+        &node,
+        &node.owner,
+        HeaderMap::new(),
+        query(None, first.next_cursor, 10),
+    )
+    .await
+    .unwrap();
+    assert!(second.objects.is_empty() && second.prefixes.is_empty());
+    let cursor = second.next_cursor.expect("the hidden run goes on");
+    assert!(matches!(decode_resume(&cursor), Ok(Resume::Hidden { .. })));
+    let third = list(
+        &node,
+        &node.owner,
+        HeaderMap::new(),
+        query(None, Some(cursor), 10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(keys(&third), vec!["x.md"]);
+    assert!(third.prefixes.is_empty() && third.next_cursor.is_none());
+}

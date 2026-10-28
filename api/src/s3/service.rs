@@ -283,22 +283,22 @@ impl ArunaS3Service {
             .and_then(|info| info.distribution.clone())
             .zip(extensions.get::<UserAccess>());
         // A distributed bucket's folder spans its key ranges, as its S3 listing does.
-        let (page, stale) = match distributed {
+        let (page, stale, more) = match distributed {
             Some((binding, user)) => {
                 let user = forward::reads::anonymous_window(user);
                 let shape = (None, false, None);
-                let (page, _, stale) =
+                let (page, next, stale) =
                     (self.merged_objects(&user, &binding, input, shape, (None, true))).await?;
-                (page, stale)
+                (page, stale, next.is_some())
             }
             None => {
                 let page = self
                     .run_object_listing(input, (None, None), false, None, (None, None))
                     .await?;
-                (page, Vec::new())
+                (page, Vec::new(), false)
             }
         };
-        let truncated = page.continuation_token.is_some() || page.sealed.is_some();
+        let truncated = more || page.continuation_token.is_some() || page.sealed.is_some();
         let folders = page
             .common_prefixes
             .into_iter()
@@ -693,7 +693,7 @@ impl S3 for ArunaS3Service {
         let (continuation_token, from) = match &merged {
             Some(binding) => match decode_bound(binding.set_id, query, plain)? {
                 Some(Resume::After(token)) => (Some(token), None),
-                Some(Resume::From(key)) => (None, Some(key)),
+                Some(other) => (None, Some(other)),
                 None => (None, None),
             },
             None => (Self::decode_list_token(plain)?, None),
@@ -753,7 +753,7 @@ impl S3 for ArunaS3Service {
             delimiter: delimiter.clone(),
             start_after: start_after.clone(),
         };
-        let (page, next_from, stale) = match &merged {
+        let (page, next, stale) = match &merged {
             Some(binding) => {
                 let shape = (owner, url_encoded, scope.as_ref());
                 self.merged_objects(&user_access, binding, input, shape, (from, true))
@@ -783,7 +783,7 @@ impl S3 for ArunaS3Service {
         let next_continuation_token = match &merged {
             Some(binding) => {
                 let query = (prefix.as_deref(), delimiter.as_deref());
-                let resume = (result_token.map(Resume::After)).or(next_from.map(Resume::From));
+                let resume = (result_token.map(Resume::After)).or(next);
                 encode_bound(binding.set_id, query, resume.as_ref())?
             }
             None => match sealed {
@@ -869,7 +869,14 @@ impl S3 for ArunaS3Service {
             ),
             None => None,
         };
-        let key_marker = marker.as_deref().filter(|_| hidden.is_none());
+        // In a distributed bucket a marker may be a merged token that resumes inside a range.
+        let query = (prefix.as_deref(), delimiter.as_deref());
+        let resumed = (merged.as_ref().zip(marker.as_deref()))
+            .and_then(|(binding, marker)| decode_bound(binding.set_id, query, Some(marker)).ok())
+            .flatten();
+        let key_marker = marker
+            .as_deref()
+            .filter(|_| hidden.is_none() && resumed.is_none());
         let continuation_token = marker_continuation_token(
             &bucket,
             key_marker,
@@ -911,9 +918,13 @@ impl S3 for ArunaS3Service {
             // A marker cannot name a range start, so a legacy listing visits every range.
             Some(binding) => {
                 let shape = (owner, url_encoded, scope.as_ref());
-                let (page, _, stale) =
-                    (self.merged_objects(&user_access, binding, input, shape, (None, false)))
+                let (mut page, next, stale) =
+                    (self.merged_objects(&user_access, binding, input, shape, (resumed, false)))
                         .await?;
+                // A range that stopped among hidden entries goes on from this marker.
+                if let Some(next) = next {
+                    page.sealed = encode_bound(binding.set_id, query, Some(&next))?;
+                }
                 (page, stale)
             }
             None => {

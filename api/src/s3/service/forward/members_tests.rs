@@ -668,6 +668,76 @@ async fn listing_merges_ranges() {
     assert_eq!(keys, ["q/1", "q/2"]);
 }
 
+/// Writes a link at `key` on member `on` to a target in a group the user cannot read.
+async fn hidden_link(members: &Members, on: usize, key: &str) {
+    use aruna_core::structs::storage::link::LinkTarget;
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    let node = &members.nodes[on];
+    let target = LinkTarget {
+        arn: VersionedObjectArn {
+            realm_id: members.realm_id,
+            node_id: node.node_id(),
+            bucket: "other".to_string(),
+            key: "x".to_string(),
+            version: ulid::Ulid::from_parts(5, 5),
+        },
+        group_id: ulid::Ulid::from_parts(9, 9),
+    };
+    let write = ReferenceWrite {
+        preassigned_version_id: None,
+        group_id: members.group_id,
+        user_id: members.user.user_identity,
+        realm_id: members.realm_id,
+        node_id: node.node_id(),
+        bucket: BUCKET.to_string(),
+        key: key.to_string(),
+        expected_bucket: None,
+        version_source: target.binding(),
+        metadata: aruna_core::structs::execution::source_access::SourceMetadata {
+            content_length: 1,
+            content_type: None,
+            etag: Some(target.arn.version.to_string()),
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        },
+        inherited_policies: Vec::new(),
+        connector_guard: None,
+        restrictions: None,
+    };
+    write_reference_version(&node.context, write).await.unwrap();
+}
+
+// A range that starts with more hidden entries than one request examines goes on from the
+// sealed cursor of its member, here and on another member, so the merged listing completes.
+#[tokio::test]
+async fn listing_passes_hidden_runs() {
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let members = members(3, &["h", "p"], 0).await;
+    for key in ["a/1", "k/zz", "q/1"] {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    for index in 0..=SCAN_BUDGET {
+        hidden_link(&members, 0, &format!("b/{index:05}")).await;
+        hidden_link(&members, 1, &format!("k/{index:05}")).await;
+    }
+    let (mut seen, mut token) = (Vec::new(), None);
+    for _ in 0..8 {
+        let input = s3s::dto::ListObjectsV2Input {
+            continuation_token: token.take(),
+            ..list_input(100)
+        };
+        let (keys, _, next) = page(&members, 0, input).await.unwrap();
+        seen.extend(keys);
+        match next {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, ["a/1", "k/zz", "q/1"]);
+}
+
 // Prefixes group keys across ranges once each, and a token of another query is refused.
 #[tokio::test]
 async fn listing_groups_prefixes() {
