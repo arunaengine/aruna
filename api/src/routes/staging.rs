@@ -24,6 +24,9 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::execution::source_access::{ListRequest, SourceEntry, SourceEntryKind};
 use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::structs::execution::table::{
+    TableImport, TableSource, source_path as table_source_path,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::distribution::ReadRoute;
@@ -202,6 +205,10 @@ pub struct StageBatchRequest {
     /// Name of an `md5sum` or `sha256sum` manifest below each prefix; jobs only.
     #[serde(default)]
     pub checksum_manifest: Option<String>,
+    /// A CSV or TSV list whose rows name the files or folders to import; jobs only.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub table: Option<TableImport>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -469,9 +476,9 @@ pub async fn stage_batch(
     if request.strategy == ApiStagingStrategy::Sync {
         return Err(ServerError::Unimplemented);
     }
-    if request.checksum_manifest.is_some() {
+    if request.checksum_manifest.is_some() || request.table.is_some() {
         return Err(ServerError::BadRequestReason(
-            "checksum manifests are read by staging jobs only".to_string(),
+            "checksum manifests and tables are read by staging jobs only".to_string(),
         ));
     }
     let node_id = request
@@ -632,12 +639,25 @@ Nothing is authorized later while the job runs.
 - S3 prefixes are walked as one flat listing with a provider cursor; other sources are walked
   directory by directory from a durable queue. Each page and its checkpoint are written together,
   and references are registered from listing metadata (size, ETag, last-modified) without a HEAD
-  per file.
+  per file. HTTP index pages round sizes and times, so each of their files gets one HEAD.
 - `checksum_manifest` names an `md5sum` or `sha256sum` file below each prefix. It is read before
   the prefix, and each imported file carries its digest; a later complete read of a reference and a
   snapshot copy keep bytes only when they match it.
 - There is no idempotency key, so resubmitting the same body creates another job and stages the same
   objects a second time.
+- `table` imports from a CSV or TSV list instead of `items` and `prefixes` (reference strategy
+  only). `source` is `{"connector": path or URL below the connector}` or
+  `{"object": {"bucket", "key"}}`, a list uploaded into Aruna and read as the caller.
+  `format`: `delimiter` (default `,`), `quote` (default `"`, `null` for none), `header`
+  (`first_row` default, `{"row": n}`, `last_comment`, `{"columns": [...]}`), `comment`, `nulls`
+  (default `[""]`), `gzip` (default: by `.gz` name or magic bytes); UTF-8. `rows`: `kind` (`file`:
+  one object per row; `folder`: the row names a directory whose files are listed), `source` and
+  `target` templates (`{column}`, `{column|basename}`), `filter` (`[{"column", "any_of"}]`),
+  `keep` (columns stored as object metadata; `null` keeps all), `text` and `exact` (columns
+  search matches as free text or as `column=value`). `rate` paces requests to the connector per
+  node (default 10 per second); transient answers back off and honour `Retry-After`. A folder row
+  writes a zero-byte folder object at `target/` carrying the row's metadata. The table and every
+  row are read under the caller's permissions; rows are authorized by the job, one by one.
 - Progress and completion are observed by reading the job by its id.
 - In a distributed bucket every coordinator imports only the keys of the ranges it coordinates:
   this node relays the job to the other coordinators with the caller's bearer token and lists their
@@ -648,24 +668,71 @@ Nothing is authorized later while the job runs.
   same `connector_id`, else that coordinator's entry names the missing connector.
 
 **Limits**
-- At least one item or prefix is required.
+- At least one item or prefix is required, or a `table`.
+- A header and every row of a table must fit into 256 KiB.
 - `node_id`, when given, must be this node, because the job runs where it was submitted."#,
     request_body(
         content = StageBatchRequest,
-        description = "One connector and target bucket for the job, plus the `items` and `prefixes` it should stage; at least one of the two must be non-empty",
-        example = json!({
-            "group_id": "01JABCDEF0123456789ABCDEFG",
-            "connector_id": "01JCONNECTOR0123456789ABCD",
-            "bucket": "research-raw",
-            "strategy": "snapshot",
-            "prefixes": [
-                {
-                    "source_prefix": "refseq/2026",
-                    "target_prefix": "genomes/2026"
-                }
-            ],
-            "checksum_manifest": "MD5SUMS"
-        })
+        description = "One connector and target bucket for the job, plus the `items` and `prefixes` it should stage, or one `table`",
+        examples(
+            ("Prefixes" = (
+                summary = "Stage a prefix with its checksum manifest",
+                value = json!({
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "connector_id": "01JCONNECTOR0123456789ABCD",
+                    "bucket": "research-raw",
+                    "strategy": "snapshot",
+                    "prefixes": [
+                        {
+                            "source_prefix": "refseq/2026",
+                            "target_prefix": "genomes/2026"
+                        }
+                    ],
+                    "checksum_manifest": "MD5SUMS"
+                })
+            )),
+            ("Assembly summary" = (
+                summary = "Import NCBI assembly folders from a summary file (connector rooted at https://ftp.ncbi.nlm.nih.gov/genomes/)",
+                value = json!({
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "connector_id": "01JCONNECTOR0123456789ABCD",
+                    "bucket": "ncbi-refseq",
+                    "strategy": "reference",
+                    "table": {
+                        "source": {"connector": "ASSEMBLY_REPORTS/assembly_summary_refseq.txt"},
+                        "format": {"delimiter": "\t", "header": "last_comment", "comment": "#", "nulls": ["na", ""]},
+                        "rows": {
+                            "kind": "folder",
+                            "source": "{ftp_path}",
+                            "target": "{ftp_path|basename}",
+                            "filter": [{"column": "assembly_accession", "any_of": ["GCF_000005845.2", "GCF_000001405.40"]}],
+                            "text": ["assembly_accession", "bioproject", "biosample", "wgs_master", "organism_name", "infraspecific_name", "isolate", "asm_name", "asm_submitter", "gbrs_paired_asm"],
+                            "exact": ["taxid", "species_taxid", "assembly_level", "group"]
+                        }
+                    }
+                })
+            )),
+            ("Uploaded list" = (
+                summary = "Import one file per row of an uploaded CSV, keeping two columns",
+                value = json!({
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "connector_id": "01JCONNECTOR0123456789ABCD",
+                    "bucket": "samples",
+                    "strategy": "reference",
+                    "table": {
+                        "source": {"object": {"bucket": "lists", "key": "samples.csv"}},
+                        "rows": {
+                            "kind": "file",
+                            "source": "{url}",
+                            "target": "samples/{url|basename}",
+                            "keep": ["sample", "description"],
+                            "text": ["description"],
+                            "exact": ["sample"]
+                        }
+                    }
+                })
+            ))
+        )
     ),
     responses(
         (
@@ -676,9 +743,9 @@ Nothing is authorized later while the job runs.
                 "job_id": "01JJOB0123456789ABCDEFGHJ"
             })
         ),
-        (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path, prefix or checksum manifest name is not confined, a target key is blank, or neither items nor prefixes were given", body = ErrorResponse),
+        (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path, prefix or checksum manifest name is not confined, a target key is blank, neither items nor prefixes nor a table were given, or the table descriptor is invalid", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "Token from another realm, or no READ on a source path or WRITE on a target key", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no READ on a source path or the table, or no WRITE on a target key or the table's destination bucket", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, a source path does not exist, or the connector is not registered on this node (code `connector_not_found`)", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
         (status = 503, description = "Job placement or the structured id clock is unavailable, or a key range of the distributed bucket is moving away from this node; the response carries `Retry-After` and the identical body may be resubmitted", body = ErrorResponse)
@@ -767,7 +834,24 @@ pub async fn submit_staging(
             target_prefix: prefix.target_prefix.trim_matches('/').to_string(),
         });
     }
-    if items.is_empty() && prefixes.is_empty() {
+    let table = request.table;
+    if let Some(table) = table.as_ref() {
+        let reference = request.strategy == ApiStagingStrategy::Reference;
+        if !items.is_empty() || !prefixes.is_empty() || !reference {
+            return Err(ServerError::BadRequestReason(
+                "a table import takes no items or prefixes and uses the reference strategy"
+                    .to_string(),
+            ));
+        }
+        check_table(
+            &state,
+            &auth,
+            (group_id, connector_id),
+            &request.bucket,
+            table,
+        )
+        .await?;
+    } else if items.is_empty() && prefixes.is_empty() {
         return Err(ServerError::BadRequestReason(
             "at least one staging item or prefix is required".to_string(),
         ));
@@ -822,6 +906,7 @@ pub async fn submit_staging(
             items,
             prefixes,
             checksum_manifest,
+            table,
         },
         node_id,
         state.rocrate_limits().artifact_retention_ms,
@@ -1643,6 +1728,35 @@ async fn resolve_quota_ceiling(
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
     Ok(config.quota.effective_group_ceiling(&group_id))
+}
+
+/// Checks a table descriptor, READ on the table and WRITE on the destination bucket; the rows
+/// are authorized by the job, row by row.
+async fn check_table(
+    state: &ServerState,
+    auth: &AuthContext,
+    (group_id, connector_id): (ulid::Ulid, ulid::Ulid),
+    bucket: &str,
+    table: &TableImport,
+) -> ServerResult<()> {
+    table
+        .validate()
+        .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+    match &table.source {
+        TableSource::Connector(path) => {
+            let source = local_connector(state, group_id, connector_id).await?;
+            let path = table_source_path(path, source.connector.base_url().as_deref())
+                .map_err(ServerError::BadRequestReason)?;
+            ensure_source_permission(state, auth, group_id, connector_id, &path).await?;
+        }
+        TableSource::Object { bucket, key } => {
+            let info = load_bucket_info(state, bucket).await?;
+            let path = blob_permission_path(state, info.group_id, bucket, key);
+            ensure_permission(state, auth, path, Permission::READ).await?;
+        }
+    }
+    let target = blob_permission_path(state, group_id, bucket, "");
+    ensure_permission(state, auth, target, Permission::WRITE).await
 }
 
 async fn load_bucket_info(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {

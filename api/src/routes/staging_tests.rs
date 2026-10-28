@@ -404,6 +404,7 @@ async fn batch_rejects_cap() {
             items: Some(items),
             prefixes: None,
             checksum_manifest: None,
+            table: None,
         }),
     )
     .await;
@@ -428,6 +429,7 @@ async fn batch_rejects_node() {
             items: None,
             prefixes: None,
             checksum_manifest: None,
+            table: None,
         }),
     )
     .await;
@@ -457,6 +459,7 @@ fn job_states_mapped() {
         items: Vec::new(),
         prefixes: Vec::new(),
         checksum_manifest: None,
+        table: None,
     };
     let node = iroh::SecretKey::from_bytes(&[6; 32]).public();
     let job_id = JobId::from_bytes([7; 16]);
@@ -497,6 +500,7 @@ async fn batch_sync_unimplemented() {
             items: None,
             prefixes: None,
             checksum_manifest: None,
+            table: None,
         }),
     )
     .await;
@@ -915,6 +919,7 @@ mod distributed {
                     .collect(),
             ),
             checksum_manifest: None,
+            table: None,
         }
     }
 
@@ -1141,6 +1146,40 @@ mod distributed {
         let mut foreign = batch(&node, &["data/a.bin"], &[]);
         foreign.group_id = ulid::Ulid::nil().to_string();
         assert!(submit(&node, foreign).await.is_err());
+    }
+
+    // A table import takes no items, uses references and needs a valid descriptor.
+    #[tokio::test]
+    async fn submit_checks_tables() {
+        use aruna_core::structs::execution::table::TableImport;
+        let node = node_state().await;
+        let table = |target: &str| {
+            let rows = serde_json::json!({ "kind": "file", "source": "{url}", "target": target });
+            let table =
+                serde_json::json!({ "source": { "connector": "lists/a.csv" }, "rows": rows });
+            Some(serde_json::from_value::<TableImport>(table).unwrap())
+        };
+        let mut with_items = batch(&node, &["data/a.bin"], &[]);
+        with_items.strategy = ApiStagingStrategy::Reference;
+        with_items.table = table("{url|basename}");
+        let mut snapshot = batch(&node, &[], &[]);
+        snapshot.table = table("{url|basename}");
+        let mut invalid = batch(&node, &[], &[]);
+        invalid.strategy = ApiStagingStrategy::Reference;
+        invalid.table = table("{url|upper}");
+        for request in [with_items, snapshot, invalid] {
+            let refused = submit(&node, request).await;
+            assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
+        }
+        let mut blocking = batch(&node, &[], &[]);
+        blocking.table = table("{url|basename}");
+        let refused = stage_batch(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Json(blocking),
+        )
+        .await;
+        assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
     }
 
     #[tokio::test]
