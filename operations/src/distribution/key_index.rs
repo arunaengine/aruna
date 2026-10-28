@@ -31,7 +31,7 @@ const VERSION_FIELD: &str = "version";
 const META_KEY_FIELD: &str = "meta_key";
 /// The free text tokens of a searchable version, space separated.
 const META_FIELD: &str = "meta";
-/// The `column=value` terms of a searchable version, one per line.
+/// The `column=value` terms of a searchable version, one stored value each.
 const EXACT_FIELD: &str = "exact";
 /// Writer memory per batch; the smallest budget tantivy accepts for one thread.
 const WRITER_BYTES: usize = 15_000_000;
@@ -423,7 +423,9 @@ fn write_batch(
             if let Some(terms) = &entry.terms {
                 document.add_text(fields.meta_key, &entry.key);
                 document.add_text(fields.meta, join(&terms.text, " "));
-                document.add_text(fields.exact, join(&terms.exact, "\n"));
+                for term in &terms.exact {
+                    document.add_text(fields.exact, term);
+                }
             }
             writer.add_document(document)?;
         }
@@ -527,13 +529,14 @@ fn join(terms: &BTreeSet<String>, separator: &str) -> String {
 
 /// Whether a stored document holds every text token and exact term of `wanted`.
 fn holds_terms(document: &TantivyDocument, fields: Fields, wanted: &MetaTerms) -> bool {
-    let stored = |field: Field| {
-        let value = document.get_first(field).and_then(|value| value.as_str());
-        value.unwrap_or_default().to_string()
-    };
-    let (text, exact) = (stored(fields.meta), stored(fields.exact));
-    let text: BTreeSet<&str> = text.split(' ').collect();
-    let exact: BTreeSet<&str> = exact.split('\n').collect();
+    let text = document
+        .get_first(fields.meta)
+        .and_then(|value| value.as_str());
+    let text: BTreeSet<&str> = text.unwrap_or_default().split(' ').collect();
+    let exact = document
+        .get_all(fields.exact)
+        .filter_map(|value| value.as_str());
+    let exact: BTreeSet<&str> = exact.collect();
     (wanted.text.iter()).all(|token| text.contains(token.as_str()))
         && (wanted.exact.iter()).all(|term| exact.contains(term.as_str()))
 }
@@ -735,6 +738,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rest.keys, ["c/"]);
+        // A multiline exact value is one term; its lines never become terms of their own.
+        let changes = vec![described("d/", &[], &["note=x\ntaxid=562"])];
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+        let split = search(meta(&[], &["taxid=562"], 10, None)).await.unwrap();
+        assert_eq!(split.keys, ["c/"]);
+        let whole = search(meta(&[], &["note=x\ntaxid=562"], 10, None))
+            .await
+            .unwrap();
+        assert_eq!(whole.keys, ["d/"]);
         // A key replaced without terms or removed no longer matches; like the key walk, its
         // deleted term may still count as examined until segments merge.
         let changes = vec![put("a/"), KeyChange::Remove("c/".to_string())];
