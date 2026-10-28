@@ -1284,7 +1284,8 @@ mod distributed {
         }
         distribute(&node.state, node.group_id, BUCKET).await;
         let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
-            "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+            "last_modified":null,"content_type":null,"referenced":false,"content_id":null,
+            "version_id":"01K8Y0000000000000000000AB"}],
             "prefixes":[],"next_cursor":"more"}"#;
         let peer = mock_peer(StatusCode::OK, answer).await;
         publish_api(&node.state, node_id(PEER), &peer.url).await;
