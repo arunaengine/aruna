@@ -155,7 +155,9 @@ impl HttpTransport for ScreenedFetch {
         screen_host(&self.policy, &host).map_err(denied)?;
         // Each request opendal sends, its own retries included, takes a token of a paced task.
         crate::pace::turn().await;
-        self.client.fetch(request).await
+        let response = self.client.fetch(request).await?;
+        crate::pace::answered(response.status(), response.headers());
+        Ok(response)
     }
 }
 

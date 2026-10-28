@@ -167,6 +167,7 @@ impl<'guard> HttpIndexClient<'guard> {
         })?;
 
         let status = response.status();
+        crate::pace::answered(status, response.headers());
         if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
             return Err(StagingSourceError::NotFound);
         }
