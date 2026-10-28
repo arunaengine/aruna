@@ -104,16 +104,31 @@ pub enum HolderAsk {
         skip: String,
         after: Option<String>,
     },
-    /// One release crate version, which the holder reads with the caller's READ checked.
-    Crate { key: String, version_id: Ulid },
+    /// One chunk of a release crate version from `offset`, which the holder reads with the
+    /// caller's READ and the release tag checked.
+    Crate {
+        key: String,
+        version_id: Ulid,
+        offset: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum HolderAnswer {
     Members(RangeMembers),
     Files(RangeFiles),
-    /// The crate's bytes; `None` when the version is gone or no longer tagged.
-    Crate(Option<Vec<u8>>),
+    /// A chunk of the crate; `None` when the version is gone or no longer tagged.
+    Crate(Option<CrateChunk>),
+}
+
+/// The most bytes of a release crate one holder reply carries, well below the frame limit.
+pub const CRATE_CHUNK: u64 = 4 * 1024 * 1024;
+
+/// Bytes of a release crate version from the asked offset, and the version's whole size.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CrateChunk {
+    pub bytes: Vec<u8>,
+    pub size: u64,
 }
 
 /// Reads one release crate version on this node with the caller's identity.

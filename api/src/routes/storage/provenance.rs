@@ -17,7 +17,9 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::bucket_metadata::RELEASE_TAG;
 use aruna_core::structs::storage::global_id::GlobalId;
-use aruna_core::structs::storage::release::{CrateRead, CrateReadError, HolderAnswer, HolderAsk};
+use aruna_core::structs::storage::release::{
+    CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk,
+};
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_operations::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version};
 use aruna_operations::metadata::MetadataReadError;
@@ -40,6 +42,7 @@ use tokio::io::DuplexStream;
 use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
 use utoipa::{IntoParams, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -521,8 +524,7 @@ async fn release_crate(
         _ => return Err(ServerError::NotFound),
     };
     if holder != local {
-        let ask = HolderAsk::Crate { key, version_id };
-        return remote_crate(state, bearer, (holder, bucket, ask)).await;
+        return remote_crate(state, bearer, (holder, bucket, key, version_id)).await;
     }
     let info = bucket_info(state, &bucket).await?;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
@@ -547,29 +549,54 @@ async fn release_crate(
     }
 }
 
-/// Asks `holder` for a release crate; it validates the token and checks READ itself.
+/// Asks `holder` for a release crate chunk by chunk; it validates the token and checks READ
+/// and the release tag on each ask.
 async fn remote_crate(
     state: &Arc<ServerState>,
     bearer: &ValidatedBearer,
-    (holder, bucket, ask): (NodeId, String, HolderAsk),
+    (holder, bucket, key, version_id): (NodeId, String, String, Ulid),
 ) -> ServerResult<serde_json::Value> {
-    let silent = || ServerError::ServiceUnavailableReason("the holder did not answer".to_string());
     let context = state.get_ctx();
-    let handle = context.metadata_handle.as_ref().ok_or_else(silent)?;
-    let token = AuthToken::bearer(bearer.as_str().to_string()).map_err(|_| silent())?;
-    match handle
-        .request_release_holder(holder, Some(token), bucket, ask)
-        .await
-    {
-        Ok(HolderAnswer::Crate(Some(bytes))) => serde_json::from_slice(&bytes)
-            .map_err(|error| ServerError::InternalError(error.to_string())),
+    let handle = context.metadata_handle.as_ref().ok_or_else(holder_silent)?;
+    let token = AuthToken::bearer(bearer.as_str().to_string()).map_err(|_| holder_silent())?;
+    let mut bytes = Vec::new();
+    loop {
+        let ask = HolderAsk::Crate {
+            key: key.clone(),
+            version_id,
+            offset: bytes.len() as u64,
+        };
+        let answer = handle
+            .request_release_holder(holder, Some(token.clone()), bucket.clone(), ask)
+            .await;
+        let chunk = holder_chunk(answer)?;
+        // A chunk that adds nothing before the end would never finish.
+        if chunk.bytes.is_empty() && (bytes.len() as u64) < chunk.size {
+            return Err(holder_silent());
+        }
+        bytes.extend(chunk.bytes);
+        if bytes.len() as u64 >= chunk.size {
+            break;
+        }
+    }
+    serde_json::from_slice(&bytes).map_err(|error| ServerError::InternalError(error.to_string()))
+}
+
+fn holder_silent() -> ServerError {
+    ServerError::ServiceUnavailableReason("the holder did not answer".to_string())
+}
+
+/// A holder's crate reply: a chunk, a gone or untagged version, a refusal, or no answer.
+fn holder_chunk(answer: Result<HolderAnswer, MetadataReadError>) -> ServerResult<CrateChunk> {
+    match answer {
+        Ok(HolderAnswer::Crate(Some(chunk))) => Ok(chunk),
         Ok(HolderAnswer::Crate(None)) | Err(MetadataReadError::NotFound) => {
             Err(ServerError::NotFound)
         }
         Err(MetadataReadError::Forbidden | MetadataReadError::Unauthorized) => {
             Err(ServerError::Forbidden)
         }
-        _ => Err(silent()),
+        _ => Err(holder_silent()),
     }
 }
 

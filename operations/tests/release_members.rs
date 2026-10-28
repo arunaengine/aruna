@@ -15,7 +15,7 @@ use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
 use aruna_core::structs::storage::distribution::KeyRange;
 use aruna_core::structs::storage::format::Compression;
-use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
+use aruna_core::structs::storage::release::{CRATE_CHUNK, CrateChunk, HolderAnswer, HolderAsk};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
@@ -242,9 +242,14 @@ async fn releases_pin_versions() -> TestResult<()> {
     let crate_ask = |key: &str, version_id| HolderAsk::Crate {
         key: key.to_string(),
         version_id,
+        offset: 0,
+    };
+    let whole = CrateChunk {
+        size: crate_bytes.len() as u64,
+        bytes: crate_bytes.clone(),
     };
     for (key, version_id, expected) in [
-        ("db/release.json", crate_version, Some(crate_bytes.clone())),
+        ("db/release.json", crate_version, Some(whole)),
         ("db/a.fasta", pinned, None),
     ] {
         let answer = handle
@@ -272,6 +277,29 @@ async fn releases_pin_versions() -> TestResult<()> {
         )
         .await;
     assert_eq!(unreadable, Err(MetadataReadError::Forbidden));
+    // A crate larger than one reply comes in chunks of the one exact version.
+    let size = CRATE_CHUNK + 10;
+    let large_tags = HashMap::from([
+        (RELEASE_TAG.to_string(), "7.0".to_string()),
+        (RELEASE_PREFIX_TAG.to_string(), "db/".to_string()),
+    ]);
+    let large = ("db/large.json", vec![b' '; size as usize]);
+    let large_version = put(context, &realm, group_id, large, large_tags).await?;
+    for (offset, length) in [(0, CRATE_CHUNK), (CRATE_CHUNK, 10)] {
+        let ask = HolderAsk::Crate {
+            key: "db/large.json".to_string(),
+            version_id: large_version,
+            offset,
+        };
+        let answer = handle
+            .request_release_holder(holder.node_id(), Some(realm.bearer_token()), bucket(), ask)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let HolderAnswer::Crate(Some(chunk)) = answer else {
+            return Err("a chunk of the large crate".into());
+        };
+        assert_eq!((chunk.bytes.len() as u64, chunk.size), (length, size));
+    }
     let forged = AuthToken::bearer("forged").map_err(|error| format!("{error:?}"))?;
     let refused = handle
         .request_release_holder(holder.node_id(), Some(forged), bucket(), ask())

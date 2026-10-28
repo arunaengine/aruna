@@ -23,8 +23,8 @@ use aruna_core::structs::storage::data::identity::content_id;
 use aruna_core::structs::storage::distribution::KeyRange;
 use aruna_core::structs::storage::origin::SourcePin;
 use aruna_core::structs::storage::release::{
-    CrateBytes, CrateRead, CrateReadError, HolderAnswer, HolderAsk, HolderRequest, RangeFiles,
-    RangeMembers, ReleaseEffect, ReleaseEvent, ReleaseFile,
+    CRATE_CHUNK, CrateBytes, CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk,
+    HolderRequest, RangeFiles, RangeMembers, ReleaseEffect, ReleaseEvent, ReleaseFile,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -45,7 +45,9 @@ use crate::metadata::protocol::{AuthToken, MetadataReadError};
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::get::{
+    GetObjectError, GetObjectInput, GetObjectOperation, ObjectRangeRequest,
+};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
 use crate::s3::object::origin::{OriginError, read_origin};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
@@ -633,7 +635,11 @@ pub async fn holder_answer(
                 next,
             }))
         }
-        HolderAsk::Crate { key, version_id } => {
+        HolderAsk::Crate {
+            key,
+            version_id,
+            offset,
+        } => {
             if !access.0.allows(Some(&key), &Permission::READ) {
                 return Err(PublishError::Forbidden("the release crate is not readable"));
             }
@@ -646,9 +652,14 @@ pub async fn holder_answer(
                 realm_id,
                 node_id,
             };
-            match read_crate(context, read).await {
-                Ok(found) if found.metadata.contains_key(RELEASE_TAG) => {
-                    Ok(HolderAnswer::Crate(Some(found.bytes)))
+            let chunk = ObjectRangeRequest::StartEnd {
+                start: offset,
+                end: offset.saturating_add(CRATE_CHUNK - 1),
+            };
+            match read_part(context, read, Some(chunk)).await {
+                Ok((found, size)) if found.metadata.contains_key(RELEASE_TAG) => {
+                    let bytes = found.bytes;
+                    Ok(HolderAnswer::Crate(Some(CrateChunk { bytes, size })))
                 }
                 Ok(_) | Err(CrateReadError::Missing) => Ok(HolderAnswer::Crate(None)),
                 Err(CrateReadError::Failed(reason)) => Err(PublishError::Unavailable(reason)),
@@ -670,11 +681,20 @@ pub async fn read_crate(
     context: &DriverContext,
     read: CrateRead,
 ) -> Result<CrateBytes, CrateReadError> {
+    Ok(read_part(context, read, None).await?.0)
+}
+
+/// Reads `range` of a release crate version, or all of it, and the version's whole size.
+async fn read_part(
+    context: &DriverContext,
+    read: CrateRead,
+    range: Option<ObjectRangeRequest>,
+) -> Result<(CrateBytes, u64), CrateReadError> {
     let operation = GetObjectOperation::new(GetObjectInput {
         bucket: read.bucket,
         key: read.key,
         version_id: Some(read.version_id),
-        range: None,
+        range,
         group_id: read.group_id,
         user_identity: read.auth.user_id,
         realm_id: read.realm_id,
@@ -690,16 +710,18 @@ pub async fn read_crate(
         ) => return Err(CrateReadError::Missing),
         Err(error) => return Err(CrateReadError::Failed(error.to_string())),
     };
+    let size = result.info.size;
     let mut bytes = Vec::new();
     let mut blob = result.blob;
     while let Some(chunk) = blob.next().await {
         let chunk = chunk.map_err(|error| CrateReadError::Failed(error.to_string()))?;
         bytes.extend_from_slice(&chunk);
     }
-    Ok(CrateBytes {
+    let found = CrateBytes {
         metadata: result.metadata,
         bytes,
-    })
+    };
+    Ok((found, size))
 }
 
 async fn ask_holder(
