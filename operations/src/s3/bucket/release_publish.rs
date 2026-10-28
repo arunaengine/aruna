@@ -41,7 +41,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::local_fence;
 use crate::distribution::status::read_view;
 use crate::driver::{DriverContext, bucket_snapshot, drive, gate_context, now_ms};
-use crate::metadata::protocol::AuthToken;
+use crate::metadata::protocol::{AuthToken, MetadataReadError};
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::GetBucketOperation;
@@ -173,6 +173,8 @@ pub fn release_crate(spec: &ReleaseSpec, files: &[ReleaseFile]) -> Vec<u8> {
     serde_json::to_vec_pretty(&document).unwrap_or_default()
 }
 
+const UNREADABLE: &str = "a file under the prefix is not readable";
+
 /// The current versions under `prefix` in `range` (the whole bucket without one), `skip` left
 /// out. Every field of a file comes from one exact version, and the caller must be able to read
 /// every file, or nothing is published.
@@ -207,9 +209,7 @@ pub async fn release_files(
                 continue;
             }
             if !access.0.allows(Some(&key), &Permission::READ) {
-                return Err(PublishError::Forbidden(
-                    "a file under the prefix is not readable",
-                ));
+                return Err(PublishError::Forbidden(UNREADABLE));
             }
             let place = (scope.realm_id, scope.node_id);
             let origin = read_origin(context, place, scope.bucket, &key, None)
@@ -437,6 +437,10 @@ async fn coordinated_files(
         {
             Ok(HolderAnswer::Files(listed)) if listed.refused.is_empty() => {
                 files.extend(listed.files)
+            }
+            // The coordinator refused a file; the generic refusal names none.
+            Err(MetadataReadError::Forbidden) => {
+                return Err(PublishError::Forbidden(UNREADABLE));
             }
             _ => return Err(refused()),
         }

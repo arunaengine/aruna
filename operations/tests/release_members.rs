@@ -256,6 +256,20 @@ async fn releases_pin_versions() -> TestResult<()> {
             .map_err(|error| format!("{error:?}"))?;
         assert_eq!(answer, HolderAnswer::Crate(expected));
     }
+    // A caller without READ gets the generic refusal, not a holder failure.
+    let stranger_token = realm.bearer_for(aruna_core::UserId::local(
+        Ulid::from(77u128),
+        realm.realm_id,
+    ));
+    let unreadable = handle
+        .request_release_holder(
+            holder.node_id(),
+            Some(stranger_token),
+            bucket(),
+            crate_ask("db/release.json", crate_version),
+        )
+        .await;
+    assert_eq!(unreadable, Err(MetadataReadError::Forbidden));
     let forged = AuthToken::bearer("forged").map_err(|error| format!("{error:?}"))?;
     let refused = handle
         .request_release_holder(holder.node_id(), Some(forged), bucket(), ask())

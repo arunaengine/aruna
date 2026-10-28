@@ -32,7 +32,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::release_publish::holder_answer;
+use crate::s3::bucket::release_publish::{PublishError, holder_answer};
 use crate::s3::bucket::search::{SearchBucketsInput, search_local_buckets};
 use crate::s3::object::search::{SearchObjectsInput, search_local_objects};
 use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
@@ -546,7 +546,10 @@ impl MetadataHandle {
                     let scope = (*net_handle.realm_id(), net_handle.node_id());
                     holder_answer(context.as_ref(), scope, &auth, (bucket.as_str(), ask))
                         .await
-                        .map_err(|_| MetadataReadError::Unavailable)
+                        .map_err(|error| match error {
+                            PublishError::Forbidden(_) => MetadataReadError::Forbidden,
+                            _ => MetadataReadError::Unavailable,
+                        })
                 })
                 .await;
                 MetadataTransportMessage::ReleaseHolderResults { result }
