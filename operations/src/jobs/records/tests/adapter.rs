@@ -137,6 +137,68 @@ async fn separates_peer_authority() {
 }
 
 #[tokio::test]
+async fn holds_bound_pages() {
+    // A holder acknowledges a spec that binds input pages only once it keeps those pages, so
+    // the publisher retries until every holder can serve them after the admitting node is gone.
+    use aruna_core::structs::execution::job::{
+        CapturedInput, InputContent, InputMode, InputSelection, InputSource, PageEntries, paginate,
+    };
+    let (_dir, context, net, family) = fixture().await;
+    let version_id = ulid::Ulid::from_parts(1, 1);
+    let pair = (
+        InputSelection {
+            source: InputSource::S3 {
+                bucket: "bakta".to_string(),
+                key: "db/bakta.db".to_string(),
+                version_id: Some(version_id.to_string()),
+            },
+            source_node_id: None,
+            dest_key: "db/bakta.db".to_string(),
+            mode: InputMode::Mount,
+            container_path: Some("/db/bakta.db".to_string()),
+            name: None,
+            description: None,
+        },
+        CapturedInput {
+            destination_key: "db/bakta.db".to_string(),
+            source_node_id: family.holder.public(),
+            version_id,
+            content: InputContent::Blake3([1; 32]),
+            bytes: 1,
+            policies: Vec::new(),
+            source_group_id: ulid::Ulid::from_parts(2, 2),
+            public: false,
+            link: None,
+            source_pin: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
+        },
+    );
+    let (manifest, pages) = paginate(&[pair], PageEntries::Spec).expect("pages");
+    let mut spec = family.spec();
+    spec.input_pages = Some(manifest);
+    let record = JobFamilyRecord::Spec(Box::new(spec.clone()));
+    let record = JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded");
+    let publish = || MetadataTransportMessage::ForwardJobRecord {
+        placement: family.placement,
+        record: Box::new(record.clone()),
+    };
+    let missing = serve_job_record(&context, crate::tests::records::node(2), publish()).await;
+    assert_eq!(missing, MetadataTransportMessage::ForwardedWriteUnavailable);
+    crate::jobs::records::pages::store_pages(&context, &spec.submission_id, &pages)
+        .await
+        .expect("pages stored");
+    let kept = serve_job_record(&context, crate::tests::records::node(2), publish()).await;
+    assert_eq!(
+        kept,
+        MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) }
+    );
+    net.shutdown().await;
+}
+
+#[tokio::test]
 async fn refuses_unknown_offer() {
     // An offer from outside the realm is declined before admission, and one naming
     // another target is not this node's launch to accept.

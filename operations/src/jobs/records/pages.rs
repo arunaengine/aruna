@@ -9,8 +9,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::INPUT_PAGE_KEYSPACE;
 use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::execution::job::{
-    CapturedInput, InputPage, InputSelection, LaunchIntent, LogicalJobSpec, PageEntries, PageError,
-    PageManifest, SubmissionId, launch_entries, needs_pages, paginate, spec_entries,
+    CapturedInput, InputPage, InputSelection, JobFamilyRecord, LaunchIntent, LogicalJobSpec,
+    PageEntries, PageError, PageManifest, SubmissionId, launch_entries, needs_pages, paginate,
+    spec_entries,
 };
 use aruna_core::types::Key;
 use thiserror::Error;
@@ -20,6 +21,7 @@ use crate::driver::DriverContext;
 use crate::forward::authorize::is_sync_eligible;
 use crate::jobs::records::keys::submission_prefix;
 use crate::metadata::api::load_realm_config;
+use crate::placement::resolve_shard_holders;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PageReadError {
@@ -142,7 +144,58 @@ async fn fetch_page(
     None
 }
 
-/// The spec with its paged inputs filled in, read here or from the nodes that admitted it.
+/// The other holders of the submission's family, which keep its pages with its records.
+async fn family_holders(context: &DriverContext, submission: SubmissionId) -> Vec<NodeId> {
+    let Some(net) = context.net_handle.as_ref() else {
+        return Vec::new();
+    };
+    let Some(config) = load_realm_config(context, *net.realm_id()).await else {
+        return Vec::new();
+    };
+    let holders = (config.family_placement(submission))
+        .map(|placement| resolve_shard_holders(&config, &placement))
+        .unwrap_or_default();
+    holders
+        .into_iter()
+        .filter(|holder| *holder != net.node_id())
+        .collect()
+}
+
+/// Keeps the pages a record binds, fetched from the peer that sent it, the nodes it names or
+/// the family holders. A holder acknowledges such a record only once this succeeds.
+pub async fn keep_pages(
+    context: &DriverContext,
+    record: &JobFamilyRecord,
+    peer: NodeId,
+) -> Result<(), PageReadError> {
+    let (submission, manifest, mut peers) = match record {
+        JobFamilyRecord::Spec(spec) => (
+            spec.submission_id,
+            spec.input_pages,
+            vec![
+                peer,
+                spec.admission.admitting_node_id,
+                spec.ingress_node_id,
+                spec.origin_node_id,
+            ],
+        ),
+        JobFamilyRecord::Launch(launch) => (
+            launch.submission_id,
+            launch.input_pages,
+            vec![peer, launch.scheduler_node_id],
+        ),
+        _ => return Ok(()),
+    };
+    let Some(manifest) = manifest else {
+        return Ok(());
+    };
+    peers.extend(family_holders(context, submission).await);
+    load_chain(context, &submission, &manifest, &peers).await?;
+    Ok(())
+}
+
+/// The spec with its paged inputs filled in, read here, from the nodes that admitted it or
+/// from the family holders.
 pub async fn with_inputs(
     context: &DriverContext,
     spec: &LogicalJobSpec,
@@ -150,11 +203,12 @@ pub async fn with_inputs(
     let Some(manifest) = spec.input_pages else {
         return Ok(spec.clone());
     };
-    let peers = [
+    let mut peers = vec![
         spec.admission.admitting_node_id,
         spec.ingress_node_id,
         spec.origin_node_id,
     ];
+    peers.extend(family_holders(context, spec.submission_id).await);
     let pages = load_chain(context, &spec.submission_id, &manifest, &peers).await?;
     let (inputs, captured): (Vec<_>, Vec<_>) = spec_entries(pages)?.into_iter().unzip();
     let mut filled = spec.clone();
@@ -163,7 +217,7 @@ pub async fn with_inputs(
     Ok(filled)
 }
 
-/// The launch's planned inputs, inline or read from its scheduler's pages.
+/// The launch's planned inputs, inline or read from its scheduler or the family holders.
 pub async fn planned_inputs(
     context: &DriverContext,
     launch: &LaunchIntent,
@@ -171,7 +225,8 @@ pub async fn planned_inputs(
     let Some(manifest) = launch.input_pages else {
         return Ok(launch.inputs.clone());
     };
-    let peers = [launch.scheduler_node_id];
+    let mut peers = vec![launch.scheduler_node_id];
+    peers.extend(family_holders(context, launch.submission_id).await);
     let pages = load_chain(context, &launch.submission_id, &manifest, &peers).await?;
     Ok(launch_entries(pages)?)
 }
