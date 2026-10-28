@@ -261,3 +261,27 @@ fn scratch_stays_private() {
     let built = ProvenanceCrate::new("start", "2026-10-28T00:00:00Z").unwrap();
     assert!(built.spool.path.starts_with(&dir));
 }
+
+#[test]
+fn crashed_scratch_reclaimed() {
+    // Entries of exports whose process is gone are removed before the next export; entries of
+    // running processes and anything else stay.
+    let dir = scratch_dir().unwrap();
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let gone = child.id();
+    child.wait().unwrap();
+    let crashed = dir.join(format!("{gone}-{}", Ulid::generate()));
+    std::fs::create_dir_all(crashed.join("journal")).unwrap();
+    let crashed_root = dir.join(format!("{gone}-{}.json", Ulid::generate()));
+    std::fs::write(&crashed_root, b"{}").unwrap();
+    let live = dir.join(scratch_name());
+    std::fs::create_dir(&live).unwrap();
+    let other = dir.join(format!("{gone}-not-an-id"));
+    std::fs::write(&other, b"").unwrap();
+
+    scratch_dir().unwrap();
+    assert!(!crashed.exists() && !crashed_root.exists());
+    assert!(live.exists() && other.exists());
+    std::fs::remove_dir(&live).unwrap();
+    std::fs::remove_file(&other).unwrap();
+}

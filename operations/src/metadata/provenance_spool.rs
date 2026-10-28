@@ -134,6 +134,7 @@ impl Spool {
 }
 
 /// The private folder of export working state: this user's own, readable by nobody else.
+/// Entries that crashed exports left behind are removed first.
 pub fn scratch_dir() -> io::Result<PathBuf> {
     let uid = rustix::process::geteuid().as_raw();
     let dir = std::env::temp_dir().join(format!("aruna-provenance-{uid}"));
@@ -151,6 +152,7 @@ pub fn scratch_dir() -> io::Result<PathBuf> {
     if found.mode() & 0o077 != 0 {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
+    reclaim(&dir);
     Ok(dir)
 }
 
@@ -166,4 +168,40 @@ pub fn scratch_file(path: &std::path::Path) -> io::Result<File> {
         .create_new(true)
         .mode(0o600)
         .open(path)
+}
+
+/// Removes entries of processes that no longer run; anything else in the folder stays.
+fn reclaim(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let stem = name.strip_suffix(".json").unwrap_or(&name);
+        let Some((pid, id)) = stem.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<i32>() else {
+            continue;
+        };
+        if Ulid::from_string(id).is_err() || pid == std::process::id() as i32 || alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        let _ = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+    }
+}
+
+/// Whether a process of this id runs; one that cannot be asked counts as running.
+fn alive(pid: i32) -> bool {
+    match rustix::process::Pid::from_raw(pid) {
+        Some(pid) => !matches!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        ),
+        None => true,
+    }
 }
