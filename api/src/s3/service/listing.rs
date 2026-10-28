@@ -115,11 +115,13 @@ impl ArunaS3Service {
             .transpose()
     }
 
+    /// Whether a common prefix holds an entry the reader may see: one the scope allows that is
+    /// no link, or a link whose target the reader may read.
     async fn readable_prefix(
         &self,
         input: &LOV2I,
         prefix: String,
-        scope: &SubpathScope,
+        (scope, reader): (Option<&SubpathScope>, Option<&UserAccess>),
         remaining_pages: &mut usize,
     ) -> S3Result<bool> {
         let mut input = LOV2I {
@@ -135,12 +137,12 @@ impl ArunaS3Service {
             let result = drive(ListBucketOperation::new(input.clone()), &self.state)
                 .await
                 .map_err(IntoS3Error::into_s3_error)?;
-            if result
-                .objects
-                .iter()
-                .any(|object| scope.allows_key(&object.head.key))
-            {
-                return Ok(true);
+            for object in &result.objects {
+                if scope.is_none_or(|scope| scope.allows_key(&object.head.key))
+                    && self.link_listable(reader, &input.bucket, object).await?
+                {
+                    return Ok(true);
+                }
             }
             let Some(token) = result.continuation_token else {
                 return Ok(false);
@@ -183,18 +185,25 @@ impl ArunaS3Service {
                 result
                     .objects
                     .retain(|object| scope.allows_key(&object.head.key));
-                let mut prefixes = Vec::new();
-                for prefix in result.common_prefixes {
-                    if scope.allows_prefix(&prefix)
-                        && self
-                            .readable_prefix(&input, prefix.clone(), scope, &mut remaining_pages)
-                            .await?
-                    {
-                        prefixes.push(prefix);
-                    }
-                }
-                result.common_prefixes = prefixes;
             }
+            // A prefix shows only when it holds an entry the reader may see, links included.
+            // Only a scoped listing bounds its scan.
+            let mut unbounded = usize::MAX;
+            let mut prefixes = Vec::new();
+            for prefix in std::mem::take(&mut result.common_prefixes) {
+                let pages = match scope {
+                    Some(_) => &mut remaining_pages,
+                    None => &mut unbounded,
+                };
+                if scope.is_none_or(|scope| scope.allows_prefix(&prefix))
+                    && self
+                        .readable_prefix(&input, prefix.clone(), (scope, reader), pages)
+                        .await?
+                {
+                    prefixes.push(prefix);
+                }
+            }
+            result.common_prefixes = prefixes;
 
             // A link shows only to a caller who may read its target.
             let mut listed = Vec::with_capacity(result.objects.len());

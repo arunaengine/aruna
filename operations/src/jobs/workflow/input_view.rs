@@ -161,6 +161,24 @@ pub fn list_page(
     listing
 }
 
+/// Lists only the entries `visible` marks, so a denied entry never becomes a key, a common
+/// prefix or a continuation marker. Indices point into `entries`.
+pub fn list_visible(
+    entries: &[ViewEntry],
+    visible: &[bool],
+    (prefix, delimiter): (&str, Option<&str>),
+    after: Option<&str>,
+    max_keys: usize,
+) -> ViewListing {
+    let shown: Vec<usize> = (0..entries.len())
+        .filter(|index| visible.get(*index).copied().unwrap_or(false))
+        .collect();
+    let subset: Vec<ViewEntry> = shown.iter().map(|index| entries[*index].clone()).collect();
+    let mut listing = list_page(&subset, prefix, delimiter, after, max_keys);
+    listing.objects = listing.objects.iter().map(|index| shown[*index]).collect();
+    listing
+}
+
 fn is_prefix(marker: &str, delimiter: Option<&str>) -> bool {
     delimiter.is_some_and(|delimiter| !delimiter.is_empty() && marker.ends_with(delimiter))
 }
@@ -440,6 +458,34 @@ mod tests {
         let second = list_page(&entries, "", Some("/"), first.next.as_deref(), 1);
         assert_eq!(keys(&entries, &second), ["genome.fna"]);
         assert!(second.next.is_none());
+    }
+
+    #[test]
+    fn denied_stays_unlisted() {
+        // A denied entry is never a key, a prefix or a cursor, on any page.
+        let entries = entries();
+        let denied = ["db/b.sqlite", "db/sub/c", "db/sub/d"];
+        let visible: Vec<bool> = entries
+            .iter()
+            .map(|entry| !denied.contains(&entry.key.as_str()))
+            .collect();
+        for (prefix, expected) in [("", vec!["db/", "genome.fna"]), ("db/", vec!["db/a.dmnd"])] {
+            let mut seen = Vec::new();
+            let mut after: Option<String> = None;
+            loop {
+                let scope = (prefix, Some("/"));
+                let page = list_visible(&entries, &visible, scope, after.as_deref(), 1);
+                seen.extend(keys(&entries, &page));
+                seen.extend(page.prefixes.clone());
+                let Some(next) = page.next else { break };
+                assert!(
+                    !denied.iter().any(|key| next.starts_with(key)),
+                    "cursor {next}"
+                );
+                after = Some(next);
+            }
+            assert_eq!(seen, expected);
+        }
     }
 
     #[test]

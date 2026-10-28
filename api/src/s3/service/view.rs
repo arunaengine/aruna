@@ -6,7 +6,7 @@
 use aruna_core::structs::execution::job::{JobId, JobRecord};
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::jobs::workflow::input_view::{
-    MAX_VIEW_KEYS, ViewEntry, ViewError, decode_token, encode_token, head_entry, list_page,
+    MAX_VIEW_KEYS, ViewEntry, ViewError, decode_token, encode_token, head_entry, list_visible,
     read_entry, view_bucket, view_entries,
 };
 use aruna_operations::s3::object::get::GetObjectError;
@@ -109,13 +109,21 @@ impl ArunaS3Service {
                 })?),
                 None => input.start_after.clone(),
             };
-        let page = list_page(
-            &entries,
-            &prefix,
-            input.delimiter.as_deref(),
-            after.as_deref(),
-            max_keys,
-        );
+        // Entries are authorized before paging, so cursors and prefixes come from visible ones.
+        let mut visible = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let shown = match entry.key.starts_with(&prefix) {
+                false => false,
+                true => match head_entry(&self.state, &record, entry, self.node_id).await {
+                    Ok(()) => true,
+                    Err(ViewError::Denied | ViewError::NotFound) => false,
+                    Err(error) => return Err(view_error(error)),
+                },
+            };
+            visible.push(shown);
+        }
+        let scope = (prefix.as_str(), input.delimiter.as_deref());
+        let page = list_visible(&entries, &visible, scope, after.as_deref(), max_keys);
         let encode = |value: &str| match &input.encoding_type {
             Some(kind) if kind.as_str() == EncodingType::URL => {
                 utf8_percent_encode(value, URL_ENCODE_SET).to_string()
@@ -125,12 +133,6 @@ impl ArunaS3Service {
         let mut contents = Vec::with_capacity(page.objects.len());
         for index in &page.objects {
             let entry = &entries[*index];
-            // A listed entry shows what a HEAD shows, so it needs the same right at its source.
-            match head_entry(&self.state, &record, entry, self.node_id).await {
-                Ok(()) => {}
-                Err(ViewError::Denied | ViewError::NotFound) => continue,
-                Err(error) => return Err(view_error(error)),
-            }
             contents.push(Object {
                 key: Some(encode(&entry.key)),
                 size: i64::try_from(entry.captured.bytes).ok(),

@@ -1552,6 +1552,67 @@ async fn subpath_hides_siblings() {
     assert_eq!(keys, vec!["imaging/scan-a", "imaging/scan-b"]);
 }
 
+#[tokio::test]
+async fn hides_link_prefixes() {
+    // A folder that holds only a link to an unreadable target is no common prefix.
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let target = aruna_core::structs::storage::link::LinkTarget {
+        arn: aruna_core::structs::storage::replication::VersionedObjectArn {
+            realm_id: service.realm_id,
+            node_id: service.node_id,
+            bucket: "hidden".to_string(),
+            key: "db".to_string(),
+            version: Ulid::generate(),
+        },
+        group_id: Ulid::generate(),
+    };
+    let version_id = Ulid::generate();
+    let version = BlobVersion::reference(
+        target.binding(),
+        source_metadata(4, "etag"),
+        UNIX_EPOCH,
+        user_access.user_identity,
+        UNIX_EPOCH,
+    );
+    write_storage_value(
+        &service.state.storage_handle,
+        BLOB_VERSIONS_KEYSPACE,
+        VersionKey::new("study", "links/db", version_id)
+            .to_bytes()
+            .unwrap(),
+        version.to_bytes().unwrap(),
+    )
+    .await;
+    write_head(
+        &service.state.storage_handle,
+        "study",
+        "links/db",
+        version_id,
+    )
+    .await;
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let input = ListObjectsV2Input {
+        bucket: "study".to_string(),
+        delimiter: Some("/".to_string()),
+        ..Default::default()
+    };
+    let output = service
+        .list_objects_v2(list_request(extensions, input))
+        .await
+        .unwrap()
+        .output;
+    let prefixes: Vec<String> = output
+        .common_prefixes
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|prefix| prefix.prefix)
+        .collect();
+    assert_eq!(prefixes, vec!["imaging/", "sequencing/"]);
+}
+
 async fn paged_request(
     service: &ArunaS3Service,
     user_access: &UserAccess,
