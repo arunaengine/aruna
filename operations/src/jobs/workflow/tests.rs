@@ -288,7 +288,7 @@ async fn denied_write_blocks() {
         &spec,
         &record,
         node_id(7),
-        &bucket,
+        (&bucket, None),
     ))
     .await
     else {

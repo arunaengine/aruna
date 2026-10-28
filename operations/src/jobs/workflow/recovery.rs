@@ -218,7 +218,7 @@ async fn retry_same_submit(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or_else(|| BackendError::Unavailable("execution needs a net handle".to_string()))?;
-    let prepared = Box::pin(prepare_inputs(context, spec, record, node_id))
+    let prepared = Box::pin(prepare_inputs(context, spec, record, node_id, true))
         .await
         .map_err(|error| BackendError::Unavailable(error.message))?;
     let pinned_image = record

@@ -421,7 +421,7 @@ pub(super) async fn resume_attempt(
                     return false;
                 };
                 let prepared =
-                    match Box::pin(prepare_inputs(&context, &spec, &record, node_id)).await {
+                    match Box::pin(prepare_inputs(&context, &spec, &record, node_id, true)).await {
                         Ok(prepared) => prepared,
                         Err(error) => {
                             Box::pin(fail_or_park(&context, job_id, token, &record, error)).await;

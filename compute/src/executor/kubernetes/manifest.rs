@@ -64,15 +64,14 @@ pub fn job_manifest(
             json!({"name":"marker","configMap":{"name":marker_name(&name)}}),
             json!({"name":"tools","emptyDir":{}}),
         ]);
-        if spec.staging_mode == StagingMode::Files {
-            for input in &layout.files {
-                mounts.push(json!({
-                    "name":"workspace",
-                    "mountPath":input.path,
-                    "subPath":relative_path(&input.path)?,
-                    "readOnly":true
-                }));
-            }
+        // Copied inputs come from the workspace, also next to mounted ones.
+        for input in &layout.files {
+            mounts.push(json!({
+                "name":"workspace",
+                "mountPath":input.path,
+                "subPath":relative_path(&input.path)?,
+                "readOnly":true
+            }));
         }
         for output in &layout.output_parents {
             mounts.push(json!({
@@ -637,7 +636,8 @@ pub fn mount_buckets(layout: &StageLayout) -> Vec<String> {
 
 pub fn needs_workspace(spec: &TaskSpec) -> bool {
     spec.staging_mode == StagingMode::Files
-        || (spec.staging_mode == StagingMode::S3Mount && !spec.output_paths.is_empty())
+        || (spec.staging_mode == StagingMode::S3Mount
+            && (!spec.output_paths.is_empty() || !spec.inputs.is_empty()))
 }
 
 pub fn secret_name(name: &str) -> String {

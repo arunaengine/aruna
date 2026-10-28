@@ -7,20 +7,19 @@ use std::time::Duration;
 
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
-    AttemptRef, NetworkAccess, ResourceRequest, S3Mount, Secret, SecurityContext, StagingMode,
-    TaskInput, TaskSpec, UserSpec, WorkspaceBinding,
+    AttemptRef, ExecutorKind, NetworkAccess, ResourceRequest, S3Mount, Secret, SecurityContext,
+    StagingMode, TaskInput, TaskSpec, UserSpec, WorkspaceBinding,
 };
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{
-    ExecutionSpec, InputMode, JobError, JobRecord, WorkspaceMode,
-};
+use aruna_core::structs::execution::job::{ExecutionSpec, JobError, JobRecord, WorkspaceMode};
 
 use super::DEFAULT_WALLTIME;
 use crate::driver::DriverContext;
 use crate::jobs::lifecycle::ids::session_of;
+use crate::jobs::workflow::input_view::{view_bucket, view_entries};
 use crate::jobs::workflow::workspace::{
     check_workspace_bucket, ensure_group_write, load_direct_inputs, mint_input_credential,
-    mint_workspace_credential, pinned_inputs, prepare_mounts,
+    mint_workspace_credential,
 };
 
 pub(super) const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
@@ -58,62 +57,95 @@ pub(super) fn job_bucket(record: &JobRecord) -> String {
     record.workspace_bucket.clone().unwrap_or_default()
 }
 
-/// True when every input is an unpinned mount, the only shape an S3 mount can
-/// deliver: a mount serves the current head of the object it names.
-fn mountable(spec: &ExecutionSpec) -> bool {
-    !spec.inputs.is_empty()
-        && spec
-            .inputs
-            .iter()
-            .all(|input| input.mode == InputMode::Mount)
-        && !pinned_inputs(spec)
+/// Whether the backend this run is placed on can mount inputs.
+fn backend_mounts(context: &DriverContext, spec: &ExecutionSpec) -> bool {
+    let kind = spec
+        .executor_constraint
+        .as_deref()
+        .map(ExecutorKind::from_wire);
+    context
+        .compute_handle
+        .as_ref()
+        .zip(kind)
+        .and_then(|(registry, kind)| registry.get(&kind).map(|backend| backend.capabilities()))
+        .is_some_and(|caps| caps.s3_mount)
 }
 
-/// Build the attempt's inputs. Every input is read straight from its source,
-/// except an unpinned mounted spec, which the container reaches over S3.
+/// The input view a run mounts, when its backend mounts and any input is mounted.
+pub(super) fn mounted_view(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+) -> Option<String> {
+    let mounts = backend_mounts(context, spec)
+        && view_entries(record).is_ok_and(|entries| !entries.is_empty());
+    mounts.then(|| view_bucket(record.job_id))
+}
+
+/// Build the attempt's inputs. Mounted inputs are read through the run's input view at their
+/// exact versions; every other input is read straight from its source into the workspace.
 /// Nothing is copied for an attempt, so an adopted one restages the same way.
 pub(super) async fn prepare_inputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
     node_id: NodeId,
+    mint: bool,
 ) -> Result<PreparedTask, JobError> {
-    if !mountable(spec) {
+    let entries = match backend_mounts(context, spec) {
+        true => view_entries(record).unwrap_or_default(),
+        false => Vec::new(),
+    };
+    let mounted: BTreeSet<String> = entries
+        .iter()
+        .map(|entry| entry.input.dest_key.clone())
+        .collect();
+    let inputs = Box::pin(load_direct_inputs(context, spec, record, node_id, &mounted)).await?;
+    if entries.is_empty() {
         return Ok(PreparedTask {
-            inputs: Box::pin(load_direct_inputs(context, spec, record, node_id)).await?,
+            inputs,
             mounts: Vec::new(),
             secrets: BTreeMap::new(),
             staging: StagingMode::Files,
             workspace: None,
         });
     }
-    let mounts = Box::pin(prepare_mounts(context, spec, record, node_id)).await?;
+    let view = view_bucket(record.job_id);
+    let mounts = entries
+        .iter()
+        .map(|entry| S3Mount {
+            bucket: view.clone(),
+            key: entry.key.clone(),
+            path: entry.input.container_path.clone().unwrap_or_default(),
+        })
+        .collect();
     let mut secrets = BTreeMap::new();
-    if !mounts.is_empty() {
-        let buckets = mounts
-            .iter()
-            .map(|mount| mount.bucket.clone())
-            .collect::<BTreeSet<_>>();
+    // A session's one credential carries the view as well, so it is minted there instead.
+    if mint {
+        let buckets = BTreeSet::from([view]);
         let credential = Box::pin(mint_input_credential(
             context, spec, record, node_id, &buckets,
         ))
         .await?;
-        secrets.insert(
-            "access_key_id".to_string(),
-            Secret::new(credential.access_key),
-        );
-        secrets.insert(
-            "secret_access_key".to_string(),
-            Secret::new(credential.secret),
-        );
+        insert_mount_secrets(&mut secrets, credential.access_key, credential.secret);
     }
     Ok(PreparedTask {
-        inputs: Vec::new(),
+        inputs,
         mounts,
         secrets,
         staging: StagingMode::S3Mount,
         workspace: None,
     })
+}
+
+/// The names the mount driver reads the run credential under.
+fn insert_mount_secrets(
+    secrets: &mut BTreeMap<String, Secret>,
+    access_key: String,
+    secret: String,
+) {
+    secrets.insert("access_key_id".to_string(), Secret::new(access_key));
+    secrets.insert("secret_access_key".to_string(), Secret::new(secret));
 }
 
 pub(super) async fn prepare_task(
@@ -124,8 +156,9 @@ pub(super) async fn prepare_task(
     bucket: &str,
 ) -> Result<PreparedTask, JobError> {
     Box::pin(prepare_workspace(context, spec, record, node_id, bucket)).await?;
-    let mut prepared = Box::pin(prepare_inputs(context, spec, record, node_id)).await?;
-    if session_of(spec).is_some() {
+    let session = session_of(spec).is_some();
+    let mut prepared = Box::pin(prepare_inputs(context, spec, record, node_id, !session)).await?;
+    if session {
         Box::pin(add_session_credential(
             context,
             spec,
@@ -168,10 +201,19 @@ async fn add_session_credential(
         .as_ref()
         .map(|registry| registry.workspace_endpoint().region.clone())
         .unwrap_or_default();
+    let view = mounted_view(context, spec, record).filter(|_| !prepared.mounts.is_empty());
     let credential = Box::pin(mint_workspace_credential(
-        context, spec, record, node_id, bucket,
+        context,
+        spec,
+        record,
+        node_id,
+        (bucket, view.as_deref()),
     ))
     .await?;
+    if view.is_some() {
+        let (access_key, secret) = (credential.access_key.clone(), credential.secret.clone());
+        insert_mount_secrets(&mut prepared.secrets, access_key, secret);
+    }
     prepared.secrets.insert(
         "AWS_ACCESS_KEY_ID".to_string(),
         Secret::new(credential.access_key),

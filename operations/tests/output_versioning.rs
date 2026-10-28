@@ -239,16 +239,26 @@ async fn capture_inputs(harness: &Harness, spec: &ExecutionSpec) -> Vec<Captured
                 .resolved_version_id
                 .or(head.version_id)
                 .expect("input has a version"),
-            blake3: <[u8; 32]>::try_from(
-                location
-                    .hashes
-                    .get(HASH_BLAKE3)
-                    .expect("blake3 is stored")
-                    .as_slice(),
-            )
-            .expect("blake3 is 32 bytes"),
+            content: aruna_core::structs::execution::job::InputContent::Blake3(
+                <[u8; 32]>::try_from(
+                    location
+                        .hashes
+                        .get(HASH_BLAKE3)
+                        .expect("blake3 is stored")
+                        .as_slice(),
+                )
+                .expect("blake3 is 32 bytes"),
+            ),
             bytes: location.blob_size,
             policies: head.source_policies.clone(),
+            source_group_id: Default::default(),
+            public: false,
+            link: None,
+            source_pin: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
         });
     }
     captured
@@ -429,9 +439,15 @@ async fn read_input(input: TaskInput) -> Vec<u8> {
 async fn staged_bytes(harness: &Harness, version: Ulid) -> Vec<u8> {
     let spec = pinned_spec(harness, version, InputMode::Snapshot);
     let record = job_record(harness, &spec);
-    let mut inputs = load_direct_inputs(&harness.driver, &spec, &record, harness.node_id)
-        .await
-        .unwrap();
+    let mut inputs = load_direct_inputs(
+        &harness.driver,
+        &spec,
+        &record,
+        harness.node_id,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(inputs.len(), 1);
     assert_eq!(inputs[0].path, INPUT_PATH);
     read_input(inputs.remove(0)).await
@@ -475,9 +491,15 @@ async fn mounts_stage_pinned() {
     let spec = pinned_spec(&harness, first.version_id, InputMode::Mount);
     let record = job_record(&harness, &spec);
 
-    let mut inputs = load_direct_inputs(&harness.driver, &spec, &record, harness.node_id)
-        .await
-        .unwrap();
+    let mut inputs = load_direct_inputs(
+        &harness.driver,
+        &spec,
+        &record,
+        harness.node_id,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(inputs.len(), 1);
     assert_eq!(inputs[0].path, INPUT_PATH);
@@ -731,9 +753,15 @@ async fn run_capture(
     };
     let backend: Arc<dyn ExecutorBackend> = Arc::new(StubBackend);
 
-    let mut inputs = load_direct_inputs(&harness.driver, &spec, &record, harness.node_id)
-        .await
-        .unwrap();
+    let mut inputs = load_direct_inputs(
+        &harness.driver,
+        &spec,
+        &record,
+        harness.node_id,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(inputs.len(), 1);
     assert_eq!(inputs[0].path, INPUT_PATH);
     assert_eq!(read_input(inputs.remove(0)).await, b"input-bytes");
