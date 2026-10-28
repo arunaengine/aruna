@@ -225,10 +225,7 @@ async fn source_read_unpinned() {
 async fn paced_read_spaced() {
     use crate::pace::{Pace, paced};
     let source = SourceListener::bind(None, false).await;
-    let pace = Pace {
-        key: ulid::Ulid::from_bytes([3; 16]),
-        rate: 4,
-    };
+    let pace = Pace::new(ulid::Ulid::from_bytes([3; 16]), 4);
     let start = std::time::Instant::now();
     let read = paced(pace, async {
         let (_, stream) = read_staging_source(&test_guard(), &source.access(), None, None)

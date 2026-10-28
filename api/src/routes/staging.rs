@@ -283,6 +283,8 @@ pub struct StagingJobResponse {
     pub submitted_at: String,
     pub finished_at: Option<String>,
     pub error: Option<String>,
+    /// While set, the job waits until then because its source answered with `Retry-After`.
+    pub paused_until: Option<String>,
     pub progress: StagingProgressResponse,
     pub errors: Vec<StagingErrorResponse>,
 }
@@ -1378,6 +1380,8 @@ fn staging_job_response(
             .last_error
             .as_ref()
             .map(|error| error.message.clone()),
+        paused_until: (record.progress.paused_until)
+            .map(|until| chrono::DateTime::<chrono::Utc>::from(until).to_rfc3339()),
         progress,
         errors: checkpoint
             .map(|checkpoint| {

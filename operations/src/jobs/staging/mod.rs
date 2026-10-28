@@ -9,6 +9,8 @@ mod manifest;
 mod table;
 mod walk;
 
+use std::sync::Arc;
+
 use aruna_blob::pace::{Pace, paced};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::{
@@ -64,12 +66,15 @@ async fn read_main(
 }
 
 pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
-    // Every source request of a table import, adapter retries included, takes a token.
+    // Every source request of a table import, adapter retries included, takes a token; a
+    // pause a source asks for ends with the job and shows in its progress.
     match spec.table.as_ref() {
         Some(table) => {
+            let progress = ctx.progress.clone();
             let pace = Pace {
-                key: spec.connector_id,
-                rate: table.rate(),
+                stops: vec![ctx.cancel.clone(), ctx.shutdown.clone()],
+                notice: Some(Arc::new(move |until| progress.set_pause(until))),
+                ..Pace::new(spec.connector_id, table.rate())
             };
             Box::pin(paced(pace, run_job(ctx, spec))).await
         }

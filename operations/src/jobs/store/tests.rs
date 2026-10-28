@@ -460,6 +460,7 @@ async fn report_freezes() {
             current: 2,
             total: Some(2),
             unit: "items".to_string(),
+            paused_until: None,
         },
         4_000,
     )
@@ -685,6 +686,7 @@ async fn success_clears_error() {
         current: 1,
         total: Some(1),
         unit: "items".to_string(),
+        paused_until: None,
     };
     let payload = JobResultPayload::Staging {
         completed_items: 1,

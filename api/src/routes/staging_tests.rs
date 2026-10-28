@@ -482,6 +482,14 @@ fn job_states_mapped() {
         record.state = state;
         assert_eq!(staging_job_response(&record, None).unwrap().state, name);
     }
+    // A job waiting out a source's `Retry-After` shows when it goes on.
+    assert_eq!(
+        staging_job_response(&record, None).unwrap().paused_until,
+        None
+    );
+    record.progress.paused_until = Some(UNIX_EPOCH + std::time::Duration::from_secs(60));
+    let paused = staging_job_response(&record, None).unwrap().paused_until;
+    assert_eq!(paused.as_deref(), Some("1970-01-01T00:01:00+00:00"));
 }
 
 #[tokio::test]

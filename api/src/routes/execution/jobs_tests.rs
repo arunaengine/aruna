@@ -484,6 +484,7 @@ async fn finish_report(state: &ServerState, job_id: JobId, owner: UserId) -> [u8
             current: 2,
             total: Some(2),
             unit: "entries".to_string(),
+            paused_until: None,
         },
         aruna_core::time::unix_timestamp_millis(),
     )

@@ -154,11 +154,16 @@ impl HttpTransport for ScreenedFetch {
         };
         screen_host(&self.policy, &host).map_err(denied)?;
         // Each request opendal sends, its own retries included, takes a token of a paced task.
-        crate::pace::turn().await;
+        crate::pace::turn().await.map_err(unpaced)?;
         let response = self.client.fetch(request).await?;
-        crate::pace::answered(response.status(), response.headers());
+        crate::pace::answered(response.status(), response.headers()).map_err(unpaced)?;
         Ok(response)
     }
+}
+
+/// A request a paced task did not send, or whose answer it cannot honour.
+fn unpaced(error: crate::pace::PaceError) -> opendal::Error {
+    opendal::Error::new(ErrorKind::Unexpected, error.to_string())
 }
 
 /// Bundles the egress policy with the clients that enforce it.

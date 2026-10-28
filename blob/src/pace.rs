@@ -4,27 +4,51 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 use http::{HeaderMap, StatusCode};
+use thiserror::Error;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 tokio::task_local! {
     static PACE: Pace;
 }
 
-/// Requests per second for every source request sent under `key`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Told the end of a pause a request waits for, and `None` once the wait is over.
+pub type PauseNotice = Arc<dyn Fn(Option<SystemTime>) + Send + Sync>;
+
+/// Requests per second for every source request sent under `key`; any of `stops` ends a wait.
+#[derive(Clone)]
 pub struct Pace {
     pub key: Ulid,
     pub rate: u32,
+    pub stops: Vec<CancellationToken>,
+    pub notice: Option<PauseNotice>,
+}
+
+impl Pace {
+    pub fn new(key: Ulid, rate: u32) -> Self {
+        Self {
+            key,
+            rate,
+            stops: Vec::new(),
+            notice: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum PaceError {
+    #[error("the job stopped while its source request waited")]
+    Stopped,
+    #[error("the source asked to pause for longer than this node can represent")]
+    Unrepresentable,
 }
 
 static BUCKETS: LazyLock<Mutex<HashMap<Ulid, Bucket>>> = LazyLock::new(Default::default);
-/// One sleep of a paced request at most; it then looks at the pause again.
-const LONGEST_SLEEP: Duration = Duration::from_secs(60);
 
 /// Tokens refill at the rate up to one; a request may borrow ahead and waits for it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,23 +56,15 @@ struct Bucket {
     tokens: f64,
     at: Instant,
     /// No request is sent before this, as a `Retry-After` answer asked.
-    until: Option<Deadline>,
+    until: Option<Instant>,
 }
 
-/// The end of a pause a source asked for.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Deadline {
-    At(Instant),
-    /// Later than any instant this clock holds.
-    Never,
-}
-
-/// How long the bucket's pause still lasts at `now`, at most one sleep.
+/// How long the bucket's pause still lasts at `now`.
 fn paused(bucket: &Bucket, now: Instant) -> Option<Duration> {
-    match bucket.until? {
-        Deadline::At(at) => (at > now).then(|| (at - now).min(LONGEST_SLEEP)),
-        Deadline::Never => Some(LONGEST_SLEEP),
-    }
+    bucket
+        .until
+        .filter(|until| *until > now)
+        .map(|until| until - now)
 }
 
 /// Takes one token at `now` and returns how long the request waits for it.
@@ -65,46 +81,46 @@ fn take(bucket: &mut Bucket, rate: u32, now: Instant) -> Duration {
 }
 
 /// The delay a `Retry-After` value asks for: seconds, or an HTTP date after `now`.
-fn retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+fn retry_after(value: &str, now: SystemTime) -> Result<Option<Duration>, PaceError> {
     let value = value.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let seconds = value.parse().map_err(|_| PaceError::Unrepresentable)?;
+        return Ok(Some(Duration::from_secs(seconds)));
     }
-    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) else {
+        return Ok(None);
+    };
     let date = SystemTime::from(date);
-    Some(date.duration_since(now).unwrap_or_default())
+    Ok(Some(date.duration_since(now).unwrap_or_default()))
 }
 
-/// Pauses the running task's key when an answer is throttled with `Retry-After`.
-pub(crate) fn answered(status: StatusCode, headers: &HeaderMap) {
+/// Pauses the running task's key when an answer is throttled with `Retry-After`; a pause this
+/// node cannot represent fails the request instead of pausing the key for good.
+pub(crate) fn answered(status: StatusCode, headers: &HeaderMap) -> Result<(), PaceError> {
     let throttled = matches!(
         status,
         StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
     );
-    let Ok(pace) = PACE.try_with(|pace| *pace) else {
-        return;
+    let Ok(key) = PACE.try_with(|pace| pace.key) else {
+        return Ok(());
     };
-    let value = headers.get(http::header::RETRY_AFTER);
-    let Some(delay) = value
-        .filter(|_| throttled)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| retry_after(value, SystemTime::now()))
-    else {
-        return;
+    let value = headers.get(http::header::RETRY_AFTER).filter(|_| throttled);
+    let Some(value) = value.and_then(|value| value.to_str().ok()) else {
+        return Ok(());
+    };
+    let Some(delay) = retry_after(value, SystemTime::now())? else {
+        return Ok(());
     };
     let mut buckets = BUCKETS.lock().unwrap_or_else(|poison| poison.into_inner());
     let now = Instant::now();
-    let bucket = (buckets.entry(pace.key)).or_insert(Bucket {
+    let until = now.checked_add(delay).ok_or(PaceError::Unrepresentable)?;
+    let bucket = (buckets.entry(key)).or_insert(Bucket {
         tokens: 1.0,
         at: now,
         until: None,
     });
-    let until = now.checked_add(delay).map_or(Deadline::Never, Deadline::At);
-    bucket.until = Some(match (bucket.until, until) {
-        (Some(Deadline::Never), _) | (_, Deadline::Never) => Deadline::Never,
-        (Some(Deadline::At(known)), Deadline::At(at)) => Deadline::At(known.max(at)),
-        (None, until) => until,
-    });
+    bucket.until = Some(bucket.until.map_or(until, |known| known.max(until)));
+    Ok(())
 }
 
 /// Runs `future` with every source request it sends paced by `pace`.
@@ -112,15 +128,35 @@ pub async fn paced<F: Future>(pace: Pace, future: F) -> F::Output {
     PACE.scope(pace, future).await
 }
 
+/// Sleeps for `wait` unless a stop token fires first.
+async fn sleep_unless(wait: Duration, stops: &[CancellationToken]) -> Result<(), PaceError> {
+    if stops.is_empty() {
+        tokio::time::sleep(wait).await;
+        return Ok(());
+    }
+    let stopped = futures::future::select_all(stops.iter().map(|stop| Box::pin(stop.cancelled())));
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => Ok(()),
+        _ = stopped => Err(PaceError::Stopped),
+    }
+}
+
 /// Waits for the next request's token when the running task is paced. A pause found before
-/// sending drops the request's slot, so requests leave a pause one slot apart.
-pub(crate) async fn turn() {
-    let Ok(pace) = PACE.try_with(|pace| *pace) else {
-        return;
+/// sending drops the request's slot, so requests leave a pause one slot apart. The notice
+/// hears the pause's end while the request waits for it.
+pub(crate) async fn turn() -> Result<(), PaceError> {
+    let Ok(pace) = PACE.try_with(Pace::clone) else {
+        return Ok(());
+    };
+    let notify = |until: Option<SystemTime>| {
+        if let Some(notice) = &pace.notice {
+            notice(until);
+        }
     };
     let mut slot: Option<Instant> = None;
+    let mut noticed = false;
     loop {
-        let wait = {
+        let (wait, pause) = {
             let mut buckets = BUCKETS.lock().unwrap_or_else(|poison| poison.into_inner());
             let now = Instant::now();
             let bucket = (buckets.entry(pace.key)).or_insert(Bucket {
@@ -131,18 +167,30 @@ pub(crate) async fn turn() {
             match paused(bucket, now) {
                 Some(pause) => {
                     slot = None;
-                    pause
+                    (pause, true)
                 }
                 None => {
                     let at = *slot.get_or_insert_with(|| now + take(bucket, pace.rate, now));
-                    if at <= now {
-                        return;
-                    }
-                    (at - now).min(LONGEST_SLEEP)
+                    (at.saturating_duration_since(now), false)
                 }
             }
         };
-        tokio::time::sleep(wait).await;
+        if pause {
+            notify(SystemTime::now().checked_add(wait));
+            noticed = true;
+        } else if noticed {
+            notify(None);
+            noticed = false;
+        }
+        if wait.is_zero() {
+            return Ok(());
+        }
+        if let Err(stopped) = sleep_unless(wait, &pace.stops).await {
+            if noticed {
+                notify(None);
+            }
+            return Err(stopped);
+        }
     }
 }
 
@@ -177,35 +225,34 @@ mod tests {
     #[test]
     fn retry_after_forms() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_412_480);
-        assert_eq!(retry_after(" 7 ", now), Some(Duration::from_secs(7)));
+        assert_eq!(retry_after(" 7 ", now), Ok(Some(Duration::from_secs(7))));
         let date = "Wed, 21 Oct 2015 07:28:30 GMT";
-        assert_eq!(retry_after(date, now), Some(Duration::from_secs(30)));
+        assert_eq!(retry_after(date, now), Ok(Some(Duration::from_secs(30))));
         assert_eq!(
             retry_after("Wed, 21 Oct 2015 07:00:00 GMT", now),
-            Some(Duration::ZERO)
+            Ok(Some(Duration::ZERO))
         );
-        assert_eq!(retry_after("soon", now), None);
+        assert_eq!(retry_after("soon", now), Ok(None));
+        let huge = "9".repeat(30);
+        assert_eq!(retry_after(&huge, now), Err(PaceError::Unrepresentable));
     }
 
     // A throttled answer with `Retry-After` holds back the key's next request; other answers
     // and unpaced tasks do not.
     #[tokio::test(start_paused = true)]
     async fn throttled_answers_pause() {
-        let pace = Pace {
-            key: Ulid::from_bytes([9; 16]),
-            rate: 100,
-        };
+        let pace = Pace::new(Ulid::from_bytes([9; 16]), 100);
         let mut headers = HeaderMap::new();
         headers.insert(http::header::RETRY_AFTER, "2".parse().unwrap());
-        answered(StatusCode::TOO_MANY_REQUESTS, &headers);
+        answered(StatusCode::TOO_MANY_REQUESTS, &headers).unwrap();
         let start = Instant::now();
         paced(pace, async {
-            turn().await;
-            answered(StatusCode::OK, &headers);
-            turn().await;
+            turn().await.unwrap();
+            answered(StatusCode::OK, &headers).unwrap();
+            turn().await.unwrap();
             assert!(Instant::now() - start < Duration::from_secs(1));
-            answered(StatusCode::TOO_MANY_REQUESTS, &headers);
-            turn().await;
+            answered(StatusCode::TOO_MANY_REQUESTS, &headers).unwrap();
+            turn().await.unwrap();
         })
         .await;
         assert!(Instant::now() - start >= Duration::from_secs(2));
@@ -215,20 +262,18 @@ mod tests {
     // pause is extended before it is reached.
     #[tokio::test(start_paused = true)]
     async fn pauses_release_spaced() {
-        let pace = Pace {
-            key: Ulid::from_bytes([12; 16]),
-            rate: 10,
-        };
+        let pace = Pace::new(Ulid::from_bytes([12; 16]), 10);
         let start = Instant::now();
         let mut headers = HeaderMap::new();
         headers.insert(http::header::RETRY_AFTER, "2".parse().unwrap());
-        paced(pace, async {
+        paced(pace.clone(), async {
             answered(StatusCode::TOO_MANY_REQUESTS, &headers)
         })
-        .await;
+        .await
+        .unwrap();
         let waiter = || {
-            paced(pace, async {
-                turn().await;
+            paced(pace.clone(), async {
+                turn().await.unwrap();
                 Instant::now() - start
             })
         };
@@ -239,20 +284,17 @@ mod tests {
         assert!(sent[1] - sent[0] >= Duration::from_millis(100));
         assert!(sent[2] - sent[1] >= Duration::from_millis(100));
 
-        let slow = Pace {
-            key: Ulid::from_bytes([13; 16]),
-            rate: 1,
-        };
+        let slow = Pace::new(Ulid::from_bytes([13; 16]), 1);
         headers.insert(http::header::RETRY_AFTER, "5".parse().unwrap());
         let start = Instant::now();
-        let requests = paced(slow, async {
-            turn().await;
-            turn().await;
+        let requests = paced(slow.clone(), async {
+            turn().await.unwrap();
+            turn().await.unwrap();
             Instant::now() - start
         });
         let extension = paced(slow, async {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            answered(StatusCode::TOO_MANY_REQUESTS, &headers);
+            answered(StatusCode::TOO_MANY_REQUESTS, &headers).unwrap();
         });
         let (second, ()) = tokio::join!(requests, extension);
         assert!(second >= Duration::from_millis(5500));
@@ -263,31 +305,63 @@ mod tests {
     async fn long_pauses_kept() {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::RETRY_AFTER, "3600".parse().unwrap());
-        let pace = Pace {
-            key: Ulid::from_bytes([10; 16]),
-            rate: 10,
-        };
+        let pace = Pace::new(Ulid::from_bytes([10; 16]), 10);
         let start = Instant::now();
         paced(pace, async {
-            answered(StatusCode::SERVICE_UNAVAILABLE, &headers);
-            turn().await;
+            answered(StatusCode::SERVICE_UNAVAILABLE, &headers).unwrap();
+            turn().await.unwrap();
         })
         .await;
         assert!(Instant::now() - start >= Duration::from_secs(3600));
-        let endless = Pace {
-            key: Ulid::from_bytes([11; 16]),
-            rate: 10,
+        // A pause beyond any instant fails the request and pauses nothing.
+        let endless = Pace::new(Ulid::from_bytes([11; 16]), 10);
+        let start = Instant::now();
+        for value in [u64::MAX.to_string(), "1".repeat(40)] {
+            headers.insert(http::header::RETRY_AFTER, value.parse().unwrap());
+            let answer = paced(endless.clone(), async {
+                answered(StatusCode::TOO_MANY_REQUESTS, &headers)
+            });
+            assert_eq!(answer.await, Err(PaceError::Unrepresentable));
+        }
+        paced(endless, turn()).await.unwrap();
+        assert_eq!(Instant::now(), start);
+    }
+
+    // A request waiting out a pause tells its notice the pause's end and ends when the job
+    // stops; a finished wait tells it the pause is over.
+    #[tokio::test(start_paused = true)]
+    async fn pause_waits_stoppable() {
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let heard = notices.clone();
+        let stop = CancellationToken::new();
+        let pace = Pace {
+            stops: vec![CancellationToken::new(), stop.clone()],
+            notice: Some(Arc::new(move |until| heard.lock().unwrap().push(until))),
+            ..Pace::new(Ulid::from_bytes([14; 16]), 10)
         };
-        headers.insert(
-            http::header::RETRY_AFTER,
-            u64::MAX.to_string().parse().unwrap(),
-        );
-        let waited = paced(endless, async {
-            answered(StatusCode::TOO_MANY_REQUESTS, &headers);
-            tokio::time::timeout(Duration::from_secs(30 * 86_400), turn()).await
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "2".parse().unwrap());
+        paced(pace.clone(), async {
+            answered(StatusCode::TOO_MANY_REQUESTS, &headers).unwrap();
+            turn().await.unwrap();
         })
         .await;
-        assert!(waited.is_err(), "the pause outlasts any wait");
+        assert!(notices.lock().unwrap()[0].is_some());
+        assert_eq!(notices.lock().unwrap()[1..], [None]);
+        headers.insert(http::header::RETRY_AFTER, "3600".parse().unwrap());
+        let start = Instant::now();
+        let waiting = paced(pace, async {
+            answered(StatusCode::TOO_MANY_REQUESTS, &headers).unwrap();
+            turn().await
+        });
+        let stopping = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            stop.cancel();
+        };
+        let (waited, ()) = tokio::join!(waiting, stopping);
+        assert_eq!(waited, Err(PaceError::Stopped));
+        assert_eq!(Instant::now() - start, Duration::from_secs(1));
+        assert_eq!(notices.lock().unwrap().last(), Some(&None));
     }
 
     // Only a paced task waits; one key's pace never slows another key or an unpaced task.
@@ -296,23 +370,20 @@ mod tests {
         let key = Ulid::from_bytes([7; 16]);
         let start = Instant::now();
         for _ in 0..5 {
-            turn().await;
+            turn().await.unwrap();
         }
         assert_eq!(Instant::now(), start);
-        let pace = Pace { key, rate: 10 };
+        let pace = Pace::new(key, 10);
         paced(pace, async {
             for _ in 0..5 {
-                turn().await;
+                turn().await.unwrap();
             }
         })
         .await;
         assert_eq!(Instant::now() - start, Duration::from_millis(400));
-        let other = Pace {
-            key: Ulid::from_bytes([8; 16]),
-            rate: 10,
-        };
+        let other = Pace::new(Ulid::from_bytes([8; 16]), 10);
         let before = Instant::now();
-        paced(other, turn()).await;
+        paced(other, turn()).await.unwrap();
         assert_eq!(Instant::now(), before);
     }
 }

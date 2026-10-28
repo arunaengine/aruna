@@ -164,12 +164,14 @@ impl<'guard> HttpIndexClient<'guard> {
             } else if let Some(username) = self.username.as_ref().filter(|_| own) {
                 request = request.basic_auth(username, self.password.as_deref());
             }
-            crate::pace::turn().await;
+            let unpaced =
+                |error: crate::pace::PaceError| StagingSourceError::ListError(error.to_string());
+            crate::pace::turn().await.map_err(unpaced)?;
             let response = request.send().await.map_err(|error| {
                 let error = error.without_url();
                 StagingSourceError::ListError(format!("http request failed: {error}"))
             })?;
-            crate::pace::answered(response.status(), response.headers());
+            crate::pace::answered(response.status(), response.headers()).map_err(unpaced)?;
             let next = (response.status().is_redirection() && visited.len() < REDIRECT_HOPS)
                 .then(|| response.headers().get(LOCATION))
                 .flatten()
@@ -885,10 +887,7 @@ mod tests {
             ("endpoint".to_string(), endpoint),
             ("root".to_string(), "data".to_string()),
         ]);
-        let pace = Pace {
-            key: ulid::Ulid::from_bytes([4; 16]),
-            rate: 4,
-        };
+        let pace = Pace::new(ulid::Ulid::from_bytes([4; 16]), 4);
         let start = std::time::Instant::now();
         let listed = paced(pace, async {
             list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false).await
