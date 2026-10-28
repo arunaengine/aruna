@@ -252,7 +252,12 @@ pub async fn put_bucket_metadata(
         }
         None => {
             drive(
-                PutMetadataOperation::new(bucket.clone(), info.group_id, metadata.clone()),
+                PutMetadataOperation::new(
+                    (auth.clone(), state.get_realm_id()),
+                    bucket.clone(),
+                    info.group_id,
+                    metadata.clone(),
+                ),
                 &state.get_ctx(),
             )
             .await
@@ -260,6 +265,7 @@ pub async fn put_bucket_metadata(
                 PutMetadataError::NoSuchBucket | PutMetadataError::GroupMismatch => {
                     ServerError::NotFound
                 }
+                PutMetadataError::Forbidden => ServerError::Forbidden,
                 error => ServerError::InternalError(error.to_string()),
             })?;
         }

@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::bucket::metadata::PutMetadataOperation;
-use aruna_core::keyspaces::{BUCKET_CREATION_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::identifier::{
     IdentifierParser, IdentifierRule, IdentifierTarget,
 };
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
+use aruna_core::structs::storage::bucket_metadata::StoredMetadata;
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
 
 const BUCKET: &str = "bakrep";
@@ -84,12 +86,17 @@ async fn seed(context: &DriverContext, actor: &Actor, listed: bool) -> Ulid {
         parser: Some(parser),
         ..BucketMetadata::default()
     };
-    drive(
-        PutMetadataOperation::new(BUCKET.to_string(), bucket.group_id, Some(metadata)),
+    let stored = StoredMetadata {
+        incarnation: 0,
+        metadata,
+    };
+    put(
         context,
+        BUCKET_METADATA_KEYSPACE,
+        BUCKET.as_bytes().to_vec(),
+        stored.to_bytes().unwrap(),
     )
-    .await
-    .unwrap();
+    .await;
     if !listed {
         // The bucket is created again under its name: the old metadata no longer applies.
         put(
