@@ -664,7 +664,10 @@ fn rejects_unsupported_fields() {
     assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
     task.id = None;
     task.inputs[0].kind = TesFileType::Directory;
-    assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
+    let (spec, _) =
+        map_execution_spec(&task, None, ExecutionTarget::Realm).expect("directory maps");
+    let InputSource::S3 { key, .. } = &spec.inputs[0].source;
+    assert!(key.ends_with('/') && spec.inputs[0].dest_key.ends_with('/'));
     task.inputs[0].kind = TesFileType::File;
     task.executors[0].stdout = Some("/logs/out".to_string());
     assert!(map_execution_spec(&task, None, ExecutionTarget::Realm).is_err());
@@ -1096,6 +1099,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
             admitted_at_ms: 10,
         },
         captured_inputs: Vec::new(),
+        input_pages: None,
         output_policies: Vec::new(),
         placement: PlacementRef::NIL,
     };
@@ -1111,7 +1115,6 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
             cancel_requested: false,
             created_at_ms: 10,
             updated_at_ms: 20,
-        input_pages: None,
             finished_at_ms: Some(20),
             progress: JobProgress::new("phases"),
             last_error: None,

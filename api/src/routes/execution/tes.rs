@@ -587,7 +587,7 @@ naming a different one; a bearer token requires that tag.
   matches is never captured. A `DIRECTORY` output captures every file below its path under its url.
   Within a pattern, brace alternatives such as `*.{bam,bai}` select each listed form and a `**`
   component spans any number of directories, as in Nextflow.
-- Unsupported: directory inputs, inline input content, wildcards in an input path, volumes,
+- Unsupported: inline input content, wildcards in an input path, volumes,
   executor stdin/stdout/stderr redirection and resource zones."#,
     request_body(
         content = TesTask,
@@ -1341,8 +1341,8 @@ fn map_task_inputs(task: &TesTask, input_mode: InputMode) -> Result<Vec<InputSel
         {
             return Err(TesError::bad_request("duplicate input path"));
         }
-        if let Some(path) = input.container_path.as_deref()
-            && inputs.iter().any(|existing| {
+        inputs.push(input);
+    }
     // An input below another input's path would be hidden by it.
     let nested = paths.iter().any(|path| {
         FilePath::new(path)
@@ -1353,15 +1353,6 @@ fn map_task_inputs(task: &TesTask, input_mode: InputMode) -> Result<Vec<InputSel
     });
     if nested {
         return Err(TesError::bad_request("input paths overlap"));
-    }
-                existing.container_path.as_deref().is_some_and(|other| {
-                    FilePath::new(path).starts_with(other) || FilePath::new(other).starts_with(path)
-                })
-            })
-        {
-            return Err(TesError::bad_request("input paths overlap"));
-        }
-        inputs.push(input);
     }
     Ok(inputs)
 }
@@ -1487,9 +1478,6 @@ fn map_task_resources(task: &TesTask) -> Result<ComputeResources, TesError> {
 }
 
 fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesError> {
-    if input.kind != TesFileType::File {
-        return Err(TesError::bad_request("directory inputs are not supported"));
-    }
     if input.content.is_some() {
         return Err(TesError::bad_request(
             "inline input content is not supported",
@@ -1499,18 +1487,34 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
         .url
         .as_deref()
         .ok_or_else(|| TesError::bad_request("input url is required"))?;
-    let (source, source_node_id) = parse_input_url(url)?;
+    let (mut source, source_node_id) = parse_input_url(url)?;
     validate_path(&input.path, "input path", false)?;
-    // TES 1.1 defines wildcards for outputs only; an input path is one file.
+    // TES 1.1 defines wildcards for outputs only; an input path is one file or directory.
     if has_wildcard(&input.path) {
         return Err(TesError::bad_request(
             "input path must not contain wildcards",
         ));
     }
+    // A directory names a key prefix, which admission expands into its objects.
+    let mut dest_key = input.path[1..].to_string();
+    if input.kind == TesFileType::Directory {
+        let InputSource::S3 {
+            key, version_id, ..
+        } = &mut source;
+        if version_id.is_some() {
+            return Err(TesError::bad_request(
+                "a directory input names an s3:// prefix, not one version",
+            ));
+        }
+        if !key.ends_with('/') {
+            key.push('/');
+        }
+        dest_key.push('/');
+    }
     Ok(InputSelection {
         source,
         source_node_id,
-        dest_key: input.path[1..].to_string(),
+        dest_key,
         mode,
         container_path: Some(input.path.clone()),
         name: input.name.clone(),
