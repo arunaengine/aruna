@@ -112,13 +112,15 @@ pub async fn paced<F: Future>(pace: Pace, future: F) -> F::Output {
     PACE.scope(pace, future).await
 }
 
-/// Waits for the next request's token when the running task is paced.
+/// Waits for the next request's token when the running task is paced. A pause found before
+/// sending drops the request's slot, so requests leave a pause one slot apart.
 pub(crate) async fn turn() {
     let Ok(pace) = PACE.try_with(|pace| *pace) else {
         return;
     };
+    let mut slot: Option<Instant> = None;
     loop {
-        let (wait, paused) = {
+        let wait = {
             let mut buckets = BUCKETS.lock().unwrap_or_else(|poison| poison.into_inner());
             let now = Instant::now();
             let bucket = (buckets.entry(pace.key)).or_insert(Bucket {
@@ -127,14 +129,20 @@ pub(crate) async fn turn() {
                 until: None,
             });
             match paused(bucket, now) {
-                Some(pause) => (pause, true),
-                None => (take(bucket, pace.rate, now), false),
+                Some(pause) => {
+                    slot = None;
+                    pause
+                }
+                None => {
+                    let at = *slot.get_or_insert_with(|| now + take(bucket, pace.rate, now));
+                    if at <= now {
+                        return;
+                    }
+                    (at - now).min(LONGEST_SLEEP)
+                }
             }
         };
         tokio::time::sleep(wait).await;
-        if !paused {
-            return;
-        }
     }
 }
 
@@ -201,6 +209,53 @@ mod tests {
         })
         .await;
         assert!(Instant::now() - start >= Duration::from_secs(2));
+    }
+
+    // Requests waiting out a pause leave it one slot apart, and a slot waits again when the
+    // pause is extended before it is reached.
+    #[tokio::test(start_paused = true)]
+    async fn pauses_release_spaced() {
+        let pace = Pace {
+            key: Ulid::from_bytes([12; 16]),
+            rate: 10,
+        };
+        let start = Instant::now();
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "2".parse().unwrap());
+        paced(pace, async {
+            answered(StatusCode::TOO_MANY_REQUESTS, &headers)
+        })
+        .await;
+        let waiter = || {
+            paced(pace, async {
+                turn().await;
+                Instant::now() - start
+            })
+        };
+        let (a, b, c) = tokio::join!(waiter(), waiter(), waiter());
+        let mut sent = [a, b, c];
+        sent.sort();
+        assert!(sent[0] >= Duration::from_secs(2));
+        assert!(sent[1] - sent[0] >= Duration::from_millis(100));
+        assert!(sent[2] - sent[1] >= Duration::from_millis(100));
+
+        let slow = Pace {
+            key: Ulid::from_bytes([13; 16]),
+            rate: 1,
+        };
+        headers.insert(http::header::RETRY_AFTER, "5".parse().unwrap());
+        let start = Instant::now();
+        let requests = paced(slow, async {
+            turn().await;
+            turn().await;
+            Instant::now() - start
+        });
+        let extension = paced(slow, async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            answered(StatusCode::TOO_MANY_REQUESTS, &headers);
+        });
+        let (second, ()) = tokio::join!(requests, extension);
+        assert!(second >= Duration::from_millis(5500));
     }
 
     // A long `Retry-After` is kept whole, and one beyond any instant pauses for good.
