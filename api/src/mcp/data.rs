@@ -1038,7 +1038,7 @@ pub(crate) async fn write_text(
             .map_err(server_error)?;
         return Ok(answer);
     }
-    store_text(&server.state, auth, &bucket_info, input)
+    store_text(&server.state, auth, &bucket_info, input, HashMap::new())
         .await
         .map_err(server_error)
 }
@@ -1052,12 +1052,14 @@ pub struct TextObjectRequest {
     pub content_type: Option<String>,
 }
 
-/// Stores a checked text write on this node as one new version of its key.
+/// Stores a checked text write on this node as one new version of its key, with `tags` as
+/// server-set version metadata.
 pub(crate) async fn store_text(
     state: &Arc<ServerState>,
     auth: &AuthContext,
     bucket_info: &BucketInfo,
     input: WriteObjectInput,
+    tags: HashMap<String, String>,
 ) -> Result<WriteObjectOutput, crate::error::ServerError> {
     use crate::error::ServerError;
     let internal = |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string());
@@ -1102,10 +1104,11 @@ pub(crate) async fn store_text(
         routing,
     })
     .with_rocrate_limits(state.rocrate_limits().clone())
-    .with_metadata(HashMap::from([(
-        CONTENT_TYPE_KEY.to_string(),
-        content_type.clone(),
-    )]))
+    .with_metadata(
+        tags.into_iter()
+            .chain([(CONTENT_TYPE_KEY.to_string(), content_type.clone())])
+            .collect(),
+    )
     .with_restrictions(auth.path_restrictions.clone());
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);

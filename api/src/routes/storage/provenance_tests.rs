@@ -86,7 +86,7 @@ async fn exports_local_version() {
         text: "x".to_string(),
         content_type: None,
     };
-    let stored = store_text(&node.state, &node.owner, &info, input)
+    let stored = store_text(&node.state, &node.owner, &info, input, Default::default())
         .await
         .unwrap();
     let version = Ulid::from_string(&stored.version_id).unwrap();
@@ -160,7 +160,7 @@ async fn revoked_token_stops() {
         text: "x".to_string(),
         content_type: None,
     };
-    let stored = store_text(&node.state, &node.owner, &info, input)
+    let stored = store_text(&node.state, &node.owner, &info, input, Default::default())
         .await
         .unwrap();
     let version = Ulid::from_string(&stored.version_id).unwrap();

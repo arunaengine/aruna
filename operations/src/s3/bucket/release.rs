@@ -16,13 +16,14 @@ use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{
     RELEASE_TAG, ReleasePointer, ReleaseRef, release_prefix,
 };
+use aruna_core::structs::storage::data::identity::content_id;
 use aruna_core::structs::storage::distribution::KeyRange;
 use aruna_core::structs::storage::global_id::GlobalId;
-use aruna_core::structs::storage::origin::OriginVersion;
+use aruna_core::structs::storage::origin::{OriginVersion, SourcePin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -33,6 +34,8 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::AuthToken;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
+use crate::s3::object::origin::read_origin;
 
 /// Rows read per storage page while looking for a bucket's releases.
 const ROW_PAGE: usize = 256;
@@ -446,4 +449,262 @@ pub async fn holder_members(
     };
     let answers = local_members(context, scope, auth, queries, Some(&held)).await?;
     Ok(RangeMembers { answers, refused })
+}
+
+/// One current file a release pins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseFile {
+    pub key: String,
+    pub version: OriginVersion,
+    pub size: u64,
+    /// The content id, when the bytes have a known BLAKE3.
+    pub content: Option<String>,
+    /// What pins a reference version: its source and the source's ETag.
+    pub pin: Option<(SourcePin, Option<String>)>,
+}
+
+/// What a publisher declares about a release besides its files.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseSpec {
+    pub label: String,
+    pub prefix: String,
+    pub upstream: Vec<Identifier>,
+    /// Runs that prepared the files, by run id.
+    pub preparation: Vec<Ulid>,
+}
+
+/// The release crate: deterministic for the same spec and files, so a repeated publish of an
+/// unchanged release yields the same bytes.
+pub fn release_crate(spec: &ReleaseSpec, files: &[ReleaseFile]) -> Vec<u8> {
+    let mut graph = vec![json!({
+        "@id": "ro-crate-metadata.json",
+        "@type": "CreativeWork",
+        "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+        "about": {"@id": "./"}
+    })];
+    let identifiers: Vec<Value> = (0..spec.upstream.len())
+        .map(|index| json!({"@id": format!("#upstream-{index}")}))
+        .collect();
+    let based_on: Vec<Value> = (spec.upstream.iter())
+        .map(|identifier| json!({"@id": identifier.url}))
+        .collect();
+    let runs: Vec<Value> = (spec.preparation.iter())
+        .map(|run_id| json!({"@id": format!("#run-{run_id}")}))
+        .collect();
+    let parts: Vec<Value> = (files.iter())
+        .map(|file| json!({"@id": file.version.to_id()}))
+        .collect();
+    graph.push(json!({
+        "@id": "./",
+        "@type": "Dataset",
+        "name": format!("Release {}", spec.label),
+        "version": spec.label,
+        "description": format!("Files under `{}` pinned at publication", spec.prefix),
+        "identifier": identifiers,
+        "isBasedOn": based_on,
+        "mentions": runs,
+        "hasPart": parts
+    }));
+    for (index, identifier) in spec.upstream.iter().enumerate() {
+        graph.push(json!({
+            "@id": format!("#upstream-{index}"),
+            "@type": "PropertyValue",
+            "name": identifier.name,
+            "value": identifier.value,
+            "url": identifier.url
+        }));
+    }
+    for run_id in &spec.preparation {
+        graph.push(json!({
+            "@id": format!("#run-{run_id}"),
+            "@type": "CreateAction",
+            "name": format!("Preparation run {run_id}"),
+            "identifier": run_id.to_string()
+        }));
+    }
+    let mut pinned = Vec::new();
+    for file in files {
+        let mut entity = json!({
+            "@id": file.version.to_id(),
+            "@type": "File",
+            "name": file.key,
+            "contentSize": file.size.to_string(),
+            "contentUrl": file.version.to_id()
+        });
+        if let Some(content) = &file.content {
+            entity["identifier"] = json!(content);
+        }
+        if let Some((pin, etag)) = &file.pin {
+            if let Some(url) = &pin.url {
+                entity["isBasedOn"] = json!({"@id": url});
+            }
+            let id = file.version.to_id();
+            let pins = [
+                ("source-etag", etag.as_ref()),
+                ("source-version", pin.source_version.as_ref()),
+            ];
+            let mut properties = Vec::new();
+            for (term, value) in pins {
+                let Some(value) = value else { continue };
+                let property = format!("{id}#{term}");
+                properties.push(json!({"@id": property}));
+                pinned.push(json!({
+                    "@id": property,
+                    "@type": "PropertyValue",
+                    "propertyID": format!("https://w3id.org/aruna/terms/{term}"),
+                    "value": value
+                }));
+            }
+            if !properties.is_empty() {
+                entity["additionalProperty"] = json!(properties);
+            }
+        }
+        graph.push(entity);
+    }
+    graph.extend(pinned);
+    let document = json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": graph
+    });
+    serde_json::to_vec_pretty(&document).unwrap_or_default()
+}
+
+/// The current versions under `prefix` this node holds, `skip` left out, with what pins them.
+pub async fn release_files(
+    context: &DriverContext,
+    scope: BucketScope<'_>,
+    prefix: &str,
+    skip: &str,
+) -> Result<Vec<ReleaseFile>, ReleaseError> {
+    let unavailable = |error: &dyn std::fmt::Display| ReleaseError::Unavailable(error.to_string());
+    let mut files = Vec::new();
+    let mut continuation = None;
+    loop {
+        let listed = drive(
+            ListBucketOperation::new(ListBucketInput {
+                bucket: scope.bucket.to_string(),
+                group_id: scope.info.group_id,
+                continuation_token: continuation.take(),
+                max_keys: Some(1_000),
+                prefix: Some(prefix.to_string()),
+                delimiter: None,
+                start_after: None,
+            }),
+            context,
+        )
+        .await
+        .map_err(|error| unavailable(&error))?;
+        for object in listed.objects {
+            let key = object.head.key;
+            if key == skip {
+                continue;
+            }
+            let origin = read_origin(
+                context,
+                (scope.realm_id, scope.node_id),
+                scope.bucket,
+                &key,
+                None,
+            )
+            .await
+            .map_err(|error| unavailable(&error))?;
+            let Some(version) = scope.exact(&key, origin.version_id) else {
+                continue;
+            };
+            let size = (object.location.as_ref().map(|location| location.blob_size))
+                .or(object
+                    .source_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.content_length))
+                .unwrap_or_default();
+            let pin = origin.source.map(|source| {
+                let pin = SourcePin {
+                    url: source.url,
+                    path: source.path,
+                    source_version: None,
+                };
+                (pin, source.etag)
+            });
+            files.push(ReleaseFile {
+                key,
+                version,
+                size,
+                content: origin.content_hash.map(content_id),
+                pin,
+            });
+        }
+        match listed.continuation_token {
+            Some(token) => continuation = Some(token),
+            None => return Ok(files),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_pins_files() {
+        // The same release gives the same bytes, and names every file by its exact version.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let version = |seed: u8| {
+            OriginVersion::Global(GlobalId::Version {
+                realm_id,
+                version_id: Ulid::from_bytes([seed; 16]),
+            })
+        };
+        let spec = ReleaseSpec {
+            label: "6.0".to_string(),
+            prefix: "db/".to_string(),
+            upstream: vec![Identifier {
+                name: "DOI".to_string(),
+                value: "10.5281/zenodo.1".to_string(),
+                url: "https://doi.org/10.5281/zenodo.1".to_string(),
+                target: IdentifierTarget::Key,
+            }],
+            preparation: vec![Ulid::from_bytes([9; 16])],
+        };
+        let files = vec![
+            ReleaseFile {
+                key: "db/a.fasta".to_string(),
+                version: version(2),
+                size: 4,
+                content: Some(content_id([7; 32])),
+                pin: None,
+            },
+            ReleaseFile {
+                key: "db/b.tsv".to_string(),
+                version: version(3),
+                size: 9,
+                content: None,
+                pin: Some((
+                    SourcePin {
+                        url: Some("https://zenodo.org/records/1/files/b.tsv".to_string()),
+                        path: "b.tsv".to_string(),
+                        source_version: None,
+                    },
+                    Some("\"abc\"".to_string()),
+                )),
+            },
+        ];
+        let bytes = release_crate(&spec, &files);
+        assert_eq!(bytes, release_crate(&spec, &files));
+        let crate_json: Value = serde_json::from_slice(&bytes).unwrap();
+        let pinned = pinned_ids(&crate_json);
+        assert!(pinned.contains(&version(2).to_id()) && pinned.contains(&version(3).to_id()));
+        assert_eq!(upstream_of(&crate_json), spec.upstream);
+        let reference = graph(&crate_json)
+            .find(|entity| entity["@id"] == version(3).to_id().as_str())
+            .unwrap();
+        assert_eq!(
+            reference["isBasedOn"]["@id"],
+            "https://zenodo.org/records/1/files/b.tsv"
+        );
+        let etag = format!("{}#source-etag", version(3).to_id());
+        let property = graph(&crate_json)
+            .find(|entity| entity["@id"] == etag.as_str())
+            .unwrap();
+        assert_eq!(property["value"], "\"abc\"");
+    }
 }

@@ -39,13 +39,17 @@ use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::identifiers::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
-use crate::routes::storage::bucket_metadata::BucketMetadataBody;
+use crate::routes::storage::bucket_metadata::{BucketIdentifierBody, BucketMetadataBody};
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
 use crate::routes::storage::relay::{
     self, RestForward, node_directed, node_read, relay_get, relayed_set, stale_miss,
 };
 use crate::server::state::ServerState;
+use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
+use aruna_operations::s3::bucket::release::{
+    BucketScope, MembershipCaller, MembershipQuery, release_members,
+};
 
 /// How long an origin read directed at another node may take, body included.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -156,6 +160,40 @@ pub struct OriginResponse {
     /// Ranges a copy answered for because their coordinator could not; it may be behind.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_ranges: Vec<String>,
+    /// Releases of the bucket that pin exactly this version and the caller may read.
+    #[serde(default)]
+    pub releases: Vec<ReleaseView>,
+    /// `false` when release membership could not be checked everywhere, so one may be missing.
+    #[serde(default = "complete_default")]
+    pub releases_complete: bool,
+}
+
+fn complete_default() -> bool {
+    true
+}
+
+/// A release that pins a version: its release crate's exact version, label and upstream ids.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReleaseView {
+    pub crate_version: String,
+    pub label: String,
+    pub upstream: Vec<BucketIdentifierBody>,
+}
+
+impl From<ReleaseRef> for ReleaseView {
+    fn from(release: ReleaseRef) -> Self {
+        Self {
+            crate_version: release.crate_version.to_id(),
+            label: release.label,
+            upstream: (release.upstream.into_iter())
+                .map(|identifier| BucketIdentifierBody {
+                    name: identifier.name,
+                    value: identifier.value,
+                    url: identifier.url,
+                })
+                .collect(),
+        }
+    }
 }
 
 fn version_id(version: &OriginVersion) -> String {
@@ -236,6 +274,8 @@ impl From<OriginView> for OriginResponse {
             identifiers: view.identifiers.into_iter().map(Into::into).collect(),
             content_id: view.content_hash.map(content_id),
             stale_ranges: Vec::new(),
+            releases: Vec::new(),
+            releases_complete: true,
         }
     }
 }
@@ -260,6 +300,10 @@ impl From<OriginView> for OriginResponse {
   uploads and imports in place; `identifier` for each link the database's parser finds.
 - `bucket_metadata` and `identifiers` come from the bucket's metadata now, not from when the
   version was made; a bucket without metadata gives none.
+- `releases` lists the bucket's releases whose release crate names exactly this version, among
+  those the caller may read. `releases_complete` is `false` when membership could not be
+  checked everywhere (a range holder of a distributed bucket did not answer), so a release may
+  be missing.
 - Without `version_id` the range's coordinator answers. While it cannot, a ready copy answers
   and `stale_ranges` names the range, since the copy may be behind; a 404 from a copy has the
   code `stale_not_found` and says the version may exist.
@@ -424,8 +468,32 @@ async fn origin_answer(
         (OriginError::BucketMissing | OriginError::VersionMissing, _) => ServerError::NotFound,
         (OriginError::Storage(reason), _) => ServerError::InternalError(reason),
     })?;
+    let version_id = view.version_id;
     let mut answer = OriginResponse::from(view);
     answer.stale_ranges = stale.iter().map(ToString::to_string).collect();
+    // Only releases the caller may read count; any other node is asked with its own bearer.
+    let scope = BucketScope {
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        bucket: &bucket,
+        info: &info,
+    };
+    let caller = MembershipCaller {
+        auth,
+        bearer: bearer.as_ref().map(ValidatedBearer::as_str),
+    };
+    let query = [MembershipQuery {
+        key: params.key.clone(),
+        version_id,
+    }];
+    match release_members(state.get_ctx().as_ref(), scope, caller, &query).await {
+        Ok(mut members) => {
+            let members = members.remove(0);
+            answer.releases = members.releases.into_iter().map(Into::into).collect();
+            answer.releases_complete = members.complete;
+        }
+        Err(_) => answer.releases_complete = false,
+    }
     Ok(Json(answer))
 }
 

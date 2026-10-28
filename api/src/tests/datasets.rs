@@ -7,11 +7,7 @@ use crate::metadata::{CreateMetadataRequest, CreateRoCrateRequest};
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::tests::{TestState, drain_metadata_background};
 use crate::tests::distributed::{bucket_info, write};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::realm::{
-    RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
-};
+use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use axum::extract::State;
 use axum::{Extension, Json};
 use serde_json::json;
@@ -70,38 +66,4 @@ pub(crate) async fn describe(test: &TestState, path: &str, public: bool, link: &
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
     Ulid::from_string(&created.summary.document_id).unwrap()
-}
-
-/// Makes the node a management node and its user a realm admin, who may curate the database
-/// list.
-pub(crate) async fn grant_curator(test: &TestState) {
-    let realm_id = test.state.get_realm_id();
-    let mut document = RealmAuthorizationDocument::default_realm_doc(realm_id);
-    for role in document.roles.values_mut() {
-        role.assigned_users.insert(test.auth.user_id);
-    }
-    let actor = Actor {
-        node_id: test.state.get_node_id(),
-        user_id: test.auth.user_id,
-        realm_id,
-    };
-    let key = realm_id.as_bytes().to_vec();
-    write(
-        &test.state,
-        AUTH_KEYSPACE,
-        key.clone(),
-        document.to_bytes(&actor).unwrap(),
-    )
-    .await;
-    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-    config.seed_default_placement();
-    config.ensure_node(test.state.get_node_id(), RealmNodeKind::Management);
-    config.seed_job_control(test.state.get_node_id(), 0);
-    write(
-        &test.state,
-        REALM_CONFIG_KEYSPACE,
-        key,
-        config.to_bytes(&actor).unwrap(),
-    )
-    .await;
 }

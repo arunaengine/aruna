@@ -429,7 +429,7 @@ mod mint {
             text: "x".to_string(),
             content_type: None,
         };
-        let stored = store_text(&node.state, &node.owner, &info, input)
+        let stored = store_text(&node.state, &node.owner, &info, input, Default::default())
             .await
             .unwrap();
         let head = BlobHeadKey::new(BUCKET, "a.md").to_bytes().unwrap();

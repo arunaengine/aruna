@@ -63,6 +63,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
         .merge(storage::bucket_metadata::router())
+        .merge(storage::releases::router())
         .merge(storage::moves::router())
         .merge(storage::rename::router())
         .merge(storage::checks::router())
@@ -273,6 +274,8 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/distribution"),
         ("GET", "/data/buckets/{bucket}/metadata"),
         ("PUT", "/data/buckets/{bucket}/metadata"),
+        ("GET", "/data/buckets/{bucket}/releases"),
+        ("POST", "/data/buckets/{bucket}/releases"),
         ("GET", "/data/buckets/{bucket}/links"),
         ("GET", "/data/buckets/{bucket}/objects"),
         ("GET", "/data/buckets/{bucket}/objects/origin"),
