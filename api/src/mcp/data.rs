@@ -27,15 +27,11 @@ use aruna_operations::s3::object::get::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
 };
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_operations::s3::object::list::{
-    ListBucketInput, ListBucketOperation, ListContinuationToken, ListedObject,
-};
+use aruna_operations::s3::object::list::{ListBucketInput, ListBucketOperation, ListedObject};
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use rmcp::Json;
@@ -396,55 +392,27 @@ impl McpServer {
         .await
         .map_err(|error| object_error(error, "read"))?;
         let limit = input.limit.unwrap_or(100).clamp(1, 200);
-        // A distributed bucket is listed across its key ranges.
-        if bucket_info.distribution.is_some() {
-            let bearer = request_bearer(&parts);
-            let request = ListRequest {
-                bucket: input.bucket.clone(),
-                prefix: input.prefix,
-                delimiter: None,
-                cursor: input.cursor,
-                limit,
-            };
-            // Only what the caller may read shows, as in the bucket's own listing.
-            let expiry = bearer
-                .as_ref()
-                .map_or(0, crate::auth::ValidatedBearer::expires_at_secs);
-            let caller = (bearer.as_ref(), Some((&auth, expiry)));
-            let page = object_page(&self.state, &bucket_info, caller, request)
-                .await
-                .map_err(server_error)?;
-            return Ok(Json(ObjectsOutput {
-                bucket: input.bucket,
-                objects: page.objects,
-                next_cursor: page.next_cursor,
-            }));
-        }
-        let cursor = input.cursor.as_deref().map(decode_cursor).transpose()?;
-        let result = drive(
-            ListBucketOperation::new(ListBucketInput {
-                bucket: input.bucket.clone(),
-                group_id: bucket_info.group_id,
-                continuation_token: cursor,
-                max_keys: Some(limit),
-                prefix: input.prefix,
-                delimiter: None,
-                start_after: None,
-            }),
-            &self.state.get_ctx(),
-        )
-        .await
-        .map_err(internal_error)?;
-        let objects = result.objects.iter().map(object_output).collect();
-        let next_cursor = result
-            .continuation_token
+        // Only what the caller may read shows, as in the bucket's own listing; a distributed
+        // bucket is listed across its key ranges.
+        let bearer = request_bearer(&parts);
+        let request = ListRequest {
+            bucket: input.bucket.clone(),
+            prefix: input.prefix,
+            delimiter: None,
+            cursor: input.cursor,
+            limit,
+        };
+        let expiry = bearer
             .as_ref()
-            .map(encode_cursor)
-            .transpose()?;
+            .map_or(0, crate::auth::ValidatedBearer::expires_at_secs);
+        let caller = (bearer.as_ref(), Some((&auth, expiry)));
+        let page = object_page(&self.state, &bucket_info, caller, request)
+            .await
+            .map_err(server_error)?;
         Ok(Json(ObjectsOutput {
             bucket: input.bucket,
-            objects,
-            next_cursor,
+            objects: page.objects,
+            next_cursor: page.next_cursor,
         }))
     }
 
@@ -1190,21 +1158,6 @@ fn bounded_bytes(max_bytes: Option<usize>) -> Result<usize, CallToolResult> {
         )));
     }
     Ok(max_bytes)
-}
-
-fn decode_cursor(cursor: &str) -> Result<ListContinuationToken, CallToolResult> {
-    const REASON: &str = "cursor must be a next_cursor value copied verbatim from a previous \
-                          list_objects answer for the same bucket and prefix; omit it to start at \
-                          the first page";
-    let bytes = STANDARD.decode(cursor).map_err(|_| bad_request(REASON))?;
-    ListContinuationToken::from_bytes(&bytes).map_err(|_| bad_request(REASON))
-}
-
-fn encode_cursor(cursor: &ListContinuationToken) -> Result<String, CallToolResult> {
-    cursor
-        .to_bytes()
-        .map(|bytes| STANDARD.encode(bytes))
-        .map_err(internal_error)
 }
 
 /// Search visibility is decided per hit by the shared REST path; the gate here
