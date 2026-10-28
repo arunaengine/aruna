@@ -277,7 +277,6 @@ pub(crate) mod tests {
         ("PUT", "/data/buckets/{bucket}/metadata"),
         ("GET", "/data/buckets/{bucket}/releases"),
         ("POST", "/data/buckets/{bucket}/releases"),
-        ("GET", "/data/buckets/{bucket}/links"),
         ("GET", "/data/buckets/{bucket}/objects"),
         ("GET", "/data/buckets/{bucket}/objects/origin"),
         ("GET", "/data/origin"),
