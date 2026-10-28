@@ -33,6 +33,7 @@ async fn version(handle: &StorageHandle, key: &str, seed: u8, generation: u64, h
         referenced: false,
         identity: Some([seed; 32]),
         pending: false,
+        searchable: false,
     };
     let mut change = InventoryChange::new(set(), key);
     change.added.push(AddedVersion {
