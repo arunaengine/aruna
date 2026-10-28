@@ -13,6 +13,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
+use aruna_core::structs::storage::distribution::KeyRange;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -347,6 +348,38 @@ async fn release_files_page() -> TestResult<()> {
     let (rest, next) = release_files(context, scope, &access, asked, (None, next)).await?;
     assert_eq!(rest.len(), count - 256);
     assert_eq!(rest[0].key, "db/0256.fasta");
+    assert_eq!(next, None);
+
+    // A range's page lists only the range: unreadable keys before it neither refuse the page
+    // nor name its end.
+    let range = KeyRange {
+        range_id: Ulid::from(1u128),
+        lower: "db/0100.fasta".to_string(),
+        upper: Some("db/0110.fasta".to_string()),
+        lineage: None,
+        coordinator: Ulid::from(2u128),
+        epoch: 1,
+        replicas: Vec::new(),
+    };
+    let inside = object_permission_path(
+        realm.realm_id,
+        group_id,
+        holder.node_id(),
+        BUCKET,
+        "db/010*",
+    );
+    let restricted = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: inside,
+            permission: Permission::READ,
+        }]),
+        ..realm.auth_context()
+    };
+    let access = load_access(context, scope, &restricted).await?;
+    let (files, next) = release_files(context, scope, &access, asked, (Some(&range), None)).await?;
+    let keys: Vec<_> = files.iter().map(|file| file.key.as_str()).collect();
+    assert_eq!(keys.len(), 10);
+    assert_eq!(keys[0], "db/0100.fasta");
     assert_eq!(next, None);
     Ok(())
 }

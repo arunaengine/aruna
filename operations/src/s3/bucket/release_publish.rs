@@ -213,20 +213,23 @@ pub async fn release_files(
     let mut files = Vec::new();
     let (mut continuation, mut after) = (None, after);
     loop {
-        let listed = drive(
-            ListBucketOperation::new(ListBucketInput {
-                bucket: scope.bucket.to_string(),
-                group_id: scope.info.group_id,
-                continuation_token: continuation.take(),
-                max_keys: Some(FILE_PAGE),
-                prefix: Some(prefix.to_string()),
-                delimiter: None,
-                start_after: after.take(),
-            }),
-            context,
-        )
-        .await
-        .map_err(|error| unavailable(&error))?;
+        let list = ListBucketOperation::new(ListBucketInput {
+            bucket: scope.bucket.to_string(),
+            group_id: scope.info.group_id,
+            continuation_token: continuation.take(),
+            max_keys: Some(FILE_PAGE),
+            prefix: Some(prefix.to_string()),
+            delimiter: None,
+            start_after: after.take(),
+        });
+        // Only the range's keys are listed, so no key outside it decides the page or its end.
+        let list = match range {
+            Some(range) => list.with_bounds(range.lower.clone(), range.upper.clone()),
+            None => list,
+        };
+        let listed = drive(list, context)
+            .await
+            .map_err(|error| unavailable(&error))?;
         let last = (listed.objects.last()).map(|object| object.head.key.clone());
         for object in listed.objects {
             let key = object.head.key;
