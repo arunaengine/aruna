@@ -2104,6 +2104,54 @@ async fn resumed_prefix_fills_page() {
 }
 
 #[tokio::test]
+async fn refuses_stale_markers() {
+    // A sealed marker this node cannot open, as after its restart, is refused by ListObjects and
+    // ListObjectVersions instead of being read as a key that sorts past every object.
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    let stale = format!("~{}", URL_SAFE_NO_PAD.encode([0xFF; 64]));
+    let mut extensions = Extensions::new();
+    extensions.insert(user_access.clone());
+    extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+    let request = S3Request {
+        input: s3s::dto::ListObjectsInput {
+            bucket: "study".to_string(),
+            marker: Some(stale.clone()),
+            ..Default::default()
+        },
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions: extensions.clone(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let error = service.list_objects(request).await.unwrap_err();
+    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument);
+    let request = S3Request {
+        input: s3s::dto::ListObjectVersionsInput {
+            bucket: "study".to_string(),
+            key_marker: Some(stale),
+            ..Default::default()
+        },
+        method: Method::GET,
+        uri: Uri::from_static("/"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let error = service.list_object_versions(request).await.unwrap_err();
+    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument);
+}
+
+#[tokio::test]
 async fn cursor_names_shown() {
     // A page that also passed a hidden link continues after the last key it showed, so its
     // token never names the hidden one.

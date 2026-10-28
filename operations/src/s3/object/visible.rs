@@ -19,9 +19,11 @@ use crate::s3::object::search::{open_position, seal_position, sealed_position};
 /// its sealed cursor resumes there, so it bounds the work of one request, never its results.
 pub const SCAN_BUDGET: usize = 1_000;
 
-/// Starts a sealed cursor; no base64 token of a listing does, and a marker that is a key
-/// starting with it stays that key when it does not open.
+/// Starts a sealed cursor; no base64 token of a listing does. A marker key starting with it
+/// stays a key unless it has the whole shape of a sealed cursor.
 const SEALED_MARK: char = '~';
+/// The bytes a sealed position adds to its plain one: its tag, nonce and authentication tag.
+const SEALED_OVERHEAD: usize = 1 + 24 + 16;
 
 /// A listing position sealed with this node's key, so it names no entry; a restart of the
 /// node makes it invalid.
@@ -30,9 +32,12 @@ pub fn seal_cursor(value: &impl Serialize) -> Option<String> {
     Some(format!("{SEALED_MARK}{}", URL_SAFE_NO_PAD.encode(sealed)))
 }
 
-/// Whether `text` claims to be a sealed cursor.
+/// Whether `text` has the shape of a sealed cursor: the mark, then base64 of a sealed position.
+/// One that does not open, as after a restart of the node, is refused, never read as a key.
 pub fn is_sealed(text: &str) -> bool {
-    text.starts_with(SEALED_MARK)
+    (text.strip_prefix(SEALED_MARK))
+        .and_then(|rest| URL_SAFE_NO_PAD.decode(rest).ok())
+        .is_some_and(|sealed| sealed_position(&sealed) && sealed.len() > SEALED_OVERHEAD)
 }
 
 /// The position a sealed cursor of this node holds; `None` for any other text.
@@ -306,5 +311,24 @@ where
                 input.start_after = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tells_sealed_markers() {
+        // A sealed cursor opens here; one sealed elsewhere keeps its shape but does not open,
+        // and a key that merely starts with the mark is no sealed cursor.
+        let cursor = seal_cursor(&HiddenCursor::default()).unwrap();
+        assert!(is_sealed(&cursor));
+        assert_eq!(open_cursor(&cursor), Some(HiddenCursor::default()));
+        let foreign = format!("~{}", URL_SAFE_NO_PAD.encode([0xFF; 64]));
+        assert!(is_sealed(&foreign));
+        assert_eq!(open_cursor::<HiddenCursor>(&foreign), None);
+        assert!(!is_sealed("~notes.txt"));
+        assert!(!is_sealed("plain"));
     }
 }

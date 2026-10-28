@@ -862,7 +862,13 @@ impl S3 for ArunaS3Service {
         }
 
         // A sealed marker resumes among hidden entries; any other marker is a key.
-        let hidden = marker.as_deref().and_then(open_cursor::<HiddenCursor>);
+        let hidden = match marker.as_deref().filter(|marker| is_sealed(marker)) {
+            Some(marker) => Some(
+                open_cursor::<HiddenCursor>(marker)
+                    .ok_or_else(|| s3_error!(InvalidArgument, "Invalid marker"))?,
+            ),
+            None => None,
+        };
         let key_marker = marker.as_deref().filter(|_| hidden.is_none());
         let continuation_token = marker_continuation_token(
             &bucket,
@@ -2679,9 +2685,13 @@ impl S3 for ArunaS3Service {
         }
 
         // A sealed key marker resumes among versions the caller may not see.
-        let hidden = key_marker
-            .as_deref()
-            .and_then(open_cursor::<link::VersionCursor>);
+        let hidden = match key_marker.as_deref().filter(|marker| is_sealed(marker)) {
+            Some(marker) => Some(
+                open_cursor::<link::VersionCursor>(marker)
+                    .ok_or_else(|| s3_error!(InvalidArgument, "Invalid key-marker"))?,
+            ),
+            None => None,
+        };
         let (key_marker, version_id_marker) = match hidden {
             Some(_) => (None, None),
             None => (key_marker, version_id_marker),
