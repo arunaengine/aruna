@@ -487,8 +487,8 @@ async fn origin_answer(
         version_id,
     }];
     match release_members(state.get_ctx().as_ref(), scope, caller, &query).await {
-        Ok(mut members) => {
-            let members = members.remove(0);
+        Ok(mut found) => {
+            let members = found.answers.remove(0);
             answer.releases = members.releases.into_iter().map(Into::into).collect();
             answer.releases_complete = members.complete;
         }

@@ -29,9 +29,9 @@ use crate::metadata::protocol::{
     read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
     write_message,
 };
-use crate::s3::bucket::release::{MembershipQuery, RangeMembers};
 use crate::s3::bucket::search::BucketSearchHit;
 use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
+use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
 #[tracing::instrument(
     name = "metadata.remote.request",
@@ -412,8 +412,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::SearchResults { .. } => "search_results",
         MetadataTransportMessage::SearchBuckets { .. } => "search_buckets",
         MetadataTransportMessage::BucketSearchResults { .. } => "bucket_search_results",
-        MetadataTransportMessage::ReleaseMembers { .. } => "release_members",
-        MetadataTransportMessage::ReleaseMembersResults { .. } => "release_members_results",
+        MetadataTransportMessage::ReleaseHolder { .. } => "release_holder",
+        MetadataTransportMessage::ReleaseHolderResults { .. } => "release_holder_results",
         MetadataTransportMessage::SearchObjects { .. } => "search_objects",
         MetadataTransportMessage::ObjectSearchResults { .. } => "object_search_results",
         MetadataTransportMessage::CreateSyncMirror { .. } => "create_sync_mirror",
@@ -780,29 +780,29 @@ impl MetadataHandle {
         }
     }
 
-    /// Asks a record holder which releases pin the queried versions in its ranges.
-    pub async fn request_release_members(
+    /// Asks a range coordinator about releases or release files in its ranges.
+    pub async fn request_release_holder(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
-        (bucket, range_ids, queries): (String, Vec<Ulid>, Vec<MembershipQuery>),
-    ) -> Result<RangeMembers, MetadataReadError> {
+        bucket: String,
+        ask: HolderAsk,
+    ) -> Result<HolderAnswer, MetadataReadError> {
         let span = Span::current();
         match send_remote_request(
             &self.inner,
             &span,
             node_id,
-            MetadataTransportMessage::ReleaseMembers {
+            MetadataTransportMessage::ReleaseHolder {
                 auth_token,
                 bucket,
-                range_ids,
-                queries,
+                ask,
             },
         )
         .await
         .map_err(|_| MetadataReadError::Unavailable)?
         {
-            MetadataTransportMessage::ReleaseMembersResults { result } => result,
+            MetadataTransportMessage::ReleaseHolderResults { result } => result,
             _ => Err(MetadataReadError::Unavailable),
         }
     }

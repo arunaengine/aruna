@@ -14,6 +14,7 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permissi
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
@@ -78,7 +79,9 @@ async fn ask(
         auth: &auth,
         bearer: None,
     };
-    Ok(release_members(context, scope, caller, queries).await?)
+    Ok(release_members(context, scope, caller, queries)
+        .await?
+        .answers)
 }
 
 #[tokio::test]
@@ -211,17 +214,23 @@ async fn releases_pin_versions() -> TestResult<()> {
         .metadata_handle
         .as_ref()
         .ok_or("handle")?;
-    let request = || {
-        (
-            BUCKET.to_string(),
-            vec![Ulid::from(5u128)],
-            queries.to_vec(),
-        )
+    let ask = || HolderAsk::Members {
+        range_ids: vec![Ulid::from(5u128)],
+        queries: queries.to_vec(),
     };
+    let bucket = || BUCKET.to_string();
     let answer = handle
-        .request_release_members(holder.node_id(), Some(realm.bearer_token()), request())
+        .request_release_holder(
+            holder.node_id(),
+            Some(realm.bearer_token()),
+            bucket(),
+            ask(),
+        )
         .await
         .map_err(|error| format!("{error:?}"))?;
+    let HolderAnswer::Members(answer) = answer else {
+        return Err("a membership answer".into());
+    };
     assert_eq!(
         answer.refused,
         vec![Ulid::from(5u128)],
@@ -229,11 +238,11 @@ async fn releases_pin_versions() -> TestResult<()> {
     );
     let forged = AuthToken::bearer("forged").map_err(|error| format!("{error:?}"))?;
     let refused = handle
-        .request_release_members(holder.node_id(), Some(forged), request())
+        .request_release_holder(holder.node_id(), Some(forged), bucket(), ask())
         .await;
     assert_eq!(refused, Err(MetadataReadError::Unauthorized));
     let missing = handle
-        .request_release_members(holder.node_id(), None, request())
+        .request_release_holder(holder.node_id(), None, bucket(), ask())
         .await;
     assert_eq!(missing, Err(MetadataReadError::Unauthorized));
     let device = realm
@@ -243,7 +252,12 @@ async fn releases_pin_versions() -> TestResult<()> {
         .as_ref()
         .ok_or("handle")?;
     let from_device = device
-        .request_release_members(holder.node_id(), Some(realm.bearer_token()), request())
+        .request_release_holder(
+            holder.node_id(),
+            Some(realm.bearer_token()),
+            bucket(),
+            ask(),
+        )
         .await;
     assert!(from_device.is_err(), "a device is no infrastructure peer");
     Ok(())

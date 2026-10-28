@@ -32,7 +32,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::release::holder_members;
+use crate::s3::bucket::release_publish::holder_answer;
 use crate::s3::bucket::search::{SearchBucketsInput, search_local_buckets};
 use crate::s3::object::search::{SearchObjectsInput, search_local_objects};
 use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
@@ -530,11 +530,10 @@ impl MetadataHandle {
                 })
                 .await
             }
-            MetadataTransportMessage::ReleaseMembers {
+            MetadataTransportMessage::ReleaseHolder {
                 auth_token,
                 bucket,
-                range_ids,
-                queries,
+                ask,
             } => {
                 let result = Box::pin(async {
                     let realm_id = self.inner.net_handle.as_ref().map(|net| *net.realm_id());
@@ -545,13 +544,12 @@ impl MetadataHandle {
                     let net_handle =
                         (self.inner.net_handle.as_ref()).ok_or(MetadataReadError::Unavailable)?;
                     let scope = (*net_handle.realm_id(), net_handle.node_id());
-                    let asked = (bucket.as_str(), range_ids.as_slice(), queries.as_slice());
-                    holder_members(context.as_ref(), scope, &auth, asked)
+                    holder_answer(context.as_ref(), scope, &auth, (bucket.as_str(), ask))
                         .await
                         .map_err(|_| MetadataReadError::Unavailable)
                 })
                 .await;
-                MetadataTransportMessage::ReleaseMembersResults { result }
+                MetadataTransportMessage::ReleaseHolderResults { result }
             }
             _ => unreachable!("request family routed incorrectly"),
         }
@@ -1038,7 +1036,7 @@ impl MetadataHandle {
             }
             message @ (MetadataTransportMessage::SearchBuckets { .. }
             | MetadataTransportMessage::SearchObjects { .. }
-            | MetadataTransportMessage::ReleaseMembers { .. }) => {
+            | MetadataTransportMessage::ReleaseHolder { .. }) => {
                 (self.bucket_request(context, peer, message).await, None)
             }
             MetadataTransportMessage::LookupIdentifier {
