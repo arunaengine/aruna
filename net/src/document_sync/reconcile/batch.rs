@@ -399,9 +399,6 @@ pub(super) async fn retry_admin(
             .await?
             {
                 AdminEventValidation::Accepted => {
-                    if let Some(key) = deferred.parked.clone() {
-                        unpark_parser(&service.storage, key).await?;
-                    }
                     let dependencies = satisfied_dependencies(&deferred.target, &deferred.event);
                     apply_admin_operation(
                         &service.storage,
@@ -409,6 +406,9 @@ pub(super) async fn retry_admin(
                         deferred.event,
                     )
                     .await?;
+                    if let Some(key) = deferred.parked.clone() {
+                        unpark_parser(&service.storage, key).await?;
+                    }
                     state.validation_cache.invalidate();
                     state.outcome.satisfied.extend(dependencies);
                     state.add_target(deferred.target);
