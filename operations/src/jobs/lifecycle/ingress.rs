@@ -134,12 +134,7 @@ pub async fn serve_input_resolve(
         .await
         .map_err(|_| SubmissionRefusal::Unavailable)?;
     // Only a realm node resolves for an ingress; a device forwards its whole submission.
-    if auth.user_id != request.created_by
-        || auth.realm_id != config.realm_id
-        || !is_sync_eligible(&config, peer)
-    {
-        return Err(SubmissionRefusal::Unauthorized);
-    }
+    resolver_admits(&auth, request.created_by, &config, peer)?;
     if request
         .inputs
         .iter()
@@ -158,6 +153,25 @@ pub async fn serve_input_resolve(
     capture_inputs(context, &request.inputs, caller, local)
         .await
         .map_err(refusal_of)
+}
+
+/// Whether a validated bearer may have inputs resolved and granted for it: its own user, this
+/// realm, a realm node asking, and no path restriction. Grants and reads run unrestricted, so a
+/// restricted bearer is refused, as submissions refuse restricted credentials.
+fn resolver_admits(
+    auth: &AuthContext,
+    created_by: UserId,
+    config: &RealmConfigDocument,
+    peer: NodeId,
+) -> Result<(), SubmissionRefusal> {
+    match auth.user_id == created_by
+        && auth.realm_id == config.realm_id
+        && auth.path_restrictions.is_none()
+        && is_sync_eligible(config, peer)
+    {
+        true => Ok(()),
+        false => Err(SubmissionRefusal::Unauthorized),
+    }
 }
 
 /// Normalizes, authorizes, and admits one external execution request.
@@ -1259,8 +1273,8 @@ async fn admit_forwarded(
         return Err(SubmissionRefusal::Unauthorized);
     }
     // A user device is owner-bound: whatever token it presents, the submission it
-    // forwards must be its owner's own.
-    if !peer_acts_for(&config, peer, auth.user_id) {
+    // forwards must be its owner's own. Its inputs resolve unrestricted, so the token must be.
+    if !peer_acts_for(&config, peer, auth.user_id) || auth.path_restrictions.is_some() {
         return Err(SubmissionRefusal::Unauthorized);
     }
     authorize_group(context, &auth, &request, local)
@@ -1770,6 +1784,42 @@ mod tests {
             releases_complete: false,
             grant: None,
         }
+    }
+
+    #[test]
+    fn refuses_restricted_resolver() {
+        // A bearer narrowed to some paths never gets unrestricted reads or grants resolved.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let peer = node(2);
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 1);
+        config
+            .nodes
+            .push(aruna_core::structs::identity::realm::RealmNode {
+                node_id: peer.to_string(),
+                kind: aruna_core::structs::identity::realm::RealmNodeKind::Server,
+            });
+        let user = UserId::local(Ulid::from_parts(3, 3), realm_id);
+        let open = AuthContext {
+            user_id: user,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        assert_eq!(resolver_admits(&open, user, &config, peer), Ok(()));
+        let restricted = AuthContext {
+            path_restrictions: Some(vec![aruna_core::structs::identity::auth::PathRestriction {
+                pattern: "/x/**".to_string(),
+                permission: Permission::READ,
+            }]),
+            ..open.clone()
+        };
+        assert_eq!(
+            resolver_admits(&restricted, user, &config, peer),
+            Err(SubmissionRefusal::Unauthorized)
+        );
+        let other = UserId::local(Ulid::from_parts(4, 4), realm_id);
+        assert!(resolver_admits(&open, other, &config, peer).is_err());
+        assert!(resolver_admits(&open, user, &config, node(9)).is_err());
     }
 
     #[test]
