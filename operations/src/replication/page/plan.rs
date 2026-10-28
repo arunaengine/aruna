@@ -123,6 +123,8 @@ pub(super) struct PageGuards {
     pub binding: DistributionBinding,
     /// Whether the bucket's own placement rules govern every record it takes.
     pub governed: bool,
+    /// Whether the set keeps a search index, so heads feed it.
+    pub search: bool,
     pub existing: Vec<Option<BlobVersion>>,
     pub heads: Vec<Option<CurrentVersionPointer>>,
 }
@@ -268,6 +270,7 @@ pub(super) fn check_guards(
         group_id: bucket.group_id,
         binding,
         governed: !bucket.placement_policies.is_empty(),
+        search: snapshot.config.settings.search_index,
         existing,
         heads,
     })
@@ -411,6 +414,7 @@ pub(super) fn page_rows(
         if let Some(mut change) = version_written(Some(&guards.binding), key, added, install) {
             // A reference carries its source root, which a member taking over the range checks.
             change.root = manifest.source.as_ref().and_then(RootEntry::of);
+            change.feed = guards.search;
             rows.inventory.push(change);
         }
         rows.written += 1;
