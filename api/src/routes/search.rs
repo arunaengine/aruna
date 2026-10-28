@@ -401,6 +401,10 @@ to its own buckets, so a bucket the caller may not read never appears.
   `q` and `group_id`; every page checks authorization again.
 - A node that fails on a page keeps its position, so a later page asks it again from there; the
   listing then ends only once every node answered to its end.
+- One page asks at most 32 nodes. Nodes left out stay in the cursor and are asked on later
+  pages, once others reached their end; hits are then ordered within each page only.
+- A node that scans many buckets without enough hits ends its part of the page where its scan
+  stopped, and the next page goes on from there.
 - A node that fails, times out or is dropped by the node cap does not fail the request. The answer
   is partial and reports it through `nodes_queried`, `nodes_failed` and `failed_nodes`, which names
   the nodes that did not answer and carries `partition-discovery` when node discovery itself

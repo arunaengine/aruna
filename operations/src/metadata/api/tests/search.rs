@@ -317,6 +317,53 @@ async fn capped_fanout_incomplete() {
     assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));
 }
 
+#[tokio::test]
+async fn capped_fanout_names_rest() {
+    // The nodes the cap leaves out are named, and skipping the asked ones reaches them next.
+    let directory = tempdir().unwrap();
+    let context = DriverContext {
+        storage_handle: storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let nodes = (0..=QUERY_MAX_NODES)
+        .map(|index| iroh::SecretKey::from_bytes(&[60 + index as u8; 32]).public())
+        .collect::<Vec<_>>();
+    let local = nodes[0];
+    let fanout = |skip: Vec<NodeId>| {
+        let call = || -> MetadataNodeCall<NodeId> {
+            metadata_node_call((), |(), node_id| async move { Ok(node_id) })
+        };
+        let scope =
+            MetadataFanoutScope::new(Some(ApiQueryMode::Distributed), Some(nodes.clone()), true)
+                .with_skip(skip);
+        run_metadata_fanout(
+            &context,
+            RealmId::from_bytes([13u8; 32]),
+            local,
+            scope,
+            MetadataFanoutOperation::BucketSearch,
+            call(),
+            call(),
+            |_, _| {},
+            map_read_error,
+        )
+    };
+    let (first, stats) = fanout(Vec::new()).await.unwrap();
+    assert_eq!(first.len(), QUERY_MAX_NODES);
+    let [left_out] = stats.omitted[..] else {
+        panic!("one node is left out: {:?}", stats.omitted);
+    };
+    let asked: Vec<NodeId> = first.iter().map(|(node_id, _)| *node_id).collect();
+    assert!(!asked.contains(&left_out));
+    let (second, stats) = fanout(asked).await.unwrap();
+    assert!(second.iter().any(|(node_id, _)| *node_id == left_out));
+    assert!(stats.omitted.is_empty());
+}
+
 fn object_search_request(realm_id: RealmId, query: &str, limit: usize) -> SearchQueryRequest {
     SearchQueryRequest {
         auth: AuthContext {
@@ -435,6 +482,7 @@ fn search_assembly_order() {
         nodes_failed: 0,
         failed_partitions: Vec::new(),
         discovery_failed: false,
+        omitted: Vec::new(),
     };
     // A strict search fails rather than answer with a range nobody searched.
     let strict = ObjectSearchPlan {
