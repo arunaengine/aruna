@@ -32,6 +32,8 @@ pub enum Target {
     /// An exact version id: a global id URL or a versioned object w3id.
     Version(String),
     Run(String),
+    /// A release crate's exact version, read as a nested crate.
+    Release(String),
 }
 
 /// One link to follow: the entity that refers to it, by which property, and the digest it
@@ -167,12 +169,14 @@ impl ProvenanceCrate {
             next.push(based_on(from));
         }
         self.database(&id, &origin["bucket_metadata"]);
-        self.releases(&id, origin);
+        next.extend(self.releases(&id, origin));
         next
     }
 
-    /// The releases that pin the version, and whether that could be checked everywhere.
-    fn releases(&mut self, id: &str, origin: &Value) {
+    /// The releases that pin the version, and whether that could be checked everywhere; returns
+    /// the release crates to read.
+    fn releases(&mut self, id: &str, origin: &Value) -> Vec<Hop> {
+        let mut crates = Vec::new();
         for release in origin["releases"].as_array().into_iter().flatten() {
             let Some(key) = release["crate_version"].as_str() else {
                 continue;
@@ -192,6 +196,12 @@ impl ProvenanceCrate {
             }
             self.put_new(key, &entity);
             self.add_ref(id, "isPartOf", key);
+            crates.push(Hop {
+                target: Target::Release(key.to_string()),
+                from: key.to_string(),
+                property: "subjectOf",
+                digest: None,
+            });
         }
         if origin["releases_complete"] == json!(false) {
             let key = format!("{id}#release-membership");
@@ -202,6 +212,34 @@ impl ProvenanceCrate {
             self.put(&key, &property);
             self.add_ref(id, "additionalProperty", &key);
         }
+        crates
+    }
+
+    /// Records a release crate, written as a nested crate when the caller may read it.
+    pub fn release(&mut self, hop: &Hop, release_crate: Option<&Value>) -> Option<CrateFile> {
+        let Target::Release(version) = &hop.target else {
+            return None;
+        };
+        let digest = blake3::hash(version.as_bytes()).to_hex();
+        let folder = format!("releases/{}/", &digest[..16]);
+        self.set_label(&asked(&hop.target), &folder);
+        let Some(release_crate) = release_crate else {
+            self.add_text(
+                version,
+                "description",
+                "The release crate is not visible to you",
+            );
+            return None;
+        };
+        let mut nested = entity(&folder, "Dataset");
+        nested.insert("name".into(), json!(format!("Release crate {version}")));
+        nested.insert("conformsTo".into(), json!({ "@id": NESTED_CRATE }));
+        self.put(&folder, &nested);
+        self.add_part(&folder);
+        self.link(hop, &folder);
+        let bytes = serde_json::to_vec_pretty(release_crate).unwrap_or_default();
+        let path = format!("{folder}ro-crate-metadata.json");
+        Some(CrateFile { path, bytes })
     }
 
     /// The bucket's database metadata now, as a Dataset the version is part of.
@@ -455,7 +493,7 @@ impl ProvenanceCrate {
         // A run names the file it made from its own side.
         match hop.target {
             Target::Run(_) => self.add_ref(to, "result", &hop.from),
-            Target::Version(_) => self.add_ref(&hop.from, hop.property, to),
+            Target::Version(_) | Target::Release(_) => self.add_ref(&hop.from, hop.property, to),
         }
     }
 
@@ -534,6 +572,7 @@ fn asked(target: &Target) -> String {
     match target {
         Target::Version(id) => id.clone(),
         Target::Run(run_id) => format!("run:{run_id}"),
+        Target::Release(id) => format!("release:{id}"),
     }
 }
 

@@ -53,6 +53,10 @@ fn walk(start: &str, answers: &BTreeMap<String, Value>) -> (Value, Vec<String>, 
                 built.push(next);
                 files.extend(file.map(|file| file.path));
             }
+            Target::Release(id) => {
+                let file = built.release(&hop, answers.get(&format!("release:{id}")));
+                files.extend(file.map(|file| file.path));
+            }
         }
     }
     (root(built), files, reads)
@@ -321,13 +325,24 @@ fn releases_join_export() {
         }],
         "releases_complete": false
     });
-    let answers = BTreeMap::from([(version.clone(), origin)]);
-    let (document, _, _) = walk(&version, &answers);
+    let release_crate = json!({"@graph": [{"@id": "./", "@type": "Dataset"}]});
+    let answers = BTreeMap::from([
+        (version.clone(), origin),
+        (format!("release:{release}"), release_crate),
+    ]);
+    let (document, files, _) = walk(&version, &answers);
     assert_eq!(
         node(&document, &version)["isPartOf"][0]["@id"],
         release.as_str()
     );
+    // The readable release crate is nested and named from the release.
+    let [nested] = files.as_slice() else {
+        panic!("one nested crate: {files:?}");
+    };
+    let folder = nested.trim_end_matches("ro-crate-metadata.json");
+    assert!(folder.starts_with("releases/"));
     let entity = node(&document, &release);
+    assert_eq!(entity["subjectOf"][0]["@id"], folder);
     assert_eq!(entity["version"], "6.0");
     assert_eq!(
         entity["isBasedOn"][0]["@id"],

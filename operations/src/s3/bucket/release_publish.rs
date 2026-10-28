@@ -605,7 +605,8 @@ pub async fn dispatch_release(context: &DriverContext, effect: ReleaseEffect) ->
     }
 }
 
-async fn read_crate(
+/// Reads one release crate version on this node with the caller's identity.
+pub async fn read_crate(
     context: &DriverContext,
     read: CrateRead,
 ) -> Result<CrateBytes, CrateReadError> {
