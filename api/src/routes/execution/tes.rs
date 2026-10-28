@@ -18,6 +18,7 @@ use aruna_core::structs::execution::job::{
     OutputSelection, PhysicalExecutionResult, ResultMessage, WorkspaceMode,
 };
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::auth::bearer_token::realm_user_cutoff;
@@ -563,7 +564,8 @@ naming a different one; a bearer token requires that tag.
 - An input url may instead be a versioned object ARN,
   `arn:aruna:<realm>:<node>:s3/<bucket>/<key>@<version>`. A local task then copies that exact
   version from the named realm node while staging; an unreachable node fails the run, not the
-  submission. The task reports such an input by its bucket and key.
+  submission. A task reports every input as the ARN of the exact version it read, so the task can
+  be submitted again unchanged.
 - A realm task reads every input from the bucket its `s3://` url names, at the version resolved
   when the task was accepted, so a later write to the source key never changes what a running task
   reads. Each declared output is written to the bucket its own url names. No bucket is created for
@@ -922,7 +924,7 @@ pub async fn get_task(
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     tes_json_response(
         StatusCode::OK,
-        project_task(&record, &details, view, &base_url),
+        project_task(&record, &details, view, (&base_url, state.get_realm_id())),
     )
 }
 
@@ -1096,7 +1098,9 @@ pub async fn list_tasks(
     };
     let tasks = records
         .iter()
-        .map(|(record, details)| project_task(record, details, view, &base_url))
+        .map(|(record, details)| {
+            project_task(record, details, view, (&base_url, state.get_realm_id()))
+        })
         .collect();
 
     tes_json_response(
@@ -1758,11 +1762,37 @@ impl TaskDetails {
     }
 }
 
+/// An input as the versioned object ARN a submission accepts: its source at the node and
+/// version the run captured, or else named; a plain `s3://` url only when it names neither.
+/// So a saved or repeated task reads exactly the data this run read.
+fn input_url(record: &JobRecord, input: &InputSelection, realm_id: RealmId) -> String {
+    let InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    let captured =
+        (record.captured_inputs.iter()).find(|captured| captured.destination_key == input.dest_key);
+    let pinned = match captured {
+        Some(captured) => Some((captured.source_node_id, captured.version_id)),
+        None => (input.source_node_id).zip(
+            version_id
+                .as_deref()
+                .and_then(|v| Ulid::from_string(v).ok()),
+        ),
+    };
+    pinned
+        .and_then(|(node_id, version)| {
+            VersionedObjectArn::new(realm_id, node_id, bucket, key, version).ok()
+        })
+        .map_or_else(|| format!("s3://{bucket}/{key}"), |arn| arn.to_string())
+}
+
 fn project_task(
     record: &JobRecord,
     details: &TaskDetails,
     view: TesView,
-    base_url: &str,
+    (base_url, realm_id): (&str, RealmId),
 ) -> TesTask {
     let id = record.job_id.to_string();
     let state = tes_state(record);
@@ -1801,11 +1831,10 @@ fn project_task(
         .iter()
         .filter_map(|input| {
             let container_path = input.container_path.as_ref()?;
-            let InputSource::S3 { bucket, key, .. } = &input.source;
             Some(TesInput {
                 name: input.name.clone(),
                 description: input.description.clone(),
-                url: Some(format!("s3://{bucket}/{key}")),
+                url: Some(input_url(record, input, realm_id)),
                 path: container_path.clone(),
                 kind: TesFileType::File,
                 ..Default::default()
