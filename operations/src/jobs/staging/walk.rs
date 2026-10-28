@@ -32,7 +32,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::limiter::paced;
+use super::limiter::retried;
 use super::manifest::{
     ManifestDigest, lasting_head, lasting_resolution, lasting_source, manifest_digests,
 };
@@ -514,7 +514,7 @@ async fn list_page(
         )
     };
     let transient = |error: &ListStagingError| (!lasting_list(error)).then(|| error.to_string());
-    paced((&ctx.cancel, &ctx.shutdown), (spec, 1), transient, list)
+    retried((&ctx.cancel, &ctx.shutdown), spec, transient, list)
         .await
         .map_err(list_failure)
 }
@@ -1030,7 +1030,7 @@ async fn head_observation(
             &ctx.driver,
         )
     };
-    let result = paced((&ctx.cancel, &ctx.shutdown), (spec, 1), transient, head)
+    let result = retried((&ctx.cancel, &ctx.shutdown), spec, transient, head)
         .await
         .map_err(|error| match lasting_head(&error) {
             true => ItemFailure::Stage(error.to_string()),

@@ -161,6 +161,7 @@ impl<'guard> HttpIndexClient<'guard> {
         } else if let Some(username) = &self.username {
             request = request.basic_auth(username, self.password.as_deref());
         }
+        crate::pace::turn().await;
         let mut response = request.send().await.map_err(|error| {
             StagingSourceError::ListError(format!("http request failed: {}", error.without_url()))
         })?;

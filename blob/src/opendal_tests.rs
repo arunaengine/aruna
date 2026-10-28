@@ -220,6 +220,28 @@ async fn source_read_unpinned() {
     }
 }
 
+// An unpinned read of a paced task sends its HEAD and its GET each with its own token.
+#[tokio::test]
+async fn paced_read_spaced() {
+    use crate::pace::{Pace, paced};
+    let source = SourceListener::bind(None, false).await;
+    let pace = Pace {
+        key: ulid::Ulid::from_bytes([3; 16]),
+        rate: 4,
+    };
+    let start = std::time::Instant::now();
+    let read = paced(pace, async {
+        let (_, stream) = read_staging_source(&test_guard(), &source.access(), None, None)
+            .await
+            .unwrap();
+        stream.try_collect::<Vec<Bytes>>().await.unwrap()
+    })
+    .await;
+    assert_eq!(read.concat(), b"hello");
+    assert_eq!(source.requests.lock().await.len(), 2);
+    assert!(start.elapsed() >= std::time::Duration::from_millis(250));
+}
+
 #[tokio::test]
 async fn source_read_range() {
     let source = SourceListener::bind(Some("\"v1\""), false).await;

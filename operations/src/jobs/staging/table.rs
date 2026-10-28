@@ -22,7 +22,7 @@ use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::StreamExt;
 
-use super::limiter::paced;
+use super::limiter::retried;
 use super::manifest::{lasting_head, lasting_resolution, lasting_source};
 use super::walk::{
     PageFailure, StagedFile, access_rules, commit_rows, coordinated, import_page, own_ranges,
@@ -242,7 +242,7 @@ async fn connector_chunk(
                 )
             };
             let transient = |error: &_| (!lasting_head(error)).then(|| format!("{error}"));
-            match paced(stop, (spec, 1), transient, head).await {
+            match retried(stop, spec, transient, head).await {
                 Ok(head) => head.metadata,
                 Err(error) if lasting_head(&error) => {
                     return Err(ChunkFailure::Lasting(format!("table unavailable: {error}")));
@@ -279,8 +279,7 @@ async fn connector_chunk(
             )
         };
         let transient = |error: &ReadSourceError| (!lasting_read(error)).then(|| error.to_string());
-        // An unpinned source read sends a HEAD before its GET.
-        let stream = match paced(stop, (spec, 2), transient, source).await {
+        let stream = match retried(stop, spec, transient, source).await {
             Ok(result) if result.metadata.compare(&observation) == ObservationMatch::Changed => {
                 return Err(ChunkFailure::Changed);
             }

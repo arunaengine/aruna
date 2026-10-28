@@ -9,6 +9,7 @@ mod manifest;
 mod table;
 mod walk;
 
+use aruna_blob::pace::{Pace, paced};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::{
     JobError, JobId, JobResultPayload, ManifestRead, StagingJobCheckpoint, StagingJobPhase,
@@ -63,6 +64,20 @@ async fn read_main(
 }
 
 pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
+    // Every source request of a table import, adapter retries included, takes a token.
+    match spec.table.as_ref() {
+        Some(table) => {
+            let pace = Pace {
+                key: spec.connector_id,
+                rate: table.rate(),
+            };
+            Box::pin(paced(pace, run_job(ctx, spec))).await
+        }
+        None => Box::pin(run_job(ctx, spec)).await,
+    }
+}
+
+async fn run_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
     if spec.strategy == StagingStrategy::Sync {
         return permanent_error("sync is not a staging job strategy");
     }

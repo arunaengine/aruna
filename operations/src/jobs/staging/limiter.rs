@@ -1,17 +1,12 @@
-//! Paces the source requests of table imports: one token bucket per read connector on this
-//! node, and backoff with `Retry-After` for transient answers.
+//! Sends the source requests of table imports again after transient answers, with backoff. The
+//! blob adapter paces every request it sends, these included.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use aruna_core::structs::execution::job::StagingJobSpec;
 use rand::RngExt;
-use tokio::time::Instant;
-use ulid::Ulid;
-
 use tokio_util::sync::CancellationToken;
 
 /// Attempts of one request while its answers stay transient.
@@ -22,44 +17,6 @@ const BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The longest `Retry-After` a page waits for; a longer one retries the job later.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
-
-static BUCKETS: LazyLock<Mutex<HashMap<Ulid, Bucket>>> = LazyLock::new(Default::default);
-
-/// Tokens refill at `rate` per second up to one; a request may borrow ahead and waits for it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Bucket {
-    tokens: f64,
-    at: Instant,
-}
-
-/// Takes one token at `now` and returns how long the request waits for it.
-fn take(bucket: &mut Bucket, rate: u32, now: Instant) -> Duration {
-    let rate = f64::from(rate.max(1));
-    let elapsed = now.saturating_duration_since(bucket.at).as_secs_f64();
-    bucket.tokens = (bucket.tokens + elapsed * rate).min(1.0);
-    bucket.at = now;
-    bucket.tokens -= 1.0;
-    match bucket.tokens < 0.0 {
-        true => Duration::from_secs_f64(-bucket.tokens / rate),
-        false => Duration::ZERO,
-    }
-}
-
-/// Waits for `requests` tokens of `connector_id`, shared by every job of this node.
-async fn acquire(connector_id: Ulid, rate: u32, requests: u32) {
-    let wait = {
-        let mut buckets = BUCKETS.lock().unwrap_or_else(|poison| poison.into_inner());
-        let now = Instant::now();
-        let bucket = (buckets.entry(connector_id)).or_insert(Bucket {
-            tokens: 1.0,
-            at: now,
-        });
-        (0..requests.max(1)).fold(Duration::ZERO, |_, _| take(bucket, rate, now))
-    };
-    if !wait.is_zero() {
-        tokio::time::sleep(wait).await;
-    }
-}
 
 /// The `Retry-After` seconds of an HTTP error answer; its headers are part of the message.
 pub(super) fn retry_after(message: &str) -> Option<Duration> {
@@ -80,12 +37,11 @@ fn backoff(attempt: u32) -> Duration {
     base + Duration::from_millis(jitter)
 }
 
-/// Sends a source request of a table import, worth `requests` requests, within the node's rate,
-/// again after a transient answer; `transient` gives a retryable failure's message.
-/// Other jobs send once.
-pub(super) async fn paced<T, E, R, F>(
+/// Sends a source request of a table import again after a transient answer; `transient` gives
+/// a retryable failure's message. Other jobs send once.
+pub(super) async fn retried<T, E, R, F>(
     (cancel, shutdown): (&CancellationToken, &CancellationToken),
-    (spec, requests): (&StagingJobSpec, u32),
+    spec: &StagingJobSpec,
     transient: impl Fn(&E) -> Option<String>,
     mut request: R,
 ) -> Result<T, E>
@@ -93,12 +49,11 @@ where
     R: FnMut() -> F,
     F: Future<Output = Result<T, E>>,
 {
-    let Some(table) = spec.table.as_ref() else {
+    if spec.table.is_none() {
         return request().await;
-    };
+    }
     let mut attempt = 0;
     loop {
-        acquire(spec.connector_id, table.rate(), requests).await;
         let result = request().await;
         let Err(error) = &result else {
             return result;
@@ -123,78 +78,42 @@ where
 mod tests {
     use super::*;
     use aruna_core::structs::execution::table::{TableImport, TableSource};
+    use tokio::time::Instant;
 
-    // Requests are spaced by the rate, so no second holds more than the rate.
-    #[test]
-    fn bucket_paces_requests() {
-        let start = Instant::now();
-        let mut bucket = Bucket {
-            tokens: 1.0,
-            at: start,
-        };
-        let waits: Vec<Duration> = (0..30).map(|_| take(&mut bucket, 10, start)).collect();
-        assert_eq!(waits[0], Duration::ZERO);
-        assert_eq!(waits[1], Duration::from_millis(100));
-        assert_eq!(waits[29], Duration::from_millis(2900));
-        // An idle bucket holds one token, not the whole idle time's worth.
-        let later = start + Duration::from_secs(60);
-        let mut idle = Bucket {
-            tokens: 0.0,
-            at: start,
-        };
-        assert_eq!(take(&mut idle, 10, later), Duration::ZERO);
-        assert_eq!(take(&mut idle, 10, later), Duration::from_millis(100));
-    }
-
-    fn spec(rate: u32) -> StagingJobSpec {
+    fn spec() -> StagingJobSpec {
         let mut spec = crate::jobs::staging::pure_tests::test_spec();
-        spec.connector_id = Ulid::from_bytes(rand::random());
         let rows = serde_json::json!({ "kind": "file", "source": "{a}", "target": "{a}" });
         spec.table = Some(TableImport {
             source: TableSource::Connector("list.csv".to_string()),
             format: Default::default(),
             rows: serde_json::from_value(rows).unwrap(),
-            rate: Some(rate),
+            rate: Some(10),
         });
         spec
     }
 
-    // A counting fake source sees at most the rate, retries included, and the retry waits
-    // for the answer's `Retry-After`.
+    // A transient answer is sent again after its `Retry-After`; a lasting one returns at once.
     #[tokio::test(start_paused = true)]
-    async fn retries_count_too() {
-        let spec = spec(10);
+    async fn transient_answers_retried() {
+        let spec = spec();
         let stop = (CancellationToken::new(), CancellationToken::new());
         let start = Instant::now();
         let sent = std::cell::RefCell::new(Vec::new());
-        for index in 0..20 {
-            let result: Result<(), String> = paced(
-                (&stop.0, &stop.1),
-                (&spec, 1),
-                |e: &String| Some(e.clone()),
-                || {
-                    sent.borrow_mut().push(Instant::now() - start);
-                    let throttled = index == 5 && sent.borrow().len() == 6;
-                    let answer = match throttled {
-                        true => Err("{\"retry-after\": \"3\"}".to_string()),
-                        false => Ok(()),
-                    };
-                    std::future::ready(answer)
-                },
-            )
-            .await;
-            assert!(result.is_ok());
-        }
-        let sent = sent.into_inner();
-        assert_eq!(sent.len(), 21);
-        for window in sent.windows(11) {
-            assert!(window[10] - window[0] >= Duration::from_secs(1));
-        }
-        assert!(sent[6] - sent[5] >= Duration::from_secs(3));
-        // A lasting error is returned at once.
-        let lasting: Result<(), String> = paced(
+        let transient = |error: &String| Some(error.clone());
+        let result: Result<(), String> = retried((&stop.0, &stop.1), &spec, transient, || {
+            sent.borrow_mut().push(Instant::now() - start);
+            let answer = match sent.borrow().len() {
+                1 => Err("{\"retry-after\": \"3\"}".to_string()),
+                _ => Ok(()),
+            };
+            std::future::ready(answer)
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(sent.borrow()[1] - sent.borrow()[0], Duration::from_secs(3));
+        let lasting: Result<(), String> = retried(
             (&stop.0, &stop.1),
-            (&spec, 1),
+            &spec,
             |_| None,
             || std::future::ready(Err("gone".to_string())),
         )
