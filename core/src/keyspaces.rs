@@ -252,6 +252,10 @@ pub const S3_SESSION_KEYSPACE: &str = "s3_sessions";
 pub const SESSION_OWNER_KEYSPACE: &str = "s3_session_owner";
 pub const SESSION_EXPIRY_KEYSPACE: &str = "s3_session_expiry";
 pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
+/// `StoredMetadata` of node-local ordinary buckets, keyed by bucket name.
+pub const BUCKET_METADATA_KEYSPACE: &str = "bucket_metadata";
+/// `ReleasePointer` rows of tagged release crate versions, keyed by `release_key`.
+pub const BUCKET_RELEASE_KEYSPACE: &str = "bucket_releases";
 /// The creation id of each bucket by name, fresh on every creation of the name.
 pub const BUCKET_CREATION_KEYSPACE: &str = "s3_bucket_creations";
 pub const RELATIONSHIP_OUT_KEYSPACE: &str = "sync_relationship_out";
@@ -649,6 +653,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SESSION_OWNER_KEYSPACE,
     SESSION_EXPIRY_KEYSPACE,
     S3_BUCKET_KEYSPACE,
+    BUCKET_METADATA_KEYSPACE,
+    BUCKET_RELEASE_KEYSPACE,
     BUCKET_CREATION_KEYSPACE,
     RELATIONSHIP_OUT_KEYSPACE,
     RELATIONSHIP_IN_KEYSPACE,

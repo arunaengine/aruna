@@ -182,6 +182,8 @@ pub struct DistributionSettings {
     pub split_objects: Option<u64>,
     /// A range whose current bytes exceed this splits; `None` never.
     pub split_bytes: Option<u64>,
+    /// The bucket metadata every member shows; changed only by `ChangeMetadata`.
+    pub metadata: Option<Box<crate::structs::storage::bucket_metadata::BucketMetadata>>,
 }
 
 /// The configuration a `create` carries in full.

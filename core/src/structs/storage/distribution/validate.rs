@@ -98,6 +98,8 @@ pub enum DistributionError {
     NoTransfer(Ulid),
     #[error("no deletion of the distributed bucket is prepared")]
     NoDeletion,
+    #[error("invalid bucket metadata: {0}")]
+    InvalidMetadata(String),
     #[error("coordinator {0} has not fenced its ranges for the deletion yet")]
     NotFenced(Ulid),
 }
