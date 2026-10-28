@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::io::Read as _;
+use std::sync::atomic::Ordering::SeqCst;
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -15,19 +16,33 @@ use crate::tests::distributed::{
     BUCKET, CLOSED_API, LOCAL, Node, PEER, node_id, node_state, publish_api,
 };
 
-async fn exported(node: &Node, auth: &AuthContext, version: &str) -> serde_json::Value {
-    let params = ExportParams {
-        version: Some(version.to_string()),
-        dataset: None,
-    };
-    let response = export_provenance(
-        State(node.state.clone()),
-        Extension(Some(auth.clone())),
-        Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
-        Query(params),
-    )
-    .await
-    .unwrap();
+/// A token check that names `auth` for the first `hops` checks, then reports it revoked.
+fn recheck(auth: &AuthContext, hops: usize) -> Recheck {
+    let (auth, left) = (
+        auth.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(hops)),
+    );
+    Arc::new(move |_, _| {
+        let open = left
+            .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+            .is_ok();
+        let auth = auth.clone();
+        Box::pin(async move { open.then_some(auth) })
+    })
+}
+
+fn caller(node: &Node, recheck: Recheck) -> Caller {
+    Caller {
+        state: node.state.clone(),
+        bearer: ValidatedBearer::new_for_test("caller-token"),
+        recheck,
+        deadline: Instant::now() + EXPORT_DEADLINE,
+    }
+}
+
+async fn exported_with(node: &Node, recheck: Recheck, version: &str) -> serde_json::Value {
+    let start = Start::Version(version.to_string());
+    let response = start_export(caller(node, recheck), start).unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -39,6 +54,10 @@ async fn exported(node: &Node, auth: &AuthContext, version: &str) -> serde_json:
         .read_to_string(&mut root)
         .unwrap();
     serde_json::from_str(&root).unwrap()
+}
+
+async fn exported(node: &Node, auth: &AuthContext, version: &str) -> serde_json::Value {
+    exported_with(node, recheck(auth, usize::MAX), version).await
 }
 
 fn arn(node: &Node, node_id: NodeId, key: &str, version: Ulid) -> String {
@@ -101,28 +120,63 @@ async fn silent_node_incomplete() {
     assert!(status.starts_with("Incomplete"));
     assert!(entity(&root, &start).is_some());
 
-    let neither = export_provenance(
-        State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
-        Extension(None),
-        Query(ExportParams {
-            version: None,
-            dataset: None,
-        }),
-    )
-    .await;
+    let export = |bearer: Option<ValidatedBearer>| {
+        export_provenance(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Extension(bearer),
+            Query(ExportParams {
+                version: None,
+                dataset: None,
+            }),
+        )
+    };
+    let neither = export(Some(ValidatedBearer::new_for_test("caller-token"))).await;
     assert!(matches!(neither, Err(ServerError::BadRequestReason(_))));
+    // Each hop checks the token again, so an export without one is refused.
+    assert!(matches!(export(None).await, Err(ServerError::Unauthorized)));
+}
+
+#[tokio::test]
+async fn revoked_token_stops() {
+    // A token revoked during the walk stops it before the next hop; nothing more is read.
+    let node = node_state().await;
+    let info = bucket_info(&node.state, BUCKET).await.unwrap();
+    let input = WriteObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "a.md".to_string(),
+        text: "x".to_string(),
+        content_type: None,
+    };
+    let stored = store_text(&node.state, &node.owner, &info, input)
+        .await
+        .unwrap();
+    let version = Ulid::from_string(&stored.version_id).unwrap();
+    let start = arn(&node, node_id(LOCAL), "a.md", version);
+    let root = exported_with(&node, recheck(&node.owner, 0), &start).await;
+    let status = entity(&root, "./").unwrap()["creativeWorkStatus"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(status, format!("Incomplete: {REVOKED}"));
+    assert!(entity(&root, &start).is_none());
+}
+
+#[test]
+fn deadline_follows_token() {
+    let now = Instant::now();
+    assert_eq!(
+        export_deadline(now, 1_000, 1_060),
+        now + Duration::from_secs(60)
+    );
+    assert_eq!(export_deadline(now, 1_000, u64::MAX), now + EXPORT_DEADLINE);
+    assert_eq!(export_deadline(now, 2_000, 1_000), now);
 }
 
 #[tokio::test]
 async fn disconnect_stops_reads() {
     let node = node_state().await;
-    let caller = Caller {
-        state: node.state.clone(),
-        auth: node.owner.clone(),
-        bearer: None,
-        deadline: Instant::now() + EXPORT_DEADLINE,
-    };
+    let caller = caller(&node, recheck(&node.owner, usize::MAX));
     let gone = CancellationToken::new();
     gone.cancel();
     let read = bounded(&caller, &gone, std::future::pending::<()>()).await;
@@ -177,10 +231,8 @@ async fn stalled_client_ends_write() {
     // A client that stops reading cannot hold the export past its deadline.
     let node = node_state().await;
     let caller = Caller {
-        state: node.state.clone(),
-        auth: node.owner.clone(),
-        bearer: None,
         deadline: Instant::now() + std::time::Duration::from_millis(50),
+        ..caller(&node, recheck(&node.owner, usize::MAX))
     };
     let (writer, _reader) = tokio::io::duplex(16);
     let mut zip = ZipFileWriter::with_tokio(writer);

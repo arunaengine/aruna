@@ -20,6 +20,7 @@ use axum::http::{HeaderMap, header};
 use axum::response::Response;
 use axum::{Extension, Json};
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use tokio::io::DuplexStream;
 use tokio::time::Instant;
@@ -29,7 +30,7 @@ use utoipa::{IntoParams, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::{ValidatedBearer, bearer_auth, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{MetadataRoCrateResponse, RoCrateExportParams};
 use crate::routes::execution::runs::run_answer;
@@ -39,6 +40,8 @@ use crate::server::state::ServerState;
 
 /// The technical time limit of one export; the crate is marked incomplete when it is reached.
 const EXPORT_DEADLINE: Duration = Duration::from_secs(15 * 60);
+/// Why a walk ends when the caller's token no longer holds.
+const REVOKED: &str = "the token expired or was revoked";
 /// Bytes buffered between the walk and the client.
 const PIPE_BYTES: usize = 64 * 1024;
 
@@ -75,11 +78,12 @@ it, as the origin and run routes do.
 - A hop the caller may not read is named by its global id or the digest that referred to it,
   never by bucket or key. A node that does not answer is listed, and the crate is incomplete.
 - Each version and run is read once per export, so cycles end.
-- The walk stops when the client disconnects or at the time limit; the root then says
-  `Incomplete` in `creativeWorkStatus`.
+- The token is checked again before each hop; the walk stops when it expires or is revoked,
+  when the client disconnects or at the time limit. The root then says `Incomplete` in
+  `creativeWorkStatus`.
 
 **Limits**
-- No count limit; one export takes at most 15 minutes."#,
+- No count limit; one export takes at most 15 minutes, and never longer than the token lives."#,
     params(ExportParams),
     responses(
         (status = 200, description = "RO-Crate ZIP stream", content_type = "application/zip"),
@@ -94,7 +98,9 @@ pub async fn export_provenance(
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Query(params): Query<ExportParams>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
+    require_realm_auth(&state, auth)?;
+    // Every hop checks this token again, so an export needs one.
+    let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let start = match (params.version, params.dataset) {
         (Some(version), None) => Start::Version(version),
         (None, Some(dataset)) => Start::Dataset(dataset),
@@ -104,15 +110,33 @@ pub async fn export_provenance(
             ));
         }
     };
+    let unix_now = aruna_core::time::unix_timestamp_secs();
+    let caller = Caller {
+        state,
+        deadline: export_deadline(Instant::now(), unix_now, bearer.expires_at_secs()),
+        bearer,
+        recheck: Arc::new(|state, bearer| {
+            Box::pin(async move {
+                bearer_auth(&state, bearer.as_str())
+                    .await
+                    .map(|(auth, _)| auth)
+            })
+        }),
+    };
+    start_export(caller, start)
+}
+
+/// The export ends at its time limit or when the token expires, whichever comes first.
+fn export_deadline(now: Instant, unix_now: u64, expires_at_secs: u64) -> Instant {
+    let left = Duration::from_secs(expires_at_secs.saturating_sub(unix_now));
+    now + left.min(EXPORT_DEADLINE)
+}
+
+/// Starts the walk and answers with the ZIP stream it writes.
+fn start_export(caller: Caller, start: Start) -> ServerResult<Response> {
     let (writer, reader) = tokio::io::duplex(PIPE_BYTES);
     let gone = CancellationToken::new();
     let guard = gone.clone().drop_guard();
-    let caller = Caller {
-        state,
-        auth,
-        bearer,
-        deadline: Instant::now() + EXPORT_DEADLINE,
-    };
     tokio::spawn(async move { walk(caller, start, writer, gone).await });
     // Dropping the body, as a disconnect does, stops the walk.
     let body = ReaderStream::new(reader).map(move |chunk| {
@@ -134,11 +158,27 @@ enum Start {
     Dataset(String),
 }
 
+/// Checks the caller's token again and answers who it names now; `None` once it is expired or
+/// revoked.
+type Recheck = Arc<
+    dyn Fn(Arc<ServerState>, ValidatedBearer) -> BoxFuture<'static, Option<AuthContext>>
+        + Send
+        + Sync,
+>;
+
 struct Caller {
     state: Arc<ServerState>,
-    auth: AuthContext,
-    bearer: Option<ValidatedBearer>,
+    bearer: ValidatedBearer,
+    recheck: Recheck,
     deadline: Instant,
+}
+
+impl Caller {
+    /// The caller as the token names it now, checked before each hop.
+    async fn current(&self, gone: &CancellationToken) -> Option<AuthContext> {
+        let check = (self.recheck)(self.state.clone(), self.bearer.clone());
+        bounded(self, gone, check).await.flatten()
+    }
 }
 
 /// What one hop read gave.
@@ -160,7 +200,11 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
         }
         Start::Dataset(document) => {
             let mut built = ProvenanceCrate::new(document, &published);
-            match bounded(&caller, &gone, crate_document(&caller, document)).await {
+            let Some(auth) = caller.current(&gone).await else {
+                built.stop(REVOKED);
+                return finish(&caller, &gone, zip, built).await;
+            };
+            match bounded(&caller, &gone, crate_document(&caller, &auth, document)).await {
                 Some(Read::Answer(dataset)) => {
                     let (hops, file) = built.dataset(&dataset);
                     if !write(&caller, &gone, &mut zip, file).await {
@@ -179,7 +223,11 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
         if built.known(&hop) {
             continue;
         }
-        let Some(read) = bounded(&caller, &gone, read_hop(&caller, &hop)).await else {
+        let Some(auth) = caller.current(&gone).await else {
+            built.stop(REVOKED);
+            break;
+        };
+        let Some(read) = bounded(&caller, &gone, read_hop(&caller, &auth, &hop)).await else {
             built.stop("the export stopped at its time limit or on disconnect");
             break;
         };
@@ -190,7 +238,8 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
             (Target::Run(_), Read::Answer(run)) => {
                 let read = match run["run_crate"].as_str() {
                     Some(document) => {
-                        bounded(&caller, &gone, crate_document(&caller, document)).await
+                        let read = crate_document(&caller, &auth, document);
+                        bounded(&caller, &gone, read).await
                     }
                     None => Some(Read::Hidden),
                 };
@@ -212,10 +261,20 @@ async fn walk(caller: Caller, start: Start, writer: DuplexStream, gone: Cancella
             (_, Read::Silent) => built.unreachable(&hop),
         }
     }
+    finish(&caller, &gone, zip, built).await
+}
+
+/// Writes the root metadata and closes the ZIP.
+async fn finish(
+    caller: &Caller,
+    gone: &CancellationToken,
+    mut zip: ZipFileWriter<DuplexStream>,
+    built: ProvenanceCrate,
+) {
     let root = serde_json::to_vec_pretty(&built.finish()).unwrap_or_default();
     let path = "ro-crate-metadata.json".to_string();
-    if write(&caller, &gone, &mut zip, CrateFile { path, bytes: root }).await {
-        let _ = bounded(&caller, &gone, zip.close()).await;
+    if write(caller, gone, &mut zip, CrateFile { path, bytes: root }).await {
+        let _ = bounded(caller, gone, zip.close()).await;
     }
 }
 
@@ -260,20 +319,20 @@ async fn bounded<T>(
     }
 }
 
-async fn read_hop(caller: &Caller, hop: &Hop) -> Read {
+async fn read_hop(caller: &Caller, auth: &AuthContext, hop: &Hop) -> Read {
     let state = &caller.state;
-    let bearer = caller.bearer.clone();
+    let bearer = Some(caller.bearer.clone());
     let headers = HeaderMap::new();
     let answer = match &hop.target {
         Target::Version(version) => {
             let ask = (version.as_str(), caller.deadline);
-            version_answer(state, &caller.auth, bearer, &headers, ask)
+            version_answer(state, auth, bearer, &headers, ask)
                 .await
                 .and_then(|Json(origin)| to_value(&origin))
         }
         Target::Run(run_id) => {
             let ask = (run_id.as_str(), caller.deadline);
-            run_answer(state, &caller.auth, bearer, &headers, ask)
+            run_answer(state, auth, bearer, &headers, ask)
                 .await
                 .and_then(|Json(run)| to_value(&run))
         }
@@ -300,11 +359,11 @@ fn to_value(answer: &impl serde::Serialize) -> ServerResult<serde_json::Value> {
 }
 
 /// A metadata document's crate as the caller may read it.
-async fn crate_document(caller: &Caller, document_id: &str) -> Read {
+async fn crate_document(caller: &Caller, auth: &AuthContext, document_id: &str) -> Read {
     let answer = export_metadata_rocrate(
         State(caller.state.clone()),
-        Extension(Some(caller.auth.clone())),
-        Extension(caller.bearer.clone()),
+        Extension(Some(auth.clone())),
+        Extension(Some(caller.bearer.clone())),
         Path(document_id.to_string()),
         Query(RoCrateExportParams::default()),
     )
