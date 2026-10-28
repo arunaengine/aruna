@@ -380,3 +380,35 @@ async fn nests_release_crates() {
         "Complete"
     );
 }
+
+#[test]
+fn holder_replies_classified() {
+    // A holder's crate reply: bytes are read, a gone version or a refusal hides the release,
+    // and anything else is a holder that did not answer.
+    let chunk = CrateChunk {
+        bytes: b"{}".to_vec(),
+        size: 2,
+    };
+    let answer = Ok(HolderAnswer::Crate(Some(chunk.clone())));
+    assert_eq!(holder_chunk(answer).unwrap(), chunk);
+    let hidden = [
+        Ok(HolderAnswer::Crate(None)),
+        Err(MetadataReadError::NotFound),
+        Err(MetadataReadError::Forbidden),
+        Err(MetadataReadError::Unauthorized),
+    ];
+    for answer in hidden {
+        let read = classify(holder_chunk(answer).map(|_| serde_json::Value::Null));
+        assert!(matches!(read, Read::Hidden));
+    }
+    let members = HolderAnswer::Members(aruna_core::structs::storage::release::RangeMembers {
+        answers: Vec::new(),
+        releases: Vec::new(),
+        complete: true,
+        refused: Vec::new(),
+    });
+    for answer in [Err(MetadataReadError::Unavailable), Ok(members)] {
+        let read = classify(holder_chunk(answer).map(|_| serde_json::Value::Null));
+        assert!(matches!(read, Read::Silent));
+    }
+}

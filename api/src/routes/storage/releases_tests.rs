@@ -169,6 +169,10 @@ async fn publish_needs_reads() {
         info: &info,
     };
     for (grants, reason) in cases {
+        // The route answers each refusal with the generic 403, which names no file.
+        let doi = "https://doi.org/10.5281/zenodo.1";
+        let routed = publish(&node, &limited(&node, &grants), request(doi)).await;
+        assert!(matches!(routed, Err(ServerError::Forbidden)), "{routed:?}");
         let input = PublishInput {
             auth: limited(&node, &grants),
             bearer: None,
