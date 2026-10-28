@@ -335,6 +335,20 @@ async fn crate_stays_local() -> TestResult<()> {
         read_crate_status(storage, job_id).await?,
         Some(RunCrateStatus::Pending)
     );
+    // Pruning the job record leaves the local crate readable by its owner.
+    storage
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: aruna_core::keyspaces::JOB_KEYSPACE.to_string(),
+            key: aruna_core::structs::execution::job::job_record_key(job_id),
+            txn_id: None,
+        })
+        .await;
+    assert!(read_job_record(storage, job_id, None).await?.is_none());
+    assert!(
+        local_run_crate(&device.context, job_id, record.created_by)
+            .await
+            .is_ok()
+    );
     Ok(())
 }
 

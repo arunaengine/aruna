@@ -29,6 +29,24 @@ impl LaunchRecord {
     }
 }
 
+/// The crate a device keeps for one of its local runs, with the user it belongs to, so it
+/// stays readable after the job record is pruned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalCrate {
+    pub owner: UserId,
+    pub jsonld: String,
+}
+
+impl LocalCrate {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 /// Value a run record shows in place of a secret-looking environment variable.
 pub const HIDDEN_VALUE: &str = "hidden";
 

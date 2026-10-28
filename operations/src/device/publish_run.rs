@@ -185,19 +185,14 @@ pub async fn local_run_crate(
     job_id: JobId,
     owner: UserId,
 ) -> Result<serde_json::Value, PublishRunError> {
-    let storage = &context.storage_handle;
-    let record = read_job_record(storage, job_id, None)
+    // The owner is kept with the crate, so it stays readable after the job is pruned.
+    let local = read_local_crate(&context.storage_handle, job_id)
         .await
         .map_err(PublishRunError::Unavailable)?
+        .filter(|local| local.owner == owner)
         .ok_or(PublishRunError::NotFound)?;
-    if record.created_by != owner {
-        return Err(PublishRunError::NotFound);
-    }
-    let jsonld = read_local_crate(storage, job_id)
-        .await
-        .map_err(PublishRunError::Unavailable)?
-        .ok_or(PublishRunError::NotFound)?;
-    serde_json::from_str(&jsonld).map_err(|error| PublishRunError::Unavailable(error.to_string()))
+    serde_json::from_str(&local.jsonld)
+        .map_err(|error| PublishRunError::Unavailable(error.to_string()))
 }
 
 /// The target one publish froze before its first copy, and the copies once all are made.

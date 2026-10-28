@@ -626,7 +626,7 @@ pub async fn put_crate_outcome(
 pub async fn put_local_crate(
     storage: &StorageHandle,
     job_id: JobId,
-    jsonld: &str,
+    local: &aruna_core::structs::execution::job::LocalCrate,
 ) -> Result<(), String> {
     let key = aruna_core::structs::execution::job::run_crate_key(job_id);
     let status = RunCrateStatus::Local
@@ -643,7 +643,7 @@ pub async fn put_local_crate(
             (
                 aruna_core::keyspaces::LOCAL_CRATE_KEYSPACE.to_string(),
                 key,
-                ByteView::from(jsonld.as_bytes().to_vec()),
+                ByteView::from(local.to_bytes().map_err(|error| error.to_string())?),
             ),
         ],
         None,
@@ -651,11 +651,11 @@ pub async fn put_local_crate(
     .await
 }
 
-/// The crate JSON-LD of a local run, while this device keeps one.
+/// The crate of a local run and its owner, while this device keeps one.
 pub async fn read_local_crate(
     storage: &StorageHandle,
     job_id: JobId,
-) -> Result<Option<String>, String> {
+) -> Result<Option<aruna_core::structs::execution::job::LocalCrate>, String> {
     let key = aruna_core::structs::execution::job::run_crate_key(job_id);
     read_raw(
         storage,
@@ -664,8 +664,9 @@ pub async fn read_local_crate(
         None,
     )
     .await?
-    .map(|value| String::from_utf8(value.to_vec()).map_err(|error| error.to_string()))
+    .map(|value| aruna_core::structs::execution::job::LocalCrate::from_bytes(value.as_ref()))
     .transpose()
+    .map_err(|error| error.to_string())
 }
 
 /// Read the run link of a physical job id, if recorded.

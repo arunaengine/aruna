@@ -12,7 +12,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, InputSource, JobError, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, LaunchRecord, RunCrateStatus, RunLink,
+    JobResultPayload, JobState, LaunchRecord, LocalCrate, RunCrateStatus, RunLink,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -143,7 +143,11 @@ async fn keep_local_crate(
         &BTreeMap::new(),
         launch.as_ref(),
     );
-    put_local_crate(storage, parent.job_id, &jsonld).await
+    let local = LocalCrate {
+        owner: parent.created_by,
+        jsonld,
+    };
+    put_local_crate(storage, parent.job_id, &local).await
 }
 
 /// The owner this node is bound to, `None` for realm infrastructure. A node the stored realm
