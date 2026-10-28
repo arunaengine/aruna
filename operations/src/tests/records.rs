@@ -134,6 +134,7 @@ impl Family {
                 admitted_at_ms: 1_000,
             },
             captured_inputs: Vec::new(),
+            input_pages: None,
             output_policies: Vec::new(),
             placement: self.placement,
         }
@@ -174,6 +175,7 @@ impl Family {
             holder_generation: 1,
             target: self.target_id(),
             inputs: Vec::new(),
+            input_pages: None,
             output_policies: Vec::new(),
             plan_digest: [5u8; 32],
             spec_digest: spec.spec_digest,

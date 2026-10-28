@@ -1099,6 +1099,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
             cancel_requested: false,
             created_at_ms: 10,
             updated_at_ms: 20,
+        input_pages: None,
             finished_at_ms: Some(20),
             progress: JobProgress::new("phases"),
             last_error: None,
