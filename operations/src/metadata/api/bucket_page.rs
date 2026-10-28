@@ -6,8 +6,6 @@ use super::{BucketPage, BucketSearchHit, MetadataApiError, NodeId};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-const CURSOR_MAX_BYTES: usize = 16 * 1024;
-
 /// Scan position of one node: the last bucket it gave, and whether it reached its end.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct NodePosition {
@@ -29,9 +27,6 @@ pub(super) fn decode_cursor(raw: Option<&str>) -> Result<Vec<NodePosition>, Meta
     let Some(raw) = raw else {
         return Ok(Vec::new());
     };
-    if raw.len() > CURSOR_MAX_BYTES {
-        return Err(invalid());
-    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(raw)
         .map_err(|_| invalid())?;
@@ -242,5 +237,23 @@ mod tests {
         assert_eq!(NodePosition::of(&positions, node(3)), Some(&done));
         let cursor = encode_cursor(&positions).expect("the left-out node keeps the listing open");
         assert_eq!(decode_cursor(Some(&cursor)).unwrap(), positions);
+    }
+
+    #[test]
+    fn many_nodes_resume() {
+        // A cursor over more nodes than any fixed size allowed still decodes.
+        let positions: Vec<_> = (0..400u16)
+            .map(|index| NodePosition {
+                node_id: *iroh::SecretKey::from_bytes(&[(index % 250) as u8 + 1; 32])
+                    .public()
+                    .as_bytes(),
+                after: Some(format!("bucket-{index:04}-{}", "x".repeat(40))),
+                done: false,
+            })
+            .collect();
+        let cursor = encode_cursor(&positions).unwrap();
+        assert!(cursor.len() > 16 * 1024);
+        assert_eq!(decode_cursor(Some(&cursor)).unwrap(), positions);
+        assert!(decode_cursor(Some("not a cursor")).is_err());
     }
 }
