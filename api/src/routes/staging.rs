@@ -1381,7 +1381,10 @@ fn staging_job_response(
             .as_ref()
             .map(|error| error.message.clone()),
         paused_until: (record.progress.paused_until)
-            .map(|until| chrono::DateTime::<chrono::Utc>::from(until).to_rfc3339()),
+            .and_then(|until| until.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|since| i64::try_from(since.as_millis()).ok())
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|until| until.to_rfc3339()),
         progress,
         errors: checkpoint
             .map(|checkpoint| {

@@ -490,6 +490,13 @@ fn job_states_mapped() {
     record.progress.paused_until = Some(UNIX_EPOCH + std::time::Duration::from_secs(60));
     let paused = staging_job_response(&record, None).unwrap().paused_until;
     assert_eq!(paused.as_deref(), Some("1970-01-01T00:01:00+00:00"));
+    // A stored end beyond the calendar shows no date instead of failing the response.
+    let far = std::time::Duration::from_secs(100_000_000_000_000);
+    record.progress.paused_until = UNIX_EPOCH.checked_add(far);
+    assert_eq!(
+        staging_job_response(&record, None).unwrap().paused_until,
+        None
+    );
 }
 
 #[tokio::test]

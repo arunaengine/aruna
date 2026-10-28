@@ -111,6 +111,11 @@ pub(crate) fn answered(status: StatusCode, headers: &HeaderMap) -> Result<(), Pa
     let Some(delay) = retry_after(value, SystemTime::now())? else {
         return Ok(());
     };
+    // Job status shows the pause's end as a calendar date, so it must have one.
+    let end = SystemTime::now().checked_add(delay);
+    if !end.is_some_and(dated) {
+        return Err(PaceError::Unrepresentable);
+    }
     let mut buckets = BUCKETS.lock().unwrap_or_else(|poison| poison.into_inner());
     let now = Instant::now();
     let until = now.checked_add(delay).ok_or(PaceError::Unrepresentable)?;
@@ -121,6 +126,13 @@ pub(crate) fn answered(status: StatusCode, headers: &HeaderMap) -> Result<(), Pa
     });
     bucket.until = Some(bucket.until.map_or(until, |known| known.max(until)));
     Ok(())
+}
+
+/// Whether `at` has a calendar date, as job status reports it.
+fn dated(at: SystemTime) -> bool {
+    let seconds = at.duration_since(SystemTime::UNIX_EPOCH).ok();
+    let seconds = seconds.and_then(|since| i64::try_from(since.as_secs()).ok());
+    seconds.is_some_and(|seconds| chrono::DateTime::from_timestamp(seconds, 0).is_some())
 }
 
 /// Runs `future` with every source request it sends paced by `pace`.
@@ -316,7 +328,11 @@ mod tests {
         // A pause beyond any instant fails the request and pauses nothing.
         let endless = Pace::new(Ulid::from_bytes([11; 16]), 10);
         let start = Instant::now();
-        for value in [u64::MAX.to_string(), "1".repeat(40)] {
+        for value in [
+            u64::MAX.to_string(),
+            "1".repeat(40),
+            "100000000000000".to_string(),
+        ] {
             headers.insert(http::header::RETRY_AFTER, value.parse().unwrap());
             let answer = paced(endless.clone(), async {
                 answered(StatusCode::TOO_MANY_REQUESTS, &headers)
