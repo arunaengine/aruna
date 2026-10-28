@@ -389,7 +389,7 @@ fn plan_entry(
     } = &version.state
         && source.connector_id == Some(input.connector.connector_id)
         && source.descriptor.source_path == entry.source_path
-        && cached_metadata.compare(&entry.observation) == ObservationMatch::Same
+        && same_observation(cached_metadata, &entry.observation)
         && version.metadata.len() == entry.metadata.len()
         && (entry.metadata.iter()).all(|(key, value)| version.metadata.get(key) == Some(value))
     {
@@ -399,6 +399,12 @@ fn plan_entry(
         true => EntryPlan::Kept,
         false => EntryPlan::Register,
     }
+}
+
+/// Whether an import saw the file as stored: equal validators, or, when there are none to
+/// compare, as with a size from a table row, the identical observation.
+fn same_observation(stored: &SourceMetadata, seen: &SourceMetadata) -> bool {
+    stored.compare(seen) == ObservationMatch::Same || stored == seen
 }
 
 /// Builds the page's rows: versions, heads and connector reference rows of new entries,
