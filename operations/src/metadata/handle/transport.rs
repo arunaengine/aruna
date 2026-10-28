@@ -794,9 +794,8 @@ impl MetadataHandle {
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
-        query: String,
-        limit: usize,
-        group_id: Option<GroupId>,
+        (query, limit): (String, usize),
+        (group_id, database): (Option<GroupId>, bool),
         start_after: Option<String>,
     ) -> Result<Vec<BucketSearchHit>, MetadataReadError> {
         let started = Instant::now();
@@ -811,6 +810,7 @@ impl MetadataHandle {
                 limit,
                 group_id,
                 start_after,
+                database,
             },
         )
         .await

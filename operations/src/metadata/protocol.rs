@@ -161,6 +161,8 @@ pub enum MetadataTransportMessage {
         group_id: Option<GroupId>,
         /// Continues after this bucket name.
         start_after: Option<String>,
+        /// Only buckets whose metadata marks them as a database.
+        database: bool,
     },
     BucketSearchResults {
         result: Result<Vec<BucketSearchHit>, MetadataReadError>,
@@ -1018,6 +1020,7 @@ mod tests {
             limit: 10,
             group_id: None,
             start_after: None,
+            database: false,
         });
         assert_auth_token(MetadataTransportMessage::SearchObjects {
             auth_token: Some(AuthToken::bearer("object-token").unwrap()),
@@ -1223,9 +1226,10 @@ mod tests {
                 limit: 0,
                 group_id: None,
                 start_after: None,
+                database: false,
             })
             .unwrap(),
-            vec![12, 0, 0, 0, 0, 0]
+            vec![12, 0, 0, 0, 0, 0, 0]
         );
     }
 

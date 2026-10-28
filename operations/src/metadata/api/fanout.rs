@@ -601,6 +601,7 @@ pub async fn search_buckets_distributed(
     let remote_auth_token = fanout_bearer(request.bearer_token.as_deref());
     let positions = decode_cursor(request.cursor.as_deref())?;
     let group_id = request.group_id;
+    let database = request.database;
     let local_call: MetadataNodeCall<Vec<BucketSearchHit>> = metadata_node_call(
         (
             context.clone(),
@@ -624,6 +625,7 @@ pub async fn search_buckets_distributed(
                     limit,
                     group_id,
                     start_after: start_after.map(|after| after.into_bytes().into()),
+                    database,
                 },
             )
             .await
@@ -643,7 +645,13 @@ pub async fn search_buckets_distributed(
                 return Ok(Vec::new());
             };
             handle
-                .request_bucket_search(node_id, auth_token, query, limit, group_id, start_after)
+                .request_bucket_search(
+                    node_id,
+                    auth_token,
+                    (query, limit),
+                    (group_id, database),
+                    start_after,
+                )
                 .await
         },
     );

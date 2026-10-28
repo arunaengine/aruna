@@ -60,6 +60,8 @@ pub struct BucketSearchRequest {
     /// `next_cursor` of the previous page.
     pub cursor: Option<String>,
     pub target_nodes: Option<Vec<NodeId>>,
+    /// Only buckets whose metadata marks them as a database.
+    pub database: bool,
 }
 
 #[derive(Debug, Clone)]

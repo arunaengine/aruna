@@ -120,6 +120,8 @@ mod tests {
             group_name: None,
             created_at: SystemTime::UNIX_EPOCH,
             set_id: None,
+            metadata: None,
+            public: false,
         }
     }
 

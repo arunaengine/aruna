@@ -9,12 +9,17 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{
+    BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, DISTRIBUTION_KEYSPACE, GROUP_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
+};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
+use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path, incarnation};
+use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, StoredMetadata};
+use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
@@ -39,6 +44,8 @@ pub struct SearchBucketsInput {
     /// Resumes the raw bucket scan after this key so a filtering caller can fill
     /// one page across several drives.
     pub start_after: Option<Key>,
+    /// Keeps only buckets whose metadata marks them as a database, with that metadata.
+    pub database: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,6 +68,10 @@ pub struct BucketSearchHit {
     pub created_at: SystemTime,
     /// The distributed bucket this local bucket is a member of; `None` for an ordinary bucket.
     pub set_id: Option<ulid::Ulid>,
+    /// The bucket's metadata, read for a database search only.
+    pub metadata: Option<BucketMetadata>,
+    /// Anyone, also without a login, may read the bucket; set for a database search only.
+    pub public: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +86,7 @@ enum SearchBucketsState {
     ScanBuckets,
     CheckPermission,
     ReadGroup,
+    ReadMetadata,
     Finish,
     Error,
 }
@@ -105,6 +117,8 @@ pub struct SearchBucketsOperation {
     state: SearchBucketsState,
     candidates: VecDeque<BucketCandidate>,
     current: Option<BucketCandidate>,
+    /// A readable hit of a database search, waiting for its metadata.
+    pending: Option<BucketSearchHit>,
     hits: Vec<BucketSearchHit>,
     next_start_after: Option<Key>,
     last_decided: Option<Key>,
@@ -131,6 +145,7 @@ impl SearchBucketsOperation {
             state: SearchBucketsState::Init,
             candidates: VecDeque::new(),
             current: None,
+            pending: None,
             hits: Vec::new(),
             next_start_after,
             last_decided: None,
@@ -293,19 +308,75 @@ impl SearchBucketsOperation {
                 Ok(arn) => arn.to_string(),
                 Err(error) => return self.fail(error.into()),
             };
-        self.hits.push(BucketSearchHit {
+        let set_id = (candidate.info.distribution.as_ref()).map(|binding| binding.set_id);
+        let hit = BucketSearchHit {
             arn,
             bucket: candidate.bucket,
             node_id: self.input.node_id,
             group_id: candidate.info.group_id,
             group_name,
             created_at: candidate.info.created_at,
-            set_id: candidate
-                .info
-                .distribution
-                .as_ref()
-                .map(|binding| binding.set_id),
-        });
+            set_id,
+            metadata: None,
+            public: false,
+        };
+        if !self.input.database {
+            self.hits.push(hit);
+            return self.continue_search();
+        }
+        self.state = SearchBucketsState::ReadMetadata;
+        let key: Key = hit.bucket.as_bytes().to_vec().into();
+        let reads = match set_id {
+            Some(set_id) => vec![(
+                DISTRIBUTION_KEYSPACE.to_string(),
+                set_id.to_bytes().to_vec().into(),
+            )],
+            None => vec![
+                (BUCKET_METADATA_KEYSPACE.to_string(), key.clone()),
+                (BUCKET_CREATION_KEYSPACE.to_string(), key),
+            ],
+        };
+        self.pending = Some(hit);
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None
+        })]
+    }
+
+    /// Keeps a pending hit only when its current metadata marks it as a database.
+    fn handle_metadata_read(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected("Event::Storage(StorageEvent::BatchReadResult)", got);
+        };
+        let Some(mut hit) = self.pending.take() else {
+            return self.fail(SearchBucketsError::NotFinished);
+        };
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let metadata = match hit.set_id {
+            Some(_) => match values.next().flatten() {
+                Some(value) => match DistributionView::from_bytes(value.as_ref()) {
+                    Ok(view) => {
+                        (view.snapshot().config.settings.metadata.clone()).map(|metadata| *metadata)
+                    }
+                    Err(error) => return self.fail(error.into()),
+                },
+                None => None,
+            },
+            None => match (values.next().flatten(), values.next().flatten()) {
+                (Some(row), creation) => match StoredMetadata::from_bytes(row.as_ref()) {
+                    Ok(stored) => (stored.incarnation
+                        == incarnation(creation.as_ref().map(|value| value.as_ref())))
+                    .then_some(stored.metadata),
+                    Err(error) => return self.fail(error.into()),
+                },
+                (None, _) => None,
+            },
+        };
+        if metadata.as_ref().is_some_and(|metadata| metadata.database) {
+            hit.metadata = metadata;
+            self.hits.push(hit);
+        }
         self.continue_search()
     }
 
@@ -375,9 +446,12 @@ async fn search_with_budget(
             .map(|group_id| (input.realm_id, group_id))
             .collect::<Vec<_>>();
         evaluators.extend(PolicyEvaluator::load_bulk(context, pending).await?);
-        for hit in output.hits {
+        for mut hit in output.hits {
             if !policy_allows(&evaluators, &input, &hit) {
                 continue;
+            }
+            if input.database {
+                hit.public = anonymous_reads(context, &input, &hit).await;
             }
             visible.push(hit);
             if visible.len() >= limit {
@@ -389,6 +463,27 @@ async fn search_with_budget(
             None => return Ok(visible),
         }
     }
+}
+
+/// Whether a caller without a login may read the bucket, deny policies included.
+async fn anonymous_reads(
+    context: &DriverContext,
+    input: &SearchBucketsInput,
+    hit: &BucketSearchHit,
+) -> bool {
+    let path = bucket_permission_path(input.realm_id, hit.group_id, hit.node_id, &hit.bucket);
+    let anonymous = AuthContext::anonymous(input.realm_id);
+    let extras = PolicyRequestExtras::operation("s3.ListBuckets");
+    crate::auth::request_authorization::authorize(
+        context,
+        input.realm_id,
+        &anonymous,
+        &path,
+        &Permission::READ,
+        extras,
+    )
+    .await
+    .is_ok()
 }
 
 /// Evaluates the loaded policies for one hit on the path the RBAC check used,
@@ -427,6 +522,7 @@ impl Operation for SearchBucketsOperation {
             SearchBucketsState::ScanBuckets => self.handle_bucket_scan(event),
             SearchBucketsState::CheckPermission => self.handle_permission(event),
             SearchBucketsState::ReadGroup => self.handle_group_read(event),
+            SearchBucketsState::ReadMetadata => self.handle_metadata_read(event),
             SearchBucketsState::Init | SearchBucketsState::Finish | SearchBucketsState::Error => {
                 smallvec![]
             }
@@ -458,13 +554,15 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
-        AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+        AUTH_KEYSPACE, BUCKET_METADATA_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        S3_BUCKET_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::{Actor, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
     use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
     use aruna_core::structs::storage::distribution::DistributionBinding;
     use aruna_storage::storage;
     use tempfile::tempdir;
@@ -487,6 +585,7 @@ mod tests {
             limit,
             group_id: None,
             start_after: None,
+            database: false,
         }
     }
 
@@ -783,6 +882,7 @@ mod tests {
                 limit: 50,
                 group_id: None,
                 start_after: None,
+                database: false,
             },
         )
         .await
@@ -797,5 +897,49 @@ mod tests {
                 .unwrap()
                 .to_string()
         );
+
+        // A database search keeps only buckets whose metadata marks them, and says who reads.
+        for (bucket, database) in [("data-public", true), ("data-private", false)] {
+            let stored = aruna_core::structs::storage::bucket_metadata::StoredMetadata {
+                incarnation: 0,
+                metadata: BucketMetadata {
+                    database,
+                    title: Some(bucket.to_string()),
+                    ..BucketMetadata::default()
+                },
+            };
+            write_value(
+                &context,
+                BUCKET_METADATA_KEYSPACE,
+                bucket.as_bytes().to_vec(),
+                stored.to_bytes().unwrap(),
+            )
+            .await;
+        }
+        let databases = search_local_buckets(
+            &context,
+            SearchBucketsInput {
+                auth: AuthContext {
+                    user_id: owner,
+                    realm_id,
+                    path_restrictions: None,
+                    session: None,
+                },
+                realm_id,
+                node_id,
+                query: String::new(),
+                limit: 50,
+                group_id: None,
+                start_after: None,
+                database: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(databases.len(), 1);
+        assert_eq!(databases[0].bucket, "data-public");
+        assert!(databases[0].public);
+        let metadata = databases[0].metadata.as_ref().unwrap();
+        assert_eq!(metadata.title.as_deref(), Some("data-public"));
     }
 }
