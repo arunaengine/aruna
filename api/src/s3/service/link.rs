@@ -9,11 +9,10 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::link::LinkTarget;
-use aruna_operations::jobs::source_read::HEAD_OPERATION;
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::link::{
-    LinkCaller, LinkError, LinkSource, authorize_target, create_link, read_target, target_visible,
+    LinkCaller, LinkError, LinkSource, create_link, head_target, read_target, target_visible,
 };
 use s3s::dto::{ETag, GetObjectOutput, StreamingBlob};
 use s3s::{S3Response, S3Result, s3_error};
@@ -63,7 +62,7 @@ impl ArunaS3Service {
             return Ok(());
         };
         let caller = self.link_caller(access, bucket).await;
-        authorize_target(&self.state, &caller.auth, &target, HEAD_OPERATION)
+        head_target(&self.state, &caller, &target, self.node_id)
             .await
             .map_err(link_error)
     }
@@ -191,12 +190,13 @@ impl ArunaS3Service {
         };
         let caller = match reader {
             Some(access) => self.link_caller(access, bucket).await,
+            // No credential expires, so only the delegation's own lifetime bounds a remote HEAD.
             None => LinkCaller {
                 auth: AuthContext::anonymous(self.realm_id),
-                credential: (String::new(), ulid::Ulid::nil(), 0),
+                credential: (String::new(), ulid::Ulid::nil(), u64::MAX),
             },
         };
-        target_visible(&self.state, &caller, &target)
+        target_visible(&self.state, &caller, &target, self.node_id)
             .await
             .map_err(link_error)
     }
@@ -225,7 +225,7 @@ impl ArunaS3Service {
                 }
             };
             let visible = match target {
-                Some(target) => target_visible(&self.state, &caller, &target)
+                Some(target) => target_visible(&self.state, &caller, &target, self.node_id)
                     .await
                     .map_err(link_error)?,
                 None => false,

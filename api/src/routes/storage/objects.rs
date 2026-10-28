@@ -518,6 +518,7 @@ pub async fn list_objects(
     Query(query): Query<ObjectListQuery>,
 ) -> ServerResult<Json<ObjectListResponse>> {
     let auth = require_realm_auth(&state, auth)?;
+    let expiry = bearer.as_ref().map_or(0, ValidatedBearer::expires_at_secs);
     let info = bucket_info(&state, &bucket).await?;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     // READ on the browsed prefix suffices, as for the group's data paths.
@@ -553,12 +554,15 @@ pub async fn list_objects(
             (token, query.start_after),
             Some(bounds),
         );
+        let caller = (&auth, expiry);
         return Ok(Json(
-            readable_page(&state, &auth, &info, page.await?).await?,
+            readable_page(&state, caller, &info, page.await?).await?,
         ));
     }
     let page = object_page(&state, &info, bearer.as_ref(), request).await?;
-    Ok(Json(readable_page(&state, &auth, &info, page).await?))
+    Ok(Json(
+        readable_page(&state, (&auth, expiry), &info, page).await?,
+    ))
 }
 
 /// The page without the keys and prefixes the caller may not read: READ on a listed prefix
@@ -566,7 +570,7 @@ pub async fn list_objects(
 /// still apply.
 async fn readable_page(
     state: &ServerState,
-    auth: &AuthContext,
+    (auth, expiry): (&AuthContext, u64),
     info: &BucketInfo,
     mut page: ObjectListResponse,
 ) -> ServerResult<ObjectListResponse> {
@@ -579,16 +583,17 @@ async fn readable_page(
     page.objects.retain(|object| readable(&object.key));
     page.prefixes.retain(|prefix| readable(prefix));
     // A link also needs its target readable, or its name and metadata stay hidden.
+    // The bearer's expiry bounds a delegated HEAD of a target on another node.
     let caller = LinkCaller {
         auth: auth.clone(),
-        credential: (String::new(), info.group_id, 0),
+        credential: (String::new(), info.group_id, expiry),
     };
     let mut visible = Vec::with_capacity(page.objects.len());
     for object in std::mem::take(&mut page.objects) {
         let shown = match object.link.as_ref() {
             None => true,
             Some(binding) => match LinkTarget::of(binding, realm_id) {
-                Some(target) => target_visible(&state.get_ctx(), &caller, &target)
+                Some(target) => target_visible(&state.get_ctx(), &caller, &target, node_id)
                     .await
                     .map_err(|error| ServerError::InternalError(error.to_string()))?,
                 None => false,

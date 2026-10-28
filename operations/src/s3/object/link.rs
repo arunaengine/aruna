@@ -64,11 +64,39 @@ pub async fn target_visible(
     context: &DriverContext,
     caller: &LinkCaller,
     target: &LinkTarget,
+    local: NodeId,
 ) -> Result<bool, LinkError> {
-    match authorize_target(context, &caller.auth, target, HEAD_OPERATION).await {
+    match head_target(context, caller, target, local).await {
         Ok(()) => Ok(true),
         Err(LinkError::Denied | LinkError::NotFound) => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+/// Whether the caller may HEAD the target: checked here and, for a target on another node,
+/// by that node in one delegated HEAD.
+pub async fn head_target(
+    context: &DriverContext,
+    caller: &LinkCaller,
+    target: &LinkTarget,
+    local: NodeId,
+) -> Result<(), LinkError> {
+    authorize_target(context, &caller.auth, target, HEAD_OPERATION).await?;
+    let arn = &target.arn;
+    if arn.node_id == local {
+        return Ok(());
+    }
+    delegated_read(context, delegation(caller, arn.node_id), arn, None, true)
+        .await
+        .map(|_| ())
+        .map_err(staging_error)
+}
+
+fn staging_error(error: aruna_core::errors::StagingSourceError) -> LinkError {
+    match error {
+        aruna_core::errors::StagingSourceError::AccessDenied => LinkError::Denied,
+        aruna_core::errors::StagingSourceError::NotFound => LinkError::NotFound,
+        other => LinkError::Unavailable(other.to_string()),
     }
 }
 
@@ -142,11 +170,7 @@ pub async fn read_target(
     let (_, _, stream) =
         delegated_read(context, delegation(caller, arn.node_id), arn, range, false)
             .await
-            .map_err(|error| match error {
-                aruna_core::errors::StagingSourceError::AccessDenied => LinkError::Denied,
-                aruna_core::errors::StagingSourceError::NotFound => LinkError::NotFound,
-                other => LinkError::Unavailable(other.to_string()),
-            })?;
+            .map_err(staging_error)?;
     Ok(body_stream(stream))
 }
 
@@ -304,11 +328,7 @@ async fn remote_target(
     let (metadata, group_id, _) =
         delegated_read(context, delegation(caller, arn.node_id), &arn, None, true)
             .await
-            .map_err(|error| match error {
-                aruna_core::errors::StagingSourceError::AccessDenied => LinkError::Denied,
-                aruna_core::errors::StagingSourceError::NotFound => LinkError::NotFound,
-                other => LinkError::Unavailable(other.to_string()),
-            })?;
+            .map_err(staging_error)?;
     let group_id = group_id.ok_or_else(|| {
         LinkError::Unavailable("the source node did not name its bucket group".to_string())
     })?;
@@ -317,4 +337,43 @@ async fn remote_target(
         ..metadata
     };
     Ok((LinkTarget { arn, group_id }, metadata))
+}
+
+#[cfg(test)]
+mod tests {
+    use aruna_core::structs::identity::realm::RealmId;
+
+    use super::*;
+    use crate::tests::access::seed_access;
+    use crate::tests::s3::{test_context, test_storage};
+
+    #[tokio::test]
+    async fn remote_head_asks_target() {
+        // Local roles allow both targets, but one on another node shows only once that node
+        // answers a delegated HEAD, which it cannot without a network here.
+        let (_directory, storage) = test_storage();
+        let context = test_context(storage);
+        let (realm_id, group_id) = (RealmId::from_bytes([1; 32]), Ulid::from_parts(2, 2));
+        let local = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let remote = iroh::SecretKey::from_bytes(&[5; 32]).public();
+        let auth = seed_access(&context, (realm_id, group_id, local), "/denied").await;
+        let caller = LinkCaller {
+            auth,
+            credential: ("key".to_string(), group_id, u64::MAX),
+        };
+        let target = |node_id| LinkTarget {
+            arn: VersionedObjectArn {
+                realm_id,
+                node_id,
+                bucket: "db".to_string(),
+                key: "bakta.db".to_string(),
+                version: Ulid::from_parts(3, 3),
+            },
+            group_id,
+        };
+        let here = target_visible(&context, &caller, &target(local), local).await;
+        assert_eq!(here, Ok(true));
+        let there = target_visible(&context, &caller, &target(remote), local).await;
+        assert!(matches!(there, Err(LinkError::Unavailable(_))), "{there:?}");
+    }
 }
