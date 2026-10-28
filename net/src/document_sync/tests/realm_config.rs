@@ -3316,3 +3316,71 @@ async fn parser_set_admission() {
         .expect("state exists");
     assert_eq!(state.database_parser(entry.entry_id), Some(parser(valid)));
 }
+
+#[tokio::test]
+async fn parser_waits_entry() {
+    // A parser change that arrives before its entry waits for the realm config instead of
+    // being refused, since only the entry names the owner group whose admins may set it.
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([64; 32]);
+    let owner_admin = UserId::local(Ulid::from_parts(1_680, 1), realm_id);
+    let actor = test_actor(15, owner_admin, realm_id);
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(actor.node_id, RealmNodeKind::Management);
+    let realm_auth = RealmAuthorizationDocument {
+        realm_id,
+        roles: HashMap::new(),
+        operation_restrictions: Default::default(),
+    };
+    batch_write_to(
+        &storage,
+        vec![
+            target_write_entry(
+                DocumentTarget::RealmConfig { realm_id },
+                config.to_bytes(&actor).expect("config serializes").into(),
+            ),
+            target_write_entry(
+                DocumentTarget::RealmAuthorization { realm_id },
+                realm_auth.to_bytes(&actor).expect("auth serializes").into(),
+            ),
+        ],
+    )
+    .await
+    .expect("realm state writes");
+    let event = test_admin_event(
+        Ulid::from_parts(1_681, 1),
+        AdminDocumentTarget::RealmConfig { realm_id },
+        &actor,
+        1,
+        AdminDocumentOperation::DatabaseParserSet {
+            entry_id: Ulid::from_parts(1_682, 1),
+            parser: None,
+        },
+    );
+    let target = DocumentTarget::RealmConfig { realm_id };
+    let placement = admin_test_placement();
+    let topic = target.sync_topic_id(realm_id, &placement);
+    let validation = validate_admin_event(
+        &storage,
+        topic,
+        ::irokle::actor_id_for(topic, node_to_peer(&actor.node_id)),
+        &target,
+        &event,
+        realm_id,
+        &placement,
+        &sign_as_origin(&event, &placement),
+        &mut ConfigValidationCache::default(),
+    )
+    .await
+    .expect("validation runs");
+    assert!(
+        matches!(
+            validation,
+            AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::RealmConfig(id)),
+                ..
+            } if id == realm_id
+        ),
+        "{validation:?}"
+    );
+}

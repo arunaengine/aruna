@@ -976,6 +976,16 @@ async fn validate_database_actors(
         }
         _ => curator || owner(event.actor.user_id),
     };
+    // A parser change may arrive before the entry it names; its owner decides once that is here.
+    if !allowed
+        && group.is_none()
+        && matches!(event.op, AdminDocumentOperation::DatabaseParserSet { .. })
+    {
+        return Ok(AdminEventValidation::Deferred {
+            dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
+            reason: "the database entry of the parser is not known here yet".to_string(),
+        });
+    }
     if let Some(group_id) = group.filter(|_| !allowed && group_auth.is_none()) {
         return Ok(AdminEventValidation::Deferred {
             dependency: Some(DocumentSyncDependency::GroupAuthorization(group_id)),
