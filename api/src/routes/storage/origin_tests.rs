@@ -318,7 +318,7 @@ fn view_keeps_fields() {
                 run_id: Ulid::from_bytes([48; 16]),
             },
         ],
-        database_entry: None,
+        bucket_metadata: None,
         identifiers: Vec::new(),
         content_hash: None,
     };
@@ -384,7 +384,7 @@ fn origin_kinds_named() {
         hop: None,
         source: None,
         projection: Vec::new(),
-        database_entry: None,
+        bucket_metadata: None,
         identifiers: Vec::new(),
         content_hash: None,
     };

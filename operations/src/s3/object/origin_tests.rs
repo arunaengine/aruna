@@ -1,19 +1,14 @@
-//! Tests identifiers on origin reads: the current database entry's parser applies.
+//! Tests identifiers on origin reads: the bucket's current metadata and its rules apply.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::DocumentTarget;
-use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::reducer::AdminDocumentState;
-use aruna_core::storage_entries::reducer_state_entry;
+use crate::s3::bucket::metadata::PutMetadataOperation;
+use aruna_core::keyspaces::{BUCKET_CREATION_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::database::DatabaseEntry;
 use aruna_core::structs::identity::identifier::{
     IdentifierParser, IdentifierRule, IdentifierTarget,
 };
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
 
@@ -36,7 +31,7 @@ async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<
     ));
 }
 
-/// A bucket with one version, listed as a database whose parser finds BioSample ids.
+/// A bucket with one version and database metadata whose rules find BioSample ids.
 async fn seed(context: &DriverContext, actor: &Actor, listed: bool) -> Ulid {
     let bucket = BucketInfo {
         group_id: Ulid::from_bytes([2; 16]),
@@ -75,33 +70,6 @@ async fn seed(context: &DriverContext, actor: &Actor, listed: bool) -> Ulid {
     )
     .await;
 
-    let entry = DatabaseEntry {
-        entry_id: Ulid::from_bytes([5; 16]),
-        dataset_id: Ulid::from_bytes([6; 16]),
-        target: DatabaseTarget::Ordinary {
-            node_id: actor.node_id,
-            bucket: BUCKET.to_string(),
-        },
-        owner_group: bucket.group_id,
-    };
-    let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
-    if listed {
-        config.databases = vec![entry.clone()];
-    }
-    let target = DocumentTarget::RealmConfig {
-        realm_id: actor.realm_id,
-    };
-    let value = config.to_bytes(actor).unwrap();
-    put(
-        context,
-        target.storage_keyspace(),
-        target.storage_key().to_vec(),
-        value,
-    )
-    .await;
-    let mut state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig {
-        realm_id: actor.realm_id,
-    });
     let parser = IdentifierParser {
         rules: vec![IdentifierRule {
             name: "BioSample".to_string(),
@@ -110,13 +78,28 @@ async fn seed(context: &DriverContext, actor: &Actor, listed: bool) -> Ulid {
             url_template: "https://www.ebi.ac.uk/biosamples/samples/{id}".to_string(),
         }],
     };
-    let op = AdminDocumentOperation::DatabaseParserSet {
-        entry_id: entry.entry_id,
+    let metadata = BucketMetadata {
+        database: true,
+        title: Some("bakrep".to_string()),
         parser: Some(parser),
+        ..BucketMetadata::default()
     };
-    state.apply_operation(actor, op).unwrap();
-    let (key_space, key, value) = reducer_state_entry(&state).unwrap();
-    put(context, &key_space, key.to_vec(), value.to_vec()).await;
+    drive(
+        PutMetadataOperation::new(BUCKET.to_string(), bucket.group_id, Some(metadata)),
+        context,
+    )
+    .await
+    .unwrap();
+    if !listed {
+        // The bucket is created again under its name: the old metadata no longer applies.
+        put(
+            context,
+            BUCKET_CREATION_KEYSPACE,
+            BUCKET.as_bytes().to_vec(),
+            Ulid::from_bytes([9; 16]).to_bytes().to_vec(),
+        )
+        .await;
+    }
     version_id
 }
 
@@ -145,13 +128,14 @@ async fn database_identifiers_read() {
             .await
             .unwrap();
         if !listed {
-            // A removed entry's parser no longer applies.
-            assert_eq!(view.database_entry, None);
+            assert_eq!(view.bucket_metadata, None);
             assert!(view.identifiers.is_empty());
             assert!(view.projection.is_empty());
             continue;
         }
-        assert_eq!(view.database_entry, Some(Ulid::from_bytes([5; 16])));
+        let metadata = view.bucket_metadata.as_ref().unwrap();
+        assert!(metadata.database);
+        assert_eq!(metadata.title.as_deref(), Some("bakrep"));
         let url = "https://www.ebi.ac.uk/biosamples/samples/SAMN15803895";
         assert_eq!(view.identifiers.len(), 1);
         assert_eq!(view.identifiers[0].value, "SAMN15803895");

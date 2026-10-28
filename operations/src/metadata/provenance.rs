@@ -162,21 +162,42 @@ impl ProvenanceCrate {
         if let Some(from) = origin["hop"]["from"].as_str() {
             next.push(based_on(from));
         }
+        self.database(&id, &origin["bucket_metadata"]);
         next
     }
 
-    /// The external source and the database that list the version now.
+    /// The bucket's database metadata now, as a Dataset the version is part of.
+    fn database(&mut self, id: &str, metadata: &Value) {
+        if metadata["database"] != json!(true) {
+            return;
+        }
+        let digest = blake3::hash(metadata.to_string().as_bytes()).to_hex();
+        let key = format!("#database-{}", &digest[..16]);
+        let mut database = entity(&key, "Dataset");
+        let title = metadata["title"]
+            .as_str()
+            .unwrap_or("Bucket with database metadata");
+        database.insert("name".into(), json!(format!("{title} (current metadata)")));
+        for property in ["version", "license", "description"] {
+            if let Some(value) = metadata[property].as_str() {
+                database.insert(property.into(), json!(value));
+            }
+        }
+        let links: Vec<Value> = (metadata["identifiers"].as_array().into_iter().flatten())
+            .filter_map(|identifier| identifier["url"].as_str())
+            .map(|url| json!(url))
+            .collect();
+        if !links.is_empty() {
+            database.insert("identifier".into(), Value::Array(links));
+        }
+        self.put(&key, &database);
+        self.add_ref(id, "isPartOf", &key);
+    }
+
+    /// The external source the version was registered from.
     fn source(&mut self, id: &str, origin: &Value) {
         if let Some(url) = origin["source"]["url"].as_str() {
             self.add_ref(id, "isBasedOn", url);
-        }
-        if let Some(entry) = origin["database_entry"].as_str() {
-            let key = format!("#database-{entry}");
-            let mut database = entity(&key, "Dataset");
-            database.insert("name".into(), json!("Database (current listing)"));
-            database.insert("identifier".into(), json!(entry));
-            self.put(&key, &database);
-            self.add_ref(id, "isPartOf", &key);
         }
     }
 

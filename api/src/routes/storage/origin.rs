@@ -39,6 +39,7 @@ use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::database_types::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
+use crate::routes::storage::bucket_metadata::BucketMetadataBody;
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
 use crate::routes::storage::relay::{
@@ -144,9 +145,9 @@ pub struct OriginResponse {
     pub source: Option<SourceBody>,
     /// The publication-safe projection: uploads and imports in place give none.
     pub projection: Vec<ProjectionBody>,
-    /// The database entry that lists the bucket now; it may change after the version was made.
-    pub database_entry: Option<String>,
-    /// Links the current database entry's parser finds in the key and source URL.
+    /// The bucket's metadata now; it may have changed since the version was made.
+    pub bucket_metadata: Option<BucketMetadataBody>,
+    /// Links the bucket metadata's identifier rules find in the key and source URL.
     #[serde(default)]
     pub identifiers: Vec<IdentifierView>,
     /// The content id of the bytes, from their BLAKE3; absent for versions not stored here
@@ -233,7 +234,7 @@ impl From<OriginView> for OriginResponse {
                     }
                 })
                 .collect(),
-            database_entry: view.database_entry.map(|entry| entry.to_string()),
+            bucket_metadata: view.bucket_metadata.map(Into::into),
             identifiers: view.identifiers.into_iter().map(Into::into).collect(),
             content_id: view.content_hash.map(content_id),
             stale_ranges: Vec::new(),
@@ -259,8 +260,8 @@ impl From<OriginView> for OriginResponse {
   the synced source version when it is a version of a distributed bucket (a node ARN names
   its bucket and key, so it is left out); `CreateAction` for job results; nothing for
   uploads and imports in place; `identifier` for each link the database's parser finds.
-- `database_entry` and `identifiers` come from the database entry that lists the bucket now,
-  not from when the version was made; a removed entry gives none.
+- `bucket_metadata` and `identifiers` come from the bucket's metadata now, not from when the
+  version was made; a bucket without metadata gives none.
 - Without `version_id` the range's coordinator answers. While it cannot, a ready copy answers
   and `stale_ranges` names the range, since the copy may be behind; a 404 from a copy has the
   code `stale_not_found` and says the version may exist.
@@ -282,7 +283,7 @@ impl From<OriginView> for OriginResponse {
             "hop": null,
             "source": null,
             "projection": [{"property": "isBasedOn", "id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"}],
-            "database_entry": null,
+            "bucket_metadata": null,
             "identifiers": [],
             "content_id": "https://w3id.org/aruna/data/af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         })),
@@ -493,7 +494,7 @@ pub struct VersionOriginParams {
             "hop": null,
             "source": null,
             "projection": [{"property": "CreateAction", "run_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2"}],
-            "database_entry": null,
+            "bucket_metadata": null,
             "identifiers": [],
             "content_id": null
         })),

@@ -14,6 +14,7 @@ pub mod holders;
 pub mod key;
 pub mod linked;
 pub mod list;
+pub mod metadata;
 pub mod placement;
 pub mod remap;
 pub mod rename;

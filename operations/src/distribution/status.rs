@@ -287,7 +287,7 @@ pub fn node_reach(context: &DriverContext, node_id: NodeId) -> Reach {
 
 /// This node's record of the set, if it holds one.
 pub async fn read_view(
-    context: &Arc<DriverContext>,
+    context: &DriverContext,
     set_id: Ulid,
 ) -> Result<Option<DistributionView>, StatusError> {
     let read = StorageEffect::Read {
