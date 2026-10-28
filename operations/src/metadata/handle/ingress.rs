@@ -1121,6 +1121,16 @@ impl MetadataHandle {
                     None,
                 )
             }
+            MetadataTransportMessage::HandRealmKey { key } => {
+                let stored = crate::realm::promote_node::serve_realm_key(context, peer, key);
+                let result = Box::pin(stored).await;
+                (MetadataTransportMessage::RealmKeyStored { result }, None)
+            }
+            MetadataTransportMessage::PromotionCheck => {
+                let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
+                let result = Box::pin(ready).await;
+                (MetadataTransportMessage::PromotionReady { result }, None)
+            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)

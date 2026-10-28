@@ -1,4 +1,4 @@
-//! Tests the system info routes for realm status, placement changes, quota and usage.
+//! Tests the system info routes for realm status, placement changes, quota, usage and promotion.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -16,6 +16,7 @@ use crate::routes::federation::{
     AcceptedRealmsSetting, RealmFederation, RegistrationSetting, get_realm_federation,
     set_realm_federation,
 };
+use crate::routes::promotion::promote_server_node;
 use crate::server::state::ServerState;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
@@ -41,7 +42,7 @@ use aruna_operations::realm::set_quota::SetQuotaError;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::body::Body;
-use axum::extract::{FromRequest, State};
+use axum::extract::{FromRequest, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::{Extension, Json};
 use std::collections::{BTreeMap, HashSet};
@@ -1919,5 +1920,44 @@ async fn counts_distributed_once() {
     assert_eq!(
         super::distinct_buckets(&node.state, Some(ulid::Ulid::nil()), 5).await,
         Some(5)
+    );
+}
+
+#[tokio::test]
+async fn promotion_requires_admin() {
+    let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
+    let stranger = AuthContext {
+        user_id: UserId::local(Ulid::generate(), realm_id),
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let node = iroh::SecretKey::generate().public().to_string();
+
+    let error = promote_server_node(State(state), Extension(Some(stranger)), Path(node))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ServerError::Forbidden));
+}
+
+#[tokio::test]
+async fn promotion_needs_server() {
+    let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+    let auth = Some(admin_auth(realm_id, admin));
+    let unknown = iroh::SecretKey::generate().public().to_string();
+
+    let error = promote_server_node(State(state.clone()), Extension(auth.clone()), Path(unknown))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ServerError::NotFound));
+
+    let own = state.get_node_id().to_string();
+    let error = promote_server_node(State(state), Extension(auth), Path(own))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ServerError::Conflict(_)),
+        "a node never promotes itself"
     );
 }

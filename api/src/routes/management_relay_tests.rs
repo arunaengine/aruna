@@ -264,3 +264,11 @@ fn allowlist_matches_router() {
         );
     }
 }
+
+#[test]
+fn promotion_fits_relay() {
+    // A relayed promotion answers, ready or not, well before the relay gives up on it.
+    let margin = std::time::Duration::from_secs(5);
+    let budget = aruna_operations::realm::promote_node::CALL_BUDGET;
+    assert!(budget + margin <= super::RELAY_TIMEOUT);
+}

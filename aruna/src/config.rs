@@ -347,6 +347,7 @@ pub async fn resolve_config(
 
     let net_secret_key = iroh::SecretKey::from_bytes(&node_state.net_secret_key);
     let node_id = net_secret_key.public();
+    node_state = identity.apply_promotion(node_state, node_id).await?;
     let (realm_id, node_capabilities) = identity.capabilities(&node_state)?;
     if realm_id != node_state.realm_id {
         return Err(SetupError::NodeStateMismatch);
