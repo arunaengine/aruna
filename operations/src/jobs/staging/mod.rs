@@ -4,7 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod lanes;
+mod limiter;
 mod manifest;
+mod table;
 mod walk;
 
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
@@ -162,6 +164,17 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
                 }
             }
         }
+        if table::reads_table(&checkpoint) {
+            // Boxed, as its page import and object writes make a large future.
+            match Box::pin(table::read_table_chunk(ctx, spec, &mut checkpoint)).await {
+                Ok(()) => continue,
+                Err(PageFailure::Retry(message)) => return retryable_error(message),
+                Err(PageFailure::Conflict(message)) => return conflict_error(message),
+                Err(PageFailure::Permanent(message)) => {
+                    return finish_failed(ctx, permanent_error(message)).await;
+                }
+            }
+        }
         if checkpoint.manifest.is_none() && checkpoint.walk.is_none() {
             match start_walk(ctx, spec, &mut checkpoint).await {
                 Ok(true) => continue,
@@ -212,12 +225,14 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
         prefixes_done: 0,
         walk: None,
         manifest: None,
+        table: spec.table.as_ref().map(|_| Default::default()),
         queue_head: 0,
         queue_tail: 0,
         items_current: 0,
         items_succeeded: 0,
         items_failed: 0,
-        items_total: spec.prefixes.is_empty().then_some(spec.items.len() as u64),
+        items_total: (spec.prefixes.is_empty() && spec.table.is_none())
+            .then_some(spec.items.len() as u64),
         bytes_current: 0,
         bytes_total: None,
         bytes_discovered: 0,
@@ -228,7 +243,8 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
 
 /// Where a job a range's new coordinator takes over goes on: the former job's position without
 /// its counters, errors or directory queue. A flat walk keeps its listing cursor and reads its
-/// manifest again; a manifest read or a directory walk, whose queue stays behind, starts over.
+/// manifest again; a manifest read, a table or a directory walk, whose queue stays behind, starts
+/// over.
 pub(crate) fn handed_checkpoint(
     spec: &StagingJobSpec,
     at: &StagingJobCheckpoint,
@@ -549,6 +565,7 @@ mod pure_tests {
                 target_prefix: String::new(),
             }],
             checksum_manifest: None,
+            table: None,
         }
     }
 

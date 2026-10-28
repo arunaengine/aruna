@@ -216,6 +216,8 @@ pub struct StagingJobSpec {
     /// Name of an `md5sum` or `sha256sum` manifest below each prefix whose digests the
     /// imported files carry and a complete read must match.
     pub checksum_manifest: Option<String>,
+    /// A table whose rows name the files or folders to import, instead of items and prefixes.
+    pub table: Option<crate::structs::execution::table::TableImport>,
 }
 
 /// One server-side object copy run outside a request, for a source whose bytes
@@ -283,6 +285,20 @@ pub struct ManifestRead {
     pub observation: Option<crate::structs::execution::source_access::SourceMetadata>,
 }
 
+/// A table being read in bounded chunks; its folders wait in the directory queue.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableRead {
+    /// Bytes read so far, after decompression for a gzip table.
+    pub offset: u64,
+    /// A connector table as first observed; later chunks are read bound to it.
+    pub observation: Option<crate::structs::execution::source_access::SourceMetadata>,
+    /// The version of an object table first read; later chunks read the same version.
+    pub version_id: Option<Ulid>,
+    /// The header, once the first chunk is read.
+    pub columns: Option<Vec<String>>,
+    pub gzip: Option<bool>,
+}
+
 /// Progress of a staging job. It stays small: positions and counters only, while directories
 /// still to list wait in the separately paginated queue.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +312,8 @@ pub struct StagingJobCheckpoint {
     pub prefixes_done: u64,
     pub walk: Option<StagingWalk>,
     pub manifest: Option<ManifestRead>,
+    /// The table being read; `None` once it is read or when the job has none.
+    pub table: Option<Box<TableRead>>,
     /// Queue rows `[queue_head, queue_tail)` are directories still to list.
     pub queue_head: u64,
     pub queue_tail: u64,

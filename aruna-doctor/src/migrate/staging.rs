@@ -47,6 +47,7 @@ impl From<LegacyStaging> for StagingJobSpec {
             items: old.items,
             prefixes: old.prefixes,
             checksum_manifest: None,
+            table: None,
         }
     }
 }
@@ -131,6 +132,7 @@ impl From<LegacyCheckpoint> for StagingJobCheckpoint {
             prefixes_done: 0,
             walk: None,
             manifest: None,
+            table: None,
             queue_head: 0,
             queue_tail: 0,
             items_current: old.items_current,
