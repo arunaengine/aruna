@@ -26,6 +26,7 @@ fn stored(size: u64) -> VersionEntry {
         referenced: false,
         identity: Some([size.to_le_bytes()[0]; 32]),
         pending: false,
+        searchable: false,
     }
 }
 
@@ -246,6 +247,7 @@ async fn purge_reaches_zero() {
         referenced: false,
         identity: None,
         pending: false,
+        searchable: false,
     };
     marker.added.push(AddedVersion {
         version_id: id(2),

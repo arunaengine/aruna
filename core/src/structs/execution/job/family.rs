@@ -177,6 +177,9 @@ pub struct LogicalJobSpec {
     pub retry: JobRetryPolicy,
     pub admission: JobAdmissionRecord,
     pub captured_inputs: Vec<CapturedInput>,
+    /// Inputs too large for the record: then `payload.inputs` and `captured_inputs` are empty
+    /// and the pages hold them in order.
+    pub input_pages: Option<PageManifest>,
     pub output_policies: Vec<PlacementPolicyRef>,
     /// Family placement derived from `submission_id`, never from the alias bucket.
     pub placement: PlacementRef,
@@ -285,6 +288,8 @@ pub struct LaunchIntent {
     pub holder_generation: u64,
     pub target: ExecutionTargetId,
     pub inputs: Vec<crate::scheduling::PlannedInput>,
+    /// Planned inputs too large for the record: then `inputs` is empty.
+    pub input_pages: Option<PageManifest>,
     pub output_policies: Vec<PlacementPolicyRef>,
     pub plan_digest: [u8; 32],
     pub spec_digest: [u8; 32],

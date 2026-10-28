@@ -90,6 +90,8 @@ pub enum ApiConnectorKind {
     LocalDirectory,
     /// Invenio files are read through repository connectors; rejected on registration.
     Invenio,
+    /// A link to an exact Aruna version, written by a link copy; rejected on registration.
+    ArunaLink,
 }
 
 impl From<ApiConnectorKind> for SourceConnectorKind {
@@ -102,6 +104,7 @@ impl From<ApiConnectorKind> for SourceConnectorKind {
             ApiConnectorKind::ArunaNative => SourceConnectorKind::ArunaNative,
             ApiConnectorKind::LocalDirectory => SourceConnectorKind::LocalDirectory,
             ApiConnectorKind::Invenio => SourceConnectorKind::Invenio,
+            ApiConnectorKind::ArunaLink => SourceConnectorKind::ArunaLink,
         }
     }
 }
@@ -116,6 +119,7 @@ impl From<SourceConnectorKind> for ApiConnectorKind {
             SourceConnectorKind::ArunaNative => ApiConnectorKind::ArunaNative,
             SourceConnectorKind::LocalDirectory => ApiConnectorKind::LocalDirectory,
             SourceConnectorKind::Invenio => ApiConnectorKind::Invenio,
+            SourceConnectorKind::ArunaLink => ApiConnectorKind::ArunaLink,
         }
     }
 }

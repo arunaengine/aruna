@@ -111,6 +111,8 @@ pub(super) struct KubernetesSettings {
     pub(super) s3_cidrs: Vec<String>,
     pub(super) s3_port: Option<String>,
     pub(super) mount_driver: Option<String>,
+    /// KubeDAL driver for run input views, which mount through this node's gateway.
+    pub(super) kubedal_driver: Option<String>,
     pub(super) policy_manifests: Vec<PathBuf>,
     pub(super) service_account: String,
     pub(super) execution_location: String,

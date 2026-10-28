@@ -155,6 +155,7 @@ fn collect_kubernetes(
         s3_cidrs,
         s3_port: parse_nonempty(env.var("ARUNA_COMPUTE_K8S_S3_PORT").as_deref()),
         mount_driver: parse_nonempty(env.var("ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER").as_deref()),
+        kubedal_driver: parse_nonempty(env.var("ARUNA_COMPUTE_K8S_KUBEDAL_DRIVER").as_deref()),
         policy_manifests,
         service_account: env
             .var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")

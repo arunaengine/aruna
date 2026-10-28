@@ -33,6 +33,7 @@ const CRATE_PROFILE: &str = "https://w3id.org/ro/crate/1.2";
 pub(crate) const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5";
 const TERMS: &str = "https://w3id.org/aruna/terms/";
 const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
+const LINK_PROPERTY: &str = "https://w3id.org/aruna/terms/link";
 
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::{
@@ -511,6 +512,10 @@ fn launch_properties(launch: &LaunchRecord) -> Vec<serde_json::Value> {
 }
 
 /// The contextual entity id of one device an input came from.
+fn group_entity(group_id: Ulid) -> String {
+    format!("#group-{group_id}")
+}
+
 fn device_entity(device: &str) -> String {
     format!("#device-{device}")
 }
@@ -613,6 +618,8 @@ fn build_crate_jsonld(
         (id, serde_json::Value::Object(file))
     };
     let mut used_devices = BTreeSet::new();
+    let mut source_groups = BTreeSet::new();
+    let mut link_properties = Vec::new();
     let mut object_ids = Vec::with_capacity(spec.inputs.len());
     let mut part_ids = Vec::new();
     let mut files = Vec::new();
@@ -626,11 +633,35 @@ fn build_crate_jsonld(
         let mut file = json!({ "@type": "File", "name": name });
         if let Some(captured) = captured {
             file["contentSize"] = json!(captured.bytes.to_string());
+            // The group whose bucket held the input, and whether anyone may read it.
+            file["sourceOrganization"] = json!({ "@id": group_entity(captured.source_group_id) });
+            source_groups.insert(captured.source_group_id);
+            if captured.public {
+                file["conditionsOfAccess"] = json!("public");
+            }
+            // The run read the target; the link it named stays visible next to it.
+            if let Some(link) = &captured.link {
+                let id = format!("#link-{}", link_properties.len());
+                file["additionalProperty"] = json!({ "@id": id });
+                link_properties.push(json!({
+                    "@id": id,
+                    "@type": "PropertyValue",
+                    "name": "Reached through link",
+                    "propertyID": LINK_PROPERTY,
+                    "value": link.to_w3id()
+                }));
+            }
         }
         // Only the device a version came from is named, never the local path it had there.
         if let Some(device) = devices.get(&input.dest_key) {
             file["isBasedOn"] = json!({ "@id": device_entity(device) });
             used_devices.insert(device.clone());
+        } else if let Some(url) = captured
+            .and_then(|captured| captured.source_pin.as_ref())
+            .and_then(|pin| pin.url.as_ref())
+        {
+            // A reference names the public source it reads; a private one stays unnamed.
+            file["isBasedOn"] = json!({ "@id": url });
         }
         let location = ObjectLocation {
             bucket: bucket.clone(),
@@ -638,7 +669,7 @@ fn build_crate_jsonld(
         };
         let version = captured
             .and_then(|captured| exact(captured.source_node_id, &location, captured.version_id));
-        let hash = captured.map(|captured| captured.blake3);
+        let hash = captured.and_then(|captured| captured.content.blake3());
         let (id, file) = entity(location, hash, version, file);
         object_ids.push(json!({ "@id": id.clone() }));
         files.push(file);
@@ -806,6 +837,15 @@ fn build_crate_jsonld(
             "identifier": device
         })
     }));
+    graph.extend(source_groups.iter().map(|group_id| {
+        json!({
+            "@id": group_entity(*group_id),
+            "@type": "Organization",
+            "name": "Aruna group",
+            "identifier": group_id.to_string()
+        })
+    }));
+    graph.extend(link_properties);
     graph.extend(properties);
     if let Some(launch) = launch {
         let mut site = json!({
@@ -1145,6 +1185,60 @@ mod pure_tests {
     }
 
     #[test]
+    fn names_source_group() {
+        // An input from another group's public bucket names that group and its open access.
+        let (mut record, spec) = execution_record();
+        let group = Ulid::from_bytes([21; 16]);
+        record.captured_inputs.push(CapturedInput {
+            destination_key: "inputs/in.txt".to_string(),
+            source_node_id: record.owner_node_id,
+            version_id: Ulid::from_bytes([13; 16]),
+            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            bytes: 3,
+            policies: Vec::new(),
+            source_group_id: group,
+            public: true,
+            link: Some(VersionedObjectArn {
+                realm_id: record.created_by.realm_id,
+                node_id: record.owner_node_id,
+                bucket: "work".to_string(),
+                key: "db/bakta.db".to_string(),
+                version: Ulid::from_bytes([14; 16]),
+            }),
+            source_pin: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
+        });
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let input = graph
+            .iter()
+            .find(|entity| entity["name"] == "Input sample")
+            .expect("input entity");
+        let organization = format!("#group-{group}");
+        assert_eq!(input["sourceOrganization"]["@id"], organization.as_str());
+        assert_eq!(input["conditionsOfAccess"], "public");
+        let entity = graph
+            .iter()
+            .find(|entity| entity["@id"] == organization.as_str())
+            .expect("group entity");
+        assert_eq!(entity["@type"], "Organization");
+        assert_eq!(entity["identifier"], group.to_string());
+        let link = graph
+            .iter()
+            .find(|entity| entity["@id"] == input["additionalProperty"]["@id"])
+            .expect("link property");
+        assert_eq!(link["propertyID"], LINK_PROPERTY);
+        assert!(
+            link["value"]
+                .as_str()
+                .is_some_and(|value| value.contains("work"))
+        );
+    }
+
+    #[test]
     fn names_by_content() {
         // Known digests become content addresses; the same content twice keeps one address,
         // and each entity keeps its own exact version as a second `contentUrl`.
@@ -1153,9 +1247,17 @@ mod pure_tests {
             destination_key: "inputs/in.txt".to_string(),
             source_node_id: record.owner_node_id,
             version_id: Ulid::from_bytes([13; 16]),
-            blake3: [9; 32],
+            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
             bytes: 3,
             policies: Vec::new(),
+            source_group_id: Default::default(),
+            public: false,
+            link: None,
+            source_pin: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
         });
         if let Some(JobResultPayload::Execution { outputs, .. }) = &mut record.result {
             outputs[0].digest = Some(hex::encode([9; 32]));

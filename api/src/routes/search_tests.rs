@@ -947,6 +947,7 @@ fn search_maps_partiality() {
             checksum: None,
             size: Some(42),
             updated_at: Some(SystemTime::UNIX_EPOCH),
+            metadata: Default::default(),
         }],
         next_cursor: Some("opaque".to_string()),
         as_of: SystemTime::UNIX_EPOCH,

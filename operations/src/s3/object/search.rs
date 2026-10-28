@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use aruna_core::NodeId;
@@ -10,6 +10,7 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::structs::execution::table::{metadata_matches, query_terms};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
@@ -42,6 +43,8 @@ pub const SEARCH_MAX_LIMIT: usize = 100;
 pub enum ObjectKeyMatch {
     Substring,
     Prefix,
+    /// Matches searchable object metadata instead of keys: free text plus `column=value` terms.
+    Metadata,
 }
 
 impl ObjectKeyMatch {
@@ -49,6 +52,7 @@ impl ObjectKeyMatch {
         match self {
             Self::Substring => key.contains(query),
             Self::Prefix => key.starts_with(query),
+            Self::Metadata => true,
         }
     }
 }
@@ -82,6 +86,9 @@ pub struct ObjectInventoryHit {
     pub checksum: Option<ObjectInventoryChecksum>,
     pub size: Option<u64>,
     pub updated_at: Option<SystemTime>,
+    /// A metadata search hit's kept columns, without the search selections.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -332,7 +339,12 @@ async fn scan_candidates(
 ) -> Result<CandidateBatch, SearchObjectsError> {
     let (heads, next_start) =
         scan_heads(context, input, start, scan_limit, txn_id, distributed).await?;
-    let live = load_live(context, input, heads, txn_id).await?;
+    let mut live = load_live(context, input, heads, txn_id).await?;
+    // Without a range index, metadata is matched on the versions the scan loaded.
+    if input.key_match == ObjectKeyMatch::Metadata {
+        let (text, exact) = query_terms(&input.query);
+        live.retain(|head| metadata_matches(&head.version.metadata, &text, &exact));
+    }
     let candidates = build_hits(context, input, live, txn_id).await?;
 
     Ok(CandidateBatch {
@@ -353,7 +365,9 @@ async fn scan_heads(
         (Some(bucket), ObjectKeyMatch::Prefix) => {
             Some(BlobHeadKey::object_prefix(bucket, &input.query)?)
         }
-        (Some(bucket), ObjectKeyMatch::Substring) => Some(BlobHeadKey::bucket_prefix(bucket)?),
+        (Some(bucket), ObjectKeyMatch::Substring | ObjectKeyMatch::Metadata) => {
+            Some(BlobHeadKey::bucket_prefix(bucket)?)
+        }
         (None, _) => None,
     };
     let event = context
@@ -583,11 +597,23 @@ async fn build_hits(
                 checksum,
                 size,
                 updated_at,
+                metadata: match input.key_match {
+                    ObjectKeyMatch::Metadata => kept_metadata(&candidate.version.metadata),
+                    ObjectKeyMatch::Substring | ObjectKeyMatch::Prefix => BTreeMap::new(),
+                },
             },
         });
     }
 
     Ok(candidates)
+}
+
+/// A version's own metadata, without the `aruna-` entries that only steer search.
+fn kept_metadata(metadata: &HashMap<String, String>) -> BTreeMap<String, String> {
+    (metadata.iter())
+        .filter(|(key, _)| !key.starts_with("aruna-"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 async fn batch_read(

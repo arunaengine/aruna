@@ -591,6 +591,7 @@ mod tests {
                 source_version: None,
                 digests: Default::default(),
             },
+            metadata: Default::default(),
         });
         PageImportInput {
             job_id: ctx.job_id,

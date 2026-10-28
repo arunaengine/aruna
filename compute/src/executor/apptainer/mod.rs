@@ -13,9 +13,8 @@ use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
     ExecutorKind, FenceContext, GrantedResources, LogLimits, LogTails, MAX_OUTPUT_MATCHES,
-    MAX_TRANSFER_BYTES, NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode,
-    TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
-    normalize_container_path,
+    NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput,
+    TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -515,11 +514,6 @@ impl ExecutorBackend for ApptainerBackend {
             ));
         }
         let size = candidate.metadata().map_err(io_error)?.len();
-        if size > MAX_TRANSFER_BYTES {
-            return Err(BackendError::InvalidSpec(
-                "output exceeds transfer limit".to_string(),
-            ));
-        }
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(stream_file(candidate, tx));
         Ok(TaskOutput {
@@ -806,7 +800,7 @@ async fn stage_files(directory: &Path, plan: StagePlan) -> Result<Vec<BindMount>
             written = written.checked_add(chunk.len() as u64).ok_or_else(|| {
                 BackendError::InvalidSpec("input byte count overflows".to_string())
             })?;
-            if written > entry.size || written > MAX_TRANSFER_BYTES {
+            if written > entry.size {
                 return Err(BackendError::InvalidSpec(format!(
                     "input `{}` exceeds its declared size",
                     entry.path.display()

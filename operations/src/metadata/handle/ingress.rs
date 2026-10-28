@@ -1159,6 +1159,22 @@ impl MetadataHandle {
                 let result = Box::pin(ready).await;
                 (MetadataTransportMessage::PromotionReady { result }, None)
             }
+            MetadataTransportMessage::ResolveJobInputs {
+                auth_token,
+                request,
+            } => {
+                let resolved = crate::jobs::lifecycle::ingress::serve_input_resolve(
+                    context, peer, auth_token, *request,
+                );
+                let result = Box::pin(resolved).await;
+                (MetadataTransportMessage::ResolvedJobInputs { result }, None)
+            }
+            MetadataTransportMessage::JobInputPage { submission, digest } => {
+                let page =
+                    crate::jobs::records::pages::serve_page(context, peer, submission, digest);
+                let page = Box::pin(page).await;
+                (MetadataTransportMessage::JobInputPageResult { page }, None)
+            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)

@@ -465,6 +465,7 @@ fn search_assembly_order() {
                         checksum: None,
                         size: None,
                         updated_at: None,
+                        metadata: Default::default(),
                     },
                     cursor_key: key.as_bytes().to_vec(),
                 }]

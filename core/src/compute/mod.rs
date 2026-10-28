@@ -26,8 +26,6 @@ pub mod quota;
 pub mod runtimes;
 pub mod session;
 
-pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-
 /// Maximum executor backends one node advertises.
 pub const MAX_ADVERTISED_EXECUTORS: usize = 8;
 

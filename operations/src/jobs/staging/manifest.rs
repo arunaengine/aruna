@@ -311,6 +311,7 @@ mod tests {
                 target_prefix: String::new(),
             }],
             checksum_manifest: Some("MD5SUMS".to_string()),
+            table: None,
         }
     }
 
@@ -326,6 +327,7 @@ mod tests {
                 offset: 4096,
                 observation: None,
             }),
+            table: None,
             queue_head: 0,
             queue_tail: 0,
             items_current: 0,

@@ -8,6 +8,7 @@ use std::ops::Bound;
 use std::sync::{Arc, LazyLock};
 
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, SEARCH_INDEX_KEYSPACE};
+use aruna_core::structs::execution::table::{query_terms, search_tokens};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::inventory::Position;
@@ -26,7 +27,7 @@ use super::{
 };
 use crate::auth::request_policy::PolicyEvaluator;
 use crate::distribution::index_feed::{range_progress, state_key};
-use crate::distribution::key_index::{KeyPage, KeyQuery, RangeIndexes};
+use crate::distribution::key_index::{KeyPage, KeyQuery, MetaTerms, RangeIndexes};
 use crate::driver::DriverContext;
 use crate::replication::members::read_record;
 
@@ -116,6 +117,14 @@ async fn range_page(
     }
 
     let names = (input.key_match == ObjectKeyMatch::Substring).then(|| input.query.clone());
+    let meta = (input.key_match == ObjectKeyMatch::Metadata).then(|| {
+        let (text, exact) = query_terms(&input.query);
+        let text = search_tokens(&text).into_iter().collect();
+        MetaTerms {
+            text,
+            exact: exact.into_iter().collect(),
+        }
+    });
     let mut evaluators = HashMap::new();
     let mut visible = Vec::with_capacity(limit + 1);
     let (mut examined, mut incomplete) = (0, 0);
@@ -124,6 +133,7 @@ async fn range_page(
             start: start.clone(),
             end: end.clone(),
             names: names.clone(),
+            meta: meta.clone(),
             limit: budget.saturating_sub(examined).max(1),
         };
         let found = search_chunk(context, &search, chunk, query).await?;

@@ -260,6 +260,9 @@ async fn resolve_inputs(
     spec: &LogicalJobSpec,
     local: NodeId,
 ) -> Result<Vec<ResolvedInput>, PlanBuildError> {
+    let spec = &crate::jobs::records::pages::with_inputs(context, spec)
+        .await
+        .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?;
     if spec.captured_inputs.len() != spec.payload.inputs.len() {
         return Err(PlanBuildError::Unavailable(
             "captured inputs are incomplete".to_string(),
@@ -280,7 +283,8 @@ async fn resolve_inputs(
                 key: input.dest_key.clone(),
                 reason: "captured inputs are unavailable".to_string(),
             })?;
-        if captured.source_node_id != spec.ingress_node_id {
+        // Each input was resolved at its own node, or at ingress when it named none.
+        if captured.source_node_id != input.source_node_id.unwrap_or(spec.ingress_node_id) {
             return Err(PlanBuildError::Input {
                 key: input.dest_key.clone(),
                 reason: "captured input endpoint changed".to_string(),
@@ -307,7 +311,7 @@ async fn resolve_inputs(
             spec.realm_id,
             local,
             captured.source_node_id,
-            captured.blake3,
+            captured.content.blake3(),
         )
         .await;
         inputs.push(ResolvedInput {
@@ -320,7 +324,7 @@ async fn resolve_inputs(
                 version: captured.version_id,
             },
             version_id: captured.version_id,
-            blake3: captured.blake3,
+            content: captured.content.clone(),
             bytes: captured.bytes,
             policies: captured.policies.clone(),
             holders,
@@ -368,12 +372,16 @@ async fn input_holders(
     realm_id: aruna_core::structs::identity::realm::RealmId,
     local: NodeId,
     source_node: NodeId,
-    blake3: [u8; 32],
+    blake3: Option<[u8; 32]>,
 ) -> Vec<InputHolder> {
     let mut holders = vec![InputHolder {
         subject: holder_subject(config, source_node),
         node_id: source_node,
     }];
+    // A reference has no stored copies to find by content, so its source is its only holder.
+    let Some(blake3) = blake3 else {
+        return holders;
+    };
     let registered = drive(GetHoldersOperation::new(blake3, realm_id, local), context)
         .await
         .unwrap_or_else(|error| {

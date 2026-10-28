@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
@@ -27,6 +27,7 @@ struct ProgressInner {
     current: AtomicU64,
     total: Mutex<Option<u64>>,
     unit: String,
+    pause: Mutex<Option<SystemTime>>,
     /// Set once this execution committed a resumable checkpoint.
     checkpointed: AtomicBool,
     /// Wakes the heartbeat to persist a committed checkpoint's progress at once.
@@ -40,6 +41,7 @@ impl ProgressReporter {
                 current: AtomicU64::new(progress.current),
                 total: Mutex::new(progress.total),
                 unit: progress.unit.clone(),
+                pause: Mutex::new(None),
                 checkpointed: AtomicBool::new(false),
                 flush: tokio::sync::Notify::new(),
             }),
@@ -52,6 +54,15 @@ impl ProgressReporter {
 
     pub fn set_current(&self, current: u64) {
         self.inner.current.store(current, Ordering::Relaxed);
+    }
+
+    /// Records the end of a pause a source asked for, `None` once the job goes on.
+    pub fn set_pause(&self, until: Option<SystemTime>) {
+        *self
+            .inner
+            .pause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = until;
     }
 
     pub fn advance(&self, delta: u64) {
@@ -78,6 +89,11 @@ impl ProgressReporter {
             current: self.inner.current.load(Ordering::Relaxed),
             total: *self.inner.total.lock().expect("progress mutex poisoned"),
             unit: self.inner.unit.clone(),
+            paused_until: *self
+                .inner
+                .pause
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
         }
     }
 }

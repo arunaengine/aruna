@@ -524,6 +524,9 @@ pub struct JobProgress {
     pub current: u64,
     pub total: Option<u64>,
     pub unit: String,
+    /// While set, the job waits until then because a source asked it to pause.
+    #[serde(default)]
+    pub paused_until: Option<std::time::SystemTime>,
 }
 
 impl JobProgress {
@@ -532,6 +535,7 @@ impl JobProgress {
             current: 0,
             total: None,
             unit: unit.into(),
+            paused_until: None,
         }
     }
 }

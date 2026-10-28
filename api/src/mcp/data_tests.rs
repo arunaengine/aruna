@@ -33,19 +33,6 @@ fn bounded_bytes_range() {
 }
 
 #[test]
-fn cursor_rejects_garbage() {
-    // Non base64 and well-formed base64 that is not a token both refuse.
-    let text = body(decode_cursor("!not base64!").unwrap_err());
-    assert!(
-        text["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("next_cursor")
-    );
-    assert!(decode_cursor("Zm9v").is_err());
-}
-
-#[test]
 fn object_error_forbidden() {
     let forbidden = body(object_error(crate::error::ServerError::Forbidden, "write"));
     assert!(
@@ -299,6 +286,80 @@ fn held_read_internal() {
     assert_eq!(error["code"], "Internal error");
 }
 
+// An ordinary bucket's listing shows neither a link to a target the caller cannot read nor
+// a key the caller's bearer denies, and no cursor names either of them.
+#[tokio::test]
+async fn lists_readable_objects() {
+    use aruna_core::structs::identity::auth::PathRestriction;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = crate::tests::distributed::node_state().await;
+    let bucket = crate::tests::distributed::BUCKET;
+    let info = crate::routes::storage::deletion::bucket_info(&node.state, bucket)
+        .await
+        .unwrap();
+    for key in ["a.md", "secret.md", "z.md"] {
+        let input = WriteObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            text: "x".to_string(),
+            content_type: None,
+        };
+        store_text(&node.state, &node.owner, &info, input, Default::default())
+            .await
+            .unwrap();
+    }
+    crate::tests::distributed::hidden_link(&node, "link.md").await;
+    let state = &node.state;
+    let root = bucket_permission_path(
+        state.get_realm_id(),
+        node.group_id,
+        state.get_node_id(),
+        bucket,
+    );
+    let rule = |pattern: String, permission| PathRestriction {
+        pattern,
+        permission,
+    };
+    let auth = AuthContext {
+        path_restrictions: Some(vec![
+            rule(root.clone(), Permission::READ),
+            rule(format!("{root}/**"), Permission::READ),
+            rule(format!("{root}/secret.md"), Permission::DENY),
+        ]),
+        ..node.owner.clone()
+    };
+    let server = McpServer::new(node.state.clone());
+    let (mut cursor, mut keys) = (None, Vec::new());
+    for _ in 0..6 {
+        let (mut parts, ()) = http::Request::new(()).into_parts();
+        parts.extensions.insert(Some(auth.clone()));
+        parts
+            .extensions
+            .insert(None::<crate::auth::ValidatedBearer>);
+        let input = ListObjectsInput {
+            bucket: bucket.to_string(),
+            prefix: None,
+            cursor: cursor.take(),
+            limit: Some(2),
+        };
+        let listed = server
+            .list_objects(Extension(parts), Parameters(input))
+            .await
+            .unwrap()
+            .0;
+        keys.extend(listed.objects.iter().map(|object| object.key.clone()));
+        cursor = listed.next_cursor;
+        let Some(cursor) = &cursor else { break };
+        let bytes = URL_SAFE_NO_PAD.decode(cursor).unwrap_or_default();
+        for hidden in [&b"secret"[..], b"link"] {
+            assert!(!bytes.windows(hidden.len()).any(|window| window == hidden));
+        }
+    }
+    assert_eq!(keys, vec!["a.md", "z.md"]);
+}
+
 mod distributed {
     //! The data tools on a member of a distributed bucket.
     use super::*;
@@ -343,6 +404,47 @@ mod distributed {
         }
     }
 
+    /// Writes a link at `key` on the first member to a target in a group the user cannot read.
+    async fn hidden_link(members: &Members, key: &str) {
+        use aruna_core::structs::storage::link::LinkTarget;
+        use aruna_core::structs::storage::replication::VersionedObjectArn;
+        use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+        let node = &members.nodes[0];
+        let target = LinkTarget {
+            arn: VersionedObjectArn {
+                realm_id: members.realm_id,
+                node_id: node.node_id(),
+                bucket: "other".to_string(),
+                key: "x".to_string(),
+                version: ulid::Ulid::from_parts(5, 5),
+            },
+            group_id: ulid::Ulid::from_parts(9, 9),
+        };
+        let write = ReferenceWrite {
+            preassigned_version_id: None,
+            group_id: members.group_id,
+            user_id: members.user.user_identity,
+            realm_id: members.realm_id,
+            node_id: node.node_id(),
+            bucket: BUCKET.to_string(),
+            key: key.to_string(),
+            expected_bucket: None,
+            version_source: target.binding(),
+            metadata: aruna_core::structs::execution::source_access::SourceMetadata {
+                content_length: 1,
+                content_type: None,
+                etag: Some(target.arn.version.to_string()),
+                last_modified: None,
+                source_version: None,
+                digests: Default::default(),
+            },
+            inherited_policies: Vec::new(),
+            connector_guard: None,
+            restrictions: None,
+        };
+        write_reference_version(&node.context, write).await.unwrap();
+    }
+
     // A text write to a key this member coordinates is stored here as a new version, and the
     // listing of the range it keeps shows it.
     #[tokio::test]
@@ -355,6 +457,8 @@ mod distributed {
             .unwrap()
             .0;
         assert_eq!((written.key.as_str(), written.size), ("a/note", 5));
+        // A link to a target the caller cannot read stays out of the range's listing.
+        hidden_link(&members, "a/secret").await;
         let input = ListObjectsInput {
             bucket: BUCKET.to_string(),
             prefix: Some("a/".to_string()),

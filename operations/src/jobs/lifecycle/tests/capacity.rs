@@ -345,14 +345,22 @@ fn accepts_copy_pin() {
         destination_key: "in/reads.fastq".to_string(),
         source_node_id: ingress,
         version_id: Ulid::from_bytes([4u8; 16]),
-        blake3: [5u8; 32],
+        content: aruna_core::structs::execution::job::InputContent::Blake3([5u8; 32]),
         bytes: 128,
         policies: Vec::new(),
+        source_group_id: Default::default(),
+        public: false,
+        link: None,
+        source_pin: None,
+        database: None,
+        releases: Vec::new(),
+        releases_complete: false,
+        grant: None,
     };
     let pin = PlannedInput {
         destination_key: captured.destination_key.clone(),
         version_id: captured.version_id,
-        blake3: captured.blake3,
+        content: captured.content.clone(),
         bytes: captured.bytes,
         policies: Vec::new(),
         source_node_id: Some(node(2)),
@@ -365,7 +373,7 @@ fn accepts_copy_pin() {
     here.source_node_id = Some(local);
     assert!(!pin_matches(&captured, &here, ingress, local));
     let mut other_bytes = pin.clone();
-    other_bytes.blake3 = [6u8; 32];
+    other_bytes.content = aruna_core::structs::execution::job::InputContent::Blake3([6u8; 32]);
     assert!(!pin_matches(&captured, &other_bytes, ingress, local));
 }
 

@@ -626,6 +626,28 @@ pub enum MetadataTransportMessage {
     PromotionReady {
         result: Result<bool, MetadataReadError>,
     },
+    /// One input page of a job family by its digest; only realm infrastructure nodes ask.
+    JobInputPage {
+        submission: aruna_core::structs::execution::job::SubmissionId,
+        digest: [u8; 32],
+    },
+    JobInputPageResult {
+        page: Option<Box<aruna_core::structs::execution::job::InputPage>>,
+    },
+    /// Inputs an ingress asks their source node to resolve and grant, under the caller's bearer.
+    ResolveJobInputs {
+        auth_token: AuthToken,
+        request: Box<crate::jobs::lifecycle::ingress::InputResolveRequest>,
+    },
+    ResolvedJobInputs {
+        result: Result<
+            Vec<(
+                aruna_core::structs::execution::job::InputSelection,
+                aruna_core::structs::execution::job::CapturedInput,
+            )>,
+            crate::jobs::lifecycle::ingress::SubmissionRefusal,
+        >,
+    },
     /// Release membership or release files of some ranges, asked of their coordinator with the
     /// caller's bearer, which the holder validates itself.
     ReleaseHolder {

@@ -266,6 +266,7 @@ async fn reference_import_counted() {
         prefixes_done: 1,
         walk: None,
         manifest: None,
+        table: None,
         queue_head: 0,
         queue_tail: 0,
         items_current: 0,
@@ -289,6 +290,7 @@ async fn reference_import_counted() {
             source_version: None,
             digests: Default::default(),
         },
+        metadata: Default::default(),
     };
     let page = PageImportInput {
         job_id,

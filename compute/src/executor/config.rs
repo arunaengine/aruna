@@ -101,6 +101,9 @@ pub struct KubernetesConfig {
     pub s3_port: u16,
     /// CSI driver name for S3 mounts; `None` disables the feature.
     pub s3_mount_driver: Option<String>,
+    /// KubeDAL mounts run input views with their own endpoint and credential per volume;
+    /// `None` mounts them through `s3_mount_driver`, whose endpoint is driver wide.
+    pub kubedal: Option<Box<KubedalMount>>,
     /// Manifest files the operator adds to the compute namespace, such as a
     /// network policy for a cluster the standard policies cannot express.
     pub policy_manifests: Vec<PathBuf>,
@@ -133,6 +136,7 @@ impl Default for KubernetesConfig {
             s3_cidrs: Vec::new(),
             s3_port: 443,
             s3_mount_driver: None,
+            kubedal: None,
             policy_manifests: Vec::new(),
             execution_location: String::new(),
             execution_labels: BTreeMap::new(),
@@ -142,6 +146,21 @@ impl Default for KubernetesConfig {
             default_disk_bytes: None,
             envelope: ResourceEnvelope::default(),
         }
+    }
+}
+
+/// The KubeDAL driver and the S3 gateway of this node as the cluster's hosts reach it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KubedalMount {
+    pub driver: String,
+    pub endpoint: String,
+    pub region: String,
+}
+
+impl KubernetesConfig {
+    /// Whether any driver can mount a run's inputs.
+    pub fn mounts_inputs(&self) -> bool {
+        self.s3_mount_driver.is_some() || self.kubedal.is_some()
     }
 }
 

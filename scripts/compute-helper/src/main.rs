@@ -7,7 +7,6 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
-const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Bounds one output listing well above the caller's match limit.
 const MAX_LISTED_FILES: u64 = 100_000;
 /// Mirrors the listing bound the caller reads with, so an oversized listing
@@ -96,12 +95,10 @@ fn stage_archive(
             }
             kind if kind.is_file() => {
                 let size = entry.size();
+                // The workspace volume's size bounds what fits; the sum only must not wrap.
                 transferred = transferred
                     .checked_add(size)
                     .ok_or_else(|| io::Error::other("input size overflows"))?;
-                if transferred > MAX_TRANSFER_BYTES {
-                    return Err(io::Error::other("input transfer limit exceeded"));
-                }
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                     reject_symlink_path(workspace, parent)?;
@@ -139,9 +136,6 @@ fn fetch_archive(workspace: &Path, path: &str, writer: impl Write) -> io::Result
         return Err(io::Error::other("output is not a regular workspace file"));
     }
     let size = source.metadata()?.len();
-    if size > MAX_TRANSFER_BYTES {
-        return Err(io::Error::other("output transfer limit exceeded"));
-    }
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(tar::EntryType::Regular);
     header.set_mode(0o440);

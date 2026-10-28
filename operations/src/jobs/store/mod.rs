@@ -812,6 +812,10 @@ where
             if old.state != record.state {
                 validate_transition(old.execution_class, old.state, record.state)?;
             }
+            // A source's pause belongs to a running attempt; every other state stores none.
+            if record.state != JobState::Running {
+                record.progress.paused_until = None;
+            }
             if !old.is_settled()
                 && record.is_settled()
                 && (record.payload.is_rocrate()

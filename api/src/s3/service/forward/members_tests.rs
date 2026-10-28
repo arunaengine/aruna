@@ -668,6 +668,153 @@ async fn listing_merges_ranges() {
     assert_eq!(keys, ["q/1", "q/2"]);
 }
 
+/// Writes a link at `key` on member `on` to a target in a group the user cannot read.
+async fn hidden_link(members: &Members, on: usize, key: &str) {
+    use aruna_core::structs::storage::link::LinkTarget;
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    let node = &members.nodes[on];
+    let target = LinkTarget {
+        arn: VersionedObjectArn {
+            realm_id: members.realm_id,
+            node_id: node.node_id(),
+            bucket: "other".to_string(),
+            key: "x".to_string(),
+            version: ulid::Ulid::from_parts(5, 5),
+        },
+        group_id: ulid::Ulid::from_parts(9, 9),
+    };
+    let write = ReferenceWrite {
+        preassigned_version_id: None,
+        group_id: members.group_id,
+        user_id: members.user.user_identity,
+        realm_id: members.realm_id,
+        node_id: node.node_id(),
+        bucket: BUCKET.to_string(),
+        key: key.to_string(),
+        expected_bucket: None,
+        version_source: target.binding(),
+        metadata: aruna_core::structs::execution::source_access::SourceMetadata {
+            content_length: 1,
+            content_type: None,
+            etag: Some(target.arn.version.to_string()),
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        },
+        inherited_policies: Vec::new(),
+        connector_guard: None,
+        restrictions: None,
+    };
+    write_reference_version(&node.context, write).await.unwrap();
+}
+
+// A range that starts with more hidden entries than one request examines goes on from the
+// sealed cursor of its member, here and on another member, so the merged listing completes.
+#[tokio::test]
+async fn listing_passes_hidden_runs() {
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let members = members(3, &["h", "p"], 0).await;
+    for key in ["a/1", "k/zz", "q/1"] {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    for index in 0..=SCAN_BUDGET {
+        hidden_link(&members, 0, &format!("b/{index:05}")).await;
+        hidden_link(&members, 1, &format!("k/{index:05}")).await;
+    }
+    let (mut seen, mut token) = (Vec::new(), None);
+    for _ in 0..8 {
+        let input = s3s::dto::ListObjectsV2Input {
+            continuation_token: token.take(),
+            ..list_input(100)
+        };
+        let (keys, _, next) = page(&members, 0, input).await.unwrap();
+        seen.extend(keys);
+        match next {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, ["a/1", "k/zz", "q/1"]);
+}
+
+/// Node 2 copies range [h, p), which node 1 coordinates and which starts with more hidden
+/// links than one request examines. Node 1 is down, so node 2 lists its copy and seals there.
+async fn sealed_copy() -> (Members, String) {
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let mut members = members(3, &["h", "p"], 1).await;
+    put(&members, 0, "k/zz", b"k").await;
+    for index in 0..=SCAN_BUDGET {
+        hidden_link(&members, 1, &format!("k/{index:05}")).await;
+    }
+    copy_rows(&members, 1, 2).await;
+    members.nodes[1].stop().await;
+    let input = s3s::dto::ListObjectsV2Input {
+        prefix: Some("k/".to_string()),
+        ..list_input(100)
+    };
+    let (keys, _, next) = page(&members, 2, input).await.unwrap();
+    assert!(keys.is_empty());
+    (members, next.expect("the copy sealed its range"))
+}
+
+// A copy that sealed its range is asked as a copy again, so the listing goes on through
+// another member while the coordinator is down.
+#[tokio::test]
+async fn sealed_copy_continues() {
+    let (members, token) = sealed_copy().await;
+    let input = s3s::dto::ListObjectsV2Input {
+        prefix: Some("k/".to_string()),
+        continuation_token: Some(token),
+        ..list_input(100)
+    };
+    let (keys, _, next) = page(&members, 0, input).await.unwrap();
+    assert_eq!((keys, next), (vec!["k/zz".to_string()], None));
+}
+
+// A range resumed at a copy is marked stale like the page that first listed the copy, on
+// the copy itself and through another member.
+#[tokio::test]
+async fn resumed_copy_stale() {
+    let (members, token) = sealed_copy().await;
+    for on in [2, 0] {
+        let node = &members.nodes[on];
+        let input = s3s::dto::ListObjectsV2Input {
+            prefix: Some("k/".to_string()),
+            continuation_token: Some(token.clone()),
+            ..list_input(100)
+        };
+        let list = request(input, Method::GET, members.user_on(on), node.bucket().await);
+        let answer = node.service.list_objects_v2(list).await.unwrap();
+        assert!(answer.headers.get(STALE_HEADER).is_some(), "node {on}");
+    }
+}
+
+// A ListObjects marker that happens to equal a ListObjectsV2 token is a plain key, so the
+// listing starts after it instead of from the first key.
+#[tokio::test]
+async fn v1_marker_stays_key() {
+    use s3s::dto::ListObjectsInput;
+    let members = members(3, &["h", "p"], 0).await;
+    for key in ["!a", "~z"] {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    let (keys, _, token) = page(&members, 0, list_input(1)).await.unwrap();
+    assert_eq!(keys, ["!a"]);
+    let node = &members.nodes[0];
+    let input = ListObjectsInput {
+        bucket: BUCKET.to_string(),
+        marker: token,
+        ..Default::default()
+    };
+    let list = request(input, Method::GET, members.user_on(0), node.bucket().await);
+    let output = node.service.list_objects(list).await.unwrap().output;
+    let keys: Vec<String> = (output.contents.unwrap_or_default().into_iter())
+        .filter_map(|object| object.key)
+        .collect();
+    assert_eq!(keys, ["~z"]);
+}
+
 // Prefixes group keys across ranges once each, and a token of another query is refused.
 #[tokio::test]
 async fn listing_groups_prefixes() {
@@ -785,28 +932,35 @@ async fn copy_rows(members: &Members, from: usize, to: usize) {
         BLOB_VERSIONS_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE,
     ] {
-        let iter = StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: None,
-            start: None,
-            limit: 1000,
-            txn_id: None,
-        };
-        let storage = &members.nodes[from].context.storage_handle;
-        let Event::Storage(StorageEvent::IterResult { values, .. }) =
-            storage.send_storage_effect(iter).await
-        else {
-            panic!("rows of {key_space} read");
-        };
-        for (key, value) in values {
-            let write = StorageEffect::Write {
+        let mut start = None;
+        loop {
+            let iter = StorageEffect::Iter {
                 key_space: key_space.to_string(),
-                key,
-                value,
+                prefix: None,
+                start: start.take(),
+                limit: 1000,
                 txn_id: None,
             };
-            let storage = &members.nodes[to].context.storage_handle;
-            storage.send_storage_effect(write).await;
+            let storage = &members.nodes[from].context.storage_handle;
+            let Event::Storage(StorageEvent::IterResult { values, .. }) =
+                storage.send_storage_effect(iter).await
+            else {
+                panic!("rows of {key_space} read");
+            };
+            let Some((last, _)) = values.last() else {
+                break;
+            };
+            start = Some(aruna_core::effects::IterStart::After(last.clone()));
+            for (key, value) in values {
+                let write = StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key,
+                    value,
+                    txn_id: None,
+                };
+                let storage = &members.nodes[to].context.storage_handle;
+                storage.send_storage_effect(write).await;
+            }
         }
     }
 }

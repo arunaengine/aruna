@@ -43,6 +43,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -2144,6 +2145,8 @@ impl CompleteUploadOperation {
                 referenced: false,
                 identity,
                 pending: identity.is_none(),
+                searchable: (self.upload_record.as_ref())
+                    .is_some_and(|upload| searchable(&upload.metadata)),
             },
         };
         let head = self.head_pointer.is_some();

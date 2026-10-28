@@ -9,7 +9,6 @@ use aruna_compute::session::Session;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::MOUNT_PREFIX_TAG;
 use aruna_core::id::NodeId;
-use aruna_core::scheduling::MAX_PLAN_INPUTS;
 use aruna_core::structs::execution::job::{
     CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode, InputSelection,
     InputSource, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
@@ -111,7 +110,7 @@ impl JobRequestError {
                 Self::ServiceUnavailableReason("job_placement_unavailable".to_string())
             }
             SubmitJobError::QuotaDenied(denied) => Self::ComputeQuotaDenied(denied),
-            SubmitJobError::AuthorityDenied => Self::Forbidden,
+            SubmitJobError::AuthorityDenied | SubmitJobError::InputDenied(_) => Self::Forbidden,
             other => Self::InternalError(other.to_string()),
         }
     }
@@ -200,13 +199,13 @@ pub(crate) async fn admit_execution(
     .await
     .map_err(JobRequestError::from_server)?;
 
-    if command.inputs.len() > MAX_PLAN_INPUTS || command.outputs.len() > MAX_EXECUTION_OUTPUTS {
+    if command.outputs.len() > MAX_EXECUTION_OUTPUTS {
         return Err(JobRequestError::BadRequest);
     }
     // Destination-key overlaps are the composition's collision policy to resolve.
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(command.inputs.len());
     for input in std::mem::take(&mut command.inputs) {
-        let input = native_input(input, target)?;
+        let input = native_input(input)?;
         if inputs
             .iter()
             .any(|existing| existing.container_path == input.container_path)
@@ -456,26 +455,17 @@ fn container_path(path: &str) -> Result<String, JobRequestError> {
 
 /// Native inputs land in the container at the given path, defaulting to
 /// `/inputs/<dest_key>` so `load_inputs` always stages them.
-pub(crate) fn native_input(
-    input: ExecutionInput,
-    target: ExecutionTarget,
-) -> Result<InputSelection, JobRequestError> {
+pub(crate) fn native_input(input: ExecutionInput) -> Result<InputSelection, JobRequestError> {
     if input.dest_key.is_empty() {
         return Err(JobRequestError::BadRequest);
     }
-    // A realm submission resolves its inputs through the planner, which stores
-    // the holder itself; naming one there would claim an unverified value.
-    let source_node_id = match (&input.source_node_id, target) {
-        (Some(node_id), ExecutionTarget::Local) => {
-            Some(NodeId::from_str(node_id).map_err(|_| JobRequestError::BadRequest)?)
-        }
-        (Some(_), ExecutionTarget::Realm) => {
-            return Err(JobRequestError::BadRequestMessage(
-                "source_node_id is only accepted by a local run".to_string(),
-            ));
-        }
-        (None, _) => None,
-    };
+    // A realm submission resolves a named node's inputs at that node, which checks them.
+    let source_node_id = input
+        .source_node_id
+        .as_deref()
+        .map(NodeId::from_str)
+        .transpose()
+        .map_err(|_| JobRequestError::BadRequest)?;
     let path = match &input.container_path {
         Some(path) => container_path(path)?,
         None => container_path(&format!("/inputs/{}", input.dest_key))?,

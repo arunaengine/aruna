@@ -28,6 +28,7 @@ pub(super) fn object_search_fingerprint(
     hasher.update(&[match key_match {
         ObjectKeyMatch::Substring => 1,
         ObjectKeyMatch::Prefix => 2,
+        ObjectKeyMatch::Metadata => 3,
     }]);
     match bucket {
         Some(bucket) => {

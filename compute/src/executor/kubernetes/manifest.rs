@@ -64,15 +64,14 @@ pub fn job_manifest(
             json!({"name":"marker","configMap":{"name":marker_name(&name)}}),
             json!({"name":"tools","emptyDir":{}}),
         ]);
-        if spec.staging_mode == StagingMode::Files {
-            for input in &layout.files {
-                mounts.push(json!({
-                    "name":"workspace",
-                    "mountPath":input.path,
-                    "subPath":relative_path(&input.path)?,
-                    "readOnly":true
-                }));
-            }
+        // Copied inputs come from the workspace, also next to mounted ones.
+        for input in &layout.files {
+            mounts.push(json!({
+                "name":"workspace",
+                "mountPath":input.path,
+                "subPath":relative_path(&input.path)?,
+                "readOnly":true
+            }));
         }
         for output in &layout.output_parents {
             mounts.push(json!({
@@ -104,10 +103,20 @@ pub fn job_manifest(
     if spec.staging_mode == StagingMode::S3Mount {
         let buckets = mount_buckets(layout);
         for (index, bucket) in buckets.iter().enumerate() {
-            volumes.push(json!({
-                "name":mount_name(&name,index),
-                "persistentVolumeClaim":{"claimName":mount_name(&name,index)}
-            }));
+            // KubeDAL reads its endpoint and credential from the run's own DataNode.
+            let source = match &config.kubedal {
+                Some(kubedal) => json!({"csi":{
+                    "driver":kubedal.driver,
+                    "readOnly":true,
+                    "volumeAttributes":{"dataNode":mount_name(&name,index),"mount":"fuse-read-only"}
+                }}),
+                None => json!({"persistentVolumeClaim":{"claimName":mount_name(&name,index)}}),
+            };
+            let mut volume = json!({"name":mount_name(&name,index)});
+            if let (Some(volume), Some(source)) = (volume.as_object_mut(), source.as_object()) {
+                volume.extend(source.clone());
+            }
+            volumes.push(volume);
             for input in layout.mounts.iter().filter(|input| &input.bucket == bucket) {
                 mounts.push(json!({
                     "name":mount_name(&name,index),
@@ -264,6 +273,40 @@ pub fn mount_pv_manifest(
     let name = mount_name(&context.attempt.external_name(), index);
     let options = ["file-mode=0444", "dir-mode=0555"];
     s3_pv_manifest(context, config, &name, bucket, &options, true)
+}
+
+/// The KubeDAL DataNode one mounted bucket reads through: this node's gateway, the bucket
+/// and the run's own secret, read only. The run's labels and epoch let cleanup find it.
+pub fn data_node_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    index: usize,
+    bucket: &str,
+) -> Result<serde_json::Value, BackendError> {
+    let kubedal = config.kubedal.as_ref().ok_or_else(|| {
+        BackendError::InvalidSpec("KubeDAL mounts are disabled on this backend".to_string())
+    })?;
+    let name = context.attempt.external_name();
+    Ok(json!({
+        "apiVersion":"kubedal.arunaengine.org/v1alpha1",
+        "kind":"DataNode",
+        "metadata":{
+            "name":mount_name(&name,index),
+            "namespace":config.namespace,
+            "labels":labels(context,"s3-mount"),
+            "annotations":annotations_base(context,"active")
+        },
+        "spec":{
+            "backend":"S3",
+            "read_only":true,
+            "secretRef":{"name":secret_name(&name)},
+            "config":{
+                "bucket":bucket,
+                "endpoint":kubedal.endpoint,
+                "region":kubedal.region
+            }
+        }
+    }))
 }
 
 pub fn mount_pvc_manifest(
@@ -634,7 +677,8 @@ pub fn mount_buckets(layout: &StageLayout) -> Vec<String> {
 
 pub fn needs_workspace(spec: &TaskSpec) -> bool {
     spec.staging_mode == StagingMode::Files
-        || (spec.staging_mode == StagingMode::S3Mount && !spec.output_paths.is_empty())
+        || (spec.staging_mode == StagingMode::S3Mount
+            && (!spec.output_paths.is_empty() || !spec.inputs.is_empty()))
 }
 
 pub fn secret_name(name: &str) -> String {
@@ -780,11 +824,13 @@ fn deadline_secs(spec: &TaskSpec) -> Option<i64> {
         .map(|duration| i64::try_from(duration.as_secs().max(1)).unwrap_or(i64::MAX))
 }
 
-/// Size of the workspace volume an attempt of `spec` gets.
+/// The workspace volume of a run: its disk request, else its staged inputs plus room to work.
 pub fn workspace_bytes(spec: &TaskSpec) -> u64 {
-    spec.resources
-        .disk_bytes
-        .unwrap_or(super::DEFAULT_WORKSPACE_BYTES)
+    spec.resources.disk_bytes.unwrap_or_else(|| {
+        (spec.inputs.iter()).fold(super::DEFAULT_WORKSPACE_BYTES, |total, input| {
+            total.saturating_add(input.size())
+        })
+    })
 }
 
 /// The limits the task pod and its workspace volume are created with.
@@ -1038,6 +1084,65 @@ mod tests {
                 mount.mount_path == "/inputs/requirements.txt" && mount.read_only == Some(true)
             }));
         }
+    }
+
+    #[test]
+    fn mounts_through_kubedal() {
+        // KubeDAL reads the run's own DataNode: this node's gateway, the view bucket and the
+        // run secret, read only, as one inline FUSE volume with a sub path per input.
+        let mut kubedal = config();
+        kubedal.kubedal = Some(Box::new(crate::executor::config::KubedalMount {
+            driver: "kubedal.arunaengine.org".to_string(),
+            endpoint: "https://s3.node-2.example".to_string(),
+            region: "us-east-1".to_string(),
+        }));
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.staging_mode = StagingMode::S3Mount;
+        spec.s3_mounts.push(S3Mount {
+            bucket: "in-run".to_string(),
+            key: "db/bakta.db".to_string(),
+            path: "/db/bakta.db".to_string(),
+        });
+        spec.secret_env
+            .insert("access_key_id".to_string(), Secret::new("temporary-access"));
+        spec.secret_env.insert(
+            "secret_access_key".to_string(),
+            Secret::new("temporary-secret"),
+        );
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &kubedal, &layout).unwrap())
+            .unwrap();
+        let pod = &job["spec"]["template"]["spec"];
+        let volume = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume.get("csi").is_some())
+            .expect("inline volume");
+        let name = mount_name(&context().attempt.external_name(), 0);
+        assert_eq!(volume["csi"]["driver"], "kubedal.arunaengine.org");
+        assert_eq!(volume["csi"]["readOnly"], true);
+        assert_eq!(volume["csi"]["volumeAttributes"]["dataNode"], name.as_str());
+        assert_eq!(volume["csi"]["volumeAttributes"]["mount"], "fuse-read-only");
+        assert!(volume.get("persistentVolumeClaim").is_none());
+        let mounts = pod["containers"][0]["volumeMounts"].as_array().unwrap();
+        assert!(mounts.iter().any(|mount| mount["subPath"] == "db/bakta.db"
+            && mount["mountPath"] == "/db/bakta.db"
+            && mount["readOnly"] == true));
+        let node = data_node_manifest(&context(), &kubedal, 0, "in-run").unwrap();
+        assert_eq!(node["kind"], "DataNode");
+        assert_eq!(node["spec"]["read_only"], true);
+        assert_eq!(node["spec"]["config"]["bucket"], "in-run");
+        assert_eq!(
+            node["spec"]["config"]["endpoint"],
+            "https://s3.node-2.example"
+        );
+        assert_eq!(
+            node["spec"]["secretRef"]["name"],
+            secret_name(&context().attempt.external_name()).as_str()
+        );
+        assert_eq!(node["metadata"]["labels"][ROLE_LABEL], "s3-mount");
+        assert!(data_node_manifest(&context(), &config(), 0, "in-run").is_err());
     }
 
     #[test]
