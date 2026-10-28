@@ -11,9 +11,9 @@ use std::time::Duration;
 use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
-    CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails, MAX_TRANSFER_BYTES, NOBODY,
-    NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput,
-    TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
+    CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails, NOBODY, NetworkAccess,
+    OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec,
+    TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
 };
 use async_trait::async_trait;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
@@ -49,9 +49,8 @@ const DIRECTORY_MODE: u32 = 1 << 31;
 const NON_REGULAR_MODES: u32 =
     DIRECTORY_MODE | (1 << 27) | (1 << 26) | (1 << 25) | (1 << 24) | (1 << 21) | (1 << 19);
 /// A wildcard listing streams the whole prefix archive to read its headers and
-/// uploads none of it, so the per-file transfer cap must not apply. This bound
-/// only stops an archive that never ends.
-const MAX_SCAN_BYTES: u64 = 1024 * MAX_TRANSFER_BYTES;
+/// uploads none of it. This bound only stops an archive that never ends.
+const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 
 mod archive;
 mod control;
@@ -347,8 +346,9 @@ impl DockerBackend {
         let directories = directories.clone();
         let handle = Handle::current();
         let (tx, rx) = mpsc::channel(4);
+        let budget = plan.budget;
         let builder = tokio::task::spawn_blocking(move || {
-            build_archive(tx, handle, &directories, files, MAX_TRANSFER_BYTES)
+            build_archive(tx, handle, &directories, files, budget)
         });
         let options = UploadToContainerOptionsBuilder::new()
             .path("/")
@@ -1011,7 +1011,7 @@ impl ExecutorBackend for DockerBackend {
             .docker
             .download_from_container(container_id, Some(options))
             .map(|chunk| chunk.map_err(|error| io::Error::other(classify_archive(&error))));
-        let counted = Box::pin(count_limited(raw, MAX_TRANSFER_BYTES));
+        let counted = Box::pin(count_limited(raw, u64::MAX));
         let reader = SyncIoBridge::new_with_handle(StreamReader::new(counted), Handle::current());
         let (header_tx, header_rx) = oneshot::channel();
         let (tx, rx) = mpsc::channel(4);
@@ -1567,6 +1567,9 @@ fn parse_rfc3339_ms(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A byte bound tests pass explicitly, the size of the former fixed limit.
+    const TEST_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
     use aruna_core::compute::TaskInput;
     use bytes::Bytes;
     use std::io::Read;
@@ -2110,7 +2113,7 @@ mod tests {
         spec.output_paths.push("/results/output.txt".to_string());
         let plan = ArchivePlan::new(&spec).unwrap();
         let directories = BTreeMap::from([(PathBuf::from("results"), 0o777)]);
-        let bytes = collect_archive(&plan, &directories, MAX_TRANSFER_BYTES)
+        let bytes = collect_archive(&plan, &directories, TEST_LIMIT)
             .await
             .unwrap();
         let found = read_entries(bytes);
@@ -2149,7 +2152,7 @@ mod tests {
         spec.session = true;
         spec.workdir = Some("/work".to_string());
         let plan = ArchivePlan::new(&spec).unwrap();
-        let bytes = collect_archive(&plan, &plan.directories, MAX_TRANSFER_BYTES)
+        let bytes = collect_archive(&plan, &plan.directories, TEST_LIMIT)
             .await
             .unwrap();
         let found = read_entries(bytes);
@@ -2175,7 +2178,7 @@ mod tests {
             Box::pin(futures_util::stream::iter(chunks)),
         ));
         let plan = ArchivePlan::new(&spec).unwrap();
-        let bytes = collect_archive(&plan, &BTreeMap::new(), MAX_TRANSFER_BYTES)
+        let bytes = collect_archive(&plan, &BTreeMap::new(), TEST_LIMIT)
             .await
             .unwrap();
         let found = read_entries(bytes);
@@ -2194,7 +2197,7 @@ mod tests {
                 Box::pin(futures_util::stream::iter(chunk)),
             ));
             let plan = ArchivePlan::new(&spec).unwrap();
-            let result = collect_archive(&plan, &BTreeMap::new(), MAX_TRANSFER_BYTES).await;
+            let result = collect_archive(&plan, &BTreeMap::new(), TEST_LIMIT).await;
             assert!(
                 matches!(result, Err(BackendError::Unavailable(_))),
                 "declared {declared} actual {actual} must fail"
@@ -2203,14 +2206,17 @@ mod tests {
     }
 
     #[test]
-    fn oversized_plan() {
-        // Declared sizes above the 4 GiB aggregate guard reject before any I/O.
+    fn budget_bounds_plan() {
+        // Staged inputs above the run's disk request reject before any I/O; without a
+        // request, inputs past the former 4 GiB guard are planned.
         let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
         spec.inputs.push(TaskInput::from_stream(
             "/big.bin",
-            MAX_TRANSFER_BYTES + 1,
+            TEST_LIMIT + 1,
             Box::pin(futures_util::stream::empty()),
         ));
+        assert!(ArchivePlan::new(&spec).is_ok());
+        spec.resources.disk_bytes = Some(TEST_LIMIT);
         assert!(matches!(
             ArchivePlan::new(&spec),
             Err(BackendError::InvalidSpec(_))
@@ -2247,7 +2253,7 @@ mod tests {
     #[tokio::test]
     async fn output_archive() {
         let bytes = make_archive(&[("output.txt", tar::EntryType::Regular, b"done")]);
-        let (size, contents) = parse_bytes(bytes, Path::new("output.txt"), MAX_TRANSFER_BYTES)
+        let (size, contents) = parse_bytes(bytes, Path::new("output.txt"), TEST_LIMIT)
             .await
             .unwrap();
         assert_eq!(size, 4);
@@ -2255,12 +2261,12 @@ mod tests {
 
         let link = make_archive(&[("output.txt", tar::EntryType::Symlink, b"")]);
         assert!(matches!(
-            parse_bytes(link, Path::new("output.txt"), MAX_TRANSFER_BYTES).await,
+            parse_bytes(link, Path::new("output.txt"), TEST_LIMIT).await,
             Err(BackendError::InvalidSpec(_))
         ));
         let unexpected = make_archive(&[("other.txt", tar::EntryType::Regular, b"x")]);
         assert!(
-            parse_bytes(unexpected, Path::new("output.txt"), MAX_TRANSFER_BYTES)
+            parse_bytes(unexpected, Path::new("output.txt"), TEST_LIMIT)
                 .await
                 .is_err()
         );
@@ -2269,7 +2275,7 @@ mod tests {
             ("other.txt", tar::EntryType::Regular, b"y"),
         ]);
         assert!(
-            parse_bytes(multiple, Path::new("output.txt"), MAX_TRANSFER_BYTES)
+            parse_bytes(multiple, Path::new("output.txt"), TEST_LIMIT)
                 .await
                 .is_err()
         );
@@ -2287,7 +2293,7 @@ mod tests {
         builder.append(&header, &b"x"[..]).unwrap();
         let bytes = builder.into_inner().unwrap();
         assert!(matches!(
-            parse_bytes(bytes, Path::new("output.txt"), MAX_TRANSFER_BYTES).await,
+            parse_bytes(bytes, Path::new("output.txt"), TEST_LIMIT).await,
             Err(BackendError::InvalidSpec(_))
         ));
     }
@@ -2327,7 +2333,7 @@ mod tests {
         let matched = list_archive(io::Cursor::new(bytes), Path::new("/"), &glob).unwrap();
 
         assert_eq!(matched, vec!["/out/a.txt", "/out/b.txt"]);
-        const { assert!(MAX_SCAN_BYTES > MAX_TRANSFER_BYTES) };
+        const { assert!(MAX_SCAN_BYTES > TEST_LIMIT) };
     }
 
     #[test]

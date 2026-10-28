@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES,
-    NOBODY, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec,
-    TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
+    ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, NOBODY, OutputMatcher,
+    ReconcileEvidence, ResumePoint, StagingMode, TaskOutput, TaskSpec, TombstoneEvidence,
+    TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1036,11 +1036,7 @@ impl ExecutorBackend for KubernetesBackend {
         }
         match spec.staging_mode {
             StagingMode::Files => {
-                self.ensure_pvc(
-                    context,
-                    spec.resources.disk_bytes.unwrap_or(DEFAULT_WORKSPACE_BYTES),
-                )
-                .await?;
+                self.ensure_pvc(context, workspace_bytes(spec)).await?;
                 self.stage(context, spec, cancel).await?;
             }
             StagingMode::DirectS3 => self.ensure_secret(context, spec).await?,
@@ -1050,11 +1046,7 @@ impl ExecutorBackend for KubernetesBackend {
                     self.ensure_mounts(context, &layout).await?;
                 }
                 if needs_workspace(spec) {
-                    self.ensure_pvc(
-                        context,
-                        spec.resources.disk_bytes.unwrap_or(DEFAULT_WORKSPACE_BYTES),
-                    )
-                    .await?;
+                    self.ensure_pvc(context, workspace_bytes(spec)).await?;
                     self.stage(context, spec, cancel).await?;
                 }
             }
@@ -1731,16 +1723,11 @@ fn build_archive(
     tx: mpsc::Sender<Result<Bytes, BackendError>>,
     plan: StagePlan,
 ) -> Result<(), BackendError> {
-    let total = plan
-        .entries
+    // The workspace volume is sized for the inputs; their sum only must not wrap.
+    plan.entries
         .iter()
         .try_fold(0u64, |total, entry| total.checked_add(entry.size))
         .ok_or_else(|| BackendError::InvalidSpec("staged input size overflows".to_string()))?;
-    if total > MAX_TRANSFER_BYTES {
-        return Err(BackendError::InvalidSpec(
-            "staged inputs exceed the transfer limit".to_string(),
-        ));
-    }
     let writer = ArchiveWriter { tx };
     let mut builder = tar::Builder::new(writer);
     for output in &plan.layout.output_parents {
@@ -1811,6 +1798,17 @@ impl<R: Read> Read for ExactReader<R> {
             .min(buffer.len());
         let read = self.inner.read(&mut buffer[..limit])?;
         self.remaining = self.remaining.saturating_sub(read as u64);
+/// The workspace volume of a run: its disk request, else its staged inputs plus room to work.
+fn workspace_bytes(spec: &TaskSpec) -> u64 {
+    spec.resources.disk_bytes.unwrap_or_else(|| {
+        spec.inputs
+            .iter()
+            .fold(DEFAULT_WORKSPACE_BYTES, |total, input| {
+                total.saturating_add(input.size())
+            })
+    })
+}
+
         Ok(read)
     }
 }
@@ -1896,13 +1894,13 @@ where
     Ok((parse_header(&header_bytes, path)?, join))
 }
 
-/// Check the header describes the requested file within the transfer bound.
+/// Check the header describes the requested regular file.
 fn parse_header(header_bytes: &[u8; 512], path: &str) -> Result<u64, BackendError> {
     let header = tar::Header::from_byte_slice(header_bytes);
     let size = header
         .size()
         .map_err(|error| BackendError::Api(format!("invalid fetch archive size: {error}")))?;
-    if size > MAX_TRANSFER_BYTES || !header.entry_type().is_file() {
+    if !header.entry_type().is_file() {
         return Err(BackendError::InvalidSpec(
             "fetch archive is not a bounded regular file".to_string(),
         ));

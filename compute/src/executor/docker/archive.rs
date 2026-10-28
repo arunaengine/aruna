@@ -7,8 +7,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use aruna_core::compute::{
-    BackendError, InputStream, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES, OutputMatcher, TaskInput,
-    TaskSpec,
+    BackendError, InputStream, MAX_OUTPUT_MATCHES, OutputMatcher, TaskInput, TaskSpec,
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -54,6 +53,8 @@ pub(super) struct ArchivePlan<'a> {
     pub(super) inputs: BTreeMap<PathBuf, &'a TaskInput>,
     pub(super) outputs: BTreeSet<PathBuf>,
     pub(super) directories: BTreeMap<PathBuf, u32>,
+    /// Staged input bytes the run's disk request allows; no request sets no bound.
+    pub(super) budget: u64,
 }
 
 impl<'a> ArchivePlan<'a> {
@@ -63,6 +64,7 @@ impl<'a> ArchivePlan<'a> {
         let mut outputs = BTreeSet::new();
         let mut files = BTreeSet::new();
         let mut input_bytes = 0u64;
+        let budget = spec.resources.disk_bytes.unwrap_or(u64::MAX);
         for input in &spec.inputs {
             let path = container_path(&input.path)?;
             if inputs.insert(path.clone(), input).is_some() || !files.insert(path) {
@@ -73,7 +75,7 @@ impl<'a> ArchivePlan<'a> {
             }
             input_bytes = input_bytes
                 .checked_add(input.size())
-                .filter(|total| *total <= MAX_TRANSFER_BYTES)
+                .filter(|total| *total <= budget)
                 .ok_or_else(transfer_error)?;
         }
         for output in &spec.output_paths {
@@ -122,6 +124,7 @@ impl<'a> ArchivePlan<'a> {
             inputs,
             outputs,
             directories,
+            budget,
         })
     }
 }
@@ -133,10 +136,7 @@ struct TransferLimitError;
 
 impl std::fmt::Display for TransferLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "task file transfer exceeds the {MAX_TRANSFER_BYTES}-byte limit"
-        )
+        write!(f, "task file transfer exceeds the run's disk request")
     }
 }
 

@@ -9,8 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use aruna_compute::ExecutorBackend;
 use aruna_core::compute::{
-    BackendError, FenceContext, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES, S3Mount, TaskInput,
-    has_wildcard, output_suffix,
+    BackendError, FenceContext, MAX_OUTPUT_MATCHES, TaskInput, has_wildcard, output_suffix,
 };
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::id::NodeId;
@@ -447,6 +446,7 @@ pub async fn prepare_mounts(
                 | HeadObjectError::NoSuchVersion
                 | HeadObjectError::DeleteMarker,
             ) => {
+        // The run's disk request bounds what it may stage; without one nothing does.
                 return Err(JobError::permanent(format!(
                     "input {}/{} not found",
                     source.bucket, source.key
@@ -492,8 +492,14 @@ pub async fn load_direct_inputs(
             })?;
         total_bytes = total_bytes
             .checked_add(size)
-            .filter(|total| *total <= MAX_TRANSFER_BYTES)
-            .ok_or_else(|| JobError::permanent("staged inputs exceed transfer limit"))?;
+            .ok_or_else(|| JobError::permanent("staged input bytes overflow"))?;
+        if let Some(budget) = spec.resources.disk_bytes
+            && total_bytes > budget
+        {
+            return Err(JobError::permanent(format!(
+                "staged inputs need more than {total_bytes} bytes, the run requests {budget}"
+            )));
+        }
         let stream = staged
             .blob
             .map(|chunk| chunk.map_err(std::io::Error::other));
