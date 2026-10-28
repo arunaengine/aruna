@@ -178,6 +178,9 @@ pub struct ObjectHit {
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// The object's kept metadata columns; filled for `match=metadata` only.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -504,7 +507,8 @@ restrictions and request policies before it can be returned.
   searchable columns in `aruna-search-text` and `aruna-search-exact` (table imports set both).
   Words of `q` must all appear in the text columns (case-insensitive, whole words); terms
   `column=value` must equal an exact column, with quotes around values with spaces, as in
-  `coli taxid=562 assembly_level="Complete Genome"`. A distributed bucket walks only its
+  `coli taxid=562 assembly_level="Complete Genome"`. Each hit carries the object's kept metadata
+  columns in `metadata`, after the same authorization as every hit. A distributed bucket walks only its
   searchable keys, a bounded number per page, so a rare match may take many pages.
 - A search without `bucket` skips distributed buckets, which only their key indexes cover;
   each skipped bucket counts in `coverage.incomplete_ranges`.
@@ -661,6 +665,7 @@ fn map_search_response(result: ObjectExecution, mode: ObjectMode) -> ObjectRespo
                 }),
                 size: hit.size,
                 updated_at: hit.updated_at.map(format_system_time),
+                metadata: hit.metadata,
             })
             .collect(),
         next_cursor: result.next_cursor,
