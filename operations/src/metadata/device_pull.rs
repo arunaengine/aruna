@@ -878,6 +878,7 @@ fn head_of(item: &ListVersionsItem, prefix: &str) -> Option<RemoteHead> {
             location,
             source_metadata,
             created_at,
+            ..
         } => (
             key,
             version_id,
@@ -1322,6 +1323,7 @@ mod tests {
                 digests: Default::default(),
             }),
             created_at: SystemTime::UNIX_EPOCH,
+            link: None,
         }
     }
 
