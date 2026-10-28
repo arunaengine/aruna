@@ -14,7 +14,6 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::str::FromStr;
 use std::sync::Arc;
 use utoipa::ToSchema;
