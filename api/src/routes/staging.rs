@@ -195,6 +195,8 @@ pub struct StageBatchRequest {
     pub group_id: String,
     #[serde(default)]
     pub node_id: Option<String>,
+    /// The connector every staged file is read through; an uploaded table list needs none itself.
+    #[serde(default)]
     pub connector_id: String,
     pub bucket: String,
     pub strategy: ApiStagingStrategy,
@@ -656,7 +658,14 @@ Nothing is authorized later while the job runs.
   one object per row; `folder`: the row names a directory whose files are listed), `source` and
   `target` templates (`{column}`, `{column|basename}`), `filter` (`[{"column", "any_of"}]`),
   `keep` (columns stored as object metadata; `null` keeps all), `text` and `exact` (columns
-  search matches as free text or as `column=value`). `rate` paces requests to the connector per
+  search matches as free text or as `column=value`). File rows may name `size` (column of the
+  byte count; such a row is registered without a HEAD), `checksums` (`[{"algorithm": "md5" |
+  "sha1" | "sha256", "column"}]`, hex digests recorded on the reference: a read whose source
+  gives no strong ETag checks the whole bytes against them) and `modified` (column of an RFC
+  3339 time, recorded as the file's modification time, or a date, which is only checked). A
+  bad value fails its row. `connector_id` is always required: every row is read through it, so
+  rows that name http(s) URLs need a connector whose base holds them for egress. A list in a
+  bucket (`object`) is itself read without the connector. `rate` paces requests to the connector per
   node (default 10 per second); transient answers back off and honour `Retry-After`. A folder row
   writes a zero-byte folder object at `target/` carrying the row's metadata. The table and every
   row are read under the caller's permissions; rows are authorized by the job, one by one.
@@ -767,6 +776,13 @@ pub async fn submit_staging(
         ..request.clone()
     };
     let group_id = parse_group_id(&request.group_id)?;
+    if request.connector_id.trim().is_empty() {
+        return Err(ServerError::BadRequestReason(
+            "connector_id is required: the files of items, prefixes and table rows are read \
+             through a connector; a table list in a bucket is read without one"
+                .to_string(),
+        ));
+    }
     let connector_id = parse_connector_id(&request.connector_id)?;
     if request.strategy == ApiStagingStrategy::Sync {
         return Err(ServerError::Unimplemented);
