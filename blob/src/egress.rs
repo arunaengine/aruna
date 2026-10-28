@@ -243,7 +243,8 @@ impl EgressGuard {
     }
 
     /// Screened GET builder that follows no redirect, for callers that follow each hop
-    /// themselves; `visited` are the earlier hops, and a hop may not leave HTTPS.
+    /// themselves; `visited` are the earlier hops, and a hop may not leave HTTPS. Errors name
+    /// the hop's host only, never its path or query, which may hold credentials.
     pub fn hop_request(
         &self,
         url: Url,
@@ -251,10 +252,10 @@ impl EgressGuard {
     ) -> Result<reqwest::RequestBuilder, EgressError> {
         let host = url
             .host_str()
-            .ok_or_else(|| EgressError::MissingHost(url.to_string()))?;
+            .ok_or_else(|| EgressError::MissingHost(format!("{}:", url.scheme())))?;
         screen_host(&self.policy, host)?;
         if scheme_downgraded(visited, &url) {
-            return Err(EgressError::SchemeDowngrade(url.to_string()));
+            return Err(EgressError::SchemeDowngrade(host.to_string()));
         }
         Ok(self.opendal.get(url))
     }
