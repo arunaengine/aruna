@@ -209,6 +209,11 @@ where
                 Probe::Shown => {
                     page.prefixes.push(group.clone());
                     last = Some((group.clone(), true));
+                    // A page the prefix fills ends here, and the next one starts past it.
+                    if page.prefixes.len() >= max {
+                        page.next = Some(NextPage::After(after_entry(&bucket, &group, true)));
+                        return Ok(page);
+                    }
                 }
                 Probe::Empty => {}
                 Probe::Stopped(at) => {

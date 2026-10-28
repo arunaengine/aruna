@@ -366,6 +366,11 @@ impl ArunaS3Service {
                     VersionProbe::Shown => {
                         shown.common_prefixes.push(group.clone());
                         last = Some((group.clone(), None));
+                        // A page the prefix fills ends here, and the next one starts past it.
+                        if shown.common_prefixes.len() >= max {
+                            after(&mut shown, &(group, None));
+                            return Ok(shown);
+                        }
                     }
                     VersionProbe::Empty => {}
                     VersionProbe::Stopped(stopped) => {

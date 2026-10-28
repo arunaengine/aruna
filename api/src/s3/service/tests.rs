@@ -2027,6 +2027,83 @@ async fn hides_link_versions() {
 }
 
 #[tokio::test]
+async fn resumed_prefix_fills_page() {
+    // A prefix found after a sealed page fills a page of one by itself, for objects and for
+    // versions alike, and the listing goes on after it.
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let (_storage_dir, service, user_access, group_id) = subpath_node().await;
+    grant_group_owner(&service, &user_access, group_id).await;
+    for index in 0..SCAN_BUDGET {
+        let at = format!("links/{index:05}");
+        let target = ("hidden", "db", Ulid::from_parts(9, 9));
+        write_link(&service, (&user_access, &at), target, "etag").await;
+    }
+    let storage = &service.state.storage_handle;
+    seed_materialized_keys(
+        storage,
+        "study",
+        &["links/zz"],
+        user_access.user_identity,
+        UNIX_EPOCH,
+    )
+    .await;
+    let expected = vec!["imaging/", "links/", "notes.txt", "sequencing/"];
+    let (mut token, mut names) = (None, Vec::new());
+    for _ in 0..8 {
+        let mut extensions = Extensions::new();
+        extensions.insert(user_access.clone());
+        extensions.insert(test_bucket_info(group_id, user_access.user_identity));
+        let input = ListObjectsV2Input {
+            bucket: "study".to_string(),
+            delimiter: Some("/".to_string()),
+            max_keys: Some(1),
+            continuation_token: token.take(),
+            ..Default::default()
+        };
+        let output = service
+            .list_objects_v2(list_request(extensions, input))
+            .await
+            .unwrap()
+            .output;
+        let prefixes = (output.common_prefixes.unwrap_or_default().into_iter())
+            .filter_map(|prefix| prefix.prefix);
+        let keys =
+            (output.contents.unwrap_or_default().into_iter()).filter_map(|object| object.key);
+        let page: Vec<String> = prefixes.chain(keys).collect();
+        assert!(page.len() <= 1, "{page:?}");
+        names.extend(page);
+        token = output.next_continuation_token;
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(names, expected);
+    let (mut marker, mut names) = (None, Vec::new());
+    for _ in 0..8 {
+        let input = s3s::dto::ListObjectVersionsInput {
+            bucket: "study".to_string(),
+            delimiter: Some("/".to_string()),
+            max_keys: Some(1),
+            key_marker: marker.take(),
+            ..Default::default()
+        };
+        let output = listed_versions(&service, (&user_access, group_id), input).await;
+        let prefixes = (output.common_prefixes.unwrap_or_default().into_iter())
+            .filter_map(|prefix| prefix.prefix);
+        let keys =
+            (output.versions.unwrap_or_default().into_iter()).filter_map(|version| version.key);
+        let page: Vec<String> = prefixes.chain(keys).collect();
+        assert!(page.len() <= 1, "{page:?}");
+        names.extend(page);
+        if output.is_truncated != Some(true) {
+            break;
+        }
+        marker = output.next_key_marker;
+    }
+    assert_eq!(names, expected);
+}
+
+#[tokio::test]
 async fn cursor_names_shown() {
     // A page that also passed a hidden link continues after the last key it showed, so its
     // token never names the hidden one.
