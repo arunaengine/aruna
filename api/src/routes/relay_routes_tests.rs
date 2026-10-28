@@ -166,7 +166,7 @@ async fn stopped_management_skipped() {
             .unwrap();
     });
     let (upstream, handle) = fake_upstream().await;
-    let fixture = setup(vec![stopped, upstream]).await;
+    let fixture = setup(vec![stopped.clone(), upstream.clone()]).await;
     let response = relay_app(fixture.state.clone())
         .oneshot(token_request())
         .await
@@ -174,6 +174,13 @@ async fn stopped_management_skipped() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(&body[..], b"{\"relayed\":true}");
+    // The ingress may wait for the stopped node first, so the next call skips it until last.
+    let cache = fixture.state.management_url_cache().read().await;
+    assert_eq!(
+        healthy_first(cache.urls.clone(), &cache.failed),
+        [upstream, stopped]
+    );
+    drop(cache);
     ingress.abort();
     handle.abort();
 }

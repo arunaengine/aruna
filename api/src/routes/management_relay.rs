@@ -255,19 +255,22 @@ async fn relay(
     ServerError::NoManagementNode.into_response()
 }
 
-/// Targets with a fresh connect failure move last; the order is kept otherwise.
+/// Targets with a fresh failure move last; the order is kept otherwise.
 fn healthy_first(mut targets: Vec<String>, failed: &BTreeMap<String, Instant>) -> Vec<String> {
     targets.sort_by_key(|target| is_fresh(failed.get(target).copied()));
     targets
 }
 
-/// Remembers a connect failure of a target; any answer from it clears the mark.
+/// Remembers a connect failure or gateway answer of a target; any other answer clears the mark.
 async fn record_outcome(
     state: &Arc<ServerState>,
     target: &str,
     sent: &Result<reqwest::Response, reqwest::Error>,
 ) {
-    let failed = sent.as_ref().is_err_and(reqwest::Error::is_connect);
+    let failed = match sent {
+        Ok(response) => gateway_failed(&Method::GET, response.status()),
+        Err(error) => error.is_connect(),
+    };
     let cache = state.management_url_cache();
     if !failed && !cache.read().await.failed.contains_key(target) {
         return;
