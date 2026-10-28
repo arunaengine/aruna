@@ -20,6 +20,7 @@ use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use thiserror::Error;
 
 use crate::driver::{DriverContext, drive};
+use crate::metadata::handle::{MetadataRequestDelivery, MetadataRequestError};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, RealmKeyPem};
 use crate::metadata::transport_message_kind;
 use crate::placement::process_placements::load_realm_config;
@@ -46,6 +47,8 @@ pub enum PromoteNodeError {
     NotServer,
     #[error("the node could not be reached: {0}")]
     Unreachable(String),
+    #[error("the answer of the node was lost; it may hold the realm key: {0}")]
+    KeyUncertain(String),
     #[error("the node refused the realm key: {0:?}")]
     Refused(MetadataReadError),
     #[error("the realm key could not be encoded")]
@@ -75,22 +78,10 @@ pub async fn promote_node(
     let message = MetadataTransportMessage::HandRealmKey {
         key: RealmKeyPem(pem.to_string()),
     };
-    match metadata
+    let reply = metadata
         .request_forwarded_write(config.node_id, message)
-        .await
-    {
-        Ok(MetadataTransportMessage::RealmKeyStored { result: Ok(()) }) => {}
-        Ok(MetadataTransportMessage::RealmKeyStored { result: Err(error) }) => {
-            return Err(PromoteNodeError::Refused(error));
-        }
-        Ok(other) => {
-            return Err(PromoteNodeError::Unreachable(format!(
-                "unexpected answer {}",
-                transport_message_kind(&other)
-            )));
-        }
-        Err(error) => return Err(PromoteNodeError::Unreachable(error.to_string())),
-    }
+        .await;
+    handoff_outcome(reply)?;
     drive(
         EnsureConfigOperation::new(EnsureConfigParams {
             actor: config.actor,
@@ -105,6 +96,30 @@ pub async fn promote_node(
     )
     .await?;
     Ok(())
+}
+
+/// A lost answer can follow a stored key, which no later call can take back.
+fn handoff_outcome(
+    reply: Result<MetadataTransportMessage, MetadataRequestError>,
+) -> Result<(), PromoteNodeError> {
+    match reply {
+        Ok(MetadataTransportMessage::RealmKeyStored { result: Ok(()) }) => Ok(()),
+        Ok(MetadataTransportMessage::RealmKeyStored { result: Err(error) }) => {
+            Err(PromoteNodeError::Refused(error))
+        }
+        Ok(other) => Err(PromoteNodeError::Unreachable(format!(
+            "unexpected answer {}",
+            transport_message_kind(&other)
+        ))),
+        Err(error) => match error.delivery() {
+            MetadataRequestDelivery::DefinitelyNotSent => {
+                Err(PromoteNodeError::Unreachable(error.to_string()))
+            }
+            MetadataRequestDelivery::PossiblySent => {
+                Err(PromoteNodeError::KeyUncertain(error.to_string()))
+            }
+        },
+    }
 }
 
 /// A listed management node is accepted again, so a retry after a lost answer succeeds.
@@ -180,6 +195,7 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::metadata::MetadataError;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -266,6 +282,22 @@ mod tests {
             check_handoff(&document, node(1), node(2), realm_id, &garbage),
             Err(MetadataReadError::Unauthorized)
         );
+    }
+
+    #[test]
+    fn lost_answer_uncertain() {
+        let lost = MetadataRequestError::possibly_sent(MetadataError::ChannelClosed);
+        assert!(matches!(
+            handoff_outcome(Err(lost)),
+            Err(PromoteNodeError::KeyUncertain(_))
+        ));
+        let refused = MetadataTransportMessage::RealmKeyStored {
+            result: Err(MetadataReadError::Forbidden),
+        };
+        assert!(matches!(
+            handoff_outcome(Ok(refused)),
+            Err(PromoteNodeError::Refused(MetadataReadError::Forbidden))
+        ));
     }
 
     #[test]

@@ -42,6 +42,8 @@ other node relays the call to one.
   right after this call.
 - A node that is offline or refuses the key leaves the realm unchanged, and the call can be repeated.
   Calling it again for an already promoted node is accepted.
+- If the node's answer is lost, the call fails with `realm_key_uncertain`: the node may already hold
+  the key, which cannot be taken back. Repeat the call to finish the promotion.
 - A management node cannot be demoted here: a copied key cannot be taken back."#,
     params(("node_id" = String, Path, description = "Node id of the server node, as the realm configuration lists it")),
     responses(
@@ -50,7 +52,7 @@ other node relays the call to one.
         (status = 403, description = "The caller lacks WRITE on the realm's onboarding administration path", body = crate::error::ErrorResponse),
         (status = 404, description = "No realm node carries this node id", body = crate::error::ErrorResponse),
         (status = 409, description = "The node is a device or the serving node itself, a group deletion is pending, or another update of the realm configuration won the race; retry", body = crate::error::ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
+        (status = 502, description = "The node's answer to the key hand-off was lost, so it may already hold the realm key while the realm configuration is unchanged; repeat the call (code `realm_key_uncertain`). Or a relayed call failed after the management node may already have applied it (code `relay_failed`)", body = crate::error::ErrorResponse),
         (status = 503, description = "The node could not be reached or refused the key, or no management node was reachable to serve the relayed call; retry", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -97,6 +99,13 @@ fn map_promote_error(error: PromoteNodeError) -> ServerError {
                 "the node did not take the realm key; the realm is unchanged, retry".to_string(),
             )
         }
+        PromoteNodeError::KeyUncertain(_) => ServerError::Refused(
+            StatusCode::BAD_GATEWAY,
+            "realm_key_uncertain",
+            "the node's answer was lost, so it may already hold the realm key, which cannot be taken \
+             back; the realm configuration is unchanged, repeat the call to finish the promotion"
+                .to_string(),
+        ),
         PromoteNodeError::Ensure(EnsureConfigError::DeletionPending) => {
             ServerError::Conflict("group deletion is pending; retry the promotion".to_string())
         }
@@ -109,5 +118,21 @@ fn map_promote_error(error: PromoteNodeError) -> ServerError {
             "storage cleanup capacity exhausted; retry".to_string(),
         ),
         other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lost_answer_reported() {
+        let error = map_promote_error(PromoteNodeError::KeyUncertain("closed".to_string()));
+        let ServerError::Refused(status, code, message) = error else {
+            panic!("a lost answer is reported as uncertain");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(code, "realm_key_uncertain");
+        assert!(message.contains("may already hold the realm key"));
     }
 }
