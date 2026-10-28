@@ -10,20 +10,23 @@ use aruna_core::structs::identity::auth::NodeCapabilities;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::StatusCode;
 use shared::{
-    TestResult, create_bearer_token, create_onboarding_secret, spawn_complete_joiner,
-    spawn_low_seed,
+    TestResult, create_bearer_token, create_onboarding_secret, spawn_keyed_joiner, spawn_low_seed,
 };
+
+/// Node key of the joiner; its node id sorts above the low seed's, so it may be promoted.
+const JOINER_KEY: [u8; 32] = [21; 32];
 
 #[tokio::test(flavor = "multi_thread")]
 async fn promoted_node_signs() -> TestResult<()> {
     let seed = spawn_low_seed().await?;
-    let secret = create_onboarding_secret(&seed, OnboardingMode::Server).await?;
-    let joiner = spawn_complete_joiner(&seed, secret).await?;
-    let joiner_id = joiner.config.node_id;
+    let joiner_id = iroh::SecretKey::from_bytes(&JOINER_KEY).public();
     assert!(
         joiner_id > seed.net.node_id(),
         "the seed keeps the database requests"
     );
+    let secret = create_onboarding_secret(&seed, OnboardingMode::Server).await?;
+    let joiner = spawn_keyed_joiner(&seed, secret, JOINER_KEY).await?;
+    assert_eq!(joiner.config.node_id, joiner_id);
     let NodeCapabilities::Management {
         realm_verifying_key,
         ..

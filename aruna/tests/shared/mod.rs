@@ -692,7 +692,7 @@ pub(crate) async fn spawn_complete_joiner(
     seed: &SeedNode,
     onboarding_secret: String,
 ) -> TestResult<JoinerNode> {
-    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Full).await
+    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Full, None).await
 }
 
 #[allow(dead_code)]
@@ -700,7 +700,67 @@ pub(crate) async fn spawn_joiner_node(
     seed: &SeedNode,
     onboarding_secret: String,
 ) -> TestResult<JoinerNode> {
-    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Minimal).await
+    spawn_joiner_mode(seed, onboarding_secret, NodeServiceMode::Minimal, None).await
+}
+
+/// A full server joiner with the node key `net_key`, so its node id is known before it joins.
+#[allow(dead_code)]
+pub(crate) async fn spawn_keyed_joiner(
+    seed: &SeedNode,
+    onboarding_secret: String,
+    net_key: [u8; 32],
+) -> TestResult<JoinerNode> {
+    spawn_joiner_mode(
+        seed,
+        onboarding_secret,
+        NodeServiceMode::Full,
+        Some(net_key),
+    )
+    .await
+}
+
+/// Stores a pending server identity with a chosen node key and a delegation the seed's realm key
+/// signs. Startup then refreshes the enrollment with it, as after a restart during onboarding.
+async fn store_pending_joiner(dir: &TempDir, seed: &SeedNode, net_key: [u8; 32]) -> TestResult<()> {
+    use aruna::identity::{
+        BootOrigin, IdentityStore, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+    };
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
+    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+
+    let NodeCapabilities::Management {
+        realm_signing_key, ..
+    } = &seed.capabilities
+    else {
+        return Err(std::io::Error::other("the seed holds no realm key").into());
+    };
+    let issuer = generate_signing_key();
+    let issuer_public =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(issuer.verifying_key().to_bytes());
+    let state = PersistedNodeState {
+        boot_origin: BootOrigin::Onboarded,
+        status: PersistedNodeStatus::PendingOnboarding,
+        realm_id: seed.realm_id,
+        net_secret_key: net_key,
+        onboarding_phase: Some(OnboardingPhase::Bootstrapped),
+        onboarding_sync_ticket: None,
+        identity: PersistedNodeIdentity::Server {
+            private_key_pem: issuer.to_pkcs8_pem(LineEnding::default())?.to_string(),
+            delegation_signature: realm_signing_key.sign(issuer_public.as_bytes()).to_string(),
+        },
+    };
+    let path = dir
+        .path()
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("invalid temp path"))?;
+    let storage = FjallStorage::open(path)?;
+    IdentityStore::from_storage(storage.clone())
+        .persist(&state)
+        .await?;
+    storage.close().await;
+    Ok(())
 }
 
 async fn spawn_seed_mode(
@@ -873,8 +933,12 @@ async fn spawn_joiner_mode(
     seed: &SeedNode,
     onboarding_secret: String,
     mode: NodeServiceMode,
+    net_key: Option<[u8; 32]>,
 ) -> TestResult<JoinerNode> {
     let joiner_dir = tempfile::tempdir()?;
+    if let Some(net_key) = net_key {
+        store_pending_joiner(&joiner_dir, seed, net_key).await?;
+    }
     let (config, storage_handle) = load_env_config(&joiner_dir, onboarding_secret).await?;
 
     let joiner_net = NetHandle::new(
