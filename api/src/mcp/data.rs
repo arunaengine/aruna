@@ -406,7 +406,12 @@ impl McpServer {
                 cursor: input.cursor,
                 limit,
             };
-            let page = object_page(&self.state, &bucket_info, (bearer.as_ref(), None), request)
+            // Only what the caller may read shows, as in the bucket's own listing.
+            let expiry = bearer
+                .as_ref()
+                .map_or(0, crate::auth::ValidatedBearer::expires_at_secs);
+            let caller = (bearer.as_ref(), Some((&auth, expiry)));
+            let page = object_page(&self.state, &bucket_info, caller, request)
                 .await
                 .map_err(server_error)?;
             return Ok(Json(ObjectsOutput {

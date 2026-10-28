@@ -1267,6 +1267,48 @@ mod distributed {
     use axum::http::StatusCode;
 
     /// Browsing a distributed bucket lists its own range here and the peer's range there.
+    /// Writes a link at `key` to a target in a group the owner cannot read.
+    async fn hidden_link(node: &crate::tests::distributed::Node, key: &str) {
+        use aruna_core::structs::storage::link::LinkTarget;
+        use aruna_core::structs::storage::replication::VersionedObjectArn;
+        use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+        let target = LinkTarget {
+            arn: VersionedObjectArn {
+                realm_id: node.owner.realm_id,
+                node_id: node.state.get_node_id(),
+                bucket: "other".to_string(),
+                key: "x".to_string(),
+                version: ulid::Ulid::from_parts(5, 5),
+            },
+            group_id: ulid::Ulid::from_parts(9, 9),
+        };
+        let write = ReferenceWrite {
+            preassigned_version_id: None,
+            group_id: node.group_id,
+            user_id: node.owner.user_id,
+            realm_id: node.owner.realm_id,
+            node_id: node.state.get_node_id(),
+            bucket: BUCKET.to_string(),
+            key: key.to_string(),
+            expected_bucket: None,
+            version_source: target.binding(),
+            metadata: aruna_core::structs::execution::source_access::SourceMetadata {
+                content_length: 1,
+                content_type: None,
+                etag: Some(target.arn.version.to_string()),
+                last_modified: None,
+                source_version: None,
+                digests: Default::default(),
+            },
+            inherited_policies: Vec::new(),
+            connector_guard: None,
+            restrictions: None,
+        };
+        write_reference_version(&node.state.get_ctx(), write)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn browses_distributed_bucket() {
         let node = node_state().await;
@@ -1282,6 +1324,8 @@ mod distributed {
                 .await
                 .unwrap();
         }
+        // A link to a target the caller cannot read stays out of the local range's entries.
+        hidden_link(&node, "c.md").await;
         distribute(&node.state, node.group_id, BUCKET).await;
         let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
             "last_modified":null,"content_type":null,"referenced":false,"content_id":null,

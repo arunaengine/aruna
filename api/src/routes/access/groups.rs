@@ -2142,7 +2142,7 @@ pub async fn list_data_paths(
             require_data_read(&state, &auth, listing_path).await?;
             list_bucket_objects(
                 &state,
-                (group_id, bearer.as_ref()),
+                (group_id, bearer.as_ref(), &auth),
                 &bucket,
                 &key_prefix,
                 query.delimiter.as_deref(),
@@ -2218,7 +2218,7 @@ async fn list_group_buckets(
 
 async fn list_bucket_objects(
     state: &ServerState,
-    (group_id, bearer): (Ulid, Option<&crate::auth::ValidatedBearer>),
+    (group_id, bearer, auth): (Ulid, Option<&crate::auth::ValidatedBearer>, &AuthContext),
     bucket: &str,
     key_prefix: &str,
     delimiter: Option<&str>,
@@ -2245,7 +2245,9 @@ async fn list_bucket_objects(
             cursor: continuation_token.map(str::to_string),
             limit,
         };
-        let page = object_page(state, &info, (bearer, None), request).await?;
+        // Only what the caller may read shows, as in the bucket's own listing.
+        let expiry = bearer.map_or(0, crate::auth::ValidatedBearer::expires_at_secs);
+        let page = object_page(state, &info, (bearer, Some((auth, expiry))), request).await?;
         let path = |key: &str| object_permission_path(realm_id, group_id, node_id, bucket, key);
         let folders = page.prefixes.iter().map(|prefix| DataPathEntry {
             permission_path: path(prefix),
