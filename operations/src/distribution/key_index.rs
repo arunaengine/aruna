@@ -6,16 +6,18 @@
 // A raw key field serves exact deletes, key order and prefixes; a tokenized name field splits
 // keys at path and name separators.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tantivy::directory::MmapDirectory;
+use tantivy::schema::Value;
 use tantivy::schema::{FAST, Field, IndexRecordOption, STORED, STRING, Schema, TEXT};
 use tantivy::tokenizer::TokenStream;
 use tantivy::{
-    DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, TERMINATED, TantivyDocument, Term,
+    DocAddress, DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, TERMINATED, TantivyDocument,
+    Term,
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -25,6 +27,12 @@ const KEY_FIELD: &str = "key";
 const NAME_FIELD: &str = "name";
 const SIZE_FIELD: &str = "size";
 const VERSION_FIELD: &str = "version";
+/// The key of a searchable version, so metadata queries walk only those keys.
+const META_KEY_FIELD: &str = "meta_key";
+/// The free text tokens of a searchable version, space separated.
+const META_FIELD: &str = "meta";
+/// The `column=value` terms of a searchable version, one per line.
+const EXACT_FIELD: &str = "exact";
 /// Writer memory per batch; the smallest budget tantivy accepts for one thread.
 const WRITER_BYTES: usize = 15_000_000;
 /// Open indexes kept for queries and writes; the cache is cleared when it is full.
@@ -54,6 +62,15 @@ pub struct IndexedKey {
     pub key: String,
     pub size: u64,
     pub version_id: Ulid,
+    /// The search terms of a searchable version.
+    pub terms: Option<MetaTerms>,
+}
+
+/// Free text tokens and exact `column=value` terms of one version's metadata.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MetaTerms {
+    pub text: BTreeSet<String>,
+    pub exact: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,12 +80,14 @@ pub enum KeyChange {
 }
 
 /// Keys between `start` and `end` in key order, examining at most `limit` keys per index
-/// segment; with `names`, only keys that hold every name token of that text.
+/// segment; with `names`, only keys that hold every name token of that text. With `meta`, only
+/// searchable keys are examined and kept when their terms hold every term of the query.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyQuery {
     pub start: Bound<String>,
     pub end: Bound<String>,
     pub names: Option<String>,
+    pub meta: Option<MetaTerms>,
     pub limit: usize,
 }
 
@@ -88,6 +107,9 @@ struct Fields {
     name: Field,
     size: Field,
     version: Field,
+    meta_key: Field,
+    meta: Field,
+    exact: Field,
 }
 
 fn schema() -> Schema {
@@ -96,6 +118,9 @@ fn schema() -> Schema {
     builder.add_text_field(NAME_FIELD, TEXT);
     builder.add_u64_field(SIZE_FIELD, STORED);
     builder.add_text_field(VERSION_FIELD, STORED);
+    builder.add_text_field(META_KEY_FIELD, STRING);
+    builder.add_text_field(META_FIELD, STORED);
+    builder.add_text_field(EXACT_FIELD, STORED);
     builder.build()
 }
 
@@ -105,6 +130,9 @@ fn fields(schema: &Schema) -> Result<Fields, KeyIndexError> {
         name: schema.get_field(NAME_FIELD)?,
         size: schema.get_field(SIZE_FIELD)?,
         version: schema.get_field(VERSION_FIELD)?,
+        meta_key: schema.get_field(META_KEY_FIELD)?,
+        meta: schema.get_field(META_FIELD)?,
+        exact: schema.get_field(EXACT_FIELD)?,
     })
 }
 
@@ -392,6 +420,11 @@ fn write_batch(
             document.add_text(fields.name, &entry.key);
             document.add_u64(fields.size, entry.size);
             document.add_text(fields.version, entry.version_id.to_string());
+            if let Some(terms) = &entry.terms {
+                document.add_text(fields.meta_key, &entry.key);
+                document.add_text(fields.meta, join(&terms.text, " "));
+                document.add_text(fields.exact, join(&terms.exact, "\n"));
+            }
             writer.add_document(document)?;
         }
     }
@@ -419,8 +452,12 @@ fn search_keys(open: &OpenIndex, query: &KeyQuery) -> Result<KeyPage, KeyIndexEr
     let searcher = open.reader.searcher();
     let mut seen = std::collections::BTreeMap::<String, bool>::new();
     let mut end: Option<String> = None;
-    for segment in searcher.segment_readers() {
-        let inverted = segment.inverted_index(fields.key)?;
+    let walked = match query.meta {
+        Some(_) => fields.meta_key,
+        None => fields.key,
+    };
+    for (ordinal, segment) in searcher.segment_readers().iter().enumerate() {
+        let inverted = segment.inverted_index(walked)?;
         let mut range = inverted.terms().range();
         range = match &query.start {
             Bound::Included(start) => range.ge(start.as_bytes()),
@@ -439,12 +476,20 @@ fn search_keys(open: &OpenIndex, query: &KeyQuery) -> Result<KeyPage, KeyIndexEr
             let key = String::from_utf8_lossy(stream.key()).into_owned();
             let postings = IndexRecordOption::Basic;
             let mut docs = inverted.read_postings_from_terminfo(stream.value(), postings)?;
-            let mut alive = false;
-            while docs.doc() != TERMINATED && !alive {
-                alive = !segment.is_deleted(docs.doc());
+            let mut alive = None;
+            while docs.doc() != TERMINATED && alive.is_none() {
+                alive = (!segment.is_deleted(docs.doc())).then_some(docs.doc());
                 docs.advance();
             }
-            *seen.entry(key.clone()).or_default() |= alive;
+            let kept = match (alive, &query.meta) {
+                (Some(doc), Some(wanted)) => {
+                    let address = DocAddress::new(ordinal as u32, doc);
+                    holds_terms(&searcher.doc::<TantivyDocument>(address)?, fields, wanted)
+                }
+                (alive, None) => alive.is_some(),
+                (None, Some(_)) => false,
+            };
+            *seen.entry(key.clone()).or_default() |= kept;
             if read == limit {
                 end = Some(end.map_or(key.clone(), |end| end.min(key)));
             }
@@ -472,6 +517,27 @@ fn search_keys(open: &OpenIndex, query: &KeyQuery) -> Result<KeyPage, KeyIndexEr
     })
 }
 
+fn join(terms: &BTreeSet<String>, separator: &str) -> String {
+    terms
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+/// Whether a stored document holds every text token and exact term of `wanted`.
+fn holds_terms(document: &TantivyDocument, fields: Fields, wanted: &MetaTerms) -> bool {
+    let stored = |field: Field| {
+        let value = document.get_first(field).and_then(|value| value.as_str());
+        value.unwrap_or_default().to_string()
+    };
+    let (text, exact) = (stored(fields.meta), stored(fields.exact));
+    let text: BTreeSet<&str> = text.split(' ').collect();
+    let exact: BTreeSet<&str> = exact.split('\n').collect();
+    (wanted.text.iter()).all(|token| text.contains(token.as_str()))
+        && (wanted.exact.iter()).all(|term| exact.contains(term.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +555,7 @@ mod tests {
             key: key.to_string(),
             size: 1,
             version_id: Ulid::from_bytes([3; 16]),
+            terms: None,
         })
     }
 
@@ -497,6 +564,7 @@ mod tests {
             start: start.map(str::to_string),
             end: end.map(str::to_string),
             names: names.map(str::to_string),
+            meta: None,
             limit,
         }
     }
@@ -595,6 +663,84 @@ mod tests {
         let second = indexes.search(set(), range(), 1, rest).await.unwrap();
         assert_eq!(second.keys, ["d.fastq"]);
         assert_eq!(second.last.as_deref(), Some("d.fastq"));
+    }
+
+    fn described(key: &str, text: &[&str], exact: &[&str]) -> KeyChange {
+        let set = |terms: &[&str]| terms.iter().map(|term| term.to_string()).collect();
+        KeyChange::Put(IndexedKey {
+            terms: Some(MetaTerms {
+                text: set(text),
+                exact: set(exact),
+            }),
+            ..match put(key) {
+                KeyChange::Put(indexed) => indexed,
+                KeyChange::Remove(_) => unreachable!(),
+            }
+        })
+    }
+
+    fn meta(text: &[&str], exact: &[&str], limit: usize, after: Option<&str>) -> KeyQuery {
+        let set = |terms: &[&str]| terms.iter().map(|term| term.to_string()).collect();
+        KeyQuery {
+            meta: Some(MetaTerms {
+                text: set(text),
+                exact: set(exact),
+            }),
+            ..query(
+                after.map_or(Bound::Unbounded, Bound::Excluded),
+                Bound::Unbounded,
+                None,
+                limit,
+            )
+        }
+    }
+
+    // Metadata queries walk only searchable keys, match their stored terms, examine at most
+    // the limit even for a common term, and continue after the last examined key.
+    #[tokio::test]
+    async fn metadata_terms_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = Arc::new(RangeIndexes::new(dir.path()));
+        let changes = vec![
+            described(
+                "a/",
+                &["escherichia", "coli"],
+                &["taxid=511145", "species_taxid=562"],
+            ),
+            put("a/genomic.fna"),
+            described("b/", &["salmonella"], &["taxid=99287"]),
+            described(
+                "c/",
+                &["escherichia", "coli"],
+                &["taxid=562", "species_taxid=562"],
+            ),
+        ];
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+        let search = |query| indexes.search(set(), range(), 1, query);
+
+        let coli = search(meta(&["coli"], &["species_taxid=562"], 10, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            (coli.keys, coli.examined),
+            (vec!["a/".to_string(), "c/".to_string()], 3)
+        );
+        let exact = search(meta(&[], &["taxid=562"], 10, None)).await.unwrap();
+        assert_eq!(exact.keys, ["c/"]);
+        // `escherichia` is in two of three folders; a page still stops at its limit.
+        let first = search(meta(&["escherichia"], &[], 2, None)).await.unwrap();
+        assert_eq!((first.keys.len(), first.examined), (1, 2));
+        assert_eq!(first.last.as_deref(), Some("b/"));
+        let rest = search(meta(&["escherichia"], &[], 2, Some("b/")))
+            .await
+            .unwrap();
+        assert_eq!(rest.keys, ["c/"]);
+        // A key replaced without terms or removed no longer matches; like the key walk, its
+        // deleted term may still count as examined until segments merge.
+        let changes = vec![put("a/"), KeyChange::Remove("c/".to_string())];
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+        let none = search(meta(&["coli"], &[], 10, None)).await.unwrap();
+        assert!(none.keys.is_empty());
     }
 
     #[tokio::test]

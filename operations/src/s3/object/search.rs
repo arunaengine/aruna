@@ -10,6 +10,7 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::structs::execution::table::{metadata_matches, query_terms};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
@@ -41,6 +42,8 @@ pub const SEARCH_MAX_LIMIT: usize = 100;
 pub enum ObjectKeyMatch {
     Substring,
     Prefix,
+    /// Matches searchable object metadata instead of keys: free text plus `column=value` terms.
+    Metadata,
 }
 
 impl ObjectKeyMatch {
@@ -48,6 +51,7 @@ impl ObjectKeyMatch {
         match self {
             Self::Substring => key.contains(query),
             Self::Prefix => key.starts_with(query),
+            Self::Metadata => true,
         }
     }
 }
@@ -331,7 +335,12 @@ async fn scan_candidates(
 ) -> Result<CandidateBatch, SearchObjectsError> {
     let (heads, next_start) =
         scan_heads(context, input, start, scan_limit, txn_id, distributed).await?;
-    let live = load_live(context, input, heads, txn_id).await?;
+    let mut live = load_live(context, input, heads, txn_id).await?;
+    // Without a range index, metadata is matched on the versions the scan loaded.
+    if input.key_match == ObjectKeyMatch::Metadata {
+        let (text, exact) = query_terms(&input.query);
+        live.retain(|head| metadata_matches(&head.version.metadata, &text, &exact));
+    }
     let candidates = build_hits(context, input, live, txn_id).await?;
 
     Ok(CandidateBatch {
@@ -352,7 +361,9 @@ async fn scan_heads(
         (Some(bucket), ObjectKeyMatch::Prefix) => {
             Some(BlobHeadKey::object_prefix(bucket, &input.query)?)
         }
-        (Some(bucket), ObjectKeyMatch::Substring) => Some(BlobHeadKey::bucket_prefix(bucket)?),
+        (Some(bucket), ObjectKeyMatch::Substring | ObjectKeyMatch::Metadata) => {
+            Some(BlobHeadKey::bucket_prefix(bucket)?)
+        }
         (None, _) => None,
     };
     let event = context

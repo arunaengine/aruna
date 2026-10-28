@@ -52,6 +52,7 @@ async fn keys(indexes: &Arc<RangeIndexes>, generation: u64) -> Vec<String> {
         start: Bound::Unbounded,
         end: Bound::Unbounded,
         names: None,
+        meta: None,
         limit: 100,
     };
     (indexes.search(set(), range_id(), generation, query).await)
@@ -286,6 +287,7 @@ async fn split_reindexes_children() {
             start: Bound::Unbounded,
             end: Bound::Unbounded,
             names: None,
+            meta: None,
             limit: 10,
         };
         let found = fixture
@@ -326,4 +328,108 @@ async fn search_off_skips() {
     .await;
     assert!(feed.is_none());
     assert!(!indexes.exists(set_id, range_id(), 1).await.unwrap());
+}
+
+/// A searchable head of `key` whose version row names `organism_name` and `taxid`.
+async fn described(handle: &StorageHandle, key: &str, seed: u8, organism: &str) {
+    use crate::distribution::inventory::{AddedVersion, HeadChange, InventoryChange};
+    use aruna_core::structs::execution::table::{SEARCH_EXACT_KEY, SEARCH_TEXT_KEY};
+    use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::distribution::OriginalEpoch;
+    use aruna_core::structs::storage::distribution::inventory::VersionEntry;
+    use aruna_core::structs::storage::format::EncodingClass;
+    let version_id = Ulid::from_bytes([seed; 16]);
+    let entry = VersionEntry {
+        identity: Some([seed; 32]),
+        searchable: true,
+        ..VersionEntry::default()
+    };
+    let mut change = InventoryChange::new(set(), key);
+    let (epoch, generation) = (OriginalEpoch(1), 1);
+    change.added.push(AddedVersion {
+        version_id,
+        epoch,
+        generation,
+        entry,
+    });
+    change.head = HeadChange::Set(HeadEntry {
+        version_id,
+        epoch,
+        generation,
+        version: entry,
+    });
+    let update = crate::distribution::inventory::InventoryUpdate::new(change);
+    assert!(apply(handle, update).await.unwrap());
+    let metadata = std::collections::HashMap::from([
+        ("organism_name".to_string(), organism.to_string()),
+        ("taxid".to_string(), format!("{seed}")),
+        (SEARCH_TEXT_KEY.to_string(), "organism_name".to_string()),
+        (SEARCH_EXACT_KEY.to_string(), "taxid".to_string()),
+    ]);
+    let version = BlobVersion::materialized(
+        [seed; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        std::time::SystemTime::UNIX_EPOCH,
+        Default::default(),
+        None,
+    )
+    .with_metadata(metadata);
+    let version_key = VersionKey::new("spire", key, Ulid::from_bytes([seed; 16]));
+    let row = (version_key.to_bytes().unwrap(), version.to_bytes().unwrap());
+    put_row(&handle.bulk(), BLOB_VERSIONS_KEYSPACE, row.0, row.1)
+        .await
+        .unwrap();
+}
+
+async fn matching(indexes: &Arc<RangeIndexes>, text: &str, exact: &str) -> Vec<String> {
+    let set_of = |term: &str| {
+        (!term.is_empty())
+            .then(|| term.to_string())
+            .into_iter()
+            .collect()
+    };
+    let query = KeyQuery {
+        start: Bound::Unbounded,
+        end: Bound::Unbounded,
+        names: None,
+        meta: Some(MetaTerms {
+            text: set_of(text),
+            exact: set_of(exact),
+        }),
+        limit: 100,
+    };
+    (indexes.search(set(), range_id(), 1, query).await)
+        .unwrap()
+        .keys
+}
+
+// The build and the feed both index a searchable head from its own version's selections,
+// without the job that wrote it; other keys stay out of metadata queries.
+#[tokio::test]
+async fn metadata_indexed_versions() {
+    let fixture = fixture().await;
+    let handle = &fixture.handle;
+    described(handle, "coli/", 7, "Escherichia coli").await;
+    assert!(
+        apply(handle, write(set(), "coli/genomic.fna", 8, 4))
+            .await
+            .unwrap()
+    );
+    let mut feeder = Feeder::new(fixture.indexes.clone(), FeedLimits::default());
+    assert!(feeder.pass(&context(handle)).await);
+    assert_eq!(matching(&fixture.indexes, "coli", "").await, ["coli/"]);
+
+    described(handle, "salmonella/", 9, "Salmonella enterica").await;
+    assert!(feeder.pass(&context(handle)).await);
+    assert_eq!(
+        matching(&fixture.indexes, "", "taxid=9").await,
+        ["salmonella/"]
+    );
+    assert!(
+        matching(&fixture.indexes, "", "organism_name=Escherichia coli")
+            .await
+            .is_empty()
+    );
+    assert_eq!(keys(&fixture.indexes, 1).await.len(), 3);
 }
