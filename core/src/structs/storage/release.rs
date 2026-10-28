@@ -80,12 +80,14 @@ pub struct ReleaseFile {
     pub pin: Option<(SourcePin, Option<String>)>,
 }
 
-/// A range coordinator's current files under a prefix; ranges it does not list come back
-/// refused.
+/// One page of a range coordinator's current files under a prefix; `refused` when it does not
+/// list the range now.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RangeFiles {
     pub files: Vec<ReleaseFile>,
-    pub refused: Vec<Ulid>,
+    pub refused: bool,
+    /// The key the next page starts after; `None` on the last page.
+    pub next: Option<String>,
 }
 
 /// What another member of a distributed bucket is asked about its ranges.
@@ -95,10 +97,12 @@ pub enum HolderAsk {
         range_ids: Vec<Ulid>,
         queries: Vec<MembershipQuery>,
     },
+    /// One page of a range's current files, after the key `after`.
     Files {
-        range_ids: Vec<Ulid>,
+        range_id: Ulid,
         prefix: String,
         skip: String,
+        after: Option<String>,
     },
     /// One release crate version, which the holder reads with the caller's READ checked.
     Crate { key: String, version_id: Ulid },

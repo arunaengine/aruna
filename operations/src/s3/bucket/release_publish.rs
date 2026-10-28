@@ -175,34 +175,59 @@ pub fn release_crate(spec: &ReleaseSpec, files: &[ReleaseFile]) -> Vec<u8> {
 
 const UNREADABLE: &str = "a file under the prefix is not readable";
 
-/// The current versions under `prefix` in `range` (the whole bucket without one), `skip` left
-/// out. Every field of a file comes from one exact version, and the caller must be able to read
-/// every file, or nothing is published.
+/// Keys listed for one page of release files, so a holder's reply stays far below the transport
+/// ceiling.
+const FILE_PAGE: usize = 256;
+
+/// Every current file under `prefix` in `range`, page by page.
+async fn all_files(
+    context: &DriverContext,
+    scope: BucketScope<'_>,
+    access: &Access,
+    asked: (&str, &str),
+    range: Option<&KeyRange>,
+) -> Result<Vec<ReleaseFile>, PublishError> {
+    let (mut files, mut after) = (Vec::new(), None);
+    loop {
+        let (page, next) = release_files(context, scope, access, asked, (range, after)).await?;
+        files.extend(page);
+        match next {
+            Some(next) => after = Some(next),
+            None => return Ok(files),
+        }
+    }
+}
+
+/// One page of the current versions under `prefix` in `range` (the whole bucket without one)
+/// after the key `after`, `skip` left out, and the key the next page starts after. Every field
+/// of a file comes from one exact version, and the caller must be able to read every file, or
+/// nothing is published.
 pub async fn release_files(
     context: &DriverContext,
     scope: BucketScope<'_>,
     access: &Access,
     (prefix, skip): (&str, &str),
-    range: Option<&KeyRange>,
-) -> Result<Vec<ReleaseFile>, PublishError> {
+    (range, after): (Option<&KeyRange>, Option<String>),
+) -> Result<(Vec<ReleaseFile>, Option<String>), PublishError> {
     let unavailable = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
     let mut files = Vec::new();
-    let mut continuation = None;
+    let (mut continuation, mut after) = (None, after);
     loop {
         let listed = drive(
             ListBucketOperation::new(ListBucketInput {
                 bucket: scope.bucket.to_string(),
                 group_id: scope.info.group_id,
                 continuation_token: continuation.take(),
-                max_keys: Some(1_000),
+                max_keys: Some(FILE_PAGE),
                 prefix: Some(prefix.to_string()),
                 delimiter: None,
-                start_after: None,
+                start_after: after.take(),
             }),
             context,
         )
         .await
         .map_err(|error| unavailable(&error))?;
+        let last = (listed.objects.last()).map(|object| object.head.key.clone());
         for object in listed.objects {
             let key = object.head.key;
             if key == skip || range.is_some_and(|range| !range.contains(&key)) {
@@ -235,9 +260,11 @@ pub async fn release_files(
                 pin,
             });
         }
-        match listed.continuation_token {
-            Some(token) => continuation = Some(token),
-            None => return Ok(files),
+        // A page with no key goes on to the next; otherwise its last key is the position.
+        match (listed.continuation_token, last) {
+            (Some(token), None) => continuation = Some(token),
+            (Some(_), last) => return Ok((files, last)),
+            (None, _) => return Ok((files, None)),
         }
     }
 }
@@ -390,7 +417,7 @@ async fn coordinated_files(
 ) -> Result<Vec<ReleaseFile>, PublishError> {
     let asked = (input.spec.prefix.as_str(), input.key.as_str());
     let Some(binding) = &scope.info.distribution else {
-        return release_files(context, scope, access, asked, None).await;
+        return all_files(context, scope, access, asked, None).await;
     };
     let unavailable = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
     let view = read_view(context, binding.set_id)
@@ -404,7 +431,7 @@ async fn coordinated_files(
     let mut files = Vec::new();
     for range in snapshot.listed_ranges(&input.spec.prefix) {
         if snapshot.lists_locally(binding.member_id, range, &fence) {
-            files.extend(release_files(context, scope, access, asked, Some(range)).await?);
+            files.extend(all_files(context, scope, access, asked, Some(range)).await?);
             continue;
         }
         let refused = || {
@@ -421,28 +448,32 @@ async fn coordinated_files(
             return Err(refused());
         };
         let token = AuthToken::bearer(bearer.clone()).map_err(|error| unavailable(&error))?;
-        let ask = HolderAsk::Files {
-            range_ids: vec![range.range_id],
-            prefix: input.spec.prefix.clone(),
-            skip: input.key.clone(),
-        };
-        match handle
-            .request_release_holder(
-                coordinator.node_id,
-                Some(token),
-                scope.bucket.to_string(),
-                ask,
-            )
-            .await
-        {
-            Ok(HolderAnswer::Files(listed)) if listed.refused.is_empty() => {
-                files.extend(listed.files)
+        let mut after = None;
+        loop {
+            let ask = HolderAsk::Files {
+                range_id: range.range_id,
+                prefix: input.spec.prefix.clone(),
+                skip: input.key.clone(),
+                after: after.take(),
+            };
+            let bucket = scope.bucket.to_string();
+            match handle
+                .request_release_holder(coordinator.node_id, Some(token.clone()), bucket, ask)
+                .await
+            {
+                Ok(HolderAnswer::Files(listed)) if !listed.refused => {
+                    files.extend(listed.files);
+                    match listed.next {
+                        Some(next) => after = Some(next),
+                        None => break,
+                    }
+                }
+                // The coordinator refused a file; the generic refusal names none.
+                Err(MetadataReadError::Forbidden) => {
+                    return Err(PublishError::Forbidden(UNREADABLE));
+                }
+                _ => return Err(refused()),
             }
-            // The coordinator refused a file; the generic refusal names none.
-            Err(MetadataReadError::Forbidden) => {
-                return Err(PublishError::Forbidden(UNREADABLE));
-            }
-            _ => return Err(refused()),
         }
     }
     files.sort_by(|left, right| left.key.cmp(&right.key));
@@ -563,15 +594,18 @@ pub async fn holder_answer(
             }))
         }
         HolderAsk::Files {
-            range_ids,
+            range_id,
             prefix,
             skip,
+            after,
         } => {
+            let refused = RangeFiles {
+                files: Vec::new(),
+                refused: true,
+                next: None,
+            };
             let Some(binding) = &info.distribution else {
-                return Ok(HolderAnswer::Files(RangeFiles {
-                    files: Vec::new(),
-                    refused: range_ids,
-                }));
+                return Ok(HolderAnswer::Files(refused));
             };
             let view = read_view(context, binding.set_id)
                 .await
@@ -581,22 +615,20 @@ pub async fn holder_answer(
                 .await
                 .map_err(|error| unavailable(&error))?;
             let snapshot = view.snapshot();
-            let (mut files, mut refused) = (Vec::new(), Vec::new());
-            for range_id in range_ids {
-                let range =
-                    (snapshot.config.ranges.iter()).find(|range| range.range_id == range_id);
-                match range.filter(|range| snapshot.lists_locally(binding.member_id, range, &fence))
-                {
-                    Some(range) => {
-                        let asked = (prefix.as_str(), skip.as_str());
-                        files.extend(
-                            release_files(context, scope, &access, asked, Some(range)).await?,
-                        )
-                    }
-                    None => refused.push(range_id),
-                }
-            }
-            Ok(HolderAnswer::Files(RangeFiles { files, refused }))
+            let range = (snapshot.config.ranges.iter()).find(|range| range.range_id == range_id);
+            let Some(range) =
+                range.filter(|range| snapshot.lists_locally(binding.member_id, range, &fence))
+            else {
+                return Ok(HolderAnswer::Files(refused));
+            };
+            let asked = (prefix.as_str(), skip.as_str());
+            let page = (Some(range), after);
+            let (files, next) = release_files(context, scope, &access, asked, page).await?;
+            Ok(HolderAnswer::Files(RangeFiles {
+                files,
+                refused: false,
+                next,
+            }))
         }
         HolderAsk::Crate { key, version_id } => {
             if !access.0.allows(Some(&key), &Permission::READ) {

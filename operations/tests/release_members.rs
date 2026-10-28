@@ -22,8 +22,9 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::release::{
-    BucketScope, MembershipCaller, MembershipQuery, release_members,
+    BucketScope, MembershipCaller, MembershipQuery, load_access, release_members,
 };
+use aruna_operations::s3::bucket::release_publish::release_files;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use serde_json::json;
 use topology::{TestResult, Topology};
@@ -294,5 +295,58 @@ async fn releases_pin_versions() -> TestResult<()> {
         )
         .await;
     assert!(from_device.is_err(), "a device is no infrastructure peer");
+    Ok(())
+}
+
+#[tokio::test]
+async fn release_files_page() -> TestResult<()> {
+    // A page of release files stops at a bounded number of keys and names where the next starts.
+    let realm = Topology::spawn(2, 1, 1).await?;
+    let group_id = realm.seed_group().await?;
+    let holder = realm.node(0);
+    let context = holder.context.as_ref();
+    let info = BucketInfo {
+        group_id,
+        created_at: SystemTime::now(),
+        created_by: realm.user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: None,
+    };
+    drive(
+        CreateBucketOperation::new(BUCKET.to_string(), info.clone()),
+        context,
+    )
+    .await?;
+    let count = 257;
+    for index in 0..count {
+        let key = format!("db/{index:04}.fasta");
+        put(
+            context,
+            &realm,
+            group_id,
+            (&key, b">a".to_vec()),
+            HashMap::new(),
+        )
+        .await?;
+    }
+    let scope = BucketScope {
+        realm_id: realm.realm_id,
+        node_id: holder.node_id(),
+        bucket: BUCKET,
+        info: &info,
+    };
+    let access = load_access(context, scope, &realm.auth_context()).await?;
+    let asked = ("db/", "db/release.json");
+    let (first, next) = release_files(context, scope, &access, asked, (None, None)).await?;
+    assert_eq!(first.len(), 256);
+    assert_eq!(next.as_deref(), Some("db/0255.fasta"));
+    let (rest, next) = release_files(context, scope, &access, asked, (None, next)).await?;
+    assert_eq!(rest.len(), count - 256);
+    assert_eq!(rest[0].key, "db/0256.fasta");
+    assert_eq!(next, None);
     Ok(())
 }
