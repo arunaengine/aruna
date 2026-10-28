@@ -250,6 +250,11 @@ pub(crate) fn handed_checkpoint(
     at: &StagingJobCheckpoint,
 ) -> StagingJobCheckpoint {
     let mut next = initial_checkpoint(spec);
+    // The table is read again from its start, pinned to what the former job first read.
+    if let (Some(table), Some(read)) = (next.table.as_mut(), at.table.as_ref()) {
+        table.version_id = read.version_id;
+        table.observation = read.observation.clone();
+    }
     next.flat = at.flat;
     next.items_done = at.items_done;
     let queued = at.queue_head < at.queue_tail;
@@ -635,6 +640,33 @@ mod pure_tests {
         assert_eq!(manifest.source_path, "refseq/SHA256SUMS");
         assert_eq!((manifest.offset, manifest.observation), (0, None));
         assert_eq!(handed_checkpoint(&test_spec(), &at).manifest, None);
+    }
+
+    // An uploaded table read to its end while folders still wait keeps its version on handover.
+    #[test]
+    fn handed_table_pinned() {
+        use aruna_core::structs::execution::job::TableRead;
+        let mut spec = test_spec();
+        spec.prefixes.clear();
+        let rows = serde_json::json!({ "kind": "folder", "source": "{p}", "target": "{p}" });
+        let table = serde_json::json!({ "source": { "object": { "bucket": "b", "key": "t.csv" } },
+            "rows": rows });
+        spec.table = Some(serde_json::from_value(table).unwrap());
+        let mut at = initial_checkpoint(&spec);
+        let version = Ulid::from_bytes([9; 16]);
+        at.table = Some(Box::new(TableRead {
+            offset: 4096,
+            version_id: Some(version),
+            columns: Some(vec!["p".to_string()]),
+            done: true,
+            ..TableRead::default()
+        }));
+        at.queue_tail = 3;
+        let handed = handed_checkpoint(&spec, &at);
+        let table = handed.table.expect("the table is read again");
+        assert_eq!((table.offset, table.done, table.columns), (0, false, None));
+        assert_eq!(table.version_id, Some(version));
+        assert_eq!((handed.queue_head, handed.queue_tail), (0, 0));
     }
 
     #[test]

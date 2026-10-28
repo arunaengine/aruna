@@ -297,6 +297,8 @@ pub struct TableRead {
     /// The header, once the first chunk is read.
     pub columns: Option<Vec<String>>,
     pub gzip: Option<bool>,
+    /// The table was read to its end; the state stays for its pinned version.
+    pub done: bool,
 }
 
 /// Progress of a staging job. It stays small: positions and counters only, while directories

@@ -52,7 +52,7 @@ const STEP_ROWS: usize = 1000;
 /// Whether the job reads its table next: the table is open, no directory is being listed
 /// and the queue has room.
 pub(super) fn reads_table(checkpoint: &StagingJobCheckpoint) -> bool {
-    checkpoint.table.is_some()
+    checkpoint.table.as_ref().is_some_and(|table| !table.done)
         && checkpoint.walk.is_none()
         && checkpoint.queue_tail.saturating_sub(checkpoint.queue_head) < QUEUE_PAUSE
 }
@@ -166,7 +166,8 @@ pub(super) async fn read_table_chunk(
         record_failure(&mut next, &entry.source_path, &entry.target, message);
     }
     read.offset += used as u64;
-    next.table = (!complete).then(|| Box::new(read));
+    read.done = complete;
+    next.table = Some(Box::new(read));
     match mapper.kind() {
         RowKind::File => file_rows(ctx, spec, checkpoint, next, entries).await,
         RowKind::Folder => folder_rows(ctx, spec, checkpoint, next, entries).await,
