@@ -42,6 +42,7 @@ use super::{
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::{PermissionRules, permission_rules};
+use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
 use crate::distribution::guard::{
     GuardError, authority_reads, authority_rows, write_target, write_targets,
 };
@@ -209,7 +210,8 @@ pub(super) struct StagedFile {
     pub(super) target_key: String,
     pub(super) size: Option<u64>,
     pub(super) observation: Option<SourceMetadata>,
-    pub(super) manifest: Option<ManifestDigest>,
+    /// Shipped digests, from a checksum manifest or a table row.
+    pub(super) manifest: Vec<ManifestDigest>,
     pub(super) metadata: BTreeMap<String, String>,
 }
 
@@ -319,7 +321,7 @@ pub(super) async fn walk_page(
             .await
             .map_err(PageFailure::Retry)?;
         for (file, digest) in files.iter_mut().zip(digests) {
-            file.manifest = digest;
+            file.manifest = digest.into_iter().collect();
         }
     }
     next.phase = item_phase(spec);
@@ -847,10 +849,13 @@ pub(super) async fn import_page(
             Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
         }
     }
-    let Some((connector, secret_fingerprint)) = source else {
-        // No file was headed, so the page registers nothing.
-        return commit_slot(ctx, slot, checkpoint, next, writes, deletes).await;
+    // Files a table row describes are not headed; the page then resolves its connector itself.
+    let source = match (source, entries.first()) {
+        (Some(source), _) => source,
+        (None, None) => return commit_slot(ctx, slot, checkpoint, next, writes, deletes).await,
+        (None, Some(entry)) => resolved_source(ctx, spec, &entry.source_path).await?,
     };
+    let (connector, secret_fingerprint) = source;
     let database = database_entry(
         &ctx.driver,
         (spec.auth_context.realm_id, spec.node_id),
@@ -970,10 +975,9 @@ async fn snapshot_page(
             return Ok(());
         }
         next.current_path = Some(file.source_path.clone());
-        let expected = file
-            .manifest
-            .map(|(algorithm, digest)| vec![ExpectedChecksum { algorithm, digest }])
-            .unwrap_or_default();
+        let expected = (file.manifest.into_iter())
+            .map(|(algorithm, digest)| ExpectedChecksum { algorithm, digest })
+            .collect();
         match stage_item(ctx, spec, &file.source_path, &file.target_key, expected).await {
             Ok(size) => {
                 next.items_current = next.items_current.saturating_add(1);
@@ -994,12 +998,9 @@ async fn snapshot_page(
     commit_rows(ctx, checkpoint, next, rows.writes, rows.deletes).await
 }
 
-/// Adds a shipped manifest digest to an observation; it binds every complete read.
-fn with_manifest(
-    mut observation: SourceMetadata,
-    digest: Option<ManifestDigest>,
-) -> SourceMetadata {
-    if let Some((algorithm, digest)) = digest {
+/// Adds shipped digests to an observation; they bind every complete read.
+fn with_manifest(mut observation: SourceMetadata, digests: Vec<ManifestDigest>) -> SourceMetadata {
+    for (algorithm, digest) in digests {
         let origin = DigestOrigin::Manifest;
         let scope = DigestScope::FullObject;
         let digest = SourceDigest {
@@ -1010,6 +1011,25 @@ fn with_manifest(
         observation.digests.insert(algorithm, digest);
     }
     observation
+}
+
+/// The connector a page's references name, read from storage without a source request.
+async fn resolved_source(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    source_path: &str,
+) -> Result<PageSource, PageFailure> {
+    let input = ResolveConnectorInput {
+        group_id: spec.group_id,
+        connector_id: spec.connector_id,
+        source_path: source_path.to_string(),
+        allow_root: false,
+    };
+    match drive(ResolveConnectorOperation::new(input), &ctx.driver).await {
+        Ok(resolved) => Ok((resolved.connector, resolved.secret_fingerprint)),
+        Err(error) if lasting_resolution(&error) => Err(PageFailure::Permanent(error.to_string())),
+        Err(error) => Err(PageFailure::Retry(error.to_string())),
+    }
 }
 
 /// One HEAD; the page takes its connector from the first one, and a changed one replays it.
@@ -1113,7 +1133,7 @@ fn map_source_entry(
     Ok(match entry.kind {
         SourceEntryKind::File => MappedEntry::File(StagedFile {
             observation: entry.observation().filter(|_| exact),
-            manifest: None,
+            manifest: Vec::new(),
             metadata: BTreeMap::new(),
             source_path: entry_path,
             target_key: target,

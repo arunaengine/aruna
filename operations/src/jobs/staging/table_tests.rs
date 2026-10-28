@@ -278,6 +278,11 @@ impl Fixture {
     }
 
     async fn search(&self, query: &str) -> Vec<String> {
+        let hits = self.hits(query).await;
+        hits.into_iter().map(|hit| hit.key).collect()
+    }
+
+    async fn hits(&self, query: &str) -> Vec<crate::s3::object::search::ObjectInventoryHit> {
         let auth = self.spec.auth_context.clone();
         let input = SearchObjectsInput {
             realm_id: auth.realm_id,
@@ -291,7 +296,33 @@ impl Fixture {
             as_of: SystemTime::now() + std::time::Duration::from_secs(3600),
         };
         let page = search_local_objects(&self.driver, input).await.unwrap();
-        page.hits.into_iter().map(|hit| hit.hit.key).collect()
+        page.hits.into_iter().map(|hit| hit.hit).collect()
+    }
+
+    /// The whole object read through the ordinary read, or why it was refused.
+    async fn read(&self, key: &str) -> Result<Vec<u8>, String> {
+        use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
+        use futures_util::StreamExt;
+        let auth = &self.spec.auth_context;
+        let input = GetObjectInput {
+            bucket: self.spec.bucket.clone(),
+            key: key.to_string(),
+            version_id: None,
+            range: None,
+            group_id: self.spec.group_id,
+            user_identity: auth.user_id,
+            realm_id: auth.realm_id,
+            node_id: self.spec.node_id,
+        };
+        let operation = GetObjectOperation::new(input);
+        let mut blob = (drive(operation, &self.driver).await)
+            .map_err(|error| error.to_string())?
+            .blob;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = blob.next().await {
+            bytes.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+        }
+        Ok(bytes)
     }
 }
 
@@ -470,4 +501,55 @@ async fn shutdown_keeps_permanent() {
     );
     let retryable = stopped(JobError::retryable("reset")).await;
     assert!(matches!(retryable, JobRunOutcome::Interrupted));
+}
+
+// List columns give size, checksum and time: such rows are registered without a HEAD, reads
+// check the bytes against the list's checksum, and metadata hits carry the kept columns.
+#[tokio::test]
+async fn list_columns_recorded() {
+    let (endpoint, site, server) = serve(Site::ncbi).await;
+    let table = serde_json::json!({
+        "source": { "object": { "bucket": "lists", "key": "files.csv" } },
+        "rows": { "kind": "file", "source": "{url}", "target": "files/{name}",
+                  "size": "bytes", "modified": "time",
+                  "checksums": [{ "algorithm": "md5", "column": "md5" }],
+                  "keep": ["note"], "text": ["note"] }
+    });
+    let fixture = Fixture::new(&endpoint, table).await;
+    let good = format!("{:x}", md5::compute(b"sums"));
+    let wrong = format!("{:x}", md5::compute(b"other"));
+    let csv = format!(
+        "url,name,bytes,md5,time,note\n\
+         {COLI}md5checksums.txt,good.txt,4,{good},2025-11-17T17:38:21Z,coli sums\n\
+         {HUMAN}README.txt,wrong.txt,6,{wrong},,human readme\n\
+         {HUMAN}README.txt,bad.txt,six,{good},,broken size\n"
+    );
+    let ctx = fixture.context(30).await;
+    let lists = drive(
+        GetBucketOperation::new("lists".to_string()),
+        &fixture.driver,
+    )
+    .await;
+    let body = (Bytes::from(csv), &BTreeMap::new());
+    let lists = ("lists", &lists.unwrap());
+    write_object(&ctx, &fixture.spec, lists, "files.csv", body)
+        .await
+        .ok()
+        .unwrap();
+
+    assert_eq!(fixture.run(31).await, (2, 1));
+    assert_eq!(
+        site.count(&Method::HEAD, &format!("{COLI}md5checksums.txt")),
+        0
+    );
+    assert_eq!(site.count(&Method::HEAD, &format!("{HUMAN}README.txt")), 0);
+    assert_eq!(fixture.read("files/good.txt").await.unwrap(), b"sums");
+    assert!(fixture.read("files/wrong.txt").await.is_err());
+
+    let hits = fixture.hits("sums").await;
+    assert_eq!(hits.len(), 1);
+    let kept = &hits[0].metadata;
+    assert_eq!(kept.get("note").map(String::as_str), Some("coli sums"));
+    assert!(kept.keys().all(|key| !key.starts_with("aruna-")));
+    server.abort();
 }

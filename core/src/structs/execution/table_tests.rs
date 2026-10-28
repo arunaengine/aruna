@@ -323,3 +323,74 @@ fn queries_split_terms() {
     assert_eq!(exact, ["taxid=562", "assembly_level=Complete Genome"]);
     assert_eq!(query_terms("=x a"), ("=x a".to_string(), Vec::new()));
 }
+
+// Size, checksum and time columns are checked per row; a bad value fails only its row.
+#[test]
+fn file_columns_checked() {
+    let rows: TableRows = serde_json::from_value(serde_json::json!({
+        "kind": "file", "source": "{url}", "target": "{url|basename}",
+        "size": "bytes", "modified": "time",
+        "checksums": [{ "algorithm": "md5", "column": "md5" },
+                      { "algorithm": "sha256", "column": "sha256" }]
+    }))
+    .unwrap();
+    let columns: Vec<String> = ["url", "bytes", "md5", "sha256", "time"]
+        .map(String::from)
+        .into();
+    let mapper = RowMapper::new(&rows, &columns).unwrap();
+    let md5 = "9e107d9d372bb6826bd81d3542a419d6";
+    let sha = "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592";
+    let row = |bytes: &str, md5: &str, sha: &str, time: &str| {
+        let value = |text: &str| (!text.is_empty()).then(|| text.to_string());
+        vec![
+            Some("a.fq".to_string()),
+            value(bytes),
+            value(md5),
+            value(sha),
+            value(time),
+        ]
+    };
+    let entry = imported(mapper.map(&row("42", md5, sha, "2025-11-17T17:38:21Z"), None));
+    assert_eq!(entry.size, Some(42));
+    assert_eq!(
+        entry.digests[0],
+        (ChecksumAlgorithm::Md5, hex::decode(md5).unwrap())
+    );
+    assert_eq!(entry.digests[1].0, ChecksumAlgorithm::Sha256);
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_401_101);
+    assert_eq!(entry.modified, Some(at));
+    // Null values give nothing; a date is checked but names no second.
+    let bare = imported(mapper.map(&row("", "", "", "2025-11-17"), None));
+    assert_eq!(
+        (bare.size, bare.digests.len(), bare.modified),
+        (None, 0, None)
+    );
+    for bad in [
+        row("-1", md5, sha, ""),
+        row("4.2", md5, sha, ""),
+        row("42", &md5[..30], sha, ""),
+        row("42", sha, "", ""),
+        row("42", "zz107d9d372bb6826bd81d3542a419d6", "", ""),
+        row("42", md5, sha, "yesterday"),
+    ] {
+        assert!(
+            matches!(mapper.map(&bad, None), RowOutcome::Failed(_)),
+            "{bad:?}"
+        );
+    }
+    let mut folder = rows.clone();
+    folder.kind = RowKind::Folder;
+    let import = |rows: TableRows| TableImport {
+        source: TableSource::Connector("list.csv".to_string()),
+        format: TableFormat::default(),
+        rows,
+        rate: None,
+    };
+    assert!(import(folder).validate().is_err());
+    let mut twice = rows.clone();
+    twice.checksums[1].algorithm = "md5".to_string();
+    assert!(import(twice).validate().is_err());
+    let mut unknown = rows;
+    unknown.checksums[0].algorithm = "crc32".to_string();
+    assert!(import(unknown).validate().is_err());
+}
