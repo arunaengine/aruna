@@ -611,6 +611,23 @@ pub enum MetadataTransportMessage {
     ReferencePageAnswer {
         answer: crate::replication::page::PageAnswer,
     },
+    /// The realm signing key a management node hands a server node it promotes.
+    HandRealmKey {
+        key: RealmKeyPem,
+    },
+    RealmKeyStored {
+        result: Result<(), MetadataReadError>,
+    },
+}
+
+/// PKCS8 PEM of the realm signing key; Debug never prints it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealmKeyPem(pub String);
+
+impl std::fmt::Debug for RealmKeyPem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RealmKeyPem(<redacted>)")
+    }
 }
 
 /// One document as a holder serves it to a device.

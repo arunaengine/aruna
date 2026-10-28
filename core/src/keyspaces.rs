@@ -474,6 +474,8 @@ pub const FEDERATION_KEYSPACE: &str = "federation_publication";
 pub const NODE_VAULT_KEYSPACE: &str = "node_vault";
 /// The one row of `NODE_STATE_KEYSPACE` that holds the node's identity.
 pub const NODE_STATE_KEY: &[u8] = b"node_state";
+/// Realm signing key a promotion handed to this node; its next start moves it into the identity.
+pub const PROMOTED_KEY_ROW: &[u8] = b"promoted_realm_key";
 pub const ONBOARDING_KEYSPACE: &str = "onboarding";
 pub const DHT_KEYSPACE: &str = "dht_v2";
 pub const CRAQLE_TERMS_KEYSPACE: &str = "terms";

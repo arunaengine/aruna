@@ -521,6 +521,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::StagingSpecResult { .. } => "staging_spec_result",
         MetadataTransportMessage::ReferencePage { .. } => "reference_page",
         MetadataTransportMessage::ReferencePageAnswer { .. } => "reference_page_answer",
+        MetadataTransportMessage::HandRealmKey { .. } => "hand_realm_key",
+        MetadataTransportMessage::RealmKeyStored { .. } => "realm_key_stored",
     }
 }
 
