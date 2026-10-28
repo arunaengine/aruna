@@ -223,6 +223,29 @@ impl ProvenanceCrate {
         (hops, Some(CrateFile { path, bytes }))
     }
 
+    /// Records a run whose crate was not written, with the state its node reported. `false`
+    /// when the state names no such outcome.
+    pub fn unwritten(&mut self, hop: &Hop, status: &str, message: Option<&str>) -> bool {
+        let state = match status {
+            "denied" => "RunRecordDenied",
+            "failed" => "RunRecordFailed",
+            "local" => "RunRecordLocal",
+            _ => return false,
+        };
+        self.run(hop, None);
+        let Target::Run(run_id) = &hop.target else {
+            return false;
+        };
+        let key = format!("#run-{run_id}");
+        self.add_text(&key, "creativeWorkStatus", state);
+        let text = match status {
+            "local" => "The run record is kept on the device that ran it",
+            _ => message.unwrap_or("The run record was not written"),
+        };
+        self.add_text(&key, "description", text);
+        true
+    }
+
     /// Records a dataset start: the dataset as a nested crate and its parts with exact ids.
     pub fn dataset(&mut self, document: &Value) -> (Vec<Hop>, CrateFile) {
         let folder = "dataset/".to_string();

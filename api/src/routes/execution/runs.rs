@@ -42,6 +42,10 @@ pub struct RunResponse {
     /// The run crate document, once written.
     pub run_crate: Option<String>,
     pub run_crate_iri: Option<String>,
+    /// The crate's state for the submitter: `pending`, `written`, `denied`, `failed` or `local`,
+    /// with a `message` when it was not written.
+    #[schema(value_type = Option<Object>)]
+    pub run_crate_status: Option<serde_json::Value>,
 }
 
 #[utoipa::path(
@@ -59,6 +63,8 @@ restrictions; anyone else needs READ on the run crate with their own token.
   node relays the call there with the caller's token.
 - Runs made before links were kept answer only while their job record exists.
 - A caller who may not see the run gets 404, as for job reads.
+- The submitter also gets `run_crate_status`, so a crate that was denied, failed or is kept
+  on a device says why instead of only being absent.
 
 **Limits**
 - One run per call."#,
@@ -68,7 +74,8 @@ restrictions; anyone else needs READ on the run crate with their own token.
             "run_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2",
             "logical_job_id": "01K8W1A0000000000000000000",
             "run_crate": "01K8W1C0000000000000000000",
-            "run_crate_iri": "https://w3id.org/aruna/01K8W1C0000000000000000000"
+            "run_crate_iri": "https://w3id.org/aruna/01K8W1C0000000000000000000",
+            "run_crate_status": { "status": "written", "resource": "01K8W1C0000000000000000000" }
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "Unknown run, or not visible to the caller", body = ErrorResponse),
@@ -123,6 +130,7 @@ pub(crate) async fn run_answer(
         logical_job_id: view.logical_job_id.map(|id| id.to_string()),
         run_crate: view.run_crate.map(|id| id.to_string()),
         run_crate_iri: view.run_crate.map(MetadataRegistryRecord::graph_iri_for),
+        run_crate_status: view.run_crate_status,
     }))
 }
 

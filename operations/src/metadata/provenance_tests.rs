@@ -285,3 +285,23 @@ fn crashed_scratch_reclaimed() {
     std::fs::remove_dir(&live).unwrap();
     std::fs::remove_file(&other).unwrap();
 }
+
+#[test]
+fn unwritten_run_status() {
+    // A run whose crate was denied says so instead of reading as not visible.
+    let output = arn(1, "out.txt");
+    let run_id = Ulid::from_bytes([5; 16]).to_string();
+    let mut built = ProvenanceCrate::new(&output, "2026-10-27T12:00:00Z").unwrap();
+    let run = Hop {
+        target: Target::Run(run_id.clone()),
+        from: output.clone(),
+        property: "result",
+        digest: None,
+    };
+    assert!(built.unwritten(&run, "denied", Some("metadata write access denied")));
+    assert!(!built.unwritten(&run, "written", None));
+    let document = root(built);
+    let entity = node(&document, &format!("#run-{run_id}"));
+    assert_eq!(entity["creativeWorkStatus"], "RunRecordDenied");
+    assert_eq!(entity["description"], "metadata write access denied");
+}

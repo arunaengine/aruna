@@ -279,7 +279,15 @@ async fn walk(
                             break;
                         }
                     },
-                    None => Some(Read::Hidden),
+                    None => {
+                        let status = &run["run_crate_status"];
+                        if let Some(state) = status["status"].as_str()
+                            && built.unwritten(&hop, state, status["message"].as_str())
+                        {
+                            continue;
+                        }
+                        Some(Read::Hidden)
+                    }
                 };
                 let (hops, file, go_on) = record_run(&mut built, &hop, read);
                 if let Some(file) = file

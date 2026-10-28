@@ -12,7 +12,7 @@ use ulid::Ulid;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::DriverContext;
-use crate::jobs::store::read_run_link;
+use crate::jobs::store::{read_crate_status, read_run_link};
 
 #[derive(Debug, Error)]
 pub enum RunReadError {
@@ -30,6 +30,8 @@ pub struct RunView {
     /// The submitted job, shown to the submitter only.
     pub logical_job_id: Option<JobId>,
     pub run_crate: Option<Ulid>,
+    /// Why the crate is in its state (written, denied, failed, local); submitter only.
+    pub run_crate_status: Option<serde_json::Value>,
 }
 
 /// Reads the run link this node keeps. The submitter with an unrestricted credential sees it;
@@ -65,10 +67,18 @@ pub async fn read_run(
             Err(_) => return Err(RunReadError::NotFound),
         }
     }
+    let run_crate_status = match submitter {
+        true => read_crate_status(&context.storage_handle, run_id)
+            .await
+            .map_err(RunReadError::Unavailable)?
+            .map(|status| status.to_public_json()),
+        false => None,
+    };
     Ok(RunView {
         run_id,
         logical_job_id: link.logical_job_id.filter(|_| submitter),
         run_crate: link.run_crate,
+        run_crate_status,
     })
 }
 
