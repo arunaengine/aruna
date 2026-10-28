@@ -380,6 +380,8 @@ async fn uploaded_list_imports() {
         "url,sample,description\n\
          {endpoint}/genomes/{COLI}md5checksums.txt,s1,\"checksums, coli\"\n\
          {HUMAN}README.txt,s2,human readme\n\
+         {HUMAN}README.txt,s2,human readme\n\
+         {HUMAN}README.txt,s4,other readme\n\
          https://elsewhere.example.org/x.txt,s3,outside\n"
     );
     let ctx = fixture.context(9).await;
@@ -395,7 +397,8 @@ async fn uploaded_list_imports() {
         .ok()
         .unwrap();
 
-    assert_eq!(fixture.run(10).await, (2, 1));
+    // A repeated row imports once; a row mapping its key differently fails.
+    assert_eq!(fixture.run(10).await, (2, 2));
     let bucket = fixture.spec.bucket.clone();
     let (_, metadata) = fixture
         .head(&bucket, "samples/md5checksums.txt")
@@ -403,7 +406,8 @@ async fn uploaded_list_imports() {
         .unwrap();
     assert_eq!(metadata["sample"], "s1");
     assert_eq!(metadata["description"], "checksums, coli");
-    assert!(fixture.head(&bucket, "samples/README.txt").await.is_some());
+    let (_, readme) = fixture.head(&bucket, "samples/README.txt").await.unwrap();
+    assert_eq!(readme["sample"], "s2");
     assert_eq!(
         fixture.search("readme sample=s2").await,
         ["samples/README.txt"]

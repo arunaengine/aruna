@@ -160,12 +160,36 @@ pub(super) async fn read_table_chunk(
             RowOutcome::Import(entry) => entries.push(entry),
         }
     }
+    let (entries, conflicts) = distinct_targets(entries);
+    for entry in conflicts {
+        let message = "another row of the table maps to this key".to_string();
+        record_failure(&mut next, &entry.source_path, &entry.target, message);
+    }
     read.offset += used as u64;
     next.table = (!complete).then(|| Box::new(read));
     match mapper.kind() {
         RowKind::File => file_rows(ctx, spec, checkpoint, next, entries).await,
         RowKind::Folder => folder_rows(ctx, spec, checkpoint, next, entries).await,
     }
+}
+
+/// Keeps the first row of each target; a later row mapping it alike is dropped, one mapping it
+/// differently is returned as a conflict, so a page never registers one key twice.
+fn distinct_targets(entries: Vec<TableEntry>) -> (Vec<TableEntry>, Vec<TableEntry>) {
+    let mut kept: Vec<TableEntry> = Vec::with_capacity(entries.len());
+    let mut seen = HashMap::new();
+    let mut conflicts = Vec::new();
+    for entry in entries {
+        match seen.get(&entry.target) {
+            Some(&index) if kept[index] == entry => {}
+            Some(_) => conflicts.push(entry),
+            None => {
+                seen.insert(entry.target.clone(), kept.len());
+                kept.push(entry);
+            }
+        }
+    }
+    (kept, conflicts)
 }
 
 fn table_name(import: &TableImport) -> String {
@@ -622,6 +646,25 @@ async fn write_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rows naming one key alike import once; rows naming it differently fail, not overwrite.
+    #[test]
+    fn duplicate_targets_kept_once() {
+        let entry = |source: &str, target: &str| TableEntry {
+            source_path: source.to_string(),
+            target: target.to_string(),
+            metadata: BTreeMap::new(),
+        };
+        let rows = vec![
+            entry("a.fq", "x/a.fq"),
+            entry("a.fq", "x/a.fq"),
+            entry("b.fq", "x/a.fq"),
+            entry("c.fq", "x/c.fq"),
+        ];
+        let (kept, conflicts) = distinct_targets(rows);
+        assert_eq!(kept, [entry("a.fq", "x/a.fq"), entry("c.fq", "x/c.fq")]);
+        assert_eq!(conflicts, [entry("b.fq", "x/a.fq")]);
+    }
 
     // A folder spanning a range boundary is queued by both coordinators, others by one.
     #[test]
