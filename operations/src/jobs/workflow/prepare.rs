@@ -85,7 +85,7 @@ pub(super) fn mounted_view(
 /// Build the attempt's inputs. Mounted inputs are read through the run's input view at their
 /// exact versions; every other input is read straight from its source into the workspace.
 /// Nothing is copied for an attempt, so an adopted one restages the same way.
-pub(super) async fn prepare_inputs(
+async fn prepare_inputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
@@ -156,6 +156,18 @@ pub(super) async fn prepare_task(
     bucket: &str,
 ) -> Result<PreparedTask, JobError> {
     Box::pin(prepare_workspace(context, spec, record, node_id, bucket)).await?;
+    Box::pin(prepare_attempt(context, spec, record, node_id, bucket)).await
+}
+
+/// The inputs and credentials of one attempt, for its first submit and for every recovery,
+/// so a resubmit carries the very credential the first submit minted.
+pub(super) async fn prepare_attempt(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    bucket: &str,
+) -> Result<PreparedTask, JobError> {
     let session = session_of(spec).is_some();
     let mut prepared = Box::pin(prepare_inputs(context, spec, record, node_id, !session)).await?;
     if session {

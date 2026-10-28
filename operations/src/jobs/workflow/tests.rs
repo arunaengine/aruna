@@ -69,6 +69,7 @@ struct StubBackend {
     reconcile_started: Notify,
     image_started: Notify,
     image_stall: AtomicBool,
+    mounts: AtomicBool,
 }
 
 impl StubBackend {
@@ -85,6 +86,7 @@ impl StubBackend {
             reconcile_started: Notify::new(),
             image_started: Notify::new(),
             image_stall: AtomicBool::new(false),
+            mounts: AtomicBool::new(false),
         })
     }
 }
@@ -93,6 +95,12 @@ impl StubBackend {
 impl ExecutorBackend for StubBackend {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Docker
+    }
+    fn capabilities(&self) -> aruna_compute::executor::BackendCaps {
+        aruna_compute::executor::BackendCaps {
+            s3_mount: self.mounts.load(Ordering::Relaxed),
+            ..Default::default()
+        }
     }
     fn run_identity(&self) -> UserSpec {
         NOBODY
@@ -1202,6 +1210,96 @@ async fn absent_retries_same() {
     assert_eq!(stored.state, JobState::Indeterminate);
     assert_eq!(stored.attempts, 1);
     assert!(stored.attempt_intent.is_some());
+}
+
+// A mounted session recovered after its first submit minted the run credential submits again
+// with that credential, which carries the workspace and the input view together.
+#[tokio::test]
+async fn recovery_reuses_credential() {
+    use aruna_core::structs::execution::job::{
+        CapturedInput, InputContent, InputMode, InputSelection, InputSource,
+    };
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let (mut ctx, net) = net_context(storage.clone()).await;
+    let backend = StubBackend::new(StubReconcile::NotFound);
+    backend.mounts.store(true, Ordering::Relaxed);
+    let registry = ExecutorRegistry::new()
+        .with_backend(backend.clone())
+        .with_workspace_endpoint(Some("http://s3.test".to_string()), String::new());
+    Arc::get_mut(&mut ctx).unwrap().compute_handle = Some(Arc::new(registry));
+    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let local = net.node_id();
+    let mut spec = session_spec(None);
+    spec.executor_constraint = Some("docker".to_string());
+    spec.inputs.push(InputSelection {
+        source: InputSource::S3 {
+            bucket: "bakta".to_string(),
+            key: "db/bakta.db".to_string(),
+            version_id: Some(Ulid::from_parts(1, 1).to_string()),
+        },
+        source_node_id: None,
+        dest_key: "db/bakta.db".to_string(),
+        mode: InputMode::Mount,
+        container_path: Some("/db/bakta.db".to_string()),
+        name: None,
+        description: None,
+    });
+    let captured = CapturedInput {
+        destination_key: "db/bakta.db".to_string(),
+        source_node_id: local,
+        version_id: Ulid::from_parts(1, 1),
+        content: InputContent::Blake3([1; 32]),
+        bytes: 1,
+        policies: Vec::new(),
+        source_group_id: spec.group_id,
+        public: false,
+        link: None,
+        source_pin: None,
+        database: None,
+        releases: Vec::new(),
+        releases_complete: false,
+        grant: None,
+    };
+    let scope = (RealmId([1; 32]), spec.group_id, local);
+    let owner = crate::tests::access::seed_access(&ctx, scope, "/none")
+        .await
+        .user_id;
+    let record = crate::jobs::store::mutate_job(&storage, record.job_id, |record| {
+        record.payload = JobPayload::Execution(spec.clone());
+        record.created_by = owner;
+        record.captured_inputs = vec![captured.clone()];
+        record.workspace_bucket = Some("ws-test".to_string());
+        Ok(crate::jobs::store::JobMutation::Persist)
+    })
+    .await
+    .unwrap();
+    let first = Box::pin(super::prepare::prepare_attempt(
+        &ctx, &spec, &record, local, "ws-test",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(first.mounts.len(), 1);
+    let fence = FenceContext {
+        attempt,
+        attempt_epoch: 0,
+        controller_generation: 1,
+    };
+    let dyn_backend: Arc<dyn ExecutorBackend> = backend.clone();
+    recover_failed_submit(
+        &ctx,
+        record.job_id,
+        token,
+        &dyn_backend,
+        &fence,
+        &spec,
+        "ws-test",
+        &CancellationToken::new(),
+        BackendError::Unavailable("io fault".to_string()),
+    )
+    .await;
+    assert_eq!(backend.submits.lock().unwrap().len(), 1);
+    net.shutdown().await;
 }
 
 // A re-driven crate job must return the already-written resource, not mint a

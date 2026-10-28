@@ -23,7 +23,7 @@ use super::super::store::{
 };
 use super::DEFAULT_WALLTIME;
 use super::finalize::{fail_and_crate, finalize_attempt, finalize_cancel};
-use super::prepare::{build_task_spec, job_bucket, prepare_inputs};
+use super::prepare::{build_task_spec, job_bucket, prepare_attempt};
 use super::recovery::{park_attempt, requeue_after_tombstone};
 use super::supervise::{supervise_and_finalize, with_execution_heartbeat};
 use crate::driver::DriverContext;
@@ -421,13 +421,14 @@ pub(super) async fn resume_attempt(
                     return false;
                 };
                 let prepared =
-                    match Box::pin(prepare_inputs(&context, &spec, &record, node_id, true)).await {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            Box::pin(fail_or_park(&context, job_id, token, &record, error)).await;
-                            return false;
-                        }
-                    };
+                    Box::pin(prepare_attempt(&context, &spec, &record, node_id, &bucket));
+                let prepared = match prepared.await {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        Box::pin(fail_or_park(&context, job_id, token, &record, error)).await;
+                        return false;
+                    }
+                };
                 let Some(pinned_image) = record
                     .attempt_intent
                     .as_ref()
