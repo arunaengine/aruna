@@ -245,3 +245,19 @@ fn spooled_state_streams() {
     assert_eq!(hidden, 500);
     assert_eq!(node(&document, "./")["hasPart"], json!([]));
 }
+
+#[test]
+fn scratch_stays_private() {
+    // Export working state lives in a folder only this user may open, in files only it may read.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir().unwrap();
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700);
+    let path = dir.join(format!("{}.json", scratch_name()));
+    drop(scratch_file(&path).unwrap());
+    assert_eq!(mode(&path), 0o600);
+    std::fs::remove_file(&path).unwrap();
+    let built = ProvenanceCrate::new("start", "2026-10-28T00:00:00Z").unwrap();
+    assert!(built.spool.path.starts_with(&dir));
+}

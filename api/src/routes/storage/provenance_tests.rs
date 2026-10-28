@@ -41,8 +41,12 @@ fn caller(node: &Node, recheck: Recheck) -> Caller {
 }
 
 async fn exported_with(node: &Node, recheck: Recheck, version: &str) -> serde_json::Value {
+    exported_by(caller(node, recheck), version).await
+}
+
+async fn exported_by(caller: Caller, version: &str) -> serde_json::Value {
     let start = Start::Version(version.to_string());
-    let response = start_export(caller(node, recheck), start).unwrap();
+    let response = start_export(caller, start).unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();

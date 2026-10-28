@@ -3,6 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::PathBuf;
+
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use serde_json::{Map, Value, json};
 use ulid::Ulid;
@@ -36,9 +41,9 @@ pub(super) type SpoolResult<T> = Result<T, fjall::Error>;
 
 impl Spool {
     pub(super) fn open() -> SpoolResult<Self> {
-        let path = std::env::temp_dir()
-            .join("aruna-provenance")
-            .join(Ulid::generate().to_string());
+        let path = scratch_dir()
+            .map_err(fjall::Error::Io)?
+            .join(scratch_name());
         let db = Database::builder(&path).temporary(true).open()?;
         let open = |name: &str| db.keyspace(name, KeyspaceCreateOptions::default);
         Ok(Self {
@@ -126,4 +131,39 @@ impl Spool {
             Ok(serde_json::from_slice(&value).unwrap_or_default())
         })
     }
+}
+
+/// The private folder of export working state: this user's own, readable by nobody else.
+pub fn scratch_dir() -> io::Result<PathBuf> {
+    let uid = rustix::process::geteuid().as_raw();
+    let dir = std::env::temp_dir().join(format!("aruna-provenance-{uid}"));
+    match DirBuilder::new().mode(0o700).create(&dir) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        _ => {}
+    }
+    // A folder of this name made by someone else, or a link, is never used.
+    let found = std::fs::symlink_metadata(&dir)?;
+    if !found.is_dir() || found.uid() != uid {
+        return Err(io::Error::other(
+            "the export scratch folder belongs to someone else",
+        ));
+    }
+    if found.mode() & 0o077 != 0 {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+/// A new entry name of this process: `<pid>-<ulid>`, which tells whose it is.
+pub fn scratch_name() -> String {
+    format!("{}-{}", std::process::id(), Ulid::generate())
+}
+
+/// Creates a new scratch file only this user may read.
+pub fn scratch_file(path: &std::path::Path) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
 }

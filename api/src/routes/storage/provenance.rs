@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::metadata::provenance::{CrateFile, Hop, ProvenanceCrate, Target};
+use aruna_operations::metadata::provenance::{
+    CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
+};
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use axum::body::Body;
@@ -26,7 +28,6 @@ use tokio::io::DuplexStream;
 use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
-use ulid::Ulid;
 use utoipa::{IntoParams, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -278,19 +279,21 @@ async fn walk(
     finish(&caller, &gone, zip, built).await
 }
 
-/// Writes the root metadata and closes the ZIP. The root is written to a temporary file first
-/// and copied into the ZIP in pieces, so it is never held in memory whole.
+/// Writes the root metadata and closes the ZIP. The root goes to a private temporary file first
+/// and is copied into the ZIP in pieces, so it is never held in memory whole.
 async fn finish(
     caller: &Caller,
     gone: &CancellationToken,
     mut zip: ZipFileWriter<DuplexStream>,
     built: ProvenanceCrate,
 ) {
-    let spooled =
-        Spooled(std::env::temp_dir().join(format!("aruna-provenance-{}.json", Ulid::generate())));
+    let Ok(dir) = scratch_dir() else {
+        return;
+    };
+    let spooled = Spooled(dir.join(format!("{}.json", scratch_name())));
     let path = spooled.0.clone();
     let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let mut out = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        let mut out = std::io::BufWriter::new(scratch_file(&path)?);
         built.write_root(&mut out)?;
         std::io::Write::flush(&mut out)
     });

@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use self::spool::{Spool, SpoolResult};
+pub use self::spool::{scratch_dir, scratch_file, scratch_name};
 
 use aruna_core::structs::storage::data::identity::text_values;
 use aruna_core::structs::storage::replication::W3idIdentifier;
