@@ -10,7 +10,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE,
-    USAGE_STATS_KEYSPACE,
+    SEARCH_FEED_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -22,7 +22,7 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::distribution::{
-    DistributionSnapshot, OriginalEpoch, Publication,
+    DistributionSettings, DistributionSnapshot, OriginalEpoch, Publication,
 };
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
@@ -31,7 +31,9 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use super::*;
-use crate::distribution::test_record::{binding, member, realm, replicated, secret, store_record};
+use crate::distribution::test_record::{
+    binding, member, realm, replicated, secret, store_record, with_settings,
+};
 use crate::distribution::test_store::{context, install, open};
 use crate::driver::drive;
 use crate::replication::protocol::VersionReplicationManifest;
@@ -234,6 +236,46 @@ async fn applies_page_once() {
     let answer = apply(&member, page(&member, manifests), 1).await;
     assert_eq!(answer, applied);
     assert_eq!(counters(&member.handle).await, counted);
+}
+
+async fn feed_rows(handle: &StorageHandle) -> usize {
+    let iter = StorageEffect::Iter {
+        key_space: SEARCH_FEED_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: 100,
+        txn_id: None,
+    };
+    match handle.send_storage_effect(iter).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values.len(),
+        other => panic!("unexpected iter answer {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn feeds_searched_sets() {
+    let member = member_two(false).await;
+    let first = record("a", 1, 1, &member.publication);
+    apply(&member, page(&member, vec![first]), 1).await;
+    assert_eq!(
+        feed_rows(&member.handle).await,
+        0,
+        "a set without an index gets no feed"
+    );
+    let settings = DistributionSettings {
+        search_index: true,
+        ..DistributionSettings::default()
+    };
+    let (snapshot, bytes) = with_settings(true, 1, settings);
+    store_record(&member.handle, snapshot.set_id(), bytes).await;
+    let second = record("b", 2, 1, &member.publication);
+    let answer = apply(&member, page(&member, vec![second]), 1).await;
+    assert!(matches!(answer, PageAnswer::Applied { applied: 1, .. }));
+    assert_eq!(
+        feed_rows(&member.handle).await,
+        1,
+        "a searched set feeds the new head"
+    );
 }
 
 /// The digest of a record's source root, as the member stores it.
