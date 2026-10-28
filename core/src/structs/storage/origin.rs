@@ -90,6 +90,15 @@ pub struct SyncHop {
     pub from: OriginVersion,
 }
 
+/// The external source a reference version reads: its public URL when it has one, the path
+/// within the source and the source's own version id, when the source names one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourcePin {
+    pub url: Option<String>,
+    pub path: String,
+    pub source_version: Option<String>,
+}
+
 /// What a dataset may say about a file's origin, read from the same pinned version. Uploads
 /// and imports in place give nothing: users, devices and storage paths stay private.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -8,6 +8,7 @@ pub mod backend_import;
 pub mod backends;
 pub mod blob;
 pub mod broken;
+pub mod bucket_metadata;
 pub mod cleanup;
 pub mod data;
 pub mod dataset_location;
