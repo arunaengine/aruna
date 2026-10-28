@@ -27,8 +27,8 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::command::{
-    ExecutionInput, ExecutionOutput, ExecutionTarget, InputMode,
-    WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
+    ExecutionInput, ExecutionOutput, InputMode, WorkspaceMode as CommandWorkspaceMode,
+    WorkspaceSpec,
 };
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{
@@ -125,6 +125,7 @@ fn family_report_fixture() -> FamilyReport {
                 admitted_at_ms: 10,
             },
             captured_inputs: Vec::new(),
+            input_pages: None,
             output_policies: Vec::new(),
             placement: PlacementRef::NIL,
         },
@@ -1291,8 +1292,8 @@ async fn local_refuses_stranger() {
 }
 
 #[test]
-fn local_names_holder() {
-    // Only a local run may name the holder: the planner stores it otherwise.
+fn names_input_holder() {
+    // Local and realm runs both keep the named node; a realm run resolves the input there.
     let input = ExecutionInput {
         bucket: "src".to_string(),
         key: "data.csv".to_string(),
@@ -1303,16 +1304,7 @@ fn local_names_holder() {
         mode: InputMode::Snapshot,
     };
 
-    assert!(matches!(
-        native_input(input.clone(), ExecutionTarget::Realm),
-        Err(JobRequestError::BadRequestMessage(_))
-    ));
-    assert_eq!(
-        native_input(input, ExecutionTarget::Local)
-            .unwrap()
-            .source_node_id,
-        Some(node_id())
-    );
+    assert_eq!(native_input(input).unwrap().source_node_id, Some(node_id()));
 }
 
 #[tokio::test]
@@ -1371,7 +1363,7 @@ fn maps_native_input() {
         container_path: None,
         mode: InputMode::Snapshot,
     };
-    let mapped = native_input(input.clone(), ExecutionTarget::Realm).unwrap();
+    let mapped = native_input(input.clone()).unwrap();
     assert_eq!(
         mapped.container_path.as_deref(),
         Some("/inputs/in/data.csv")
@@ -1382,10 +1374,7 @@ fn maps_native_input() {
         ..input.clone()
     };
     assert_eq!(
-        native_input(explicit, ExecutionTarget::Realm)
-            .unwrap()
-            .container_path
-            .as_deref(),
+        native_input(explicit).unwrap().container_path.as_deref(),
         Some("/data/input.csv")
     );
 
@@ -1393,7 +1382,7 @@ fn maps_native_input() {
         container_path: Some("/in/../etc".to_string()),
         ..input
     };
-    assert!(native_input(traversal, ExecutionTarget::Realm).is_err());
+    assert!(native_input(traversal).is_err());
 }
 
 fn output_request(path: &str, key: &str, bucket: Option<&str>) -> ExecutionOutput {

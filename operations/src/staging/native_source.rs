@@ -15,6 +15,11 @@ use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, Source
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::distribution::delegation::SignedDelegation;
+use aruna_core::structs::storage::read_grant::{
+    self, GrantScope, GrantedRequest, MAX_REQUEST_SECS, SignedGrant, SignedRequest,
+};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{SyncRelationship, SyncState};
 use aruna_net::NetHandle;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
@@ -30,7 +35,11 @@ use ulid::Ulid;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::connectors::resolver::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
+use crate::distribution::delegate::{prune_nonces, spend_nonce};
 use crate::driver::{DriverContext, drive};
+use crate::forward::authorize::is_sync_eligible;
+use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION};
+use crate::metadata::api::load_realm_config;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
@@ -48,12 +57,22 @@ const MAX_HEADER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct NativeReferenceRequest {
-    relationship_id: Ulid,
+    authority: NativeAuthority,
     bucket: String,
     key: String,
     version_id: Ulid,
     head: bool,
     range: Option<NativeRange>,
+}
+
+/// On whose behalf a native read runs: a sync relationship's creator, or a caller a read grant
+/// of this node names, presented by the reading node in one signed request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum NativeAuthority {
+    Relationship(Ulid),
+    Granted(Box<SignedRequest>),
+    /// A caller the reading node verified itself, for one request bound by a D33 delegation.
+    Delegated(Box<SignedDelegation>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -66,6 +85,11 @@ struct NativeRange {
 enum NativeReferenceResponse {
     Content(SourceMetadata),
     Rejected(NativeReferenceReject),
+    /// A caller read's answer, with the group of the bucket that holds the version.
+    Described {
+        metadata: SourceMetadata,
+        group_id: aruna_core::types::GroupId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,6 +101,7 @@ enum NativeReferenceReject {
 
 struct PreparedReference {
     metadata: SourceMetadata,
+    group_id: Option<aruna_core::types::GroupId>,
     body: Option<BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>>>,
 }
 
@@ -123,7 +148,8 @@ async fn native_head(
     let (response, mut stream) = send_request(context, origin, request).await?;
     close_stream(&mut stream);
     match response {
-        NativeReferenceResponse::Content(metadata) => {
+        NativeReferenceResponse::Content(metadata)
+        | NativeReferenceResponse::Described { metadata, .. } => {
             Ok(StagingSourceEvent::HeadResult { metadata })
         }
         NativeReferenceResponse::Rejected(reject) => Err(map_reject(reject)),
@@ -138,7 +164,8 @@ async fn native_read(
     let (origin, request) = native_request(&access, range, false)?;
     let (response, stream) = send_request(context, origin, request).await?;
     match response {
-        NativeReferenceResponse::Content(metadata) => {
+        NativeReferenceResponse::Content(metadata)
+        | NativeReferenceResponse::Described { metadata, .. } => {
             let reader = ReaderStream::new(stream.into_recv());
             Ok(StagingSourceEvent::ReadResult {
                 metadata,
@@ -192,7 +219,7 @@ fn native_request(
     Ok((
         origin_node_id,
         NativeReferenceRequest {
-            relationship_id,
+            authority: NativeAuthority::Relationship(relationship_id),
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id,
@@ -200,6 +227,140 @@ fn native_request(
             range,
         },
     ))
+}
+
+/// Seconds a granted request this node signs stays valid.
+const GRANTED_SECS: u64 = 15;
+
+/// One exact version read from `holder` for the caller `grant` names. The holder checks the
+/// grant it issued, this node's signature and the caller's permissions, then serves the range.
+pub(crate) async fn granted_read(
+    context: &DriverContext,
+    holder: NodeId,
+    grant: &SignedGrant,
+    range: Option<std::ops::Range<u64>>,
+    head: bool,
+) -> Result<(SourceMetadata, BiStream), StagingSourceError> {
+    let net = context
+        .net_handle
+        .as_ref()
+        .ok_or(StagingSourceError::HandleMissing)?;
+    let GrantScope::Version(arn) = &grant.grant.scope else {
+        return Err(StagingSourceError::AccessDenied);
+    };
+    let range = range
+        .map(|range| {
+            (range.start < range.end)
+                .then_some(NativeRange {
+                    start: range.start,
+                    end: range.end,
+                })
+                .ok_or_else(|| StagingSourceError::ReadError("invalid source range".to_string()))
+        })
+        .transpose()?;
+    let operation = if head { HEAD_OPERATION } else { READ_OPERATION };
+    let scope = &grant.grant.scope;
+    let digest = read_grant::request_digest(
+        operation,
+        scope,
+        range.map(|range| (range.start, range.end)),
+    )
+    .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
+    let request = GrantedRequest {
+        realm_id: *net.realm_id(),
+        issuer: net.node_id(),
+        target: holder,
+        operation: operation.to_string(),
+        request_digest: digest,
+        nonce: rand::random(),
+        issued_at: aruna_core::time::unix_timestamp_millis() / 1000,
+        valid_secs: GRANTED_SECS,
+        grant: grant.clone(),
+    };
+    let bytes = request
+        .signing_bytes()
+        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
+    let signed = SignedRequest {
+        signature: net.sign(&bytes),
+        request,
+    };
+    let request = NativeReferenceRequest {
+        authority: NativeAuthority::Granted(Box::new(signed)),
+        bucket: arn.bucket.clone(),
+        key: arn.key.clone(),
+        version_id: arn.version,
+        head,
+        range,
+    };
+    let (response, stream) = send_request(context, holder, request).await?;
+    match response {
+        NativeReferenceResponse::Content(metadata)
+        | NativeReferenceResponse::Described { metadata, .. } => Ok((metadata, stream)),
+        NativeReferenceResponse::Rejected(reject) => Err(map_reject(reject)),
+    }
+}
+
+/// One exact version read from `holder` for a caller this node verified itself, bound by a
+/// D33 delegation to this operation, version and range.
+pub(crate) async fn delegated_read(
+    context: &DriverContext,
+    caller: crate::distribution::delegate::DelegationInput,
+    arn: &VersionedObjectArn,
+    range: Option<std::ops::Range<u64>>,
+    head: bool,
+) -> Result<(SourceMetadata, Option<aruna_core::types::GroupId>, BiStream), StagingSourceError> {
+    let range = range
+        .map(|range| {
+            (range.start < range.end)
+                .then_some(NativeRange {
+                    start: range.start,
+                    end: range.end,
+                })
+                .ok_or_else(|| StagingSourceError::ReadError("invalid source range".to_string()))
+        })
+        .transpose()?;
+    let operation = if head { HEAD_OPERATION } else { READ_OPERATION };
+    let scope = GrantScope::Version(arn.clone());
+    let digest = read_grant::request_digest(
+        operation,
+        &scope,
+        range.map(|range| (range.start, range.end)),
+    )
+    .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
+    let input = crate::distribution::delegate::DelegationInput {
+        target: arn.node_id,
+        operation: operation.to_string(),
+        bucket: arn.bucket.clone(),
+        key: arn.key.clone(),
+        request_digest: digest,
+        ..caller
+    };
+    let now = aruna_core::time::unix_timestamp_millis() / 1000;
+    let signed = crate::distribution::delegate::issue_delegation(context, input, now)
+        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
+    let request = NativeReferenceRequest {
+        authority: NativeAuthority::Delegated(Box::new(signed)),
+        bucket: arn.bucket.clone(),
+        key: arn.key.clone(),
+        version_id: arn.version,
+        head,
+        range,
+    };
+    let (response, stream) = send_request(context, arn.node_id, request).await?;
+    match response {
+        NativeReferenceResponse::Content(metadata) => Ok((metadata, None, stream)),
+        NativeReferenceResponse::Described { metadata, group_id } => {
+            Ok((metadata, Some(group_id), stream))
+        }
+        NativeReferenceResponse::Rejected(reject) => Err(map_reject(reject)),
+    }
+}
+
+/// The body of a granted read as a byte stream.
+pub(crate) fn body_stream(
+    stream: BiStream,
+) -> BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>> {
+    BackendStream::new(ReaderStream::new(stream.into_recv()))
 }
 
 async fn send_request(
@@ -265,13 +426,17 @@ pub(crate) async fn handle_native_stream(
 
     match prepare_reference(context, peer, &request).await {
         Ok(mut prepared) => {
-            if write_response(
-                &mut stream.0,
-                &NativeReferenceResponse::Content(prepared.metadata),
-            )
-            .await
-            .is_err()
-            {
+            // Only a caller read names the group; a sync relationship knows its own bucket.
+            let response = match (&request.authority, prepared.group_id) {
+                (NativeAuthority::Relationship(_), _) | (_, None) => {
+                    NativeReferenceResponse::Content(prepared.metadata)
+                }
+                (_, Some(group_id)) => NativeReferenceResponse::Described {
+                    metadata: prepared.metadata,
+                    group_id,
+                },
+            };
+            if write_response(&mut stream.0, &response).await.is_err() {
                 return;
             }
             if let Some(body) = prepared.body.as_mut() {
@@ -322,13 +487,180 @@ async fn prepare_reference(
     let net_handle = context.net_handle.as_ref().ok_or_else(|| {
         NativeReferenceReject::Unavailable("network handle unavailable".to_string())
     })?;
+    let relationship_id = match &request.authority {
+        NativeAuthority::Relationship(relationship_id) => *relationship_id,
+        NativeAuthority::Granted(signed) => {
+            return Box::pin(prepare_granted(context, peer, request, signed)).await;
+        }
+        NativeAuthority::Delegated(signed) => {
+            return Box::pin(prepare_delegated(context, peer, request, signed)).await;
+        }
+    };
     let relationship = drive(
-        GetRelationshipOperation::new(request.relationship_id, SyncRelationshipDirection::Outgoing),
+        GetRelationshipOperation::new(relationship_id, SyncRelationshipDirection::Outgoing),
         context,
     )
     .await
     .map_err(map_relationship_error)?;
     validate_relationship(net_handle, peer, &relationship, request)?;
+    let auth_context = AuthContext {
+        user_id: relationship.created_by,
+        realm_id: relationship.source.realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let read = read_exact(context, &auth_context, relationship.source.node_id, request).await;
+    if matches!(read, Err(NativeReferenceReject::AccessDenied)) {
+        mark_access_denied(context, relationship).await;
+    }
+    read
+}
+
+/// A read a grant of this node covers: the reading node signed it, is realm infrastructure,
+/// sent it once, and asks exactly the version and range the grant and request name.
+async fn prepare_granted(
+    context: &DriverContext,
+    peer: NodeId,
+    request: &NativeReferenceRequest,
+    signed: &SignedRequest,
+) -> Result<PreparedReference, NativeReferenceReject> {
+    let net = context.net_handle.as_ref().ok_or_else(|| {
+        NativeReferenceReject::Unavailable("network handle unavailable".to_string())
+    })?;
+    let now = aruna_core::time::unix_timestamp_millis() / 1000;
+    let granted = signed
+        .verify(*net.realm_id(), net.node_id(), now)
+        .map_err(|_| NativeReferenceReject::AccessDenied)?;
+    let config = load_realm_config(context, *net.realm_id())
+        .await
+        .ok_or_else(|| {
+            NativeReferenceReject::Unavailable("realm config unavailable".to_string())
+        })?;
+    if granted.issuer != peer || !is_sync_eligible(&config, peer) {
+        return Err(NativeReferenceReject::AccessDenied);
+    }
+    let grant = &granted.grant.grant;
+    let scope = GrantScope::Version(VersionedObjectArn {
+        realm_id: *net.realm_id(),
+        node_id: net.node_id(),
+        bucket: request.bucket.clone(),
+        key: request.key.clone(),
+        version: request.version_id,
+    });
+    let operation = if request.head {
+        HEAD_OPERATION
+    } else {
+        READ_OPERATION
+    };
+    let range = request.range.map(|range| (range.start, range.end));
+    let digest = read_grant::request_digest(operation, &scope, range)
+        .map_err(|_| NativeReferenceReject::AccessDenied)?;
+    if grant.scope != scope || granted.operation != operation || granted.request_digest != digest {
+        return Err(NativeReferenceReject::AccessDenied);
+    }
+    let expires = granted.issued_at.saturating_add(2 * MAX_REQUEST_SECS);
+    spend_nonce(context, granted.nonce, expires)
+        .await
+        .map_err(|_| NativeReferenceReject::AccessDenied)?;
+    prune_nonces(context, now).await;
+    let auth_context = AuthContext {
+        user_id: grant.user_id,
+        realm_id: grant.realm_id,
+        path_restrictions: grant.restrictions.clone(),
+        session: None,
+    };
+    refuse_governed(context, request).await?;
+    read_exact(context, &auth_context, net.node_id(), request).await
+}
+
+/// A read the reading node vouches for in one D33 delegation: signed by a realm
+/// infrastructure node, unused, and naming this exact version, operation and range.
+async fn prepare_delegated(
+    context: &DriverContext,
+    peer: NodeId,
+    request: &NativeReferenceRequest,
+    signed: &SignedDelegation,
+) -> Result<PreparedReference, NativeReferenceReject> {
+    let net = context.net_handle.as_ref().ok_or_else(|| {
+        NativeReferenceReject::Unavailable("network handle unavailable".to_string())
+    })?;
+    let now = aruna_core::time::unix_timestamp_millis() / 1000;
+    let delegation = signed
+        .verify(*net.realm_id(), net.node_id(), now)
+        .map_err(|_| NativeReferenceReject::AccessDenied)?;
+    let config = load_realm_config(context, *net.realm_id())
+        .await
+        .ok_or_else(|| {
+            NativeReferenceReject::Unavailable("realm config unavailable".to_string())
+        })?;
+    if delegation.issuer != peer || !is_sync_eligible(&config, peer) {
+        return Err(NativeReferenceReject::AccessDenied);
+    }
+    let scope = GrantScope::Version(VersionedObjectArn {
+        realm_id: *net.realm_id(),
+        node_id: net.node_id(),
+        bucket: request.bucket.clone(),
+        key: request.key.clone(),
+        version: request.version_id,
+    });
+    let operation = if request.head {
+        HEAD_OPERATION
+    } else {
+        READ_OPERATION
+    };
+    let range = request.range.map(|range| (range.start, range.end));
+    let digest = read_grant::request_digest(operation, &scope, range)
+        .map_err(|_| NativeReferenceReject::AccessDenied)?;
+    if delegation.operation != operation
+        || delegation.bucket != request.bucket
+        || delegation.key != request.key
+        || delegation.request_digest != digest
+    {
+        return Err(NativeReferenceReject::AccessDenied);
+    }
+    let expires = delegation.issued_at.saturating_add(2 * MAX_REQUEST_SECS);
+    spend_nonce(context, delegation.nonce, expires)
+        .await
+        .map_err(|_| NativeReferenceReject::AccessDenied)?;
+    prune_nonces(context, now).await;
+    let auth_context = AuthContext {
+        user_id: delegation.user_id,
+        realm_id: delegation.realm_id,
+        path_restrictions: delegation.restrictions.clone(),
+        session: None,
+    };
+    refuse_governed(context, request).await?;
+    read_exact(context, &auth_context, net.node_id(), request).await
+}
+
+/// Governed content answers only the managed read's destination challenge.
+async fn refuse_governed(
+    context: &DriverContext,
+    request: &NativeReferenceRequest,
+) -> Result<(), NativeReferenceReject> {
+    let head = drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: request.bucket.clone(),
+            key: request.key.clone(),
+            version_id: Some(request.version_id),
+        }),
+        context,
+    )
+    .await
+    .map_err(map_head_error)?;
+    match head.source_policies.is_empty() {
+        true => Ok(()),
+        false => Err(NativeReferenceReject::AccessDenied),
+    }
+}
+
+/// Authorizes `auth_context` like an S3 read of the exact version, then reads it.
+async fn read_exact(
+    context: &DriverContext,
+    auth_context: &AuthContext,
+    node_id: NodeId,
+    request: &NativeReferenceRequest,
+) -> Result<PreparedReference, NativeReferenceReject> {
     let bucket_info = match drive(GetBucketOperation::new(request.bucket.clone()), context).await {
         Ok(info) => info,
         Err(GetBucketError::NotFound) => {
@@ -338,29 +670,23 @@ async fn prepare_reference(
             return Err(NativeReferenceReject::Unavailable(error.to_string()));
         }
     };
-    let auth_context = AuthContext {
-        user_id: relationship.created_by,
-        realm_id: relationship.source.realm_id,
-        path_restrictions: None,
-        session: None,
-    };
     let path = object_permission_path(
-        relationship.source.realm_id,
+        auth_context.realm_id,
         bucket_info.group_id,
-        relationship.source.node_id,
+        node_id,
         &request.bucket,
         &request.key,
     );
     if let Err(error) = authorize(
         context,
         auth_context.realm_id,
-        &auth_context,
+        auth_context,
         &path,
         &Permission::READ,
         PolicyRequestExtras::operation(if request.head {
-            "s3.HeadObject"
+            HEAD_OPERATION
         } else {
-            "s3.GetObject"
+            READ_OPERATION
         }),
     )
     .await
@@ -368,7 +694,6 @@ async fn prepare_reference(
         match error {
             AuthorizeError::PermissionDenied
             | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => {
-                mark_access_denied(context, relationship).await;
                 return Err(NativeReferenceReject::AccessDenied);
             }
             AuthorizeError::Policy(PolicyEnforcementError::Unavailable(error)) => {
@@ -397,6 +722,7 @@ async fn prepare_reference(
         let metadata = head_metadata(&result, request.version_id)?;
         return Ok(PreparedReference {
             metadata,
+            group_id: Some(bucket_info.group_id),
             body: None,
         });
     }
@@ -412,9 +738,9 @@ async fn prepare_reference(
             version_id: Some(request.version_id),
             range,
             group_id: bucket_info.group_id,
-            user_identity: relationship.created_by,
-            realm_id: relationship.created_by.realm_id,
-            node_id: relationship.source.node_id,
+            user_identity: auth_context.user_id,
+            realm_id: auth_context.realm_id,
+            node_id,
         }),
         context,
     )
@@ -423,6 +749,7 @@ async fn prepare_reference(
     let metadata = result_metadata(&result, request.version_id)?;
     Ok(PreparedReference {
         metadata,
+        group_id: Some(bucket_info.group_id),
         body: Some(result.blob),
     })
 }
@@ -630,7 +957,7 @@ mod tests {
     #[test]
     fn request_roundtrips() {
         let request = NativeReferenceRequest {
-            relationship_id: Ulid::from_bytes([1u8; 16]),
+            authority: NativeAuthority::Relationship(Ulid::from_bytes([1u8; 16])),
             bucket: "source".to_string(),
             key: "nested/data.txt".to_string(),
             version_id: Ulid::from_bytes([2u8; 16]),
@@ -682,7 +1009,7 @@ mod tests {
             status: SyncStatusSnapshot::default(),
         };
         let request = NativeReferenceRequest {
-            relationship_id: relationship.id,
+            authority: NativeAuthority::Relationship(relationship.id),
             bucket: "source".to_string(),
             key: "data.txt".to_string(),
             version_id: Ulid::generate(),

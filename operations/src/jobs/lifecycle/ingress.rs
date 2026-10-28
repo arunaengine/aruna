@@ -10,13 +10,16 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobId,
-    JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
-    OutputDestination, SubmissionClaim, SubmissionId, WorkspaceMode,
+    CapturedInput, ExecutionSpec, InputContent, InputSelection, JobAdmissionRecord, JobFamilyId,
+    JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordKind, JobRetryPolicy, LogicalJobSpec,
+    LogicalJobState, OutputDestination, SubmissionClaim, SubmissionId, WorkspaceMode, spec_entries,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::group_permission_path;
+use aruna_core::structs::storage::origin::{SourcePin, public_source_url, publishable};
+use aruna_core::structs::storage::read_grant::{GrantScope, ReadGrant};
+use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::time::unix_timestamp_millis;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -36,10 +39,14 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::jobs::records::keys::{family_prefix, kind_prefix};
+use crate::jobs::records::pages::{load_chain, page_request};
 use crate::jobs::records::rows::ProjectionCache;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::jobs::service::{mint_local_job, validate_execution};
+use crate::jobs::source_read::{
+    HEAD_OPERATION, READ_OPERATION, SourceReadError, authorize_read, issue_grant, public_read,
+};
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::MetadataTransportMessage;
@@ -92,6 +99,67 @@ pub enum SubmissionRefusal {
     Unavailable,
 }
 
+/// The inputs an ingress asks their source node to resolve and grant for one caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputResolveRequest {
+    pub created_by: UserId,
+    pub submission_id: SubmissionId,
+    /// Unix seconds the grants end at, bounded by this node's job retention.
+    pub expires_at: u64,
+    pub inputs: Vec<InputSelection>,
+}
+
+/// Resolves inputs this node holds for an ingress. The caller's bearer is validated here, so
+/// the grants vouch for an identity this node checked, never for one a peer asserted.
+pub async fn serve_input_resolve(
+    context: &Arc<DriverContext>,
+    peer: NodeId,
+    auth_token: AuthToken,
+    request: InputResolveRequest,
+) -> Result<Vec<CapturedInput>, SubmissionRefusal> {
+    let Some(metadata) = context.metadata_handle.as_ref() else {
+        return Err(SubmissionRefusal::Unavailable);
+    };
+    if !matches!(auth_token, AuthToken::Bearer(_)) {
+        return Err(SubmissionRefusal::Unauthorized);
+    }
+    let auth = metadata
+        .authorize_write_peer(peer, Some(auth_token))
+        .await
+        .map_err(|error| match error {
+            WritePeerError::Unauthorized => SubmissionRefusal::Unauthorized,
+            WritePeerError::Unavailable(_) => SubmissionRefusal::Unavailable,
+        })?;
+    let (config, local) = local_view(context)
+        .await
+        .map_err(|_| SubmissionRefusal::Unavailable)?;
+    // Only a realm node resolves for an ingress; a device forwards its whole submission.
+    if auth.user_id != request.created_by
+        || auth.realm_id != config.realm_id
+        || !is_sync_eligible(&config, peer)
+    {
+        return Err(SubmissionRefusal::Unauthorized);
+    }
+    if request
+        .inputs
+        .iter()
+        .any(|input| input.source_node_id.is_some_and(|node| node != local))
+    {
+        return Err(SubmissionRefusal::Invalid {
+            reason: "an input names another node".to_string(),
+        });
+    }
+    let bound = unix_timestamp_millis().saturating_add(crate::jobs::JOB_RETENTION_MS) / 1000;
+    let caller = (
+        request.created_by,
+        request.submission_id,
+        request.expires_at.min(bound),
+    );
+    capture_inputs(context, &request.inputs, caller, local)
+        .await
+        .map_err(refusal_of)
+}
+
 /// Normalizes, authorizes, and admits one external execution request.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_external_job(
@@ -123,12 +191,21 @@ pub async fn submit_external_job(
             ingress_node_id: local,
             captured_inputs: Vec::new(),
             output_policies: Vec::new(),
+            input_pages: None,
         };
         return forward_device(context, request, &config, local, auth_token).await;
     }
     pin_outputs(&mut spec, local);
-    let (captured_inputs, output_policies) = resolve_inputs(context, &spec, local).await?;
-    let request = SubmissionRequest {
+    let (inputs, captured_inputs, output_policies) = resolve_inputs(
+        context,
+        &spec,
+        caller_of(created_by, &scope, retention_ms),
+        (local, auth_token.as_ref()),
+    )
+    .await?;
+    // Directory inputs are stored as the files they expanded to.
+    spec.inputs = inputs;
+    let mut request = SubmissionRequest {
         created_by,
         spec,
         scope,
@@ -136,8 +213,12 @@ pub async fn submit_external_job(
         ingress_node_id: local,
         captured_inputs,
         output_policies,
+        input_pages: None,
     };
     let identity = request.identity().map_err(SubmitJobError::Conversion)?;
+    page_inputs(context, &identity, &mut request)
+        .await
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
     let view = family_view(&config, &identity)?;
     if view.holds(local) {
         return admit_here(context, &request, &identity, &config, local).await;
@@ -217,21 +298,401 @@ fn input_reference(bucket: &str, key: &str, version_id: Option<&str>) -> String 
     }
 }
 
-/// Resolve node-local names once at ingress. The resulting values are stored in
+/// A reference version without a content hash, accepted only when GetObject can serve it at
+/// that exact version: a strong ETag on a source that enforces `If-Match` binds every range,
+/// recorded digests bind a whole read. Anything else is not materialized.
+fn reference_content(
+    reference: &str,
+    head: &crate::s3::object::head::HeadObjectResult,
+) -> Result<(InputContent, Option<SourcePin>), SubmitJobError> {
+    let refused = |reason: &str| SubmitJobError::InvalidWorkspace(format!("{reference}: {reason}"));
+    let (Some(binding), Some(metadata), None) =
+        (&head.source_binding, &head.source_metadata, &head.location)
+    else {
+        return Err(refused("input is not materialized"));
+    };
+    let range_bound = binding.descriptor.kind.enforces_if_match()
+        && crate::s3::object::get::strong_validator(metadata.etag.as_deref());
+    if !range_bound && metadata.enforced_checksums().is_empty() {
+        return Err(refused(
+            "input reference cannot be read at its exact version",
+        ));
+    }
+    let descriptor = &binding.descriptor;
+    let pin = SourcePin {
+        url: publishable(descriptor)
+            .then(|| public_source_url(descriptor))
+            .flatten(),
+        path: descriptor.source_path.clone(),
+        source_version: descriptor.version_selector.clone(),
+    };
+    let content = InputContent::Reference {
+        etag: metadata.etag.clone(),
+        range_bound,
+    };
+    Ok((content, Some(pin)))
+}
+
+/// Who resolves inputs: the caller, the submission its grants name, and when they end.
+fn caller_of(
+    created_by: UserId,
+    scope: &SubmissionScope,
+    retention_ms: u64,
+) -> (UserId, SubmissionId, u64) {
+    let expires_at = (unix_timestamp_millis().saturating_add(retention_ms)) / 1000;
+    (
+        created_by,
+        ids::submission_of(created_by, scope),
+        expires_at,
+    )
+}
+
+/// A denied read is the caller's own; anything undecided may clear on a retry.
+fn source_error(reference: &str, error: SourceReadError) -> SubmitJobError {
+    match error {
+        SourceReadError::NotFound => {
+            SubmitJobError::InvalidWorkspace(format!("{reference}: input bucket not found"))
+        }
+        SourceReadError::Denied => SubmitJobError::InputDenied(reference.to_string()),
+        SourceReadError::Unavailable(error) => {
+            SubmitJobError::PlacementUnavailable(format!("{reference}: {error}"))
+        }
+    }
+}
+
+/// Resolve every input at the node that holds it, once, at ingress. The values are stored in
 /// the family spec and remain valid when admission or planning is forwarded.
 async fn resolve_inputs(
     context: &DriverContext,
     spec: &ExecutionSpec,
-    local: NodeId,
+    caller: (UserId, SubmissionId, u64),
+    (local, auth_token): (NodeId, Option<&AuthToken>),
 ) -> Result<
     (
+        Vec<InputSelection>,
         Vec<CapturedInput>,
         Vec<aruna_core::structs::placement::policy::PlacementPolicyRef>,
     ),
     SubmitJobError,
 > {
-    let mut captured_inputs = Vec::with_capacity(spec.inputs.len());
+    let mut remote: std::collections::BTreeMap<NodeId, Vec<InputSelection>> = Default::default();
+    let mut here = Vec::new();
     for input in &spec.inputs {
+        match input.source_node_id.filter(|node| *node != local) {
+            Some(node) => remote.entry(node).or_default().push(input.clone()),
+            None => here.push(input.clone()),
+        }
+    }
+    let mut files = Vec::with_capacity(here.len());
+    for input in here {
+        match is_directory(&input) {
+            true => files.extend(expand_directory(context, &input, caller.0, local).await?),
+            false => files.push(input),
+        }
+    }
+    // A link resolves to its target; the target may live on another node.
+    let mut links = std::collections::BTreeMap::new();
+    let mut here = Vec::with_capacity(files.len());
+    for input in files {
+        let (input, link) = follow_link(context, input, caller.0, local).await?;
+        if let Some(link) = link {
+            links.insert(input.dest_key.clone(), link);
+        }
+        match input.source_node_id.filter(|node| *node != local) {
+            Some(node) => remote.entry(node).or_default().push(input),
+            None => here.push(input),
+        }
+    }
+    let mut captured = capture_inputs(context, &here, caller, local).await?;
+    let mut remote_inputs = Vec::new();
+    for (node, inputs) in remote {
+        captured.extend(remote_captures(context, node, &inputs, caller, auth_token).await?);
+        remote_inputs.extend(inputs);
+    }
+    let mut by_key: std::collections::BTreeMap<String, CapturedInput> = captured
+        .into_iter()
+        .map(|captured| (captured.destination_key.clone(), captured))
+        .collect();
+    let captured_inputs = here
+        .iter()
+        .chain(remote_inputs.iter())
+        .filter_map(|input| by_key.remove(&input.dest_key))
+        .map(|mut captured: CapturedInput| {
+            captured.link = links.remove(&captured.destination_key);
+            captured
+        })
+        .collect();
+    let output_policies = resolve_outputs(context, spec, local).await?;
+    Ok((
+        here.into_iter().chain(remote_inputs).collect(),
+        captured_inputs,
+        output_policies,
+    ))
+}
+
+/// Follows links an input names on this node to the version they end at, which the caller
+/// must be able to read like any input. Returns the input of the target and the first link.
+/// A link to a link is followed; a cycle is refused; a target elsewhere ends the walk here.
+async fn follow_link(
+    context: &DriverContext,
+    mut input: InputSelection,
+    created_by: UserId,
+    local: NodeId,
+) -> Result<(InputSelection, Option<VersionedObjectArn>), SubmitJobError> {
+    use aruna_core::structs::execution::job::InputSource;
+    use aruna_core::structs::storage::link::LinkTarget;
+    let realm_id = context.serving_realm(created_by.realm_id);
+    let auth = AuthContext {
+        user_id: created_by,
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let mut first = None;
+    let mut seen = std::collections::BTreeSet::new();
+    while input.source_node_id.is_none_or(|node| node == local) {
+        let InputSource::S3 {
+            bucket,
+            key,
+            version_id,
+        } = &input.source;
+        let reference = input_reference(bucket, key, version_id.as_deref());
+        let version = version_id
+            .as_deref()
+            .and_then(|version| Ulid::from_string(version).ok());
+        let head = drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: version,
+            }),
+            context,
+        )
+        .await;
+        let Ok(head) = head else {
+            break;
+        };
+        let Some(target) =
+            (head.source_binding.as_ref()).and_then(|binding| LinkTarget::of(binding, realm_id))
+        else {
+            break;
+        };
+        // The link itself must be readable by the caller before its target is.
+        authorize_read(context, &auth, local, (bucket, key), READ_OPERATION)
+            .await
+            .map_err(|error| source_error(&reference, error))?;
+        let link = VersionedObjectArn {
+            realm_id,
+            node_id: local,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version: head
+                .resolved_version_id
+                .or(head.version_id)
+                .unwrap_or(target.arn.version),
+        };
+        if !seen.insert(link.to_w3id()) {
+            return Err(SubmitJobError::InvalidWorkspace(format!(
+                "{reference}: the links form a cycle"
+            )));
+        }
+        first.get_or_insert(link);
+        input.source = InputSource::S3 {
+            bucket: target.arn.bucket.clone(),
+            key: target.arn.key.clone(),
+            version_id: Some(target.arn.version.to_string()),
+        };
+        input.source_node_id = (target.arn.node_id != local).then_some(target.arn.node_id);
+    }
+    Ok((input, first))
+}
+
+/// A directory input names a key prefix, marked by its trailing `/`.
+fn is_directory(input: &InputSelection) -> bool {
+    let aruna_core::structs::execution::job::InputSource::S3 { key, .. } = &input.source;
+    key.ends_with('/') && input.dest_key.ends_with('/')
+}
+
+/// One pinned input per object below a directory input's prefix, at the current version, each
+/// below the directory's container path. An object the caller may not read refuses the whole
+/// directory without naming it; a distributed bucket's prefix spans other members' ranges.
+async fn expand_directory(
+    context: &DriverContext,
+    input: &InputSelection,
+    created_by: UserId,
+    local: NodeId,
+) -> Result<Vec<InputSelection>, SubmitJobError> {
+    use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
+    use aruna_core::structs::execution::job::InputSource;
+    let InputSource::S3 {
+        bucket,
+        key: prefix,
+        ..
+    } = &input.source;
+    let reference = format!("s3://{bucket}/{prefix}");
+    let info = drive(GetBucketOperation::new(bucket.clone()), context)
+        .await
+        .map_err(|_| {
+            SubmitJobError::InvalidWorkspace(format!("{reference}: input bucket not found"))
+        })?;
+    if info.distribution.is_some() {
+        return Err(SubmitJobError::InvalidWorkspace(format!(
+            "{reference}: directory inputs of a distributed bucket are not supported"
+        )));
+    }
+    let directory = input
+        .container_path
+        .as_deref()
+        .unwrap_or("/")
+        .trim_end_matches('/');
+    let auth = AuthContext {
+        user_id: created_by,
+        realm_id: context.serving_realm(created_by.realm_id),
+        path_restrictions: None,
+        session: None,
+    };
+    let mut files = Vec::new();
+    let mut continuation_token = None;
+    loop {
+        let page = drive(
+            ListBucketOperation::new(ListBucketInput {
+                bucket: bucket.clone(),
+                group_id: info.group_id,
+                continuation_token,
+                max_keys: Some(ListBucketOperation::DEFAULT_MAX_KEYS),
+                prefix: Some(prefix.clone()),
+                delimiter: None,
+                start_after: None,
+            }),
+            context,
+        )
+        .await
+        .map_err(|error| SubmitJobError::PlacementUnavailable(format!("{reference}: {error}")))?;
+        for object in page.objects {
+            let relative = &object.head.key[prefix.len()..];
+            if relative.is_empty() || relative.ends_with('/') {
+                continue;
+            }
+            let readable = (object.head.bucket.as_str(), object.head.key.as_str());
+            authorize_read(context, &auth, local, readable, READ_OPERATION)
+                .await
+                .map_err(|error| source_error(&reference, error))?;
+            files.push(InputSelection {
+                source: InputSource::S3 {
+                    bucket: bucket.clone(),
+                    key: object.head.key.clone(),
+                    version_id: Some(object.version_id.to_string()),
+                },
+                source_node_id: input.source_node_id,
+                dest_key: format!("{}{relative}", input.dest_key),
+                mode: input.mode,
+                container_path: Some(format!("{directory}/{relative}")),
+                name: None,
+                description: None,
+            });
+        }
+        match page.continuation_token {
+            Some(token) => continuation_token = Some(token),
+            None => break,
+        }
+    }
+    if files.is_empty() {
+        return Err(SubmitJobError::InvalidWorkspace(format!(
+            "{reference}: the directory input holds no objects"
+        )));
+    }
+    Ok(files)
+}
+
+/// The inputs of another node, resolved and granted by that node for the caller's own bearer.
+/// Every input must name its exact version, so nothing depends on a remote head.
+async fn remote_captures(
+    context: &DriverContext,
+    node: NodeId,
+    inputs: &[InputSelection],
+    (created_by, submission_id, expires_at): (UserId, SubmissionId, u64),
+    auth_token: Option<&AuthToken>,
+) -> Result<Vec<CapturedInput>, SubmitJobError> {
+    let mut versions = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let aruna_core::structs::execution::job::InputSource::S3 {
+            bucket,
+            key,
+            version_id,
+        } = &input.source;
+        let version = version_id
+            .as_deref()
+            .and_then(|version| Ulid::from_string(version).ok())
+            .ok_or_else(|| {
+                SubmitJobError::InvalidWorkspace(format!(
+                    "s3://{bucket}/{key}: an input on another node must name its exact version"
+                ))
+            })?;
+        versions.push((input.dest_key.clone(), version));
+    }
+    let (Some(metadata), Some(AuthToken::Bearer(token))) =
+        (context.metadata_handle.as_ref(), auth_token)
+    else {
+        return Err(SubmitJobError::PlacementUnavailable(
+            "an input on another node needs the caller's bearer token".to_string(),
+        ));
+    };
+    let request = InputResolveRequest {
+        created_by,
+        submission_id,
+        expires_at,
+        inputs: inputs.to_vec(),
+    };
+    let answer = metadata
+        .request_input_resolve(node, AuthToken::Bearer(token.clone()), request)
+        .await
+        .map_err(|error| {
+            SubmitJobError::PlacementUnavailable(format!("input node {node}: {error}"))
+        })?;
+    let captured = match answer {
+        Ok(captured) => captured,
+        Err(SubmissionRefusal::Invalid { reason }) => {
+            return Err(SubmitJobError::InvalidWorkspace(reason));
+        }
+        Err(SubmissionRefusal::Unauthorized) => {
+            return Err(SubmitJobError::InputDenied(format!(
+                "inputs on node {node}"
+            )));
+        }
+        Err(refusal) => {
+            return Err(SubmitJobError::PlacementUnavailable(format!(
+                "input node {node} refused: {refusal:?}"
+            )));
+        }
+    };
+    // The node answers for exactly the asked versions, each held by itself.
+    let exact = captured.len() == versions.len()
+        && captured
+            .iter()
+            .zip(&versions)
+            .all(|(captured, (dest_key, version))| {
+                captured.destination_key == *dest_key
+                    && captured.version_id == *version
+                    && captured.source_node_id == node
+            });
+    match exact {
+        true => Ok(captured),
+        false => Err(SubmitJobError::PlacementUnavailable(format!(
+            "input node {node} answered other versions"
+        ))),
+    }
+}
+
+/// Captures inputs this node holds: each is read like an S3 GET by the caller, pinned to an
+/// exact version and granted for later exact reads.
+async fn capture_inputs(
+    context: &DriverContext,
+    inputs: &[InputSelection],
+    (created_by, submission_id, expires_at): (UserId, SubmissionId, u64),
+    local: NodeId,
+) -> Result<Vec<CapturedInput>, SubmitJobError> {
+    let mut captured_inputs = Vec::with_capacity(inputs.len());
+    for input in inputs {
         let aruna_core::structs::execution::job::InputSource::S3 {
             bucket,
             key,
@@ -275,14 +736,12 @@ async fn resolve_inputs(
             .and_then(|location| location.hashes.get(HASH_BLAKE3))
             .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok());
         let blake3 = match blake3 {
-            Some(hash) => hash,
-            None => crate::jobs::lifecycle::plan::version_hash(context, bucket, key, version)
-                .await
-                .ok_or_else(|| {
-                    SubmitJobError::InvalidWorkspace(format!(
-                        "{reference}: input is not materialized"
-                    ))
-                })?,
+            Some(hash) => Some(hash),
+            None => crate::jobs::lifecycle::plan::version_hash(context, bucket, key, version).await,
+        };
+        let (content, source_pin) = match blake3 {
+            Some(hash) => (InputContent::Blake3(hash), None),
+            None => reference_content(&reference, &head)?,
         };
         let bytes = head
             .location
@@ -298,15 +757,68 @@ async fn resolve_inputs(
             &head.source_policies,
         )
         .map_err(|error| SubmitJobError::InvalidWorkspace(format!("{reference}: {error}")))?;
+        // The caller must read the input like an S3 GET of it, in whatever group it lives.
+        let realm_id = context.serving_realm(created_by.realm_id);
+        let auth = AuthContext {
+            user_id: created_by,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let object = (bucket.as_str(), key.as_str());
+        let source_group_id = authorize_read(context, &auth, local, object, READ_OPERATION)
+            .await
+            .map_err(|error| source_error(&reference, error))?;
+        let public = public_read(context, realm_id, (local, source_group_id), object)
+            .await
+            .map_err(|error| source_error(&reference, error))?;
+        // This node validated the caller itself, so its grant vouches for exact reads later.
+        let grant = issue_grant(
+            context,
+            ReadGrant {
+                realm_id,
+                issuer: local,
+                submission_id,
+                user_id: created_by,
+                restrictions: None,
+                scope: GrantScope::Version(VersionedObjectArn {
+                    realm_id,
+                    node_id: local,
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version,
+                }),
+                operations: vec![READ_OPERATION.to_string(), HEAD_OPERATION.to_string()],
+                expires_at,
+            },
+        );
         captured_inputs.push(CapturedInput {
             destination_key: input.dest_key.clone(),
             source_node_id: local,
             version_id: version,
-            blake3,
+            content,
             bytes,
             policies,
+            source_group_id,
+            public,
+            link: None,
+            source_pin,
+            database: None,
+            releases: Vec::new(),
+            // Release membership is not checked until the provenance lookup lands.
+            releases_complete: false,
+            grant,
         });
     }
+    Ok(captured_inputs)
+}
+
+/// The placement refs of every bucket the run writes into; all live on the ingress node.
+async fn resolve_outputs(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    local: NodeId,
+) -> Result<Vec<aruna_core::structs::placement::policy::PlacementPolicyRef>, SubmitJobError> {
     let mut buckets = std::collections::BTreeSet::new();
     for output in &spec.file_outputs {
         if output.destination_node_id != Some(local) {
@@ -356,7 +868,7 @@ async fn resolve_inputs(
     output_policies =
         aruna_core::structs::placement::policy::PlacementPolicyRef::canonical_set(&output_policies)
             .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
-    Ok((captured_inputs, output_policies))
+    Ok(output_policies)
 }
 
 /// The realm config this node synchronized plus its own identity.
@@ -435,6 +947,7 @@ async fn admit_here(
             admitted_at_ms: now_ms,
         },
         captured_inputs: request.captured_inputs.clone(),
+        input_pages: request.input_pages,
         output_policies: request.output_policies.clone(),
         placement,
     }
@@ -727,7 +1240,7 @@ async fn admit_forwarded(
         return Err(SubmissionRefusal::Unavailable);
     };
     let auth = metadata
-        .authorize_write_peer(peer, Some(auth_token))
+        .authorize_write_peer(peer, Some(auth_token.clone()))
         .await
         .map_err(|error| match error {
             WritePeerError::Unauthorized => SubmissionRefusal::Unauthorized,
@@ -753,11 +1266,21 @@ async fn admit_forwarded(
     authorize_group(context, &auth, &request, local)
         .await
         .map_err(|_| SubmissionRefusal::Unauthorized)?;
+    // Paged inputs come from the forwarding node, checked page by page against the manifest.
+    if let Some(manifest) = request.input_pages.take() {
+        let pages = load_chain(context, &submission_id, &manifest, &[peer])
+            .await
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entries = spec_entries(pages).map_err(|_| SubmissionRefusal::IdentityMismatch)?;
+        let (inputs, captured): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        request.spec.inputs = inputs;
+        request.captured_inputs = captured;
+    }
     // The holder owns what it writes and reads, so a device submission is
     // normalized here rather than trusted from a node that holds none of it.
     let ingress = match is_device(&config, peer) {
         true => {
-            pin_device_request(context, &mut request, local).await?;
+            pin_device_request(context, &mut request, (local, &auth_token)).await?;
             local
         }
         false => peer,
@@ -771,10 +1294,7 @@ async fn admit_forwarded(
                 .any(|input| input.dest_key == captured.destination_key)
         })
         || request.ingress_node_id != ingress
-        || request
-            .captured_inputs
-            .iter()
-            .any(|captured| captured.source_node_id != request.ingress_node_id)
+        || !sources_match(&request.spec.inputs, &request.captured_inputs, ingress)
         || request
             .spec
             .file_outputs
@@ -798,6 +1318,9 @@ async fn admit_forwarded(
     if !view.holds(local) {
         return Err(SubmissionRefusal::NotHolder);
     }
+    page_inputs(context, &identity, &mut request)
+        .await
+        .map_err(|_| SubmissionRefusal::Unavailable)?;
     match admit_here(context, &request, &identity, &config, local).await {
         Ok(accepted) => Ok(SubmissionAck {
             job_id: accepted.job_id,
@@ -814,18 +1337,55 @@ async fn admit_forwarded(
     }
 }
 
+/// Moves inputs too large for the spec record into pages kept here; the identity is already
+/// computed from the full lists, so it covers every page.
+async fn page_inputs(
+    context: &DriverContext,
+    identity: &RequestIdentity,
+    request: &mut SubmissionRequest,
+) -> Result<(), crate::jobs::records::pages::PageReadError> {
+    request.input_pages = page_request(
+        context,
+        &identity.submission_id,
+        &mut request.spec.inputs,
+        &mut request.captured_inputs,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Whether each capture comes from the node its input names, or from ingress when it names none.
+pub(crate) fn sources_match(
+    inputs: &[InputSelection],
+    captured: &[CapturedInput],
+    ingress: NodeId,
+) -> bool {
+    captured.iter().all(|captured| {
+        inputs.iter().any(|input| {
+            input.dest_key == captured.destination_key
+                && input.source_node_id.unwrap_or(ingress) == captured.source_node_id
+        })
+    })
+}
+
 /// Normalizes a device submission at the holder: the outputs are pinned here and
 /// the referenced inputs are resolved against this node's own objects, so the
 /// recomputed identity covers names only this node assigned.
 async fn pin_device_request(
     context: &Arc<DriverContext>,
     request: &mut SubmissionRequest,
-    local: NodeId,
+    (local, auth_token): (NodeId, &AuthToken),
 ) -> Result<(), SubmissionRefusal> {
     pin_outputs(&mut request.spec, local);
-    let (captured_inputs, output_policies) = resolve_inputs(context, &request.spec, local)
-        .await
-        .map_err(refusal_of)?;
+    let (inputs, captured_inputs, output_policies) = resolve_inputs(
+        context,
+        &request.spec,
+        caller_of(request.created_by, &request.scope, request.retention_ms),
+        (local, Some(auth_token)),
+    )
+    .await
+    .map_err(refusal_of)?;
+    request.spec.inputs = inputs;
     request.captured_inputs = captured_inputs;
     request.output_policies = output_policies;
     request.ingress_node_id = local;
@@ -1093,6 +1653,170 @@ mod tests {
         assert!(matches!(
             reference_shape(&bad_version),
             Err(SubmitJobError::InvalidWorkspace(_))
+        ));
+    }
+
+    fn reference_head(
+        kind: aruna_core::structs::execution::source_connector::SourceConnectorKind,
+        etag: Option<&str>,
+        digested: bool,
+    ) -> crate::s3::object::head::HeadObjectResult {
+        use aruna_core::structs::checksum::ChecksumAlgorithm;
+        use aruna_core::structs::execution::source_access::{
+            DigestOrigin, DigestScope, SourceDigest, SourceMetadata,
+        };
+        use aruna_core::structs::execution::staging::{
+            PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+        };
+        let mut digests = std::collections::BTreeMap::new();
+        if digested {
+            digests.insert(
+                ChecksumAlgorithm::Sha256,
+                SourceDigest {
+                    digest: vec![1; 32],
+                    scope: DigestScope::FullObject,
+                    origin: DigestOrigin::Manifest,
+                },
+            );
+        }
+        crate::s3::object::head::HeadObjectResult {
+            location: None,
+            metadata: Default::default(),
+            source_metadata: Some(SourceMetadata {
+                content_length: 9,
+                content_type: None,
+                etag: etag.map(str::to_string),
+                last_modified: None,
+                source_version: None,
+                digests,
+            }),
+            last_refresh: None,
+            version_created_at: None,
+            version_id: None,
+            resolved_version_id: None,
+            checksum_type:
+                aruna_core::structs::storage::multipart::MultipartChecksumType::FullObject,
+            composite_hashes: Default::default(),
+            part_count: None,
+            source_policies: Vec::new(),
+            source_binding: Some(VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind,
+                    public_config: Default::default(),
+                    source_path: "db/bakta.db".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                    namespace: None,
+                    root: None,
+                },
+                connector_id: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn binds_reference_reads() {
+        // A strong ETag on an S3 source binds every range; recorded digests bind a whole read;
+        // a source with neither cannot be read at its exact version.
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        let bound = reference_content(
+            "s3://db/a",
+            &reference_head(SourceConnectorKind::S3, Some("\"e1\""), false),
+        );
+        let (content, pin) = bound.expect("range bound reference");
+        assert_eq!(
+            content,
+            InputContent::Reference {
+                etag: Some("\"e1\"".to_string()),
+                range_bound: true
+            }
+        );
+        assert_eq!(pin.expect("pin").path, "db/bakta.db");
+        let weak = reference_head(SourceConnectorKind::S3, Some("W/\"e1\""), true);
+        let (content, _) = reference_content("s3://db/a", &weak).expect("digest bound");
+        assert!(matches!(
+            content,
+            InputContent::Reference {
+                range_bound: false,
+                ..
+            }
+        ));
+        let http = reference_head(SourceConnectorKind::Http, Some("\"e1\""), false);
+        assert!(matches!(
+            reference_content("s3://db/a", &http),
+            Err(SubmitJobError::InvalidWorkspace(_))
+        ));
+        let mut stored = reference_head(SourceConnectorKind::S3, Some("\"e1\""), false);
+        stored.source_binding = None;
+        assert!(reference_content("s3://db/a", &stored).is_err());
+    }
+
+    fn captured_from(input: &InputSelection, source: NodeId) -> CapturedInput {
+        CapturedInput {
+            destination_key: input.dest_key.clone(),
+            source_node_id: source,
+            version_id: Ulid::from_parts(1, 1),
+            content: InputContent::Blake3([1; 32]),
+            bytes: 1,
+            policies: Vec::new(),
+            source_group_id: Ulid::from_parts(2, 2),
+            public: false,
+            link: None,
+            source_pin: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
+        }
+    }
+
+    #[test]
+    fn checks_capture_sources() {
+        // A capture must come from the node its input names, or from ingress without one.
+        let (ingress, other) = (node(1), node(2));
+        let unnamed = s3_input("a", "x", None);
+        let mut named = s3_input("b", "y", Some(&Ulid::from_parts(1, 1).to_string()));
+        named.dest_key = "named".to_string();
+        named.source_node_id = Some(other);
+        let inputs = vec![unnamed.clone(), named.clone()];
+        let honest = vec![
+            captured_from(&unnamed, ingress),
+            captured_from(&named, other),
+        ];
+        assert!(sources_match(&inputs, &honest, ingress));
+        let forged = vec![
+            captured_from(&unnamed, ingress),
+            captured_from(&named, ingress),
+        ];
+        assert!(!sources_match(&inputs, &forged, ingress));
+        let moved = vec![captured_from(&unnamed, other), captured_from(&named, other)];
+        assert!(!sources_match(&inputs, &moved, ingress));
+    }
+
+    #[tokio::test]
+    async fn remote_needs_pin_and_bearer() {
+        // An input on another node needs an exact version and the caller's own bearer.
+        let dir = tempdir().unwrap();
+        let context = test_ctx(dir.path().to_str().unwrap());
+        let caller = (
+            UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1; 32])),
+            SubmissionId([4; 32]),
+            10,
+        );
+        let unpinned = vec![s3_input("a", "x", None)];
+        let refused = remote_captures(&context, node(2), &unpinned, caller, None).await;
+        assert!(matches!(refused, Err(SubmitJobError::InvalidWorkspace(_))));
+        let pinned = vec![s3_input(
+            "a",
+            "x",
+            Some(&Ulid::from_parts(1, 1).to_string()),
+        )];
+        let tokenless = remote_captures(&context, node(2), &pinned, caller, None).await;
+        assert!(matches!(
+            tokenless,
+            Err(SubmitJobError::PlacementUnavailable(_))
         ));
     }
 
