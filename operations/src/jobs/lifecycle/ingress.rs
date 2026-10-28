@@ -38,7 +38,7 @@ use super::ids::{
 use super::witness::arm_family;
 use super::{LifecycleError, ids};
 use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::PolicyRequestExtras;
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::jobs::records::keys::{family_prefix, kind_prefix};
@@ -985,7 +985,11 @@ async fn readable_metadata(
     .await
     {
         Ok(()) => bucket_metadata(context, bucket, info).await,
-        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => Ok(None),
+        // Only a refusal omits the metadata; unreadable policy state stays a retryable failure.
+        Err(
+            AuthorizeError::PermissionDenied
+            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
+        ) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
 }
