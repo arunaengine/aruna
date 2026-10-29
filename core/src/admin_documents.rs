@@ -401,6 +401,13 @@ pub enum AdminDocumentOperation {
     ConfigReplicasSet {
         replicas: crate::structs::identity::realm::ReplicaQuota,
     },
+    /// Sets or clears the realm-administered display name of a node. It is a label for people
+    /// only: placement, routing and policy never read it.
+    #[serde(rename = "RealmConfigNodeNameSet")]
+    NodeNameSet {
+        node_id: NodeId,
+        display_name: Option<String>,
+    },
 }
 
 impl AdminDocumentOperation {
@@ -674,6 +681,22 @@ mod tests {
         for op in operations {
             assert_eq!(postcard_roundtrip(op.clone()), op);
         }
+    }
+
+    #[test]
+    fn node_name_appended() {
+        // Postcard tags variants by position, so stored events keep decoding only if
+        // the new variant follows every earlier one.
+        let replicas = AdminDocumentOperation::ConfigReplicasSet {
+            replicas: Default::default(),
+        };
+        let named = AdminDocumentOperation::NodeNameSet {
+            node_id: node(1),
+            display_name: Some("Giessen storage 1".to_string()),
+        };
+        let replicas_tag = postcard::to_allocvec(&replicas).unwrap()[0];
+        assert_eq!(postcard::to_allocvec(&named).unwrap()[0], replicas_tag + 1);
+        assert_eq!(postcard_roundtrip(named.clone()), named);
     }
 
     fn placement_entry(node_id: NodeId) -> NodePlacementEntry {

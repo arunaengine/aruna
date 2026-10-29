@@ -59,6 +59,10 @@ impl AdminDocumentState {
                 let value = replicas_value(replicas);
                 self.apply_config_setting(event, CONFIG_REPLICAS_PATH, value);
             }
+            AdminDocumentOperation::NodeNameSet {
+                node_id,
+                display_name,
+            } => self.apply_node_name(event, node_id, display_name.clone()),
             AdminDocumentOperation::ConfigPoliciesSet { policies } => {
                 self.apply_config_setting(event, CONFIG_POLICIES_PATH, policies_value(policies));
             }

@@ -251,6 +251,18 @@ pub fn validate_portal_features(
     Ok(())
 }
 
+/// Longest node display name, in characters.
+pub const MAX_NODE_NAME: usize = 64;
+
+/// The one node display name rule: trimmed, non-empty, at most [`MAX_NODE_NAME`] characters
+/// and free of control characters. `None` means the name is refused.
+pub fn normalize_node_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let length = trimmed.chars().count();
+    ((1..=MAX_NODE_NAME).contains(&length) && !trimmed.chars().any(char::is_control))
+        .then(|| trimmed.to_string())
+}
+
 /// One realm-wide bearer token revocation. The expiry is the revoked token's
 /// own `exp`: past it the token no longer validates, so the entry is pruned and
 /// the replicated set stays bounded by one token lifetime of revocations.
@@ -1191,7 +1203,10 @@ mod test {
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
-    use super::{JobFamilyError, PortalFeatureError, validate_portal_features};
+    use super::{
+        JobFamilyError, MAX_NODE_NAME, PortalFeatureError, normalize_node_name,
+        validate_portal_features,
+    };
 
     #[test]
     pub fn realm_auth_roundtrip() {
@@ -2256,6 +2271,23 @@ mod test {
             RealmConfigDocument::from_bytes(&encoded).expect("full record decodes"),
             config
         );
+    }
+
+    #[test]
+    fn node_name_rule() {
+        // Every node replicates the name, so the one rule must refuse what a portal cannot show.
+        assert_eq!(
+            normalize_node_name("  Giessen 1 "),
+            Some("Giessen 1".to_string())
+        );
+        assert_eq!(
+            normalize_node_name(&"ä".repeat(MAX_NODE_NAME)).map(|name| name.chars().count()),
+            Some(MAX_NODE_NAME)
+        );
+        assert_eq!(normalize_node_name(&"a".repeat(MAX_NODE_NAME + 1)), None);
+        assert_eq!(normalize_node_name("   "), None);
+        assert_eq!(normalize_node_name("node\u{7}one"), None);
+        assert_eq!(normalize_node_name("two\nlines"), None);
     }
 
     #[test]

@@ -313,6 +313,21 @@ impl AdminDocumentState {
             .and_then(|value| serde_json::from_str(value).ok())
     }
 
+    /// Display names of realm nodes, by node id. A cleared or conflicting name is absent.
+    pub fn materialized_node_names(&self) -> BTreeMap<NodeId, String> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return BTreeMap::new();
+        }
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let node_id = path.strip_prefix("realm_config.node_names.")?;
+                let node_id = NodeId::from_str(node_id).ok()?;
+                Some((node_id, version.value.clone()?))
+            })
+            .collect()
+    }
+
     pub fn materialized_realm_quota(&self) -> Option<QuotaConfig> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return None;
@@ -507,6 +522,25 @@ impl AdminDocumentState {
         value: Option<String>,
     ) {
         let path = config_node_path(node_id);
+        let current = self.user_subject_ids.get(&path).cloned();
+
+        match self.reduce_value(event, &path, current, value) {
+            Some(version) => {
+                self.user_subject_ids.insert(path, version);
+            }
+            None => {
+                self.user_subject_ids.remove(&path);
+            }
+        }
+    }
+
+    pub(super) fn apply_node_name(
+        &mut self,
+        event: &AdminDocumentEvent,
+        node_id: &NodeId,
+        value: Option<String>,
+    ) {
+        let path = node_name_path(node_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
         match self.reduce_value(event, &path, current, value) {

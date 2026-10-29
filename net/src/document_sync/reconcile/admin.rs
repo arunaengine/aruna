@@ -824,6 +824,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::ConfigFederationSet { .. }
             | AdminDocumentOperation::ConfigPortalSet { .. }
             | AdminDocumentOperation::ConfigReplicasSet { .. }
+            | AdminDocumentOperation::NodeNameSet { .. }
             | AdminDocumentOperation::ConfigTokenRevoked { .. }
     )
 }
