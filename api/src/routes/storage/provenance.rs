@@ -64,6 +64,8 @@ const FINISH_WINDOW: Duration = Duration::from_secs(60);
 const REVOKED: &str = "the token expired or was revoked";
 /// Bytes buffered between the walk and the client.
 const PIPE_BYTES: usize = 64 * 1024;
+/// A regular file readable by everyone, so an unpacked crate opens without a chmod.
+const FILE_MODE: u16 = 0o100_644;
 
 #[derive(OpenApi)]
 #[openapi()]
@@ -373,7 +375,8 @@ async fn finish(
         let entry = ZipEntryBuilder::new(
             "ro-crate-metadata.json".to_string().into(),
             Compression::Stored,
-        );
+        )
+        .unix_permissions(FILE_MODE);
         let mut entry = zip
             .write_entry_stream(entry)
             .await
@@ -653,7 +656,8 @@ async fn write(
     zip: &mut ZipFileWriter<DuplexStream>,
     file: CrateFile,
 ) -> bool {
-    let entry = ZipEntryBuilder::new(file.path.into(), Compression::Stored);
+    let entry =
+        ZipEntryBuilder::new(file.path.into(), Compression::Stored).unix_permissions(FILE_MODE);
     // A started entry may use the finishing window, so the ZIP never ends inside an entry.
     let written = until(
         caller.finish_by,

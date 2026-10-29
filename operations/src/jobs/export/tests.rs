@@ -655,6 +655,13 @@ async fn assert_roundtrip(handle: &BlobHandle, eln: bool, version: &str, seed: u
     );
     assert_eq!(read_entry(&mut archive, "data/a file.txt"), FIXTURE_BYTES);
     assert_eq!(read_entry(&mut archive, "data/copy.txt"), FIXTURE_BYTES);
+    // Every entry unpacks as a readable regular file.
+    for index in 0..archive.len() {
+        assert_eq!(
+            archive.by_index(index).unwrap().unix_mode(),
+            Some(0o100_644)
+        );
+    }
     drop(archive);
 
     let (export_location, export_size) =

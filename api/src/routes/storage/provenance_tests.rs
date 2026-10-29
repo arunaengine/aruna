@@ -361,6 +361,13 @@ async fn nests_release_crates() {
         .filter(|name| name.starts_with("releases/"))
         .collect();
     assert_eq!(nested.len(), 1, "the release crate is nested");
+    // Every entry unpacks as a readable regular file.
+    for index in 0..archive.len() {
+        assert_eq!(
+            archive.by_index(index).unwrap().unix_mode(),
+            Some(0o100_644)
+        );
+    }
     let mut text = String::new();
     let mut file = archive.by_name(&nested[0]).unwrap();
     file.read_to_string(&mut text).unwrap();
