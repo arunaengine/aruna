@@ -58,7 +58,7 @@ pub(super) fn retired_nodes(parts: &[(NodeId, BucketPage)]) -> Vec<NodeId> {
 /// node with fewer than `limit` hits, all shown and an uncut scan, is done. A failed node keeps
 /// its position, a node left out by the fanout cap is kept for a later page, done nodes stay
 /// done, and other nodes this page did not ask are dropped from the cursor. A distributed bucket
-/// shows once.
+/// shows once: its other members count as given, so their nodes move past it too.
 pub(super) fn merge_pages(
     parts: Vec<(NodeId, BucketPage)>,
     (failed, omitted): (&[NodeId], &[NodeId]),
@@ -72,7 +72,21 @@ pub(super) fn merge_pages(
         let node = |hit: &BucketSearchHit| *hit.node_id.as_bytes();
         (&left.bucket, node(left)).cmp(&(&right.bucket, node(right)))
     });
-    hits.truncate(limit);
+    // Members of one distributed bucket answer alike, so the first one stands for the set.
+    let mut sets = std::collections::HashSet::new();
+    let mut shown = Vec::with_capacity(limit);
+    let mut given_hits = Vec::new();
+    for hit in hits {
+        let repeat = hit.set_id.is_some_and(|set_id| sets.contains(&set_id));
+        if !repeat && shown.len() == limit {
+            continue;
+        }
+        if !repeat {
+            sets.extend(hit.set_id);
+            shown.push(hit.clone());
+        }
+        given_hits.push(hit);
+    }
     let nodes: Vec<NodeId> = parts
         .iter()
         .map(|(node, _)| *node)
@@ -91,7 +105,9 @@ pub(super) fn merge_pages(
         }
     }
     for (node, given) in &parts {
-        let taken: Vec<_> = hits.iter().filter(|hit| hit.node_id == *node).collect();
+        let taken: Vec<_> = (given_hits.iter())
+            .filter(|hit| hit.node_id == *node)
+            .collect();
         let Some(entry) = positions
             .iter_mut()
             .find(|entry| entry.node_id == *node.as_bytes())
@@ -107,10 +123,7 @@ pub(super) fn merge_pages(
         entry.done |=
             given.retired || (given.scanned_to.is_none() && given.hits.len() < limit && all_shown);
     }
-    // Members of one distributed bucket answer alike, so the first one stands for the set.
-    let mut sets = std::collections::HashSet::new();
-    hits.retain(|hit| hit.set_id.is_none_or(|set_id| sets.insert(set_id)));
-    (hits, positions)
+    (shown, positions)
 }
 
 #[cfg(test)]
@@ -221,6 +234,35 @@ mod tests {
         assert_eq!(names.iter().filter(|name| **name == "refseq").count(), 1);
         assert_eq!(hits.len(), 3);
         assert!(positions.iter().all(|entry| entry.done));
+    }
+
+    // With one hit per page, two members of one set still show the bucket only once.
+    #[test]
+    fn folds_across_pages() {
+        let set_id = ulid::Ulid::from_bytes([7; 16]);
+        let stores = [
+            (node(1), vec!["a", "refseq"]),
+            (node(2), vec!["refseq", "z"]),
+        ];
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let positions = decode_cursor(cursor.as_deref()).unwrap();
+            let mut parts = page(&stores, &positions, 1);
+            for (_, page) in &mut parts {
+                for hit in &mut page.hits {
+                    hit.set_id = (hit.bucket == "refseq").then_some(set_id);
+                }
+            }
+            let (hits, positions) = merge_pages(parts, (&[], &[]), positions, 1);
+            assert!(hits.len() <= 1);
+            seen.extend(hits.into_iter().map(|hit| hit.bucket));
+            cursor = encode_cursor(&positions);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen, ["a", "refseq", "z"]);
     }
 
     #[test]
