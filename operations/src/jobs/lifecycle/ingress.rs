@@ -478,6 +478,40 @@ fn source_error(reference: &str, error: SourceReadError) -> SubmitJobError {
     }
 }
 
+/// Points a local input of a distributed bucket at the member that coordinates its key, so it
+/// is captured and pinned there, as an S3 read of the key is served there.
+async fn range_holder(
+    context: &DriverContext,
+    mut input: InputSelection,
+    local: NodeId,
+) -> Result<InputSelection, SubmitJobError> {
+    if input.source_node_id.is_some_and(|node| node != local) {
+        return Ok(input);
+    }
+    let aruna_core::structs::execution::job::InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    // A missing or unreadable bucket is refused by the capture with its own message.
+    let Ok(info) = drive(GetBucketOperation::new(bucket.clone()), context).await else {
+        return Ok(input);
+    };
+    let Some(binding) = info.distribution else {
+        return Ok(input);
+    };
+    let coordinator = crate::distribution::guard::read_coordinator(context, &binding, key)
+        .await
+        .map_err(|error| {
+            let reference = input_reference(bucket, key, version_id.as_deref());
+            SubmitJobError::PlacementUnavailable(format!("{reference}: {error}"))
+        })?;
+    if let Some((_, node)) = coordinator {
+        input.source_node_id = Some(node);
+    }
+    Ok(input)
+}
+
 /// Resolve every input at the node that holds it, once, at ingress. The values are stored in
 /// the family spec and remain valid when admission or planning is forwarded.
 async fn resolve_inputs(
@@ -516,6 +550,7 @@ async fn resolve_inputs(
         if let Some(link) = link {
             links.insert(input.dest_key.clone(), link);
         }
+        let input = range_holder(context, input, local).await?;
         match input.source_node_id.filter(|node| *node != local) {
             Some(node) => remote.entry(node).or_default().push(input),
             None => here.push(input),
@@ -1648,6 +1683,56 @@ mod tests {
             submission_id: SubmissionId([seed; 32]),
             request_digest: [seed; 32],
         }
+    }
+
+    // A plain s3:// input of a distributed bucket is captured at the member that coordinates
+    // its key, not refused because this member holds no copy.
+    #[tokio::test]
+    async fn routes_range_holder() {
+        use crate::distribution::test_record::{binding, record, secret, store_record};
+        use crate::distribution::test_store::{context, open};
+        let (_dir, handle) = open();
+        let (snapshot, bytes) = record(true);
+        store_record(&handle, snapshot.set_id(), bytes).await;
+        let bucket = aruna_core::structs::storage::blob::BucketInfo {
+            group_id: Ulid::from_bytes([90; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: UserId::nil(RealmId::from_bytes([9; 32])),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: Some(binding(&snapshot, 1, 5)),
+        };
+        let write = StorageEffect::Write {
+            key_space: aruna_core::keyspaces::S3_BUCKET_KEYSPACE.to_string(),
+            key: b"refseq".to_vec().into(),
+            value: bucket.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        handle.send_storage_effect(write).await;
+        let context = context(&handle);
+        let input = |key: &str| InputSelection {
+            source: InputSource::S3 {
+                bucket: "refseq".to_string(),
+                key: key.to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: key.to_string(),
+            mode: InputMode::Snapshot,
+            container_path: Some(format!("/in/{key}")),
+            name: None,
+            description: None,
+        };
+        let local = secret(1).public();
+
+        let lower = range_holder(&context, input("a"), local).await.unwrap();
+        let upper = range_holder(&context, input("x"), local).await.unwrap();
+
+        assert_eq!(lower.source_node_id, None);
+        assert_eq!(upper.source_node_id, Some(secret(2).public()));
     }
 
     fn test_ctx(root: &str) -> DriverContext {
