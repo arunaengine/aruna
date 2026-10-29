@@ -5,6 +5,7 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::{self, Read, Write};
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use aruna_core::compute::{
@@ -50,9 +51,9 @@ mod status;
 
 use manifest::{
     HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_node_manifest, data_pv_manifest,
-    data_pvc_manifest, helper_pod, job_manifest, marker_manifest, marker_name, mount_buckets,
-    mount_pv_manifest, mount_pvc_manifest, needs_workspace, network_policies, policy_manifests,
-    pvc_manifest, secret_manifest, secret_name, session_mount, workspace_name,
+    data_pvc_manifest, helper_name, helper_pod, job_manifest, marker_manifest, marker_name,
+    mount_buckets, mount_pv_manifest, mount_pvc_manifest, needs_workspace, network_policies,
+    policy_manifests, pvc_manifest, secret_manifest, secret_name, session_mount, workspace_name,
 };
 use status::{
     job_pending, job_status, pod_started, pod_stuck_reason, task_started, task_state,
@@ -72,6 +73,11 @@ const EXEC_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// size. kube-rs otherwise defaults to 1 KiB, which throttles a transfer to a trickle
 /// and, on the read side, blocks the frame loop that drives its keepalive ping.
 const STREAM_BUF_BYTES: usize = 512 * 1024;
+/// Bytes one fetch exec reads, so each exec stays short: a proxy on the API path
+/// may cut a long exec stream.
+const FETCH_RANGE_BYTES: u64 = 32 * 1024 * 1024;
+/// Execs per range before the output fails; each retry resumes at the last byte.
+const RANGE_TRIES: u32 = 5;
 /// Bounds the termination evidence kept on a terminal status.
 const MAX_TERMINATION_DETAIL: usize = 2048;
 
@@ -582,6 +588,30 @@ impl KubernetesBackend {
         }
     }
 
+    /// The running fetch helper of this attempt, created once and reused by every
+    /// listing and fetch until cleanup removes it.
+    async fn fetch_helper(&self, context: &FenceContext) -> Result<Pod, BackendError> {
+        let name = helper_name(&context.attempt.external_name(), "fetch");
+        if let Some(pod) = self.pods().get_opt(&name).await.map_err(kube_error)? {
+            let running = pod.metadata.deletion_timestamp.is_none()
+                && pod
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.phase.as_deref())
+                    == Some("Running");
+            let generation = pod
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(GENERATION_ANNOTATION));
+            if running && generation == Some(&context.controller_generation.to_string()) {
+                return Ok(pod);
+            }
+        }
+        self.create_helper(context, "fetch", &CancellationToken::new())
+            .await
+    }
+
     async fn remove_marker(&self, context: &FenceContext) -> Result<(), BackendError> {
         let name = marker_name(&context.attempt.external_name());
         match self.markers().get_opt(&name).await.map_err(kube_error)? {
@@ -872,9 +902,7 @@ impl KubernetesBackend {
         prefix: &str,
         glob: &OutputMatcher,
     ) -> Result<Vec<String>, BackendError> {
-        let pod = self
-            .create_helper(context, "fetch", &CancellationToken::new())
-            .await?;
+        let pod = self.fetch_helper(context).await?;
         let params = AttachParams::default()
             .container("helper")
             .stdin(false)
@@ -916,7 +944,6 @@ impl KubernetesBackend {
             select_listed(&listing, glob)
         }
         .await;
-        let _ = self.delete_pod(&pod).await;
         listed
     }
 
@@ -925,52 +952,61 @@ impl KubernetesBackend {
         context: &FenceContext,
         path: &str,
     ) -> Result<TaskOutput, BackendError> {
-        let pod = self
-            .create_helper(context, "fetch", &CancellationToken::new())
-            .await?;
+        let pod = self.fetch_helper(context).await?.name_any();
+        let (size, reader, join) = self.open_range(&pod, path, 0).await?;
+        let (tx, rx) = mpsc::channel(4);
+        let backend = self.clone();
+        let path = path.to_string();
+        tokio::spawn(async move {
+            let open = |offset| backend.open_range(&pod, &path, offset);
+            stream_ranges(&path, size, (reader, join), open, tx).await;
+        });
+        Ok(TaskOutput {
+            size,
+            chunks: Box::pin(ChannelStream(rx)),
+        })
+    }
+
+    /// Start one fetch exec from `offset` and read the file size it reports first.
+    async fn open_range(
+        &self,
+        pod: &str,
+        path: &str,
+        offset: u64,
+    ) -> Result<(u64, RangeBody, ExecJoin), BackendError> {
         let params = AttachParams::default()
             .container("helper")
             .stdin(false)
             .stdout(true)
             .stderr(false)
             .max_stdout_buf_size(STREAM_BUF_BYTES);
+        let (offset, length) = (offset.to_string(), FETCH_RANGE_BYTES.to_string());
         let mut attached = self
             .pods()
             .exec(
-                &pod.name_any(),
+                pod,
                 [
                     HELPER_PATH,
                     "fetch",
                     "--workspace",
-                    "/workspace",
+                    WORKSPACE_PATH,
                     "--path",
                     path,
+                    "--offset",
+                    &offset,
+                    "--length",
+                    &length,
                 ],
                 &params,
             )
             .await
             .map_err(kube_error)?;
-        let mut stdout = attached.stdout().ok_or_else(|| {
+        let stdout = attached.stdout().ok_or_else(|| {
             BackendError::Api("fetch exec did not expose standard output".to_string())
         })?;
-        // The helper Pod still has to go on either failure.
-        let (size, join) = match read_header(&mut stdout, path, join_exec(attached)).await {
-            Ok(header) => header,
-            Err(error) => {
-                let _ = self.delete_pod(&pod).await;
-                return Err(error);
-            }
-        };
-        let (tx, rx) = mpsc::channel(4);
-        let backend = self.clone();
-        tokio::spawn(async move {
-            stream_output(stdout, join, size, tx).await;
-            let _ = backend.delete_pod(&pod).await;
-        });
-        Ok(TaskOutput {
-            size,
-            chunks: Box::pin(ChannelStream(rx)),
-        })
+        let mut reader: RangeBody = Box::pin(stdout);
+        let (size, join) = read_size(&mut reader, Box::pin(join_exec(attached))).await?;
+        Ok((size, reader, join))
     }
 }
 
@@ -1973,87 +2009,122 @@ fn select_listed(listing: &[u8], glob: &OutputMatcher) -> Result<Vec<String>, Ba
     Ok(matched)
 }
 
-/// Read the leading tar header the fetch helper emits, returning the unpolled `join`
-/// beside the declared body size. A torn read reports the exec status, which holds
-/// its real cause; an intact but invalid header keeps its own error and drops `join`.
-async fn read_header<R, F>(stdout: &mut R, path: &str, join: F) -> Result<(u64, F), BackendError>
-where
-    R: AsyncRead + Unpin,
-    F: Future<Output = Result<(), BackendError>>,
-{
-    let mut header_bytes = [0u8; 512];
-    if let Err(error) = stdout.read_exact(&mut header_bytes).await {
+type RangeBody = Pin<Box<dyn AsyncRead + Send>>;
+type ExecJoin = Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send>>;
+
+/// Read the file size the fetch helper writes first. A torn read reports the exec
+/// status, which holds its real cause.
+async fn read_size(
+    reader: &mut RangeBody,
+    join: ExecJoin,
+) -> Result<(u64, ExecJoin), BackendError> {
+    let mut size = [0u8; 8];
+    if let Err(error) = reader.read_exact(&mut size).await {
         return Err(joined_error(join, io_error(error)).await);
     }
-    Ok((parse_header(&header_bytes, path)?, join))
+    Ok((u64::from_be_bytes(size), join))
 }
 
-/// Check the header describes the requested regular file.
-fn parse_header(header_bytes: &[u8; 512], path: &str) -> Result<u64, BackendError> {
-    let header = tar::Header::from_byte_slice(header_bytes);
-    let size = header
-        .size()
-        .map_err(|error| BackendError::Api(format!("invalid fetch archive size: {error}")))?;
-    if !header.entry_type().is_file() {
-        return Err(BackendError::InvalidSpec(
-            "fetch archive is not a bounded regular file".to_string(),
-        ));
-    }
-    let archive_path = header
-        .path()
-        .map_err(|error| BackendError::Api(format!("invalid fetch archive path: {error}")))?;
-    let expected = normalize_container_path(path).map_err(BackendError::InvalidSpec)?;
-    if archive_path.as_ref() != expected.strip_prefix("/").unwrap_or(&expected) {
-        return Err(BackendError::Conflict(
-            "fetch helper returned a different output path".to_string(),
-        ));
-    }
-    Ok(size)
-}
-
-async fn stream_output<R: AsyncRead + Unpin>(
-    mut stdout: R,
-    join: impl Future<Output = Result<(), BackendError>>,
+/// Send `size` bytes range by range: `first` reads from offset 0 and `open` starts
+/// the exec of a later range. A dropped range resumes at its last received byte.
+async fn stream_ranges<O, F>(
+    path: &str,
     size: u64,
+    first: (RangeBody, ExecJoin),
+    mut open: O,
     tx: mpsc::Sender<Result<Bytes, BackendError>>,
-) {
-    let mut remaining = size;
+) where
+    O: FnMut(u64) -> F,
+    F: Future<Output = Result<(u64, RangeBody, ExecJoin), BackendError>>,
+{
+    let mut offset = 0;
+    let mut tries = 0;
+    let mut current = Some(first);
     let mut buffer = vec![0u8; 64 * 1024];
-    while remaining > 0 {
-        let limit = usize::try_from(remaining)
-            .unwrap_or(usize::MAX)
-            .min(buffer.len());
-        match stdout.read(&mut buffer[..limit]).await {
-            Ok(0) => {
-                let transferred = size - remaining;
-                let short = BackendError::Api(format!(
-                    "fetch archive ended after {transferred} of {size} bytes"
-                ));
-                let _ = tx.send(Err(joined_error(join, short).await)).await;
-                return;
-            }
-            Ok(read) => {
-                remaining -= read as u64;
-                if tx
-                    .send(Ok(Bytes::copy_from_slice(&buffer[..read])))
-                    .await
-                    .is_err()
-                {
+    while offset < size {
+        let end = offset.saturating_add(FETCH_RANGE_BYTES).min(size);
+        let opened = match current.take() {
+            Some(exec) => Ok(exec),
+            None => match open(offset).await {
+                Ok((found, ..)) if found != size => {
+                    let changed = format!("output {path} changed from {size} to {found} bytes");
+                    let _ = tx.send(Err(BackendError::Conflict(changed))).await;
                     return;
                 }
+                Ok((_, reader, join)) => Ok((reader, join)),
+                Err(error) => Err(error),
+            },
+        };
+        let failure = match opened {
+            Ok((mut reader, join)) => {
+                match read_range(&mut reader, &mut offset, end, &tx, &mut buffer).await {
+                    Ok(true) => {
+                        // Every byte of the range arrived, so a lost exec status costs nothing.
+                        if let Err(error) = join.await {
+                            tracing::warn!(%error, "fetch exec status lost after a full range");
+                        }
+                        tries = 0;
+                        continue;
+                    }
+                    Ok(false) => return,
+                    Err(error) => {
+                        drop(reader);
+                        joined_error(join, error).await
+                    }
+                }
             }
-            Err(error) => {
-                let _ = tx
-                    .send(Err(joined_error(join, io_error(error)).await))
-                    .await;
-                return;
-            }
+            Err(error) => error,
+        };
+        tries += 1;
+        if tries >= RANGE_TRIES || !failure.retryable() {
+            let message =
+                format!("output {path} failed at byte {offset} after {tries} tries: {failure}");
+            let error = if failure.retryable() {
+                BackendError::Api(message)
+            } else {
+                BackendError::InvalidSpec(message)
+            };
+            let _ = tx.send(Err(error)).await;
+            return;
         }
+        tracing::debug!(%failure, offset, "fetch range dropped; resuming");
     }
-    let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
-    if let Err(error) = join.await {
-        let _ = tx.send(Err(error)).await;
+}
+
+/// Send the bytes up to `end`, advancing `offset` per chunk. `Ok(false)` means the
+/// receiver is gone.
+async fn read_range(
+    reader: &mut RangeBody,
+    offset: &mut u64,
+    end: u64,
+    tx: &mpsc::Sender<Result<Bytes, BackendError>>,
+    buffer: &mut [u8],
+) -> Result<bool, BackendError> {
+    while *offset < end {
+        let limit = usize::try_from(end - *offset)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = tokio::time::timeout(EXEC_JOIN_TIMEOUT, reader.read(&mut buffer[..limit]))
+            .await
+            .map_err(|_| BackendError::Timeout("fetch exec stalled".to_string()))?
+            .map_err(io_error)?;
+        if read == 0 {
+            return Err(BackendError::Api(format!(
+                "fetch exec ended at byte {offset} of a range ending at {end}"
+            )));
+        }
+        if tx
+            .send(Ok(Bytes::copy_from_slice(&buffer[..read])))
+            .await
+            .is_err()
+        {
+            return Ok(false);
+        }
+        *offset += read as u64;
     }
+    let mut sink = tokio::io::sink();
+    let _ = tokio::time::timeout(EXEC_JOIN_TIMEOUT, tokio::io::copy(reader, &mut sink)).await;
+    Ok(true)
 }
 
 /// kube-rs reports a websocket failure or an unexpected close as a plain EOF or IO
@@ -3431,103 +3502,93 @@ mod tests {
         items
     }
 
-    // A dead websocket reaches the reader as a plain EOF, so the exec status must win
-    // over the truncation the reader sees.
+    fn exec(bytes: &[u8], status: Result<(), BackendError>) -> (RangeBody, ExecJoin) {
+        let reader: RangeBody = Box::pin(std::io::Cursor::new(bytes.to_vec()));
+        (reader, Box::pin(std::future::ready(status)))
+    }
+
+    fn dropped() -> Result<(), BackendError> {
+        Err(BackendError::Api("websocket reset".to_string()))
+    }
+
+    // A stream cut mid-range resumes at the last received byte instead of failing.
     #[tokio::test]
-    async fn truncation_prefers_status() {
-        let (mut writer, reader) = tokio::io::duplex(64);
-        writer.write_all(b"abc").await.unwrap();
-        drop(writer);
+    async fn resumes_dropped_range() {
         let (tx, rx) = mpsc::channel(4);
+        let opened = std::sync::Mutex::new(Vec::new());
+        let open = |offset| {
+            opened.lock().unwrap().push(offset);
+            let (reader, join) = exec(b"defghij", Ok(()));
+            std::future::ready(Ok((10, reader, join)))
+        };
 
-        let join = std::future::ready(Err(BackendError::Api("websocket reset".to_string())));
-        stream_output(reader, join, 8, tx).await;
+        let streamed = stream_ranges("/out/data", 10, exec(b"abc", dropped()), open, tx);
+        let (_, items) = tokio::join!(streamed, drain_stream(rx));
 
-        let items = drain_stream(rx).await;
-        assert_eq!(items.len(), 2);
-        assert!(items[0].is_ok());
-        match items[1].as_ref().expect_err("the stream must fail") {
-            BackendError::Api(message) => assert_eq!(message, "websocket reset"),
+        let bytes: Vec<u8> = items
+            .into_iter()
+            .flat_map(|item| item.expect("no range may fail").to_vec())
+            .collect();
+        assert_eq!(bytes, b"abcdefghij");
+        assert_eq!(*opened.lock().unwrap(), vec![3]);
+    }
+
+    // A range that keeps dropping ends the output with its cause after bounded tries.
+    #[tokio::test]
+    async fn bounds_range_retries() {
+        let (tx, rx) = mpsc::channel(4);
+        let opened = std::sync::atomic::AtomicU32::new(0);
+        let open = |_| {
+            opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (reader, join) = exec(b"", dropped());
+            std::future::ready(Ok((10, reader, join)))
+        };
+
+        let streamed = stream_ranges("/out/data", 10, exec(b"ab", dropped()), open, tx);
+        let (_, items) = tokio::join!(streamed, drain_stream(rx));
+
+        assert_eq!(opened.into_inner(), RANGE_TRIES - 1);
+        match items
+            .last()
+            .unwrap()
+            .as_ref()
+            .expect_err("the output must fail")
+        {
+            BackendError::Api(message) => assert_eq!(
+                message,
+                "output /out/data failed at byte 2 after 5 tries: backend api error: websocket reset"
+            ),
             other => panic!("unexpected error: {other:?}"),
         }
     }
 
-    // A clean exec status leaves the shortfall as the only evidence.
+    // A file that changes between ranges must not be stitched together.
     #[tokio::test]
-    async fn truncation_reports_shortfall() {
-        let (mut writer, reader) = tokio::io::duplex(64);
-        writer.write_all(b"abc").await.unwrap();
-        drop(writer);
+    async fn rejects_changed_size() {
         let (tx, rx) = mpsc::channel(4);
-
-        stream_output(reader, std::future::ready(Ok(())), 8, tx).await;
-
-        let items = drain_stream(rx).await;
-        match items[1].as_ref().expect_err("the stream must fail") {
-            BackendError::Api(message) => {
-                assert_eq!(message, "fetch archive ended after 3 of 8 bytes")
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    // A complete body still fails when the helper exits non-zero afterwards.
-    #[tokio::test]
-    async fn complete_reports_status() {
-        let (mut writer, reader) = tokio::io::duplex(64);
-        writer.write_all(b"abcdefgh").await.unwrap();
-        drop(writer);
-        let (tx, rx) = mpsc::channel(4);
-
-        let join = std::future::ready(Err(BackendError::Api("helper exited 1".to_string())));
-        stream_output(reader, join, 8, tx).await;
-
-        let items = drain_stream(rx).await;
-        assert!(items[..items.len() - 1].iter().all(Result::is_ok));
-        assert!(
-            items.last().unwrap().is_err(),
-            "the exec status must surface"
-        );
-    }
-
-    fn header_bytes(path: &str, size: u64) -> [u8; 512] {
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(size);
-        header.set_path(path).expect("header path");
-        header.set_cksum();
-        *header.as_bytes()
-    }
-
-    // A deterministic protocol mismatch must keep its own error: joining an undrained
-    // exec would block until the timeout and reclassify it as retryable.
-    #[tokio::test(start_paused = true)]
-    async fn invalid_header_survives() {
-        let bytes = header_bytes("workspace/other.txt", 4);
-        let join = std::future::pending::<Result<(), BackendError>>();
-        let read = tokio::time::timeout(
-            EXEC_JOIN_TIMEOUT * 4,
-            read_header(&mut &bytes[..], "/workspace/data.txt", join),
-        )
-        .await
-        .expect("validation must not wait on the exec");
-
-        let Err(error) = read else {
-            panic!("a mismatched archive path must fail");
+        let open = |_| {
+            let (reader, join) = exec(b"cdefghijkl", Ok(()));
+            std::future::ready(Ok((12, reader, join)))
         };
-        assert!(matches!(error, BackendError::Conflict(_)));
+
+        let streamed = stream_ranges("/out/data", 10, exec(b"ab", dropped()), open, tx);
+        let (_, items) = tokio::join!(streamed, drain_stream(rx));
+
+        assert!(matches!(
+            items.last().unwrap(),
+            Err(BackendError::Conflict(message)) if message.contains("changed from 10 to 12")
+        ));
     }
 
-    // A header that never arrives in full is a transport failure: the exec status
-    // holds the real cause.
+    // A size that never arrives in full is a transport failure: the exec status holds
+    // the real cause.
     #[tokio::test]
-    async fn torn_header_joins() {
-        let bytes = header_bytes("workspace/data.txt", 4);
-        let join = std::future::ready(Err(BackendError::Api("websocket closed".to_string())));
+    async fn torn_size_joins() {
+        let (mut reader, join) = exec(&[0, 0, 0], dropped());
 
-        let Err(error) = read_header(&mut &bytes[..16], "/workspace/data.txt", join).await else {
-            panic!("a short header must fail");
+        let Err(error) = read_size(&mut reader, join).await else {
+            panic!("a short size must fail");
         };
-        assert!(matches!(&error, BackendError::Api(message) if message == "websocket closed"));
+        assert!(matches!(&error, BackendError::Api(message) if message == "websocket reset"));
     }
 }
