@@ -18,7 +18,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_core::structs::storage::data::identity::{
-    CONTENT_URL, DataEntity, ObjectLocation, normalized_id, parse_hash,
+    CONTENT_URL, DataEntity, ObjectLocation, content_id, normalized_id, parse_hash,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -704,9 +704,16 @@ fn build_crate_jsonld(
                       hash: Option<[u8; 32]>,
                       (version, by_version): (Option<String>, bool),
                       file: serde_json::Value| {
-        // Without a hash, a captured input's exact version keeps same-named inputs of two
-        // nodes apart.
+        // Without a hash, or when another input has the same bytes, a captured input's exact
+        // version names it, so two inputs never share an id or fall back to a bucket path.
         let id = match (hash, &version) {
+            (Some(hash), Some(version))
+                if by_version
+                    && used.contains(&content_id(hash))
+                    && used.insert(version.clone()) =>
+            {
+                version.clone()
+            }
             (Some(hash), _) => normalized_id(hash, &location, &mut used),
             (None, Some(version)) if by_version => version.clone(),
             _ => location.to_url(),
@@ -1569,6 +1576,67 @@ mod pure_tests {
         assert_eq!(output["contentUrl"][1], arn(11));
         let action = graph.iter().find(|e| e["@type"] == "CreateAction").unwrap();
         assert_eq!(action["object"][0]["@id"], content);
+        assert!(craqle::validate_rocrate_jsonld(&value.to_string()).is_ok());
+    }
+
+    #[test]
+    fn same_bytes_versioned() {
+        // A second input with the same bytes, here reached through a link, is named by its
+        // exact version, never by a bucket path another crate could use for other data.
+        let (mut record, mut spec) = execution_record();
+        let mut second = spec.inputs[0].clone();
+        second.dest_key = "inputs/linked.txt".to_string();
+        second.name = Some("Linked sample".to_string());
+        spec.inputs.push(second);
+        let link = VersionedObjectArn::new(
+            record.created_by.realm_id,
+            record.owner_node_id,
+            "work",
+            "links/in.txt",
+            Ulid::from_bytes([15; 16]),
+        )
+        .unwrap();
+        for (destination, link) in [("inputs/in.txt", None), ("inputs/linked.txt", Some(link))] {
+            record.captured_inputs.push(CapturedInput {
+                destination_key: destination.to_string(),
+                source_node_id: record.owner_node_id,
+                version_id: Ulid::from_bytes([13; 16]),
+                content: InputContent::Blake3([9; 32]),
+                bytes: 3,
+                policies: Vec::new(),
+                source_group_id: Default::default(),
+                public: false,
+                link,
+                source_pin: None,
+                database: None,
+                releases: Vec::new(),
+                releases_complete: false,
+                grant: None,
+            });
+        }
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let id_of = |name: &str| {
+            let file = graph.iter().find(|entity| entity["name"] == name);
+            file.expect("input entity")["@id"].clone()
+        };
+        let exact = VersionedObjectArn::new(
+            record.created_by.realm_id,
+            record.owner_node_id,
+            "src",
+            "in.txt",
+            Ulid::from_bytes([13; 16]),
+        )
+        .unwrap()
+        .to_w3id();
+        let content = aruna_core::structs::storage::data::identity::content_id([9; 32]);
+        assert_eq!(id_of("Input sample"), content);
+        assert_eq!(id_of("Linked sample"), exact);
+        assert!(
+            !graph
+                .iter()
+                .any(|entity| entity["@id"] == "s3://src/in.txt")
+        );
         assert!(craqle::validate_rocrate_jsonld(&value.to_string()).is_ok());
     }
 
