@@ -104,9 +104,15 @@ impl NodeHeartbeat {
         if bytes.len() > MAX_HEARTBEAT_BYTES {
             return Err(HeartbeatError::TooLarge);
         }
-        // A sender that predates `jobs` stops before it; its `None` is one zero byte.
+        // A sender that predates `jobs` stops right before it; its `None` is one zero byte.
+        // A padded decode that still yields counts was a truncated newer heartbeat instead.
         let heartbeat: Self = postcard::from_bytes(bytes)
-            .or_else(|_| postcard::from_bytes(&[bytes, &[0]].concat()))
+            .or_else(
+                |error| match postcard::from_bytes::<Self>(&[bytes, &[0]].concat()) {
+                    Ok(legacy) if legacy.jobs.is_none() => Ok(legacy),
+                    _ => Err(error),
+                },
+            )
             .map_err(|error| HeartbeatError::Decode(error.to_string()))?;
         heartbeat.validate()?;
         Ok(heartbeat)
@@ -200,6 +206,17 @@ mod tests {
         let from_older = postcard::to_allocvec(&earlier(&beat)).unwrap();
         let decoded = NodeHeartbeat::from_bytes(&from_older).unwrap();
         assert_eq!(decoded, NodeHeartbeat { jobs: None, ..beat });
+    }
+
+    #[test]
+    fn rejects_truncated_counts() {
+        // Cut before the imports count, padding would read imports as 0 and pass as valid.
+        let bytes = heartbeat(5).to_bytes().unwrap();
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            NodeHeartbeat::from_bytes(truncated),
+            Err(HeartbeatError::Decode(_))
+        ));
     }
 
     fn availability() -> ExecutorAvailability {
