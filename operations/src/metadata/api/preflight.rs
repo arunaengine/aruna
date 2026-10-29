@@ -1253,6 +1253,9 @@ pub(super) fn assemble_preflight_execution(
                 title: hit.title,
             });
     }
+    // A location target has a path-style IRI only when the node it was resolved on serves S3.
+    let unread = (resolved.targets.iter()).any(|target| target.location().is_some());
+    path_style_complete &= plan.s3_endpoint.is_some() || !unread;
     let index_current = node_freshness
         .iter()
         .all(|freshness| freshness.index_state == MetadataIndexState::Current);
@@ -1264,10 +1267,6 @@ pub(super) fn assemble_preflight_execution(
     if !plan.allow_partial && !complete {
         return Err(MetadataApiError::ServiceUnavailable);
     }
-    let unread = resolved
-        .targets
-        .iter()
-        .any(|target| target.location().is_some());
     let targets = resolved
         .targets
         .into_iter()

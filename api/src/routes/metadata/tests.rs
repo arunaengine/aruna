@@ -3954,22 +3954,28 @@ async fn preflight_locates_unread() {
     )
     .await;
     drain_metadata_background(test.state.as_ref()).await;
+    let purge = || PreflightTargetBody::BucketPrefix {
+        bucket: bucket.to_string(),
+        prefix: Some(key.to_string()),
+        operation: PreflightStorageBody::AllVersionsPurge,
+    };
 
-    let response = preflight_route(
-        &test,
-        Some(test.auth.clone()),
-        PreflightTargetBody::BucketPrefix {
-            bucket: bucket.to_string(),
-            prefix: Some(key.to_string()),
-            operation: PreflightStorageBody::AllVersionsPurge,
-        },
-        MetadataQueryMode::Local,
-        true,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    // Without an S3 endpoint no path-style IRI of the key is queried, so coverage says so.
+    let mode = || MetadataQueryMode::Local;
+    let auth = Some(test.auth.clone());
+    let response = preflight_route(&test, auth.clone(), purge(), mode(), true, None, None)
+        .await
+        .unwrap();
+    assert!(!response.coverage.path_style_complete);
+    assert!(!response.targets[0].would_remove_location);
+
+    test.state
+        .register_s3_interface("127.0.0.1:9000".parse().unwrap(), "https://s3.example.test")
+        .await;
+    let response = preflight_route(&test, auth, purge(), mode(), true, None, None)
+        .await
+        .unwrap();
+    assert!(response.coverage.path_style_complete);
     assert_eq!(response.targets.len(), 1);
     let target = &response.targets[0];
     assert_eq!(target.content_w3id, None);
