@@ -918,32 +918,33 @@ async fn export_or_park(
         Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
         return None;
     };
-    let capture = Box::pin(capture_outputs(
-        context, backend, fence, spec, &record, node_id,
-    ));
-    let captured = match cancel {
-        Some(cancel) => tokio::select! {
-            captured = capture => captured,
-            () = cancel.cancelled() => {
-                info!(job_id = %job_id, "Output capture stopped by a cancel");
-                Box::pin(cancel_capture(context, job_id, token, bucket)).await;
-                return None;
-            }
-        },
-        None => capture.await,
+    // The cancel path itself captures what finished before the cancel, so it is never stopped.
+    let never = CancellationToken::new();
+    let stop = cancel.unwrap_or(&never);
+    let captured = Box::pin(capture_outputs(
+        context,
+        backend,
+        fence,
+        spec,
+        &record,
+        (node_id, stop),
+    ))
+    .await;
+    // A cancelled run settles once its capture has returned, after any put cleaned up.
+    let cancelled = || async {
+        cancel.is_none_or(CancellationToken::is_cancelled)
+            || cancel_requested(context, job_id).await
     };
     match captured {
         Ok(outputs) => Some(outputs),
+        Err(error) if cancelled().await => {
+            info!(job_id = %job_id, error = ?error, "Output capture of a cancelled run stopped");
+            Box::pin(cancel_capture(context, job_id, token, bucket)).await;
+            None
+        }
         Err(error)
             if error.kind == aruna_core::structs::execution::job::JobErrorKind::Retryable =>
         {
-            if cancel.is_none_or(CancellationToken::is_cancelled)
-                || cancel_requested(context, job_id).await
-            {
-                warn!(job_id = %job_id, error = ?error, "Output capture of a cancelled run failed");
-                Box::pin(cancel_capture(context, job_id, token, bucket)).await;
-                return None;
-            }
             warn!(job_id = %job_id, error = ?error, "Output capture failed; parking");
             Box::pin(park_attempt(context, job_id, token, error)).await;
             None

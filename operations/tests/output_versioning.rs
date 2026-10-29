@@ -11,7 +11,7 @@ use aruna_compute::ExecutorBackend;
 use aruna_core::UserId;
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
-    LogTails, NOBODY, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec, UserSpec,
+    LogTails, NOBODY, OutputChunks, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec, UserSpec,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -638,7 +638,11 @@ async fn exact_version_survives() {
 }
 
 /// A terminal attempt whose declared output is one fixed byte string.
-struct StubBackend;
+/// `stall` sends half of the output, signals, and then stops sending like a stuck exec stream.
+#[derive(Default)]
+struct StubBackend {
+    stall: Option<Arc<tokio::sync::Notify>>,
+}
 
 #[async_trait::async_trait]
 impl ExecutorBackend for StubBackend {
@@ -687,11 +691,23 @@ impl ExecutorBackend for StubBackend {
         _context: &FenceContext,
         _path: &str,
     ) -> Result<TaskOutput, BackendError> {
+        let chunks: OutputChunks = match self.stall.clone() {
+            Some(sent) => {
+                let half = bytes::Bytes::from_static(&OUTPUT_BYTES[..OUTPUT_BYTES.len() / 2]);
+                let stuck = futures_util::stream::once(async move {
+                    sent.notify_one();
+                    std::future::pending::<Result<bytes::Bytes, BackendError>>().await
+                });
+                Box::pin(futures_util::stream::iter(vec![Ok(half)]).chain(stuck))
+            }
+            None => {
+                let whole = bytes::Bytes::from_static(OUTPUT_BYTES);
+                Box::pin(futures_util::stream::iter(vec![Ok(whole)]))
+            }
+        };
         Ok(TaskOutput {
             size: OUTPUT_BYTES.len() as u64,
-            chunks: Box::pin(futures_util::stream::iter(vec![Ok(
-                bytes::Bytes::from_static(OUTPUT_BYTES),
-            )])),
+            chunks,
         })
     }
     async fn reconcile(&self, _context: &FenceContext) -> ReconcileEvidence {
@@ -752,7 +768,7 @@ async fn run_capture(
         attempt_epoch: control.attempt_epoch,
         controller_generation: 1,
     };
-    let backend: Arc<dyn ExecutorBackend> = Arc::new(StubBackend);
+    let backend: Arc<dyn ExecutorBackend> = Arc::new(StubBackend::default());
 
     let mut inputs = load_direct_inputs(
         &harness.driver,
@@ -772,7 +788,7 @@ async fn run_capture(
         &fence,
         &spec,
         &record,
-        harness.node_id,
+        (harness.node_id, &CancellationToken::new()),
     )
     .await
     .unwrap()
@@ -900,7 +916,8 @@ async fn replay_skips_announce() {
         attempt_epoch: control.attempt_epoch,
         controller_generation: 1,
     };
-    let backend: Arc<dyn ExecutorBackend> = Arc::new(StubBackend);
+    let backend: Arc<dyn ExecutorBackend> = Arc::new(StubBackend::default());
+    let never = CancellationToken::new();
     let capture = || {
         capture_outputs(
             &harness.driver,
@@ -908,7 +925,7 @@ async fn replay_skips_announce() {
             &fence,
             &spec,
             &record,
-            harness.node_id,
+            (harness.node_id, &never),
         )
     };
 
@@ -939,6 +956,58 @@ async fn replay_skips_announce() {
         obligations(&harness).await.is_empty(),
         "the replay recreated a drained obligation"
     );
+}
+
+#[tokio::test]
+async fn cancel_aborts_put() {
+    // A cancel while output bytes still stream fails that put through its own stream, so it
+    // runs its cleanup instead of being dropped; a later capture writes the reserved version.
+    let harness = setup().await;
+    seed_auth(&harness).await;
+    create_bucket(&harness, RESULTS).await;
+    let pinned = put_version(&harness, b"input-bytes", None).await;
+    let mut spec = pinned_spec(&harness, pinned.version_id, InputMode::Snapshot);
+    spec.file_outputs.push(OutputSelection {
+        container_path: OUTPUT_PATH.to_string(),
+        path_prefix: None,
+        destination_node_id: Some(harness.node_id),
+        destination: OutputDestination::S3 {
+            bucket: RESULTS.to_string(),
+            key: "cancelled.txt".to_string(),
+        },
+        name: None,
+        description: None,
+    });
+    let (record, control) = seed_execution(&harness, spec.clone()).await;
+    let fence = FenceContext {
+        attempt: AttemptRef::new(record.job_id.to_string().to_lowercase(), 1),
+        attempt_epoch: control.attempt_epoch,
+        controller_generation: 1,
+    };
+    let sent = Arc::new(tokio::sync::Notify::new());
+    let stalled: Arc<dyn ExecutorBackend> = Arc::new(StubBackend {
+        stall: Some(sent.clone()),
+    });
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    // The cancel comes while the put holds half of the bytes.
+    let canceller = tokio::spawn(async move {
+        sent.notified().await;
+        stop.cancel();
+    });
+    let ids = (harness.node_id, &cancel);
+    let refused = capture_outputs(&harness.driver, &stalled, &fence, &spec, &record, ids).await;
+    canceller.await.unwrap();
+    assert!(refused.is_err());
+    assert!(!object_exists(&harness, RESULTS, "cancelled.txt").await);
+
+    let whole: Arc<dyn ExecutorBackend> = Arc::new(StubBackend::default());
+    let ids = (harness.node_id, &CancellationToken::new());
+    let written = capture_outputs(&harness.driver, &whole, &fence, &spec, &record, ids)
+        .await
+        .unwrap();
+    assert_eq!(written[0].size, OUTPUT_BYTES.len() as u64);
+    assert!(object_exists(&harness, RESULTS, "cancelled.txt").await);
 }
 
 #[tokio::test]
