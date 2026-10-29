@@ -472,6 +472,7 @@ pub(crate) async fn peer_heartbeat(state: &ServerState) {
         availability: Vec::new(),
         reservation: Default::default(),
         demand: Default::default(),
+        jobs: None,
     };
     assert!(net.record_heartbeat(node_id(PEER), heartbeat));
 }

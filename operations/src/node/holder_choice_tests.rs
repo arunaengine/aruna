@@ -66,6 +66,7 @@ fn held(seed: u8, age_ms: u64, slots: Option<DownloadSlots>) -> HeldHeartbeat {
             availability: Vec::new(),
             reservation: Default::default(),
             demand: Default::default(),
+            jobs: None,
         },
         age_ms,
         received_at_ms: 0,

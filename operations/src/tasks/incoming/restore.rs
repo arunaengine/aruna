@@ -357,6 +357,7 @@ impl OperationsTaskHandler {
                 node_id,
                 realm_id,
                 sequence,
+                Some(self.jobs_runtime.running_jobs()),
             )
             .await
             {

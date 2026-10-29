@@ -28,6 +28,17 @@ pub struct NodeHeartbeat {
     pub availability: Vec<(String, ExecutorAvailability)>,
     pub reservation: ComputeReservationSnapshot,
     pub demand: ComputeDemandSnapshot,
+    /// Background jobs the sender runs right now; `None` from a sender that predates the count.
+    /// It must stay the last field, so older peers skip it as trailing bytes.
+    pub jobs: Option<RunningJobs>,
+}
+
+/// How many leased background jobs a node runs right now. Counts only, never job details.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningJobs {
+    pub total: u32,
+    /// The staging imports among `total`.
+    pub imports: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -93,7 +104,9 @@ impl NodeHeartbeat {
         if bytes.len() > MAX_HEARTBEAT_BYTES {
             return Err(HeartbeatError::TooLarge);
         }
+        // A sender that predates `jobs` stops before it; its `None` is one zero byte.
         let heartbeat: Self = postcard::from_bytes(bytes)
+            .or_else(|_| postcard::from_bytes(&[bytes, &[0]].concat()))
             .map_err(|error| HeartbeatError::Decode(error.to_string()))?;
         heartbeat.validate()?;
         Ok(heartbeat)
@@ -145,7 +158,48 @@ mod tests {
                 epoch,
                 ..ComputeDemandSnapshot::default()
             },
+            jobs: Some(RunningJobs {
+                total: 3,
+                imports: 2,
+            }),
         }
+    }
+
+    /// The heartbeat as peers sent it before the job counts.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct EarlierHeartbeat {
+        realm_id: RealmId,
+        epoch: AdvertisementEpoch,
+        sequence: u64,
+        utilization: NodeUtilization,
+        availability: Vec<(String, ExecutorAvailability)>,
+        reservation: ComputeReservationSnapshot,
+        demand: ComputeDemandSnapshot,
+    }
+
+    fn earlier(beat: &NodeHeartbeat) -> EarlierHeartbeat {
+        EarlierHeartbeat {
+            realm_id: beat.realm_id,
+            epoch: beat.epoch,
+            sequence: beat.sequence,
+            utilization: beat.utilization,
+            availability: beat.availability.clone(),
+            reservation: beat.reservation.clone(),
+            demand: beat.demand.clone(),
+        }
+    }
+
+    #[test]
+    fn job_counts_compatible() {
+        // Peers upgrade one by one, so each side must read the other's heartbeat.
+        let beat = heartbeat(5);
+        let bytes = beat.to_bytes().unwrap();
+        let read_by_older: EarlierHeartbeat = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(read_by_older, earlier(&beat));
+
+        let from_older = postcard::to_allocvec(&earlier(&beat)).unwrap();
+        let decoded = NodeHeartbeat::from_bytes(&from_older).unwrap();
+        assert_eq!(decoded, NodeHeartbeat { jobs: None, ..beat });
     }
 
     fn availability() -> ExecutorAvailability {
