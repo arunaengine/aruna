@@ -77,9 +77,12 @@ pub(super) async fn build(
         local_only = workspace.is_none(),
         "Kubernetes executor backend enabled"
     );
+    // Pods use the in-cluster endpoint when one is set; KubeDAL keeps the public one.
+    let session = workspace.as_ref().and(kubernetes.session_endpoint.clone());
     Ok(ExecutorRegistry::new()
         .with_backend(std::sync::Arc::new(backend))
-        .with_workspace_endpoint(workspace, "eu-central-1".to_string()))
+        .with_workspace_endpoint(workspace, "eu-central-1".to_string())
+        .with_session_endpoint(session))
 }
 
 #[cfg(test)]
