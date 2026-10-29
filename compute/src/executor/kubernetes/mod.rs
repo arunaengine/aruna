@@ -909,7 +909,7 @@ impl KubernetesBackend {
             .stdout(true)
             .stderr(false)
             .max_stdout_buf_size(STREAM_BUF_BYTES);
-        let listed = async {
+        async {
             let mut attached = self
                 .pods()
                 .exec(
@@ -943,8 +943,7 @@ impl KubernetesBackend {
             join_exec(attached).await?;
             select_listed(&listing, glob)
         }
-        .await;
-        listed
+        .await
     }
 
     async fn fetch_archive(
