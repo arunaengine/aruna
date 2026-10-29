@@ -451,6 +451,7 @@ fn search_assembly_order() {
         failed_partitions: Vec::new(),
         discovery_failed: false,
         omitted_partitions: 0,
+        pending: Vec::new(),
     };
     let page = |node_id, key: Option<&str>| SearchNodePage {
         hits: key
