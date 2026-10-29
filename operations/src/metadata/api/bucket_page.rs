@@ -23,28 +23,60 @@ impl NodePosition {
     }
 }
 
-pub(super) fn decode_cursor(raw: Option<&str>) -> Result<Vec<NodePosition>, MetadataApiError> {
+/// Where every node's scan stands, and the distributed buckets already shown.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct BucketCursor {
+    pub(super) positions: Vec<NodePosition>,
+    pub(super) shown: Vec<ShownSet>,
+}
+
+/// A distributed bucket a page showed, kept while one of its members may still reach it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ShownSet {
+    pub(super) set_id: ulid::Ulid,
+    pub(super) bucket: String,
+}
+
+impl From<Vec<NodePosition>> for BucketCursor {
+    fn from(positions: Vec<NodePosition>) -> Self {
+        Self {
+            positions,
+            shown: Vec::new(),
+        }
+    }
+}
+
+pub(super) fn decode_cursor(raw: Option<&str>) -> Result<BucketCursor, MetadataApiError> {
     let invalid = || MetadataApiError::InvalidCursor("invalid bucket search cursor".to_string());
     let Some(raw) = raw else {
-        return Ok(Vec::new());
+        return Ok(BucketCursor::default());
     };
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(raw)
         .map_err(|_| invalid())?;
-    let positions: Vec<NodePosition> = postcard::from_bytes(&bytes).map_err(|_| invalid())?;
-    if (positions.iter()).any(|entry| NodeId::from_bytes(&entry.node_id).is_err()) {
+    let cursor: BucketCursor = postcard::from_bytes(&bytes).map_err(|_| invalid())?;
+    if (cursor.positions.iter()).any(|entry| NodeId::from_bytes(&entry.node_id).is_err()) {
         return Err(invalid());
     }
-    Ok(positions)
+    Ok(cursor)
 }
 
 /// `None` once every node reached its end.
-pub(super) fn encode_cursor(positions: &[NodePosition]) -> Option<String> {
-    if positions.iter().all(|entry| entry.done) {
+pub(super) fn encode_cursor(cursor: &BucketCursor) -> Option<String> {
+    if cursor.positions.iter().all(|entry| entry.done) {
         return None;
     }
-    let bytes = postcard::to_allocvec(positions).ok()?;
+    let bytes = postcard::to_allocvec(cursor).ok()?;
     Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Whether a node at `position` may still reach `bucket`: it is not done, and its position is
+/// sealed, so unknown, or a bucket name before it.
+fn may_reach(position: &NodePosition, bucket: &str) -> bool {
+    !position.done
+        && position.after.as_deref().is_none_or(|after| {
+            crate::s3::object::search::sealed_position(after) || after < bucket.as_bytes()
+        })
 }
 
 /// The nodes whose scan ended because the cursor's position no longer opens there.
@@ -58,13 +90,18 @@ pub(super) fn retired_nodes(parts: &[(NodeId, BucketPage)]) -> Vec<NodeId> {
 /// node with fewer than `limit` hits, all shown and an uncut scan, is done. A failed node keeps
 /// its position, a node left out by the fanout cap is kept for a later page, done nodes stay
 /// done, and other nodes this page did not ask are dropped from the cursor. A distributed bucket
-/// shows once: its other members count as given, so their nodes move past it too.
+/// shows once: its other members count as given, so their nodes move past it too, and the
+/// cursor remembers it while a member may still reach it on a later page.
 pub(super) fn merge_pages(
     parts: Vec<(NodeId, BucketPage)>,
     (failed, omitted): (&[NodeId], &[NodeId]),
-    mut positions: Vec<NodePosition>,
+    cursor: BucketCursor,
     limit: usize,
-) -> (Vec<BucketSearchHit>, Vec<NodePosition>) {
+) -> (Vec<BucketSearchHit>, BucketCursor) {
+    let BucketCursor {
+        mut positions,
+        mut shown,
+    } = cursor;
     let mut hits: Vec<_> = (parts.iter())
         .flat_map(|(_, page)| page.hits.clone())
         .collect();
@@ -73,17 +110,17 @@ pub(super) fn merge_pages(
         (&left.bucket, node(left)).cmp(&(&right.bucket, node(right)))
     });
     // Members of one distributed bucket answer alike, so the first one stands for the set.
-    let mut sets = std::collections::HashSet::new();
-    let mut shown = Vec::with_capacity(limit);
+    let mut sets: std::collections::HashSet<_> = shown.iter().map(|set| set.set_id).collect();
+    let mut page = Vec::with_capacity(limit);
     let mut given_hits = Vec::new();
     for hit in hits {
         let repeat = hit.set_id.is_some_and(|set_id| sets.contains(&set_id));
-        if !repeat && shown.len() == limit {
+        if !repeat && page.len() == limit {
             continue;
         }
         if !repeat {
             sets.extend(hit.set_id);
-            shown.push(hit.clone());
+            page.push(hit.clone());
         }
         given_hits.push(hit);
     }
@@ -123,7 +160,16 @@ pub(super) fn merge_pages(
         entry.done |=
             given.retired || (given.scanned_to.is_none() && given.hits.len() < limit && all_shown);
     }
-    (shown, positions)
+    shown.extend(page.iter().filter_map(|hit| {
+        let set_id = hit.set_id?;
+        Some(ShownSet {
+            set_id,
+            bucket: hit.bucket.clone(),
+        })
+    }));
+    shown.retain(|set| (positions.iter()).any(|position| may_reach(position, &set.bucket)));
+    let cursor = BucketCursor { positions, shown };
+    (page, cursor)
 }
 
 #[cfg(test)]
@@ -193,7 +239,7 @@ mod tests {
         let mut cursor: Option<String> = None;
         loop {
             let positions = decode_cursor(cursor.as_deref()).unwrap();
-            let parts = page(&stores, &positions, 3);
+            let parts = page(&stores, &positions.positions, 3);
             let (hits, positions) = merge_pages(parts, (&[], &[]), positions, 3);
             assert!(hits.len() <= 3);
             seen.extend(hits.into_iter().map(|hit| hit.bucket));
@@ -228,12 +274,12 @@ mod tests {
             )
         });
 
-        let (hits, positions) = merge_pages(parts.to_vec(), (&[], &[]), Vec::new(), 10);
+        let (hits, positions) = merge_pages(parts.to_vec(), (&[], &[]), Default::default(), 10);
 
         let names: Vec<_> = hits.iter().map(|hit| hit.bucket.as_str()).collect();
         assert_eq!(names.iter().filter(|name| **name == "refseq").count(), 1);
         assert_eq!(hits.len(), 3);
-        assert!(positions.iter().all(|entry| entry.done));
+        assert!(positions.positions.iter().all(|entry| entry.done));
     }
 
     // With one hit per page, two members of one set still show the bucket only once.
@@ -248,7 +294,7 @@ mod tests {
         let mut cursor: Option<String> = None;
         loop {
             let positions = decode_cursor(cursor.as_deref()).unwrap();
-            let mut parts = page(&stores, &positions, 1);
+            let mut parts = page(&stores, &positions.positions, 1);
             for (_, page) in &mut parts {
                 for hit in &mut page.hits {
                     hit.set_id = (hit.bucket == "refseq").then_some(set_id);
@@ -265,15 +311,61 @@ mod tests {
         assert_eq!(seen, ["a", "refseq", "z"]);
     }
 
+    // A member whose scan was cut before a shown distributed bucket reaches it on a later
+    // page; the cursor still knows the set, so the bucket shows once.
+    #[test]
+    fn remembers_shown_sets() {
+        let set_id = ulid::Ulid::from_bytes([7; 16]);
+        let member = |node_id| BucketSearchHit {
+            set_id: Some(set_id),
+            ..hit("refseq", node_id)
+        };
+        let sealed = crate::s3::object::search::seal_position(b"bucket-key").unwrap();
+        let first = vec![
+            (
+                node(1),
+                BucketPage {
+                    hits: vec![member(node(1))],
+                    ..BucketPage::default()
+                },
+            ),
+            (
+                node(2),
+                BucketPage {
+                    scanned_to: Some(sealed),
+                    ..BucketPage::default()
+                },
+            ),
+        ];
+        let (hits, cursor) = merge_pages(first, (&[], &[]), Default::default(), 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(cursor.shown.len(), 1);
+        let cursor = decode_cursor(encode_cursor(&cursor).as_deref()).unwrap();
+
+        let second = vec![(
+            node(2),
+            BucketPage {
+                hits: vec![member(node(2)), hit("z", node(2))],
+                ..BucketPage::default()
+            },
+        )];
+        let (hits, cursor) = merge_pages(second, (&[], &[]), cursor, 5);
+        let names: Vec<_> = hits.iter().map(|hit| hit.bucket.as_str()).collect();
+        assert_eq!(names, ["z"]);
+        // Every member is past the bucket now, so the cursor forgets it.
+        assert!(cursor.shown.is_empty());
+    }
+
     #[test]
     fn failed_node_resumes() {
         let stores = [(node(1), vec!["a", "b"])];
-        let (hits, positions) = merge_pages(Vec::new(), (&[node(1)], &[]), Vec::new(), 5);
+        let (hits, positions) = merge_pages(Vec::new(), (&[node(1)], &[]), Default::default(), 5);
         assert!(hits.is_empty());
         // The failed node is asked again from its start on the next page.
         let cursor = encode_cursor(&positions).expect("a failed node keeps the listing open");
         let positions = decode_cursor(Some(&cursor)).unwrap();
-        let (hits, positions) = merge_pages(page(&stores, &positions, 5), (&[], &[]), positions, 5);
+        let parts = page(&stores, &positions.positions, 5);
+        let (hits, positions) = merge_pages(parts, (&[], &[]), positions, 5);
         assert_eq!(hits.len(), 2);
         assert_eq!(encode_cursor(&positions), None);
         assert!(decode_cursor(Some("not a cursor")).is_err());
@@ -289,9 +381,10 @@ mod tests {
         };
         let stores = [(node(1), vec!["a"])];
         let positions = vec![gone];
-        let (hits, positions) = merge_pages(page(&stores, &positions, 5), (&[], &[]), positions, 5);
+        let parts = page(&stores, &positions, 5);
+        let (hits, positions) = merge_pages(parts, (&[], &[]), positions.into(), 5);
         assert_eq!(hits.len(), 1);
-        assert!(NodePosition::of(&positions, node(9)).is_none());
+        assert!(NodePosition::of(&positions.positions, node(9)).is_none());
         assert_eq!(encode_cursor(&positions), None);
         // A failed node that is still a member keeps its position for the next page.
         let failed = NodePosition {
@@ -299,8 +392,9 @@ mod tests {
             after: Some(b"c".to_vec()),
             done: false,
         };
-        let (_, positions) = merge_pages(Vec::new(), (&[node(2)], &[]), vec![failed.clone()], 5);
-        assert_eq!(positions, [failed]);
+        let positions = vec![failed.clone()].into();
+        let (_, positions) = merge_pages(Vec::new(), (&[node(2)], &[]), positions, 5);
+        assert_eq!(positions.positions, [failed]);
     }
 
     #[test]
@@ -311,9 +405,10 @@ mod tests {
             scanned_to: Some(b"k".to_vec()),
             retired: false,
         };
-        let (hits, positions) = merge_pages(vec![(node(1), cut)], (&[], &[]), Vec::new(), 5);
+        let parts = vec![(node(1), cut)];
+        let (hits, positions) = merge_pages(parts, (&[], &[]), Default::default(), 5);
         assert_eq!(hits.len(), 1);
-        let entry = NodePosition::of(&positions, node(1)).unwrap();
+        let entry = NodePosition::of(&positions.positions, node(1)).unwrap();
         assert_eq!(
             (entry.after.as_deref(), entry.done),
             (Some(&b"k"[..]), false)
@@ -325,9 +420,10 @@ mod tests {
             done: true,
         };
         let parts = vec![(node(1), BucketPage::default())];
-        let (_, positions) = merge_pages(parts, (&[], &[node(2)]), vec![done.clone()], 5);
-        assert!(NodePosition::of(&positions, node(2)).is_some_and(|entry| !entry.done));
-        assert_eq!(NodePosition::of(&positions, node(3)), Some(&done));
+        let (_, positions) = merge_pages(parts, (&[], &[node(2)]), vec![done.clone()].into(), 5);
+        let left = &positions.positions;
+        assert!(NodePosition::of(left, node(2)).is_some_and(|entry| !entry.done));
+        assert_eq!(NodePosition::of(left, node(3)), Some(&done));
         let cursor = encode_cursor(&positions).expect("the left-out node keeps the listing open");
         assert_eq!(decode_cursor(Some(&cursor)).unwrap(), positions);
     }
@@ -344,6 +440,7 @@ mod tests {
                 done: false,
             })
             .collect();
+        let positions: BucketCursor = positions.into();
         let cursor = encode_cursor(&positions).unwrap();
         assert!(cursor.len() > 16 * 1024);
         assert_eq!(decode_cursor(Some(&cursor)).unwrap(), positions);
@@ -364,9 +461,9 @@ mod tests {
         };
         let parts = vec![(node(1), retired)];
         assert_eq!(retired_nodes(&parts), [node(1)]);
-        let (hits, positions) = merge_pages(parts, (&[], &[]), vec![stale], 5);
+        let (hits, positions) = merge_pages(parts, (&[], &[]), vec![stale].into(), 5);
         assert!(hits.is_empty());
-        assert!(NodePosition::of(&positions, node(1)).is_some_and(|entry| entry.done));
+        assert!(NodePosition::of(&positions.positions, node(1)).is_some_and(|entry| entry.done));
         assert_eq!(encode_cursor(&positions), None);
     }
 }
