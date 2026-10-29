@@ -1818,11 +1818,19 @@ impl GetObjectOperation {
                 let Some(head_metadata) = self.source_metadata.as_ref() else {
                     return self.emit_error(GetObjectError::GetObjectFailed);
                 };
-                if head_metadata.compare(&metadata) == ObservationMatch::Changed {
+                let comparison = head_metadata.compare(&metadata);
+                if comparison == ObservationMatch::Changed {
                     if self.reference_explicit {
                         return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                     }
                     return self.restart_after_conflict();
+                }
+                // Without digests, only the read's own validators prove a pinned version.
+                if comparison == ObservationMatch::Unknown
+                    && self.reference_explicit
+                    && self.verify_digests.is_empty()
+                {
+                    return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                 }
                 self.advance_observation = None;
                 // `last_refresh` was set by the head handler from the drift check.

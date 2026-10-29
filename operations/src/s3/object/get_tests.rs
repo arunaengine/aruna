@@ -2039,6 +2039,40 @@ fn unbound_pin_served() {
     assert_eq!(operation.state, GetObjectState::ReadReferenceSource);
 }
 
+// A pinned version without digests is refused when the read itself does not prove it: other
+// bytes than the HEAD's, or no validator in the GET's answer.
+#[test]
+fn unproven_pin_refused() {
+    for read in [
+        observation(10),
+        SourceMetadata {
+            etag: None,
+            ..observation(9)
+        },
+    ] {
+        let mut operation = drifted_operation();
+        operation.reference_explicit = true;
+        operation.source_metadata = Some(observation(9));
+        operation.state = GetObjectState::ReadReferenceSource;
+
+        operation.step(source_read(read));
+
+        assert_eq!(
+            operation.finalize(),
+            Err(GetObjectError::HistoricalReferenceUnavailable)
+        );
+    }
+
+    // The same validators in the GET serve the pin.
+    let mut operation = drifted_operation();
+    operation.reference_explicit = true;
+    operation.source_metadata = Some(observation(9));
+    operation.state = GetObjectState::ReadReferenceSource;
+    let effects = operation.step(source_read(observation(9)));
+    assert!(effects.is_empty());
+    assert_eq!(operation.state, GetObjectState::Finish);
+}
+
 // A bound read whose condition fails queues a request to observe the source, which the refresh
 // worker retries until it records the change; the read itself fails as changed.
 #[test]
