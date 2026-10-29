@@ -285,6 +285,7 @@ async fn create_token(
             restrictions,
             via: None,
             auth_time: None,
+            cutoff: None,
         }),
         &state.get_ctx(),
     )

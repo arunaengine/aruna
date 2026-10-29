@@ -41,7 +41,7 @@ use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };
-use aruna_operations::session::{CreateSessionConfig, CreateSessionError, CreateSessionOperation};
+use aruna_operations::session::{CreateSessionConfig, CreateSessionError, create_making_room};
 use aruna_operations::users::get_oidc::{GetOidcInput, GetOidcOperation};
 use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
@@ -111,6 +111,12 @@ pub struct GetUserResponse {
     pub name: String,
     pub subject_ids: Vec<String>,
     pub attributes: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TokenQuery {
+    /// Shorter token lifetime in seconds; at most 24 hours.
+    pub expires_in_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -332,29 +338,28 @@ async fn issue_user_session(
     restrictions: Option<Vec<PathRestriction>>,
     auth_time: Option<u64>,
 ) -> ServerResult<String> {
-    let created = drive(
-        CreateSessionOperation::new(CreateSessionConfig {
-            time: now_timestamp(),
-            expiry,
-            user_id,
-            realm_id: state.get_realm_id(),
-            node_capabilities: state.node_capabilities().clone(),
-            kind,
-            label: None,
-            name: None,
-            restrictions,
-            via: None,
-            auth_time,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| match err {
-        CreateSessionError::LimitReached => {
-            ServerError::Conflict("active session limit reached".to_string())
-        }
-        error => ServerError::InternalError(error.to_string()),
-    })?;
+    let config = CreateSessionConfig {
+        time: now_timestamp(),
+        expiry,
+        user_id,
+        realm_id: state.get_realm_id(),
+        node_capabilities: state.node_capabilities().clone(),
+        kind,
+        label: None,
+        name: None,
+        restrictions,
+        via: None,
+        auth_time,
+        cutoff: None,
+    };
+    let created = create_making_room(&state.get_ctx(), state.get_node_id(), config)
+        .await
+        .map_err(|err| match err {
+            CreateSessionError::LimitReached { .. } => {
+                ServerError::Conflict("active session limit reached".to_string())
+            }
+            error => ServerError::InternalError(error.to_string()),
+        })?;
     Ok(created.token.expose().to_string())
 }
 
@@ -711,7 +716,7 @@ async fn register_user(
     path = "/access/token",
     tag = "access/tokens",
     summary = "Issue a realm bearer token",
-    description = r#"Mints a realm bearer token for the calling user, valid for 24 hours.
+    description = r#"Mints a realm bearer token for the calling user, valid for 24 hours or `expires_in_seconds`.
 
 **Authentication**: a realm bearer token, which refreshes itself, or an
 OIDC token from a configured issuer whose subject has been registered at
@@ -726,7 +731,9 @@ somebody else.
 - The token is returned in this response only, so a lost one has to be reissued here.
 
 **Limits**
-- Issuance prunes expired and revoked sessions first and refuses when 256 active ones remain."#,
+- At most 256 active sessions per user. Issuance prunes expired and revoked sessions first; when
+  256 active ones remain, the user's oldest sessions are signed out to make room."#,
+    params(("expires_in_seconds" = Option<u64>, Query, description = "Token lifetime in seconds, 1 to 86400; defaults to 86400")),
     responses(
         (
             status = 200,
@@ -738,7 +745,8 @@ somebody else.
         ),
         (status = 401, description = "Missing or invalid bearer token, or this node knows no user for the presented OIDC subject", body = ErrorResponse),
         (status = 403, description = "The user is deactivated, an alias of the canonical user of that OIDC subject, or the caller holds a federated session", body = ErrorResponse),
-        (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
+        (status = 400, description = "`expires_in_seconds` is 0", body = ErrorResponse),
+        (status = 409, description = "No room could be made for another session", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -746,6 +754,7 @@ async fn get_token(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<TokenQuery>,
 ) -> ServerResult<(StatusCode, Json<GetTokenResponse>)> {
     let (user_id, kind, restrictions, auth_time) = match auth {
         Some(aruna_ctx) => {
@@ -791,9 +800,13 @@ async fn get_token(
     };
 
     ensure_active(&state, user_id).await?;
-    let expiry = now_timestamp()
-        .checked_add(TOKEN_EXPIRY_SECONDS)
-        .ok_or_else(|| ServerError::InternalError("token expiry overflow".to_string()))?;
+    let now = now_timestamp();
+    let expiry = aruna_operations::session::bound_session_expiry(
+        now,
+        query.expires_in_seconds,
+        now.saturating_add(TOKEN_EXPIRY_SECONDS),
+    )
+    .map_err(crate::routes::access::sessions::map_create_error)?;
     let token = issue_user_session(&state, user_id, expiry, kind, restrictions, auth_time).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
