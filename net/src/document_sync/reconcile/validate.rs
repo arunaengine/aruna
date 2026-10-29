@@ -1489,6 +1489,13 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("node display name is not a valid name".to_string());
             }
         }
+        AdminDocumentOperation::NodePlaceSet {
+            place: Some(place), ..
+        } => {
+            if !place.valid() {
+                return Err("node place is empty or not valid".to_string());
+            }
+        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1708,6 +1715,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::ConfigPortalSet { .. }
         | AdminDocumentOperation::ConfigReplicasSet { .. }
         | AdminDocumentOperation::NodeNameSet { .. }
+        | AdminDocumentOperation::NodePlaceSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
         AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };

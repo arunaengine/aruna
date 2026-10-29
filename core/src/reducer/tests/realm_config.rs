@@ -810,3 +810,53 @@ fn node_name_sets_clears() {
     assert!(state.materialized_node_names().is_empty());
     assert!(state.materialized_config_nodes().is_empty());
 }
+
+#[test]
+fn node_place_sets_clears() {
+    use crate::structs::identity::realm::{NodeCoordinates, NodePlace};
+    let mut state = realm_config_state();
+    let place = NodePlace {
+        name: Some("Giessen".to_string()),
+        coordinates: NodeCoordinates::from_degrees(50.58, 8.68),
+    };
+    let placed = AdminDocumentOperation::NodePlaceSet {
+        node_id: node(12),
+        place: Some(place.clone()),
+    };
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            placed,
+        ))
+        .unwrap();
+    assert_eq!(
+        state.materialized_node_places(),
+        BTreeMap::from([(node(12), place)])
+    );
+    assert!(
+        state.materialized_node_names().is_empty(),
+        "names keep their own path"
+    );
+
+    // A place nobody could store is refused before it reaches the state.
+    let invalid = AdminDocumentOperation::NodePlaceSet {
+        node_id: node(12),
+        place: Some(NodePlace::default()),
+    };
+    let observed = state.clock.clone();
+    let refused = state.apply(&realm_config_event(2, node(1), 2, observed, invalid));
+    assert_eq!(refused, Err(AdminDocumentError::InvalidNodePlace));
+
+    let cleared = AdminDocumentOperation::NodePlaceSet {
+        node_id: node(12),
+        place: None,
+    };
+    let observed = state.clock.clone();
+    state
+        .apply(&realm_config_event(3, node(1), 3, observed, cleared))
+        .unwrap();
+    assert!(state.materialized_node_places().is_empty());
+}

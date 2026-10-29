@@ -20,7 +20,7 @@ use crate::admin_documents::{
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained, valid_token_hash};
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::realm::{
-    MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmConfigDocument,
+    MetadataReplicationConfig, NodePlace, OidcProviderConfig, QuotaConfig, RealmConfigDocument,
     RealmDiscoveryConfig, RealmId, RealmNodeKind, ReplicaQuota,
 };
 use crate::structs::placement::compute_config::RealmComputeConfig;
@@ -111,6 +111,8 @@ pub enum AdminDocumentError {
     Distribution(#[from] crate::structs::storage::distribution::DistributionError),
     #[error("publisher cutoffs repeat a set or exceed their bound")]
     InvalidCutoffs,
+    #[error("node place is empty, or its name or coordinates are invalid")]
+    InvalidNodePlace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

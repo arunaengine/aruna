@@ -114,6 +114,7 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
             vec![CONFIG_REPLICAS_PATH.to_string()]
         }
         AdminDocumentOperation::NodeNameSet { node_id, .. } => vec![node_name_path(node_id)],
+        AdminDocumentOperation::NodePlaceSet { node_id, .. } => vec![node_place_path(node_id)],
         AdminDocumentOperation::ConfigPoliciesSet { .. } => {
             vec![CONFIG_POLICIES_PATH.to_string()]
         }
@@ -271,6 +272,10 @@ pub fn publisher_cutoffs_path(node_id: &NodeId) -> String {
 
 pub fn node_name_path(node_id: &NodeId) -> String {
     format!("realm_config.node_names.{node_id}")
+}
+
+pub fn node_place_path(node_id: &NodeId) -> String {
+    format!("realm_config.node_places.{node_id}")
 }
 
 pub fn config_oidc_path(provider_id: &str) -> String {

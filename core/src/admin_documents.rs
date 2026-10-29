@@ -408,6 +408,12 @@ pub enum AdminDocumentOperation {
         node_id: NodeId,
         display_name: Option<String>,
     },
+    /// Sets or clears where a node is shown on a map; like its display name, presentation only.
+    #[serde(rename = "RealmConfigNodePlaceSet")]
+    NodePlaceSet {
+        node_id: NodeId,
+        place: Option<crate::structs::identity::realm::NodePlace>,
+    },
 }
 
 impl AdminDocumentOperation {
@@ -697,6 +703,15 @@ mod tests {
         let replicas_tag = postcard::to_allocvec(&replicas).unwrap()[0];
         assert_eq!(postcard::to_allocvec(&named).unwrap()[0], replicas_tag + 1);
         assert_eq!(postcard_roundtrip(named.clone()), named);
+        let placed = AdminDocumentOperation::NodePlaceSet {
+            node_id: node(1),
+            place: Some(crate::structs::identity::realm::NodePlace {
+                name: Some("Giessen".to_string()),
+                coordinates: None,
+            }),
+        };
+        assert_eq!(postcard::to_allocvec(&placed).unwrap()[0], replicas_tag + 2);
+        assert_eq!(postcard_roundtrip(placed.clone()), placed);
     }
 
     fn placement_entry(node_id: NodeId) -> NodePlacementEntry {

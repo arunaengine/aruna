@@ -62,7 +62,16 @@ impl AdminDocumentState {
             AdminDocumentOperation::NodeNameSet {
                 node_id,
                 display_name,
-            } => self.apply_node_name(event, node_id, display_name.clone()),
+            } => self.apply_node_value(event, node_name_path(node_id), display_name.clone()),
+            AdminDocumentOperation::NodePlaceSet { node_id, place } => {
+                if place.as_ref().is_some_and(|place| !place.valid()) {
+                    return Err(AdminDocumentError::InvalidNodePlace);
+                }
+                let value = (place.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidNodePlace)?;
+                self.apply_node_value(event, node_place_path(node_id), value);
+            }
             AdminDocumentOperation::ConfigPoliciesSet { policies } => {
                 self.apply_config_setting(event, CONFIG_POLICIES_PATH, policies_value(policies));
             }
