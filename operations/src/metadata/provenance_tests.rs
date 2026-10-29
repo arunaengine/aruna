@@ -308,6 +308,19 @@ fn unwritten_run_status() {
     let entity = node(&document, &format!("#run-{run_id}"));
     assert_eq!(entity["creativeWorkStatus"], "RunRecordDenied");
     assert_eq!(entity["description"], "metadata write access denied");
+
+    // A crate that is still being written says so, not that the record is hidden.
+    let mut built = ProvenanceCrate::new(&output, "2026-10-27T12:00:00Z").unwrap();
+    assert!(built.unwritten(&run, "pending", None));
+    let document = root(built);
+    let entity = node(&document, &format!("#run-{run_id}"));
+    assert_eq!(entity["creativeWorkStatus"], "RunRecordPending");
+    assert!(
+        entity["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("The run record is still being written")
+    );
 }
 
 #[test]

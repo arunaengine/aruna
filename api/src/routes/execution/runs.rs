@@ -63,8 +63,8 @@ restrictions; anyone else needs READ on the run crate with their own token.
   node relays the call there with the caller's token.
 - Runs made before links were kept answer only while their job record exists.
 - A caller who may not see the run gets 404, as for job reads.
-- The submitter also gets `run_crate_status`, so a crate that was denied, failed or is kept
-  on a device says why instead of only being absent.
+- The submitter also gets `run_crate_status`, so a crate that is still being written
+  (`pending`), was denied, failed or is kept on a device says why instead of only being absent.
 
 **Limits**
 - One run per call."#,

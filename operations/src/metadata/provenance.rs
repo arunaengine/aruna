@@ -327,6 +327,7 @@ impl ProvenanceCrate {
             "denied" => "RunRecordDenied",
             "failed" => "RunRecordFailed",
             "local" => "RunRecordLocal",
+            "pending" => "RunRecordPending",
             _ => return false,
         };
         self.run(hop, None);
@@ -337,6 +338,7 @@ impl ProvenanceCrate {
         self.add_text(&key, "creativeWorkStatus", state);
         let text = match status {
             "local" => "The run record is kept on the device that ran it",
+            "pending" => "The run record is still being written; export again in a few minutes",
             _ => message.unwrap_or("The run record was not written"),
         };
         self.add_text(&key, "description", text);
