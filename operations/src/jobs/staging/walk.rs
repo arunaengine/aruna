@@ -61,7 +61,8 @@ use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 /// Entries one listing request reads.
 const STAGING_PAGE_SIZE: usize = 1000;
 /// Entries a flat reference walk gathers from several listings into one page transaction.
-const COMMIT_ENTRIES: usize = 5000;
+/// Its commit holds the single storage writer, so other requests wait for it: keep it short.
+const COMMIT_ENTRIES: usize = 2000;
 /// Bytes of listed source paths one gathered page holds at most.
 const COMMIT_PATH_BYTES: usize = 4 << 20;
 /// Snapshot pages copy every file before their checkpoint, so they stay smaller.
