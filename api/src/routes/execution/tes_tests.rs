@@ -1187,6 +1187,53 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
 }
 
 #[test]
+fn family_pins_inputs() {
+    // A realm task reports a local input as the exact version captured at accept.
+    let mut report = family_fixture();
+    let (holder, version) = (node_id(), Ulid::from_bytes([31u8; 16]));
+    report.spec.payload.inputs = vec![InputSelection {
+        source: InputSource::S3 {
+            bucket: "work".to_string(),
+            key: "dir/a.txt".to_string(),
+            version_id: None,
+        },
+        source_node_id: None,
+        dest_key: "dir/a.txt".to_string(),
+        mode: InputMode::Mount,
+        container_path: Some("/in/a.txt".to_string()),
+        name: None,
+        description: None,
+    }];
+    report.spec.captured_inputs = vec![aruna_core::structs::execution::job::CapturedInput {
+        destination_key: "dir/a.txt".to_string(),
+        source_node_id: holder,
+        version_id: version,
+        content: aruna_core::structs::execution::job::InputContent::Blake3([1; 32]),
+        bytes: 1,
+        policies: Vec::new(),
+        source_group_id: Ulid::from_bytes([5u8; 16]),
+        public: false,
+        link: None,
+        source_pin: None,
+        database: None,
+        releases: Vec::new(),
+        releases_complete: false,
+        grant: None,
+    }];
+    let task = project_task(
+        &family_record(&report),
+        &TaskDetails::from_report(&report),
+        TesView::Basic,
+        ("http://x", realm()),
+    );
+    let arn = VersionedObjectArn::new(realm(), holder, "work", "dir/a.txt", version).unwrap();
+    assert_eq!(
+        task.inputs[0].url.as_deref(),
+        Some(arn.to_string().as_str())
+    );
+}
+
+#[test]
 fn family_preserves_versions() {
     // TES preserves canonical output versions and reports none before canonical success.
     use aruna_core::structs::execution::job::LogicalJobState;
