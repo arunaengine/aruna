@@ -275,11 +275,11 @@ pub struct BucketHit {
     pub group_id: String,
     pub group_name: Option<String>,
     pub created_at: String,
-    /// The distributed bucket this hit is a member of; absent for an ordinary bucket. Hits of one
-    /// set on several nodes are one bucket.
+    /// The distributed bucket this hit is a member of; absent for an ordinary bucket. A page shows
+    /// one member of a set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set_id: Option<String>,
-    /// The bucket's metadata, in a `database=true` search only.
+    /// The bucket's current metadata, if it has any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<crate::routes::storage::bucket_metadata::BucketMetadataBody>,
     /// Anyone, also without a login, may read the bucket; in a `database=true` search only.
@@ -396,11 +396,12 @@ to its own buckets, so a bucket the caller may not read never appears.
 - The search fans out over the realm's serving nodes under one shared deadline of about 12 seconds.
 - An empty or missing `q` lists every bucket the caller may read; `group_id` keeps only the
   buckets of that group.
+- Every hit carries the bucket's current `metadata`, if it has any.
 - `database=true` keeps only buckets whose current metadata marks them as a database, across
-  groups, and adds that `metadata` and `public` (readable without a login) to each hit. This is
-  how clients find databases; there is no separate database list.
-- A member of a distributed bucket carries its `set_id`; every member node answers its own hit,
-  so hits with one `set_id` are one bucket.
+  groups, and adds `public` (readable without a login) to each hit. This is how clients find
+  databases; there is no separate database list.
+- A distributed bucket carries its `set_id` and shows once per page, as the member node that
+  sorts first; a page boundary between two members may show it again on the next page.
 - Hits are ordered by bucket name, then node id. `next_cursor` continues the listing and is absent
   on the last page. It is opaque, holds a scan position per node and is only valid with the same
   `q` and `group_id`; every page checks authorization again.
@@ -425,7 +426,7 @@ to its own buckets, so a bucket the caller may not read never appears.
         ("group_id" = Option<String>, Query, description = "Only buckets of this group, as a 26-character ULID"),
         ("limit" = Option<usize>, Query, description = "Maximum number of merged hits (default 10, clamped to 1..=50)"),
         ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` of the previous page, with the same `q`, `group_id` and `database`"),
-        ("database" = Option<bool>, Query, description = "Only buckets whose metadata marks them as a database; hits then carry `metadata` and `public`")
+        ("database" = Option<bool>, Query, description = "Only buckets whose metadata marks them as a database; hits then carry `public`")
     ),
     responses(
         (

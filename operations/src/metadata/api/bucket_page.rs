@@ -57,7 +57,8 @@ pub(super) fn retired_nodes(parts: &[(NodeId, BucketPage)]) -> Vec<NodeId> {
 /// its hits on this page, or past its scan when it showed every hit and its scan was cut. A
 /// node with fewer than `limit` hits, all shown and an uncut scan, is done. A failed node keeps
 /// its position, a node left out by the fanout cap is kept for a later page, done nodes stay
-/// done, and other nodes this page did not ask are dropped from the cursor.
+/// done, and other nodes this page did not ask are dropped from the cursor. A distributed bucket
+/// shows once.
 pub(super) fn merge_pages(
     parts: Vec<(NodeId, BucketPage)>,
     (failed, omitted): (&[NodeId], &[NodeId]),
@@ -106,6 +107,9 @@ pub(super) fn merge_pages(
         entry.done |=
             given.retired || (given.scanned_to.is_none() && given.hits.len() < limit && all_shown);
     }
+    // Members of one distributed bucket answer alike, so the first one stands for the set.
+    let mut sets = std::collections::HashSet::new();
+    hits.retain(|hit| hit.set_id.is_none_or(|set_id| sets.insert(set_id)));
     (hits, positions)
 }
 
@@ -186,6 +190,37 @@ mod tests {
             }
         }
         assert_eq!(seen, ["a", "b", "c", "d", "e", "g"]);
+    }
+
+    // Two members of one set answer the same bucket; the page shows it once, and both
+    // nodes still move past it.
+    #[test]
+    fn folds_set_members() {
+        let set_id = ulid::Ulid::from_bytes([7; 16]);
+        let member = |node_id| BucketSearchHit {
+            set_id: Some(set_id),
+            ..hit("refseq", node_id)
+        };
+        let parts = [node(1), node(2)].map(|node_id| {
+            let hits = vec![
+                member(node_id),
+                hit(&format!("own-{}", node_id.fmt_short()), node_id),
+            ];
+            (
+                node_id,
+                BucketPage {
+                    hits,
+                    ..BucketPage::default()
+                },
+            )
+        });
+
+        let (hits, positions) = merge_pages(parts.to_vec(), (&[], &[]), Vec::new(), 10);
+
+        let names: Vec<_> = hits.iter().map(|hit| hit.bucket.as_str()).collect();
+        assert_eq!(names.iter().filter(|name| **name == "refseq").count(), 1);
+        assert_eq!(hits.len(), 3);
+        assert!(positions.iter().all(|entry| entry.done));
     }
 
     #[test]
