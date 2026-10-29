@@ -53,7 +53,8 @@ use manifest::{
     HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_node_manifest, data_pv_manifest,
     data_pvc_manifest, helper_name, helper_pod, job_manifest, marker_manifest, marker_name,
     mount_buckets, mount_pv_manifest, mount_pvc_manifest, needs_workspace, network_policies,
-    policy_manifests, pvc_manifest, secret_manifest, secret_name, session_mount, workspace_name,
+    policy_manifests, pvc_manifest, secret_manifest, secret_name, session_mount,
+    session_node_manifest, workspace_name,
 };
 use status::{
     job_pending, job_status, pod_started, pod_stuck_reason, task_started, task_state,
@@ -235,35 +236,45 @@ impl KubernetesBackend {
     ) -> Result<(), BackendError> {
         for (index, bucket) in mount_buckets(layout).iter().enumerate() {
             let value = data_node_manifest(context, &self.config, index, bucket)?;
-            let node: DynamicObject = serde_json::from_value(value)
-                .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
-            let name = node.name_any();
-            match self
-                .data_nodes()
-                .create(&PostParams::default(), &node)
-                .await
-            {
-                Ok(_) => {}
-                Err(error) if api_code(&error) == Some(409) => {
-                    let existing = self.data_nodes().get(&name).await.map_err(kube_error)?;
-                    let epoch = existing
-                        .metadata
-                        .annotations
-                        .as_ref()
-                        .and_then(|annotations| annotations.get(EPOCH_ANNOTATION))
-                        .and_then(|epoch| epoch.parse::<u64>().ok());
-                    let same = epoch == Some(context.attempt_epoch)
-                        && existing.data["spec"]["config"]["bucket"].as_str() == Some(bucket);
-                    if !same {
-                        return Err(BackendError::Conflict(format!(
-                            "DataNode `{name}` belongs to another attempt"
-                        )));
-                    }
-                }
-                Err(error) => return Err(kube_error(error)),
-            }
+            self.ensure_data_node(context, value, bucket).await?;
         }
         Ok(())
+    }
+
+    async fn ensure_data_node(
+        &self,
+        context: &FenceContext,
+        value: Value,
+        bucket: &str,
+    ) -> Result<(), BackendError> {
+        let node: DynamicObject = serde_json::from_value(value)
+            .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
+        let name = node.name_any();
+        match self
+            .data_nodes()
+            .create(&PostParams::default(), &node)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if api_code(&error) == Some(409) => {
+                let existing = self.data_nodes().get(&name).await.map_err(kube_error)?;
+                let epoch = existing
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(EPOCH_ANNOTATION))
+                    .and_then(|epoch| epoch.parse::<u64>().ok());
+                let same = epoch == Some(context.attempt_epoch)
+                    && existing.data["spec"]["config"]["bucket"].as_str() == Some(bucket);
+                match same {
+                    true => Ok(()),
+                    false => Err(BackendError::Conflict(format!(
+                        "DataNode `{name}` belongs to another attempt"
+                    ))),
+                }
+            }
+            Err(error) => Err(kube_error(error)),
+        }
     }
 
     fn data_nodes(&self) -> Api<DynamicObject> {
@@ -281,10 +292,14 @@ impl KubernetesBackend {
         else {
             return Ok(());
         };
-        let pv = data_pv_manifest(context, &self.config, &workspace.bucket_name, &mount.prefix)?;
+        let bucket = &workspace.bucket_name;
+        if self.config.kubedal.is_some() {
+            let value = session_node_manifest(context, &self.config, bucket)?;
+            return self.ensure_data_node(context, value, bucket).await;
+        }
+        let pv = data_pv_manifest(context, &self.config, bucket, &mount.prefix)?;
         let pvc = data_pvc_manifest(context, &self.config)?;
-        self.ensure_volume(context, &workspace.bucket_name, pv, pvc)
-            .await
+        self.ensure_volume(context, bucket, pv, pvc).await
     }
 
     async fn ensure_volume(
@@ -2606,6 +2621,54 @@ mod tests {
                 "POST /api/v1/persistentvolumes",
                 "POST /api/v1/namespaces/compute/persistentvolumeclaims",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_session_node() {
+        // With KubeDAL configured the session gets its own DataNode and no Mountpoint volume.
+        let nodes = "/apis/kubedal.arunaengine.org/v1alpha1/namespaces/compute/datanodes";
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let client = fake_client(move |method, path| {
+            recorder
+                .lock()
+                .expect("record request")
+                .push(format!("{method} {path}"));
+            match (method, path) {
+                ("POST", path) if path == nodes => {
+                    (201, core_object("DataNode", "aruna-job-a1-data"))
+                }
+                _ => (404, status_json(404)),
+            }
+        });
+        let mut config = test_config();
+        config.s3_mount_driver = Some("s3.csi.scality.com".to_string());
+        config.kubedal = Some(Box::new(crate::executor::config::KubedalMount {
+            driver: "kubedal.arunaengine.org".to_string(),
+            endpoint: "https://s3.example".to_string(),
+            region: String::new(),
+        }));
+        let backend = KubernetesBackend {
+            client,
+            config,
+            policies: Vec::new(),
+        };
+        let mut spec = TaskSpec::new(context().attempt, "session:latest");
+        spec.session = true;
+        spec.workspace = Some(aruna_core::compute::WorkspaceBinding {
+            s3_endpoint: "https://s3.example".to_string(),
+            bucket_name: "workspace-bucket".to_string(),
+            region: String::new(),
+        });
+        spec.session_mount = Some(aruna_core::compute::SessionMount {
+            prefix: "data/".to_string(),
+            path: "/work/data".to_string(),
+        });
+        backend.ensure_data(&context(), &spec).await.unwrap();
+        assert_eq!(
+            seen.lock().expect("read requests").clone(),
+            [format!("POST {nodes}")]
         );
     }
 

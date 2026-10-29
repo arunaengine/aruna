@@ -149,10 +149,21 @@ pub fn job_manifest(
     if let Some(mount) = session_mount(spec, config) {
         let path = normalize_container_path(&mount.path).map_err(BackendError::InvalidSpec)?;
         let volume = data_name(&name);
-        volumes.push(json!({
-            "name":volume,
-            "persistentVolumeClaim":{"claimName":volume}
-        }));
+        // KubeDAL writes through the session's own DataNode, so the credential stays on this realm.
+        volumes.push(match &config.kubedal {
+            Some(kubedal) => {
+                let mut attributes = json!({"dataNode":volume,"mount":"fuse-read-write"});
+                if !mount.prefix.is_empty() {
+                    attributes["path"] = json!(mount.prefix);
+                }
+                json!({"name":volume,"csi":{
+                    "driver":kubedal.driver,
+                    "readOnly":false,
+                    "volumeAttributes":attributes
+                }})
+            }
+            None => json!({"name":volume,"persistentVolumeClaim":{"claimName":volume}}),
+        });
         mounts.push(json!({
             "name":volume,
             "mountPath":path,
@@ -283,6 +294,27 @@ pub fn data_node_manifest(
     index: usize,
     bucket: &str,
 ) -> Result<serde_json::Value, BackendError> {
+    let name = mount_name(&context.attempt.external_name(), index);
+    kubedal_node(context, config, &name, bucket, true)
+}
+
+/// The session's writable DataNode for its workspace bucket, named like its data volume.
+pub fn session_node_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    bucket: &str,
+) -> Result<serde_json::Value, BackendError> {
+    let name = data_name(&context.attempt.external_name());
+    kubedal_node(context, config, &name, bucket, false)
+}
+
+fn kubedal_node(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    node: &str,
+    bucket: &str,
+    read_only: bool,
+) -> Result<serde_json::Value, BackendError> {
     let kubedal = config.kubedal.as_ref().ok_or_else(|| {
         BackendError::InvalidSpec("KubeDAL mounts are disabled on this backend".to_string())
     })?;
@@ -291,14 +323,14 @@ pub fn data_node_manifest(
         "apiVersion":"kubedal.arunaengine.org/v1alpha1",
         "kind":"DataNode",
         "metadata":{
-            "name":mount_name(&name,index),
+            "name":node,
             "namespace":config.namespace,
             "labels":labels(context,"s3-mount"),
             "annotations":annotations_base(context,"active")
         },
         "spec":{
             "backend":"S3",
-            "read_only":true,
+            "read_only":read_only,
             "secretRef":{"name":secret_name(&name)},
             "config":{
                 "bucket":bucket,
@@ -659,7 +691,7 @@ pub fn session_mount<'a>(
     spec: &'a TaskSpec,
     config: &KubernetesConfig,
 ) -> Option<&'a SessionMount> {
-    if !spec.session || spec.workspace.is_none() || config.s3_mount_driver.is_none() {
+    if !spec.session || spec.workspace.is_none() || !config.mounts_inputs() {
         return None;
     }
     spec.session_mount.as_ref()
@@ -1323,6 +1355,71 @@ mod tests {
         assert_eq!(data["access_key_id"], "session-access");
         assert_eq!(data["secret_access_key"], "session-secret");
         assert_eq!(data["AWS_ACCESS_KEY_ID"], "session-access");
+    }
+
+    #[test]
+    fn mounts_session_kubedal() {
+        // With KubeDAL the data volume never uses the driver wide Mountpoint endpoint.
+        let spec = session_spec();
+        let mut config = config();
+        config.kubedal = Some(Box::new(crate::executor::config::KubedalMount {
+            driver: "kubedal.arunaengine.org".to_string(),
+            endpoint: "https://s3.node-2.example".to_string(),
+            region: "us-east-1".to_string(),
+        }));
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &config, &layout).unwrap())
+            .unwrap();
+        let pod = &job["spec"]["template"]["spec"];
+        let volume = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "aruna-job-a1-data")
+            .unwrap();
+        assert!(volume.get("persistentVolumeClaim").is_none());
+        assert_eq!(volume["csi"]["driver"], "kubedal.arunaengine.org");
+        assert_eq!(volume["csi"]["readOnly"], false);
+        let attributes = &volume["csi"]["volumeAttributes"];
+        assert_eq!(attributes["dataNode"], "aruna-job-a1-data");
+        assert_eq!(attributes["mount"], "fuse-read-write");
+        assert_eq!(attributes["path"], "data/");
+        let mounts = pod["containers"][0]["volumeMounts"].as_array().unwrap();
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount["mountPath"] == "/work/data" && mount["readOnly"] == false)
+        );
+        let node = session_node_manifest(&context(), &config, "workspace-bucket").unwrap();
+        assert_eq!(node["metadata"]["name"], "aruna-job-a1-data");
+        assert_eq!(node["metadata"]["labels"][ROLE_LABEL], "s3-mount");
+        assert_eq!(node["spec"]["read_only"], false);
+        assert_eq!(node["spec"]["config"]["bucket"], "workspace-bucket");
+        assert_eq!(
+            node["spec"]["config"]["endpoint"],
+            "https://s3.node-2.example"
+        );
+        assert_eq!(node["spec"]["secretRef"]["name"], "aruna-job-a1-env");
+        let secret = secret_manifest(&context(), &config, &spec).unwrap();
+        assert_eq!(
+            secret.string_data.unwrap()["access_key_id"],
+            "session-access"
+        );
+
+        // The whole bucket needs no path; KubeDAL alone also enables the mount.
+        let mut spec = spec;
+        spec.session_mount.as_mut().unwrap().prefix = String::new();
+        config.s3_mount_driver = None;
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &config, &layout).unwrap())
+            .unwrap();
+        let volume = job["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "aruna-job-a1-data")
+            .cloned()
+            .unwrap();
+        assert!(volume["csi"]["volumeAttributes"].get("path").is_none());
     }
 
     #[test]
