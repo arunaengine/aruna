@@ -113,9 +113,15 @@ pub(super) fn merge_pages(
     let mut sets: std::collections::HashSet<_> = shown.iter().map(|set| set.set_id).collect();
     let mut page = Vec::with_capacity(limit);
     let mut given_hits = Vec::new();
+    // A node gives only a prefix of its page: after its first hit left out, nothing more.
+    let mut cut = std::collections::HashSet::new();
     for hit in hits {
         let repeat = hit.set_id.is_some_and(|set_id| sets.contains(&set_id));
+        if cut.contains(&hit.node_id) {
+            continue;
+        }
         if !repeat && page.len() == limit {
+            cut.insert(hit.node_id);
             continue;
         }
         if !repeat {
@@ -280,6 +286,45 @@ mod tests {
         assert_eq!(names.iter().filter(|name| **name == "refseq").count(), 1);
         assert_eq!(hits.len(), 3);
         assert!(positions.positions.iter().all(|entry| entry.done));
+    }
+
+    // A remembered member hit after a left-out hit of the same node is not given, so the
+    // left-out bucket is not skipped for good.
+    #[test]
+    fn gives_only_prefix() {
+        let set_id = ulid::Ulid::from_bytes([7; 16]);
+        let member = BucketSearchHit {
+            set_id: Some(set_id),
+            ..hit("m", node(2))
+        };
+        let parts = vec![
+            (
+                node(1),
+                BucketPage {
+                    hits: vec![hit("a", node(1)), hit("b", node(1))],
+                    ..BucketPage::default()
+                },
+            ),
+            (
+                node(2),
+                BucketPage {
+                    hits: vec![hit("c", node(2)), member],
+                    ..BucketPage::default()
+                },
+            ),
+        ];
+        let cursor = BucketCursor {
+            positions: Vec::new(),
+            shown: vec![ShownSet {
+                set_id,
+                bucket: "m".to_string(),
+            }],
+        };
+        let (hits, cursor) = merge_pages(parts, (&[], &[]), cursor, 2);
+        let names: Vec<_> = hits.iter().map(|hit| hit.bucket.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        let second = NodePosition::of(&cursor.positions, node(2)).unwrap();
+        assert_eq!((second.after.as_deref(), second.done), (None, false));
     }
 
     // With one hit per page, two members of one set still show the bucket only once.
