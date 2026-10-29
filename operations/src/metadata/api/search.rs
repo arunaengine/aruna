@@ -26,6 +26,9 @@ const CURSOR_MAX_BYTES: usize = 64 * 1024;
 
 const SEARCH_MAX_BYTES: usize = 2 * 1024;
 
+/// Skipped distributed buckets one realm-wide page searches by name; more count as unsearched.
+const MAX_SKIPPED_SEARCHES: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct MetadataSearchRequest {
     pub auth: Option<AuthContext>,
@@ -336,7 +339,7 @@ pub async fn search_objects(
     let plan = plan_object_search(realm_id, request)?;
     let partitions =
         resolve_object_partitions(context, realm_id, local_node_id, &plan, deadline).await?;
-    let (parts, fanout_stats) = run_object_fanout(
+    let (mut parts, fanout_stats) = run_object_fanout(
         context,
         realm_id,
         local_node_id,
@@ -345,7 +348,76 @@ pub async fn search_objects(
         deadline,
     )
     .await?;
-    assemble_object_execution(context, &plan, partitions, parts, fanout_stats)
+    let skipped = take_skipped(&mut parts);
+    let mut execution = assemble_object_execution(context, &plan, partitions, parts, fanout_stats)?;
+    for (index, bucket) in skipped.into_iter().enumerate() {
+        if index >= MAX_SKIPPED_SEARCHES {
+            execution.incomplete_ranges += 1;
+            execution.complete = false;
+            continue;
+        }
+        let ids = (realm_id, local_node_id);
+        Box::pin(search_skipped(context, ids, &plan, bucket, &mut execution)).await?;
+    }
+    Ok(execution)
+}
+
+/// The distributed buckets a realm-wide page skipped, once each. They no longer count as
+/// unsearched: [`search_skipped`] searches them through their range indexes.
+fn take_skipped(parts: &mut [(NodeId, SearchNodePage)]) -> Vec<String> {
+    let mut skipped = Vec::new();
+    for (_, page) in parts.iter_mut() {
+        page.incomplete_ranges =
+            (page.incomplete_ranges).saturating_sub(page.skipped_buckets.len());
+        skipped.append(&mut page.skipped_buckets);
+    }
+    skipped.sort_unstable();
+    skipped.dedup();
+    skipped
+}
+
+/// Adds the hits of one skipped distributed bucket; hits beyond one page of it, or a search
+/// that failed, count as an unsearched range.
+async fn search_skipped(
+    context: &DriverContext,
+    (realm_id, local_node_id): (RealmId, NodeId),
+    plan: &ObjectSearchPlan,
+    bucket: String,
+    execution: &mut ObjectExecution,
+) -> Result<(), MetadataApiError> {
+    let strict = plan.mode == ObjectQueryMode::DistributedStrict;
+    let request = SearchQueryRequest {
+        auth: plan.auth.clone(),
+        bearer_token: plan.bearer_token.clone(),
+        query: plan.query.clone(),
+        key_match: plan.key_match,
+        bucket: Some(bucket.clone()),
+        limit: plan.limit,
+        cursor: None,
+        mode: plan.mode,
+        target_nodes: plan.target_nodes.clone(),
+    };
+    let found = match search_objects(context, realm_id, local_node_id, request).await {
+        Ok(found) => found,
+        Err(error) if strict => return Err(error),
+        Err(_) => {
+            execution.incomplete_ranges += 1;
+            execution.complete = false;
+            return Ok(());
+        }
+    };
+    let unshown = usize::from(found.next_cursor.is_some());
+    if strict && unshown > 0 {
+        return Err(MetadataApiError::SearchIncomplete(format!(
+            "distributed bucket {bucket} has more hits than one page shows; search it by name"
+        )));
+    }
+    execution.hits.extend(found.hits);
+    execution.incomplete_ranges += found.incomplete_ranges + unshown;
+    execution.index_progress.extend(found.index_progress);
+    execution.partial_ranges.extend(found.partial_ranges);
+    execution.complete &= found.complete && unshown == 0;
+    Ok(())
 }
 
 pub(super) fn plan_object_search(

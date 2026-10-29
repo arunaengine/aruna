@@ -530,8 +530,10 @@ restrictions and request policies before it can be returned.
   `coli taxid=562 assembly_level="Complete Genome"`. Each hit carries the object's kept metadata
   columns in `metadata`, after the same authorization as every hit. A distributed bucket walks only its
   searchable keys, a bounded number per page, so a rare match may take many pages.
-- A search without `bucket` skips distributed buckets, which only their key indexes cover;
-  each skipped bucket counts in `coverage.incomplete_ranges`.
+- A search without `bucket` reaches a distributed bucket through its key indexes: the page whose
+  scan reaches it adds one bucket-scoped page of its hits, so that page may hold more than `limit`
+  hits. More hits of it than one page, a failed search of it, or more than 8 such buckets on one
+  page count in `coverage.incomplete_ranges`; search the bucket by name for all its hits.
 - A cursor that continues after keys the caller may not see carries them sealed; a restart of
   the node that sealed it makes such a cursor invalid."#,
     params(

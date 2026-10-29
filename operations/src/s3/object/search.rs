@@ -118,6 +118,9 @@ pub struct SearchNodePage {
     /// if the caller may read it.
     #[serde(default)]
     pub partial_ranges: Vec<(ulid::Ulid, Option<String>)>,
+    /// The distributed buckets this realm-wide page skipped, each counted in `incomplete_ranges`.
+    #[serde(default)]
+    pub skipped_buckets: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -224,14 +227,20 @@ fn node_page(
     next_start_after: Option<Vec<u8>>,
     distributed: &HashMap<String, bool>,
 ) -> SearchNodePage {
+    let mut skipped_buckets: Vec<String> = (distributed.iter())
+        .filter(|(_, bound)| **bound)
+        .map(|(name, _)| name.clone())
+        .collect();
+    skipped_buckets.sort_unstable();
     SearchNodePage {
         hits,
         next_start_after,
         observed_at: SystemTime::now(),
-        incomplete_ranges: distributed.values().filter(|bound| **bound).count(),
+        incomplete_ranges: skipped_buckets.len(),
         remote_ranges: 0,
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
+        skipped_buckets,
     }
 }
 

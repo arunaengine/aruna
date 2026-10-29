@@ -477,6 +477,7 @@ fn search_assembly_order() {
         remote_ranges: 0,
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
+        skipped_buckets: Vec::new(),
     };
     let stats = || MetadataFanoutStats {
         nodes_queried: 2,
