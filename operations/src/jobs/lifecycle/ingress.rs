@@ -411,9 +411,9 @@ fn input_reference(bucket: &str, key: &str, version_id: Option<&str>) -> String 
     }
 }
 
-/// A reference version without a content hash, accepted only when GetObject can serve it at
-/// that exact version: a strong ETag on a source that enforces `If-Match` binds every range,
-/// recorded digests bind a whole read. Anything else is not materialized.
+/// A reference version without a content hash, served by GetObject while its source still
+/// matches the recorded observation: a strong ETag on a source that enforces `If-Match` binds
+/// every range, so only that input may be mounted. Anything else is not materialized.
 fn reference_content(
     reference: &str,
     head: &crate::s3::object::head::HeadObjectResult,
@@ -426,11 +426,6 @@ fn reference_content(
     };
     let range_bound = binding.descriptor.kind.enforces_if_match()
         && crate::s3::object::get::strong_validator(metadata.etag.as_deref());
-    if !range_bound && metadata.enforced_checksums().is_empty() {
-        return Err(refused(
-            "input reference cannot be read at its exact version",
-        ));
-    }
     let descriptor = &binding.descriptor;
     let pin = SourcePin {
         url: publishable(descriptor)
@@ -1921,8 +1916,8 @@ mod tests {
 
     #[test]
     fn binds_reference_reads() {
-        // A strong ETag on an S3 source binds every range; recorded digests bind a whole read;
-        // a source with neither cannot be read at its exact version.
+        // A strong ETag on an S3 source binds every range; any other reference is staged whole,
+        // bound to its recorded observation.
         use aruna_core::structs::execution::source_connector::SourceConnectorKind;
         let bound = reference_content(
             "s3://db/a",
@@ -1947,9 +1942,13 @@ mod tests {
             }
         ));
         let http = reference_head(SourceConnectorKind::Http, Some("\"e1\""), false);
+        let (content, _) = reference_content("s3://db/a", &http).expect("observation bound");
         assert!(matches!(
-            reference_content("s3://db/a", &http),
-            Err(SubmitJobError::InvalidWorkspace(_))
+            content,
+            InputContent::Reference {
+                range_bound: false,
+                ..
+            }
         ));
         let mut stored = reference_head(SourceConnectorKind::S3, Some("\"e1\""), false);
         stored.source_binding = None;

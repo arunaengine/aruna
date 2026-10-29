@@ -1980,24 +1980,25 @@ fn oversized_spool_refused() {
     );
 }
 
-// An HTTP server may ignore `If-Match`, so a pinned version it serves needs recorded digests:
-// without them it is refused even when the observation compares as the same.
+// A pinned version without digests is still served while its source matches the observation:
+// the read response is compared again, so a change in between never serves other bytes.
 #[test]
-fn unbound_pin_refused() {
+fn unbound_pin_served() {
     let mut operation = drifted_operation();
     let stored = observation(9);
     operation.reference_cached = Some(stored.clone());
     operation.reference_explicit = true;
     operation.state = GetObjectState::HeadReferenceSource;
 
-    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
         metadata: stored,
     }));
 
-    assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::HistoricalReferenceUnavailable)
-    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+    ));
+    assert_eq!(operation.state, GetObjectState::ReadReferenceSource);
 }
 
 // A bound read whose condition fails queues a request to observe the source, which the refresh
