@@ -85,7 +85,7 @@ pub async fn supervise_and_finalize(
                     .await;
                 }
                 Box::pin(finalize_attempt(
-                    &context, job_id, token, &backend, &fence, &spec, &bucket, result,
+                    &context, job_id, token, &backend, &fence, &spec, &bucket, result, &cancel,
                 ))
                 .await;
             }

@@ -71,6 +71,9 @@ struct StubBackend {
     image_stall: AtomicBool,
     mounts: AtomicBool,
     sessions: AtomicBool,
+    capture_hangs: AtomicBool,
+    capture_fails: AtomicBool,
+    cancel_exited: AtomicBool,
 }
 
 impl StubBackend {
@@ -89,6 +92,9 @@ impl StubBackend {
             image_stall: AtomicBool::new(false),
             mounts: AtomicBool::new(false),
             sessions: AtomicBool::new(false),
+            capture_hangs: AtomicBool::new(false),
+            capture_fails: AtomicBool::new(false),
+            cancel_exited: AtomicBool::new(false),
         })
     }
 }
@@ -162,6 +168,15 @@ impl ExecutorBackend for StubBackend {
     }
     async fn cancel(&self, _context: &FenceContext) -> Result<CancelEvidence, BackendError> {
         self.cancels.fetch_add(1, Ordering::Relaxed);
+        if self.cancel_exited.load(Ordering::Relaxed) {
+            return Ok(CancelEvidence::Stopped(AttemptStatus {
+                phase: AttemptPhase::Exited { code: 0 },
+                backend_ref: "c1".to_string(),
+                started_at_ms: Some(1),
+                finished_at_ms: Some(2),
+                detail: None,
+            }));
+        }
         if self.cancel_lost.load(Ordering::Relaxed) {
             return Ok(CancelEvidence::Stopped(AttemptStatus {
                 phase: AttemptPhase::SystemError {
@@ -193,6 +208,19 @@ impl ExecutorBackend for StubBackend {
         _path: &str,
     ) -> Result<TaskOutput, BackendError> {
         Err(BackendError::InvalidSpec("no output".to_string()))
+    }
+    async fn list_outputs(
+        &self,
+        _context: &FenceContext,
+        _pattern: &str,
+    ) -> Result<Vec<String>, BackendError> {
+        if self.capture_hangs.load(Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
+        if self.capture_fails.load(Ordering::Relaxed) {
+            return Err(BackendError::Unavailable("exec stream dropped".to_string()));
+        }
+        Err(BackendError::InvalidSpec("no listing".to_string()))
     }
     async fn reconcile(&self, _context: &FenceContext) -> ReconcileEvidence {
         match self.reconcile {
@@ -480,6 +508,7 @@ async fn system_error_parks() {
             finished_at_ms: Some(2),
             detail: None,
         }),
+        &CancellationToken::new(),
     ))
     .await;
 
@@ -566,6 +595,7 @@ async fn capture_failure_caps() {
                 finished_at_ms: Some(2),
                 detail: None,
             }),
+            &CancellationToken::new(),
         ))
         .await;
     }
@@ -582,6 +612,119 @@ async fn capture_failure_caps() {
         matches!(stored.result, Some(JobResultPayload::Execution { .. })),
         "cleanup and the run crate need a result"
     );
+}
+
+/// A run that exited 0 and captures one wildcard output.
+fn capture_spec(node: aruna_core::id::NodeId) -> ExecutionSpec {
+    let mut spec = execution_spec();
+    spec.file_outputs
+        .push(aruna_core::structs::execution::job::OutputSelection {
+            container_path: "/out/*".to_string(),
+            path_prefix: Some("/out".to_string()),
+            destination_node_id: Some(node),
+            destination: aruna_core::structs::execution::job::OutputDestination::S3 {
+                bucket: "dest".to_string(),
+                key: "results/".to_string(),
+            },
+            name: None,
+            description: None,
+        });
+    spec
+}
+
+fn exited_zero() -> Result<AttemptStatus, BackendError> {
+    Ok(AttemptStatus {
+        phase: AttemptPhase::Exited { code: 0 },
+        backend_ref: "c1".to_string(),
+        started_at_ms: Some(1),
+        finished_at_ms: Some(2),
+        detail: None,
+    })
+}
+
+// A cancel during output capture stops the capture and settles the run as cancelled.
+#[tokio::test]
+async fn cancel_stops_capture() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let (ctx, net) = net_context(storage.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let job_id = record.job_id;
+    begin_external_running(&storage, job_id, token, Some(1), 6)
+        .await
+        .unwrap();
+    let stub = StubBackend::new(StubReconcile::NotFound);
+    stub.capture_hangs.store(true, Ordering::Relaxed);
+    let backend: Arc<dyn ExecutorBackend> = stub;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    // Only a lost cancel would block here; the cap reports that instead of hanging the suite.
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        Box::pin(finalize_attempt(
+            &ctx,
+            job_id,
+            token,
+            &backend,
+            &fence(&attempt),
+            &capture_spec(net.node_id()),
+            "ws-test",
+            exited_zero(),
+            &cancel,
+        )),
+    )
+    .await
+    .expect("capture ignored the cancel");
+
+    let stored = read_job_record(&storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert!(stored.claim.is_none());
+    net.shutdown().await;
+}
+
+// A capture that fails after a cancel settles as cancelled; parking it would retry the run
+// and, once local attempts ran out, let the family place it on another node.
+#[tokio::test]
+async fn cancelled_capture_settles() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let (ctx, net) = net_context(storage.clone()).await;
+    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let job_id = record.job_id;
+    begin_external_running(&storage, job_id, token, Some(1), 6)
+        .await
+        .unwrap();
+    set_cancel_requested(&storage, job_id, 7).await.unwrap();
+    let stub = StubBackend::new(StubReconcile::NotFound);
+    stub.capture_fails.store(true, Ordering::Relaxed);
+    stub.cancel_exited.store(true, Ordering::Relaxed);
+    stub.logs_release.notify_one();
+    let backend: Arc<dyn ExecutorBackend> = stub;
+
+    Box::pin(finalize_attempt(
+        &ctx,
+        job_id,
+        token,
+        &backend,
+        &fence(&attempt),
+        &capture_spec(net.node_id()),
+        "ws-test",
+        exited_zero(),
+        &CancellationToken::new(),
+    ))
+    .await;
+
+    let stored = read_job_record(&storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert_eq!(stored.attempts, record.attempts);
+    net.shutdown().await;
 }
 
 #[tokio::test]

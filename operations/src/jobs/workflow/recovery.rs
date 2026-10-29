@@ -93,6 +93,7 @@ pub(super) async fn recover_failed_submit(
                     spec,
                     bucket,
                     Ok(status),
+                    cancel,
                 ))
                 .await;
                 return false;
