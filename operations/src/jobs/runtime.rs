@@ -652,7 +652,8 @@ async fn run_job(
 
     let progress = ProgressReporter::from_progress(&record.progress);
     let ctx = JobContext {
-        driver: context.clone(),
+        // Bulk lane: imports and other background payloads must not delay API requests.
+        driver: Arc::new(context.bulk()),
         job_id,
         owner_node_id: record.owner_node_id,
         claim_token: token,

@@ -422,20 +422,8 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// A context whose storage effects dispatch on the bulk lane, so background
-    /// queue draining never starves foreground sync traffic.
-    fn bulk_context(&self) -> DriverContext {
-        let mut context = self.context.as_ref().clone();
-        context.storage_handle = context.storage_handle.bulk();
-        context.metadata_handle = context
-            .metadata_handle
-            .as_ref()
-            .map(|metadata_handle| metadata_handle.bulk());
-        context
-    }
-
     pub(super) async fn drain_materialization_queue(&self) {
-        let bulk = self.bulk_context();
+        let bulk = self.context.bulk();
         match process_materialization_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainMaterializationQueue, drain_delay(&result))
@@ -478,7 +466,7 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_graph_queue(&self) {
-        let bulk = self.bulk_context();
+        let bulk = self.context.bulk();
         match crate::metadata::prune_queue::process_prune_batch(&bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)

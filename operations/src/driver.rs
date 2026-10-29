@@ -52,6 +52,15 @@ impl DriverContext {
             .as_ref()
             .map_or(fallback, |net| *net.realm_id())
     }
+
+    /// This context with its storage effects and metadata reads on the bulk lane, so
+    /// background work never delays request traffic.
+    pub fn bulk(&self) -> Self {
+        let mut context = self.clone();
+        context.storage_handle = context.storage_handle.bulk();
+        context.metadata_handle = context.metadata_handle.as_ref().map(MetadataHandle::bulk);
+        context
+    }
 }
 
 impl std::fmt::Debug for DriverContext {
@@ -2232,5 +2241,36 @@ mod test {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bulk_skips_foreground() {
+        // Background work on a bulk context never queues ahead of request effects.
+        let (storage_handle, receivers) = storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+        .bulk();
+        let read = StorageEffect::Read {
+            key_space: "bulk".to_string(),
+            key: ByteView::from(*b"k"),
+            txn_id: None,
+        };
+        let pending =
+            tokio::spawn(async move { context.storage_handle.send_storage_effect(read).await });
+
+        let bulk = receivers.bulk;
+        let (effect, ..) = tokio::task::spawn_blocking(move || bulk.recv())
+            .await
+            .unwrap()
+            .expect("the effect reaches the bulk lane");
+        assert!(matches!(effect, StorageEffect::Read { key_space, .. } if key_space == "bulk"));
+        assert!(receivers.foreground.try_recv().is_err());
+        pending.abort();
     }
 }
