@@ -636,15 +636,18 @@ mod pure_tests {
         ));
     }
 
-    // A user at the session limit still signs in: the oldest session is signed out instead.
-    #[tokio::test]
-    async fn full_user_signs_in() {
-        use crate::driver::{DriverContext, drive};
+    /// A realm whose user `session_config` creates sessions for, on real storage.
+    async fn session_realm() -> (
+        tempfile::TempDir,
+        crate::driver::DriverContext,
+        CreateSessionConfig,
+        aruna_core::id::NodeId,
+    ) {
         use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
         let dir = tempfile::tempdir().unwrap();
         let storage =
             aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = DriverContext {
+        let context = crate::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
@@ -667,9 +670,65 @@ mod pure_tests {
             node_weight: None,
             node_labels: Default::default(),
         };
-        drive(CreateRealmOperation::new(realm), &context)
+        crate::driver::drive(CreateRealmOperation::new(realm), &context)
             .await
             .unwrap();
+        (dir, context, config, node_id)
+    }
+
+    // Signing out works past the 64 self-service revocations a user may hold: the rest move
+    // the user's cutoff, and the next sign-in still works.
+    #[tokio::test]
+    async fn revokes_past_capacity() {
+        use crate::driver::drive;
+        use crate::session::revoke::RevokeSessionOperation;
+        let (_dir, context, config, node_id) = session_realm().await;
+        let now = aruna_core::time::unix_timestamp_secs();
+        let base = now - 1_000;
+        let mut sessions = Vec::new();
+        for offset in 0..100 {
+            let session = CreateSessionConfig {
+                time: base + offset,
+                expiry: now + 3_600,
+                ..config.clone()
+            };
+            let created = drive(CreateSessionOperation::new(session), &context)
+                .await
+                .unwrap();
+            sessions.push(created.session);
+        }
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id,
+            user_id: config.user_id,
+            realm_id: config.realm_id,
+        };
+        for session in &sessions {
+            let revoke = RevokeSessionOperation::new(actor.clone(), session.sid.clone(), now);
+            let revoked = drive(revoke, &context).await.unwrap();
+            assert!(revoked.is_some_and(|revoked| revoked.revoked));
+        }
+        let cutoff = crate::auth::bearer_token::realm_user_cutoff(
+            &context.storage_handle,
+            config.realm_id,
+            &config.user_id,
+        )
+        .await
+        .unwrap();
+        // The last revoked session and every older one are cut off.
+        assert_eq!(cutoff, Some(base + 100));
+        let next = CreateSessionConfig {
+            time: now,
+            expiry: now + 3_600,
+            ..config
+        };
+        create_making_room(&context, node_id, next).await.unwrap();
+    }
+
+    // A user at the session limit still signs in: the oldest session is signed out instead.
+    #[tokio::test]
+    async fn full_user_signs_in() {
+        use crate::driver::drive;
+        let (_dir, context, config, node_id) = session_realm().await;
         // The cutoff is read against the wall clock, so the sessions are recent.
         let now = aruna_core::time::unix_timestamp_secs();
         let base = now - 1_000;
