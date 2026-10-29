@@ -8,7 +8,7 @@ use super::{
     RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, RealmQuotaOverride,
     ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info, get_realm_placement,
     get_usage, map_handle_error, map_placement_error, map_quota_error, map_realm_nodes,
-    mutate_realm_placement, presence_nodes, set_realm_quota,
+    mutate_realm_placement, presence_nodes, run_realm_info, set_realm_quota,
 };
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
@@ -16,6 +16,7 @@ use crate::routes::federation::{
     AcceptedRealmsSetting, RealmFederation, RegistrationSetting, get_realm_federation,
     set_realm_federation,
 };
+use crate::routes::node_names::{NodeNameRequest, name_own_device, name_realm_node};
 use crate::routes::promotion::promote_server_node;
 use crate::server::state::ServerState;
 use crate::tests::routes::{test_context, test_state, test_storage};
@@ -1786,6 +1787,7 @@ async fn device_never_connected() {
         present,
         BTreeMap::new(),
         &PeerContacts::default(),
+        &BTreeMap::new(),
         10_000,
     );
 
@@ -1839,6 +1841,7 @@ async fn reports_device_seen() {
         HashSet::new(),
         BTreeMap::new(),
         &contacts,
+        &BTreeMap::new(),
         now_ms,
     );
     let device = |node_id: aruna_core::NodeId| {
@@ -1960,4 +1963,176 @@ async fn promotion_needs_server() {
         matches!(error, ServerError::Conflict(_)),
         "a node never promotes itself"
     );
+}
+
+fn name_body(name: Option<&str>) -> Json<NodeNameRequest> {
+    Json(NodeNameRequest {
+        display_name: name.map(str::to_string),
+    })
+}
+
+#[tokio::test]
+async fn node_name_shown() {
+    // The portal reads the name from the realm listing, and a clear must drop the field.
+    let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+    let auth = admin_auth(realm_id, admin);
+    let own = state.get_node_id().to_string();
+    let before = run_realm_info(&state, Some(auth.clone())).await.unwrap();
+    let placement = before
+        .nodes
+        .iter()
+        .find(|node| node.node_id == own)
+        .unwrap();
+    let placement = placement.placement.clone();
+    let (status, Json(named)) = name_realm_node(
+        State(state.clone()),
+        Extension(Some(auth.clone())),
+        Path(own.clone()),
+        Ok(name_body(Some(" Giessen storage 1 "))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(named.display_name.as_deref(), Some("Giessen storage 1"));
+
+    let info = run_realm_info(&state, Some(auth.clone())).await.unwrap();
+    let node = info.nodes.iter().find(|node| node.node_id == own).unwrap();
+    assert_eq!(node.display_name.as_deref(), Some("Giessen storage 1"));
+    assert_eq!(node.placement, placement, "placement stays as it was");
+
+    let (_, Json(cleared)) = name_realm_node(
+        State(state.clone()),
+        Extension(Some(auth.clone())),
+        Path(own.clone()),
+        Ok(name_body(None)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cleared.display_name, None);
+    let info = serde_json::to_value(run_realm_info(&state, Some(auth)).await.unwrap()).unwrap();
+    let node = info["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["node_id"] == own)
+        .unwrap();
+    assert!(node.get("display_name").is_none());
+}
+
+#[tokio::test]
+async fn node_name_gated() {
+    let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+    let own = state.get_node_id().to_string();
+    let stranger = AuthContext {
+        user_id: UserId::local(Ulid::generate(), realm_id),
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let call = |auth: Option<AuthContext>, node: String, name: &str| {
+        name_realm_node(
+            State(state.clone()),
+            Extension(auth),
+            Path(node),
+            Ok(name_body(Some(name))),
+        )
+    };
+    let unknown = iroh::SecretKey::generate().public().to_string();
+    let admin = Some(admin_auth(realm_id, admin));
+    assert!(matches!(
+        call(None, own.clone(), "x").await,
+        Err(ServerError::Unauthorized)
+    ));
+    assert!(matches!(
+        call(Some(stranger.clone()), own.clone(), "x").await,
+        Err(ServerError::Forbidden)
+    ));
+    assert!(matches!(
+        call(admin.clone(), own.clone(), "two\nlines").await,
+        Err(ServerError::BadRequestReason(_))
+    ));
+    assert!(matches!(
+        call(admin, unknown, "x").await,
+        Err(ServerError::NotFound)
+    ));
+    // The owner route reaches only the caller's own devices, so a server node is unknown.
+    assert!(matches!(
+        name_own_device(
+            State(state.clone()),
+            Extension(Some(stranger)),
+            Path(own),
+            Ok(name_body(Some("mine"))),
+        )
+        .await,
+        Err(ServerError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn owner_names_device() {
+    let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
+    let owner = UserId::local(Ulid::generate(), realm_id);
+    let device = iroh::SecretKey::generate().public();
+    let mut config = drive(
+        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        &state.get_ctx(),
+    )
+    .await
+    .unwrap();
+    config.ensure_node(
+        device,
+        aruna_core::structs::identity::realm::RealmNodeKind::User { owner },
+    );
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: UserId::nil(realm_id),
+        realm_id,
+    };
+    state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+            key: realm_id.as_bytes().to_vec().into(),
+            value: config.to_bytes(&actor).unwrap().into(),
+            txn_id: None,
+        })
+        .await;
+
+    let (_, Json(named)) = name_own_device(
+        State(state.clone()),
+        Extension(Some(admin_auth(realm_id, owner))),
+        Path(device.to_string()),
+        Ok(name_body(Some("Lab laptop"))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(named.display_name.as_deref(), Some("Lab laptop"));
+
+    let mut delegated = admin_auth(realm_id, owner);
+    delegated.path_restrictions = Some(Vec::new());
+    assert!(matches!(
+        name_own_device(
+            State(state),
+            Extension(Some(delegated)),
+            Path(device.to_string()),
+            Ok(name_body(Some("x"))),
+        )
+        .await,
+        Err(ServerError::Forbidden)
+    ));
+}
+
+#[test]
+fn openapi_registers_names() {
+    let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+    assert!(
+        openapi["paths"]["/system/realm/nodes/{node_id}"]
+            .get("patch")
+            .is_some()
+    );
+    let devices = &openapi["paths"]["/access/users/me/devices/{id}"];
+    assert!(devices.get("patch").is_some() && devices.get("delete").is_some());
+    let node = &openapi["components"]["schemas"]["RealmNodeInfoResponse"]["properties"];
+    assert!(node.get("display_name").is_some());
 }
