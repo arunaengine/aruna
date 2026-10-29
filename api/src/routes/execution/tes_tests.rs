@@ -329,6 +329,12 @@ fn maps_submit_errors() {
         assert_eq!(TesError::from_submit(error).status, expected);
     }
 
+    // An input refusal names the input and the reason, so the caller can fix it.
+    let invalid = TesError::from_submit(SubmitJobError::InvalidWorkspace(
+        "s3://data/a.txt: input object not found".to_string(),
+    ));
+    assert_eq!(invalid.message, "s3://data/a.txt: input object not found");
+
     // The 503 body carries the fixed reason, never a holder identity.
     let unavailable = TesError::from_submit(SubmitJobError::PlacementUnavailable(
         "node 7 idle".to_string(),

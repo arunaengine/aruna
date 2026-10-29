@@ -940,7 +940,7 @@ pub(crate) fn map_submit_error(
         SubmitJobError::ActiveJobLimit { limit } => {
             ServerError::Conflict(format!("active job limit of {limit} reached"))
         }
-        SubmitJobError::InvalidWorkspace(_) => ServerError::BadRequest,
+        SubmitJobError::InvalidWorkspace(reason) => ServerError::BadRequestMessage(reason),
         SubmitJobError::TooManyOutputs { limit } => {
             ServerError::BadRequestMessage(format!("a job may declare at most {limit} outputs"))
         }
