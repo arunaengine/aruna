@@ -732,7 +732,8 @@ somebody else.
 
 **Limits**
 - At most 256 active sessions per user. Issuance prunes expired and revoked sessions first; when
-  256 active ones remain, the user's oldest sessions are signed out to make room."#,
+  256 active ones remain, the user's oldest sessions are signed out to make room. A service
+  account is refused with 409 instead, so its other sessions keep working."#,
     params(("expires_in_seconds" = Option<u64>, Query, description = "Token lifetime in seconds, 1 to 86400; defaults to 86400")),
     responses(
         (
@@ -746,7 +747,7 @@ somebody else.
         (status = 401, description = "Missing or invalid bearer token, or this node knows no user for the presented OIDC subject", body = ErrorResponse),
         (status = 403, description = "The user is deactivated, an alias of the canonical user of that OIDC subject, or the caller holds a federated session", body = ErrorResponse),
         (status = 400, description = "`expires_in_seconds` is 0", body = ErrorResponse),
-        (status = 409, description = "No room could be made for another session", body = ErrorResponse)
+        (status = 409, description = "A service account holds 256 active sessions, or no room could be made", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

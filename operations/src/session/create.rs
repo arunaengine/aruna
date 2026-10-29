@@ -419,7 +419,8 @@ impl Operation for CreateSessionOperation {
 }
 
 /// Creates a session for the user. At the session limit the user's cutoff moves past the
-/// oldest active sessions, which signs them out, and creation runs again.
+/// oldest active sessions, which signs them out, and creation runs again. A service account
+/// keeps the plain limit, so renewing never ends the sessions its automation uses.
 pub async fn create_making_room(
     context: &crate::driver::DriverContext,
     node_id: aruna_core::id::NodeId,
@@ -446,6 +447,15 @@ pub async fn create_making_room(
             Err(CreateSessionError::LimitReached { oldest }) => oldest,
             other => return other,
         };
+        let read = crate::users::read_document::ReadUserOperation::new(config.user_id);
+        let service = match crate::driver::drive(read, context).await {
+            Ok(user) => user.service_group().is_some(),
+            Err(crate::users::read_document::ReadUserError::NotFound) => false,
+            Err(error) => return Err(CreateSessionError::Retire(error.to_string())),
+        };
+        if service {
+            return Err(CreateSessionError::LimitReached { oldest });
+        }
         let actor = aruna_core::structs::identity::auth::Actor {
             node_id,
             user_id: config.user_id,
@@ -728,6 +738,69 @@ mod pure_tests {
             ..config
         };
         create_making_room(&context, node_id, next).await.unwrap();
+    }
+
+    // A service account at the limit is refused as before; none of its sessions are ended.
+    #[tokio::test]
+    async fn service_keeps_limit() {
+        use crate::driver::drive;
+        use aruna_core::document::DocumentTarget;
+        let (_dir, context, config, node_id) = session_realm().await;
+        let user = aruna_core::structs::identity::user::User {
+            user_id: config.user_id,
+            name: "pipeline".to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: std::collections::HashMap::from([(
+                aruna_core::user::validation::SERVICE_GROUP_ATTRIBUTE.to_string(),
+                Ulid::from_bytes([8; 16]).to_string(),
+            )]),
+        };
+        let target = DocumentTarget::User {
+            user_id: config.user_id,
+        };
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id,
+            user_id: config.user_id,
+            realm_id: config.realm_id,
+        };
+        let write = StorageEffect::Write {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            value: user.to_bytes(&actor).unwrap().into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(write).await;
+        let now = aruna_core::time::unix_timestamp_secs();
+        let base = now - 1_000;
+        for offset in 0..MAX_USER_SESSIONS as u64 {
+            let session = CreateSessionConfig {
+                time: base + offset,
+                expiry: now + 3_600,
+                ..config.clone()
+            };
+            drive(CreateSessionOperation::new(session), &context)
+                .await
+                .unwrap();
+        }
+        let next = CreateSessionConfig {
+            time: now,
+            expiry: now + 3_600,
+            ..config.clone()
+        };
+        let refused = create_making_room(&context, node_id, next).await;
+        assert_eq!(
+            refused,
+            Err(CreateSessionError::LimitReached { oldest: base })
+        );
+        let cutoff = crate::auth::bearer_token::realm_user_cutoff(
+            &context.storage_handle,
+            config.realm_id,
+            &config.user_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cutoff, None);
     }
 
     // A sign-in right after a sign-out moved the cutoff into the next second is issued at the
