@@ -48,9 +48,7 @@ pub struct StageEntry {
 impl StageLayout {
     pub fn from_spec(spec: &TaskSpec) -> Result<Self, BackendError> {
         match spec.staging_mode {
-            StagingMode::Files
-                if !spec.session && (spec.workspace.is_some() || !spec.secret_env.is_empty()) =>
-            {
+            StagingMode::Files if !spec.reaches_s3() && !spec.secret_env.is_empty() => {
                 return Err(BackendError::InvalidSpec(
                     "Files staging must not include task credentials".to_string(),
                 ));
@@ -58,12 +56,6 @@ impl StageLayout {
             StagingMode::DirectS3 if !spec.inputs.is_empty() => {
                 return Err(BackendError::InvalidSpec(
                     "DirectS3 staging must not include container file inputs".to_string(),
-                ));
-            }
-            // Mounted inputs may sit next to copied ones; only a session binds a workspace.
-            StagingMode::S3Mount if !spec.session && spec.workspace.is_some() => {
-                return Err(BackendError::InvalidSpec(
-                    "S3Mount staging must not include a workspace binding".to_string(),
                 ));
             }
             _ => {}
@@ -267,7 +259,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_keeps_credentials() {
+    fn workspace_keeps_credentials() {
+        // A batch run bound to its bucket keeps the credential like a session does.
         let mut spec = TaskSpec::new(AttemptRef::new("session", 0), "session:latest");
         spec.workspace = Some(aruna_core::compute::WorkspaceBinding {
             s3_endpoint: "http://s3.example".to_string(),
@@ -279,10 +272,14 @@ mod tests {
         for staging in [StagingMode::Files, StagingMode::S3Mount] {
             spec.staging_mode = staging;
             spec.session = false;
-            assert!(StageLayout::from_spec(&spec).is_err());
+            assert!(StageLayout::from_spec(&spec).is_ok());
             spec.session = true;
             assert!(StageLayout::from_spec(&spec).is_ok());
         }
+        spec.session = false;
+        spec.workspace = None;
+        spec.staging_mode = StagingMode::Files;
+        assert!(StageLayout::from_spec(&spec).is_err());
     }
 
     #[test]

@@ -1145,7 +1145,7 @@ impl ExecutorBackend for KubernetesBackend {
         }
         self.remove_helpers(context).await?;
         self.remove_marker(context).await?;
-        if spec.session {
+        if spec.reaches_s3() {
             self.ensure_secret(context, spec).await?;
             if session_mount(spec, &self.config).is_some() {
                 self.ensure_data(context, spec).await?;
@@ -1644,7 +1644,7 @@ fn validate_spec(
             "S3 mounts are disabled on this backend".to_string(),
         ));
     }
-    if spec.session
+    if spec.reaches_s3()
         && spec.security.network != aruna_core::compute::NetworkAccess::Open
         && config.s3_cidrs.is_empty()
     {

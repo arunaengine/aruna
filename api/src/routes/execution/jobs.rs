@@ -1138,7 +1138,9 @@ additionally need WRITE on that bucket, which must belong to the same group.
 - A run never creates a bucket. Omitting `workspace` (or `workspace.mode` `none`) captures the
   declared outputs to the buckets they name, so every output needs its own `bucket`;
   `workspace.mode` `existing` runs inside a bucket the caller already owns, which is where an
-  output without a `bucket` and `output_prefixes` resolve their `dest_key`.
+  output without a `bucket` and `output_prefixes` resolve their `dest_key`. Where the backend
+  gives sessions S3 access, such a run also gets a credential for that bucket only, with
+  `AWS_ENDPOINT_URL`, `AWS_REGION` and `ARUNA_WORKSPACE_BUCKET` set.
 - Every bucket a run writes into, the workspace and each output destination alike, must exist,
   belong to the execution group, and grant the caller WRITE.
 - On a user device a `realm` request is always forwarded under the caller's own bearer token: the

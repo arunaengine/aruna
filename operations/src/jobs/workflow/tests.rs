@@ -70,6 +70,7 @@ struct StubBackend {
     image_started: Notify,
     image_stall: AtomicBool,
     mounts: AtomicBool,
+    sessions: AtomicBool,
 }
 
 impl StubBackend {
@@ -87,6 +88,7 @@ impl StubBackend {
             image_started: Notify::new(),
             image_stall: AtomicBool::new(false),
             mounts: AtomicBool::new(false),
+            sessions: AtomicBool::new(false),
         })
     }
 }
@@ -99,6 +101,7 @@ impl ExecutorBackend for StubBackend {
     fn capabilities(&self) -> aruna_compute::executor::BackendCaps {
         aruna_compute::executor::BackendCaps {
             s3_mount: self.mounts.load(Ordering::Relaxed),
+            session: self.sessions.load(Ordering::Relaxed),
             ..Default::default()
         }
     }
@@ -1295,6 +1298,50 @@ async fn recovery_reuses_credential() {
     )
     .await;
     assert_eq!(backend.submits.lock().unwrap().len(), 1);
+    net.shutdown().await;
+}
+
+// A batch run inside its bucket gets a session's credential and endpoint where its backend
+// gives sessions S3 access; elsewhere it runs without one, as before.
+#[tokio::test]
+async fn workspace_run_credential() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let (mut ctx, net) = net_context(storage.clone()).await;
+    let backend = StubBackend::new(StubReconcile::NotFound);
+    let registry = ExecutorRegistry::new()
+        .with_backend(backend.clone())
+        .with_workspace_endpoint(Some("http://s3.test".to_string()), String::new());
+    Arc::get_mut(&mut ctx).unwrap().compute_handle = Some(Arc::new(registry));
+    let (record, _token, _attempt) = ready_with_intent(&storage).await;
+    let local = net.node_id();
+    let mut spec = execution_spec();
+    spec.executor_constraint = Some("docker".to_string());
+    let scope = (RealmId([1; 32]), spec.group_id, local);
+    let owner = crate::tests::access::seed_access(&ctx, scope, "/none")
+        .await
+        .user_id;
+    let record = crate::jobs::store::mutate_job(&storage, record.job_id, |record| {
+        record.payload = JobPayload::Execution(spec.clone());
+        record.created_by = owner;
+        record.workspace_mode = WorkspaceMode::Existing;
+        record.workspace_bucket = Some("ws-test".to_string());
+        Ok(crate::jobs::store::JobMutation::Persist)
+    })
+    .await
+    .unwrap();
+    let prepare = || super::prepare::prepare_attempt(&ctx, &spec, &record, local, "ws-test");
+    let plain = Box::pin(prepare()).await.unwrap();
+    assert!(plain.workspace.is_none());
+    assert!(plain.secrets.is_empty());
+
+    backend.sessions.store(true, Ordering::Relaxed);
+    let bound = Box::pin(prepare()).await.unwrap();
+    let workspace = bound.workspace.expect("workspace binding");
+    assert_eq!(workspace.bucket_name, "ws-test");
+    assert_eq!(workspace.s3_endpoint, "http://s3.test");
+    assert!(bound.secrets.contains_key("AWS_ACCESS_KEY_ID"));
+    assert!(bound.secrets.contains_key("AWS_SECRET_ACCESS_KEY"));
     net.shutdown().await;
 }
 

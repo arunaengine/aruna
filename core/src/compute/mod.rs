@@ -661,12 +661,16 @@ impl TaskSpec {
         }
     }
 
+    /// Whether the task reaches its workspace bucket over S3: a session, or a run bound to one.
+    pub fn reaches_s3(&self) -> bool {
+        self.session || self.workspace.is_some()
+    }
+
     pub fn effective_env(&self) -> BTreeMap<String, String> {
         let mut env = self.env.clone();
         env.insert("ARUNA_JOB_ID".to_string(), self.attempt.job_id.clone());
-        // A session always reaches its workspace bucket over S3, whatever the
-        // staging mode of its declared inputs is.
-        if self.staging_mode == StagingMode::DirectS3 || self.session {
+        // Such a task reaches its bucket over S3, whatever the staging mode of its inputs is.
+        if self.staging_mode == StagingMode::DirectS3 || self.reaches_s3() {
             if let Some(workspace) = &self.workspace {
                 env.insert(
                     "AWS_ENDPOINT_URL".to_string(),

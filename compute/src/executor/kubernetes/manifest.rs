@@ -46,7 +46,7 @@ pub fn job_manifest(
     labels.insert(
         "aruna-engine.org/network".to_string(),
         match spec.security.network {
-            NetworkAccess::Isolated if spec.session => "s3",
+            NetworkAccess::Isolated if spec.reaches_s3() => "s3",
             NetworkAccess::Isolated => "none",
             NetworkAccess::S3Only => "s3",
             NetworkAccess::Open => "task",
@@ -127,7 +127,7 @@ pub fn job_manifest(
             }
         }
     }
-    if spec.staging_mode == StagingMode::DirectS3 || spec.session {
+    if spec.staging_mode == StagingMode::DirectS3 || spec.reaches_s3() {
         env_from.push(json!({"secretRef":{"name":secret_name(&name)}}));
     }
     // Tools write caches relative to the working directory, so the non-root
@@ -1355,6 +1355,61 @@ mod tests {
         assert_eq!(data["access_key_id"], "session-access");
         assert_eq!(data["secret_access_key"], "session-secret");
         assert_eq!(data["AWS_ACCESS_KEY_ID"], "session-access");
+    }
+
+    #[test]
+    fn workspace_run_reaches() {
+        // A batch run bound to its bucket gets the credential, endpoint and S3-only egress.
+        let mut spec = session_spec();
+        spec.session = false;
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job =
+            serde_json::to_value(job_manifest(&context(), &spec, &config(), &layout).unwrap())
+                .unwrap();
+        let template = &job["spec"]["template"];
+        assert_eq!(
+            template["metadata"]["labels"]["aruna-engine.org/network"],
+            "s3"
+        );
+        let container = &template["spec"]["containers"][0];
+        assert_eq!(
+            container["envFrom"][0]["secretRef"]["name"],
+            "aruna-job-a1-env"
+        );
+        let env = container["env"].as_array().unwrap();
+        assert!(
+            env.iter().any(|entry| entry["name"] == "AWS_ENDPOINT_URL"
+                && entry["value"] == "https://s3.example")
+        );
+        assert!(
+            env.iter()
+                .any(|entry| entry["name"] == "ARUNA_WORKSPACE_BUCKET"
+                    && entry["value"] == "workspace-bucket")
+        );
+        let volumes = template["spec"]["volumes"].as_array().unwrap();
+        assert!(
+            volumes
+                .iter()
+                .all(|volume| volume["name"] != "aruna-job-a1-data")
+        );
+
+        // An unbound batch run stays without any network.
+        spec.workspace = None;
+        spec.secret_env.clear();
+        let job =
+            serde_json::to_value(job_manifest(&context(), &spec, &config(), &layout).unwrap())
+                .unwrap();
+        let template = &job["spec"]["template"];
+        assert_eq!(
+            template["metadata"]["labels"]["aruna-engine.org/network"],
+            "none"
+        );
+        assert!(
+            template["spec"]["containers"][0]["envFrom"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
