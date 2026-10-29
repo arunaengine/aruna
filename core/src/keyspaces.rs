@@ -336,6 +336,10 @@ pub const REALM_MARKER_KEYSPACE: &str = "device_realm_marker";
 /// only address it has for a management-only route.
 pub const MANAGEMENT_URL_KEYSPACE: &str = "device_management_urls";
 
+/// Display names of realm nodes, as a realm node served them, keyed by realm id. A device runs
+/// no document sync, so this copy is what its realm listing shows.
+pub const NODE_NAME_KEYSPACE: &str = "device_node_names";
+
 /// Realm-document fetches that every realm node refused for realm membership, keyed by realm
 /// id. Two without a successful fetch between them report the device as removed.
 pub const REALM_REMOVAL_KEYSPACE: &str = "device_realm_removal";
@@ -690,6 +694,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DEVICE_FENCE_KEYSPACE,
     REALM_MARKER_KEYSPACE,
     MANAGEMENT_URL_KEYSPACE,
+    NODE_NAME_KEYSPACE,
     REALM_REMOVAL_KEYSPACE,
     SYNC_STATE_KEYSPACE,
     DEVICE_REPLICA_KEYSPACE,

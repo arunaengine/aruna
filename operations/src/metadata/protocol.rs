@@ -723,6 +723,8 @@ pub struct RealmDocuments {
     /// What the serving node had applied when it made this copy. A device
     /// refuses a copy that has seen less than the one it already holds.
     pub clock: AdminDocumentClock,
+    /// Display names of realm nodes from the serving node's realm config state.
+    pub node_names: std::collections::BTreeMap<aruna_core::NodeId, String>,
 }
 
 /// One page of immutable records plus the cursor of the next one.

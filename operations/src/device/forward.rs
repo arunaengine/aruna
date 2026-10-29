@@ -26,6 +26,7 @@ use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_document::update_metadata_document;
 use crate::node::node_info::read_info_documents;
 use crate::placement::process_placements::load_realm_config;
+use crate::realm::node_name::ReadNamesOperation;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentClock;
@@ -147,6 +148,12 @@ pub(super) async fn read_realm_documents(
         node_infos,
         management_urls: management_urls(context, &config).await,
         clock: applied_clock(context, realm_id).await,
+        node_names: drive(ReadNamesOperation::new(realm_id), context)
+            .await
+            .map_err(|error| {
+                warn!(%error, "Failed to read the node display names for a device");
+                SyncRefusal::Unavailable
+            })?,
     })
 }
 

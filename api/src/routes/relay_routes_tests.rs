@@ -328,3 +328,37 @@ async fn hop_stays_local() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
 }
+
+// A device runs no document sync: its listing shows the names a realm node last served it.
+#[tokio::test]
+async fn device_lists_names() {
+    let fixture = setup(Vec::new()).await;
+    let state = &fixture.state;
+    let realm_id = state.get_realm_id();
+    let node_id = state.get_node_id();
+    let names = std::collections::BTreeMap::from([(node_id, "Lab laptop".to_string())]);
+    write_row(
+        state,
+        aruna_core::keyspaces::NODE_NAME_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        postcard::to_allocvec(&names).unwrap(),
+    )
+    .await;
+    let owner = aruna_core::structs::identity::auth::AuthContext {
+        user_id: UserId::local(Ulid::from_bytes([9u8; 16]), realm_id),
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+
+    let info = crate::routes::info::run_realm_info(state, Some(owner))
+        .await
+        .unwrap();
+
+    let device = info
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id.to_string())
+        .unwrap();
+    assert_eq!(device.display_name.as_deref(), Some("Lab laptop"));
+}

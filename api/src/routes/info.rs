@@ -22,7 +22,7 @@ use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::device::realm_documents::installed_management_urls;
+use aruna_operations::device::realm_documents::{installed_management_urls, installed_node_names};
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
@@ -1293,12 +1293,7 @@ pub(crate) async fn run_realm_info(
         let discovery = serde_json::to_value(&config.discovery)
             .map_err(|error| ServerError::InternalError(error.to_string()))?;
         let contacts = state.peer_contacts();
-        let names = drive(ReadNamesOperation::new(config.realm_id), &state.get_ctx())
-            .await
-            .unwrap_or_else(|error| {
-                warn!(error = %error, "node display names unavailable for realm info");
-                BTreeMap::new()
-            });
+        let names = node_names(state, config.realm_id).await;
         let nodes = map_realm_nodes(
             state,
             &config,
@@ -1339,6 +1334,26 @@ pub(crate) async fn run_realm_info(
         quota,
         interfaces,
     })
+}
+
+/// Node display names. A device runs no document sync, so it shows the copy a realm node
+/// last served it.
+async fn node_names(
+    state: &ServerState,
+    realm_id: aruna_core::structs::identity::realm::RealmId,
+) -> BTreeMap<aruna_core::NodeId, String> {
+    if matches!(
+        state.node_capabilities(),
+        aruna_core::structs::identity::auth::NodeCapabilities::User { .. }
+    ) {
+        return installed_node_names(&state.get_ctx(), realm_id).await;
+    }
+    drive(ReadNamesOperation::new(realm_id), &state.get_ctx())
+        .await
+        .unwrap_or_else(|error| {
+            warn!(error = %error, "node display names unavailable for realm info");
+            BTreeMap::new()
+        })
 }
 
 /// Every management node of the realm with the api url it published, in
