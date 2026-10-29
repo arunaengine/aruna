@@ -431,6 +431,7 @@ pub async fn create_making_room(
             .await
             .map_err(|error| CreateSessionError::Retire(error.to_string()))
     };
+    let now = config.time;
     config.cutoff = read_cutoff(config.realm_id, config.user_id).await?;
     // A token issued before the cutoff would be refused at once, so it is issued at it.
     let at_cutoff = |config: &mut CreateSessionConfig| {
@@ -461,7 +462,7 @@ pub async fn create_making_room(
             user_id: config.user_id,
             realm_id: config.realm_id,
         };
-        let retire = super::revoke::cutoff_revocation(actor, oldest, config.time);
+        let retire = super::revoke::cutoff_revocation(actor, oldest, now);
         crate::driver::drive(
             crate::auth::revoke_token::RevokeTokenOperation::new(retire),
             context,
