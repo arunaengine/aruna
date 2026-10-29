@@ -126,6 +126,9 @@ fn foreign_paths_fail() {
         mapper.map(&row("https://data.example.org/files/a.fq"), None),
         RowOutcome::Failed(_)
     ));
+    // A failed row is still named by the key it would map to.
+    let failed = row("https://other.example.org/files/a.fq");
+    assert_eq!(mapper.target_key(&failed).as_deref(), Some("samples/a.fq"));
 }
 
 // Quoted fields may hold delimiters and newlines; a row cut by the chunk end waits.

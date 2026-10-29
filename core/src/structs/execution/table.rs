@@ -733,6 +733,12 @@ impl RowMapper {
         })
     }
 
+    /// The key a row maps to, if its target renders as a canonical key; names a failed row.
+    pub fn target_key(&self, fields: &[Option<String>]) -> Option<String> {
+        let value = |index: usize| fields.get(index).and_then(Option::as_deref);
+        render(&self.target, &value).and_then(|target| canonical_path(&target))
+    }
+
     /// The size, checksums and modification time a row gives; a null value gives none.
     fn described<'a>(
         &self,

@@ -150,16 +150,19 @@ pub(super) async fn read_table_chunk(
     let mut entries = Vec::new();
     for (row, end) in rows {
         let at = read.offset + end as u64;
-        let outcome = match row {
-            Ok(fields) => mapper.map(&fields, base.as_deref()),
-            Err(reason) => RowOutcome::Failed(reason),
+        let (outcome, target) = match row {
+            Ok(fields) => match mapper.map(&fields, base.as_deref()) {
+                failed @ RowOutcome::Failed(_) => (failed, mapper.target_key(&fields)),
+                outcome => (outcome, None),
+            },
+            Err(reason) => (RowOutcome::Failed(reason), None),
         };
         match outcome {
             RowOutcome::Filtered | RowOutcome::Skipped => {}
             RowOutcome::Failed(reason) => record_failure(
                 &mut next,
                 &name,
-                "",
+                target.as_deref().unwrap_or_default(),
                 format!("row ending at byte {at}: {reason}"),
             ),
             RowOutcome::Import(entry) => entries.push(entry),
