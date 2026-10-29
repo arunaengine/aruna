@@ -797,6 +797,14 @@ fn build_crate_jsonld(
                     .to_string();
                 context_entities.entry(context_id).or_insert(context_entity);
             }
+            // The bucket metadata and releases an input is part of are datasets the root lists.
+            for part in file["isPartOf"].as_array().into_iter().flatten() {
+                if let Some(part) = part["@id"].as_str()
+                    && !part_ids.iter().any(|id| id == part)
+                {
+                    part_ids.push(part.to_string());
+                }
+            }
         }
         object_ids.push(json!({ "@id": id.clone() }));
         files.push(file);
@@ -1444,6 +1452,9 @@ mod pure_tests {
         assert_eq!(release["@id"], crate_version.to_id().as_str());
         assert_eq!(release["version"], "6.0");
         assert_eq!(release["isBasedOn"][0]["@id"], doi.url.as_str());
+        // The metadata snapshot and the release must reach the root, or the crate is refused.
+        let checked = craqle::validate_rocrate_jsonld(&value.to_string());
+        assert!(checked.is_ok(), "{checked:?}");
 
         // Membership that was not checked everywhere is marked; a private source stays unnamed.
         let mut unchecked = captured(false);
