@@ -1016,6 +1016,12 @@ pub struct RealmUtilizationResponse {
     pub heartbeat_at_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub download_slots: Option<DownloadSlotsResponse>,
+    /// Background jobs the node runs right now, from its heartbeat; absent without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jobs_running: Option<u32>,
+    /// The staging imports among `jobs_running`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imports_running: Option<u32>,
 }
 
 /// DRS download slot use from the node's heartbeat.
@@ -1416,6 +1422,7 @@ fn map_node_document(
         heartbeat_at_ms: held.received_at_ms,
         ..held.heartbeat.utilization
     });
+    let jobs = held.and_then(|held| held.heartbeat.jobs);
     NodeDocumentResponse {
         executors: document
             .executors
@@ -1443,6 +1450,8 @@ fn map_node_document(
                     max: slots.max,
                     refused: slots.refused,
                 }),
+            jobs_running: jobs.map(|jobs| jobs.total),
+            imports_running: jobs.map(|jobs| jobs.imports),
         },
         telemetry: TelemetryState::of(held),
         telemetry_age_ms: held.map(|held| held.age_ms),

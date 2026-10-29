@@ -1626,6 +1626,31 @@ async fn realm_node_details() {
     assert!(serialized["urls"].get("api").is_none());
     assert!(serialized["utilization"].get("documents_held").is_none());
     assert!(serialized["utilization"].get("load_permille").is_none());
+    assert!(serialized["utilization"].get("jobs_running").is_none());
+
+    // A held heartbeat brings the running job counts; the counts are all it reveals.
+    let heartbeat = aruna_core::heartbeat::NodeHeartbeat {
+        realm_id,
+        epoch: document.epoch,
+        sequence: 1,
+        utilization: document.utilization,
+        availability: Vec::new(),
+        reservation: Default::default(),
+        demand: Default::default(),
+        jobs: Some(aruna_core::heartbeat::RunningJobs {
+            total: 9,
+            imports: 8,
+        }),
+    };
+    let held = aruna_core::heartbeat::HeldHeartbeat {
+        node_id,
+        heartbeat,
+        age_ms: 0,
+        received_at_ms: 1_700_000_001_000,
+    };
+    let utilization = super::map_node_document(&document, Some(&held)).utilization;
+    assert_eq!(utilization.jobs_running, Some(9));
+    assert_eq!(utilization.imports_running, Some(8));
 }
 
 #[test]
@@ -1635,7 +1660,13 @@ fn node_openapi_optional() {
         ("RealmNodeUrlsResponse", &["api", "s3"][..]),
         (
             "RealmNodeUtilizationResponse",
-            &["documents_held", "load_permille", "download_slots"][..],
+            &[
+                "documents_held",
+                "load_permille",
+                "download_slots",
+                "jobs_running",
+                "imports_running",
+            ][..],
         ),
     ] {
         let schema = &openapi["components"]["schemas"][schema];
