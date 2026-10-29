@@ -26,7 +26,7 @@ const CURSOR_MAX_BYTES: usize = 64 * 1024;
 
 const SEARCH_MAX_BYTES: usize = 2 * 1024;
 
-/// Skipped distributed buckets one realm-wide page searches by name; more count as unsearched.
+/// Skipped distributed buckets one realm-wide page searches by name; the rest wait in its cursor.
 const MAX_SKIPPED_SEARCHES: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -385,7 +385,7 @@ async fn search_until(
     let mut failed = 0;
     for (index, pending) in queue.into_iter().enumerate() {
         if index >= MAX_SKIPPED_SEARCHES {
-            failed += 1;
+            partitions.pending.push(pending);
             continue;
         }
         let ids = (realm_id, local_node_id);
@@ -423,6 +423,14 @@ async fn search_until(
     }
     execution.incomplete_ranges += failed;
     execution.complete &= failed == 0;
+    // Strict mode answers complete pages only; work left in the cursor is not missing.
+    if plan.mode == ObjectQueryMode::DistributedStrict && execution.incomplete_ranges > 0 {
+        return Err(MetadataApiError::SearchIncomplete(incomplete_reason(
+            execution.incomplete_ranges,
+            execution.partial_ranges.len(),
+            &execution.index_progress,
+        )));
+    }
     Ok(execution)
 }
 
