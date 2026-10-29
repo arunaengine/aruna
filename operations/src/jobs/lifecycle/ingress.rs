@@ -206,6 +206,10 @@ pub async fn serve_input_resolve(
             return Err(SubmissionRefusal::Unavailable);
         };
         captured.link = link;
+        // An input asked without a version is pinned to the one captured here.
+        let aruna_core::structs::execution::job::InputSource::S3 { version_id, .. } =
+            &mut input.source;
+        version_id.get_or_insert_with(|| captured.version_id.to_string());
         let answer = (input, captured);
         if !fits(&mut size, &answer) {
             if answers.is_empty() {
@@ -235,13 +239,24 @@ fn answers_input(
             .and_then(|v| Ulid::from_string(v).ok())
     };
     let InputSource::S3 { bucket, key, .. } = &asked.source;
+    // A source asked without a version is answered at the version captured there.
+    let same_source = |selection: &InputSelection| {
+        let InputSource::S3 {
+            bucket: answered,
+            key: answered_key,
+            ..
+        } = &selection.source;
+        answered == bucket
+            && answered_key == key
+            && pin(asked).is_none_or(|v| pin(selection) == Some(v))
+    };
     let source_kept = match &captured.link {
-        None => selection.source == asked.source,
+        None => same_source(selection),
         Some(link) => {
             link.node_id == node
                 && link.bucket == *bucket
                 && link.key == *key
-                && Some(link.version) == pin(asked)
+                && pin(asked).is_none_or(|version| link.version == version)
         }
     };
     source_kept
@@ -478,6 +493,21 @@ fn source_error(reference: &str, error: SourceReadError) -> SubmitJobError {
     }
 }
 
+/// An input the caller names on another node must name its exact version there too.
+fn exact_version(input: &InputSelection) -> Result<(), SubmitJobError> {
+    let aruna_core::structs::execution::job::InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    match version_id.as_deref().map(Ulid::from_string) {
+        Some(Ok(_)) => Ok(()),
+        _ => Err(SubmitJobError::InvalidWorkspace(format!(
+            "s3://{bucket}/{key}: an input on another node must name its exact version"
+        ))),
+    }
+}
+
 /// Points a local input of a distributed bucket at the member that coordinates its key, so it
 /// is captured and pinned there, as an S3 read of the key is served there.
 async fn range_holder(
@@ -531,7 +561,10 @@ async fn resolve_inputs(
     let mut here = Vec::new();
     for input in &spec.inputs {
         match input.source_node_id.filter(|node| *node != local) {
-            Some(node) => remote.entry(node).or_default().push(input.clone()),
+            Some(node) => {
+                exact_version(input)?;
+                remote.entry(node).or_default().push(input.clone());
+            }
             None => here.push(input.clone()),
         }
     }
@@ -774,21 +807,6 @@ async fn remote_captures(
     (created_by, submission_id, expires_at): (UserId, SubmissionId, u64),
     auth_token: Option<&AuthToken>,
 ) -> Result<Vec<(InputSelection, CapturedInput)>, SubmitJobError> {
-    for input in inputs {
-        let aruna_core::structs::execution::job::InputSource::S3 {
-            bucket,
-            key,
-            version_id,
-        } = &input.source;
-        version_id
-            .as_deref()
-            .and_then(|version| Ulid::from_string(version).ok())
-            .ok_or_else(|| {
-                SubmitJobError::InvalidWorkspace(format!(
-                    "s3://{bucket}/{key}: an input on another node must name its exact version"
-                ))
-            })?;
-    }
     let (Some(metadata), Some(AuthToken::Bearer(token))) =
         (context.metadata_handle.as_ref(), auth_token)
     else {
@@ -2150,6 +2168,26 @@ mod tests {
         let mut stale = linked;
         stale.link.as_mut().expect("link").version = Ulid::from_parts(9, 9);
         assert!(!answers_input(&asked, &(target, stale), node_id));
+
+        // An input routed to its range coordinator without a version is answered pinned there,
+        // never unpinned and never as another key.
+        let mut unpinned = s3_input("db", "bakta.db", None);
+        unpinned.source_node_id = Some(node_id);
+        assert!(answers_input(&unpinned, &plain, node_id));
+        let bare = (unpinned.clone(), captured_from(&asked, node_id));
+        assert!(!answers_input(&unpinned, &bare, node_id));
+        let mut other = asked.clone();
+        other.source = s3_input("db", "other.db", Some(&version.to_string())).source;
+        let moved = (other.clone(), captured_from(&other, node_id));
+        assert!(!answers_input(&unpinned, &moved, node_id));
+    }
+
+    // A node named by the caller still needs an exact version; a range coordinator does not.
+    #[test]
+    fn named_node_needs_version() {
+        assert!(exact_version(&s3_input("db", "a", None)).is_err());
+        let version = Ulid::from_parts(1, 1).to_string();
+        assert!(exact_version(&s3_input("db", "a", Some(&version))).is_ok());
     }
 
     #[test]
@@ -2212,8 +2250,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_needs_pin_and_bearer() {
-        // An input on another node needs an exact version and the caller's own bearer.
+    async fn remote_needs_bearer() {
+        // An input on another node needs the caller's own bearer; its version rule is checked
+        // where the caller names the node (`named_node_needs_version`).
         let dir = tempdir().unwrap();
         let context = test_ctx(dir.path().to_str().unwrap());
         let caller = (
@@ -2221,9 +2260,6 @@ mod tests {
             SubmissionId([4; 32]),
             10,
         );
-        let unpinned = vec![s3_input("a", "x", None)];
-        let refused = remote_captures(&context, node(2), &unpinned, caller, None).await;
-        assert!(matches!(refused, Err(SubmitJobError::InvalidWorkspace(_))));
         let pinned = vec![s3_input(
             "a",
             "x",
