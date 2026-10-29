@@ -86,6 +86,34 @@ fn summary_maps_folders() {
     assert_eq!(mapper.map(&last, Some(BASE)), RowOutcome::Skipped);
 }
 
+// One file per assembly comes straight from the summary: a suffix after the folder's basename.
+#[test]
+fn summary_maps_genomes() {
+    let mut import = ncbi();
+    import.rows.kind = RowKind::File;
+    import.rows.source = "{ftp_path}/{ftp_path|basename}_genomic.fna.gz".to_string();
+    import.rows.target = "{ftp_path|basename}/{ftp_path|basename}_genomic.fna.gz".to_string();
+    import.rows.filter.clear();
+    import.validate().unwrap();
+    let bytes = SUMMARY.as_bytes();
+    let (columns, used) = read_header(&import.format, bytes, true).unwrap();
+    let mapper = RowMapper::new(&import.rows, &columns).unwrap();
+    let (rows, _) = parse_rows(&import.format, Some(38), &bytes[used..], true).unwrap();
+    let outcomes: Vec<RowOutcome> = (rows.into_iter())
+        .map(|(row, _)| mapper.map(&row.unwrap(), Some(BASE)))
+        .collect();
+    let human = imported(outcomes[0].clone());
+    let folder = "GCF_000001405.40_GRCh38.p14";
+    assert_eq!(
+        human.source_path,
+        format!("all/GCF/000/001/405/{folder}/{folder}_genomic.fna.gz")
+    );
+    assert_eq!(human.target, format!("{folder}/{folder}_genomic.fna.gz"));
+    // A row without a size column is headed once at import; an `na` folder is skipped.
+    assert_eq!(human.size, None);
+    assert_eq!(outcomes.last(), Some(&RowOutcome::Skipped));
+}
+
 // URLs outside the connector base and non-canonical paths fail their row only.
 #[test]
 fn foreign_paths_fail() {
