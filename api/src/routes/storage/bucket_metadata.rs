@@ -13,6 +13,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::metadata::{
     PutMetadataError, PutMetadataOperation, bucket_metadata,
 };
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -126,8 +127,10 @@ pub struct BucketMetadataResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PutBucketMetadataRequest {
-    /// `null` clears the metadata.
+    /// Required; `null` clears the metadata.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub metadata: Option<BucketMetadataBody>,
 }
 
@@ -193,12 +196,13 @@ pub async fn get_bucket_metadata(
     path = "/data/buckets/{bucket}/metadata",
     tag = "data/storage",
     summary = "Set a bucket's metadata",
-    description = r#"Replaces what describes a bucket, or clears it with `null`.
+    description = r#"Replaces what describes a bucket, or clears it with `"metadata": null`.
 
 **Authentication**: realm bearer token with WRITE on the owning group's admin path. For a
 distributed bucket the set's publisher checks the forwarded token again.
 
 **Behavior**
+- `metadata` is required and is the only field, so a body without it never clears anything.
 - `database: true` lets clients show the bucket as a database; it changes nothing else.
 - Identifier rules must compile and their links, like every identifier link, must be `http` or
   `https`.
@@ -219,7 +223,7 @@ distributed bucket the set's publisher checks the forwarded token again.
             "bucket": "bakta-db",
             "metadata": {"database": true, "title": "Bakta database", "version": "6.0", "license": null, "identifiers": [], "parser": null, "dataset": null}
         })),
-        (status = 400, description = "Invalid identifier rules, identifier link or dataset id", body = ErrorResponse),
+        (status = 400, description = "Missing `metadata`, an unknown field, or invalid identifier rules, identifier link or dataset id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the owning group's admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the group", body = ErrorResponse),
@@ -232,9 +236,11 @@ pub async fn put_bucket_metadata(
     Extension(auth): Extension<Option<AuthContext>>,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
-    Json(request): Json<PutBucketMetadataRequest>,
+    request: Result<Json<PutBucketMetadataRequest>, JsonRejection>,
 ) -> ServerResult<Json<BucketMetadataResponse>> {
     let auth = require_realm_auth(&state, auth)?;
+    let Json(request) =
+        request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     let metadata = request.metadata.map(BucketMetadata::try_from).transpose()?;
     let info = bucket_info(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, info.group_id).await?;
@@ -275,3 +281,7 @@ pub async fn put_bucket_metadata(
         metadata: metadata.map(Into::into),
     }))
 }
+
+#[cfg(test)]
+#[path = "bucket_metadata_tests.rs"]
+mod tests;
