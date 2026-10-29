@@ -24,6 +24,7 @@ pub mod info;
 pub mod link_routes;
 pub mod management_relay;
 pub mod metadata;
+pub mod node_names;
 pub mod notifications;
 pub mod oai;
 pub mod onboarding;
@@ -107,6 +108,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(repository::links::router())
         .merge(repository::check::router())
         .merge(link_routes::router())
+        .merge(node_names::router())
         .merge(notifications::router())
         .merge(policies::router())
         .merge(portal::router())
@@ -459,6 +461,8 @@ pub(crate) mod tests {
         ("PATCH", "/data/sync/relationships/{id}"),
         ("PATCH", "/device/folders/{folder_id}"),
         ("PATCH", "/system/realm/placement"),
+        ("PATCH", "/system/realm/nodes/{node_id}"),
+        ("PATCH", "/access/users/me/devices/{id}"),
         ("PATCH", "/access/users/me"),
         ("PATCH", "/system/assistant/providers/{id}"),
         ("PATCH", "/access/users/{id}"),

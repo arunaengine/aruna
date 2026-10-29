@@ -40,6 +40,7 @@ use aruna_operations::realm::get_nodes::{
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
 };
+use aruna_operations::realm::node_name::ReadNamesOperation;
 use aruna_operations::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
@@ -932,6 +933,9 @@ pub struct NodeInfoResponse {
     /// not seen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_ms: Option<u64>,
+    /// Realm-administered display name; absent when unset. A label only, never an identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Placement map entry (location/weight/status) when the node is mapped.
     pub placement: Option<NodePlacementResponse>,
     /// Latest published node info document (capabilities/labels/urls/utilization) if received.
@@ -1283,12 +1287,19 @@ pub(crate) async fn run_realm_info(
         let discovery = serde_json::to_value(&config.discovery)
             .map_err(|error| ServerError::InternalError(error.to_string()))?;
         let contacts = state.peer_contacts();
+        let names = drive(ReadNamesOperation::new(config.realm_id), &state.get_ctx())
+            .await
+            .unwrap_or_else(|error| {
+                warn!(error = %error, "node display names unavailable for realm info");
+                BTreeMap::new()
+            });
         let nodes = map_realm_nodes(
             state,
             &config,
             present_nodes,
             node_info_docs,
             &contacts,
+            &names,
             unix_timestamp_millis(),
         );
         (
@@ -2238,6 +2249,7 @@ fn map_realm_nodes(
         aruna_core::structs::storage::node_info::NodeInfoDocument,
     >,
     contacts: &PeerContacts,
+    names: &BTreeMap<aruna_core::NodeId, String>,
     now_ms: u64,
 ) -> Vec<NodeInfoResponse> {
     let current_node = state.get_node_id();
@@ -2289,6 +2301,7 @@ fn map_realm_nodes(
                     (false, _, false) => RealmConnectionStatus::Configured,
                 },
                 last_seen_ms,
+                display_name: parsed.and_then(|node_id| names.get(&node_id).cloned()),
                 placement,
                 info,
             }
