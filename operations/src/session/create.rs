@@ -431,6 +431,11 @@ pub async fn create_making_room(
             .map_err(|error| CreateSessionError::Retire(error.to_string()))
     };
     config.cutoff = read_cutoff(config.realm_id, config.user_id).await?;
+    // A token issued before the cutoff would be refused at once, so it is issued at it.
+    let at_cutoff = |config: &mut CreateSessionConfig| {
+        config.time = config.time.max(config.cutoff.unwrap_or(0));
+    };
+    at_cutoff(&mut config);
     loop {
         let oldest = match crate::driver::drive(
             CreateSessionOperation::new(config.clone()),
@@ -459,6 +464,7 @@ pub async fn create_making_room(
             return Err(CreateSessionError::LimitReached { oldest });
         }
         config.cutoff = cutoff;
+        at_cutoff(&mut config);
     }
 }
 
@@ -722,6 +728,35 @@ mod pure_tests {
             ..config
         };
         create_making_room(&context, node_id, next).await.unwrap();
+    }
+
+    // A sign-in right after a sign-out moved the cutoff into the next second is issued at the
+    // cutoff, so its token is not refused at once.
+    #[tokio::test]
+    async fn issues_at_cutoff() {
+        use crate::driver::drive;
+        let (_dir, context, config, node_id) = session_realm().await;
+        let now = aruna_core::time::unix_timestamp_secs();
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id,
+            user_id: config.user_id,
+            realm_id: config.realm_id,
+        };
+        let raise = super::super::revoke::cutoff_revocation(actor, now, now);
+        drive(
+            crate::auth::revoke_token::RevokeTokenOperation::new(raise),
+            &context,
+        )
+        .await
+        .unwrap();
+        let next = CreateSessionConfig {
+            time: now,
+            expiry: now + 3_600,
+            ..config
+        };
+        let created = create_making_room(&context, node_id, next).await.unwrap();
+        assert_eq!(created.session.created_at, now + 1);
+        assert_eq!(created.session.expires_at, now + 3_600);
     }
 
     // A user at the session limit still signs in: the oldest session is signed out instead.
