@@ -2021,6 +2021,12 @@ async fn read_size(
     if let Err(error) = reader.read_exact(&mut size).await {
         return Err(joined_error(join, io_error(error)).await);
     }
+    // No file reaches 64 PiB; an older helper starts with a tar path instead of a size.
+    if size[0] != 0 {
+        return Err(BackendError::InvalidSpec(
+            "the fetch helper sent no file size; deploy the helper image of this release".into(),
+        ));
+    }
     Ok((u64::from_be_bytes(size), join))
 }
 
@@ -3589,5 +3595,12 @@ mod tests {
             panic!("a short size must fail");
         };
         assert!(matches!(&error, BackendError::Api(message) if message == "websocket reset"));
+
+        // An older helper answers with a tar header, whose path is no size.
+        let (mut reader, join) = exec(b"out/data\0\0\0\0", Ok(()));
+        let Err(error) = read_size(&mut reader, join).await else {
+            panic!("a tar header must not pass as a size");
+        };
+        assert!(matches!(error, BackendError::InvalidSpec(_)));
     }
 }
