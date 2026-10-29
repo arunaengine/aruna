@@ -6,7 +6,8 @@ use super::*;
 
 use super::super::preflight::{
     assemble_preflight_execution, index_state, plan_preflight_request, resolve_all_preflight,
-    resolve_preflight_targets, resolve_preflight_versions, verify_preflight_cursor, visible_prefix,
+    resolve_preflight_targets, resolve_preflight_versions, verify_preflight_cursor,
+    version_targets, visible_prefix,
 };
 
 // Documents not materialized yet have no postings, so their absence is never reported current.
@@ -460,4 +461,91 @@ async fn headless_versions_purge() {
         .await
         .expect("bucket resolves");
     assert_eq!((versions.len(), complete), (6, true));
+}
+
+// Versions whose bytes were never read have no content identity, so their key's location names
+// them; a purge removes that location, and resolving them leaves nothing out.
+#[test]
+fn unread_versions_located() {
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::storage::blob::{ArchiveKey, BackendRef};
+    use aruna_core::structs::storage::format::EncodingClass;
+
+    let user = UserId::nil(RealmId::from_bytes([80u8; 32]));
+    let at = SystemTime::UNIX_EPOCH;
+    let source = VersionSourceBinding {
+        strategy: StagingStrategy::Reference,
+        descriptor: PortableSourceDescriptor {
+            kind: SourceConnectorKind::Http,
+            public_config: HashMap::new(),
+            source_path: "genomes/b.fna".to_string(),
+            version_selector: None,
+            capabilities: Vec::new(),
+            origin_node_id: None,
+            namespace: None,
+            root: None,
+        },
+        connector_id: Some(Ulid::from_bytes([2; 16])),
+    };
+    let observed = SourceMetadata {
+        content_length: 7,
+        content_type: None,
+        etag: None,
+        last_modified: None,
+        source_version: None,
+        digests: Default::default(),
+    };
+    let reference = BlobVersion::reference(source, observed, at, user, at);
+    let stored = BlobVersion::materialized(
+        [9; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        at,
+        user,
+        None,
+    );
+    let pending = BlobVersion::pending(
+        ArchiveKey::new(Ulid::nil(), BackendRef::node_default()),
+        at,
+        user,
+        None,
+    );
+    let version = |key: &str, id: u64| VersionKey::new("genes", key, Ulid::from_parts(id, 0));
+    let versions = vec![
+        (version("a", 1), stored),
+        (version("b", 2), reference.clone()),
+        (version("b", 3), reference),
+        (version("c", 4), pending),
+    ];
+    let node = iroh::SecretKey::from_bytes(&[5; 32]).public();
+    let purge = MetadataStorageOperation::AllVersionsPurge;
+    let targets = version_targets(versions, purge, node, Some("https://s3.example"));
+
+    let ids: Vec<_> = targets
+        .iter()
+        .map(|target| target.content_w3id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            content_w3id([9; 32]).as_str(),
+            "s3://genes/b",
+            "s3://genes/c"
+        ]
+    );
+    assert_eq!(targets[0].location(), None);
+    let located = &targets[1];
+    assert_eq!(located.location(), Some("s3://genes/b"));
+    assert_eq!(located.content_hash, [0; 32]);
+    assert_eq!(
+        located.queried_iris,
+        ["https://s3.example/genes/b", "s3://genes/b"]
+    );
+    assert_eq!(located.targeted_versions.len(), 2);
+    assert_eq!(located.removed_locations, located.targeted_versions);
+    assert_eq!(targets[2].location(), Some("s3://genes/c"));
 }
