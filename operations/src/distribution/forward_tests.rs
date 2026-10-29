@@ -116,3 +116,20 @@ fn internal_tokens_refused() {
     assert!(!bearer_only(&internal));
     assert!(bearer_only(&AuthToken::bearer("token").unwrap()));
 }
+
+// A refused member's bucket goes, but only while it is still that member's bucket.
+#[tokio::test]
+async fn removes_refused_member() {
+    let (_directory, context) = crate::tests::notifications::context_with_storage();
+    let (set_id, member_id) = (Ulid::from_bytes([3; 16]), Ulid::from_bytes([4; 16]));
+    let create = CreateBucketOperation::new("spire".to_string(), bucket(set_id, member_id, 0));
+    drive(create.mapped(), &context).await.unwrap();
+
+    remove_member(&context, "spire", set_id, Ulid::from_bytes([5; 16])).await;
+    let kept = drive(GetBucketOperation::new("spire".to_string()), &context).await;
+    assert!(kept.is_ok(), "another member's bucket stays");
+
+    remove_member(&context, "spire", set_id, member_id).await;
+    let gone = drive(GetBucketOperation::new("spire".to_string()), &context).await;
+    assert!(gone.is_err(), "the refused member's bucket is deleted");
+}

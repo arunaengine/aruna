@@ -179,7 +179,8 @@ pub async fn create_set(
 }
 
 /// Admits every member the record has not admitted yet and activates the set once every
-/// coordinator and replica is in. A failed member keeps the set pending; nothing is deleted.
+/// coordinator and replica is in. A failed member keeps the set pending; only the bucket of a
+/// member refused for capacity is deleted, so the name stays free.
 /// Each member checks capacity against `sizes`; a range no admitted member holds is empty.
 pub async fn admit_pending(
     context: &Arc<DriverContext>,

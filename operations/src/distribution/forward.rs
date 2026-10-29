@@ -35,6 +35,7 @@ use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
 use crate::placement::process_placements::load_realm_config;
 use crate::replication::bootstrap::wake_bootstrap;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
+use crate::s3::bucket::delete::DeleteBucketOperation;
 use crate::s3::bucket::get::GetBucketOperation;
 
 /// A publish attempt retries a storage conflict this often before it gives up.
@@ -249,7 +250,7 @@ pub(crate) async fn admit_member(
     let admit = AdmitConfig {
         realm_id,
         node_id,
-        bucket,
+        bucket: bucket.clone(),
         set_id: snapshot.set_id(),
         member_id,
         intent: member.intent,
@@ -263,15 +264,41 @@ pub(crate) async fn admit_member(
         sizes: sizes.to_vec(),
         capacity: node_routing(context).catalog.capacity(),
     };
-    drive(AdmitOperation::new(admit), context.as_ref())
-        .await
-        .map_err(|error| match error {
-            AdmitError::BindingChanged(_)
-            | AdmitError::CapacityUnknown
-            | AdmitError::InsufficientCapacity { .. }
-            | AdmitError::SizeUnknown(_) => SyncRefusal::Invalid(error.to_string()),
-            _ => SyncRefusal::Unavailable,
-        })
+    let admitted = drive(AdmitOperation::new(admit), context.as_ref()).await;
+    if let Err(
+        AdmitError::CapacityUnknown
+        | AdmitError::InsufficientCapacity { .. }
+        | AdmitError::SizeUnknown(_),
+    ) = &admitted
+        && member.incarnation.is_none()
+    {
+        // A member never admitted holds nothing, so its bucket goes and a new create may use the name.
+        remove_member(context, &bucket, snapshot.set_id(), member_id).await;
+    }
+    admitted.map_err(|error| match error {
+        AdmitError::BindingChanged(_)
+        | AdmitError::CapacityUnknown
+        | AdmitError::InsufficientCapacity { .. }
+        | AdmitError::SizeUnknown(_) => SyncRefusal::Invalid(error.to_string()),
+        _ => SyncRefusal::Unavailable,
+    })
+}
+
+/// Deletes the bucket of the name while it still carries this member's binding.
+async fn remove_member(context: &DriverContext, bucket: &str, set_id: Ulid, member_id: Ulid) {
+    let Ok(info) = drive(GetBucketOperation::new(bucket.to_string()), context).await else {
+        return;
+    };
+    let Some(binding) = info
+        .distribution
+        .filter(|binding| (binding.set_id, binding.member_id) == (set_id, member_id))
+    else {
+        return;
+    };
+    let delete = DeleteBucketOperation::new(bucket.to_string()).bound_to(binding);
+    if let Err(error) = drive(delete, context).await {
+        warn!(%error, bucket, "The bucket of a refused member stayed");
+    }
 }
 
 async fn create_member(
