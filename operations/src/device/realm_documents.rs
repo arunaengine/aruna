@@ -16,8 +16,8 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    GROUP_KEYSPACE, MANAGEMENT_URL_KEYSPACE, NODE_NAME_KEYSPACE, REALM_MARKER_KEYSPACE,
-    REALM_REMOVAL_KEYSPACE,
+    GROUP_KEYSPACE, MANAGEMENT_URL_KEYSPACE, NODE_NAME_KEYSPACE, NODE_PLACE_KEYSPACE,
+    REALM_MARKER_KEYSPACE, REALM_REMOVAL_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::SyncRefusal;
@@ -39,6 +39,7 @@ use crate::metadata::protocol::{
 };
 use crate::node::node_info::{read_info_document, write_info_document};
 use crate::realm::mutate_placement::node_kind;
+use crate::realm::node_name::NodeDisplays;
 
 /// Attempts in which every answering peer served a copy the marker does not
 /// cover before the marker is treated as wrong. The realm agreeing against a
@@ -476,7 +477,7 @@ async fn install_documents(
     let stored_owner = read_bytes(context, owner_target.clone()).await;
     let stored_groups = installed_group_docs(context).await;
     let stored_urls = installed_management_urls(context, plan.realm_id).await;
-    let stored_names = installed_node_names(context, plan.realm_id).await;
+    let stored = installed_displays(context, plan.realm_id).await;
     if !install_node_infos(context, &accepted.documents.node_infos).await {
         return false;
     }
@@ -485,7 +486,8 @@ async fn install_documents(
         && stored_owner.as_deref() == accepted.documents.owner.as_deref()
         && stored_groups == accepted.documents.groups
         && stored_urls == accepted.documents.management_urls
-        && stored_names == accepted.documents.node_names;
+        && stored.names == accepted.documents.node_names
+        && stored.places == accepted.documents.node_places;
     if unchanged {
         // Nothing but the marker moves: writing the documents again would re-register
         // every realm peer on every beat for a copy this device already holds.
@@ -544,6 +546,15 @@ async fn install_documents(
         MANAGEMENT_URL_KEYSPACE.to_string(),
         Key::from(plan.realm_id.as_bytes().to_vec()),
         Value::from(url_bytes),
+    ));
+    let Ok(place_bytes) = postcard::to_allocvec(&accepted.documents.node_places) else {
+        warn!("The fetched node places could not be stored");
+        return false;
+    };
+    writes.push((
+        NODE_PLACE_KEYSPACE.to_string(),
+        Key::from(plan.realm_id.as_bytes().to_vec()),
+        Value::from(place_bytes),
     ));
     let Ok(name_bytes) = postcard::to_allocvec(&accepted.documents.node_names) else {
         warn!("The fetched node display names could not be stored");
@@ -719,17 +730,26 @@ pub async fn installed_management_urls(
     postcard::from_bytes(&bytes).unwrap_or_default()
 }
 
-/// The node display names a realm node last served this device; empty before the first copy.
-pub async fn installed_node_names(
+/// The node display names and map places a realm node last served this device; empty before
+/// the first copy.
+pub async fn installed_displays(context: &Arc<DriverContext>, realm_id: RealmId) -> NodeDisplays {
+    NodeDisplays {
+        names: installed_map(context, NODE_NAME_KEYSPACE, realm_id).await,
+        places: installed_map(context, NODE_PLACE_KEYSPACE, realm_id).await,
+    }
+}
+
+async fn installed_map<T: serde::de::DeserializeOwned>(
     context: &Arc<DriverContext>,
+    key_space: &str,
     realm_id: RealmId,
-) -> BTreeMap<NodeId, String> {
+) -> BTreeMap<NodeId, T> {
     let Event::Storage(StorageEvent::ReadResult {
         value: Some(bytes), ..
     }) = context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: NODE_NAME_KEYSPACE.to_string(),
+            key_space: key_space.to_string(),
             key: realm_id.as_bytes().to_vec().into(),
             txn_id: None,
         })
@@ -927,6 +947,7 @@ mod tests {
             management_urls: Vec::new(),
             clock: clock(seen),
             node_names: BTreeMap::new(),
+            node_places: BTreeMap::new(),
         };
         accept(documents, realm()).expect("the answer is this realm's")
     }
@@ -1110,7 +1131,8 @@ mod tests {
         );
     }
 
-    // A device runs no document sync, so its realm listing shows only the names a copy brought.
+    // A device runs no document sync, so its realm listing shows only the names and places a
+    // copy brought.
     #[tokio::test]
     async fn installs_node_names() {
         let (_dir, context) = device(&config(&[1, 2])).await;
@@ -1128,10 +1150,17 @@ mod tests {
             marker: RealmMarker::default(),
         };
         let names = BTreeMap::from([(node(2), "Lab laptop".to_string())]);
+        let place = aruna_core::structs::identity::realm::NodePlace {
+            name: Some("Giessen".to_string()),
+            coordinates: None,
+        };
+        let places = BTreeMap::from([(node(2), place)]);
         let mut named = answer(&[1, 2], &[(1, 6)]);
         named.documents.node_names = names.clone();
+        named.documents.node_places = places.clone();
         assert!(install_documents(&context, &plan, named, 0).await);
-        assert_eq!(installed_node_names(&context, realm()).await, names);
+        let installed = installed_displays(&context, realm()).await;
+        assert_eq!((installed.names, installed.places), (names, places));
 
         // A later copy with the name cleared must clear it here too.
         let plan = FetchPlan {
@@ -1139,7 +1168,10 @@ mod tests {
             ..plan
         };
         assert!(install_documents(&context, &plan, answer(&[1, 2], &[(1, 7)]), 0).await);
-        assert!(installed_node_names(&context, realm()).await.is_empty());
+        assert_eq!(
+            installed_displays(&context, realm()).await,
+            NodeDisplays::default()
+        );
     }
 
     fn group_docs(seed: u128, display_name: &str) -> DeviceGroupDocuments {

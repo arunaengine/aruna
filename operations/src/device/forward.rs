@@ -140,6 +140,12 @@ pub(super) async fn read_realm_documents(
         })?
         .into_values()
         .collect();
+    let displays = drive(ReadNamesOperation::new(realm_id), context)
+        .await
+        .map_err(|error| {
+            warn!(%error, "Failed to read the node display names for a device");
+            SyncRefusal::Unavailable
+        })?;
     Ok(RealmDocuments {
         realm_config,
         realm_authorization,
@@ -148,12 +154,8 @@ pub(super) async fn read_realm_documents(
         node_infos,
         management_urls: management_urls(context, &config).await,
         clock: applied_clock(context, realm_id).await,
-        node_names: drive(ReadNamesOperation::new(realm_id), context)
-            .await
-            .map_err(|error| {
-                warn!(%error, "Failed to read the node display names for a device");
-                SyncRefusal::Unavailable
-            })?,
+        node_names: displays.names,
+        node_places: displays.places,
     })
 }
 
