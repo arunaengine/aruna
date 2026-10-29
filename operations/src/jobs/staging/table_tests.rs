@@ -438,6 +438,44 @@ async fn summary_imports_folders() {
     server.abort();
 }
 
+// A gzip table spanning many chunks is fetched once per run: each chunk continues the decoder
+// of the one before instead of decompressing the table from its start again.
+#[tokio::test]
+async fn gzip_table_streams() {
+    use std::io::Write;
+    const GZIP: &str = "ASSEMBLY_REPORTS/assembly_summary_refseq.txt.gz";
+    let (endpoint, site, server) = serve(|endpoint| {
+        let mut site = Site::ncbi(endpoint);
+        let summary = String::from_utf8(site.files[GZIP.trim_end_matches(".gz")].clone()).unwrap();
+        let (header, rows) = summary.split_at(summary.find("\nGCF_").unwrap() + 1);
+        // A filtered row repeated until the real rows lie several chunks into the table.
+        let filler = rows.lines().nth(2).unwrap();
+        let mut table = header.to_string();
+        while table.len() < 4 * aruna_core::structs::execution::table::TABLE_CHUNK {
+            table.push_str(filler);
+            table.push('\n');
+        }
+        table.push_str(rows);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Default::default());
+        encoder.write_all(table.as_bytes()).unwrap();
+        site.files
+            .insert(GZIP.to_string(), encoder.finish().unwrap());
+        site
+    })
+    .await;
+    let mut table = summary_table();
+    table["source"]["connector"] = GZIP.into();
+    let fixture = Fixture::new(&endpoint, table).await;
+
+    assert_eq!(fixture.run(9).await, (4, 0));
+    assert_eq!(
+        site.count(&Method::GET, GZIP),
+        1,
+        "one stream for the whole table"
+    );
+    server.abort();
+}
+
 // An uploaded CSV of file URLs imports one reference per row with its kept columns, read as
 // the submitter.
 #[tokio::test]

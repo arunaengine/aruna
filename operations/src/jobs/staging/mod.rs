@@ -134,6 +134,7 @@ async fn run_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
         return retryable_error(error);
     }
     let mut ahead = None;
+    let mut gzip = None;
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -211,7 +212,8 @@ async fn run_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
         }
         if table::reads_table(&checkpoint) {
             // Boxed, as its page import and object writes make a large future.
-            match Box::pin(table::read_table_chunk(ctx, spec, &mut checkpoint)).await {
+            let reading = table::read_table_chunk(ctx, spec, &mut checkpoint, &mut gzip);
+            match Box::pin(reading).await {
                 Ok(()) => continue,
                 Err(PageFailure::Retry(message)) => return retryable_error(message),
                 Err(PageFailure::Conflict(message)) => return conflict_error(message),

@@ -303,22 +303,33 @@ fn gzip_windows_resume() {
         "summary.txt",
         SUMMARY.as_bytes()
     ));
+    // Each step continues the decoder of the step before, after the bytes that step used.
+    let mut cursor = GzipCursor::new(0);
+    let mut pieces = compressed.chunks(97);
     let mut read = Vec::new();
     loop {
-        let mut window = GzipWindow::new(read.len() as u64, 1000);
-        for chunk in compressed.chunks(97) {
-            if window.push(chunk).unwrap() {
-                break;
+        while !cursor.ready(1000) {
+            match pieces.next() {
+                Some(piece) => cursor.push(piece).unwrap(),
+                None => cursor.finish().unwrap(),
             }
         }
-        let (bytes, complete) = window.finish().unwrap();
-        read.extend_from_slice(&bytes);
-        if complete {
+        let (bytes, complete) = cursor.chunk(1000);
+        let used = bytes.len().min(700);
+        read.extend_from_slice(&bytes[..used]);
+        assert!(cursor.advance(read.len() as u64));
+        if complete && used == bytes.len() {
             break;
         }
     }
     assert_eq!(read, SUMMARY.as_bytes());
-    let mut truncated = GzipWindow::new(0, TABLE_CHUNK);
+    assert!(!cursor.advance(0), "a cursor never goes back");
+    // A cursor opened at a later position skips to it.
+    let mut later = GzipCursor::new(5);
+    later.push(&compressed).unwrap();
+    later.finish().unwrap();
+    assert_eq!(later.chunk(4).0, &SUMMARY.as_bytes()[5..9]);
+    let mut truncated = GzipCursor::new(0);
     truncated.push(&compressed[..compressed.len() / 2]).unwrap();
     assert!(truncated.finish().is_err());
 }

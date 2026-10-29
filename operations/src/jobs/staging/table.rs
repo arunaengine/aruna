@@ -13,8 +13,8 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::execution::table::{
-    GzipWindow, RowKind, RowMapper, RowOutcome, TABLE_CHUNK, TableEntry, TableImport, TableSource,
-    is_gzip, parse_rows, read_header, source_path,
+    GzipCursor, RowKind, RowMapper, RowOutcome, TABLE_CHUNK, TableEntry, TableError, TableImport,
+    TableSource, is_gzip, parse_rows, read_header, source_path,
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
@@ -77,12 +77,28 @@ enum ChunkFailure {
     Retry(String),
 }
 
+/// A table stream as opened, with the version it opened when the table is an object.
+type Opened = (
+    BackendStream<Result<Bytes, StreamError>>,
+    Option<ulid::Ulid>,
+);
+
+/// A gzip table's open stream and decoder, kept across the steps of one job run so the table
+/// is decoded once instead of from its start for every chunk.
+pub(super) struct GzipStream {
+    version_id: Option<ulid::Ulid>,
+    observation: Option<SourceMetadata>,
+    stream: BackendStream<Result<Bytes, StreamError>>,
+    cursor: GzipCursor,
+}
+
 /// Reads the next chunk of the table: its header first, then rows, and commits their rows
-/// with the checkpoint.
+/// with the checkpoint. `kept` carries a gzip table's stream from one step of the run to the next.
 pub(super) async fn read_table_chunk(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     checkpoint: &mut StagingJobCheckpoint,
+    kept: &mut Option<GzipStream>,
 ) -> Result<(), PageFailure> {
     let (Some(import), Some(read)) = (spec.table.as_ref(), checkpoint.table.clone()) else {
         return Ok(());
@@ -105,10 +121,10 @@ pub(super) async fn read_table_chunk(
     let chunk = match &import.source {
         TableSource::Connector(path) => {
             let path = source_path(path, base.as_deref()).map_err(PageFailure::Permanent)?;
-            connector_chunk(ctx, spec, (import, &path), *read).await
+            connector_chunk(ctx, spec, (import, &path), *read, kept).await
         }
         TableSource::Object { bucket, key } => {
-            object_chunk(ctx, spec, import, (bucket, key), *read).await
+            object_chunk(ctx, spec, (import, bucket, key), *read, kept).await
         }
     };
     let chunk = match chunk {
@@ -231,6 +247,7 @@ async fn connector_chunk(
     spec: &StagingJobSpec,
     (import, path): (&TableImport, &str),
     mut read: TableRead,
+    kept: &mut Option<GzipStream>,
 ) -> Result<Chunk, ChunkFailure> {
     if !source_allowed(ctx, spec, source_permission_path(spec, path)).await? {
         return Err(ChunkFailure::Lasting("table read denied".to_string()));
@@ -265,56 +282,79 @@ async fn connector_chunk(
         .gzip
         .unwrap_or_else(|| is_gzip(&import.format, path, &[]));
     loop {
-        let plain = !gzip;
+        if gzip {
+            let at = (None, Some(observation.clone()), read.offset);
+            let observation = &observation;
+            let open = || async move {
+                let stream = open_source(ctx, spec, path, observation, None).await?;
+                Ok((stream, None))
+            };
+            let (bytes, complete, _) = gzip_chunk(kept, at, open).await?;
+            read.gzip = Some(true);
+            return Ok(Chunk {
+                bytes,
+                complete,
+                read,
+            });
+        }
         let end = (read.offset + TABLE_CHUNK as u64).min(length);
-        if plain && read.offset >= end {
+        if read.offset >= end {
             return Ok(Chunk {
                 bytes: Vec::new(),
                 complete: true,
                 read,
             });
         }
-        let source = || {
-            drive(
-                ReadSourceOperation::new(ReadSourceInput {
-                    group_id: spec.group_id,
-                    connector_id: spec.connector_id,
-                    source_path: path.to_string(),
-                    range: plain.then_some(read.offset..end),
-                    expected: Some(observation.clone()),
-                }),
-                &ctx.driver,
-            )
-        };
-        let transient = |error: &ReadSourceError| (!lasting_read(error)).then(|| error.to_string());
-        let stream = match retried(stop, spec, transient, source).await {
-            Ok(result) if result.metadata.compare(&observation) == ObservationMatch::Changed => {
-                return Err(ChunkFailure::Changed);
-            }
-            Ok(result) => result.stream,
-            Err(ReadSourceError::Staging(StagingSourceError::ConditionFailed)) => {
-                return Err(ChunkFailure::Changed);
-            }
-            Err(error) if lasting_read(&error) => {
-                return Err(ChunkFailure::Lasting(format!("table read failed: {error}")));
-            }
-            Err(error) => return Err(ChunkFailure::Retry(error.to_string())),
-        };
-        let (bytes, complete) = match gzip {
-            true => window(stream, read.offset).await?,
-            false => (collect(stream).await?, end == length),
-        };
+        let range = Some(read.offset..end);
+        let bytes = collect(open_source(ctx, spec, path, &observation, range).await?).await?;
         // The first chunk decides by its magic bytes whether a table is compressed.
-        if read.gzip.is_none() && !gzip && is_gzip(&import.format, path, &bytes) {
+        if read.gzip.is_none() && is_gzip(&import.format, path, &bytes) {
             gzip = true;
             continue;
         }
-        read.gzip = Some(gzip);
+        read.gzip = Some(false);
         return Ok(Chunk {
             bytes,
-            complete,
+            complete: end == length,
             read,
         });
+    }
+}
+
+/// The connector table's bytes in `range`, or all of them, bound to `observation`.
+async fn open_source(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    path: &str,
+    observation: &SourceMetadata,
+    range: Option<std::ops::Range<u64>>,
+) -> Result<BackendStream<Result<Bytes, StreamError>>, ChunkFailure> {
+    let stop = (&ctx.cancel, &ctx.shutdown);
+    let source = || {
+        drive(
+            ReadSourceOperation::new(ReadSourceInput {
+                group_id: spec.group_id,
+                connector_id: spec.connector_id,
+                source_path: path.to_string(),
+                range: range.clone(),
+                expected: Some(observation.clone()),
+            }),
+            &ctx.driver,
+        )
+    };
+    let transient = |error: &ReadSourceError| (!lasting_read(error)).then(|| error.to_string());
+    match retried(stop, spec, transient, source).await {
+        Ok(result) if result.metadata.compare(observation) == ObservationMatch::Changed => {
+            Err(ChunkFailure::Changed)
+        }
+        Ok(result) => Ok(result.stream),
+        Err(ReadSourceError::Staging(StagingSourceError::ConditionFailed)) => {
+            Err(ChunkFailure::Changed)
+        }
+        Err(error) if lasting_read(&error) => {
+            Err(ChunkFailure::Lasting(format!("table read failed: {error}")))
+        }
+        Err(error) => Err(ChunkFailure::Retry(error.to_string())),
     }
 }
 
@@ -322,9 +362,9 @@ async fn connector_chunk(
 async fn object_chunk(
     ctx: &JobContext,
     spec: &StagingJobSpec,
-    import: &TableImport,
-    (bucket, key): (&str, &str),
+    (import, bucket, key): (&TableImport, &str, &str),
     mut read: TableRead,
+    kept: &mut Option<GzipStream>,
 ) -> Result<Chunk, ChunkFailure> {
     let info = match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
         Ok(info) => info,
@@ -340,27 +380,47 @@ async fn object_chunk(
     if !source_allowed(ctx, spec, path).await? {
         return Err(ChunkFailure::Lasting("table read denied".to_string()));
     }
+    let input = |version_id, range| GetObjectInput {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id,
+        range,
+        group_id: info.group_id,
+        user_identity: auth.user_id,
+        realm_id: auth.realm_id,
+        node_id: spec.node_id,
+    };
+    let restrictions = || auth.path_restrictions.clone();
     let mut gzip = read
         .gzip
         .unwrap_or_else(|| is_gzip(&import.format, key, &[]));
     loop {
+        if gzip {
+            let version_id = read.version_id;
+            let (input, restrictions) = (&input, &restrictions);
+            let open = || async move {
+                let found = get_object_routed(&ctx.driver, input(version_id, None), restrictions())
+                    .await
+                    .map_err(object_failure)?;
+                Ok((found.blob, found.resolved_version_id.or(found.version_id)))
+            };
+            let at = (version_id, None, read.offset);
+            let (bytes, complete, opened) = gzip_chunk(kept, at, open).await?;
+            read.version_id = read.version_id.or(opened);
+            read.gzip = Some(true);
+            return Ok(Chunk {
+                bytes,
+                complete,
+                read,
+            });
+        }
         let start = read.offset;
-        let range = (!gzip).then_some(ObjectRangeRequest::StartEnd {
+        let range = Some(ObjectRangeRequest::StartEnd {
             start,
             end: start + TABLE_CHUNK as u64 - 1,
         });
-        let input = GetObjectInput {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version_id: read.version_id,
-            range,
-            group_id: info.group_id,
-            user_identity: auth.user_id,
-            realm_id: auth.realm_id,
-            node_id: spec.node_id,
-        };
-        let restrictions = auth.path_restrictions.clone();
-        let result = match get_object_routed(&ctx.driver, input, restrictions).await {
+        let input = input(read.version_id, range);
+        let result = match get_object_routed(&ctx.driver, input, restrictions()).await {
             Ok(result) => result,
             // A range from the table's end on reads nothing.
             Err(GetObjectError::InvalidRange) => {
@@ -370,37 +430,34 @@ async fn object_chunk(
                     read,
                 });
             }
-            Err(
-                error @ (GetObjectError::NoSuchKey
-                | GetObjectError::NoSuchVersion
-                | GetObjectError::DeleteMarker),
-            ) => {
-                return Err(ChunkFailure::Lasting(format!("table unavailable: {error}")));
-            }
-            Err(error) => return Err(ChunkFailure::Retry(error.to_string())),
+            Err(error) => return Err(object_failure(error)),
         };
         read.version_id = read
             .version_id
             .or(result.resolved_version_id.or(result.version_id));
         let size = result.info.size;
-        let (bytes, complete) = match gzip {
-            true => window(result.blob, start).await?,
-            false => {
-                let bytes = collect(result.blob).await?;
-                let complete = start + bytes.len() as u64 >= size;
-                (bytes, complete)
-            }
-        };
-        if read.gzip.is_none() && !gzip && is_gzip(&import.format, key, &bytes) {
+        let bytes = collect(result.blob).await?;
+        if read.gzip.is_none() && is_gzip(&import.format, key, &bytes) {
             gzip = true;
             continue;
         }
-        read.gzip = Some(gzip);
+        read.gzip = Some(false);
         return Ok(Chunk {
+            complete: start + bytes.len() as u64 >= size,
             bytes,
-            complete,
             read,
         });
+    }
+}
+
+fn object_failure(error: GetObjectError) -> ChunkFailure {
+    match error {
+        GetObjectError::NoSuchKey
+        | GetObjectError::NoSuchVersion
+        | GetObjectError::DeleteMarker => {
+            ChunkFailure::Lasting(format!("table unavailable: {error}"))
+        }
+        error => ChunkFailure::Retry(error.to_string()),
     }
 }
 
@@ -415,22 +472,57 @@ async fn collect(
     Ok(bytes)
 }
 
-/// The decompressed chunk after `offset`; the read stops once the chunk is full.
-async fn window(
-    mut stream: BackendStream<Result<Bytes, StreamError>>,
-    offset: u64,
-) -> Result<(Vec<u8>, bool), ChunkFailure> {
-    let mut window = GzipWindow::new(offset, TABLE_CHUNK);
-    let invalid = |error: aruna_core::structs::execution::table::TableError| {
-        ChunkFailure::Lasting(error.to_string())
-    };
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| ChunkFailure::Retry(error.to_string()))?;
-        if window.push(&chunk).map_err(invalid)? {
-            break;
+/// The decompressed chunk at `at`, a version, an observation and an offset, decoded on from the
+/// stream an earlier step of this run left open there; a new stream from `open` decodes from the
+/// start and skips to the offset once. Returns the version the stream opened, if it opened one.
+async fn gzip_chunk<F, Opening>(
+    kept: &mut Option<GzipStream>,
+    (version_id, observation, offset): (Option<ulid::Ulid>, Option<SourceMetadata>, u64),
+    mut open: F,
+) -> Result<(Vec<u8>, bool, Option<ulid::Ulid>), ChunkFailure>
+where
+    F: FnMut() -> Opening,
+    Opening: Future<Output = Result<Opened, ChunkFailure>>,
+{
+    let invalid = |error: TableError| ChunkFailure::Lasting(error.to_string());
+    let mut current = (kept.take())
+        .filter(|kept| kept.version_id == version_id && kept.observation == observation)
+        .and_then(|mut kept| kept.cursor.advance(offset).then_some(kept));
+    let mut opened = None;
+    loop {
+        let reused = current.is_some();
+        let mut gzip = match current.take() {
+            Some(gzip) => gzip,
+            None => {
+                let (stream, version) = open().await?;
+                opened = version;
+                GzipStream {
+                    version_id: version_id.or(version),
+                    observation: observation.clone(),
+                    stream,
+                    cursor: GzipCursor::new(offset),
+                }
+            }
+        };
+        let mut failed = None;
+        while failed.is_none() && !gzip.cursor.ready(TABLE_CHUNK) {
+            match gzip.stream.next().await {
+                Some(Ok(bytes)) => gzip.cursor.push(&bytes).map_err(invalid)?,
+                Some(Err(error)) => failed = Some(error.to_string()),
+                None => gzip.cursor.finish().map_err(invalid)?,
+            }
+        }
+        match failed {
+            // A stream left open between steps may have been closed meanwhile; open it again.
+            Some(_) if reused => {}
+            Some(error) => return Err(ChunkFailure::Retry(error)),
+            None => {
+                let (bytes, complete) = gzip.cursor.chunk(TABLE_CHUNK);
+                *kept = Some(gzip);
+                return Ok((bytes, complete, opened));
+            }
         }
     }
-    window.finish().map_err(invalid)
 }
 
 fn lasting_read(error: &ReadSourceError) -> bool {

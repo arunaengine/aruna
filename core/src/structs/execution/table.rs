@@ -836,72 +836,76 @@ fn canonical_path(path: &str) -> Option<String> {
     (!invalid).then(|| path.to_string())
 }
 
-/// Decompresses a gzip table from its start and keeps the bytes after `skip`, at most `limit`.
-pub struct GzipWindow {
-    decoder: flate2::write::MultiGzDecoder<Window>,
+/// Decompresses a gzip table in order and keeps its decoder between the chunks one read takes,
+/// so every compressed byte is decoded once. Bytes before the read position are dropped.
+pub struct GzipCursor {
+    decoder: flate2::write::MultiGzDecoder<Vec<u8>>,
+    /// Decompressed bytes dropped from the front of the buffer.
+    dropped: u64,
+    /// The decompressed position the next chunk starts at.
+    at: u64,
+    ended: bool,
 }
 
-struct Window {
-    skip: u64,
-    limit: usize,
-    kept: Vec<u8>,
-    full: bool,
-}
-
-impl Write for Window {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let skipped = (self.skip.min(bytes.len() as u64)) as usize;
-        self.skip -= skipped as u64;
-        let rest = &bytes[skipped..];
-        let room = self.limit - self.kept.len();
-        if rest.len() > room {
-            self.kept.extend_from_slice(&rest[..room]);
-            self.full = true;
-            return Err(std::io::Error::other("window full"));
+impl GzipCursor {
+    /// A cursor that decodes from the table's start and keeps the bytes from `at` on.
+    pub fn new(at: u64) -> Self {
+        Self {
+            decoder: flate2::write::MultiGzDecoder::new(Vec::new()),
+            dropped: 0,
+            at,
+            ended: false,
         }
-        self.kept.extend_from_slice(rest);
-        Ok(bytes.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    /// Moves the read position forward to `at`; `false` for a position before the current one.
+    pub fn advance(&mut self, at: u64) -> bool {
+        if at < self.at {
+            return false;
+        }
+        self.at = at;
+        self.trim();
+        true
+    }
+
+    /// Feeds compressed bytes.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), TableError> {
+        (self.decoder.write_all(bytes)).map_err(|error| TableError::Gzip(error.to_string()))?;
+        self.trim();
         Ok(())
     }
-}
 
-impl GzipWindow {
-    pub fn new(skip: u64, limit: usize) -> Self {
-        let window = Window {
-            skip,
-            limit,
-            kept: Vec::new(),
-            full: false,
-        };
-        Self {
-            decoder: flate2::write::MultiGzDecoder::new(window),
-        }
+    /// Marks the compressed input as read to its end; a cut stream is an error.
+    pub fn finish(&mut self) -> Result<(), TableError> {
+        (self.decoder.try_finish()).map_err(|error| TableError::Gzip(error.to_string()))?;
+        self.ended = true;
+        self.trim();
+        Ok(())
     }
 
-    /// Feeds compressed bytes; `true` once the window is full and reading may stop.
-    pub fn push(&mut self, bytes: &[u8]) -> Result<bool, TableError> {
-        match self.decoder.write_all(bytes) {
-            Ok(()) => Ok(false),
-            Err(_) if self.decoder.get_ref().full => Ok(true),
-            Err(error) => Err(TableError::Gzip(error.to_string())),
-        }
+    /// Whether a chunk of `limit` bytes, or the table's end, is decoded.
+    pub fn ready(&self, limit: usize) -> bool {
+        self.ended || (self.dropped == self.at && self.decoder.get_ref().len() >= limit)
     }
 
-    /// The kept bytes and whether they reach the end of the table.
-    pub fn finish(mut self) -> Result<(Vec<u8>, bool), TableError> {
-        if !self.decoder.get_ref().full {
-            match self.decoder.try_finish() {
-                Ok(()) => {}
-                Err(_) if self.decoder.get_ref().full => {}
-                Err(error) => return Err(TableError::Gzip(error.to_string())),
-            }
+    /// Up to `limit` bytes from the read position and whether they reach the table's end.
+    pub fn chunk(&self, limit: usize) -> (Vec<u8>, bool) {
+        let buffered = self.decoder.get_ref();
+        if self.dropped < self.at {
+            return (Vec::new(), self.ended);
         }
-        let window = self.decoder.get_ref();
-        let complete = !window.full;
-        Ok((window.kept.clone(), complete))
+        let taken = buffered.len().min(limit);
+        (
+            buffered[..taken].to_vec(),
+            self.ended && taken == buffered.len(),
+        )
+    }
+
+    fn trim(&mut self) {
+        let buffered = self.decoder.get_mut();
+        let dropped = (self.at - self.dropped).min(buffered.len() as u64);
+        buffered.drain(..dropped as usize);
+        self.dropped += dropped;
     }
 }
 
