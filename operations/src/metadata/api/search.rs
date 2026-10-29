@@ -336,6 +336,16 @@ pub async fn search_objects(
     request: SearchQueryRequest,
 ) -> Result<ObjectExecution, MetadataApiError> {
     let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
+    search_until(context, (realm_id, local_node_id), request, deadline).await
+}
+
+/// One search page that ends by `deadline`, which its distributed bucket searches share.
+async fn search_until(
+    context: &DriverContext,
+    (realm_id, local_node_id): (RealmId, NodeId),
+    request: SearchQueryRequest,
+    deadline: tokio::time::Instant,
+) -> Result<ObjectExecution, MetadataApiError> {
     let plan = plan_object_search(realm_id, request)?;
     let partitions =
         resolve_object_partitions(context, realm_id, local_node_id, &plan, deadline).await?;
@@ -357,7 +367,8 @@ pub async fn search_objects(
             continue;
         }
         let ids = (realm_id, local_node_id);
-        Box::pin(search_skipped(context, ids, &plan, bucket, &mut execution)).await?;
+        let search = search_skipped(context, ids, &plan, bucket, deadline, &mut execution);
+        Box::pin(search).await?;
     }
     Ok(execution)
 }
@@ -383,6 +394,7 @@ async fn search_skipped(
     (realm_id, local_node_id): (RealmId, NodeId),
     plan: &ObjectSearchPlan,
     bucket: String,
+    deadline: tokio::time::Instant,
     execution: &mut ObjectExecution,
 ) -> Result<(), MetadataApiError> {
     let strict = plan.mode == ObjectQueryMode::DistributedStrict;
@@ -397,7 +409,7 @@ async fn search_skipped(
         mode: plan.mode,
         target_nodes: plan.target_nodes.clone(),
     };
-    let found = match search_objects(context, realm_id, local_node_id, request).await {
+    let found = match search_until(context, (realm_id, local_node_id), request, deadline).await {
         Ok(found) => found,
         Err(error) if strict => return Err(error),
         Err(_) => {
