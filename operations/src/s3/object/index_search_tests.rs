@@ -426,13 +426,13 @@ async fn metadata_hits_authorized() {
         }]),
         ..owner(fixture)
     };
-    let first = test.search(metadata(denied, "escherichia"), 2).await;
+    let first = test.search(metadata(denied, "escherichia"), 1).await;
     assert!(first.hits.is_empty());
     let cursor = first
         .next_start_after
         .expect("the budget ends the page early");
     assert!(sealed_position(&cursor));
-    let last = BlobHeadKey::new("spire", "b/").to_bytes().unwrap();
+    let last = BlobHeadKey::new("spire", "a/").to_bytes().unwrap();
     assert_eq!(open_position(&cursor).unwrap(), last);
 }
 

@@ -306,6 +306,12 @@ impl Feeder {
                     changed += 1;
                 }
                 (Some(account), IndexState::Building { generation, cursor }) => {
+                    // A build begun with an older schema starts over in the next generation.
+                    let (generation, cursor) =
+                        match self.indexes.outdated(set_id, range_id, generation).await? {
+                            true => (generation + 1, None),
+                            false => (generation, cursor),
+                        };
                     let build = Build {
                         key: key.to_vec(),
                         set_id,
@@ -317,6 +323,24 @@ impl Feeder {
                         self.states = previous;
                         return Ok(changed + 1);
                     }
+                    changed += 1;
+                }
+                (Some(_), IndexState::Ready { generation })
+                    if !self.indexes.exists(set_id, range_id, generation).await? =>
+                {
+                    // A lost index, or one of an older schema, is built again beside it; searches
+                    // report the range incomplete until the new generation is ready.
+                    let state = IndexState::Building {
+                        generation: generation + 1,
+                        cursor: None,
+                    };
+                    put_row(
+                        storage,
+                        SEARCH_INDEX_KEYSPACE,
+                        key.to_vec(),
+                        state.to_bytes()?,
+                    )
+                    .await?;
                     changed += 1;
                 }
                 (Some(_), IndexState::Ready { .. }) => {}

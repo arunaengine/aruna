@@ -512,8 +512,11 @@ restrictions and request policies before it can be returned.
 - `coverage` names the live-head source, observation times, failed partitions, completeness and
   truncation.
 - A bucket-scoped search of a distributed bucket reads only the key indexes of the ranges each
-  member coordinates and examines a bounded number of candidates per page; a page that reaches
-  that bound returns a cursor even without hits. Substring queries match whole name parts of
+  member coordinates. Substring and metadata queries look their terms up in the index, so a page
+  holds the next matches in key order and an index answers no more hits once a page comes back
+  without a cursor. A page can still return a cursor with few or no hits when the caller may not
+  read the matches, or when a range is only partly indexed. A prefix query without terms
+  examines a bounded number of keys per page. Substring queries match whole name parts of
   the key, split at `/`, `.`, `-`, `_` and other separators. `coverage.incomplete_ranges` counts
   ranges whose index is missing or still being built (and, in `local` mode, ranges another
   member coordinates); they are never scanned, and `complete` is false while any remain.
@@ -528,8 +531,8 @@ restrictions and request policies before it can be returned.
   Words of `q` must all appear in the text columns (case-insensitive, whole words); terms
   `column=value` must equal an exact column, with quotes around values with spaces, as in
   `coli taxid=562 assembly_level="Complete Genome"`. Each hit carries the object's kept metadata
-  columns in `metadata`, after the same authorization as every hit. A distributed bucket walks only its
-  searchable keys, a bounded number per page, so a rare match may take many pages.
+  columns in `metadata`, after the same authorization as every hit. A distributed bucket finds the
+  matches in its key indexes, so a rare match is on the first page.
 - A search without `bucket` reaches a distributed bucket through its key indexes: the page whose
   scan reaches it adds one bucket-scoped page of its hits, so that page may hold more than `limit`
   hits. More hits of it than one page, a failed search of it, or more than 8 such buckets on one

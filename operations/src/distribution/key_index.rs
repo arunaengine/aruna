@@ -4,20 +4,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 // A raw key field serves exact deletes, key order and prefixes; a tokenized name field splits
-// keys at path and name separators.
+// keys at path and name separators. Term queries find matches; the key fast field orders them.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::ops::Bound;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
+use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tantivy::directory::MmapDirectory;
-use tantivy::schema::Value;
+use tantivy::query::{BooleanQuery, EnableScoring, Occur, Query, TermQuery};
 use tantivy::schema::{FAST, Field, IndexRecordOption, STORED, STRING, Schema, TEXT};
 use tantivy::tokenizer::TokenStream;
 use tantivy::{
-    DocAddress, DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, TERMINATED, TantivyDocument,
-    Term,
+    DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TERMINATED, TantivyDocument,
+    TantivyError, Term,
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -29,9 +29,9 @@ const SIZE_FIELD: &str = "size";
 const VERSION_FIELD: &str = "version";
 /// The key of a searchable version, so metadata queries walk only those keys.
 const META_KEY_FIELD: &str = "meta_key";
-/// The free text tokens of a searchable version, space separated.
+/// The free text tokens of a searchable version, one indexed term each.
 const META_FIELD: &str = "meta";
-/// The `column=value` terms of a searchable version, one stored value each.
+/// The `column=value` terms of a searchable version, one indexed term each.
 const EXACT_FIELD: &str = "exact";
 /// Writer memory per batch; the smallest budget tantivy accepts for one thread.
 const WRITER_BYTES: usize = 15_000_000;
@@ -79,9 +79,10 @@ pub enum KeyChange {
     Remove(String),
 }
 
-/// Keys between `start` and `end` in key order, examining at most `limit` keys per index
-/// segment; with `names`, only keys that hold every name token of that text. With `meta`, only
-/// searchable keys are examined and kept when their terms hold every term of the query.
+/// Keys between `start` and `end` in key order; with `names`, only keys that hold every name
+/// token of that text, and with `meta`, only searchable keys holding every term of the query.
+/// A query with terms returns at most `limit` matches; one without examines at most `limit` keys
+/// per index segment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyQuery {
     pub start: Bound<String>,
@@ -95,7 +96,7 @@ pub struct KeyQuery {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct KeyPage {
     pub keys: Vec<String>,
-    /// Keys looked at, live, deleted or not matching.
+    /// Keys looked at: the matches of a query with terms, every walked key of one without.
     pub examined: usize,
     /// The last examined key when the window continues after it; `None` once it is read.
     pub last: Option<String>,
@@ -119,8 +120,8 @@ fn schema() -> Schema {
     builder.add_u64_field(SIZE_FIELD, STORED);
     builder.add_text_field(VERSION_FIELD, STORED);
     builder.add_text_field(META_KEY_FIELD, STRING);
-    builder.add_text_field(META_FIELD, STORED);
-    builder.add_text_field(EXACT_FIELD, STORED);
+    builder.add_text_field(META_FIELD, STRING);
+    builder.add_text_field(EXACT_FIELD, STRING);
     builder.build()
 }
 
@@ -216,7 +217,8 @@ impl RangeIndexes {
         .await
     }
 
-    /// Whether a generation's directory holds an index.
+    /// Whether a generation's directory holds an index of the current schema; an index of an
+    /// older schema counts as missing, so the feed builds the next generation beside it.
     pub async fn exists(
         self: &Arc<Self>,
         set_id: Ulid,
@@ -224,8 +226,30 @@ impl RangeIndexes {
         generation: u64,
     ) -> Result<bool, KeyIndexError> {
         let dir = self.directory(set_id, range_id, generation);
-        self.blocking(move |_| Ok(dir.join("meta.json").exists()))
-            .await
+        self.blocking(move |indexes| match indexes.open_index(&dir, false) {
+            Ok(_) => Ok(true),
+            Err(
+                KeyIndexError::Missing(_) | KeyIndexError::Tantivy(TantivyError::SchemaError(_)),
+            ) => Ok(false),
+            Err(error) => Err(error),
+        })
+        .await
+    }
+
+    /// Whether a generation's directory holds an index of an older schema.
+    pub async fn outdated(
+        self: &Arc<Self>,
+        set_id: Ulid,
+        range_id: Ulid,
+        generation: u64,
+    ) -> Result<bool, KeyIndexError> {
+        let dir = self.directory(set_id, range_id, generation);
+        self.blocking(move |indexes| match indexes.open_index(&dir, false) {
+            Err(KeyIndexError::Tantivy(TantivyError::SchemaError(_))) => Ok(true),
+            Ok(_) | Err(KeyIndexError::Missing(_)) => Ok(false),
+            Err(error) => Err(error),
+        })
+        .await
     }
 
     /// Live keys in a generation as of its last commit; a missing generation holds none.
@@ -422,7 +446,9 @@ fn write_batch(
             document.add_text(fields.version, entry.version_id.to_string());
             if let Some(terms) = &entry.terms {
                 document.add_text(fields.meta_key, &entry.key);
-                document.add_text(fields.meta, join(&terms.text, " "));
+                for token in &terms.text {
+                    document.add_text(fields.meta, token);
+                }
                 for term in &terms.exact {
                     document.add_text(fields.exact, term);
                 }
@@ -435,30 +461,105 @@ fn write_batch(
     Ok(())
 }
 
-/// Walks the key terms of every segment in key order, each at most `query.limit` terms, so
-/// the work is bounded by the limit and never by the range's size. Keys up to the smallest
-/// segment end are examined everywhere; the page continues after that key.
+/// The live keys of the window that hold every term of the query, in key order. A query with
+/// terms is answered from the inverted index; one without walks the key terms.
 fn search_keys(open: &OpenIndex, query: &KeyQuery) -> Result<KeyPage, KeyIndexError> {
     let fields = fields(&open.index.schema())?;
     let mut analyzer = open.index.tokenizer_for_field(fields.name)?;
-    let mut tokens = |text: &str| {
-        let mut stream = analyzer.token_stream(text);
-        let mut found = Vec::new();
+    let mut terms = Vec::new();
+    if let Some(names) = &query.names {
+        let mut stream = analyzer.token_stream(names);
         while let Some(token) = stream.next() {
-            found.push(token.text.clone());
+            terms.push(Term::from_field_text(fields.name, &token.text));
         }
-        found
-    };
-    let wanted = query.names.as_deref().map(&mut tokens);
-    let limit = query.limit.max(1);
+    }
+    if let Some(meta) = &query.meta {
+        let text = meta.text.iter().map(|token| (fields.meta, token));
+        let exact = meta.exact.iter().map(|term| (fields.exact, term));
+        terms.extend(
+            text.chain(exact)
+                .map(|(field, term)| Term::from_field_text(field, term)),
+        );
+    }
     let searcher = open.reader.searcher();
+    match terms.is_empty() {
+        true => walk_keys(&searcher, fields, query),
+        false => matched_keys(&searcher, terms, query),
+    }
+}
+
+/// The first `query.limit` live keys of the window that hold every term. Each segment keeps
+/// its smallest matching key ordinals, so the work follows the matches, never the range size.
+fn matched_keys(
+    searcher: &Searcher,
+    terms: Vec<Term>,
+    query: &KeyQuery,
+) -> Result<KeyPage, KeyIndexError> {
+    let clauses = (terms.into_iter())
+        .map(|term| {
+            let query: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+            (Occur::Must, query)
+        })
+        .collect();
+    let weight =
+        BooleanQuery::new(clauses).weight(EnableScoring::disabled_from_searcher(searcher))?;
+    let limit = query.limit.max(1);
+    let mut found = BTreeSet::new();
+    for segment in searcher.segment_readers() {
+        let Some(column) = segment.fast_fields().str(KEY_FIELD)? else {
+            continue;
+        };
+        // Key ordinals follow key order, so the window is one ordinal interval.
+        let window =
+            (column.dictionary()).term_bounds_to_ord(query.start.as_ref(), query.end.as_ref())?;
+        // One more than the limit tells whether the window continues after the page.
+        let mut smallest = BinaryHeap::with_capacity(limit + 2);
+        let mut scorer = weight.scorer(segment, 1.0)?;
+        let mut doc = scorer.doc();
+        while doc != TERMINATED {
+            let ordinal = (!segment.is_deleted(doc))
+                .then(|| column.ords().first(doc))
+                .flatten();
+            if let Some(ordinal) = ordinal.filter(|ordinal| window.contains(ordinal)) {
+                smallest.push(ordinal);
+                if smallest.len() > limit + 1 {
+                    smallest.pop();
+                }
+            }
+            doc = scorer.advance();
+        }
+        for ordinal in smallest {
+            let mut key = String::new();
+            column.ord_to_str(ordinal, &mut key)?;
+            found.insert(key);
+        }
+    }
+    let more = found.len() > limit;
+    let keys: Vec<String> = found.into_iter().take(limit).collect();
+    let last = more.then(|| keys.last().cloned()).flatten();
+    Ok(KeyPage {
+        examined: keys.len(),
+        keys,
+        last,
+    })
+}
+
+/// Walks the key terms of every segment in key order, each at most `query.limit` terms, so
+/// the work is bounded by the limit and never by the range's size. Keys up to the smallest
+/// segment end are examined everywhere; the page continues after that key.
+fn walk_keys(
+    searcher: &Searcher,
+    fields: Fields,
+    query: &KeyQuery,
+) -> Result<KeyPage, KeyIndexError> {
+    let limit = query.limit.max(1);
     let mut seen = std::collections::BTreeMap::<String, bool>::new();
     let mut end: Option<String> = None;
     let walked = match query.meta {
         Some(_) => fields.meta_key,
         None => fields.key,
     };
-    for (ordinal, segment) in searcher.segment_readers().iter().enumerate() {
+    for segment in searcher.segment_readers() {
         let inverted = segment.inverted_index(walked)?;
         let mut range = inverted.terms().range();
         range = match &query.start {
@@ -478,20 +579,12 @@ fn search_keys(open: &OpenIndex, query: &KeyQuery) -> Result<KeyPage, KeyIndexEr
             let key = String::from_utf8_lossy(stream.key()).into_owned();
             let postings = IndexRecordOption::Basic;
             let mut docs = inverted.read_postings_from_terminfo(stream.value(), postings)?;
-            let mut alive = None;
-            while docs.doc() != TERMINATED && alive.is_none() {
-                alive = (!segment.is_deleted(docs.doc())).then_some(docs.doc());
+            let mut alive = false;
+            while docs.doc() != TERMINATED && !alive {
+                alive = !segment.is_deleted(docs.doc());
                 docs.advance();
             }
-            let kept = match (alive, &query.meta) {
-                (Some(doc), Some(wanted)) => {
-                    let address = DocAddress::new(ordinal as u32, doc);
-                    holds_terms(&searcher.doc::<TantivyDocument>(address)?, fields, wanted)
-                }
-                (alive, None) => alive.is_some(),
-                (None, Some(_)) => false,
-            };
-            *seen.entry(key.clone()).or_default() |= kept;
+            *seen.entry(key.clone()).or_default() |= alive;
             if read == limit {
                 end = Some(end.map_or(key.clone(), |end| end.min(key)));
             }
@@ -504,41 +597,12 @@ fn search_keys(open: &OpenIndex, query: &KeyQuery) -> Result<KeyPage, KeyIndexEr
     let keys = (seen.into_iter())
         .filter(|(_, alive)| *alive)
         .map(|(key, _)| key)
-        .filter(|key| {
-            let Some(wanted) = &wanted else {
-                return true;
-            };
-            let found = tokens(key);
-            wanted.iter().all(|token| found.contains(token))
-        })
         .collect();
     Ok(KeyPage {
         keys,
         examined,
         last: end,
     })
-}
-
-fn join(terms: &BTreeSet<String>, separator: &str) -> String {
-    terms
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(separator)
-}
-
-/// Whether a stored document holds every text token and exact term of `wanted`.
-fn holds_terms(document: &TantivyDocument, fields: Fields, wanted: &MetaTerms) -> bool {
-    let text = document
-        .get_first(fields.meta)
-        .and_then(|value| value.as_str());
-    let text: BTreeSet<&str> = text.unwrap_or_default().split(' ').collect();
-    let exact = document
-        .get_all(fields.exact)
-        .filter_map(|value| value.as_str());
-    let exact: BTreeSet<&str> = exact.collect();
-    (wanted.text.iter()).all(|token| text.contains(token.as_str()))
-        && (wanted.exact.iter()).all(|term| exact.contains(term.as_str()))
 }
 
 #[cfg(test)]
@@ -650,22 +714,82 @@ mod tests {
         assert_eq!(found.keys, ["b/y"]);
     }
 
-    // Keys that do not match still count, so a query with few hits stops at its limit.
+    // A rare name far into the range is the first page's hit, with no empty pages before it.
     #[tokio::test]
-    async fn examined_keys_bounded() {
+    async fn rare_name_found() {
         let dir = tempfile::tempdir().unwrap();
         let indexes = Arc::new(RangeIndexes::new(dir.path()));
-        let changes = ["a.bam", "b.bam", "c.bam", "d.fastq"].map(put).to_vec();
+        let mut changes: Vec<_> = (0..3_000).map(|n| put(&format!("k/{n:05}.bam"))).collect();
+        changes.push(put("k/02990.fastq"));
         indexes.apply(set(), range(), 1, changes).await.unwrap();
 
         let names = query(Bound::Unbounded, Bound::Unbounded, Some("fastq"), 2);
         let first = indexes.search(set(), range(), 1, names).await.unwrap();
-        assert_eq!((first.keys.len(), first.examined), (0, 2));
-        assert_eq!(first.last.as_deref(), Some("b.bam"));
-        let rest = query(Bound::Excluded("b.bam"), Bound::Unbounded, Some("fastq"), 2);
+        assert_eq!(first.keys, ["k/02990.fastq"]);
+        assert_eq!(first.last, None, "an empty rest means no more hits");
+    }
+
+    // Every name token must match, and a page continues right after its last hit.
+    #[tokio::test]
+    async fn names_paged_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = Arc::new(RangeIndexes::new(dir.path()));
+        let keys = [
+            "a/s1.fastq",
+            "b/s1.bam",
+            "c/s1.fastq",
+            "d/s2.fastq",
+            "e/s1.fastq",
+        ];
+        let changes = keys.map(put).to_vec();
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+
+        let both = query(Bound::Unbounded, Bound::Unbounded, Some("s1 FASTQ"), 2);
+        let first = indexes.search(set(), range(), 1, both).await.unwrap();
+        assert_eq!(first.keys, ["a/s1.fastq", "c/s1.fastq"]);
+        assert_eq!(first.last.as_deref(), Some("c/s1.fastq"));
+        let rest = query(
+            Bound::Excluded("c/s1.fastq"),
+            Bound::Unbounded,
+            Some("s1 fastq"),
+            2,
+        );
         let second = indexes.search(set(), range(), 1, rest).await.unwrap();
-        assert_eq!(second.keys, ["d.fastq"]);
-        assert_eq!(second.last.as_deref(), Some("d.fastq"));
+        assert_eq!(second.keys, ["e/s1.fastq"]);
+        assert_eq!(second.last, None);
+
+        // Removed and replaced keys stay out of term matches like they do of the key walk.
+        let changes = vec![
+            KeyChange::Remove("a/s1.fastq".to_string()),
+            put("c/s1.fastq"),
+        ];
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+        let again = query(Bound::Unbounded, Bound::Unbounded, Some("s1 fastq"), 10);
+        let found = indexes.search(set(), range(), 1, again).await.unwrap();
+        assert_eq!(found.keys, ["c/s1.fastq", "e/s1.fastq"]);
+    }
+
+    // An index written with an older schema reads as missing, so the feed builds it again.
+    #[tokio::test]
+    async fn older_schema_outdated() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = Arc::new(RangeIndexes::new(dir.path()));
+        let older = indexes.directory(set(), range(), 1);
+        std::fs::create_dir_all(&older).unwrap();
+        let mut builder = Schema::builder();
+        builder.add_text_field(KEY_FIELD, STRING | FAST | STORED);
+        builder.add_text_field(META_FIELD, STORED);
+        Index::create_in_dir(&older, builder.build()).unwrap();
+
+        assert!(!indexes.exists(set(), range(), 1).await.unwrap());
+        assert!(indexes.outdated(set(), range(), 1).await.unwrap());
+        let all = query(Bound::Unbounded, Bound::Unbounded, None, 10);
+        assert!(indexes.search(set(), range(), 1, all).await.is_err());
+        indexes
+            .apply(set(), range(), 2, vec![put("k")])
+            .await
+            .unwrap();
+        assert!(!indexes.outdated(set(), range(), 2).await.unwrap());
     }
 
     fn described(key: &str, text: &[&str], exact: &[&str]) -> KeyChange {
@@ -698,8 +822,8 @@ mod tests {
         }
     }
 
-    // Metadata queries walk only searchable keys, match their stored terms, examine at most
-    // the limit even for a common term, and continue after the last examined key.
+    // Metadata queries match the indexed terms of searchable keys and continue after the last
+    // hit of a full page.
     #[tokio::test]
     async fn metadata_terms_match() {
         let dir = tempfile::tempdir().unwrap();
@@ -724,20 +848,17 @@ mod tests {
         let coli = search(meta(&["coli"], &["species_taxid=562"], 10, None))
             .await
             .unwrap();
-        assert_eq!(
-            (coli.keys, coli.examined),
-            (vec!["a/".to_string(), "c/".to_string()], 3)
-        );
+        assert_eq!(coli.keys, ["a/", "c/"]);
         let exact = search(meta(&[], &["taxid=562"], 10, None)).await.unwrap();
         assert_eq!(exact.keys, ["c/"]);
-        // `escherichia` is in two of three folders; a page still stops at its limit.
-        let first = search(meta(&["escherichia"], &[], 2, None)).await.unwrap();
-        assert_eq!((first.keys.len(), first.examined), (1, 2));
-        assert_eq!(first.last.as_deref(), Some("b/"));
-        let rest = search(meta(&["escherichia"], &[], 2, Some("b/")))
+        // `escherichia` is in two of three folders; a page stops at its limit of hits.
+        let first = search(meta(&["escherichia"], &[], 1, None)).await.unwrap();
+        assert_eq!(first.keys, ["a/"]);
+        assert_eq!(first.last.as_deref(), Some("a/"));
+        let rest = search(meta(&["escherichia"], &[], 1, Some("a/")))
             .await
             .unwrap();
-        assert_eq!(rest.keys, ["c/"]);
+        assert_eq!((rest.keys, rest.last), (vec!["c/".to_string()], None));
         // A multiline exact value is one term; its lines never become terms of their own.
         let changes = vec![described("d/", &[], &["note=x\ntaxid=562"])];
         indexes.apply(set(), range(), 1, changes).await.unwrap();
@@ -747,8 +868,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(whole.keys, ["d/"]);
-        // A key replaced without terms or removed no longer matches; like the key walk, its
-        // deleted term may still count as examined until segments merge.
+        // A key replaced without terms or removed no longer matches.
         let changes = vec![put("a/"), KeyChange::Remove("c/".to_string())];
         indexes.apply(set(), range(), 1, changes).await.unwrap();
         let none = search(meta(&["coli"], &[], 10, None)).await.unwrap();
