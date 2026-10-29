@@ -343,7 +343,12 @@ impl Feeder {
                     .await?;
                     changed += 1;
                 }
-                (Some(_), IndexState::Ready { .. }) => {}
+                // Generations a crash or a failed prune left after a rebuild go now.
+                (Some(_), IndexState::Ready { generation }) => {
+                    (self.indexes)
+                        .prune(set_id, range_id, Some(generation))
+                        .await?;
+                }
             }
             previous = Some(key.to_vec());
         }
