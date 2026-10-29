@@ -727,6 +727,53 @@ async fn cancelled_capture_settles() {
     net.shutdown().await;
 }
 
+// A cancelled run whose last local attempt parks settles as cancelled, not as an
+// exhausted error the family would place on another node.
+#[tokio::test]
+async fn cancelled_exhaustion_settles() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let mut ctx = context(storage.clone());
+    Arc::get_mut(&mut ctx).unwrap().task_handle = None;
+    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let job_id = record.job_id;
+    begin_external_running(&storage, job_id, token, Some(1), 6)
+        .await
+        .unwrap();
+    crate::jobs::store::mutate_job(&storage, job_id, |record| {
+        record.attempts = JOB_MAX_ATTEMPTS - 1;
+        Ok(crate::jobs::store::JobMutation::Persist)
+    })
+    .await
+    .unwrap();
+    set_cancel_requested(&storage, job_id, 7).await.unwrap();
+    let stub = StubBackend::new(StubReconcile::NotFound);
+    stub.logs_fail.store(true, Ordering::Relaxed);
+    stub.cancel_exited.store(true, Ordering::Relaxed);
+    let backend: Arc<dyn ExecutorBackend> = stub;
+
+    Box::pin(finalize_attempt(
+        &ctx,
+        job_id,
+        token,
+        &backend,
+        &fence(&attempt),
+        &execution_spec(),
+        "ws-test",
+        exited_zero(),
+        &CancellationToken::new(),
+    ))
+    .await;
+
+    let stored = read_job_record(&storage, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Cancelled);
+    assert!(!stored.locally_exhausted);
+    assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
+}
+
 #[tokio::test]
 async fn finalize_renews_lease() {
     let dir = tempdir().unwrap();

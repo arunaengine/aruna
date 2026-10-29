@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::super::store::{
-    ParkOutcome, begin_external_running, mark_indeterminate, read_job_record,
-    record_attempt_tombstone, requeue_before_attempt,
+    CancelRequestOutcome, ParkOutcome, begin_external_running, mark_indeterminate, read_job_record,
+    record_attempt_tombstone, requeue_before_attempt, set_cancel_requested,
 };
 use super::compute::{RecoveryAction, recovery_action};
 use super::finalize::{cleanup_and_crate, fail_and_crate, finalize_attempt, finalize_cancel};
@@ -327,6 +327,20 @@ pub(super) async fn park_attempt(
         Ok(ParkOutcome::Parked(_)) => {}
         Ok(ParkOutcome::Exhausted(record)) => {
             warn!(job_id = %job_id, "Local attempts exhausted; parking job");
+            // A cancelled run settles as cancelled, so the family does not run it elsewhere.
+            let record = match record.cancel_requested {
+                true => match set_cancel_requested(
+                    &context.storage_handle,
+                    job_id,
+                    unix_timestamp_millis(),
+                )
+                .await
+                {
+                    Ok(CancelRequestOutcome::Cancelled(cancelled)) => cancelled,
+                    _ => record,
+                },
+                false => record,
+            };
             Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
         }
         Err(error) => warn!(job_id = %job_id, error = %error, "Attempt park write failed"),
