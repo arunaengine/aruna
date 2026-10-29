@@ -967,12 +967,12 @@ impl KubernetesBackend {
         path: &str,
     ) -> Result<TaskOutput, BackendError> {
         let pod = self.fetch_helper(context).await?.name_any();
-        let (size, reader, join) = self.open_range(&pod, path, 0).await?;
+        let (size, reader, join) = self.open_range(&pod, path, (0, FETCH_RANGE_BYTES)).await?;
         let (tx, rx) = mpsc::channel(4);
         let backend = self.clone();
         let path = path.to_string();
         tokio::spawn(async move {
-            let open = |offset| backend.open_range(&pod, &path, offset);
+            let open = |range| backend.open_range(&pod, &path, range);
             stream_ranges(&path, size, (reader, join), open, tx).await;
         });
         Ok(TaskOutput {
@@ -986,7 +986,7 @@ impl KubernetesBackend {
         &self,
         pod: &str,
         path: &str,
-        offset: u64,
+        (offset, length): (u64, u64),
     ) -> Result<(u64, RangeBody, ExecJoin), BackendError> {
         let params = AttachParams::default()
             .container("helper")
@@ -994,7 +994,7 @@ impl KubernetesBackend {
             .stdout(true)
             .stderr(false)
             .max_stdout_buf_size(STREAM_BUF_BYTES);
-        let (offset, length) = (offset.to_string(), FETCH_RANGE_BYTES.to_string());
+        let (offset, length) = (offset.to_string(), length.to_string());
         let mut attached = self
             .pods()
             .exec(
@@ -2054,18 +2054,23 @@ async fn stream_ranges<O, F>(
     mut open: O,
     tx: mpsc::Sender<Result<Bytes, BackendError>>,
 ) where
-    O: FnMut(u64) -> F,
+    O: FnMut((u64, u64)) -> F,
     F: Future<Output = Result<(u64, RangeBody, ExecJoin), BackendError>>,
 {
     let mut offset = 0;
     let mut tries = 0;
     let mut current = Some(first);
     let mut buffer = vec![0u8; 64 * 1024];
+    // A resumed range keeps its end, so a link that drops midway still finishes it.
+    let mut end = FETCH_RANGE_BYTES.min(size);
     while offset < size {
-        let end = offset.saturating_add(FETCH_RANGE_BYTES).min(size);
+        if offset >= end {
+            end = offset.saturating_add(FETCH_RANGE_BYTES).min(size);
+        }
+        let started = offset;
         let opened = match current.take() {
             Some(exec) => Ok(exec),
-            None => match open(offset).await {
+            None => match open((offset, end - offset)).await {
                 Ok((found, ..)) if found != size => {
                     let changed = format!("output {path} changed from {size} to {found} bytes");
                     let _ = tx.send(Err(BackendError::Conflict(changed))).await;
@@ -2095,7 +2100,11 @@ async fn stream_ranges<O, F>(
             }
             Err(error) => error,
         };
-        tries += 1;
+        // Only a try that moved no byte counts toward the limit.
+        tries = match offset > started {
+            true => 0,
+            false => tries + 1,
+        };
         if tries >= RANGE_TRIES || !failure.retryable() {
             let message =
                 format!("output {path} failed at byte {offset} after {tries} tries: {failure}");
@@ -3584,8 +3593,8 @@ mod tests {
     async fn resumes_dropped_range() {
         let (tx, rx) = mpsc::channel(4);
         let opened = std::sync::Mutex::new(Vec::new());
-        let open = |offset| {
-            opened.lock().unwrap().push(offset);
+        let open = |range| {
+            opened.lock().unwrap().push(range);
             let (reader, join) = exec(b"defghij", Ok(()));
             std::future::ready(Ok((10, reader, join)))
         };
@@ -3598,7 +3607,44 @@ mod tests {
             .flat_map(|item| item.expect("no range may fail").to_vec())
             .collect();
         assert_eq!(bytes, b"abcdefghij");
-        assert_eq!(*opened.lock().unwrap(), vec![3]);
+        assert_eq!(*opened.lock().unwrap(), vec![(3, 7)]);
+    }
+
+    // A link that drops every few bytes still finishes: each resume keeps the range end and
+    // asks only for the rest, and a try that moved bytes is not a failed try.
+    #[tokio::test]
+    async fn finishes_dropping_range() {
+        let size = FETCH_RANGE_BYTES + 6;
+        let (tx, mut rx) = mpsc::channel(4);
+        let opened = std::sync::Mutex::new(Vec::new());
+        let open = |(offset, length): (u64, u64)| {
+            opened.lock().unwrap().push((offset, length));
+            let tail = offset + length == size;
+            // A third of a range at most per exec, and never past what was asked.
+            let sent = length.min(FETCH_RANGE_BYTES / 3 + 1);
+            let (reader, join) = match sent == length && tail {
+                true => exec(&vec![1; sent as usize], Ok(())),
+                false => exec(&vec![1; sent as usize], dropped()),
+            };
+            std::future::ready(Ok((size, reader, join)))
+        };
+        let first = exec(&vec![1; (FETCH_RANGE_BYTES / 3) as usize], dropped());
+
+        let streamed = stream_ranges("/out/data", size, first, open, tx);
+        let counted = async {
+            let mut total = 0;
+            while let Some(item) = rx.recv().await {
+                total += item.expect("no range may fail").len() as u64;
+            }
+            total
+        };
+        let (_, total) = tokio::join!(streamed, counted);
+
+        assert_eq!(total, size);
+        let opened = opened.lock().unwrap();
+        assert!(opened.iter().all(|(offset, length)| {
+            offset + length == FETCH_RANGE_BYTES || offset + length == size
+        }));
     }
 
     // A range that keeps dropping ends the output with its cause after bounded tries.
@@ -3615,7 +3661,8 @@ mod tests {
         let streamed = stream_ranges("/out/data", 10, exec(b"ab", dropped()), open, tx);
         let (_, items) = tokio::join!(streamed, drain_stream(rx));
 
-        assert_eq!(opened.into_inner(), RANGE_TRIES - 1);
+        // The first exec moved two bytes, so only the five empty resumes count.
+        assert_eq!(opened.into_inner(), RANGE_TRIES);
         match items
             .last()
             .unwrap()
