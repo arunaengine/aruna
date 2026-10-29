@@ -484,7 +484,6 @@ where
     F: FnMut() -> Opening,
     Opening: Future<Output = Result<Opened, ChunkFailure>>,
 {
-    let invalid = |error: TableError| ChunkFailure::Lasting(error.to_string());
     let mut current = (kept.take())
         .filter(|kept| kept.version_id == version_id && kept.observation == observation)
         .and_then(|mut kept| kept.cursor.advance(offset).then_some(kept));
@@ -500,29 +499,41 @@ where
                     version_id: version_id.or(version),
                     observation: observation.clone(),
                     stream,
-                    cursor: GzipCursor::new(offset),
+                    cursor: GzipCursor::new(offset, TABLE_CHUNK),
                 }
             }
         };
-        let mut failed = None;
-        while failed.is_none() && !gzip.cursor.ready(TABLE_CHUNK) {
-            match gzip.stream.next().await {
-                Some(Ok(bytes)) => gzip.cursor.push(&bytes).map_err(invalid)?,
-                Some(Err(error)) => failed = Some(error.to_string()),
-                None => gzip.cursor.finish().map_err(invalid)?,
-            }
-        }
-        match failed {
-            // A stream left open between steps may have been closed meanwhile; open it again.
-            Some(_) if reused => {}
-            Some(error) => return Err(ChunkFailure::Retry(error)),
-            None => {
-                let (bytes, complete) = gzip.cursor.chunk(TABLE_CHUNK);
+        match decode_chunk(&mut gzip).await {
+            Ok(()) => {
+                let (bytes, complete) = gzip.cursor.chunk();
                 *kept = Some(gzip);
                 return Ok((bytes, complete, opened));
             }
+            // A stream kept between steps may have been closed or its source rewritten
+            // meanwhile; opening it again checks the source like the first read did.
+            Err(_) if reused => {}
+            Err(Broken::Stream(error)) => return Err(ChunkFailure::Retry(error)),
+            Err(Broken::Gzip(error)) => return Err(ChunkFailure::Lasting(error.to_string())),
         }
     }
+}
+
+/// Why decoding a chunk stopped: the transport failed or the bytes are no valid gzip.
+enum Broken {
+    Stream(String),
+    Gzip(TableError),
+}
+
+/// Pulls compressed bytes until the cursor holds the next chunk or the table's end.
+async fn decode_chunk(gzip: &mut GzipStream) -> Result<(), Broken> {
+    while !gzip.cursor.fill().map_err(Broken::Gzip)? {
+        match gzip.stream.next().await {
+            Some(Ok(bytes)) => gzip.cursor.push(&bytes),
+            Some(Err(error)) => return Err(Broken::Stream(error.to_string())),
+            None => gzip.cursor.finish(),
+        }
+    }
+    Ok(())
 }
 
 fn lasting_read(error: &ReadSourceError) -> bool {

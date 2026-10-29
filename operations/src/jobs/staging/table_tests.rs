@@ -476,6 +476,63 @@ async fn gzip_table_streams() {
     server.abort();
 }
 
+/// A stream of `bytes` in pieces, the way a transport delivers them.
+fn pieces(bytes: Vec<u8>) -> BackendStream<Result<Bytes, StreamError>> {
+    let pieces: Vec<Result<Bytes, StreamError>> = (bytes.chunks(16 * 1024))
+        .map(|piece| Ok(Bytes::copy_from_slice(piece)))
+        .collect();
+    BackendStream(Box::pin(futures_util::stream::iter(pieces)))
+}
+
+// A source rewritten in place while a step kept its stream makes the kept decoder fail; the
+// stream is opened again once, and that open reports the change, never a broken table.
+#[tokio::test]
+async fn rewritten_gzip_reopens() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut seed = 7u64;
+    let mut text = Vec::new();
+    while text.len() < 1 << 20 {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        text.extend_from_slice(format!("{:016x}\n", seed).as_bytes());
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Default::default());
+    encoder.write_all(&text).unwrap();
+    let compressed = encoder.finish().unwrap();
+    // The first part of the table, then bytes another writer left behind.
+    let mut rewritten = compressed[..compressed.len() / 2].to_vec();
+    rewritten.extend(std::iter::repeat_n(0xFF, compressed.len() / 2));
+    let opens = AtomicUsize::new(0);
+    let open = || {
+        let first = opens.fetch_add(1, Ordering::SeqCst) == 0;
+        let rewritten = rewritten.clone();
+        async move {
+            match first {
+                true => Ok((pieces(rewritten), None)),
+                false => Err(ChunkFailure::Changed),
+            }
+        }
+    };
+    let mut kept = None;
+    let mut offset = 0;
+    let failure = loop {
+        match gzip_chunk(&mut kept, (None, None, offset), open).await {
+            Ok((bytes, _, _)) => offset += bytes.len() as u64,
+            Err(failure) => break failure,
+        }
+    };
+    assert!(offset > 0, "the first steps read the table");
+    assert!(matches!(failure, ChunkFailure::Changed));
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+
+    // A freshly opened stream that is no valid gzip stays a lasting failure.
+    let broken = || async { Ok((pieces(vec![0xFF; 1024]), None)) };
+    let failure = gzip_chunk(&mut None, (None, None, 0), broken).await;
+    assert!(matches!(failure, Err(ChunkFailure::Lasting(_))));
+}
+
 // An uploaded CSV of file URLs imports one reference per row with its kept columns, read as
 // the submitter.
 #[tokio::test]
