@@ -1915,7 +1915,7 @@ fn drift_digest_decides() {
     assert!(effects.is_empty());
     assert_eq!(
         operation.finalize(),
-        Err(GetObjectError::ReferenceSourceChanged)
+        Err(GetObjectError::ReferenceChecksumMismatch)
     );
 }
 
@@ -1938,7 +1938,7 @@ fn pinned_unknown_verified() {
 
     assert_eq!(
         operation.finalize(),
-        Err(GetObjectError::ReferenceSourceChanged)
+        Err(GetObjectError::ReferenceChecksumMismatch)
     );
 }
 

@@ -167,6 +167,8 @@ pub enum GetObjectError {
     InvalidRange,
     #[error("Reference source metadata changed during access.")]
     ReferenceSourceChanged,
+    #[error("The reference source no longer matches its recorded checksum.")]
+    ReferenceChecksumMismatch,
     #[error("The historical reference version is no longer available.")]
     HistoricalReferenceUnavailable,
     #[error(
@@ -1287,7 +1289,7 @@ impl GetObjectOperation {
                 // Recorded digests bind the bytes, so a drifted source never replaces them.
                 let bound = self.reference_cached.as_ref();
                 if bound.is_some_and(|stored| !stored.enforced_checksums().is_empty()) {
-                    return self.emit_error(GetObjectError::ReferenceSourceChanged);
+                    return self.emit_error(GetObjectError::ReferenceChecksumMismatch);
                 }
                 // Current drift records a same-binding successor, but repeated
                 // change fails rather than serving mismatched bytes.
@@ -1920,7 +1922,7 @@ impl GetObjectOperation {
         let expected = std::mem::take(&mut self.verify_digests);
         // Dropping the stream of a spool that missed the digests removes the spool.
         if unmatched_checksum(&expected, &hashes).is_some() {
-            return self.emit_error(GetObjectError::ReferenceSourceChanged);
+            return self.emit_error(GetObjectError::ReferenceChecksumMismatch);
         }
         self.reference_stream = Some(blob);
         self.finish_reference_output()

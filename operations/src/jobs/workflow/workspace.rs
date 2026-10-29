@@ -1406,6 +1406,7 @@ fn get_input_retryable(error: &GetObjectError) -> bool {
         GetObjectError::StorageError(error) => storage_retryable(error),
         GetObjectError::ReferenceSourceChanged => true,
         GetObjectError::HistoricalReferenceUnavailable
+        | GetObjectError::ReferenceChecksumMismatch
         | GetObjectError::ReferenceAdvanceExhausted => false,
         _ => false,
     }

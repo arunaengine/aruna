@@ -26,6 +26,16 @@ fn read_error(error: GetObjectError) -> ServerError {
             aruna_core::structs::storage::encryption::BucketKeyError::Locked(_),
         )) => abe_error(AbeError::Required),
         GetObjectError::NoSuchKey | GetObjectError::NoSuchVersion => ServerError::NotFound,
+        // Permanent reference refusals: a retry cannot change their answer.
+        GetObjectError::HistoricalReferenceUnavailable => ServerError::Conflict(
+            "the source no longer serves this reference version; read the current version".into(),
+        ),
+        error @ GetObjectError::ReferenceAdvanceExhausted => {
+            ServerError::Conflict(error.to_string())
+        }
+        error @ GetObjectError::ReferenceChecksumMismatch => {
+            ServerError::PreconditionFailed(error.to_string())
+        }
         _ => ServerError::ServiceUnavailable,
     }
 }
@@ -47,7 +57,8 @@ fn read_error(error: GetObjectError) -> ServerError {
         (status = 206, description = "Pinned plaintext range", content_type = "application/octet-stream"),
         (status = 400, body = ErrorResponse, description = "Invalid encoding or range syntax"), (status = 401, body = ErrorResponse, description = "Bearer token required"),
         (status = 403, body = ErrorResponse, description = "READ refused or wrong object key"), (status = 404, body = ErrorResponse, description = "Version missing"),
-        (status = 409, body = ErrorResponse, description = "Envelope pending or stale version"), (status = 416, body = ErrorResponse, description = "Range not satisfiable"),
+        (status = 409, body = ErrorResponse, description = "Envelope pending, stale version, or a reference version its source no longer serves"),
+        (status = 412, body = ErrorResponse, description = "The reference source no longer matches its recorded checksum"), (status = 416, body = ErrorResponse, description = "Range not satisfiable"),
         (status = 423, body = ErrorResponse, description = "Locked, object key required"),
         (status = 503, body = ErrorResponse, description = "Download or storage unavailable, or no holder of the key's range answered")), security(("bearer_auth" = [])))]
 pub async fn content(

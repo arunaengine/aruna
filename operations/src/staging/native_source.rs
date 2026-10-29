@@ -793,7 +793,8 @@ fn map_get_error(error: GetObjectError) -> NativeReferenceReject {
         | GetObjectError::DeleteMarker
         // The pinned observation no longer has bytes to relay.
         // Drift and exhausted bindings remain retryable through rebinding.
-        | GetObjectError::HistoricalReferenceUnavailable => NativeReferenceReject::NotFound,
+        | GetObjectError::HistoricalReferenceUnavailable
+        | GetObjectError::ReferenceChecksumMismatch => NativeReferenceReject::NotFound,
         GetObjectError::ReferenceSourceChanged | GetObjectError::ReferenceAdvanceExhausted => {
             NativeReferenceReject::Unavailable(error.to_string())
         }

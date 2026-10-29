@@ -1207,6 +1207,7 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
              read from offset 0 for a fresh read"
         )),
         error @ (GetObjectError::ReferenceSourceChanged
+        | GetObjectError::ReferenceChecksumMismatch
         | GetObjectError::ReferenceAdvanceExhausted
         | GetObjectError::SpoolBudgetExhausted) => {
             server_error(crate::error::ServerError::Conflict(error.to_string()))
