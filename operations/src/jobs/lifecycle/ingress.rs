@@ -288,7 +288,7 @@ pub async fn submit_external_job(
     validate_execution(&mut spec, workspace_mode, workspace_bucket.as_deref())?;
     store_workspace(&mut spec, workspace_mode, workspace_bucket.clone())
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
-    ids::required_labels(&spec)
+    let labels = ids::required_labels(&spec)
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
     let (config, local) = local_view(context).await?;
     let scope = match idempotency_key {
@@ -307,6 +307,16 @@ pub async fn submit_external_job(
             input_pages: None,
         };
         return forward_device(context, request, &config, local, auth_token).await;
+    }
+    if !labels.is_empty() {
+        // Only a complete read of the advertisements proves that no executor carries a label.
+        let (documents, unread) = super::plan::advertisements(context, &config).await;
+        if let Some(label) = super::plan::missing_label(&documents, &labels).filter(|_| !unread) {
+            return Err(SubmitJobError::InvalidWorkspace(format!(
+                "no executor in the realm carries the label `{}={}`",
+                label.key, label.value
+            )));
+        }
     }
     pin_outputs(&mut spec, local);
     let (inputs, captured_inputs, output_policies) = resolve_inputs(
