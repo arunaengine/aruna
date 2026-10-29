@@ -451,7 +451,8 @@ pub async fn create_making_room(
         let read = crate::users::read_document::ReadUserOperation::new(config.user_id);
         let service = match crate::driver::drive(read, context).await {
             Ok(user) => user.service_group().is_some(),
-            Err(crate::users::read_document::ReadUserError::NotFound) => false,
+            // An unknown account may be a service account not yet replicated here.
+            Err(crate::users::read_document::ReadUserError::NotFound) => true,
             Err(error) => return Err(CreateSessionError::Retire(error.to_string())),
         };
         if service {
@@ -693,6 +694,38 @@ mod pure_tests {
         (dir, context, config, node_id)
     }
 
+    /// Stores the user document of `config`'s user with the given attributes.
+    async fn store_user(
+        context: &crate::driver::DriverContext,
+        config: &CreateSessionConfig,
+        node_id: aruna_core::id::NodeId,
+        attributes: std::collections::HashMap<String, String>,
+    ) {
+        use aruna_core::document::DocumentTarget;
+        let user = aruna_core::structs::identity::user::User {
+            user_id: config.user_id,
+            name: "user".to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes,
+        };
+        let target = DocumentTarget::User {
+            user_id: config.user_id,
+        };
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id,
+            user_id: config.user_id,
+            realm_id: config.realm_id,
+        };
+        let write = StorageEffect::Write {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            value: user.to_bytes(&actor).unwrap().into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(write).await;
+    }
+
     // Signing out works past the 64 self-service revocations a user may hold: the rest move
     // the user's cutoff, and the next sign-in still works.
     #[tokio::test]
@@ -741,67 +774,51 @@ mod pure_tests {
         create_making_room(&context, node_id, next).await.unwrap();
     }
 
-    // A service account at the limit is refused as before; none of its sessions are ended.
+    // A service account, or one whose document is not here yet, at the limit is refused as
+    // before; none of its sessions are ended.
     #[tokio::test]
     async fn service_keeps_limit() {
         use crate::driver::drive;
-        use aruna_core::document::DocumentTarget;
-        let (_dir, context, config, node_id) = session_realm().await;
-        let user = aruna_core::structs::identity::user::User {
-            user_id: config.user_id,
-            name: "pipeline".to_string(),
-            subject_ids: Vec::new(),
-            alias_user_ids: Default::default(),
-            attributes: std::collections::HashMap::from([(
-                aruna_core::user::validation::SERVICE_GROUP_ATTRIBUTE.to_string(),
-                Ulid::from_bytes([8; 16]).to_string(),
-            )]),
-        };
-        let target = DocumentTarget::User {
-            user_id: config.user_id,
-        };
-        let actor = aruna_core::structs::identity::auth::Actor {
-            node_id,
-            user_id: config.user_id,
-            realm_id: config.realm_id,
-        };
-        let write = StorageEffect::Write {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            value: user.to_bytes(&actor).unwrap().into(),
-            txn_id: None,
-        };
-        context.storage_handle.send_storage_effect(write).await;
-        let now = aruna_core::time::unix_timestamp_secs();
-        let base = now - 1_000;
-        for offset in 0..MAX_USER_SESSIONS as u64 {
-            let session = CreateSessionConfig {
-                time: base + offset,
+        for known in [true, false] {
+            let (_dir, context, config, node_id) = session_realm().await;
+            if known {
+                let service = std::collections::HashMap::from([(
+                    aruna_core::user::validation::SERVICE_GROUP_ATTRIBUTE.to_string(),
+                    Ulid::from_bytes([8; 16]).to_string(),
+                )]);
+                store_user(&context, &config, node_id, service).await;
+            }
+            let now = aruna_core::time::unix_timestamp_secs();
+            let base = now - 1_000;
+            for offset in 0..MAX_USER_SESSIONS as u64 {
+                let session = CreateSessionConfig {
+                    time: base + offset,
+                    expiry: now + 3_600,
+                    ..config.clone()
+                };
+                drive(CreateSessionOperation::new(session), &context)
+                    .await
+                    .unwrap();
+            }
+            let next = CreateSessionConfig {
+                time: now,
                 expiry: now + 3_600,
                 ..config.clone()
             };
-            drive(CreateSessionOperation::new(session), &context)
-                .await
-                .unwrap();
+            let refused = create_making_room(&context, node_id, next).await;
+            assert_eq!(
+                refused,
+                Err(CreateSessionError::LimitReached { oldest: base })
+            );
+            let cutoff = crate::auth::bearer_token::realm_user_cutoff(
+                &context.storage_handle,
+                config.realm_id,
+                &config.user_id,
+            )
+            .await
+            .unwrap();
+            assert_eq!(cutoff, None);
         }
-        let next = CreateSessionConfig {
-            time: now,
-            expiry: now + 3_600,
-            ..config.clone()
-        };
-        let refused = create_making_room(&context, node_id, next).await;
-        assert_eq!(
-            refused,
-            Err(CreateSessionError::LimitReached { oldest: base })
-        );
-        let cutoff = crate::auth::bearer_token::realm_user_cutoff(
-            &context.storage_handle,
-            config.realm_id,
-            &config.user_id,
-        )
-        .await
-        .unwrap();
-        assert_eq!(cutoff, None);
     }
 
     // A sign-in right after a sign-out moved the cutoff into the next second is issued at the
@@ -838,6 +855,7 @@ mod pure_tests {
     async fn full_user_signs_in() {
         use crate::driver::drive;
         let (_dir, context, config, node_id) = session_realm().await;
+        store_user(&context, &config, node_id, Default::default()).await;
         // The cutoff is read against the wall clock, so the sessions are recent.
         let now = aruna_core::time::unix_timestamp_secs();
         let base = now - 1_000;
