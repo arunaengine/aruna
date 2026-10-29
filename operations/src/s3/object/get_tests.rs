@@ -1881,6 +1881,44 @@ fn unknown_keeps_digests() {
     assert_eq!(result.last_refresh, None);
 }
 
+// A changed time or ETag of the same length is decided by the recorded digests: matching bytes
+// are served, without recording a successor.
+#[test]
+fn drift_digest_decides() {
+    let mut operation = drifted_operation();
+    let stored = digested(9, 7);
+    let mut fresh = observation(9);
+    fresh.etag = Some("etag-new".to_string());
+    operation.reference_cached = Some(stored.clone());
+    operation.state = GetObjectState::HeadReferenceSource;
+
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: fresh.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+    ));
+    operation.step(source_read(fresh));
+    assert!(operation.step(spooled(7)).is_empty());
+
+    let result = operation.finalize().unwrap();
+    assert_eq!(result.source_metadata.unwrap().digests, stored.digests);
+
+    // A different length can never match the digests, so it fails without a read.
+    let mut operation = drifted_operation();
+    operation.reference_cached = Some(digested(9, 7));
+    operation.state = GetObjectState::HeadReferenceSource;
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(10),
+    }));
+    assert!(effects.is_empty());
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::ReferenceSourceChanged)
+    );
+}
+
 // Bytes that miss the recorded digests are never served: the spool stream is dropped, the read
 // fails.
 #[test]

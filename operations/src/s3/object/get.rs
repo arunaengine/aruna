@@ -1254,7 +1254,12 @@ impl GetObjectOperation {
                     }
                     return self.serve_reference_source(served, bound);
                 }
-                if comparison == ObservationMatch::Unknown {
+                // Recorded digests decide over a changed time or ETag of the same length.
+                let digests_decide = self.reference_cached.as_ref().is_some_and(|stored| {
+                    !stored.enforced_checksums().is_empty()
+                        && stored.content_length == metadata.content_length
+                });
+                if comparison == ObservationMatch::Unknown || digests_decide {
                     // Nothing proves the bytes unchanged. The whole bytes are checked against the
                     // recorded digests before any is served; without digests a pinned version is
                     // refused, and the current one is served fresh without counting as refreshed.
