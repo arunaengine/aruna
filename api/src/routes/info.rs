@@ -6,6 +6,7 @@ use crate::auth::{
     ensure_permission, permission_granted, require_realm_auth, require_unrestricted_auth,
 };
 use crate::error::{ServerError, ServerResult};
+use crate::routes::node_names::CoordinatesBody;
 pub use crate::server::state::PortalStatus;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
@@ -22,7 +23,7 @@ use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::device::realm_documents::{installed_management_urls, installed_node_names};
+use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
 use aruna_operations::driver::{backend_used_bytes, drive};
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
@@ -40,7 +41,7 @@ use aruna_operations::realm::get_nodes::{
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
 };
-use aruna_operations::realm::node_name::ReadNamesOperation;
+use aruna_operations::realm::node_name::{NodeDisplays, ReadNamesOperation};
 use aruna_operations::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
@@ -918,7 +919,7 @@ pub struct RealmProviderResponse {
     pub discovery_url: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[schema(as = RealmNodeInfoResponse)]
 pub struct NodeInfoResponse {
     pub node_id: String,
@@ -936,6 +937,13 @@ pub struct NodeInfoResponse {
     /// Realm-administered display name; absent when unset. A label only, never an identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Readable place name for maps, such as `Giessen`; absent when unset. Presentation only,
+    /// unlike the placement `location`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
+    /// Map position of the node; absent when unset. Presentation only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coordinates: Option<CoordinatesBody>,
     /// Placement map entry (location/weight/status) when the node is mapped.
     pub placement: Option<NodePlacementResponse>,
     /// Latest published node info document (capabilities/labels/urls/utilization) if received.
@@ -1336,23 +1344,23 @@ pub(crate) async fn run_realm_info(
     })
 }
 
-/// Node display names. A device runs no document sync, so it shows the copy a realm node
-/// last served it.
+/// Node display names and map places. A device runs no document sync, so it shows the copy a
+/// realm node last served it.
 async fn node_names(
     state: &ServerState,
     realm_id: aruna_core::structs::identity::realm::RealmId,
-) -> BTreeMap<aruna_core::NodeId, String> {
+) -> NodeDisplays {
     if matches!(
         state.node_capabilities(),
         aruna_core::structs::identity::auth::NodeCapabilities::User { .. }
     ) {
-        return installed_node_names(&state.get_ctx(), realm_id).await;
+        return installed_displays(&state.get_ctx(), realm_id).await;
     }
     drive(ReadNamesOperation::new(realm_id), &state.get_ctx())
         .await
         .unwrap_or_else(|error| {
             warn!(error = %error, "node display names unavailable for realm info");
-            BTreeMap::new()
+            NodeDisplays::default()
         })
 }
 
@@ -2273,7 +2281,7 @@ fn map_realm_nodes(
         aruna_core::structs::storage::node_info::NodeInfoDocument,
     >,
     contacts: &PeerContacts,
-    names: &BTreeMap<aruna_core::NodeId, String>,
+    names: &NodeDisplays,
     now_ms: u64,
 ) -> Vec<NodeInfoResponse> {
     let current_node = state.get_node_id();
@@ -2312,6 +2320,8 @@ fn map_realm_nodes(
             let seen_recently = is_device
                 && (is_current
                     || parsed.is_some_and(|node_id| contacts.seen_recently(&node_id, now_ms)));
+            let shown = parsed.map(|node_id| names.of(&node_id)).unwrap_or_default();
+            let place = shown.place.unwrap_or_default();
             NodeInfoResponse {
                 node_id: node.node_id.clone(),
                 kind,
@@ -2325,7 +2335,9 @@ fn map_realm_nodes(
                     (false, _, false) => RealmConnectionStatus::Configured,
                 },
                 last_seen_ms,
-                display_name: parsed.and_then(|node_id| names.get(&node_id).cloned()),
+                display_name: shown.name,
+                place: place.name,
+                coordinates: place.coordinates.map(CoordinatesBody::from),
                 placement,
                 info,
             }

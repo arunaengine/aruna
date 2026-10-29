@@ -1818,7 +1818,7 @@ async fn device_never_connected() {
         present,
         BTreeMap::new(),
         &PeerContacts::default(),
-        &BTreeMap::new(),
+        &aruna_operations::realm::node_name::NodeDisplays::default(),
         10_000,
     );
 
@@ -1872,7 +1872,7 @@ async fn reports_device_seen() {
         HashSet::new(),
         BTreeMap::new(),
         &contacts,
-        &BTreeMap::new(),
+        &aruna_operations::realm::node_name::NodeDisplays::default(),
         now_ms,
     );
     let device = |node_id: aruna_core::NodeId| {
@@ -1998,8 +1998,72 @@ async fn promotion_needs_server() {
 
 fn name_body(name: Option<&str>) -> Json<NodeNameRequest> {
     Json(NodeNameRequest {
-        display_name: name.map(str::to_string),
+        display_name: Some(name.map(str::to_string)),
+        ..NodeNameRequest::default()
     })
+}
+
+// The map place sits beside the name: each field changes alone, `null` clears it, and the
+// realm listing shows what is set without touching placement.
+#[tokio::test]
+async fn node_place_shown() {
+    let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+    let auth = admin_auth(realm_id, admin);
+    let own = state.get_node_id().to_string();
+    let patch = |body: serde_json::Value| {
+        let request = serde_json::from_value::<NodeNameRequest>(body).unwrap();
+        name_realm_node(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Path(own.clone()),
+            Ok(Json(request)),
+        )
+    };
+    let (_, Json(named)) = patch(serde_json::json!({"display_name": "Storage 1"}))
+        .await
+        .unwrap();
+    assert_eq!((named.place, named.coordinates), (None, None));
+    let (_, Json(placed)) = patch(serde_json::json!({
+        "place": " Giessen ",
+        "coordinates": {"lat": 50.58412345678, "lon": 8.6784}
+    }))
+    .await
+    .unwrap();
+    assert_eq!(placed.display_name.as_deref(), Some("Storage 1"));
+    assert_eq!(placed.place.as_deref(), Some("Giessen"));
+    let coordinates = placed.coordinates.unwrap();
+    assert_eq!((coordinates.lat, coordinates.lon), (50.5841235, 8.6784));
+
+    let info = run_realm_info(&state, Some(auth.clone())).await.unwrap();
+    let node = info.nodes.iter().find(|node| node.node_id == own).unwrap();
+    assert_eq!(node.place.as_deref(), Some("Giessen"));
+    assert_eq!(node.coordinates, Some(coordinates));
+    assert_eq!(node.display_name.as_deref(), Some("Storage 1"));
+    assert_eq!(node.placement.as_ref().unwrap().location, "default");
+
+    let (_, Json(moved)) = patch(serde_json::json!({"coordinates": null}))
+        .await
+        .unwrap();
+    assert_eq!(
+        (moved.place.as_deref(), moved.coordinates),
+        (Some("Giessen"), None)
+    );
+    for invalid in [
+        serde_json::json!({}),
+        serde_json::json!({"coordinates": {"lat": 91.0, "lon": 0.0}}),
+        serde_json::json!({"place": "  "}),
+    ] {
+        assert!(matches!(
+            patch(invalid).await,
+            Err(ServerError::BadRequestReason(_))
+        ));
+    }
+    let info = serde_json::to_value(run_realm_info(&state, Some(auth)).await.unwrap()).unwrap();
+    let node = (info["nodes"].as_array().unwrap().iter())
+        .find(|node| node["node_id"] == own)
+        .unwrap();
+    assert_eq!(node["place"], "Giessen");
+    assert!(node.get("coordinates").is_none());
 }
 
 #[tokio::test]

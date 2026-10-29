@@ -344,6 +344,18 @@ async fn device_lists_names() {
         postcard::to_allocvec(&names).unwrap(),
     )
     .await;
+    let place = aruna_core::structs::identity::realm::NodePlace {
+        name: Some("Giessen".to_string()),
+        coordinates: aruna_core::structs::identity::realm::NodeCoordinates::from_degrees(50.5, 8.6),
+    };
+    let places = std::collections::BTreeMap::from([(node_id, place)]);
+    write_row(
+        state,
+        aruna_core::keyspaces::NODE_PLACE_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        postcard::to_allocvec(&places).unwrap(),
+    )
+    .await;
     let owner = aruna_core::structs::identity::auth::AuthContext {
         user_id: UserId::local(Ulid::from_bytes([9u8; 16]), realm_id),
         realm_id,
@@ -361,4 +373,7 @@ async fn device_lists_names() {
         .find(|node| node.node_id == node_id.to_string())
         .unwrap();
     assert_eq!(device.display_name.as_deref(), Some("Lab laptop"));
+    assert_eq!(device.place.as_deref(), Some("Giessen"));
+    let coordinates = device.coordinates.unwrap();
+    assert_eq!((coordinates.lat, coordinates.lon), (50.5, 8.6));
 }
