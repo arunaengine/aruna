@@ -1,5 +1,5 @@
-//! Sets, clears and reads the realm-administered display names of realm nodes.
-//! A name is a label for people: placement, routing and policy never read it.
+//! Sets, clears and reads the realm-administered display names and map places of realm nodes.
+//! Both are for people only: placement, routing and policy never read them.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -17,7 +17,7 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{
-    MAX_NODE_NAME, RealmConfigDocument, RealmId, normalize_node_name,
+    MAX_NODE_NAME, NodeCoordinates, NodePlace, RealmConfigDocument, RealmId, normalize_node_name,
 };
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::task::TaskEvent;
@@ -42,14 +42,44 @@ pub enum NameScope {
     RealmAdmin,
 }
 
+/// The fields one request changes: `None` keeps a field, `Some(None)` clears it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodeChange {
+    pub display_name: Option<Option<String>>,
+    pub place: Option<Option<String>>,
+    pub coordinates: Option<Option<NodeCoordinates>>,
+}
+
+/// What a node shows people: its display name and map place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeDisplay {
+    pub name: Option<String>,
+    pub place: Option<NodePlace>,
+}
+
+/// The display names and map places of realm nodes, by node id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeDisplays {
+    pub names: BTreeMap<NodeId, String>,
+    pub places: BTreeMap<NodeId, NodePlace>,
+}
+
+impl NodeDisplays {
+    pub fn of(&self, node_id: &NodeId) -> NodeDisplay {
+        NodeDisplay {
+            name: self.names.get(node_id).cloned(),
+            place: self.places.get(node_id).cloned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetNodeNameConfig {
     pub actor: Actor,
     /// The caller's own token context; it is never derived from `actor`.
     pub auth_context: AuthContext,
     pub node_id: NodeId,
-    /// `None` clears the name.
-    pub display_name: Option<String>,
+    pub change: NodeChange,
     pub scope: NameScope,
 }
 
@@ -58,7 +88,7 @@ pub struct SetNodeNameOperation {
     config: SetNodeNameConfig,
     txn_id: Option<TxnId>,
     state: SetNodeNameState,
-    output: Option<Result<Option<String>, SetNodeNameError>>,
+    output: Option<Result<NodeDisplay, SetNodeNameError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,9 +122,13 @@ pub enum SetNodeNameError {
     #[error("this node is not a realm management node")]
     NotManagementNode,
     #[error(
-        "display name must be non-empty, at most {MAX_NODE_NAME} characters and free of control characters"
+        "display name and place must be non-empty, at most {MAX_NODE_NAME} characters and free of control characters"
     )]
     InvalidName,
+    #[error("coordinates must lie within latitude -90 to 90 and longitude -180 to 180")]
+    InvalidCoordinates,
+    #[error("the request changes no field")]
+    EmptyChange,
     #[error("node {node_id} is not a node the caller may name")]
     UnknownNode { node_id: NodeId },
     #[error("missing active transaction")]
@@ -194,34 +228,57 @@ impl SetNodeNameOperation {
         let mut reducer_state = previous_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_event = reducer_state.apply_operation(
-            &self.config.actor,
-            AdminDocumentOperation::NodeNameSet {
+        let change = &self.config.change;
+        let mut shown = NodeDisplay {
+            name: reducer_state.materialized_node_names().remove(&node_id),
+            place: reducer_state.materialized_node_places().remove(&node_id),
+        };
+        let mut operations = Vec::new();
+        if let Some(display_name) = &change.display_name {
+            shown.name = display_name.clone();
+            operations.push(AdminDocumentOperation::NodeNameSet {
                 node_id,
-                display_name: self.config.display_name.clone(),
-            },
-        )?;
+                display_name: display_name.clone(),
+            });
+        }
+        if change.place.is_some() || change.coordinates.is_some() {
+            // The place travels whole, so a change of one field keeps the other.
+            let current = shown.place.take().unwrap_or_default();
+            let place = NodePlace {
+                name: change.place.clone().unwrap_or(current.name),
+                coordinates: change.coordinates.unwrap_or(current.coordinates),
+            };
+            shown.place = (place.name.is_some() || place.coordinates.is_some()).then_some(place);
+            operations.push(AdminDocumentOperation::NodePlaceSet {
+                node_id,
+                place: shown.place.clone(),
+            });
+        }
 
         let document_target = DocumentTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         };
         let placement = target_placement_ref(&document, &document_target, Default::default());
-        let record = new_identified_record(
-            admin_event.event_id,
-            self.config.actor.node_id,
-            document_target,
-            Vec::new(),
-            DocumentOutboxEvent::admin(admin_event),
-            placement,
-            false,
-        );
-        let mut writes = vec![
-            reducer_state_entry(&reducer_state)?,
-            outbox_write_entry(&record).map_err(ConversionError::from)?,
-        ];
+        let mut records = Vec::new();
+        for operation in operations {
+            let admin_event = reducer_state.apply_operation(&self.config.actor, operation)?;
+            records.push(new_identified_record(
+                admin_event.event_id,
+                self.config.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentOutboxEvent::admin(admin_event),
+                placement,
+                false,
+            ));
+        }
+        let mut writes = vec![reducer_state_entry(&reducer_state)?];
+        for record in &records {
+            writes.push(outbox_write_entry(record).map_err(ConversionError::from)?);
+        }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(self.config.display_name.clone()));
+        self.output = Some(Ok(shown));
         self.state = SetNodeNameState::WriteState {
             stale_conflict_deletes: stale_conflict_deletes(
                 previous_state.as_ref(),
@@ -260,7 +317,7 @@ impl SetNodeNameOperation {
 }
 
 impl Operation for SetNodeNameOperation {
-    type Output = Option<String>;
+    type Output = NodeDisplay;
     type Error = SetNodeNameError;
 
     fn start(&mut self) -> Effects {
@@ -271,11 +328,8 @@ impl Operation for SetNodeNameOperation {
         if foreign {
             return self.fail(SetNodeNameError::Unauthorized);
         }
-        if let Some(raw) = self.config.display_name.take() {
-            match normalize_node_name(&raw) {
-                Some(name) => self.config.display_name = Some(name),
-                None => return self.fail(SetNodeNameError::InvalidName),
-            }
+        if let Err(error) = normalize_change(&mut self.config.change) {
+            return self.fail(error);
         }
         if self.config.scope == NameScope::Owner {
             return self.begin_transaction();
@@ -412,13 +466,31 @@ impl Operation for SetNodeNameOperation {
     }
 }
 
-/// Reads the display names of realm nodes from this node's replicated realm config state.
-/// A realm without any name reads as an empty map.
+/// Trims the change's texts and checks every field; an empty change is refused.
+fn normalize_change(change: &mut NodeChange) -> Result<(), SetNodeNameError> {
+    if *change == NodeChange::default() {
+        return Err(SetNodeNameError::EmptyChange);
+    }
+    for text in [&mut change.display_name, &mut change.place] {
+        if let Some(Some(raw)) = text {
+            *raw = normalize_node_name(raw).ok_or(SetNodeNameError::InvalidName)?;
+        }
+    }
+    match change.coordinates {
+        Some(Some(coordinates)) if !coordinates.valid() => {
+            Err(SetNodeNameError::InvalidCoordinates)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Reads the display names and map places of realm nodes from this node's replicated realm
+/// config state. A realm without any reads as empty maps.
 #[derive(Debug, PartialEq)]
 pub struct ReadNamesOperation {
     realm_id: RealmId,
     done: bool,
-    output: Option<Result<BTreeMap<NodeId, String>, SetNodeNameError>>,
+    output: Option<Result<NodeDisplays, SetNodeNameError>>,
 }
 
 impl ReadNamesOperation {
@@ -430,7 +502,7 @@ impl ReadNamesOperation {
         }
     }
 
-    fn finish(&mut self, output: Result<BTreeMap<NodeId, String>, SetNodeNameError>) -> Effects {
+    fn finish(&mut self, output: Result<NodeDisplays, SetNodeNameError>) -> Effects {
         self.done = true;
         self.output = Some(output);
         smallvec![]
@@ -438,7 +510,7 @@ impl ReadNamesOperation {
 }
 
 impl Operation for ReadNamesOperation {
-    type Output = BTreeMap<NodeId, String>;
+    type Output = NodeDisplays;
     type Error = SetNodeNameError;
 
     fn start(&mut self) -> Effects {
@@ -458,16 +530,18 @@ impl Operation for ReadNamesOperation {
         }
         match event {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                let names = value
+                let displays = value
                     .map(|bytes| decode_reducer_state(&bytes).map_err(ConversionError::from))
                     .transpose()
                     .map(|state| {
-                        state
-                            .map(|state| state.materialized_node_names())
-                            .unwrap_or_default()
+                        let displays = state.map(|state| NodeDisplays {
+                            names: state.materialized_node_names(),
+                            places: state.materialized_node_places(),
+                        });
+                        displays.unwrap_or_default()
                     })
                     .map_err(SetNodeNameError::from);
-                self.finish(names)
+                self.finish(displays)
             }
             Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
             other => self.finish(Err(SetNodeNameError::UnexpectedEvent {

@@ -11,6 +11,7 @@ use aruna_core::task::TaskKey;
 use ulid::Ulid;
 
 use super::*;
+use aruna_core::structs::identity::realm::{NodeCoordinates, NodePlace};
 
 const REALM: RealmId = RealmId([5; 32]);
 
@@ -61,9 +62,19 @@ fn config(
         },
         auth_context: auth(caller),
         node_id,
-        display_name: name.map(str::to_string),
+        change: NodeChange {
+            display_name: Some(name.map(str::to_string)),
+            ..NodeChange::default()
+        },
         scope,
     }
+}
+
+fn named(name: Option<&str>) -> Result<NodeDisplay, SetNodeNameError> {
+    Ok(NodeDisplay {
+        name: name.map(str::to_string),
+        place: None,
+    })
 }
 
 /// Drives the operation to its stored reducer state, given the state it reads.
@@ -109,7 +120,7 @@ fn written_state(effects: &Effects) -> AdminDocumentState {
         .expect("reducer state is written")
 }
 
-fn finish(mut operation: SetNodeNameOperation) -> Result<Option<String>, SetNodeNameError> {
+fn finish(mut operation: SetNodeNameOperation) -> Result<NodeDisplay, SetNodeNameError> {
     let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),
     }));
@@ -153,20 +164,20 @@ fn admin_sets_name() {
         state.materialized_node_names(),
         BTreeMap::from([(node(2), "Giessen storage 1".to_string())])
     );
-    assert_eq!(finish(operation), Ok(Some("Giessen storage 1".to_string())));
+    assert_eq!(finish(operation), named(Some("Giessen storage 1")));
 }
 
 #[test]
 fn admin_clears_name() {
     // A clear must replace the stored name, not leave it behind.
-    let mut named =
+    let mut first =
         SetNodeNameOperation::new(config(node(2), Some("old"), NameScope::RealmAdmin, user(1)));
-    let stored = written_state(&drive_write(&mut named, None, RealmNodeKind::Management));
+    let stored = written_state(&drive_write(&mut first, None, RealmNodeKind::Management));
     let mut operation =
         SetNodeNameOperation::new(config(node(2), None, NameScope::RealmAdmin, user(1)));
     let effects = drive_write(&mut operation, Some(&stored), RealmNodeKind::Management);
     assert!(written_state(&effects).materialized_node_names().is_empty());
-    assert_eq!(finish(operation), Ok(None));
+    assert_eq!(finish(operation), named(None));
 }
 
 #[test]
@@ -179,7 +190,7 @@ fn owner_names_device() {
         written_state(&effects).materialized_node_names(),
         BTreeMap::from([(node(3), "Laptop".to_string())])
     );
-    assert_eq!(finish(operation), Ok(Some("Laptop".to_string())));
+    assert_eq!(finish(operation), named(Some("Laptop")));
 }
 
 #[test]
@@ -268,7 +279,7 @@ fn reads_stored_names() {
         key: Key::from(&b"state"[..]),
         value: None,
     }));
-    assert_eq!(empty.finalize(), Ok(BTreeMap::new()));
+    assert_eq!(empty.finalize(), Ok(NodeDisplays::default()));
 
     let mut named = SetNodeNameOperation::new(config(
         node(2),
@@ -283,8 +294,98 @@ fn reads_stored_names() {
         key: Key::from(&b"state"[..]),
         value: Some(postcard::to_allocvec(&stored).unwrap().into()),
     }));
+    let displays = operation.finalize().unwrap();
     assert_eq!(
-        operation.finalize(),
-        Ok(BTreeMap::from([(node(2), "Giessen".to_string())]))
+        displays.names,
+        BTreeMap::from([(node(2), "Giessen".to_string())])
     );
+}
+
+fn placed(change: NodeChange) -> SetNodeNameOperation {
+    SetNodeNameOperation::new(SetNodeNameConfig {
+        change,
+        ..config(node(2), None, NameScope::RealmAdmin, user(1))
+    })
+}
+
+// A place change keeps the name and the other place field, and a cleared place goes whole.
+#[test]
+fn places_merge_clear() {
+    let giessen = NodeCoordinates::from_degrees(50.58, 8.68);
+    let mut first = placed(NodeChange {
+        display_name: Some(Some("Storage 1".to_string())),
+        place: Some(Some(" Giessen ".to_string())),
+        coordinates: None,
+    });
+    let stored = written_state(&drive_write(&mut first, None, RealmNodeKind::Management));
+    let place = |name: &str, coordinates| NodePlace {
+        name: Some(name.to_string()),
+        coordinates,
+    };
+    assert_eq!(
+        stored.materialized_node_places(),
+        BTreeMap::from([(node(2), place("Giessen", None))])
+    );
+
+    let mut moved = placed(NodeChange {
+        coordinates: Some(giessen),
+        ..NodeChange::default()
+    });
+    let effects = drive_write(&mut moved, Some(&stored), RealmNodeKind::Management);
+    let stored = written_state(&effects);
+    assert_eq!(stored.materialized_node_names()[&node(2)], "Storage 1");
+    assert_eq!(
+        stored.materialized_node_places()[&node(2)],
+        place("Giessen", giessen)
+    );
+    assert_eq!(
+        finish(moved),
+        Ok(NodeDisplay {
+            name: Some("Storage 1".to_string()),
+            place: Some(place("Giessen", giessen)),
+        })
+    );
+
+    let mut cleared = placed(NodeChange {
+        place: Some(None),
+        coordinates: Some(None),
+        ..NodeChange::default()
+    });
+    let stored = written_state(&drive_write(
+        &mut cleared,
+        Some(&stored),
+        RealmNodeKind::Management,
+    ));
+    assert!(stored.materialized_node_places().is_empty());
+    assert_eq!(stored.materialized_node_names()[&node(2)], "Storage 1");
+}
+
+#[test]
+fn refuses_invalid_places() {
+    let out = NodeCoordinates {
+        lat_e7: 900_000_001,
+        lon_e7: 0,
+    };
+    let changes = [
+        (NodeChange::default(), SetNodeNameError::EmptyChange),
+        (
+            NodeChange {
+                place: Some(Some("\u{7}".to_string())),
+                ..NodeChange::default()
+            },
+            SetNodeNameError::InvalidName,
+        ),
+        (
+            NodeChange {
+                coordinates: Some(Some(out)),
+                ..NodeChange::default()
+            },
+            SetNodeNameError::InvalidCoordinates,
+        ),
+    ];
+    for (change, error) in changes {
+        let mut operation = placed(change);
+        let effects = operation.start();
+        assert_eq!(refusal(operation, effects), error);
+    }
 }
