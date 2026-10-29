@@ -505,6 +505,9 @@ fn search_keys(
     for term in &terms {
         rarest = rarest.min(searcher.doc_freq(term)?);
     }
+    if rarest > scan_limit {
+        return walk_keys(&searcher, fields, query, Some(&terms));
+    }
     let clauses = (terms.into_iter())
         .map(|term| {
             let query: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
@@ -513,10 +516,7 @@ fn search_keys(
         .collect();
     let weight =
         BooleanQuery::new(clauses).weight(EnableScoring::disabled_from_searcher(&searcher))?;
-    match rarest > scan_limit {
-        true => walk_keys(&searcher, fields, query, Some(weight.as_ref())),
-        false => matched_keys(&searcher, weight.as_ref(), query),
-    }
+    matched_keys(&searcher, weight.as_ref(), query)
 }
 
 /// The first `query.limit` live keys of the window that hold every term. Each segment keeps
@@ -570,12 +570,12 @@ fn matched_keys(
 /// Walks the key terms of every segment in key order, each at most `query.limit` terms, so
 /// the work is bounded by the limit and never by the range's size. Keys up to the smallest
 /// segment end are examined everywhere; the page continues after that key. With `matching`,
-/// a walked key is kept only when its document holds every term.
+/// a walked key is kept only when its document holds every one of those terms.
 fn walk_keys(
     searcher: &Searcher,
     fields: Fields,
     query: &KeyQuery,
-    matching: Option<&dyn Weight>,
+    matching: Option<&[Term]>,
 ) -> Result<KeyPage, KeyIndexError> {
     let limit = query.limit.max(1);
     let mut seen = std::collections::BTreeMap::<String, bool>::new();
@@ -619,16 +619,20 @@ fn walk_keys(
             }
         }
         // The terms' postings move forward only, so candidates are tested in document order.
+        // Each term's postings seek on their own, so the work follows the candidates; an
+        // aligned intersection could scan whole postings lists between two of them.
         candidates.sort_unstable();
-        let mut terms = matching
-            .map(|weight| weight.scorer(segment, 1.0))
-            .transpose()?;
+        let mut postings = Vec::new();
+        for term in matching.unwrap_or_default() {
+            let inverted = segment.inverted_index(term.field())?;
+            postings.push(inverted.read_postings(term, IndexRecordOption::Basic)?);
+        }
         for (doc, key) in candidates {
-            let holds = match terms.as_mut() {
-                Some(scorer) if scorer.doc() < doc => scorer.seek(doc) == doc,
-                Some(scorer) => scorer.doc() == doc,
-                None => true,
-            };
+            let holds = postings.iter_mut().all(|postings| match postings {
+                Some(postings) if postings.doc() < doc => postings.seek(doc) == doc,
+                Some(postings) => postings.doc() == doc,
+                None => false,
+            });
             *seen.entry(key).or_default() |= holds;
         }
     }
@@ -849,6 +853,39 @@ mod tests {
         let rare = query(Bound::Unbounded, Bound::Unbounded, Some("unique"), 5);
         let rare = indexes.search(set(), range(), 1, rare).await.unwrap();
         assert_eq!((rare.keys, rare.last), (vec![key(29)], None));
+    }
+
+    // Two common terms in alternating documents are tested per walked candidate, each page
+    // bounded by its limit, and only documents holding both are hits.
+    #[tokio::test]
+    async fn common_pair_walks() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = Arc::new(RangeIndexes::with_scan(dir.path(), 2));
+        let key = |n: usize| match (n % 8, n % 2) {
+            (0, _) => format!("k/{n:03}-alpha-beta.bam"),
+            (_, 0) => format!("k/{n:03}-alpha.bam"),
+            _ => format!("k/{n:03}-beta.bam"),
+        };
+        let changes = (0..40).map(|n| put(&key(n))).collect();
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+
+        let (mut found, mut pages) = (Vec::new(), 0);
+        let mut after = Bound::Unbounded;
+        loop {
+            let start = after.as_ref().map(String::as_str);
+            let page = query(start, Bound::Unbounded, Some("alpha beta"), 3);
+            let page = indexes.search(set(), range(), 1, page).await.unwrap();
+            assert!(page.examined <= 3, "a page examines at most its limit");
+            pages += 1;
+            found.extend(page.keys);
+            match page.last {
+                Some(last) => after = Bound::Excluded(last),
+                None => break,
+            }
+        }
+        let both: Vec<_> = (0..40).step_by(8).map(key).collect();
+        assert_eq!(found, both);
+        assert_eq!(pages, 14, "the walk moves three keys a page");
     }
 
     // An index written with an older schema reads as missing, so the feed builds it again.
