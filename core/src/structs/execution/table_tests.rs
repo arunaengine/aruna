@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use std::io::Write;
 
 const SUMMARY: &str = include_str!("../../../tests/fixtures/assembly_summary.tsv");
 const BASE: &str = "https://ftp.ncbi.nlm.nih.gov/genomes/";
@@ -304,17 +305,17 @@ fn gzip_windows_resume() {
         SUMMARY.as_bytes()
     ));
     // Each step continues the decoder of the step before, after the bytes that step used.
-    let mut cursor = GzipCursor::new(0);
+    let mut cursor = GzipCursor::new(0, 1000);
     let mut pieces = compressed.chunks(97);
     let mut read = Vec::new();
     loop {
-        while !cursor.ready(1000) {
+        while !cursor.fill().unwrap() {
             match pieces.next() {
-                Some(piece) => cursor.push(piece).unwrap(),
-                None => cursor.finish().unwrap(),
+                Some(piece) => cursor.push(piece),
+                None => cursor.finish(),
             }
         }
-        let (bytes, complete) = cursor.chunk(1000);
+        let (bytes, complete) = cursor.chunk();
         let used = bytes.len().min(700);
         read.extend_from_slice(&bytes[..used]);
         assert!(cursor.advance(read.len() as u64));
@@ -325,13 +326,61 @@ fn gzip_windows_resume() {
     assert_eq!(read, SUMMARY.as_bytes());
     assert!(!cursor.advance(0), "a cursor never goes back");
     // A cursor opened at a later position skips to it.
-    let mut later = GzipCursor::new(5);
-    later.push(&compressed).unwrap();
-    later.finish().unwrap();
-    assert_eq!(later.chunk(4).0, &SUMMARY.as_bytes()[5..9]);
-    let mut truncated = GzipCursor::new(0);
-    truncated.push(&compressed[..compressed.len() / 2]).unwrap();
-    assert!(truncated.finish().is_err());
+    let mut later = GzipCursor::new(5, 4);
+    later.push(&compressed);
+    later.finish();
+    assert!(later.fill().unwrap());
+    assert_eq!(later.chunk().0, &SUMMARY.as_bytes()[5..9]);
+    let mut truncated = GzipCursor::new(0, TABLE_CHUNK);
+    truncated.push(&compressed[..compressed.len() / 2]);
+    truncated.finish();
+    assert!(truncated.fill().is_err());
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+// A small compressed input that expands enormously is decoded only as far as a chunk needs,
+// also while skipping to a late position.
+#[test]
+fn gzip_memory_bounded() {
+    let zeros = gzip(&vec![0u8; 16 << 20]);
+    assert!(zeros.len() < 64 * 1024);
+    let mut cursor = GzipCursor::new(0, 1000);
+    cursor.push(&zeros);
+    assert!(cursor.fill().unwrap());
+    assert!(cursor.kept.len() <= 1001 && cursor.kept.capacity() <= 4 * 1024);
+    assert!(
+        cursor.decoded <= 1001,
+        "decoding stops after the chunk and one byte"
+    );
+    let (bytes, complete) = cursor.chunk();
+    assert_eq!((bytes.len(), complete), (1000, false));
+
+    let mut late = GzipCursor::new(15 << 20, 1000);
+    late.push(&zeros);
+    assert!(late.fill().unwrap());
+    assert!(late.kept.len() <= 1001 && late.kept.capacity() <= 4 * 1024);
+    assert!(late.decoded <= (15 << 20) + 1001);
+}
+
+// A table whose last chunk is exactly the chunk size is complete only once its end is known;
+// until then the cursor waits instead of offering a chunk that cuts the last row off.
+#[test]
+fn gzip_exact_chunk() {
+    let table = b"a\tb\n1\t2\n";
+    let mut cursor = GzipCursor::new(0, table.len());
+    cursor.push(&gzip(table));
+    assert!(
+        !cursor.fill().unwrap(),
+        "the end of the input is not known yet"
+    );
+    cursor.finish();
+    assert!(cursor.fill().unwrap());
+    assert_eq!(cursor.chunk(), (table.to_vec(), true));
 }
 
 // Search reads the version's own selections: only selected columns match, tax ids exactly.
