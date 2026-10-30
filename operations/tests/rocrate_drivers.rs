@@ -503,6 +503,105 @@ async fn final_retry_resumes() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn rollback_keeps_released() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+
+    // The first run stops after the first payload commits; a release then pins it before the
+    // resumed run fails the second payload's checksum and rolls back.
+    let mut fixture = build_fixture(true).await?;
+    let mut archive = pair_archive().await?;
+    let local = zip_offsets(&archive, b"PK\x03\x04")[2];
+    let central = zip_offsets(&archive, b"PK\x01\x02")[2];
+    write_u32(&mut archive, local + 14, 0);
+    write_u32(&mut archive, central + 16, 0);
+    let upload_id = create_upload(&fixture, archive).await?;
+    let spec = import_spec(&fixture, upload_id, doc_id(1));
+    let job_id = job_id();
+    let first_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let first_token = first_context.claim_token;
+    let first_run = tokio::spawn({
+        let spec = spec.clone();
+        async move { run_rocrate_import(&first_context, &spec).await }
+    });
+    let hit = fixture.gate.as_mut().expect("gated fixture").take_hit();
+    tokio::time::timeout(Duration::from_secs(30), hit)
+        .await
+        .map_err(|_| "import did not reach the committed version gate")??;
+    let gate = fixture.gate.as_ref().expect("gated fixture");
+    gate.fail_buckets(true);
+    gate.release();
+    let JobRunOutcome::Failed(temporary) = first_run.await? else {
+        return Err("import with an unreadable bucket did not fail".into());
+    };
+    assert_eq!(temporary.kind, JobErrorKind::Retryable);
+    gate.fail_buckets(false);
+
+    let written = object_versions(&fixture, "imported/data1.txt").await?;
+    let [version_id] = written[..] else {
+        return Err(format!("expected one written version, found {written:?}").into());
+    };
+    let arn = VersionedObjectArn::new(
+        fixture.actor.realm_id,
+        fixture.actor.node_id,
+        BUCKET,
+        "imported/data1.txt",
+        version_id,
+    )?;
+    let release = serde_json::json!({
+        "@graph": [{"@type": "File", "@id": arn.to_w3id(), "name": "imported/data1.txt"}]
+    });
+    let tags = std::collections::HashMap::from([
+        (RELEASE_TAG.to_string(), "1.0".to_string()),
+        (RELEASE_PREFIX_TAG.to_string(), "imported/".to_string()),
+    ]);
+    let release = serde_json::to_vec(&release)?;
+    put_tagged(&fixture, "imported/release.json", release, tags).await?;
+
+    release_job(
+        &fixture.context.storage_handle,
+        job_id,
+        first_token,
+        unix_timestamp_millis(),
+    )
+    .await?;
+    let second_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let JobRunOutcome::Failed(error) = run_rocrate_import(&second_context, &spec).await else {
+        return Err("checksum mismatch did not fail the import".into());
+    };
+
+    assert_eq!(error.kind, JobErrorKind::Permanent);
+    assert!(
+        error
+            .message
+            .contains("so they were kept: `imported/data1.txt`")
+            && error.message.ends_with("no other objects were written"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        object_versions(&fixture, "imported/data1.txt").await?,
+        vec![version_id]
+    );
+    let rows = read_rows(&fixture, job_id).await?;
+    let first = (rows.iter())
+        .find(|row| row.entry_key == "data1.txt")
+        .ok_or("first entry report row is missing")?;
+    assert_eq!(first.code, ReasonCode::Failed);
+    assert_eq!(first.detail.version_id, Some(version_id));
+    assert!(
+        (first.message.as_deref()).is_some_and(|message| message.contains("a release pins it")),
+        "{:?}",
+        first.message
+    );
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn report_rows_coexist() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_fixture(false).await?;
     let payload_path = "signature/ro-crate-metadata.json.minisig";
@@ -1746,6 +1845,15 @@ async fn put_object(
     key: &str,
     bytes: Vec<u8>,
 ) -> Result<PutObjectResult, Box<dyn std::error::Error>> {
+    put_tagged(fixture, key, bytes, Default::default()).await
+}
+
+async fn put_tagged(
+    fixture: &Fixture,
+    key: &str,
+    bytes: Vec<u8>,
+    tags: std::collections::HashMap<String, String>,
+) -> Result<PutObjectResult, Box<dyn std::error::Error>> {
     let size = bytes.len() as u64;
     let body = BackendStream::<Result<Bytes, StreamError>>::new(stream::once(async move {
         Ok::<Bytes, std::io::Error>(Bytes::from(bytes))
@@ -1769,7 +1877,8 @@ async fn put_object(
             preassigned_version_id: None,
             quota_ceiling: None,
             routing: RoutingSnapshot::single(Ulid::generate()),
-        }),
+        })
+        .with_metadata(tags),
         fixture.context.as_ref(),
     )
     .await?)

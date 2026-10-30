@@ -76,8 +76,10 @@ use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::release::{BucketScope, MembershipQuery};
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use crate::s3::object::delete::pinned::version_pins;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
@@ -1283,7 +1285,11 @@ async fn cleanup_source(
     checkpoint: &mut ImportCheckpoint,
 ) -> Result<(), ImportFailure> {
     if let Some(plan) = plan.filter(|_| rollback_required(checkpoint)) {
-        checkpoint.rolled_back = rollback_writes(ctx, spec, plan, checkpoint).await?;
+        let (removed, kept) = rollback_writes(ctx, spec, plan, checkpoint).await?;
+        checkpoint.rolled_back = removed;
+        if let Some(failure) = checkpoint.failure.as_mut().filter(|_| !kept.is_empty()) {
+            failure.push_str(&format!("; {PINNED_KEPT}: `{}`", kept.join("`, `")));
+        }
     }
     if let Some(input) = checkpoint.input.as_ref() {
         crate::blob::hidden::delete_hidden(&ctx.driver, &input.location)
@@ -1340,22 +1346,25 @@ fn rollback_required(checkpoint: &ImportCheckpoint) -> bool {
     !checkpoint.created && checkpoint.failure.is_some()
 }
 
-/// Deletes exactly the object versions this import wrote.
-/// Every version id is minted by this job, so versions another writer owns are
-/// never removed, even where the import landed on an existing key.
+/// Failure text before the keys a rollback kept because a release pins them.
+const PINNED_KEPT: &str = "a release pins these written objects, so they were kept";
+
+/// Deletes exactly the object versions this import wrote, but keeps and returns those a release
+/// pins. Every version id is minted by this job, so versions another writer owns are never
+/// removed, even where the import landed on an existing key.
 async fn rollback_writes(
     ctx: &JobContext,
     spec: &ImportRoCrateSpec,
     plan: &ImportPlan,
     checkpoint: &ImportCheckpoint,
-) -> Result<u64, ImportFailure> {
+) -> Result<(u64, Vec<String>), ImportFailure> {
     // The entry at `next_entry` may have landed before the failure was seen.
     let attempted = plan
         .entries
         .len()
         .min(checkpoint.next_entry.saturating_add(1));
     if attempted == 0 {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
     // An unreachable bucket leaves the rollback unfinished, so it must requeue
     // instead of reporting a clean one.
@@ -1368,11 +1377,43 @@ async fn rollback_writes(
                 failure_message(error)
             ))
         })?;
+    let scope = BucketScope {
+        realm_id: spec.auth_context.realm_id,
+        node_id: ctx.owner_node_id,
+        bucket: &spec.target.bucket,
+        info: &bucket,
+    };
+    let queries: Vec<MembershipQuery> = (plan.entries[..attempted].iter())
+        .map(|entry| MembershipQuery {
+            key: entry.target_key.clone(),
+            version_id: entry.version_id,
+        })
+        .collect();
+    let (pins, guards) = version_pins(&ctx.driver, scope, &spec.auth_context, &queries)
+        .await
+        .map_err(|error| {
+            ImportFailure::Retryable(format!("rollback cannot check releases: {error}"))
+        })?;
+    let (pinned, removable): (Vec<_>, Vec<_>) = (plan.entries[..attempted].iter())
+        .zip(pins)
+        .partition(|(_, pinned)| *pinned);
+    let mut kept = Vec::with_capacity(pinned.len());
+    for (entry, _) in pinned {
+        let mut row = read_report(ctx, &entry.path)
+            .await?
+            .unwrap_or_else(|| entry_report(entry));
+        row.code = ReasonCode::Failed;
+        row.message =
+            Some("written object was kept after the import failed: a release pins it".to_string());
+        write_report(ctx, &row).await?;
+        kept.push(entry.target_key.clone());
+    }
+    let removable: Vec<_> = removable.into_iter().map(|(entry, _)| entry).collect();
     let outcomes = delete_objects(
         &ctx.driver,
         BulkDeleteInput {
             bucket: spec.target.bucket.clone(),
-            entries: plan.entries[..attempted]
+            entries: removable
                 .iter()
                 .map(|entry| BulkDeleteEntry {
                     key: entry.target_key.clone(),
@@ -1384,14 +1425,14 @@ async fn rollback_writes(
             node_id: ctx.owner_node_id,
             deleted_by: spec.auth_context.user_id,
             restrictions: spec.auth_context.path_restrictions.clone(),
-            guards: Vec::new(),
+            guards,
         },
     )
     .await;
     let mut removed = 0;
     // Only a version that was really removed loses its report detail, so the
     // entry that failed before writing keeps its own failure message.
-    for (entry, outcome) in plan.entries[..attempted].iter().zip(outcomes) {
+    for (entry, outcome) in removable.into_iter().zip(outcomes) {
         match outcome.result {
             Ok(_) => removed += 1,
             Err(DeleteObjectError::NoSuchVersion) => continue,
@@ -1419,7 +1460,7 @@ async fn rollback_writes(
         removed,
         "Rolled back objects written by a failed RO-Crate import"
     );
-    Ok(removed)
+    Ok((removed, kept))
 }
 
 /// Checks the target and returns its set hint, which planned version ids carry.
@@ -2150,7 +2191,9 @@ fn write_state(checkpoint: &ImportCheckpoint) -> String {
     if checkpoint.created {
         return "the metadata document was created".to_string();
     }
+    let kept = (checkpoint.failure.as_deref()).is_some_and(|failure| failure.contains(PINNED_KEPT));
     match checkpoint.rolled_back {
+        0 if kept => "no other objects were written".to_string(),
         0 => "no objects were written".to_string(),
         1 => "1 written object was removed".to_string(),
         removed => format!("{removed} written objects were removed"),
