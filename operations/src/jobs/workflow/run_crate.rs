@@ -569,15 +569,10 @@ fn capture_entities(
     let mut part_of = Vec::new();
     if let Some(metadata) = &captured.database {
         let described = &metadata.described;
-        // The dataset that describes the bucket is named by its own id; older runs had none.
-        let database_id = match metadata.dataset {
-            Some(dataset) => MetadataRegistryRecord::graph_iri_for(dataset),
-            None => {
-                let snapshot = serde_json::to_value(metadata).unwrap_or_default();
-                let digest = blake3::hash(snapshot.to_string().as_bytes()).to_hex();
-                format!("#bucket-metadata-{}", &digest[..16])
-            }
-        };
+        // Each captured description is its own snapshot, based on the dataset it was read from.
+        let snapshot = serde_json::to_value(metadata).unwrap_or_default();
+        let digest = blake3::hash(snapshot.to_string().as_bytes()).to_hex();
+        let database_id = format!("#bucket-metadata-{}", &digest[..16]);
         let title = described.title.as_deref().unwrap_or("Bucket metadata");
         let mut database = json!({
             "@id": database_id.clone(),
@@ -598,6 +593,10 @@ fn capture_entities(
             .collect();
         if !links.is_empty() {
             database["identifier"] = json!(links);
+        }
+        if let Some(dataset) = metadata.dataset {
+            database["isBasedOn"] =
+                json!({ "@id": MetadataRegistryRecord::graph_iri_for(dataset) });
         }
         part_of.push(json!({ "@id": database_id }));
         entities.push(database);
@@ -1458,11 +1457,7 @@ mod pure_tests {
         let part_of = input["isPartOf"].as_array().expect("part of");
         let database = find(&part_of[0]["@id"]).expect("metadata snapshot");
         let dataset = MetadataRegistryRecord::graph_iri_for(Ulid::from_bytes([16; 16]));
-        assert_eq!(
-            database["@id"],
-            dataset.as_str(),
-            "named by the bucket's dataset"
-        );
+        assert_eq!(database["isBasedOn"]["@id"], dataset.as_str());
         assert_eq!(database["name"], "Bakta (at admission)");
         assert_eq!(database["version"], "6.0");
         assert_eq!(database["identifier"][0], doi.url.as_str());
@@ -1550,6 +1545,69 @@ mod pure_tests {
         let (second_id, second) = version_of("Second sample");
         assert_ne!(first_id, second_id);
         assert_eq!((first, second), (json!("v1"), json!("v2")));
+    }
+
+    #[test]
+    fn snapshots_stay_apart() {
+        // Two captures of one dataset with different descriptions stay two snapshots of it.
+        use aruna_core::structs::storage::bucket_metadata::CapturedDatabase;
+        use aruna_core::structs::storage::dataset_description::DatasetDescription;
+        let (mut record, mut spec) = execution_record();
+        let mut second = spec.inputs[0].clone();
+        second.dest_key = "inputs/in2.txt".to_string();
+        second.name = Some("Second sample".to_string());
+        spec.inputs.push(second);
+        let dataset = Ulid::from_bytes([16; 16]);
+        for (destination, seed, title) in [
+            ("inputs/in.txt", 13, "Bakta 5"),
+            ("inputs/in2.txt", 14, "Bakta 6"),
+        ] {
+            record.captured_inputs.push(CapturedInput {
+                destination_key: destination.to_string(),
+                source_node_id: record.owner_node_id,
+                version_id: Ulid::from_bytes([seed; 16]),
+                content: InputContent::Blake3([seed; 32]),
+                bytes: 3,
+                policies: Vec::new(),
+                source_group_id: Ulid::from_bytes([21; 16]),
+                public: false,
+                link: None,
+                source_pin: None,
+                database: Some(CapturedDatabase {
+                    database: true,
+                    described: DatasetDescription {
+                        title: Some(title.to_string()),
+                        ..DatasetDescription::default()
+                    },
+                    dataset: Some(dataset),
+                    ..CapturedDatabase::default()
+                }),
+                releases: Vec::new(),
+                releases_complete: true,
+                grant: None,
+            });
+        }
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let snapshot_of = |name: &str| {
+            let file = graph
+                .iter()
+                .find(|entity| entity["name"] == name)
+                .expect("input entity");
+            let id = &file["isPartOf"][0]["@id"];
+            graph
+                .iter()
+                .find(|entity| entity["@id"] == *id)
+                .expect("snapshot")
+                .clone()
+        };
+        let (first, second) = (snapshot_of("Input sample"), snapshot_of("Second sample"));
+        assert_ne!(first["@id"], second["@id"]);
+        assert_eq!(first["name"], "Bakta 5 (at admission)");
+        assert_eq!(second["name"], "Bakta 6 (at admission)");
+        let source = MetadataRegistryRecord::graph_iri_for(dataset);
+        assert_eq!(first["isBasedOn"]["@id"], source.as_str());
+        assert_eq!(second["isBasedOn"]["@id"], source.as_str());
     }
 
     #[test]
