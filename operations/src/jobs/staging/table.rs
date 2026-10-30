@@ -193,7 +193,7 @@ pub(super) async fn read_table_chunk(
     read.done = complete;
     next.table = Some(Box::new(read));
     match mapper.kind() {
-        RowKind::File => file_rows(ctx, spec, checkpoint, next, entries).await,
+        RowKind::File | RowKind::Record => file_rows(ctx, spec, checkpoint, next, entries).await,
         RowKind::Folder => folder_rows(ctx, spec, checkpoint, next, entries).await,
     }
 }
@@ -544,14 +544,20 @@ fn lasting_read(error: &ReadSourceError) -> bool {
     }
 }
 
-/// Registers the files of file rows as references carrying their row metadata.
+/// Registers the files of file and record rows as references carrying their row metadata, and
+/// writes the empty objects of record rows without a source.
 async fn file_rows(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     checkpoint: &mut StagingJobCheckpoint,
-    next: StagingJobCheckpoint,
+    mut next: StagingJobCheckpoint,
     entries: Vec<TableEntry>,
 ) -> Result<(), PageFailure> {
+    let (empty, entries): (Vec<_>, Vec<_>) =
+        (entries.into_iter()).partition(|entry| entry.source_path.is_empty());
+    if !empty.is_empty() {
+        empty_objects(ctx, spec, &mut next, empty).await?;
+    }
     // A row with a size is its own observation; its checksums bind the reads without a strong
     // ETag, and a row without a size is headed.
     let files = (entries.into_iter())
@@ -561,8 +567,8 @@ async fn file_rows(
             size: entry.size,
             observation: entry.size.map(|content_length| SourceMetadata {
                 content_length,
-                content_type: None,
-                etag: None,
+                content_type: entry.content_type,
+                etag: entry.etag,
                 last_modified: entry.modified,
                 source_version: None,
                 digests: Default::default(),
@@ -574,6 +580,51 @@ async fn file_rows(
         .collect();
     let rows = (files, Vec::new(), Vec::new());
     import_page(ctx, spec, (None, None), checkpoint, next, rows, None).await
+}
+
+/// Writes each empty object this node coordinates, with its row metadata, before the chunk
+/// commits; a transient failure retries the chunk, which writes equal objects only once.
+async fn empty_objects(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    next: &mut StagingJobCheckpoint,
+    entries: Vec<TableEntry>,
+) -> Result<(), PageFailure> {
+    let bucket = pinned_bucket(ctx, spec).await.map_err(page_failure)?;
+    let rules = access_rules(ctx, spec).await.map_err(PageFailure::Retry)?;
+    for entry in entries {
+        let target = object_permission_path(
+            spec.auth_context.realm_id,
+            spec.group_id,
+            spec.node_id,
+            &spec.bucket,
+            &entry.target,
+        );
+        if !rules.allows(&target, &Permission::WRITE) {
+            record_failure(next, "", &entry.target, "permission denied".to_string());
+            continue;
+        }
+        let own = coordinated(ctx, &bucket, &[entry.target.as_str()]).await;
+        if own.map_err(PageFailure::Retry)?.first() != Some(&true) {
+            continue;
+        }
+        match Box::pin(put_folder(
+            ctx,
+            spec,
+            &bucket,
+            &entry.target,
+            &entry.metadata,
+        ))
+        .await
+        {
+            Ok(()) => {}
+            Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
+                record_failure(next, "", &entry.target, message)
+            }
+            Err(failure) => return Err(page_failure(failure)),
+        }
+    }
+    Ok(())
 }
 
 /// Queues the folders of folder rows whose keys overlap a range this node coordinates, after
@@ -906,6 +957,8 @@ mod tests {
             size: None,
             digests: Vec::new(),
             modified: None,
+            etag: None,
+            content_type: None,
         };
         let rows = vec![
             entry("a.fq", "x/a.fq"),

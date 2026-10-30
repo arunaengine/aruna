@@ -695,3 +695,53 @@ async fn list_columns_recorded() {
     assert!(kept.keys().all(|key| !key.starts_with("aruna-")));
     server.abort();
 }
+
+// Record rows are trusted as they are: the source sees no request, the references keep the
+// row's ETag, type, time and metadata, and a row without a source writes an empty object.
+#[tokio::test]
+async fn record_rows_trusted() {
+    let (endpoint, site, server) = serve(Site::ncbi).await;
+    let table = serde_json::json!({
+        "source": { "object": { "bucket": "lists", "key": "records.tsv" } },
+        "format": { "delimiter": "\t", "quote": null },
+        "rows": { "kind": "record", "source": "{source}", "target": "{key}", "keep": [],
+                  "size": "size", "modified": "modified",
+                  "checksums": [{ "algorithm": "md5", "column": "md5" }] }
+    });
+    let fixture = Fixture::new(&endpoint, table).await;
+    let md5 = format!("{:x}", md5::compute(b"sums"));
+    let meta = r#"{"note":"coli sums","aruna-search-text":"note"}"#;
+    let tsv = format!(
+        "key\tsource\tsize\tmodified\tetag\tcontent_type\tmd5\tmetadata\n\
+         coli/sums.txt\t{COLI}md5checksums.txt\t4\t2025-11-17T17:38:21Z\t\"e1\"\ttext/plain\t{md5}\t{meta}\n\
+         coli/\t\t0\t\t\t\t\t{meta}\n"
+    );
+    let ctx = fixture.context(40).await;
+    let lists = drive(
+        GetBucketOperation::new("lists".to_string()),
+        &fixture.driver,
+    )
+    .await;
+    let body = (Bytes::from(tsv), &BTreeMap::new());
+    let lists = ("lists", &lists.unwrap());
+    write_object(&ctx, &fixture.spec, lists, "records.tsv", body)
+        .await
+        .ok()
+        .unwrap();
+
+    fixture.run(41).await;
+    assert!(site.requests.lock().unwrap().is_empty());
+    let observation = fixture.observation("coli/sums.txt").await;
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_401_101);
+    assert_eq!(observation.content_length, 4);
+    assert_eq!(observation.etag.as_deref(), Some("\"e1\""));
+    assert_eq!(observation.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(observation.last_modified, Some(at));
+    let bucket = fixture.spec.bucket.clone();
+    let (_, folder) = fixture.head(&bucket, "coli/").await.unwrap();
+    assert_eq!(folder["note"], "coli sums");
+    let mut found = fixture.search("sums").await;
+    found.sort();
+    assert_eq!(found, ["coli/", "coli/sums.txt"]);
+    server.abort();
+}

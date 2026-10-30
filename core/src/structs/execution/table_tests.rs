@@ -485,3 +485,104 @@ fn file_columns_checked() {
     unknown.checksums[0].algorithm = "crc32".to_string();
     assert!(import(unknown).validate().is_err());
 }
+
+#[test]
+fn record_rows_trusted() {
+    let rows: TableRows = serde_json::from_value(serde_json::json!({
+        "kind": "record", "source": "{source}", "target": "{key}", "keep": [],
+        "size": "size", "modified": "modified",
+        "checksums": [{ "algorithm": "md5", "column": "md5" }]
+    }))
+    .unwrap();
+    let columns: Vec<String> = [
+        "key",
+        "source",
+        "size",
+        "modified",
+        "etag",
+        "content_type",
+        "md5",
+        "metadata",
+    ]
+    .map(String::from)
+    .into();
+    let mapper = RowMapper::new(&rows, &columns).unwrap();
+    let md5 = "9e107d9d372bb6826bd81d3542a419d6";
+    let row = |key: &str, source: &str, size: &str, metadata: &str| {
+        let value = |text: &str| (!text.is_empty()).then(|| text.to_string());
+        vec![
+            value(key),
+            value(source),
+            value(size),
+            Some("2025-11-17T17:38:21Z".to_string()),
+            Some(format!("\"{md5}\"")),
+            Some("text/plain".to_string()),
+            Some(md5.to_string()),
+            value(metadata),
+        ]
+    };
+    let meta = r#"{"taxid": "562", "aruna-search-exact": "taxid"}"#;
+    let entry = imported(mapper.map(&row("g/a.txt", "all/g/a.txt", "42", meta), None));
+    assert_eq!(
+        (entry.source_path.as_str(), entry.target.as_str()),
+        ("all/g/a.txt", "g/a.txt")
+    );
+    assert_eq!(entry.size, Some(42));
+    assert_eq!(
+        entry.etag.as_deref(),
+        Some("\"9e107d9d372bb6826bd81d3542a419d6\"")
+    );
+    assert_eq!(entry.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(entry.digests.len(), 1);
+    assert_eq!(entry.metadata.get("taxid").map(String::as_str), Some("562"));
+    assert_eq!(
+        entry.metadata.get(SEARCH_EXACT_KEY).map(String::as_str),
+        Some("taxid")
+    );
+    // A row without a source is an empty object; a folder marker keeps its slash.
+    let folder = imported(mapper.map(&row("g/", "", "0", meta), None));
+    assert_eq!(
+        (folder.source_path.as_str(), folder.target.as_str()),
+        ("", "g/")
+    );
+    for bad in [
+        row("g/b", "", "3", ""),
+        row("g/b", "all/g/b", "3", "[1]"),
+        row("g/b", "all/g/b", "3", r#"{"aruna-owner": "x"}"#),
+        row("g/b", "all/g/b", "3", r#"{"bad key": "x"}"#),
+    ] {
+        assert!(
+            matches!(mapper.map(&bad, None), RowOutcome::Failed(_)),
+            "{bad:?}"
+        );
+    }
+    // File rows ignore the record columns.
+    let mut file = rows.clone();
+    file.kind = RowKind::File;
+    let plain = imported(
+        RowMapper::new(&file, &columns)
+            .unwrap()
+            .map(&row("g/a", "all/g/a", "1", meta), None),
+    );
+    assert_eq!(
+        (plain.etag, plain.content_type, plain.metadata.len()),
+        (None, None, 0)
+    );
+    let import = |rows: TableRows| TableImport {
+        source: TableSource::Connector("records.tsv".to_string()),
+        format: TableFormat::default(),
+        rows,
+        rate: None,
+    };
+    let mut sizeless = rows;
+    sizeless.size = None;
+    assert!(import(sizeless).validate().is_err());
+}
+
+// The record kind is a new last variant, so stored descriptors of the other kinds still decode.
+#[test]
+fn record_kind_appended() {
+    assert_eq!(postcard::to_allocvec(&RowKind::File).unwrap(), [0]);
+    assert_eq!(postcard::to_allocvec(&RowKind::Folder).unwrap(), [1]);
+    assert_eq!(postcard::to_allocvec(&RowKind::Record).unwrap(), [2]);
+}

@@ -31,6 +31,12 @@ pub const MAX_METADATA_ENTRIES: usize = 128;
 pub const MAX_METADATA_KEY: usize = 128;
 /// Bytes of one metadata value at most.
 pub const MAX_METADATA_VALUE: usize = 4 * 1024;
+/// Column of a record row's source ETag.
+pub const RECORD_ETAG: &str = "etag";
+/// Column of a record row's content type.
+pub const RECORD_CONTENT_TYPE: &str = "content_type";
+/// Column of a record row's metadata as a JSON object of strings.
+pub const RECORD_METADATA: &str = "metadata";
 /// Whether version metadata names columns that metadata search matches.
 pub fn searchable(metadata: &std::collections::HashMap<String, String>) -> bool {
     metadata.contains_key(SEARCH_TEXT_KEY) || metadata.contains_key(SEARCH_EXACT_KEY)
@@ -205,6 +211,10 @@ pub enum RowKind {
     File,
     /// A row names a directory whose files are listed.
     Folder,
+    /// A row is a complete object record whose values are trusted, so the source is never
+    /// asked: size, time and checksums as for files, plus the `etag`, `content_type` and
+    /// `metadata` columns when present. A row without a source writes an empty object.
+    Record,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +373,10 @@ impl TableImport {
         let described = rows.size.is_some() || rows.modified.is_some();
         if rows.kind == RowKind::Folder && (described || !rows.checksums.is_empty()) {
             let reason = "size, checksums and modified describe file rows only";
+            return Err(TableError::Mapping(reason.to_string()));
+        }
+        if rows.kind == RowKind::Record && rows.size.is_none() {
+            let reason = "record rows need a size column";
             return Err(TableError::Mapping(reason.to_string()));
         }
         let mut algorithms = BTreeSet::new();
@@ -588,6 +602,8 @@ pub struct TableEntry {
     pub digests: Vec<(ChecksumAlgorithm, Vec<u8>)>,
     /// The file's modification time from the row, when it names one to the second.
     pub modified: Option<SystemTime>,
+    pub etag: Option<String>,
+    pub content_type: Option<String>,
 }
 
 /// The row mapping resolved against one table's columns.
@@ -603,6 +619,8 @@ pub struct RowMapper {
     size: Option<usize>,
     checksums: Vec<(ChecksumAlgorithm, usize)>,
     modified: Option<usize>,
+    /// Columns of a record row's ETag, content type and metadata object.
+    record: [Option<usize>; 3],
 }
 
 impl RowMapper {
@@ -675,6 +693,10 @@ impl RowMapper {
             size: rows.size.as_deref().map(index).transpose()?,
             checksums,
             modified: rows.modified.as_deref().map(index).transpose()?,
+            record: [RECORD_ETAG, RECORD_CONTENT_TYPE, RECORD_METADATA].map(|name| {
+                let found = columns.iter().position(|column| column == name);
+                found.filter(|_| rows.kind == RowKind::Record)
+            }),
         })
     }
 
@@ -692,21 +714,30 @@ impl RowMapper {
         if !included {
             return RowOutcome::Filtered;
         }
-        let (Some(source), Some(target)) =
-            (render(&self.source, &value), render(&self.target, &value))
-        else {
+        let source = render(&self.source, &value);
+        let (Some(rendered), true) = (
+            render(&self.target, &value),
+            source.is_some() || self.kind == RowKind::Record,
+        ) else {
             return RowOutcome::Skipped;
         };
-        let source = match source_path(&source, base) {
-            Ok(path) => path,
+        let source = match source.map(|source| source_path(&source, base)).transpose() {
+            Ok(source) => source,
             Err(reason) => return RowOutcome::Failed(reason),
         };
-        let Some(target) = canonical_path(&target) else {
-            return RowOutcome::Failed(format!("the target `{target}` is not a canonical key"));
+        let Some(mut target) = canonical_path(&rendered) else {
+            return RowOutcome::Failed(format!("the target `{rendered}` is not a canonical key"));
         };
-        let source_path = match self.kind {
-            RowKind::File => source,
-            RowKind::Folder => format!("{source}/"),
+        let source_path = match (self.kind, source) {
+            (RowKind::Folder, Some(source)) => format!("{source}/"),
+            (_, Some(source)) => source,
+            // A record without a source is an empty object; a folder marker keeps its `/`.
+            (_, None) => {
+                if rendered.ends_with('/') {
+                    target.push('/');
+                }
+                String::new()
+            }
         };
         let mut metadata = BTreeMap::new();
         for (index, key) in &self.kept {
@@ -723,6 +754,15 @@ impl RowMapper {
             Ok(described) => described,
             Err(reason) => return RowOutcome::Failed(reason),
         };
+        let [etag, content_type, object] = self.record.map(|index| index.and_then(value));
+        if let Some(object) = object
+            && let Err(reason) = record_metadata(object, &mut metadata)
+        {
+            return RowOutcome::Failed(reason);
+        }
+        if source_path.is_empty() && size != Some(0) {
+            return RowOutcome::Failed("a record without a source must be empty".to_string());
+        }
         RowOutcome::Import(TableEntry {
             source_path,
             target,
@@ -730,6 +770,8 @@ impl RowMapper {
             size,
             digests,
             modified,
+            etag: etag.map(str::to_string),
+            content_type: content_type.map(str::to_string),
         })
     }
 
@@ -772,6 +814,29 @@ impl RowMapper {
             },
         };
         Ok((size, digests, modified))
+    }
+}
+
+/// Adds a record row's metadata object; the search selection entries are the only `aruna-`
+/// keys it may carry, as the import itself writes them.
+fn record_metadata(object: &str, metadata: &mut BTreeMap<String, String>) -> Result<(), String> {
+    let entries: BTreeMap<String, String> = serde_json::from_str(object)
+        .map_err(|error| format!("the metadata is no JSON object of strings: {error}"))?;
+    for (key, value) in entries {
+        let selection = key == SEARCH_TEXT_KEY || key == SEARCH_EXACT_KEY;
+        if !header_safe(&key) || (key.starts_with("aruna-") && !selection) {
+            return Err(format!("`{key}` cannot be a metadata key"));
+        }
+        if value.len() > MAX_METADATA_VALUE {
+            return Err(format!("the value of `{key}` is too long"));
+        }
+        metadata.entry(key).or_insert(value);
+    }
+    match metadata.len() <= MAX_METADATA_ENTRIES {
+        true => Ok(()),
+        false => Err(format!(
+            "at most {MAX_METADATA_ENTRIES} metadata entries fit an object"
+        )),
     }
 }
 
