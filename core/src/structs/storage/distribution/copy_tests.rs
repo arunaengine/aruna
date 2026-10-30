@@ -9,8 +9,8 @@ use super::*;
 use crate::structs::storage::distribution::presets::shard_layout;
 use crate::structs::storage::distribution::split::split_ids;
 use crate::structs::storage::distribution::{
-    DistributionConfig, DistributionRequest, DistributionSettings, KeyRange, SetRoot, TransferRole,
-    next_snapshot,
+    DistributionConfig, DistributionRequest, DistributionSettings, KeyRange, ReadRoute, SetRoot,
+    TransferRole, next_snapshot,
 };
 
 fn secret(seed: u8) -> iroh::SecretKey {
@@ -108,6 +108,13 @@ fn copy_fills_range() {
     assert_eq!(next.lifecycle.fills, vec![copy.clone()]);
     assert!(next.bootstrap_open() && next.filling(range.range_id, member(2)));
     assert!(next.copy_holders(range).is_empty());
+    let coordinator = next.member(member(1)).unwrap().node_id;
+    let holder = ReadRoute::Holder {
+        range_id: range.range_id,
+        node_id: coordinator,
+    };
+    assert_eq!(next.read_route(member(2), "a", false), Ok(holder.clone()));
+    assert_eq!(next.read_route(member(2), "", true), Ok(holder));
     assert!(next.transfer_targets(range).is_empty());
     assert!(next_snapshot(realm(), Some(&next), &transfer(range, 2)).is_err());
     // Only the coordinator states the copy filled, and only at the range's epoch.
@@ -118,6 +125,8 @@ fn copy_fills_range() {
     let range = &done.config.ranges[0];
     assert!(done.lifecycle.fills.is_empty() && !done.bootstrap_open());
     assert_eq!(done.copy_holders(range).len(), 1);
+    let local = ReadRoute::Local { catching_up: false };
+    assert_eq!(done.read_route(member(2), "a", false), Ok(local));
     assert_eq!(done.transfer_targets(range).len(), 1);
     assert!(next_snapshot(realm(), Some(&done), &transfer(range, 2)).is_ok());
     // A replayed statement finds no filling copy.

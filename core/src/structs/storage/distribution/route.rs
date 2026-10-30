@@ -72,7 +72,8 @@ fn reaches(range: &KeyRange, prefix: &str) -> bool {
 
 impl DistributionSnapshot {
     /// Routes a read of `key`, or with `listing` of every key starting with it, arriving at
-    /// `member_id`: local when this member keeps the records of every range the read reaches.
+    /// `member_id`: local when this member keeps the records of every range the read reaches
+    /// and is not still filling a copy of one.
     pub fn read_route(
         &self,
         member_id: Ulid,
@@ -97,7 +98,7 @@ impl DistributionSnapshot {
         }
         match reached
             .into_iter()
-            .find(|range| !keeps_records(range, member))
+            .find(|range| !keeps_records(range, member) || self.filling(range.range_id, member_id))
         {
             None => Ok(ReadRoute::Local {
                 catching_up: member.state != MemberState::Ready,
