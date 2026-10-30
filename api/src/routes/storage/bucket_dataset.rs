@@ -99,7 +99,7 @@ group's metadata path.
             "bucket": "bakta-db",
             "dataset": "01JMETADATA0123456789ABCDE",
             "metadata": {"database": false, "parser": null, "dataset": "01JMETADATA0123456789ABCDE"},
-            "description": {"title": "Bakta database", "description": "Annotation database for Bakta", "version": "6.0", "license": "https://spdx.org/licenses/CC-BY-4.0", "identifiers": [{"name": "DOI", "value": "10.5281/zenodo.14916843", "url": "https://doi.org/10.5281/zenodo.14916843"}]}
+            "description": {"title": "Bakta database", "description": "Annotation database for Bakta", "version": "6.0", "license": "https://spdx.org/licenses/CC-BY-4.0.html", "identifiers": [{"name": "DOI", "value": "10.5281/zenodo.14916843", "url": "https://doi.org/10.5281/zenodo.14916843"}]}
         })),
         (status = 400, description = "An unknown field, an empty title or description, or an identifier without an http or https link; or the dataset was refused", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -225,7 +225,7 @@ fn license_url(license: &str) -> String {
     let license = license.trim();
     match license.contains("://") {
         true => license.to_string(),
-        false => format!("https://spdx.org/licenses/{license}"),
+        false => format!("https://spdx.org/licenses/{license}.html"),
     }
 }
 

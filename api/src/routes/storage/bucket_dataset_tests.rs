@@ -87,7 +87,7 @@ fn crate_reads_back() {
     assert_eq!(described.version.as_deref(), Some("2.1"));
     assert_eq!(
         described.license.as_deref(),
-        Some("https://spdx.org/licenses/CC-BY-4.0")
+        Some("https://spdx.org/licenses/CC-BY-4.0.html")
     );
     assert_eq!(described.identifiers, identifiers);
 
