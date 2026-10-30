@@ -5,13 +5,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
+use std::pin::Pin;
 
 use aruna_core::NodeId;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::BUCKET_RELEASE_KEYSPACE;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::identifier::Identifier;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::document::group_admin_path;
@@ -47,7 +48,7 @@ use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, ObjectRangeRequest,
+    GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest, get_object_routed,
 };
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
 use crate::s3::object::origin::{OriginError, read_origin};
@@ -685,13 +686,23 @@ pub async fn read_crate(
     Ok(read_part(context, read, None).await?.0)
 }
 
+/// Reads an object, through a holder when this member keeps the record but not the bytes.
+/// Boxed, since a routed read drives operations that may read release crates again.
+fn routed_read(
+    context: &DriverContext,
+    input: GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+) -> Pin<Box<dyn Future<Output = Result<GetObjectResult, GetObjectError>> + Send + '_>> {
+    Box::pin(get_object_routed(context, input, restrictions))
+}
+
 /// Reads `range` of a release crate version, or all of it, and the version's whole size.
 async fn read_part(
     context: &DriverContext,
     read: CrateRead,
     range: Option<ObjectRangeRequest>,
 ) -> Result<(CrateBytes, u64), CrateReadError> {
-    let operation = GetObjectOperation::new(GetObjectInput {
+    let input = GetObjectInput {
         bucket: read.bucket,
         key: read.key,
         version_id: Some(read.version_id),
@@ -700,9 +711,9 @@ async fn read_part(
         user_identity: read.auth.user_id,
         realm_id: read.realm_id,
         node_id: read.node_id,
-    })
-    .with_restrictions(read.auth.path_restrictions.clone());
-    let result = match drive(operation, context).await {
+    };
+    let restrictions = read.auth.path_restrictions.clone();
+    let result = match routed_read(context, input, restrictions).await {
         Ok(result) => result,
         Err(
             GetObjectError::NoSuchKey
