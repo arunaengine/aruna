@@ -1349,6 +1349,9 @@ fn rollback_required(checkpoint: &ImportCheckpoint) -> bool {
 /// Failure text before the keys a rollback kept because a release pins them.
 const PINNED_KEPT: &str = "a release pins these written objects, so they were kept";
 
+/// Report message of an entry whose written object a rollback removed.
+const REMOVED: &str = "written object was removed after the import failed";
+
 /// Deletes exactly the object versions this import wrote, but keeps and returns those a release
 /// pins. Every version id is minted by this job, so versions another writer owns are never
 /// removed, even where the import landed on an existing key.
@@ -1435,7 +1438,14 @@ async fn rollback_writes(
     for (entry, outcome) in removable.into_iter().zip(outcomes) {
         match outcome.result {
             Ok(_) => removed += 1,
-            Err(DeleteObjectError::NoSuchVersion) => continue,
+            Err(DeleteObjectError::NoSuchVersion) => {
+                // An earlier attempt may have removed it; its report row still counts it.
+                let row = read_report(ctx, &entry.path).await?;
+                if row.is_some_and(|row| row.message.as_deref() == Some(REMOVED)) {
+                    removed += 1;
+                }
+                continue;
+            }
             Err(error) => {
                 return Err(ImportFailure::Retryable(format!(
                     "rollback of `{}` failed: {error}",
@@ -1447,7 +1457,7 @@ async fn rollback_writes(
             .await?
             .unwrap_or_else(|| entry_report(entry));
         row.code = ReasonCode::Failed;
-        row.message = Some("written object was removed after the import failed".to_string());
+        row.message = Some(REMOVED.to_string());
         row.detail.version_id = None;
         row.detail.blake3 = None;
         row.detail.size = None;

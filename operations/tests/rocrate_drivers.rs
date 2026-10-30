@@ -20,8 +20,8 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE, GROUP_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
@@ -37,6 +37,7 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo, VersionKey};
+use aruna_core::structs::storage::bucket_metadata::release_marker;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::time::unix_timestamp_millis;
@@ -120,6 +121,7 @@ struct StorageGate {
     release: mpsc::Sender<()>,
     stop: Arc<AtomicBool>,
     faulty: Arc<AtomicBool>,
+    conflict: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -145,6 +147,11 @@ impl StorageGate {
     /// looks like from inside the import.
     fn fail_buckets(&self, faulty: bool) {
         self.faulty.store(faulty, Ordering::Release);
+    }
+
+    /// Add a release marker just before the second fenced delete reads it, so that delete fails.
+    fn conflict_second(&self) {
+        self.conflict.store(true, Ordering::Release);
     }
 
     async fn stop(&mut self) {
@@ -595,6 +602,95 @@ async fn rollback_keeps_released() -> Result<(), Box<dyn std::error::Error>> {
         (first.message.as_deref()).is_some_and(|message| message.contains("a release pins it")),
         "{:?}",
         first.message
+    );
+
+    fixture.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rollback_counts_earlier() -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+
+    // A marker conflict stops the rollback after it removed the first payload; a release then
+    // pins the second, so the resumed rollback removes nothing new but must still count the first.
+    let fixture = build_fixture(true).await?;
+    let mut archive = triple_archive().await?;
+    let local = zip_offsets(&archive, b"PK\x03\x04")[3];
+    let central = zip_offsets(&archive, b"PK\x01\x02")[3];
+    write_u32(&mut archive, local + 14, 0);
+    write_u32(&mut archive, central + 16, 0);
+    let upload_id = create_upload(&fixture, archive).await?;
+    let spec = import_spec(&fixture, upload_id, doc_id(1));
+    let job_id = job_id();
+    let first_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let first_token = first_context.claim_token;
+    let gate = fixture.gate.as_ref().expect("gated fixture");
+    gate.release();
+    gate.conflict_second();
+    let JobRunOutcome::Failed(interrupted) = run_rocrate_import(&first_context, &spec).await else {
+        return Err("rollback with a marker conflict did not fail".into());
+    };
+    assert_eq!(
+        interrupted.kind,
+        JobErrorKind::Retryable,
+        "{}",
+        interrupted.message
+    );
+    assert!(
+        object_versions(&fixture, "imported/data1.txt")
+            .await?
+            .is_empty()
+    );
+    let written = object_versions(&fixture, "imported/data2.txt").await?;
+    let [version_id] = written[..] else {
+        return Err(format!("expected one written version, found {written:?}").into());
+    };
+
+    let arn = VersionedObjectArn::new(
+        fixture.actor.realm_id,
+        fixture.actor.node_id,
+        BUCKET,
+        "imported/data2.txt",
+        version_id,
+    )?;
+    let release = serde_json::json!({
+        "@graph": [{"@type": "File", "@id": arn.to_w3id(), "name": "imported/data2.txt"}]
+    });
+    let tags = std::collections::HashMap::from([
+        (RELEASE_TAG.to_string(), "1.0".to_string()),
+        (RELEASE_PREFIX_TAG.to_string(), "imported/".to_string()),
+    ]);
+    let release = serde_json::to_vec(&release)?;
+    put_tagged(&fixture, "imported/release.json", release, tags).await?;
+
+    release_job(
+        &fixture.context.storage_handle,
+        job_id,
+        first_token,
+        unix_timestamp_millis(),
+    )
+    .await?;
+    let second_context =
+        claim_context(&fixture, job_id, JobPayload::ImportRoCrate(spec.clone())).await?;
+    let JobRunOutcome::Failed(error) = run_rocrate_import(&second_context, &spec).await else {
+        return Err("resumed rollback did not fail the import".into());
+    };
+
+    assert_eq!(error.kind, JobErrorKind::Permanent);
+    assert!(
+        error
+            .message
+            .contains("so they were kept: `imported/data2.txt`")
+            && error.message.ends_with("1 written object was removed"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        object_versions(&fixture, "imported/data2.txt").await?,
+        vec![version_id]
     );
 
     fixture.stop().await;
@@ -1332,12 +1428,28 @@ fn storage_proxy(
     let thread_stop = stop.clone();
     let faulty = Arc::new(AtomicBool::new(false));
     let thread_faulty = faulty.clone();
+    let conflict = Arc::new(AtomicBool::new(false));
+    let thread_conflict = conflict.clone();
     let thread = std::thread::Builder::new()
         .name("rocrate-storage-gate".to_string())
         .spawn(move || {
             let mut version_transaction = None;
             let mut hit_sender = Some(hit_sender);
+            let mut fenced = 0;
             while let Ok((effect, response, _span, _queued, _in_flight)) = receiver.recv() {
+                if thread_conflict.load(Ordering::Acquire) && fenced_release(&effect) {
+                    fenced += 1;
+                    if fenced == 2 {
+                        thread_conflict.store(false, Ordering::Release);
+                        let marker = StorageEffect::Write {
+                            key_space: BUCKET_RELEASE_KEYSPACE.to_string(),
+                            key: ByteView::from(release_marker(BUCKET)),
+                            value: ByteView::from(Ulid::generate().to_bytes().to_vec()),
+                            txn_id: None,
+                        };
+                        runtime.block_on(direct.send_storage_effect(marker));
+                    }
+                }
                 if thread_faulty.load(Ordering::Acquire) && bucket_read(&effect) {
                     response.send(StorageEvent::Error {
                         error: StorageError::ReadError("boom".to_string()),
@@ -1384,6 +1496,7 @@ fn storage_proxy(
             release,
             stop,
             faulty,
+            conflict,
             thread: Some(thread),
         },
     ))
@@ -1393,6 +1506,14 @@ fn bucket_read(effect: &StorageEffect) -> bool {
     matches!(
         effect,
         StorageEffect::Read { key_space, .. } if key_space == S3_BUCKET_KEYSPACE
+    )
+}
+
+fn fenced_release(effect: &StorageEffect) -> bool {
+    matches!(
+        effect,
+        StorageEffect::BatchRead { reads, txn_id: Some(_) }
+            if reads.iter().any(|(key_space, _)| key_space == BUCKET_RELEASE_KEYSPACE)
     )
 }
 
@@ -2109,6 +2230,30 @@ async fn pair_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             PAYLOAD,
         )
         .await?;
+    Ok(archive.close().await?)
+}
+
+async fn triple_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut json: serde_json::Value = serde_json::from_str(&pair_json())?;
+    let graph = json["@graph"]
+        .as_array_mut()
+        .ok_or("pair graph is missing")?;
+    graph[1]["hasPart"] = serde_json::json!([
+        {"@id": "data1.txt"}, {"@id": "data2.txt"}, {"@id": "data3.txt"}
+    ]);
+    graph.push(serde_json::json!({"@id": "data3.txt", "@type": "File", "name": "Third"}));
+    let mut archive = async_zip::base::write::ZipFileWriter::new(Vec::new());
+    let metadata = ZipEntryBuilder::new(
+        "ro-crate-metadata.json".to_string().into(),
+        Compression::Stored,
+    );
+    archive
+        .write_entry_whole(metadata, json.to_string().as_bytes())
+        .await?;
+    for name in ["data1.txt", "data2.txt", "data3.txt"] {
+        let entry = ZipEntryBuilder::new(name.to_string().into(), Compression::Deflate);
+        archive.write_entry_whole(entry, PAYLOAD).await?;
+    }
     Ok(archive.close().await?)
 }
 
