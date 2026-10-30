@@ -59,6 +59,8 @@ pub enum PutMetadataError {
     /// A distributed bucket keeps its metadata in the set's settings instead.
     #[error("the bucket is distributed")]
     Distributed,
+    #[error("the bucket metadata changed meanwhile")]
+    Changed,
     #[error("PutBucketMetadata did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
@@ -79,6 +81,8 @@ pub struct PutMetadataOperation {
     bucket: String,
     group_id: GroupId,
     metadata: Option<BucketMetadata>,
+    /// Writes only while the stored metadata is still this; none counts as the default.
+    expected: Option<BucketMetadata>,
     state: PutMetadataState,
     txn_id: Option<TxnId>,
     outcome: Option<Result<(), PutMetadataError>>,
@@ -97,10 +101,17 @@ impl PutMetadataOperation {
             bucket,
             group_id,
             metadata,
+            expected: None,
             state: PutMetadataState::Init,
             txn_id: None,
             outcome: None,
         }
+    }
+
+    /// Writes only while the bucket's current metadata is still `current`.
+    pub fn expecting(mut self, current: BucketMetadata) -> Self {
+        self.expected = Some(current);
+        self
     }
 
     fn key(&self) -> aruna_core::types::Key {
@@ -170,14 +181,33 @@ impl PutMetadataOperation {
             return self.fail(PutMetadataError::Forbidden);
         }
         self.state = PutMetadataState::ReadCreation;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_CREATION_KEYSPACE.to_string(),
-            key: self.key(),
+        let reads = vec![
+            (BUCKET_CREATION_KEYSPACE.to_string(), self.key()),
+            (BUCKET_METADATA_KEYSPACE.to_string(), self.key()),
+        ];
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
             txn_id: Some(txn_id),
         })]
     }
 
-    fn on_creation(&mut self, txn_id: TxnId, value: Option<aruna_core::types::Value>) -> Effects {
+    fn on_creation(
+        &mut self,
+        txn_id: TxnId,
+        (value, row): (
+            Option<aruna_core::types::Value>,
+            Option<aruna_core::types::Value>,
+        ),
+    ) -> Effects {
+        if let Some(expected) = &self.expected {
+            let current = match current_row(value.as_ref(), row.as_ref()) {
+                Ok(current) => current.unwrap_or_default(),
+                Err(error) => return self.fail(error.into()),
+            };
+            if current != *expected {
+                return self.fail(PutMetadataError::Changed);
+            }
+        }
         self.state = PutMetadataState::Write;
         let key = self.key();
         let Some(metadata) = self.metadata.take() else {
@@ -253,9 +283,13 @@ impl Operation for PutMetadataOperation {
             },
             (
                 PutMetadataState::ReadCreation,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
+                Event::Storage(StorageEvent::BatchReadResult { values }),
             ) => match self.txn_id {
-                Some(txn_id) => self.on_creation(txn_id, value),
+                Some(txn_id) => {
+                    let mut values = values.into_iter().map(|(_, value)| value);
+                    let read = (values.next().flatten(), values.next().flatten());
+                    self.on_creation(txn_id, read)
+                }
                 None => self.fail(PutMetadataError::NotFinished),
             },
             (
@@ -281,8 +315,9 @@ impl Operation for PutMetadataOperation {
             (PutMetadataState::StartTransaction, received) => {
                 self.unexpected("transaction start", received)
             }
-            (PutMetadataState::ReadBucket | PutMetadataState::ReadCreation, received) => {
-                self.unexpected("read result", received)
+            (PutMetadataState::ReadBucket, received) => self.unexpected("read result", received),
+            (PutMetadataState::ReadCreation, received) => {
+                self.unexpected("batch read result", received)
             }
             (PutMetadataState::Authorize, received) => {
                 self.unexpected("authorization result", received)
@@ -341,11 +376,20 @@ pub async fn bucket_metadata(
         return Err(format!("bucket metadata read failed: {event:?}"));
     };
     let mut values = values.into_iter().map(|(_, value)| value);
-    let (Some(row), creation) = (values.next().flatten(), values.next().flatten()) else {
+    let (row, creation) = (values.next().flatten(), values.next().flatten());
+    current_row(creation.as_ref(), row.as_ref()).map_err(|error| error.to_string())
+}
+
+/// The metadata a stored row gives the bucket's current incarnation.
+fn current_row(
+    creation: Option<&aruna_core::types::Value>,
+    row: Option<&aruna_core::types::Value>,
+) -> Result<Option<BucketMetadata>, ConversionError> {
+    let Some(row) = row else {
         return Ok(None);
     };
-    let stored = StoredMetadata::from_bytes(row.as_ref()).map_err(|error| error.to_string())?;
-    let current = incarnation(creation.as_ref().map(|value| value.as_ref()));
+    let stored = StoredMetadata::from_bytes(row.as_ref())?;
+    let current = incarnation(creation.map(|value| value.as_ref()));
     Ok((stored.incarnation == current).then_some(stored.metadata))
 }
 
@@ -500,5 +544,10 @@ mod tests {
             bucket_metadata(&context, "db", &info).await,
             Ok(Some(metadata.clone()))
         );
+        // A conditional write applies only while the stored metadata is what it expects.
+        let stale = put(admin).expecting(BucketMetadata::default());
+        assert_eq!(drive(stale, &context).await, Err(PutMetadataError::Changed));
+        let current = put(admin).expecting(metadata.clone());
+        drive(current, &context).await.unwrap();
     }
 }

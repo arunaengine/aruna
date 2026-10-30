@@ -140,3 +140,27 @@ async fn describe_then_link() {
         "{unknown:?}"
     );
 }
+
+// A dataset the route created but could not link is deleted again, so no orphan stays.
+#[tokio::test]
+async fn unlinked_dataset_removed() {
+    let test = setup_network_state().await;
+    add_bucket(&test).await;
+    let created = post(&test, body()).await.unwrap();
+    let dataset = Ulid::from_string(&created.dataset).unwrap();
+    drain_metadata_background(test.state.as_ref()).await;
+    remove_dataset(&test.state, &test.auth, None, dataset)
+        .await
+        .unwrap();
+    drain_metadata_background(test.state.as_ref()).await;
+    let Json(read) = get_bucket_metadata(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Extension(None),
+        Path(BUCKET.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read.description, None, "the dataset is gone");
+    assert!(read.description_unavailable.is_some());
+}

@@ -134,6 +134,7 @@ async fn refuses_unreadable_link() {
             dataset,
             ..BucketMetadata::default()
         })),
+        expected: None,
     };
     let token = || AuthToken::bearer("token").unwrap();
     let missing = change(Some(Ulid::from_bytes([7; 16])));
@@ -144,7 +145,10 @@ async fn refuses_unreadable_link() {
     );
     for unlinked in [
         change(None),
-        DistributionRequest::ChangeMetadata { metadata: None },
+        DistributionRequest::ChangeMetadata {
+            metadata: None,
+            expected: None,
+        },
     ] {
         let kept = readable_link(&context, (&auth, token()), &unlinked).await;
         assert_eq!(kept, Ok(()));

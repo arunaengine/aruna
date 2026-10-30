@@ -5,13 +5,14 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_identifiers};
 use aruna_core::structs::storage::data::link::DataLink;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
+use aruna_operations::metadata::forward::route_metadata_delete;
 use aruna_operations::s3::bucket::metadata::bucket_metadata;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -19,6 +20,7 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -30,7 +32,7 @@ use super::deletion::bucket_info;
 use super::routing::ensure_group_admin;
 use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::run_create_metadata;
+use crate::metadata::{forwarded_auth_token, local_write_record, run_create_metadata};
 use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
@@ -82,8 +84,9 @@ group's metadata path.
 - The dataset's root entity carries the title, description, version, license and identifiers;
   it is edited like any dataset afterwards. The bucket's other metadata stays as it is.
 - A bucket that already links a dataset is refused, so a repeated request creates nothing.
-- The two writes are not one transaction. When the link fails after the dataset was created,
-  the answer names the dataset, and `PUT /data/buckets/{bucket}/metadata` links it.
+- The link applies only while the bucket's metadata is still what was read; a concurrent
+  change fails it with 409. When the link fails, the new dataset is deleted again; only when
+  that fails too, the answer names it, and `PUT /data/buckets/{bucket}/metadata` links it.
 - The new dataset is read like any other once it is materialized, which takes a moment."#,
     params(("bucket" = String, Path, description = "Bucket name on this node")),
     request_body(content = DescribeBucketRequest, example = json!({
@@ -105,8 +108,8 @@ group's metadata path.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the owning group's admin or metadata path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
-        (status = 409, description = "The bucket already links a dataset", body = ErrorResponse),
-        (status = 503, description = "The dataset was not accepted, or it was created but not linked; the message names it then", body = ErrorResponse)
+        (status = 409, description = "The bucket already links a dataset, or its metadata changed meanwhile", body = ErrorResponse),
+        (status = 503, description = "The dataset was not accepted, or it was created but neither linked nor removed; the message names it then", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -153,20 +156,20 @@ pub async fn describe_bucket(
     let dataset = created.document_id;
     let metadata = BucketMetadata {
         dataset: Some(dataset),
-        ..current
+        ..current.clone()
     };
-    let linked = write_metadata(
-        &state,
-        (&auth, bearer),
-        (&bucket, &info),
-        Some(metadata.clone()),
-    );
-    linked.await.map_err(|error| {
-        ServerError::ServiceUnavailableReason(format!(
-            "dataset {dataset} was created but not linked ({error}); link it with \
-             PUT /data/buckets/{bucket}/metadata"
-        ))
-    })?;
+    // Links only while the metadata is still what was read, so no concurrent change is lost.
+    let change = (Some(metadata.clone()), Some(current));
+    let linked = write_metadata(&state, (&auth, bearer.clone()), (&bucket, &info), change);
+    if let Err(error) = linked.await {
+        return Err(match remove_dataset(&state, &auth, bearer, dataset).await {
+            Ok(()) => error,
+            Err(removal) => ServerError::ServiceUnavailableReason(format!(
+                "dataset {dataset} was created but not linked ({error}) nor removed \
+                 ({removal}); link it with PUT /data/buckets/{bucket}/metadata or delete it"
+            )),
+        });
+    }
     let description = DatasetDescriptionBody {
         title: Some(request.title),
         description: Some(request.description),
@@ -183,6 +186,27 @@ pub async fn describe_bucket(
             description,
         }),
     ))
+}
+
+/// Deletes a dataset this request created but could not link.
+async fn remove_dataset(
+    state: &ServerState,
+    auth: &AuthContext,
+    bearer: Option<ValidatedBearer>,
+    dataset: Ulid,
+) -> ServerResult<()> {
+    let extras = PolicyRequestExtras::rest();
+    let record = local_write_record(state, auth, dataset, extras).await?;
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: auth.user_id,
+        realm_id: state.get_realm_id(),
+    };
+    let token = forwarded_auth_token(bearer)?;
+    let ctx = state.get_ctx();
+    route_metadata_delete(&ctx, actor, record.as_ref(), dataset, token)
+        .await
+        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))
 }
 
 fn checked_identifiers(request: &DescribeBucketRequest) -> ServerResult<Vec<Identifier>> {

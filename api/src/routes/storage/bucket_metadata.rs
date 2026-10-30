@@ -171,38 +171,41 @@ async fn check_link(
 }
 
 /// Writes a bucket's metadata: on this node for an ordinary bucket, through the set's publisher
-/// for a distributed one.
+/// for a distributed one. With `expected`, only while the current metadata is still that.
 pub(crate) async fn write_metadata(
     state: &ServerState,
     (auth, bearer): (&AuthContext, Option<ValidatedBearer>),
     (bucket, info): (&str, &BucketInfo),
-    metadata: Option<BucketMetadata>,
+    (metadata, expected): (Option<BucketMetadata>, Option<BucketMetadata>),
 ) -> ServerResult<()> {
     match &info.distribution {
         Some(binding) => {
             let bearer = forwarded_auth_token(bearer)?;
-            change_metadata(&state.get_ctx(), (auth, bearer), binding.set_id, metadata)
+            let change = (metadata, expected);
+            change_metadata(&state.get_ctx(), (auth, bearer), binding.set_id, change)
                 .await
                 .map_err(map_create_error)?;
         }
         None => {
-            drive(
-                PutMetadataOperation::new(
-                    (auth.clone(), state.get_realm_id()),
-                    bucket.to_string(),
-                    info.group_id,
-                    metadata,
-                ),
-                &state.get_ctx(),
-            )
-            .await
-            .map_err(|error| match error {
-                PutMetadataError::NoSuchBucket | PutMetadataError::GroupMismatch => {
-                    ServerError::NotFound
-                }
-                PutMetadataError::Forbidden => ServerError::Forbidden,
-                error => ServerError::InternalError(error.to_string()),
-            })?;
+            let mut put = PutMetadataOperation::new(
+                (auth.clone(), state.get_realm_id()),
+                bucket.to_string(),
+                info.group_id,
+                metadata,
+            );
+            if let Some(expected) = expected {
+                put = put.expecting(expected);
+            }
+            drive(put, &state.get_ctx())
+                .await
+                .map_err(|error| match error {
+                    PutMetadataError::NoSuchBucket | PutMetadataError::GroupMismatch => {
+                        ServerError::NotFound
+                    }
+                    PutMetadataError::Forbidden => ServerError::Forbidden,
+                    PutMetadataError::Changed => ServerError::Conflict(error.to_string()),
+                    error => ServerError::InternalError(error.to_string()),
+                })?;
         }
     }
     Ok(())
@@ -354,7 +357,8 @@ pub async fn put_bucket_metadata(
     ensure_group_admin(&state, &auth, info.group_id).await?;
     let token = forwarded_auth_token(bearer.clone())?;
     let description = check_link(&state, metadata.as_ref(), (&auth, token)).await?;
-    write_metadata(&state, (&auth, bearer), (&bucket, &info), metadata.clone()).await?;
+    let change = (metadata.clone(), None);
+    write_metadata(&state, (&auth, bearer), (&bucket, &info), change).await?;
     Ok(Json(BucketMetadataResponse {
         bucket,
         metadata: metadata.map(Into::into),

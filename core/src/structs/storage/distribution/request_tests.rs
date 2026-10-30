@@ -383,6 +383,7 @@ fn metadata_survives_settings() {
     let metadata = Box::new(metadata);
     let set = DistributionRequest::ChangeMetadata {
         metadata: Some(metadata.clone()),
+        expected: None,
     };
     let head = step(&created(), &set);
     assert_eq!(head.config.settings.metadata, Some(metadata.clone()));
@@ -398,7 +399,10 @@ fn metadata_survives_settings() {
     assert_eq!(head.config.settings.metadata, Some(metadata));
     let cleared = step(
         &head,
-        &DistributionRequest::ChangeMetadata { metadata: None },
+        &DistributionRequest::ChangeMetadata {
+            metadata: None,
+            expected: None,
+        },
     );
     assert_eq!(cleared.config.settings.metadata, None);
     assert!(cleared.config.settings.public);
@@ -407,9 +411,33 @@ fn metadata_survives_settings() {
             database: true,
             ..BucketMetadata::default()
         })),
+        expected: None,
     };
     assert!(matches!(
         next_snapshot(realm(), Some(&cleared), &broken),
         Err(DistributionError::InvalidMetadata(_))
     ));
+}
+
+#[test]
+fn metadata_expects_current() {
+    // A conditional change applies only while the metadata is still what the caller read.
+    use crate::structs::storage::bucket_metadata::BucketMetadata;
+    let linked = |seed| BucketMetadata {
+        dataset: Some(ulid::Ulid::from_bytes([seed; 16])),
+        ..BucketMetadata::default()
+    };
+    let link = |seed, expected: BucketMetadata| DistributionRequest::ChangeMetadata {
+        metadata: Some(Box::new(linked(seed))),
+        expected: Some(Box::new(expected)),
+    };
+    // No metadata yet reads as the default.
+    let head = step(&created(), &link(1, BucketMetadata::default()));
+    assert_eq!(head.config.settings.metadata.as_deref(), Some(&linked(1)));
+    assert_eq!(
+        next_snapshot(realm(), Some(&head), &link(2, BucketMetadata::default())),
+        Err(DistributionError::MetadataChanged)
+    );
+    let head = step(&head, &link(2, linked(1)));
+    assert_eq!(head.config.settings.metadata.as_deref(), Some(&linked(2)));
 }

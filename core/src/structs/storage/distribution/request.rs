@@ -75,6 +75,8 @@ pub enum DistributionRequest {
     /// Replaces the bucket metadata only; `None` clears it.
     ChangeMetadata {
         metadata: Option<Box<crate::structs::storage::bucket_metadata::BucketMetadata>>,
+        /// Applies only while the metadata is still this; no metadata counts as the default.
+        expected: Option<Box<crate::structs::storage::bucket_metadata::BucketMetadata>>,
     },
 }
 
@@ -213,8 +215,15 @@ fn accept(
             };
             Ok(())
         }
-        DistributionRequest::ChangeMetadata { metadata } => {
+        DistributionRequest::ChangeMetadata { metadata, expected } => {
             changeable(next)?;
+            let current = next.config.settings.metadata.as_deref().cloned();
+            if expected
+                .as_ref()
+                .is_some_and(|expected| **expected != current.unwrap_or_default())
+            {
+                return Err(DistributionError::MetadataChanged);
+            }
             if let Some(metadata) = metadata {
                 crate::structs::storage::bucket_metadata::validate_metadata(metadata)
                     .map_err(DistributionError::InvalidMetadata)?;
