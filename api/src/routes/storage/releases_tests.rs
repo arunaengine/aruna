@@ -344,7 +344,11 @@ async fn browses_release_files() {
 async fn purge_keeps_pinned() {
     use crate::routes::storage::deletion::{PurgeScopeRequest, SubmitPurgeRequest, submit_purge};
     use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
+    use aruna_operations::driver::drive;
     use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_pinned, refuse_scope};
+    use aruna_operations::s3::object::delete::{
+        DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
+    };
 
     let node = node_state().await;
     store(&node, "db/a.fasta", ">a").await;
@@ -391,7 +395,7 @@ async fn purge_keeps_pinned() {
     assert_eq!(refused, Err(PinnedError::Scope));
     // The newer version and the release crate itself belong to no release.
     let newer = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", current)).await;
-    assert_eq!(newer, Ok(()));
+    let guards = newer.expect("no release pins the newer version");
     let crate_version = release.version_id.parse().unwrap();
     let own = refuse_pinned(
         context.as_ref(),
@@ -399,7 +403,25 @@ async fn purge_keeps_pinned() {
         caller,
         ("db/release.json", crate_version),
     );
-    assert_eq!(own.await, Ok(()));
+    assert!(own.await.is_ok());
+    // A release published after the check pins the newer version: the checked delete fails.
+    let mut later = request(doi);
+    later.label = "6.1".to_string();
+    publish(&node, &node.owner, later).await.unwrap();
+    let delete = DeleteObjectOperation::new(DeleteObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "db/a.fasta".to_string(),
+        version_id: Some(current),
+        group_id: info.group_id,
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        deleted_by: node.owner.user_id,
+    })
+    .with_fence(guards, Vec::new());
+    let raced = drive(delete, context.as_ref()).await;
+    assert_eq!(raced, Err(DeleteObjectError::FenceTaken));
+    let again = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", current)).await;
+    assert!(matches!(again, Err(PinnedError::Version { .. })));
 
     let shared = context.as_ref();
     let purge = |purged: StoragePurgeScope| async move {

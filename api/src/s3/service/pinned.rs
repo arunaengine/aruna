@@ -8,7 +8,9 @@ use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::s3::bucket::release::{BucketScope, MembershipQuery};
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
-use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_pinned, version_pins};
+use aruna_operations::s3::object::delete::pinned::{
+    PinnedError, ReleaseGuards, refuse_pinned, version_pins,
+};
 use s3s::dto::Error as S3DeleteError;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use ulid::Ulid;
@@ -61,15 +63,16 @@ impl ArunaS3Service {
         }
     }
 
-    /// Refuses the permanent deletion of `version_id` of `key` while a release pins it.
+    /// Refuses the permanent deletion of `version_id` of `key` while a release pins it; else
+    /// the guards its delete keeps.
     pub(super) async fn refuse_pinned(
         &self,
         (bucket, info): (&str, Option<&BucketInfo>),
         auth: &AuthContext,
         (key, version_id): (&str, Ulid),
-    ) -> S3Result<()> {
+    ) -> S3Result<ReleaseGuards> {
         let Some(info) = self.release_info(bucket, info).await? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let scope = self.scope(bucket, &info);
         refuse_pinned(&self.state, scope, auth, (key, version_id))
@@ -77,20 +80,21 @@ impl ArunaS3Service {
             .map_err(|error| pinned_error(&error))
     }
 
-    /// Keeps the entries no release pins; each pinned or unchecked version gets an error.
+    /// Keeps the entries no release pins, with the guards their deletes keep; each pinned or
+    /// unchecked version gets an error.
     pub(super) async fn drop_pinned(
         &self,
         (bucket, info): (&str, Option<&BucketInfo>),
         auth: &AuthContext,
         entries: Vec<BulkDeleteEntry>,
-    ) -> S3Result<(Vec<BulkDeleteEntry>, Vec<S3DeleteError>)> {
+    ) -> S3Result<(Vec<BulkDeleteEntry>, Vec<S3DeleteError>, ReleaseGuards)> {
         let versioned = entries.iter().any(|entry| entry.version_id.is_some());
         let info = match versioned {
             true => self.release_info(bucket, info).await?,
             false => None,
         };
         let Some(info) = info else {
-            return Ok((entries, Vec::new()));
+            return Ok((entries, Vec::new(), Vec::new()));
         };
         let queries: Vec<MembershipQuery> = (entries.iter())
             .filter_map(|entry| {
@@ -101,10 +105,11 @@ impl ArunaS3Service {
             })
             .collect();
         let pins = version_pins(&self.state, self.scope(bucket, &info), auth, &queries).await;
-        let mut pins = match pins {
-            Ok(pins) => pins.into_iter().map(Ok).collect::<Vec<_>>().into_iter(),
-            Err(error) => vec![Err(error); queries.len()].into_iter(),
+        let (pins, guards): (Vec<Result<bool, PinnedError>>, _) = match pins {
+            Ok((pins, guards)) => (pins.into_iter().map(Ok).collect(), guards),
+            Err(error) => (vec![Err(error); queries.len()], Vec::new()),
         };
+        let mut pins = pins.into_iter();
         let (mut kept, mut errors) = (Vec::new(), Vec::new());
         for entry in entries {
             let Some(version_id) = entry.version_id else {
@@ -133,7 +138,7 @@ impl ArunaS3Service {
                 }),
             }
         }
-        Ok((kept, errors))
+        Ok((kept, errors, guards))
     }
 }
 

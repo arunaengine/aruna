@@ -10,23 +10,24 @@ use std::pin::Pin;
 use aruna_core::NodeId;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::BUCKET_RELEASE_KEYSPACE;
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::identifier::Identifier;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::document::group_admin_path;
-use aruna_core::structs::storage::blob::bucket_permission_path;
+use aruna_core::structs::storage::blob::{VersionKey, bucket_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{
     RELEASE_PREFIX_TAG, RELEASE_TAG, ReleasePointer, curator_path, release_prefix,
 };
 use aruna_core::structs::storage::data::identity::content_id;
 use aruna_core::structs::storage::distribution::KeyRange;
-use aruna_core::structs::storage::origin::SourcePin;
+use aruna_core::structs::storage::origin::{OriginVersion, SourcePin};
 use aruna_core::structs::storage::release::{
     CRATE_CHUNK, CrateBytes, CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk,
     HolderRequest, RangeFiles, RangeMembers, ReleaseEffect, ReleaseEvent, ReleaseFile,
 };
+use aruna_core::types::{Key, Value as Row};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -317,6 +318,7 @@ pub async fn publish_release(
     }
     let access = load_access(context, scope, &input.auth).await?;
     let files = coordinated_files(context, scope, &access, &input).await?;
+    let guards = file_guards(context, scope, &files).await?;
     let bytes = release_crate(&input.spec, &files);
     let hash = *blake3::hash(&bytes).as_bytes();
     // A concurrent publish moves the head; the next pass then finds its release or conflicts.
@@ -343,7 +345,8 @@ pub async fn publish_release(
             Err(OriginError::VersionMissing) => None,
             Err(error) => return Err(PublishError::Unavailable(error.to_string())),
         };
-        if let Some(version_id) = put_crate(context, scope, &input, (bytes.clone(), head)).await? {
+        let write = (bytes.clone(), head, guards.clone());
+        if let Some(version_id) = put_crate(context, scope, &input, write).await? {
             return Ok(Published {
                 version_id,
                 files: files.len(),
@@ -487,13 +490,56 @@ async fn coordinated_files(
     Ok(files)
 }
 
+/// The version rows of an ordinary bucket's pinned files as they are now. The crate's write
+/// keeps them, so a file deleted meanwhile fails the publish instead of breaking the release.
+async fn file_guards(
+    context: &DriverContext,
+    scope: BucketScope<'_>,
+    files: &[ReleaseFile],
+) -> Result<Vec<(String, Key, Option<Row>)>, PublishError> {
+    if scope.info.distribution.is_some() {
+        return Ok(Vec::new());
+    }
+    let mut reads = Vec::with_capacity(files.len());
+    for file in files {
+        let OriginVersion::Node(arn) = &file.version else {
+            continue;
+        };
+        let key = VersionKey::new(scope.bucket, file.key.as_str(), arn.version)
+            .to_bytes()
+            .map_err(|error| PublishError::Unavailable(error.to_string()))?;
+        reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(key)));
+    }
+    if reads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let read = StorageEffect::BatchRead {
+        reads,
+        txn_id: None,
+    };
+    let values = match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        other => return Err(PublishError::Unavailable(format!("{other:?}"))),
+    };
+    if values.iter().any(|(_, value)| value.is_none()) {
+        return Err(PublishError::Conflict(CHANGED.to_string()));
+    }
+    let space = || BLOB_VERSIONS_KEYSPACE.to_string();
+    Ok(values
+        .into_iter()
+        .map(|(key, value)| (space(), key, value))
+        .collect())
+}
+
+const CHANGED: &str = "a pinned file changed while the release was written; publish again";
+
 /// Writes the release crate as one version tagged with its label and prefix; `None` when the
-/// key's head is no longer `head`, so nothing was written.
+/// key's head is no longer `head`, so nothing was written. Each guard must still read as given.
 async fn put_crate(
     context: &DriverContext,
     scope: BucketScope<'_>,
     input: &PublishInput,
-    (bytes, head): (Vec<u8>, Option<Ulid>),
+    (bytes, head, guards): (Vec<u8>, Option<Ulid>, Vec<(String, Key, Option<Row>)>),
 ) -> Result<Option<Ulid>, PublishError> {
     let failed = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
     let realm = drive(GetConfigOperation::new(scope.realm_id), context)
@@ -540,9 +586,13 @@ async fn put_crate(
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
+    if !guards.is_empty() {
+        operation = operation.with_fence(guards, Vec::new());
+    }
     let result = match drive(operation, context).await {
         Ok(result) => result,
         Err(PutObjectError::HeadChanged) => return Ok(None),
+        Err(PutObjectError::FenceTaken) => return Err(PublishError::Conflict(CHANGED.to_string())),
         Err(error) => return Err(failed(&error)),
     };
     complete_put(

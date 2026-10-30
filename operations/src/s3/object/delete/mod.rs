@@ -1169,7 +1169,9 @@ impl DeleteObjectOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(DeleteObjectError::NoTransactionFound);
         };
-        let next = match (self.row_fence.as_mut(), self.version_id) {
+        // A permanent delete mints no marker; its receipts name the deleted version.
+        let version_id = self.version_id.or(self.input.version_id);
+        let next = match (self.row_fence.as_mut(), version_id) {
             (Some(fence), Some(version_id)) => fence.next(txn_id, version_id),
             (Some(_), None) => return self.emit_error(DeleteObjectError::InvalidOperationState),
             (None, _) => None,

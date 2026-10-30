@@ -2765,12 +2765,15 @@ impl S3 for ArunaS3Service {
             session: None,
         };
         // A version a release pins stays; a delete marker is still allowed.
-        if let Some(version_id) = version_id {
-            let place = (req.input.bucket.as_str(), bucket_info);
-            let version = (req.input.key.as_str(), version_id);
-            self.refuse_pinned(place, &replication_auth, version)
-                .await?;
-        }
+        let guards = match version_id {
+            Some(version_id) => {
+                let place = (req.input.bucket.as_str(), bucket_info);
+                let version = (req.input.key.as_str(), version_id);
+                self.refuse_pinned(place, &replication_auth, version)
+                    .await?
+            }
+            None => Vec::new(),
+        };
         let replication_bucket = req.input.bucket.clone();
         let replication_key = req.input.key.clone();
         let replicate_latest_delete = version_id.is_none();
@@ -2785,6 +2788,10 @@ impl S3 for ArunaS3Service {
             deleted_by: user_access.user_identity,
         })
         .with_restrictions(replication_auth.path_restrictions.clone());
+        let operation = match guards.is_empty() {
+            true => operation,
+            false => operation.with_fence(guards, Vec::new()),
+        };
 
         let result = drive(operation, &self.state)
             .await
@@ -2921,7 +2928,7 @@ impl S3 for ArunaS3Service {
             });
         }
         let place = (bucket.as_str(), bucket_info.as_ref());
-        let (entries, pinned) = self.drop_pinned(place, &replication_auth, entries).await?;
+        let (entries, pinned, guards) = self.drop_pinned(place, &replication_auth, entries).await?;
         errors.extend(pinned);
         // Delete markers for keys another member coordinates are forwarded there one by one.
         let (entries, forwarded, forward_errors) = self
@@ -2944,6 +2951,7 @@ impl S3 for ArunaS3Service {
                 node_id: self.node_id,
                 deleted_by: user_access.user_identity,
                 restrictions: replication_auth.path_restrictions.clone(),
+                guards,
             },
         )
         .await;

@@ -406,6 +406,7 @@ async fn scoped_fence_isolates() {
             node_id: context.node_id,
             deleted_by: context.user_id,
             restrictions: None,
+            guards: Vec::new(),
         },
     )
     .await;
@@ -1267,4 +1268,68 @@ async fn purge_releases_copies() {
     .await
     .unwrap();
     assert!(left.is_empty());
+}
+
+/// A release published after a file purge was submitted keeps the version it pins: the purge
+/// checks again before it deletes, and fails without deleting it.
+#[tokio::test]
+async fn purge_keeps_released() {
+    use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+
+    let context = setup_context().await;
+    let file = drive(
+        put_operation(&context, "db/a.fasta", b">a"),
+        &context.driver,
+    )
+    .await
+    .unwrap();
+    let spec = StoragePurgeSpec {
+        scope: StoragePurgeScope::File {
+            bucket: "bucket".to_string(),
+            key: "db/a.fasta".to_string(),
+        },
+        group_id: context.group_id,
+        auth_context: auth(&context),
+        node_id: context.node_id,
+    };
+    let job = claimed_job(
+        context.driver.clone(),
+        JobId::from_bytes([0xD9; 16]),
+        spec.clone(),
+    )
+    .await;
+    let arn = VersionedObjectArn::new(
+        context.realm_id,
+        context.node_id,
+        "bucket",
+        "db/a.fasta",
+        file.version_id,
+    )
+    .unwrap();
+    let pinned = serde_json::json!({
+        "@graph": [{"@type": "File", "@id": arn.to_w3id(), "name": "db/a.fasta"}]
+    });
+    let tags = HashMap::from([
+        (RELEASE_TAG.to_string(), "6.0".to_string()),
+        (RELEASE_PREFIX_TAG.to_string(), "db/".to_string()),
+    ]);
+    let bytes = serde_json::to_vec(&pinned).unwrap();
+    let release = put_operation(&context, "db/release.json", &bytes).with_metadata(tags);
+    drive(release, &context.driver).await.unwrap();
+
+    let outcome = run_storage_purge(&job, &spec, false).await;
+
+    assert!(matches!(
+        outcome,
+        JobRunOutcome::Failed(error) if error.message.contains("pinned by a release")
+    ));
+    let key = VersionKey::new("bucket", "db/a.fasta", file.version_id);
+    let row = read_value(
+        &context.driver.storage_handle,
+        BLOB_VERSIONS_KEYSPACE,
+        key.to_bytes().unwrap(),
+    )
+    .await;
+    assert!(row.is_some());
 }

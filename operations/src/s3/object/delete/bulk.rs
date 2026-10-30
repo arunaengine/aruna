@@ -10,7 +10,7 @@ use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key, Value};
 use ulid::Ulid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +28,8 @@ pub struct BulkDeleteInput {
     pub node_id: NodeId,
     pub deleted_by: UserId,
     pub restrictions: Option<Vec<PathRestriction>>,
+    /// Rows each permanent delete's transaction must still read as given.
+    pub guards: Vec<(String, Key, Option<Value>)>,
 }
 
 #[derive(Debug)]
@@ -43,20 +45,21 @@ pub async fn delete_objects(
 ) -> Vec<BulkDeleteOutcome> {
     let mut outcomes = Vec::with_capacity(input.entries.len());
     for entry in input.entries {
-        let result = drive(
-            DeleteObjectOperation::new(DeleteObjectInput {
-                bucket: input.bucket.clone(),
-                key: entry.key.clone(),
-                version_id: entry.version_id,
-                group_id: input.group_id,
-                realm_id: input.realm_id,
-                node_id: input.node_id,
-                deleted_by: input.deleted_by,
-            })
-            .with_restrictions(input.restrictions.clone()),
-            context,
-        )
-        .await;
+        let operation = DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: input.bucket.clone(),
+            key: entry.key.clone(),
+            version_id: entry.version_id,
+            group_id: input.group_id,
+            realm_id: input.realm_id,
+            node_id: input.node_id,
+            deleted_by: input.deleted_by,
+        })
+        .with_restrictions(input.restrictions.clone());
+        let operation = match entry.version_id.is_some() && !input.guards.is_empty() {
+            true => operation.with_fence(input.guards.clone(), Vec::new()),
+            false => operation,
+        };
+        let result = drive(operation, context).await;
 
         outcomes.push(BulkDeleteOutcome {
             key: entry.key,
@@ -198,6 +201,7 @@ mod test {
                 node_id,
                 deleted_by: user_id,
                 restrictions: None,
+                guards: Vec::new(),
             },
         )
         .await;
@@ -249,6 +253,7 @@ mod test {
                 node_id,
                 deleted_by: user_id,
                 restrictions: None,
+                guards: Vec::new(),
             },
         )
         .await;

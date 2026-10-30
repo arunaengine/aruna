@@ -5,8 +5,13 @@
 
 // Every release counts, also one the caller cannot read, so a refusal names none.
 
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::BUCKET_RELEASE_KEYSPACE;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::bucket_metadata::release_marker;
 use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -78,38 +83,65 @@ async fn retained(
         .map_err(|error| unchecked(&error))
 }
 
-/// Whether a release pins each of `queries`.
+/// Rows a permanent delete's transaction must still read as the pin check did: the bucket's
+/// release marker, so a release added since fails the delete instead of losing its version.
+pub type ReleaseGuards = Vec<(String, Key, Option<Value>)>;
+
+/// The bucket's release marker as it is before its releases are read.
+async fn release_guards(
+    context: &DriverContext,
+    bucket: &str,
+) -> Result<ReleaseGuards, PinnedError> {
+    let key: Key = release_marker(bucket).into();
+    let read = StorageEffect::Read {
+        key_space: BUCKET_RELEASE_KEYSPACE.to_string(),
+        key: key.clone(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(vec![(BUCKET_RELEASE_KEYSPACE.to_string(), key, value)])
+        }
+        other => Err(PinnedError::Unchecked(format!(
+            "the release marker could not be read: {other:?}"
+        ))),
+    }
+}
+
+/// Whether a release pins each of `queries`, and the guards their deletes must keep.
 pub async fn version_pins(
     context: &DriverContext,
     scope: BucketScope<'_>,
     auth: &AuthContext,
     queries: &[MembershipQuery],
-) -> Result<Vec<bool>, PinnedError> {
+) -> Result<(Vec<bool>, ReleaseGuards), PinnedError> {
     if queries.is_empty() || scope.info.distribution.is_some() {
-        return Ok(vec![false; queries.len()]);
+        return Ok((vec![false; queries.len()], Vec::new()));
     }
+    let guards = release_guards(context, scope.bucket).await?;
     let output = retained(context, scope, auth, queries).await?;
-    pinned(queries, &output)
+    Ok((pinned(queries, &output)?, guards))
 }
 
-/// Refuses the permanent deletion of one version a release pins.
+/// Refuses the permanent deletion of one version a release pins; else the guards its delete
+/// must keep.
 pub async fn refuse_pinned(
     context: &DriverContext,
     scope: BucketScope<'_>,
     auth: &AuthContext,
     (key, version_id): (&str, Ulid),
-) -> Result<(), PinnedError> {
+) -> Result<ReleaseGuards, PinnedError> {
     let query = MembershipQuery {
         key: key.to_string(),
         version_id,
     };
-    let pins = version_pins(context, scope, auth, std::slice::from_ref(&query)).await?;
+    let (pins, guards) = version_pins(context, scope, auth, std::slice::from_ref(&query)).await?;
     match pins.first() {
         Some(true) => Err(PinnedError::Version {
             key: key.to_string(),
             version_id,
         }),
-        _ => Ok(()),
+        _ => Ok(guards),
     }
 }
 

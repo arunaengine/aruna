@@ -1384,6 +1384,7 @@ async fn rollback_writes(
             node_id: ctx.owner_node_id,
             deleted_by: spec.auth_context.user_id,
             restrictions: spec.auth_context.path_restrictions.clone(),
+            guards: Vec::new(),
         },
     )
     .await;
