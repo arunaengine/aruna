@@ -12,9 +12,10 @@ use super::lifecycle::{
     TransferPlan, activate_transfer, commit_deletion, deletion_fenced, prepare_deletion,
     prepare_transfer, transfer_complete, transfer_fenced,
 };
-use super::membership::{changeable, join, leave};
+use super::membership::{add_copy, changeable, copy_filled, join, leave};
+use super::snapshot::RangeFill;
 use super::snapshot::{DistributionSnapshot, Lifecycle};
-use super::split::apply_split;
+use super::split::{admin_split, apply_split};
 use super::validate::validate_config;
 use super::{
     DistributionConfig, DistributionError, DistributionMember, DistributionSettings,
@@ -54,6 +55,16 @@ pub enum DistributionRequest {
     Leave {
         member_id: Ulid,
     },
+    /// A ready `copy` member keeps one more range; its coordinator fills the copy first.
+    AddCopy {
+        fill: RangeFill,
+    },
+    /// Splits a range at `split_key` while it is at `epoch`, as its coordinator would.
+    Split {
+        range_id: Ulid,
+        epoch: u64,
+        split_key: String,
+    },
     TransferPrepare {
         transfer_id: Ulid,
         range_id: Ulid,
@@ -89,6 +100,8 @@ impl DistributionRequest {
             Self::ChangeSettings { .. } => "change settings",
             Self::Join { .. } => "join",
             Self::Leave { .. } => "leave",
+            Self::AddCopy { .. } => "add copy",
+            Self::Split { .. } => "split",
             Self::TransferPrepare { .. } => "transfer prepare",
             Self::TransferActivate { .. } => "transfer activate",
             Self::DeletePrepare { .. } => "delete prepare",
@@ -239,6 +252,15 @@ fn accept(
         DistributionRequest::Create { .. } => Err(DistributionError::SetMismatch(next.set_id())),
         DistributionRequest::Join { member, ranges } => join(next, member, ranges),
         DistributionRequest::Leave { member_id } => leave(next, *member_id),
+        DistributionRequest::AddCopy { fill } => add_copy(next, fill),
+        DistributionRequest::Split {
+            range_id,
+            epoch,
+            split_key,
+        } => {
+            changeable(next)?;
+            admin_split(next, *range_id, *epoch, split_key)
+        }
         DistributionRequest::TransferPrepare {
             transfer_id,
             range_id,
@@ -356,6 +378,7 @@ fn embed(
             next.statements.push(signed.clone());
             Ok(())
         }
+        StatementKind::CopyFilled { .. } => copy_filled(next, statement),
         StatementKind::TransferFenced { .. } => transfer_fenced(next, signed),
         StatementKind::TransferComplete { .. } => transfer_complete(next, signed),
         StatementKind::DeleteFenced { .. } => deletion_fenced(next, signed),

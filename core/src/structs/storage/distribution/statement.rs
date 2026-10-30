@@ -87,6 +87,15 @@ pub enum StatementKind {
         ranges: Vec<(Ulid, u64)>,
         watermark: u64,
     },
+    /// The coordinator walked a range for its new copy, everything up to the watermark
+    /// (milliseconds) its walk started at included.
+    CopyFilled {
+        fill_id: Ulid,
+        range_id: Ulid,
+        epoch: u64,
+        member_id: Ulid,
+        watermark: u64,
+    },
     /// An automatic balancing transfer proposed by the range's coordinator.
     TransferPrepare {
         /// The revision number the coordinator decided on.
@@ -109,6 +118,7 @@ impl StatementKind {
             Self::Split { .. } => "split",
             Self::TransferPrepare { .. } => "transfer prepare",
             Self::CaughtUp { .. } => "caught up",
+            Self::CopyFilled { .. } => "copy filled",
         }
     }
 

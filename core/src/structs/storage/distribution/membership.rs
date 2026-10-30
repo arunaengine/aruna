@@ -1,5 +1,5 @@
-//! Applies a group admin's `join` and `leave` to a set's record. A joined member starts created,
-//! admits itself, catches up from the coordinators and becomes ready.
+//! Applies a group admin's `join`, `leave` and `add copy` to a set's record. A joined member
+//! starts created, admits itself, catches up from the coordinators and becomes ready.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,10 +7,15 @@
 
 use ulid::Ulid;
 
-use super::snapshot::{DistributionSnapshot, Tombstone};
-use super::{DistributionError, DistributionMember, MemberState, SetPhase};
+use super::snapshot::{DistributionSnapshot, RangeFill, Tombstone};
+use super::{
+    DataStrategy, DistributionError, DistributionMember, MemberState, SetPhase, Statement,
+    StatementKind,
+};
+use crate::structs::identity::realm::RealmId;
 
 const JOIN_DOMAIN: &str = "aruna-distribution-join-v1";
+const FILLED_DOMAIN: &[u8] = b"aruna-distribution-filled-v1";
 
 /// The intent a joined member's admission names: the set, the digest of the head it joined on
 /// and the complete join request, so an admission never moves to another join.
@@ -107,6 +112,9 @@ pub(super) fn leave(
     for range in &mut next.config.ranges {
         range.replicas.retain(|replica| *replica != member_id);
     }
+    next.lifecycle
+        .fills
+        .retain(|fill| fill.member_id != member_id);
     if let Some(member) =
         (next.config.members.iter_mut()).find(|known| known.member_id == member_id)
     {
@@ -115,7 +123,121 @@ pub(super) fn leave(
     Ok(())
 }
 
+/// Adds a ready `copy` member as a replica of one more range; the range's coordinator fills
+/// the copy before reads use it.
+pub(super) fn add_copy(
+    next: &mut DistributionSnapshot,
+    fill: &RangeFill,
+) -> Result<(), DistributionError> {
+    changeable(next)?;
+    let refused = DistributionError::InvalidChange;
+    if next.phase != SetPhase::Active {
+        return Err(refused("only an active set takes new copies"));
+    }
+    let member = next
+        .member(fill.member_id)
+        .ok_or(DistributionError::NoMember(fill.member_id))?;
+    if member.state != MemberState::Ready || member.strategy != DataStrategy::Copy {
+        return Err(refused(
+            "only a ready member with the copy strategy takes a copy",
+        ));
+    }
+    if (next.lifecycle.fills.iter()).any(|open| open.fill_id == fill.fill_id) {
+        return Err(refused("the copy was already added"));
+    }
+    if (next.lifecycle.transfers.iter()).any(|open| open.range_id == fill.range_id) {
+        return Err(DistributionError::TransferOpen(fill.range_id));
+    }
+    let range = (next.config.ranges.iter_mut())
+        .find(|range| range.range_id == fill.range_id)
+        .ok_or(refused("the range does not exist"))?;
+    if range.coordinator == fill.member_id || range.replicas.contains(&fill.member_id) {
+        return Err(refused("the member already keeps a copy of the range"));
+    }
+    range.replicas.push(fill.member_id);
+    next.lifecycle.fills.push(fill.clone());
+    Ok(())
+}
+
+/// Takes the coordinator's statement that the copy holds everything it walked: the member
+/// then serves the range like any replica.
+pub(super) fn copy_filled(
+    next: &mut DistributionSnapshot,
+    statement: &Statement,
+) -> Result<(), DistributionError> {
+    let invalid = DistributionError::InvalidStatement;
+    let StatementKind::CopyFilled {
+        fill_id,
+        range_id,
+        epoch,
+        member_id,
+        ..
+    } = &statement.kind
+    else {
+        return Err(invalid("not a filled copy"));
+    };
+    let index = (next.lifecycle.fills.iter())
+        .position(|fill| fill.fill_id == *fill_id)
+        .ok_or(invalid("the copy is not filling"))?;
+    let fill = &next.lifecycle.fills[index];
+    let range = (next.config.ranges.iter()).find(|range| range.range_id == fill.range_id);
+    let current = range
+        .is_some_and(|range| range.coordinator == statement.member_id && range.epoch == *epoch);
+    if fill.range_id != *range_id || fill.member_id != *member_id || !current {
+        return Err(invalid(
+            "only the range's coordinator states the copy filled at its epoch",
+        ));
+    }
+    next.lifecycle.fills.remove(index);
+    Ok(())
+}
+
+impl Statement {
+    /// The coordinator's statement that it walked `fill` to its end at `epoch`. Its id is
+    /// derived from the fill, so a retry is embedded once.
+    pub fn copy_filled(
+        realm_id: RealmId,
+        set_id: Ulid,
+        signer: &DistributionMember,
+        fill: &RangeFill,
+        (epoch, watermark): (u64, u64),
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(FILLED_DOMAIN);
+        hasher.update(&set_id.to_bytes());
+        hasher.update(&fill.fill_id.to_bytes());
+        let mut id = [0; 16];
+        id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        Self {
+            realm_id,
+            set_id,
+            statement_id: Ulid::from_bytes(id),
+            member_id: signer.member_id,
+            incarnation: signer.incarnation.unwrap_or_default(),
+            intent: signer.intent,
+            kind: StatementKind::CopyFilled {
+                fill_id: fill.fill_id,
+                range_id: fill.range_id,
+                epoch,
+                member_id: fill.member_id,
+                watermark,
+            },
+        }
+    }
+}
+
 impl DistributionSnapshot {
+    /// Whether `member_id` keeps a copy of `range_id` that is still filling.
+    pub fn filling(&self, range_id: Ulid, member_id: Ulid) -> bool {
+        (self.lifecycle.fills.iter())
+            .any(|fill| fill.range_id == range_id && fill.member_id == member_id)
+    }
+
+    /// Whether a coordinator still walks a range for a member: a catch-up or a filling copy.
+    pub fn bootstrap_open(&self) -> bool {
+        !self.catching_up().is_empty() || !self.lifecycle.fills.is_empty()
+    }
+
     /// The highest epoch the record names for any range or open transfer; a transfer takes a
     /// fresh epoch above it, so no epoch is ever reused within the set.
     pub fn max_epoch(&self) -> u64 {
@@ -148,3 +270,7 @@ impl DistributionSnapshot {
 #[cfg(test)]
 #[path = "membership_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "copy_tests.rs"]
+mod copy_tests;

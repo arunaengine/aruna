@@ -18,6 +18,7 @@ use crate::structs::identity::realm::RealmId;
 
 const SNAPSHOT_DOMAIN: &str = "aruna-distribution-snapshot-v1";
 const DIGEST_DOMAIN: &[u8] = b"aruna-distribution-revision-v2";
+const FILL_DOMAIN: &[u8] = b"aruna-distribution-fill-v1";
 
 /// A transfer between prepare and activate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -31,6 +32,25 @@ pub struct OpenTransfer {
     /// Digests of the embedded `transfer fenced` and `transfer complete` statements.
     pub fenced: Option<[u8; 32]>,
     pub completed: Option<[u8; 32]>,
+}
+
+/// A copy of one range a ready member gains; its coordinator fills it from its inventory, and
+/// reads of the range avoid the member until the coordinator states the copy filled.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RangeFill {
+    pub fill_id: Ulid,
+    pub range_id: Ulid,
+    pub member_id: Ulid,
+}
+
+impl RangeFill {
+    /// The intent the fill's walk cursor names, so a cursor of an earlier walk starts over.
+    pub fn intent(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(FILL_DOMAIN);
+        hasher.update(&self.fill_id.to_bytes());
+        *hasher.finalize().as_bytes()
+    }
 }
 
 /// A deletion between prepare and the last member's purge.
@@ -47,6 +67,8 @@ pub struct Deletion {
 pub struct Lifecycle {
     pub transfers: Vec<OpenTransfer>,
     pub deletion: Option<Deletion>,
+    /// New copies of ranges that are still filling.
+    pub fills: Vec<RangeFill>,
 }
 
 /// A member bucket the set deleted or released, so a returning member learns of it.
@@ -155,6 +177,14 @@ impl DistributionSnapshot {
         }
         for member in &self.config.members {
             self.check_admission(member)?;
+        }
+        let listed = |fill: &RangeFill| {
+            (self.config.ranges.iter()).any(|range| {
+                range.range_id == fill.range_id && range.replicas.contains(&fill.member_id)
+            })
+        };
+        if !self.lifecycle.fills.iter().all(listed) {
+            return Err(malformed("a filling copy is not a replica of its range"));
         }
         // An active set's coordinators are admitted; a replica only once it joined and admitted.
         if self.phase == SetPhase::Active {

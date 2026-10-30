@@ -28,8 +28,9 @@ pub struct RetiredRange {
     pub upper_id: Ulid,
 }
 
-/// The ids one split derives from its range, epoch and key, so a retry is the same split.
-fn split_ids(set_id: Ulid, range_id: Ulid, epoch: u64, split_key: &str) -> [Ulid; 3] {
+/// The ids one split derives from its range, epoch and key, so a retry is the same split:
+/// the statement id, then the lower and upper child ids.
+pub fn split_ids(set_id: Ulid, range_id: Ulid, epoch: u64, split_key: &str) -> [Ulid; 3] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(SPLIT_DOMAIN);
     hasher.update(&set_id.to_bytes());
@@ -130,7 +131,51 @@ pub(super) fn apply_split(
     else {
         return Err(DistributionError::InvalidStatement("not a split"));
     };
-    let invalid = DistributionError::InvalidStatement;
+    let plan = SplitPlan {
+        range_id: *range_id,
+        epoch: *epoch,
+        split_key,
+        children: (*lower_id, *upper_id),
+    };
+    split_range(next, &plan, Some(statement.member_id))
+}
+
+/// Applies a group admin's split of a range at `split_key`, with the ids and checks of the
+/// coordinator's own split.
+pub(super) fn admin_split(
+    next: &mut DistributionSnapshot,
+    range_id: Ulid,
+    epoch: u64,
+    split_key: &str,
+) -> Result<(), DistributionError> {
+    let [_, lower_id, upper_id] = split_ids(next.set_id(), range_id, epoch, split_key);
+    let plan = SplitPlan {
+        range_id,
+        epoch,
+        split_key,
+        children: (lower_id, upper_id),
+    };
+    split_range(next, &plan, None)
+}
+
+struct SplitPlan<'a> {
+    range_id: Ulid,
+    epoch: u64,
+    split_key: &'a str,
+    children: (Ulid, Ulid),
+}
+
+/// Replaces the range by its two children; `signer` must coordinate it when a statement splits.
+fn split_range(
+    next: &mut DistributionSnapshot,
+    plan: &SplitPlan<'_>,
+    signer: Option<Ulid>,
+) -> Result<(), DistributionError> {
+    let (split_key, (lower_id, upper_id)) = (plan.split_key, plan.children);
+    let invalid = match signer {
+        Some(_) => DistributionError::InvalidStatement,
+        None => DistributionError::InvalidChange,
+    };
     if next.phase != SetPhase::Active || next.lifecycle.deletion.is_some() {
         return Err(invalid(
             "only an active set that is not being deleted splits",
@@ -140,22 +185,22 @@ pub(super) fn apply_split(
         return Err(DistributionError::RangeCount);
     }
     let index = (next.config.ranges.iter())
-        .position(|range| range.range_id == *range_id)
+        .position(|range| range.range_id == plan.range_id)
         .ok_or(invalid("the range was already split or does not exist"))?;
     let range = next.config.ranges[index].clone();
-    if range.coordinator != statement.member_id || range.epoch != *epoch {
+    if signer.is_some_and(|signer| signer != range.coordinator) || range.epoch != plan.epoch {
         return Err(invalid(
             "only the range's coordinator splits it at its epoch",
         ));
     }
-    if (next.lifecycle.transfers.iter()).any(|transfer| transfer.range_id == *range_id) {
+    if (next.lifecycle.transfers.iter()).any(|transfer| transfer.range_id == plan.range_id) {
         return Err(invalid("a transfer of the range is open"));
     }
-    let inside = range.lower.as_str() < split_key.as_str()
-        && range
-            .upper
-            .as_deref()
-            .is_none_or(|upper| split_key.as_str() < upper);
+    if (next.lifecycle.fills.iter()).any(|fill| fill.range_id == plan.range_id) {
+        return Err(invalid("a new copy of the range is still filling"));
+    }
+    let inside = range.lower.as_str() < split_key
+        && range.upper.as_deref().is_none_or(|upper| split_key < upper);
     if !inside || split_key.len() > MAX_BOUND_BYTES {
         return Err(invalid("the split key leaves a child empty"));
     }
@@ -163,7 +208,7 @@ pub(super) fn apply_split(
         next.config.ranges.iter().any(|range| range.range_id == *id)
             || next.retired_range(*id).is_some()
     };
-    if lower_id == upper_id || taken(lower_id) || taken(upper_id) {
+    if lower_id == upper_id || taken(&lower_id) || taken(&upper_id) {
         return Err(invalid("the child range ids are taken"));
     }
     let child = |range_id, lower, upper| KeyRange {
@@ -173,15 +218,15 @@ pub(super) fn apply_split(
         lineage: Some(range.range_id),
         ..range.clone()
     };
-    let lower = child(*lower_id, range.lower.clone(), Some(split_key.clone()));
-    let upper = child(*upper_id, split_key.clone(), range.upper.clone());
+    let lower = child(lower_id, range.lower.clone(), Some(split_key.to_string()));
+    let upper = child(upper_id, split_key.to_string(), range.upper.clone());
     next.config.ranges.splice(index..=index, [lower, upper]);
     next.retired.push(RetiredRange {
         range_id: range.range_id,
         lineage: range.lineage,
-        split_key: split_key.clone(),
-        lower_id: *lower_id,
-        upper_id: *upper_id,
+        split_key: split_key.to_string(),
+        lower_id,
+        upper_id,
     });
     Ok(())
 }
