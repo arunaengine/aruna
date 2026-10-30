@@ -17,7 +17,8 @@ use aruna_core::structs::storage::distribution::presets::{
 };
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionConfig, DistributionError, DistributionRequest, DistributionRevision,
-    DistributionSettings, SetPhase, SetRoot, SignedSnapshot, SignedStatement,
+    DistributionSettings, DistributionSnapshot, DistributionView, SetPhase, SetRoot,
+    SignedSnapshot, SignedStatement,
 };
 use aruna_core::types::GroupId;
 use thiserror::Error;
@@ -30,6 +31,10 @@ use crate::driver::DriverContext;
 use crate::forward::authorize::is_sync_eligible;
 use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
 use crate::placement::process_placements::load_realm_config;
+
+/// How often and how far apart admission rereads a record that lags the accepted revision.
+const RECORD_POLLS: u32 = 50;
+const RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// How the key space is laid out over the chosen nodes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,7 +172,7 @@ pub async fn create_set(
     .await?;
     // The set exists from here on, so every later failure still names it.
     // The ranges of a new set are empty.
-    match admit_pending(context, auth, bearer, set_id, &[]).await {
+    match admit_pending(context, auth, bearer, (set_id, None), &[]).await {
         Ok(report) => Ok(report),
         Err(error) => Ok(CreationReport {
             set_id,
@@ -182,11 +187,12 @@ pub async fn create_set(
 /// A failed member keeps the set pending; a member refused for capacity loses its empty bucket.
 /// Each member checks capacity against `sizes`; a range no admitted member holds is empty. A
 /// member with a copy not admitted yet is admitted again, which opens the new range on its node.
+/// With `accepted`, this node's record must reach that revision first.
 pub async fn admit_pending(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
     bearer: Option<AuthToken>,
-    set_id: Ulid,
+    (set_id, accepted): (Ulid, Option<DistributionRevision>),
     sizes: &[RangeSize],
 ) -> Result<CreationReport, CreateError> {
     let local = context
@@ -194,9 +200,7 @@ pub async fn admit_pending(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or_else(|| CreateError::Invalid("this node has no realm transport".to_string()))?;
-    let view = read_view(context, set_id)
-        .await?
-        .ok_or(CreateError::UnknownSet(set_id))?;
+    let view = accepted_view(context, set_id, accepted).await?;
     if view.conflicted() {
         return Err(CreateError::Conflicted);
     }
@@ -261,6 +265,39 @@ pub async fn admit_pending(
         members,
         error,
     })
+}
+
+/// This node's record of the set once it reached `accepted`, waiting a bounded time for it.
+async fn accepted_view(
+    context: &DriverContext,
+    set_id: Ulid,
+    accepted: Option<DistributionRevision>,
+) -> Result<DistributionView, CreateError> {
+    for _ in 0..RECORD_POLLS {
+        let view = read_view(context, set_id).await?;
+        match (view, &accepted) {
+            (Some(view), None) => return Ok(view),
+            (Some(view), Some(revision)) if reached(&view.head.snapshot, revision) => {
+                return Ok(view);
+            }
+            (None, None) => return Err(CreateError::UnknownSet(set_id)),
+            _ => tokio::time::sleep(RECORD_POLL).await,
+        }
+    }
+    let number = accepted.map(|revision| revision.number).unwrap_or_default();
+    Err(CreateError::Blocked(format!(
+        "the publisher accepted the change as revision {number} of distributed bucket {set_id}, \
+         but this node has not received it yet; retry the admission shortly"
+    )))
+}
+
+/// Whether `head` is `revision` or a later revision.
+fn reached(head: &DistributionSnapshot, revision: &DistributionRevision) -> bool {
+    match head.number.cmp(&revision.number) {
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => head.revision() == *revision,
+        std::cmp::Ordering::Greater => true,
+    }
 }
 
 /// Hands a member's statement to the publisher; one it already embedded counts as done.

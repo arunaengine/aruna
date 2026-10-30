@@ -231,7 +231,7 @@ pub async fn join_member(
         ranges: input.ranges,
     };
     send(context, (local, &snapshot), caller.clone(), request).await?;
-    admit_pending(context, caller.0, caller.1, set_id, &input.sizes).await
+    admit_pending(context, caller.0, caller.1, (set_id, None), &input.sizes).await
 }
 
 /// Marks a member leaving; a coordinator transfers its ranges first.
@@ -295,8 +295,8 @@ pub async fn add_copy(
         admitted: false,
     };
     let request = DistributionRequest::AddCopy { fill };
-    send(context, (local, &snapshot), caller.clone(), request).await?;
-    admit_pending(context, caller.0, caller.1, set_id, sizes).await
+    let accepted = send(context, (local, &snapshot), caller.clone(), request).await?;
+    admit_pending(context, caller.0, caller.1, (set_id, Some(accepted)), sizes).await
 }
 
 /// Splits one range by hand; `dry_run` only plans the split.

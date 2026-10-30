@@ -764,7 +764,7 @@ pub async fn retry_admission(
     owned_status(&state, group_id, set_id).await?;
     let sizes = range_sizes(&state, bearer.as_ref(), set_id).await?;
     let bearer = crate::metadata::forwarded_auth_token(bearer)?;
-    let report = admit_pending(&state.get_ctx(), &auth, bearer, set_id, &sizes)
+    let report = admit_pending(&state.get_ctx(), &auth, bearer, (set_id, None), &sizes)
         .await
         .map_err(map_create_error)?;
     Ok(Json(admission_response(report)))
