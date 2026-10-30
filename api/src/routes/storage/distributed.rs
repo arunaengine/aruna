@@ -238,6 +238,8 @@ pub struct DistributedResponse {
     pub ranges: Vec<RangeResponse>,
     /// The node glob grant that covers this bucket on every member node.
     pub recommended_grant: String,
+    /// The current settings in full; a settings change replaces all of them.
+    pub settings: SettingsRequest,
     /// Open transfers of ranges to another coordinator.
     #[serde(default)]
     pub transfers: Vec<TransferResponse>,
@@ -351,6 +353,14 @@ pub(crate) fn behaviour(value: BehaviourName) -> RangeBehaviour {
     }
 }
 
+fn behaviour_name(value: RangeBehaviour) -> BehaviourName {
+    match value {
+        RangeBehaviour::Passthrough => BehaviourName::Passthrough,
+        RangeBehaviour::FillFirst => BehaviourName::FillFirst,
+        RangeBehaviour::ServeAndFill => BehaviourName::ServeAndFill,
+    }
+}
+
 pub(crate) fn settings_of(request: &SettingsRequest) -> DistributionSettings {
     DistributionSettings {
         refresh_secs: request.refresh_secs,
@@ -420,6 +430,14 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
             admitted: member.admitted,
         })
         .collect();
+    let settings = SettingsRequest {
+        refresh_secs: status.settings.refresh_secs,
+        range_behaviour: status.settings.range_behaviour.map(behaviour_name),
+        search_index: status.settings.search_index,
+        public: status.settings.public,
+        split_objects: status.settings.split_objects,
+        split_bytes: status.settings.split_bytes,
+    };
     let ranges = status
         .ranges
         .into_iter()
@@ -471,6 +489,7 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
         members,
         ranges,
         recommended_grant: status.recommended_grant,
+        settings,
         transfers: (status.lifecycle.transfers.iter())
             .map(|open| TransferResponse {
                 transfer_id: open.transfer_id.to_string(),
@@ -568,7 +587,15 @@ const STATUS_EXAMPLE: &str = r#"{
     }],
     "copies_behind": true,
     "copies_counted": false,
-    "recommended_grant": "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/*/spire/**"
+    "recommended_grant": "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/*/spire/**",
+    "settings": {
+        "refresh_secs": null,
+        "range_behaviour": null,
+        "search_index": true,
+        "public": false,
+        "split_objects": null,
+        "split_bytes": null
+    }
 }"#;
 
 fn status_example() -> serde_json::Value {
@@ -740,7 +767,9 @@ pub(crate) async fn owned_status(
 - `copies` lists, on the coordinator's node only, each member the range is published to: the
   versions still queued for it and the age of the oldest. The count reads a bounded part of
   the queues; `copies_counted` is false when they held more, and the counts are lower bounds.
-  `copies_behind` is true while any listed member has versions queued."#,
+  `copies_behind` is true while any listed member has versions queued.
+- `settings` holds every current setting in the shape the settings route takes. A change
+  replaces them all, so send them back with only the changed field edited."#,
     params(
         ("group_id" = String, Path, description = "Owner group id"),
         ("set_id" = String, Path, description = "Distributed bucket set id")
