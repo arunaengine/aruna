@@ -20,6 +20,7 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, group_permission_path,
 };
 use aruna_core::structs::storage::bucket_metadata::{CapturedDatabase, ReleaseRef};
+use aruna_core::structs::storage::dataset_description::DatasetDescription;
 use aruna_core::structs::storage::origin::{SourcePin, public_source_url, publishable};
 use aruna_core::structs::storage::read_grant::{GrantScope, ReadGrant};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -55,7 +56,7 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{AuthToken, WritePeerError};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::metadata::{bucket_metadata, dataset_description};
+use crate::s3::bucket::metadata::{DescriptionError, bucket_metadata, dataset_description};
 use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
@@ -1033,7 +1034,8 @@ async fn capture_inputs(
 
 /// The bucket's metadata and its dataset's description when the caller may read the bucket
 /// itself, checked like the metadata route; READ on one key alone shows none of it, and the run
-/// still starts. A dataset the caller cannot read now leaves the description empty.
+/// still starts. A dataset the caller may not read leaves the description empty; one that is
+/// unavailable now fails the admission, which may be retried.
 async fn readable_metadata(
     context: &DriverContext,
     (auth, local, bearer): (&AuthContext, NodeId, Option<&str>),
@@ -1067,11 +1069,22 @@ async fn readable_metadata(
         Some(dataset) => {
             let token = bearer.and_then(|token| crate::metadata::AuthToken::bearer(token).ok());
             let read = dataset_description(context, auth.realm_id, dataset, (Some(auth), token));
-            read.await.unwrap_or_default()
+            admitted_description(read.await)?
         }
         None => Default::default(),
     };
     Ok(Some(CapturedDatabase::new(metadata, described)))
+}
+
+/// The description a run captures: empty only when the dataset definitely gives none.
+fn admitted_description(
+    read: Result<DatasetDescription, DescriptionError>,
+) -> Result<DatasetDescription, String> {
+    match read {
+        Ok(described) => Ok(described),
+        Err(DescriptionError::Unreadable | DescriptionError::Invalid(_)) => Ok(Default::default()),
+        Err(error @ DescriptionError::Unavailable) => Err(error.to_string()),
+    }
 }
 
 /// The releases that pin one input version, checked with the caller's own access; a check that
@@ -1723,6 +1736,23 @@ mod tests {
             submission_id: SubmissionId([seed; 32]),
             request_digest: [seed; 32],
         }
+    }
+
+    #[test]
+    fn unavailable_dataset_retries() {
+        // Only a dataset that gives no description for good leaves the capture empty.
+        let described = DatasetDescription {
+            title: Some("Bakta".to_string()),
+            ..DatasetDescription::default()
+        };
+        assert_eq!(admitted_description(Ok(described.clone())), Ok(described));
+        for definite in [
+            DescriptionError::Unreadable,
+            DescriptionError::Invalid("not a Dataset".to_string()),
+        ] {
+            assert_eq!(admitted_description(Err(definite)), Ok(Default::default()));
+        }
+        assert!(admitted_description(Err(DescriptionError::Unavailable)).is_err());
     }
 
     // A plain s3:// input of a distributed bucket is captured at the member that coordinates
