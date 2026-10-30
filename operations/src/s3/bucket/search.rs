@@ -947,7 +947,7 @@ mod tests {
                 incarnation: 0,
                 metadata: BucketMetadata {
                     database,
-                    title: Some(bucket.to_string()),
+                    dataset: database.then(|| ulid::Ulid::from_bytes([9; 16])),
                     ..BucketMetadata::default()
                 },
             };
@@ -984,7 +984,7 @@ mod tests {
         assert_eq!(databases[0].bucket, "data-public");
         assert!(databases[0].public);
         let metadata = databases[0].metadata.as_ref().unwrap();
-        assert_eq!(metadata.title.as_deref(), Some("data-public"));
+        assert_eq!(metadata.dataset, Some(ulid::Ulid::from_bytes([9; 16])));
 
         // A cut scan seals its position, which names the unreadable bucket it stopped at.
         let input = SearchBucketsInput {

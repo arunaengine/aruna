@@ -568,25 +568,32 @@ fn capture_entities(
     }
     let mut part_of = Vec::new();
     if let Some(metadata) = &captured.database {
-        let snapshot = serde_json::to_value(metadata).unwrap_or_default();
-        let digest = blake3::hash(snapshot.to_string().as_bytes()).to_hex();
-        let database_id = format!("#bucket-metadata-{}", &digest[..16]);
-        let title = metadata.title.as_deref().unwrap_or("Bucket metadata");
+        let described = &metadata.described;
+        // The dataset that describes the bucket is named by its own id; older runs had none.
+        let database_id = match metadata.dataset {
+            Some(dataset) => MetadataRegistryRecord::graph_iri_for(dataset),
+            None => {
+                let snapshot = serde_json::to_value(metadata).unwrap_or_default();
+                let digest = blake3::hash(snapshot.to_string().as_bytes()).to_hex();
+                format!("#bucket-metadata-{}", &digest[..16])
+            }
+        };
+        let title = described.title.as_deref().unwrap_or("Bucket metadata");
         let mut database = json!({
             "@id": database_id.clone(),
             "@type": "Dataset",
             "name": format!("{title} (at admission)")
         });
         for (name, value) in [
-            ("version", &metadata.version),
-            ("license", &metadata.license),
-            ("description", &metadata.description),
+            ("version", &described.version),
+            ("license", &described.license),
+            ("description", &described.description),
         ] {
             if let Some(value) = value {
                 database[name] = json!(value);
             }
         }
-        let links: Vec<_> = (metadata.identifiers.iter())
+        let links: Vec<_> = (described.identifiers.iter())
             .map(|identifier| json!(identifier.url))
             .collect();
         if !links.is_empty() {
@@ -1379,7 +1386,8 @@ mod pure_tests {
         // Admission's capture names a public source's pin, the bucket's metadata then and the
         // releases that pin the input; unchecked membership is marked on the file.
         use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
-        use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, ReleaseRef};
+        use aruna_core::structs::storage::bucket_metadata::{CapturedDatabase, ReleaseRef};
+        use aruna_core::structs::storage::dataset_description::DatasetDescription;
         use aruna_core::structs::storage::origin::{OriginVersion, SourcePin};
         let (mut record, spec) = execution_record();
         let doi = Identifier {
@@ -1413,12 +1421,16 @@ mod pure_tests {
                 path: "db/in.txt".to_string(),
                 source_version: Some("v6".to_string()),
             }),
-            database: Some(BucketMetadata {
+            database: Some(CapturedDatabase {
                 database: true,
-                title: Some("Bakta".to_string()),
-                version: Some("6.0".to_string()),
-                identifiers: vec![doi.clone()],
-                ..BucketMetadata::default()
+                described: DatasetDescription {
+                    title: Some("Bakta".to_string()),
+                    version: Some("6.0".to_string()),
+                    identifiers: vec![doi.clone()],
+                    ..DatasetDescription::default()
+                },
+                dataset: Some(Ulid::from_bytes([16; 16])),
+                ..CapturedDatabase::default()
             }),
             releases: vec![ReleaseRef {
                 crate_version: crate_version.clone(),
@@ -1445,6 +1457,12 @@ mod pure_tests {
         assert_eq!(values, [json!("db/in.txt"), json!("v6"), json!("\"abc\"")]);
         let part_of = input["isPartOf"].as_array().expect("part of");
         let database = find(&part_of[0]["@id"]).expect("metadata snapshot");
+        let dataset = MetadataRegistryRecord::graph_iri_for(Ulid::from_bytes([16; 16]));
+        assert_eq!(
+            database["@id"],
+            dataset.as_str(),
+            "named by the bucket's dataset"
+        );
         assert_eq!(database["name"], "Bakta (at admission)");
         assert_eq!(database["version"], "6.0");
         assert_eq!(database["identifier"][0], doi.url.as_str());

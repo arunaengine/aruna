@@ -15,12 +15,19 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, StoredMetadata};
+use aruna_core::structs::storage::dataset_description::{DatasetDescription, describe};
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::DriverContext;
+use crate::metadata::AuthToken;
+use crate::metadata::api::{
+    ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
+};
+use crate::metadata::forward::export_rocrate_routed;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PutMetadataState {
@@ -342,6 +349,51 @@ pub async fn bucket_metadata(
     Ok((stored.incarnation == current).then_some(stored.metadata))
 }
 
+/// Why a bucket's dataset gives no description.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DescriptionError {
+    #[error("the dataset does not exist or the caller may not read it")]
+    Unreadable,
+    #[error("{0}")]
+    Invalid(String),
+    #[error("the dataset could not be read now")]
+    Unavailable,
+}
+
+/// Bytes the summary of a dataset may have; only its root entity is read.
+const SUMMARY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// What the dataset `dataset` says about a bucket, read from its holders with the caller's own
+/// access, so a reader never sees a description it may not read.
+pub async fn dataset_description(
+    context: &DriverContext,
+    realm_id: RealmId,
+    dataset: Ulid,
+    (auth, token): (Option<&AuthContext>, Option<AuthToken>),
+) -> Result<DatasetDescription, DescriptionError> {
+    let request = ExportMetadataRequest {
+        document_id: dataset,
+        auth: auth.cloned(),
+        view: RoCrateExportView::Summary,
+        limit: None,
+        offset: None,
+        after: None,
+    };
+    let context = std::sync::Arc::new(context.clone());
+    match export_rocrate_routed(&context, realm_id, request, token, SUMMARY_BYTES).await {
+        Ok(ExportMetadataResult::Summary { jsonld, .. }) => {
+            describe(&jsonld).map_err(DescriptionError::Invalid)
+        }
+        Err(
+            MetadataApiError::NotFound
+            | MetadataApiError::Forbidden
+            | MetadataApiError::Unauthorized
+            | MetadataApiError::BadRequest,
+        ) => Err(DescriptionError::Unreadable),
+        Ok(_) | Err(_) => Err(DescriptionError::Unavailable),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,7 +405,6 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
     use aruna_core::structs::storage::format::Compression;
     use std::time::SystemTime;
-    use ulid::Ulid;
 
     async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
         let effect = StorageEffect::Write {

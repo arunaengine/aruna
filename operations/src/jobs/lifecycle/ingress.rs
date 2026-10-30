@@ -19,7 +19,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, group_permission_path,
 };
-use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, ReleaseRef};
+use aruna_core::structs::storage::bucket_metadata::{CapturedDatabase, ReleaseRef};
 use aruna_core::structs::storage::origin::{SourcePin, public_source_url, publishable};
 use aruna_core::structs::storage::read_grant::{GrantScope, ReadGrant};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -55,7 +55,7 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{AuthToken, WritePeerError};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::metadata::bucket_metadata;
+use crate::s3::bucket::metadata::{bucket_metadata, dataset_description};
 use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
@@ -886,6 +886,8 @@ async fn capture_inputs(
     (local, bearer): (NodeId, Option<&str>),
 ) -> Result<Vec<CapturedInput>, SubmitJobError> {
     let mut captured_inputs = Vec::with_capacity(inputs.len());
+    // Inputs of one bucket share its metadata and its dataset's description, read once.
+    let mut databases = std::collections::HashMap::new();
     for input in inputs {
         let aruna_core::structs::execution::job::InputSource::S3 {
             bucket,
@@ -971,9 +973,16 @@ async fn capture_inputs(
         let info = drive(GetBucketOperation::new(bucket.clone()), context)
             .await
             .map_err(|error| unavailable(error.to_string()))?;
-        let database = readable_metadata(context, (&auth, local), bucket, &info)
-            .await
-            .map_err(unavailable)?;
+        let database = match databases.get(bucket.as_str()) {
+            Some(database) => Option::clone(database),
+            None => {
+                let database = readable_metadata(context, (&auth, local, bearer), bucket, &info)
+                    .await
+                    .map_err(unavailable)?;
+                databases.insert(bucket.clone(), database.clone());
+                database
+            }
+        };
         let scope = BucketScope {
             realm_id,
             node_id: local,
@@ -1022,17 +1031,18 @@ async fn capture_inputs(
     Ok(captured_inputs)
 }
 
-/// The bucket's metadata when the caller may read the bucket itself, checked like the metadata
-/// route; READ on one key alone shows none of it, and the run still starts.
+/// The bucket's metadata and its dataset's description when the caller may read the bucket
+/// itself, checked like the metadata route; READ on one key alone shows none of it, and the run
+/// still starts. A dataset the caller cannot read now leaves the description empty.
 async fn readable_metadata(
     context: &DriverContext,
-    (auth, local): (&AuthContext, NodeId),
+    (auth, local, bearer): (&AuthContext, NodeId, Option<&str>),
     bucket: &str,
     info: &BucketInfo,
-) -> Result<Option<BucketMetadata>, String> {
+) -> Result<Option<CapturedDatabase>, String> {
     let path = bucket_permission_path(auth.realm_id, info.group_id, local, bucket);
     let extras = PolicyRequestExtras::rest();
-    match authorize(
+    let metadata = match authorize(
         context,
         auth.realm_id,
         auth,
@@ -1042,14 +1052,26 @@ async fn readable_metadata(
     )
     .await
     {
-        Ok(()) => bucket_metadata(context, bucket, info).await,
+        Ok(()) => bucket_metadata(context, bucket, info).await?,
         // Only a refusal omits the metadata; unreadable policy state stays a retryable failure.
         Err(
             AuthorizeError::PermissionDenied
             | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
-        ) => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
+        ) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    let described = match metadata.dataset {
+        Some(dataset) => {
+            let token = bearer.and_then(|token| crate::metadata::AuthToken::bearer(token).ok());
+            let read = dataset_description(context, auth.realm_id, dataset, (Some(auth), token));
+            read.await.unwrap_or_default()
+        }
+        None => Default::default(),
+    };
+    Ok(Some(CapturedDatabase::new(metadata, described)))
 }
 
 /// The releases that pin one input version, checked with the caller's own access; a check that

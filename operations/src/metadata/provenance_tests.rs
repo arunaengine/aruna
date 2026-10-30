@@ -364,3 +364,31 @@ fn releases_join_export() {
     let marker = node(&document, &format!("{version}#release-membership"));
     assert_eq!(marker["value"], "incomplete");
 }
+
+#[test]
+fn database_from_dataset() {
+    // A database bucket's version is part of the dataset that describes the bucket now.
+    let file = arn(1, "db/genes.tsv");
+    let dataset = Ulid::from_bytes([7; 16]);
+    let origin = json!({
+        "origin": { "kind": "upload" },
+        "bucket_metadata": { "database": true, "dataset": dataset.to_string() },
+        "description": {
+            "title": "Bakta database",
+            "description": "Annotation database",
+            "version": "6.0",
+            "identifiers": [{ "name": "DOI", "value": "10.5281/zenodo.1",
+                              "url": "https://doi.org/10.5281/zenodo.1" }]
+        }
+    });
+    let (document, _, _) = walk(&file, &BTreeMap::from([(file.clone(), origin)]));
+    let id = format!("https://w3id.org/aruna/{dataset}");
+    assert_eq!(node(&document, &file)["isPartOf"][0]["@id"], id.as_str());
+    let database = node(&document, &id);
+    assert_eq!(database["name"], "Bakta database (current metadata)");
+    assert_eq!(database["description"], "Annotation database");
+    assert_eq!(
+        database["identifier"][0],
+        "https://doi.org/10.5281/zenodo.1"
+    );
+}
