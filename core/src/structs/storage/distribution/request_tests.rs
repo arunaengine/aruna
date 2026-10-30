@@ -377,7 +377,7 @@ fn metadata_survives_settings() {
     use crate::structs::storage::bucket_metadata::BucketMetadata;
     let metadata = BucketMetadata {
         database: true,
-        title: Some("Bakta DB".to_string()),
+        dataset: Some(ulid::Ulid::from_bytes([9; 16])),
         ..BucketMetadata::default()
     };
     let metadata = Box::new(metadata);
@@ -404,12 +404,7 @@ fn metadata_survives_settings() {
     assert!(cleared.config.settings.public);
     let broken = DistributionRequest::ChangeMetadata {
         metadata: Some(Box::new(BucketMetadata {
-            identifiers: vec![crate::structs::identity::identifier::Identifier {
-                name: "DOI".to_string(),
-                value: "10.1/x".to_string(),
-                url: "javascript:alert(1)".to_string(),
-                target: crate::structs::identity::identifier::IdentifierTarget::Key,
-            }],
+            database: true,
             ..BucketMetadata::default()
         })),
     };
