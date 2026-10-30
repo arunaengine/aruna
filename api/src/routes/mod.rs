@@ -63,6 +63,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::blobs::router())
         .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
+        .merge(storage::bucket_dataset::router())
         .merge(storage::bucket_metadata::router())
         .merge(storage::releases::router())
         .merge(storage::moves::router())
