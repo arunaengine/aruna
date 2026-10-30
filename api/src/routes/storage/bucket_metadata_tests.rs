@@ -26,38 +26,63 @@ async fn put(node: &Node, body: serde_json::Value) -> ServerResult<BucketMetadat
     .map(|Json(response)| response)
 }
 
-async fn title(node: &Node) -> Option<String> {
+async fn stored(node: &Node) -> Option<BucketMetadataBody> {
     let Json(read) = get_bucket_metadata(
         State(node.state.clone()),
         Extension(Some(node.owner.clone())),
+        Extension(None),
         Path(BUCKET.to_string()),
     )
     .await
     .unwrap();
-    read.metadata.and_then(|metadata| metadata.title)
+    read.metadata
 }
 
 // A body without `metadata`, or with an unknown field, is refused and never clears what is set.
 #[tokio::test]
 async fn requires_metadata_field() {
     let node = node_state().await;
-    put(&node, json!({"metadata": {"title": "Bakta database"}}))
+    put(&node, json!({"metadata": {"parser": null}}))
         .await
         .unwrap();
 
-    let flat = put(&node, json!({"title": "Bakta", "database": true})).await;
+    let flat = put(&node, json!({"database": false})).await;
     assert!(
         matches!(flat, Err(ServerError::BadRequestReason(_))),
         "{flat:?}"
     );
-    let extra = put(&node, json!({"metadata": {"title": "x"}, "dataset": "y"})).await;
+    let extra = put(&node, json!({"metadata": {}, "dataset": "y"})).await;
     assert!(
         matches!(extra, Err(ServerError::BadRequestReason(_))),
         "{extra:?}"
     );
-    assert_eq!(title(&node).await.as_deref(), Some("Bakta database"));
+    assert!(stored(&node).await.is_some());
 
     let cleared = put(&node, json!({"metadata": null})).await.unwrap();
     assert!(cleared.metadata.is_none());
-    assert_eq!(title(&node).await, None);
+    assert!(stored(&node).await.is_none());
+}
+
+// The description lives only in the dataset: former description fields are refused, a database
+// needs a dataset, and a dataset the caller cannot read is never linked.
+#[tokio::test]
+async fn description_only_in_dataset() {
+    let node = node_state().await;
+    for field in ["title", "description", "version", "license", "identifiers"] {
+        let body = json!({"metadata": {"database": false, field: "x"}});
+        let refused = put(&node, body).await;
+        assert!(
+            matches!(refused, Err(ServerError::BadRequestReason(_))),
+            "{field}: {refused:?}"
+        );
+    }
+    let without = put(&node, json!({"metadata": {"database": true}})).await;
+    assert!(
+        matches!(without, Err(ServerError::BadRequestReason(_))),
+        "{without:?}"
+    );
+    let unknown = Ulid::from_bytes([77; 16]).to_string();
+    let missing = put(&node, json!({"metadata": {"dataset": unknown}})).await;
+    assert!(missing.is_err(), "{missing:?}");
+    assert!(stored(&node).await.is_none(), "nothing was linked");
 }

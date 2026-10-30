@@ -37,9 +37,12 @@ use utoipa_axum::routes;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::metadata::forwarded_auth_token;
 use crate::routes::identifiers::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
-use crate::routes::storage::bucket_metadata::{BucketIdentifierBody, BucketMetadataBody};
+use crate::routes::storage::bucket_metadata::{
+    BucketIdentifierBody, BucketMetadataBody, DatasetDescriptionBody, describe_bucket,
+};
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
 use crate::routes::storage::relay::{
@@ -151,6 +154,9 @@ pub struct OriginResponse {
     pub projection: Vec<ProjectionBody>,
     /// The bucket's metadata now; it may have changed since the version was made.
     pub bucket_metadata: Option<BucketMetadataBody>,
+    /// What the bucket's linked dataset says now, read with the caller's access.
+    #[serde(default)]
+    pub description: Option<DatasetDescriptionBody>,
     /// Links the bucket metadata's identifier rules find in the key and source URL.
     #[serde(default)]
     pub identifiers: Vec<IdentifierView>,
@@ -271,6 +277,7 @@ impl From<OriginView> for OriginResponse {
                 })
                 .collect(),
             bucket_metadata: view.bucket_metadata.map(Into::into),
+            description: None,
             identifiers: view.identifiers.into_iter().map(Into::into).collect(),
             content_id: view.content_hash.map(content_id),
             stale_ranges: Vec::new(),
@@ -299,7 +306,8 @@ impl From<OriginView> for OriginResponse {
   its bucket and key, so it is left out); `CreateAction` for job results; nothing for
   uploads and imports in place; `identifier` for each link the database's parser finds.
 - `bucket_metadata` and `identifiers` come from the bucket's metadata now, not from when the
-  version was made; a bucket without metadata gives none.
+  version was made; a bucket without metadata gives none. `description` is what the bucket's
+  linked dataset says now, read with the caller's access; it is `null` while it cannot be read.
 - `releases` lists the bucket's releases whose release crate names exactly this version, among
   those the caller may read. `releases_complete` is `false` when membership could not be
   checked everywhere (a range holder of a distributed bucket did not answer), so a release may
@@ -326,6 +334,7 @@ impl From<OriginView> for OriginResponse {
             "source": null,
             "projection": [{"property": "isBasedOn", "id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"}],
             "bucket_metadata": null,
+            "description": null,
             "identifiers": [],
             "content_id": "https://w3id.org/aruna/data/af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         })),
@@ -469,7 +478,11 @@ async fn origin_answer(
         (OriginError::Storage(reason), _) => ServerError::InternalError(reason),
     })?;
     let version_id = view.version_id;
+    let token = forwarded_auth_token(bearer.clone())?;
+    let metadata = view.bucket_metadata.as_ref();
+    let (description, _) = describe_bucket(state, metadata, (Some(auth), token)).await;
     let mut answer = OriginResponse::from(view);
+    answer.description = description;
     answer.stale_ranges = stale.iter().map(ToString::to_string).collect();
     // Only releases the caller may read count; any other node is asked with its own bearer.
     let scope = BucketScope {
@@ -561,6 +574,7 @@ pub struct VersionOriginParams {
             "source": null,
             "projection": [{"property": "CreateAction", "run_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2"}],
             "bucket_metadata": null,
+            "description": null,
             "identifiers": [],
             "content_id": null
         })),

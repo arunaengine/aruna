@@ -15,9 +15,10 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
 use aruna_operations::metadata::api::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
-    ObjectExecution, ObjectQueryMode, SearchQueryRequest, search_buckets_distributed,
-    search_metadata as run_search_metadata, search_objects,
+    ObjectExecution, ObjectQueryMode, SearchQueryRequest, forwarded_bearer,
+    search_buckets_distributed, search_metadata as run_search_metadata, search_objects,
 };
+use aruna_operations::s3::bucket::metadata::dataset_description;
 use aruna_operations::s3::object::search::ObjectKeyMatch;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{Query, State};
@@ -282,6 +283,9 @@ pub struct BucketHit {
     /// The bucket's current metadata, if it has any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<crate::routes::storage::bucket_metadata::BucketMetadataBody>,
+    /// What a database's linked dataset says now, read with the caller's access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<crate::routes::storage::bucket_metadata::DatasetDescriptionBody>,
     /// Anyone, also without a login, may read the bucket; in a `database=true` search only.
     #[serde(default)]
     pub public: bool,
@@ -396,7 +400,9 @@ to its own buckets, so a bucket the caller may not read never appears.
 - The search fans out over the realm's serving nodes under one shared deadline of about 12 seconds.
 - An empty or missing `q` lists every bucket the caller may read; `group_id` keeps only the
   buckets of that group.
-- Every hit carries the bucket's current `metadata`, if it has any.
+- Every hit carries the bucket's current `metadata`, if it has any. A database hit also
+  carries `description`, read now from its linked dataset with the caller's access; it is
+  absent while that dataset cannot be read. Queries match bucket names only.
 - `database=true` keeps only buckets whose current metadata marks them as a database, across
   groups, and adds `public` (readable without a login) to each hit. This is how clients find
   databases; there is no separate database list.
@@ -470,13 +476,14 @@ pub async fn bucket_search(
         return Err(ServerError::BadRequest);
     }
     let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
+    let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
     let result = search_buckets_distributed(
         state.get_ctx().as_ref(),
         state.get_realm_id(),
         state.get_node_id(),
         BucketSearchRequest {
-            auth,
-            bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
+            auth: auth.clone(),
+            bearer_token: bearer.clone(),
             query: query.to_string(),
             limit: params
                 .limit
@@ -490,7 +497,9 @@ pub async fn bucket_search(
     )
     .await
     .map_err(map_api_error)?;
-    Ok((StatusCode::OK, Json(map_bucket_section(result))))
+    let mut section = map_bucket_section(result);
+    describe_hits(&state, &auth, bearer.as_deref(), &mut section).await;
+    Ok((StatusCode::OK, Json(section)))
 }
 
 #[utoipa::path(
@@ -934,7 +943,7 @@ async fn run_buckets(
         state.get_node_id(),
         BucketSearchRequest {
             auth: auth.clone(),
-            bearer_token,
+            bearer_token: bearer_token.clone(),
             query: query.to_string(),
             limit: limit.min(MAX_BUCKET_LIMIT),
             group_id: None,
@@ -945,7 +954,43 @@ async fn run_buckets(
     )
     .await
     .map_err(map_api_error)?;
-    Ok(Some(map_bucket_section(result)))
+    let mut section = map_bucket_section(result);
+    describe_hits(state, auth, bearer_token.as_deref(), &mut section).await;
+    Ok(Some(section))
+}
+
+/// Datasets one search reads at the same time.
+const DESCRIBE_READS: usize = 8;
+
+/// Adds the linked dataset's description to every database hit, reading each dataset once with
+/// the caller's access; a dataset that cannot be read now leaves its hits without one.
+async fn describe_hits(
+    state: &ServerState,
+    auth: &AuthContext,
+    bearer: Option<&str>,
+    section: &mut BucketsSection,
+) {
+    use futures_util::StreamExt;
+    let dataset_of = |hit: &BucketHit| {
+        let metadata = hit.metadata.as_ref().filter(|metadata| metadata.database)?;
+        Ulid::from_string(metadata.dataset.as_deref()?).ok()
+    };
+    let datasets: std::collections::BTreeSet<Ulid> =
+        section.hits.iter().filter_map(dataset_of).collect();
+    let ctx = state.get_ctx();
+    let reads = datasets.into_iter().map(|dataset| {
+        let token = forwarded_bearer(bearer).ok().flatten();
+        let read = dataset_description(&ctx, state.get_realm_id(), dataset, (Some(auth), token));
+        async move { (dataset, read.await.ok()) }
+    });
+    let found: std::collections::BTreeMap<_, _> = futures_util::stream::iter(reads)
+        .buffer_unordered(DESCRIBE_READS)
+        .collect()
+        .await;
+    for hit in &mut section.hits {
+        let described = dataset_of(hit).and_then(|dataset| found.get(&dataset).cloned());
+        hit.description = described.flatten().map(Into::into);
+    }
 }
 
 fn map_bucket_section(result: BucketSearchExecution) -> BucketsSection {
@@ -971,6 +1016,7 @@ fn map_bucket_section(result: BucketSearchExecution) -> BucketsSection {
                 created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
                 set_id: hit.set_id.map(|set_id| set_id.to_string()),
                 metadata: hit.metadata.map(Into::into),
+                description: None,
                 public: hit.public,
             })
             .collect(),
