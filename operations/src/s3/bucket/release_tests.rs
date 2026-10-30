@@ -145,6 +145,7 @@ async fn operation(
         bearer: bearer.map(str::to_string),
         queries,
         ranges: None,
+        retention: false,
     })
 }
 

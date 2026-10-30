@@ -3,95 +3,111 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+// Every release counts, also one the caller cannot read, so a refusal names none.
+
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::release::{
-    BucketScope, MembersOutput, MembershipCaller, MembershipQuery, release_members,
+    BucketScope, MembersConfig, MembersOutput, MembershipQuery, ReleaseMembersOperation,
+    load_access,
 };
-use crate::s3::bucket::release_view::{FilePage, ViewError, release_view};
+use crate::s3::bucket::release_view::{FilePage, ReleaseViewOperation, ViewConfig, ViewError};
 
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PinnedError {
     #[error(
-        "version {version_id} of `{key}` is pinned by release {}; delete the key for a delete \
-         marker instead, or delete the release crate version first",
-        names(.releases)
+        "version {version_id} of `{key}` is pinned by a release; delete the key for a delete \
+         marker instead, or delete the release crate version first"
     )]
-    Version {
-        key: String,
-        version_id: Ulid,
-        releases: Vec<String>,
-    },
+    Version { key: String, version_id: Ulid },
     #[error(
-        "versions in this scope are pinned by release {}; delete the release crate versions \
-         first, or delete the keys for delete markers instead",
-        names(.0)
+        "versions in this scope are pinned by a release; delete the release crate versions \
+         first, or delete the keys for delete markers instead"
     )]
-    Scope(Vec<String>),
+    Scope,
     #[error("the releases of the bucket could not all be checked, so nothing was deleted: {0}")]
     Unchecked(String),
 }
 
-fn names(releases: &[String]) -> String {
-    let quoted: Vec<String> = releases.iter().map(|label| format!("`{label}`")).collect();
-    quoted.join(", ")
-}
-
-/// The labels of the releases that pin each queried version, in query order. An answer that
-/// may miss a release refuses, since the deletion could break it.
-pub fn pinned_labels(
+/// Whether a release pins each queried version, in query order. An answer that may miss a
+/// release refuses, since the deletion could break it.
+pub fn pinned(
     queries: &[MembershipQuery],
     output: &MembersOutput,
-) -> Result<Vec<Vec<String>>, PinnedError> {
+) -> Result<Vec<bool>, PinnedError> {
     if !output.complete || output.answers.len() != queries.len() {
         return Err(PinnedError::Unchecked(
             "a release crate could not be read".to_string(),
         ));
     }
     Ok((output.answers.iter())
-        .map(|answer| {
-            let labels = answer.releases.iter().map(|release| release.label.clone());
-            labels.collect()
-        })
+        .map(|answer| !answer.releases.is_empty())
         .collect())
 }
 
-/// The labels of the releases that pin each of `queries`, read with the caller's access.
+/// Every release of the bucket that pins `queries`, whatever the caller may read. A
+/// distributed bucket deletes no single versions, so only this node's releases count.
+async fn retained(
+    context: &DriverContext,
+    scope: BucketScope<'_>,
+    auth: &AuthContext,
+    queries: &[MembershipQuery],
+) -> Result<MembersOutput, PinnedError> {
+    let unchecked = |error: &dyn std::fmt::Display| PinnedError::Unchecked(error.to_string());
+    let access = load_access(context, scope, auth)
+        .await
+        .map_err(|error| unchecked(&error))?;
+    let config = MembersConfig {
+        realm_id: scope.realm_id,
+        node_id: scope.node_id,
+        bucket: scope.bucket.to_string(),
+        info: scope.info.clone(),
+        auth: auth.clone(),
+        access,
+        bearer: None,
+        queries: queries.to_vec(),
+        ranges: None,
+        retention: true,
+    };
+    drive(ReleaseMembersOperation::new(config), context)
+        .await
+        .map_err(|error| unchecked(&error))
+}
+
+/// Whether a release pins each of `queries`.
 pub async fn version_pins(
     context: &DriverContext,
     scope: BucketScope<'_>,
-    caller: MembershipCaller<'_>,
+    auth: &AuthContext,
     queries: &[MembershipQuery],
-) -> Result<Vec<Vec<String>>, PinnedError> {
-    if queries.is_empty() {
-        return Ok(Vec::new());
+) -> Result<Vec<bool>, PinnedError> {
+    if queries.is_empty() || scope.info.distribution.is_some() {
+        return Ok(vec![false; queries.len()]);
     }
-    let output = release_members(context, scope, caller, queries)
-        .await
-        .map_err(|error| PinnedError::Unchecked(error.to_string()))?;
-    pinned_labels(queries, &output)
+    let output = retained(context, scope, auth, queries).await?;
+    pinned(queries, &output)
 }
 
 /// Refuses the permanent deletion of one version a release pins.
 pub async fn refuse_pinned(
     context: &DriverContext,
     scope: BucketScope<'_>,
-    caller: MembershipCaller<'_>,
+    auth: &AuthContext,
     (key, version_id): (&str, Ulid),
 ) -> Result<(), PinnedError> {
     let query = MembershipQuery {
         key: key.to_string(),
         version_id,
     };
-    let pins = version_pins(context, scope, caller, std::slice::from_ref(&query)).await?;
-    match pins.into_iter().next() {
-        Some(releases) if !releases.is_empty() => Err(PinnedError::Version {
+    let pins = version_pins(context, scope, auth, std::slice::from_ref(&query)).await?;
+    match pins.first() {
+        Some(true) => Err(PinnedError::Version {
             key: key.to_string(),
             version_id,
-            releases,
         }),
         _ => Ok(()),
     }
@@ -109,53 +125,52 @@ fn reach<'a>(scope: &'a StoragePurgeScope, prefix: &str) -> Option<&'a str> {
 pub async fn refuse_scope(
     context: &DriverContext,
     scope: BucketScope<'_>,
-    caller: MembershipCaller<'_>,
+    auth: &AuthContext,
     purge: &StoragePurgeScope,
 ) -> Result<(), PinnedError> {
-    if purge.is_bucket() {
+    if purge.is_bucket() || scope.info.distribution.is_some() {
         return Ok(());
     }
-    let output = release_members(context, scope, caller, &[])
-        .await
-        .map_err(|error| PinnedError::Unchecked(error.to_string()))?;
+    let output = retained(context, scope, auth, &[]).await?;
     if !output.complete {
         return Err(PinnedError::Unchecked(
             "a release crate could not be read".to_string(),
         ));
     }
-    let mut pinning = Vec::new();
+    let unrestricted = AuthContext {
+        path_restrictions: None,
+        ..auth.clone()
+    };
     for release in &output.releases {
         let Some(wanted) = reach(purge, &release.prefix) else {
             continue;
         };
-        let page = FilePage {
-            prefix: wanted.to_string(),
-            limit: 1,
-            ..FilePage::default()
+        let config = ViewConfig {
+            realm_id: scope.realm_id,
+            node_id: scope.node_id,
+            bucket: scope.bucket.to_string(),
+            info: scope.info.clone(),
+            auth: unrestricted.clone(),
+            key: release.key.clone(),
+            version_id: release.version_id,
+            page: FilePage {
+                prefix: wanted.to_string(),
+                limit: 1,
+                ..FilePage::default()
+            },
         };
-        let found = release_view(
-            context,
-            scope,
-            caller.auth,
-            (&release.key, release.version_id),
-            page,
-        )
-        .await;
-        let pins = match found {
+        let pins = match drive(ReleaseViewOperation::new(config), context).await {
             Ok(view) => {
                 (view.files.first()).is_some_and(|file| purge.matches_key(scope.bucket, &file.key))
             }
             Err(ViewError::Missing | ViewError::NoRelease) => false,
             Err(error) => return Err(PinnedError::Unchecked(error.to_string())),
         };
-        if pins && !pinning.contains(&release.release.label) {
-            pinning.push(release.release.label.clone());
+        if pins {
+            return Err(PinnedError::Scope);
         }
     }
-    match pinning.is_empty() {
-        true => Ok(()),
-        false => Err(PinnedError::Scope(pinning)),
-    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 //! Tests the release pin refusal of permanent deletions: which answers refuse, which purge
-//! scopes a release reaches, and the release names in the refusal.
+//! scopes a release reaches, and that a refusal names no release.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -41,23 +41,20 @@ fn output(answers: Vec<Vec<ReleaseRef>>, complete: bool) -> MembersOutput {
 }
 
 #[test]
-fn labels_follow_queries() {
+fn pins_follow_queries() {
     let queries = [query("db/a"), query("db/b")];
     let answers = vec![vec![release("6.0"), release("6.1")], Vec::new()];
-    let pins = pinned_labels(&queries, &output(answers, true)).unwrap();
-    assert_eq!(
-        pins,
-        [vec!["6.0".to_string(), "6.1".to_string()], Vec::new()]
-    );
+    let pins = pinned(&queries, &output(answers, true)).unwrap();
+    assert_eq!(pins, [true, false]);
 }
 
 #[test]
 fn unchecked_answers_refuse() {
     // A release that could not be read may pin the version, so nothing is deleted.
     let queries = [query("db/a")];
-    let incomplete = pinned_labels(&queries, &output(vec![Vec::new()], false));
+    let incomplete = pinned(&queries, &output(vec![Vec::new()], false));
     assert!(matches!(incomplete, Err(PinnedError::Unchecked(_))));
-    let short = pinned_labels(&queries, &output(Vec::new(), true));
+    let short = pinned(&queries, &output(Vec::new(), true));
     assert!(matches!(short, Err(PinnedError::Unchecked(_))));
 }
 
@@ -85,17 +82,16 @@ fn scopes_reach_releases() {
 }
 
 #[test]
-fn refusal_names_releases() {
+fn refusal_names_none() {
+    // A release the caller cannot read also refuses, so no release label is shown.
     let error = PinnedError::Version {
         key: "db/a".to_string(),
         version_id: Ulid::from_bytes([1; 16]),
-        releases: vec!["6.0".to_string(), "6.1".to_string()],
     };
     let message = error.to_string();
     assert!(
-        message.contains("`6.0`, `6.1`") && message.contains("db/a"),
+        message.contains("db/a") && message.contains("a release"),
         "{message}"
     );
-    let scope = PinnedError::Scope(vec!["6.0 light".to_string()]).to_string();
-    assert!(scope.contains("`6.0 light`"), "{scope}");
+    assert!(PinnedError::Scope.to_string().contains("a release"));
 }

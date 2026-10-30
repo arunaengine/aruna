@@ -591,6 +591,7 @@ pub async fn holder_answer(
                 bearer: None,
                 queries,
                 ranges: Some(range_ids),
+                retention: false,
             };
             let output = drive(ReleaseMembersOperation::new(config), context).await?;
             Ok(HolderAnswer::Members(RangeMembers {

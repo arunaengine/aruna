@@ -6,7 +6,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery};
+use aruna_operations::s3::bucket::release::{BucketScope, MembershipQuery};
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_pinned, version_pins};
 use s3s::dto::Error as S3DeleteError;
@@ -18,7 +18,7 @@ use crate::s3::error::IntoS3Error;
 
 const PINNED_CODE: &str = "VersionPinnedByRelease";
 
-/// A pinned version answers 409 naming its releases; an unchecked one 503.
+/// A pinned version answers 409; an unchecked one 503.
 pub(super) fn pinned_error(error: &PinnedError) -> S3Error {
     let (code, status) = match error {
         PinnedError::Unchecked(_) => (
@@ -71,9 +71,8 @@ impl ArunaS3Service {
         let Some(info) = self.release_info(bucket, info).await? else {
             return Ok(());
         };
-        let caller = MembershipCaller { auth, bearer: None };
         let scope = self.scope(bucket, &info);
-        refuse_pinned(&self.state, scope, caller, (key, version_id))
+        refuse_pinned(&self.state, scope, auth, (key, version_id))
             .await
             .map_err(|error| pinned_error(&error))
     }
@@ -101,8 +100,7 @@ impl ArunaS3Service {
                 })
             })
             .collect();
-        let caller = MembershipCaller { auth, bearer: None };
-        let pins = version_pins(&self.state, self.scope(bucket, &info), caller, &queries).await;
+        let pins = version_pins(&self.state, self.scope(bucket, &info), auth, &queries).await;
         let mut pins = match pins {
             Ok(pins) => pins.into_iter().map(Ok).collect::<Vec<_>>().into_iter(),
             Err(error) => vec![Err(error); queries.len()].into_iter(),
@@ -114,11 +112,10 @@ impl ArunaS3Service {
                 continue;
             };
             let refusal = match pins.next() {
-                Some(Ok(releases)) if releases.is_empty() => None,
-                Some(Ok(releases)) => Some(PinnedError::Version {
+                Some(Ok(false)) => None,
+                Some(Ok(true)) => Some(PinnedError::Version {
                     key: entry.key.clone(),
                     version_id,
-                    releases,
                 }),
                 Some(Err(error)) => Some(error),
                 None => Some(PinnedError::Unchecked("no answer".to_string())),
@@ -149,16 +146,10 @@ mod tests {
         let pinned = PinnedError::Version {
             key: "db/a".to_string(),
             version_id: Ulid::from_bytes([1; 16]),
-            releases: vec!["6.0".to_string()],
         };
         let refused = pinned_error(&pinned);
         assert_eq!(*refused.code(), S3ErrorCode::Custom(PINNED_CODE.into()));
         assert_eq!(refused.status_code(), Some(http::StatusCode::CONFLICT));
-        assert!(
-            refused
-                .message()
-                .is_some_and(|message| message.contains("`6.0`"))
-        );
         let unchecked = pinned_error(&PinnedError::Unchecked("down".to_string()));
         assert_eq!(
             unchecked.status_code(),

@@ -16,7 +16,7 @@ use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::jobs::service::submit_purge_job;
 use aruna_operations::metadata::api::set_preview_distributed;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
+use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_scope};
 use aruna_operations::s3::object::versions::{
@@ -479,9 +479,9 @@ async fn set_coverage(
   is deleted only at the exact backend version Aruna recorded, only after the versions are gone
   and on disk, and only while no other key, version, link or copy reads it; such files stay.
   It needs an unrestricted token, and for a bucket `confirm` set to the bucket name.
-- A file or folder purge is refused while a release the caller can read pins a version in
-  it; the refusal names the releases. Delete the release crate version first, or delete the
-  keys for delete markers. A bucket purge deletes the releases with their files.
+- A file or folder purge is refused while any release pins a version in it, also one the
+  caller cannot read; the refusal names no release. Delete the release crate version first, or
+  delete the keys for delete markers. A bucket purge deletes the releases with their files.
 - `POST /data/storage/purge/jobs/{job_id}/{action}` pauses, resumes or aborts the purge."#,
     request_body(
         content = SubmitPurgeRequest,
@@ -520,7 +520,7 @@ async fn set_coverage(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not delete the selected scope permanently, or a restricted token asks to delete storage files", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
-        (status = 409, description = "The idempotency key is retained for a purge of a different scope, or a release pins a version in the file or folder; the message names the releases", body = ErrorResponse),
+        (status = 409, description = "The idempotency key is retained for a purge of a different scope, or a release pins a version in the file or folder", body = ErrorResponse),
         (status = 503, description = "The bucket's releases could not all be checked", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -528,7 +528,6 @@ async fn set_coverage(
 pub async fn submit_purge(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<SubmitPurgeRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitPurgeResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
@@ -554,7 +553,7 @@ pub async fn submit_purge(
     {
         return Err(ServerError::Forbidden);
     }
-    refuse_released(&state, (&info, bearer.as_ref()), &auth, &scope).await?;
+    refuse_released(&state, &info, &auth, &scope).await?;
     let spec = StoragePurgeSpec {
         scope,
         group_id: info.group_id,
@@ -585,11 +584,11 @@ pub async fn submit_purge(
     ))
 }
 
-/// Refuses a purge of versions a release of the bucket pins: 409 naming the releases, 503
-/// when a release could not be checked.
+/// Refuses a purge of versions a release of the bucket pins: 409, or 503 when a release could
+/// not be checked.
 async fn refuse_released(
     state: &ServerState,
-    (info, bearer): (&BucketInfo, Option<&ValidatedBearer>),
+    info: &BucketInfo,
     auth: &AuthContext,
     scope: &StoragePurgeScope,
 ) -> ServerResult<()> {
@@ -599,11 +598,7 @@ async fn refuse_released(
         bucket: scope.bucket(),
         info,
     };
-    let caller = MembershipCaller {
-        auth,
-        bearer: bearer.map(ValidatedBearer::as_str),
-    };
-    match refuse_scope(state.get_ctx().as_ref(), place, caller, scope).await {
+    match refuse_scope(state.get_ctx().as_ref(), place, auth, scope).await {
         Ok(()) => Ok(()),
         Err(error @ PinnedError::Unchecked(_)) => {
             Err(ServerError::ServiceUnavailableReason(error.to_string()))

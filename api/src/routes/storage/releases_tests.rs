@@ -370,16 +370,25 @@ async fn purge_keeps_pinned() {
         bucket: BUCKET,
         info: &info,
     };
-    let caller = MembershipCaller {
-        auth: &node.owner,
-        bearer: None,
-    };
+    let caller = &node.owner;
     let context = state.get_ctx();
     let refused = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", pinned)).await;
-    let Err(PinnedError::Version { releases, .. }) = refused else {
-        panic!("the pinned version is kept: {refused:?}");
+    assert!(
+        matches!(refused, Err(PinnedError::Version { .. })),
+        "the pinned version is kept: {refused:?}"
+    );
+    // A caller who cannot read the release crate is refused too, without its name.
+    let (realm, node_id) = (state.get_realm_id(), state.get_node_id());
+    let path = object_permission_path(realm, node.group_id, node_id, BUCKET, "db/a.fasta");
+    let blind = limited(&node, &[(path, Permission::WRITE)]);
+    let refused = refuse_pinned(context.as_ref(), scope, &blind, ("db/a.fasta", pinned)).await;
+    assert!(matches!(refused, Err(PinnedError::Version { .. })));
+    let file = StoragePurgeScope::File {
+        bucket: BUCKET.to_string(),
+        key: "db/a.fasta".to_string(),
     };
-    assert_eq!(releases, ["6.0"]);
+    let refused = refuse_scope(context.as_ref(), scope, &blind, &file).await;
+    assert_eq!(refused, Err(PinnedError::Scope));
     // The newer version and the release crate itself belong to no release.
     let newer = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", current)).await;
     assert_eq!(newer, Ok(()));
@@ -400,10 +409,7 @@ async fn purge_keeps_pinned() {
         bucket: BUCKET.to_string(),
         key: "db/a.fasta".to_string(),
     };
-    assert_eq!(
-        purge(file).await,
-        Err(PinnedError::Scope(vec!["6.0".to_string()]))
-    );
+    assert_eq!(purge(file).await, Err(PinnedError::Scope));
     let folder = |prefix: &str| StoragePurgeScope::Prefix {
         bucket: BUCKET.to_string(),
         prefix: prefix.to_string(),
@@ -421,7 +427,6 @@ async fn purge_keeps_pinned() {
     let submitted = submit_purge(
         State(node.state.clone()),
         Extension(Some(node.owner.clone())),
-        Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         Json(SubmitPurgeRequest {
             scope: PurgeScopeRequest::File {
                 bucket: BUCKET.to_string(),
@@ -436,5 +441,5 @@ async fn purge_keeps_pinned() {
     let Err(ServerError::Conflict(message)) = submitted else {
         panic!("the purge of a pinned file is refused: {submitted:?}");
     };
-    assert!(message.contains("`6.0`"), "{message}");
+    assert!(!message.contains("6.0"), "{message}");
 }
