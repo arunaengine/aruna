@@ -37,6 +37,7 @@ use crate::replication::bootstrap::wake_bootstrap;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::delete::DeleteBucketOperation;
 use crate::s3::bucket::get::GetBucketOperation;
+use crate::s3::bucket::metadata::{DescriptionError, dataset_description};
 
 /// A publish attempt retries a storage conflict this often before it gives up.
 const PUBLISH_ATTEMPTS: usize = 3;
@@ -135,12 +136,15 @@ pub(crate) async fn serve_publish(
             set_id,
             request_id,
             request,
-        } => match caller(context, peer, auth_token).await {
+        } => match caller(context, peer, auth_token.clone()).await {
             // Statements carry their signer's authority, never a forwarded caller's.
             Ok(_) if !request.admin() => Err(PublishRefusal::Rejected(
                 "statements are submitted without a caller".to_string(),
             )),
-            Ok(auth) => publish_local(context, set_id, request_id, *request, Some(auth)).await,
+            Ok(auth) => match readable_link(context, (&auth, auth_token), &request).await {
+                Ok(()) => publish_local(context, set_id, request_id, *request, Some(auth)).await,
+                Err(refusal) => Err(refusal),
+            },
             Err(SyncRefusal::Unavailable) => Err(PublishRefusal::Unavailable(
                 "the caller could not be checked".to_string(),
             )),
@@ -160,6 +164,36 @@ pub(crate) async fn serve_publish(
         _ => return reject("unexpected distribution message"),
     };
     MetadataTransportMessage::DistributionAccepted { result }
+}
+
+/// Refuses a metadata change that links a dataset the caller cannot read or that is no Dataset,
+/// as the metadata route does.
+async fn readable_link(
+    context: &DriverContext,
+    (auth, token): (&AuthContext, AuthToken),
+    request: &DistributionRequest,
+) -> Result<(), PublishRefusal> {
+    let DistributionRequest::ChangeMetadata {
+        metadata: Some(metadata),
+        ..
+    } = request
+    else {
+        return Ok(());
+    };
+    let Some(dataset) = metadata.dataset else {
+        return Ok(());
+    };
+    let caller = (Some(auth), Some(token));
+    match dataset_description(context, auth.realm_id, dataset, caller).await {
+        Ok(_) => Ok(()),
+        Err(DescriptionError::Unreadable) => Err(PublishRefusal::Rejected(format!(
+            "dataset {dataset} does not exist or you may not read it"
+        ))),
+        Err(DescriptionError::Invalid(reason)) => Err(PublishRefusal::Rejected(reason)),
+        Err(DescriptionError::Unavailable) => Err(PublishRefusal::Unavailable(format!(
+            "dataset {dataset} could not be read now"
+        ))),
+    }
 }
 
 /// Only configured realm infrastructure nodes relay statements; devices are refused.

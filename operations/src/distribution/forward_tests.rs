@@ -117,6 +117,40 @@ fn internal_tokens_refused() {
     assert!(bearer_only(&AuthToken::bearer("token").unwrap()));
 }
 
+// The publisher checks a linked dataset with the caller's own access, like the REST route.
+#[tokio::test]
+async fn refuses_unreadable_link() {
+    use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
+    let (_directory, context) = crate::tests::notifications::context_with_storage();
+    let realm = RealmId::from_bytes([9; 32]);
+    let auth = AuthContext {
+        user_id: UserId::nil(realm),
+        realm_id: realm,
+        path_restrictions: None,
+        session: None,
+    };
+    let change = |dataset| DistributionRequest::ChangeMetadata {
+        metadata: Some(Box::new(BucketMetadata {
+            dataset,
+            ..BucketMetadata::default()
+        })),
+    };
+    let token = || AuthToken::bearer("token").unwrap();
+    let missing = change(Some(Ulid::from_bytes([7; 16])));
+    let refused = readable_link(&context, (&auth, token()), &missing).await;
+    assert!(
+        matches!(refused, Err(PublishRefusal::Rejected(_))),
+        "{refused:?}"
+    );
+    for unlinked in [
+        change(None),
+        DistributionRequest::ChangeMetadata { metadata: None },
+    ] {
+        let kept = readable_link(&context, (&auth, token()), &unlinked).await;
+        assert_eq!(kept, Ok(()));
+    }
+}
+
 // A refused member's bucket goes, but only while it is still that member's bucket.
 #[tokio::test]
 async fn removes_refused_member() {
