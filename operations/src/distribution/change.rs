@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
 use aruna_core::structs::storage::distribution::capacity::RangeSize;
 use aruna_core::structs::storage::distribution::snapshot::RangeFill;
@@ -16,7 +17,7 @@ use aruna_core::structs::storage::distribution::split::split_ids;
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionError, DistributionMember, DistributionRequest, DistributionRevision,
     DistributionSettings, DistributionSnapshot, MemberState, MetadataCoverage, RangeBehaviour,
-    TransferRole,
+    TransferRole, next_snapshot,
 };
 use ulid::Ulid;
 
@@ -306,21 +307,32 @@ pub async fn split_range(
 ) -> Result<(SplitPlan, Option<DistributionRevision>), CreateError> {
     let (local, snapshot) = head(context, set_id).await?;
     let plan = plan_split(context, &snapshot, range_id, split_key).await?;
+    let request = checked_split(&snapshot, caller.0.realm_id, &plan)?;
     if dry_run {
         return Ok((plan, None));
     }
     needs_coordinator(context, &snapshot, range_id, "the split")?;
+    let revision = send(context, (local, &snapshot), caller, request).await?;
+    Ok((plan, Some(revision)))
+}
+
+/// The split request of `plan`, refused unless the head accepts it as the publisher would.
+fn checked_split(
+    snapshot: &DistributionSnapshot,
+    realm_id: RealmId,
+    plan: &SplitPlan,
+) -> Result<DistributionRequest, CreateError> {
     let epoch = (snapshot.config.ranges.iter())
-        .find(|range| range.range_id == range_id)
+        .find(|range| range.range_id == plan.range_id)
         .map(|range| range.epoch)
         .unwrap_or_default();
     let request = DistributionRequest::Split {
-        range_id,
+        range_id: plan.range_id,
         epoch,
         split_key: plan.split_key.clone(),
     };
-    let revision = send(context, (local, &snapshot), caller, request).await?;
-    Ok((plan, Some(revision)))
+    next_snapshot(realm_id, Some(snapshot), &request)?;
+    Ok(request)
 }
 
 pub async fn change_settings(
@@ -380,7 +392,7 @@ pub async fn delete_set(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::test_record::{member, replicated};
+    use crate::distribution::test_record::{member, realm, record, replicated};
 
     #[test]
     fn refusal_names_eligible() {
@@ -406,5 +418,33 @@ mod tests {
             panic!("a range without copies has no eligible member");
         };
         assert!(message.contains("none"), "{message}");
+    }
+
+    #[test]
+    fn split_checked_early() {
+        // A dry run refuses what the publisher would refuse: a key outside the range.
+        let (snapshot, _) = record(true);
+        let lower = &snapshot.config.ranges[0];
+        let plan = |key: &str| {
+            let [_, lower_id, upper_id] = split_ids(snapshot.set_id(), lower.range_id, 0, key);
+            SplitPlan {
+                range_id: lower.range_id,
+                split_key: key.to_string(),
+                lower_id,
+                upper_id,
+            }
+        };
+        assert!(checked_split(&snapshot, realm(), &plan("f")).is_ok());
+        let refused = checked_split(&snapshot, realm(), &plan("x"));
+        assert!(
+            matches!(refused, Err(CreateError::Distribution(_))),
+            "{refused:?}"
+        );
+        let (pending, _) = record(false);
+        let refused = checked_split(&pending, realm(), &plan("f"));
+        assert!(
+            matches!(refused, Err(CreateError::Distribution(_))),
+            "{refused:?}"
+        );
     }
 }
