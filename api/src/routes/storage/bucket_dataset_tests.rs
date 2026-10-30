@@ -183,3 +183,27 @@ fn keeps_uncertain_links() {
         assert!(!refused(&unknown), "{unknown:?}");
     }
 }
+
+// The link waits until the new dataset is readable, but only for a bounded time.
+#[tokio::test(start_paused = true)]
+async fn waits_until_readable() {
+    let reads = std::cell::Cell::new(0);
+    let later = || {
+        reads.set(reads.get() + 1);
+        let read = match reads.get() {
+            1 | 2 => Err(DescriptionError::Unavailable),
+            _ => Ok(DatasetDescription::default()),
+        };
+        std::future::ready(read)
+    };
+    assert!(becomes_readable(later).await);
+    assert_eq!(reads.get(), 3);
+
+    reads.set(0);
+    let never = || {
+        reads.set(reads.get() + 1);
+        std::future::ready(Err(DescriptionError::Unreadable))
+    };
+    assert!(!becomes_readable(never).await);
+    assert_eq!(reads.get(), READY_DELAYS.len() + 1);
+}

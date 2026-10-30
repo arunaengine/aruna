@@ -4,16 +4,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_identifiers};
 use aruna_core::structs::storage::data::link::DataLink;
+use aruna_core::structs::storage::dataset_description::DatasetDescription;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::route_metadata_delete;
-use aruna_operations::s3::bucket::metadata::bucket_metadata;
+use aruna_operations::s3::bucket::metadata::{
+    DescriptionError, bucket_metadata, dataset_description,
+};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -88,7 +92,9 @@ group's metadata path.
   change fails it with 409. When the link is refused, the new dataset is deleted again. When
   the outcome is not known, or the deletion fails, the dataset stays and the 503 answer names
   it; `GET` shows whether it is linked and `PUT /data/buckets/{bucket}/metadata` links it.
-- The new dataset is read like any other once it is materialized, which takes a moment."#,
+- The new dataset is read like any other once it is materialized, which takes a moment. A
+  distributed bucket links it only once it can be read, after a few seconds at most; until
+  then the 503 answer names it."#,
     params(("bucket" = String, Path, description = "Bucket name on this node")),
     request_body(content = DescribeBucketRequest, example = json!({
         "title": "Bakta database",
@@ -155,6 +161,19 @@ pub async fn describe_bucket(
     )
     .await?;
     let dataset = created.document_id;
+    // A set's publisher reads the dataset before it accepts the link, so it must be readable.
+    if info.distribution.is_some() {
+        let token = forwarded_auth_token(bearer.clone())?;
+        let (ctx, realm_id) = (state.get_ctx(), state.get_realm_id());
+        let caller = (Some(&auth), token);
+        let read = || dataset_description(&ctx, realm_id, dataset, caller.clone());
+        if !becomes_readable(read).await {
+            return Err(ServerError::ServiceUnavailableReason(format!(
+                "dataset {dataset} was created but cannot be read yet; link it with \
+                 PUT /data/buckets/{bucket}/metadata once it can"
+            )));
+        }
+    }
     let metadata = BucketMetadata {
         dataset: Some(dataset),
         ..current.clone()
@@ -194,6 +213,23 @@ pub async fn describe_bucket(
             description,
         }),
     ))
+}
+
+/// Milliseconds between reads of a new dataset; materializing it takes a moment, not forever.
+const READY_DELAYS: [u64; 6] = [100, 200, 400, 800, 1600, 3200];
+
+/// Whether `read` gives the new dataset's description within the bounded wait.
+async fn becomes_readable<R>(mut read: impl FnMut() -> R) -> bool
+where
+    R: Future<Output = Result<DatasetDescription, DescriptionError>>,
+{
+    for delay in READY_DELAYS {
+        if read().await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+    read().await.is_ok()
 }
 
 /// A link the bucket's node or publisher definitely refused; any other failure may have applied.
