@@ -440,4 +440,7 @@ fn metadata_expects_current() {
     );
     let head = step(&head, &link(2, linked(1)));
     assert_eq!(head.config.settings.metadata.as_deref(), Some(&linked(2)));
+    // A retry of the applied change finds its own metadata and succeeds.
+    let head = step(&head, &link(2, linked(1)));
+    assert_eq!(head.config.settings.metadata.as_deref(), Some(&linked(2)));
 }

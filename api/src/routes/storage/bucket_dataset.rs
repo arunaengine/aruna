@@ -85,8 +85,9 @@ group's metadata path.
   it is edited like any dataset afterwards. The bucket's other metadata stays as it is.
 - A bucket that already links a dataset is refused, so a repeated request creates nothing.
 - The link applies only while the bucket's metadata is still what was read; a concurrent
-  change fails it with 409. When the link fails, the new dataset is deleted again; only when
-  that fails too, the answer names it, and `PUT /data/buckets/{bucket}/metadata` links it.
+  change fails it with 409. When the link is refused, the new dataset is deleted again. When
+  the outcome is not known, or the deletion fails, the dataset stays and the 503 answer names
+  it; `GET` shows whether it is linked and `PUT /data/buckets/{bucket}/metadata` links it.
 - The new dataset is read like any other once it is materialized, which takes a moment."#,
     params(("bucket" = String, Path, description = "Bucket name on this node")),
     request_body(content = DescribeBucketRequest, example = json!({
@@ -109,7 +110,7 @@ group's metadata path.
         (status = 403, description = "No WRITE on the owning group's admin or metadata path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "The bucket already links a dataset, or its metadata changed meanwhile", body = ErrorResponse),
-        (status = 503, description = "The dataset was not accepted, or it was created but neither linked nor removed; the message names it then", body = ErrorResponse)
+        (status = 503, description = "The dataset was not accepted, or it was created and may not be linked; the message names it then", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -162,6 +163,13 @@ pub async fn describe_bucket(
     let change = (Some(metadata.clone()), Some(current));
     let linked = write_metadata(&state, (&auth, bearer.clone()), (&bucket, &info), change);
     if let Err(error) = linked.await {
+        if !refused(&error) {
+            return Err(ServerError::ServiceUnavailableReason(format!(
+                "dataset {dataset} was created, but whether it was linked is not known ({error}); \
+                 read GET /data/buckets/{bucket}/metadata, or link it with \
+                 PUT /data/buckets/{bucket}/metadata"
+            )));
+        }
         return Err(match remove_dataset(&state, &auth, bearer, dataset).await {
             Ok(()) => error,
             Err(removal) => ServerError::ServiceUnavailableReason(format!(
@@ -186,6 +194,19 @@ pub async fn describe_bucket(
             description,
         }),
     ))
+}
+
+/// A link the bucket's node or publisher definitely refused; any other failure may have applied.
+fn refused(error: &ServerError) -> bool {
+    matches!(
+        error,
+        ServerError::Conflict(_)
+            | ServerError::BadRequestReason(_)
+            | ServerError::BadRequestMessage(_)
+            | ServerError::Unauthorized
+            | ServerError::Forbidden
+            | ServerError::NotFound
+    )
 }
 
 /// Deletes a dataset this request created but could not link.

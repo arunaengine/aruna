@@ -108,7 +108,7 @@ impl PutMetadataOperation {
         }
     }
 
-    /// Writes only while the bucket's current metadata is still `current`.
+    /// Writes only while the bucket's current metadata is still `current` or already the new one.
     pub fn expecting(mut self, current: BucketMetadata) -> Self {
         self.expected = Some(current);
         self
@@ -204,7 +204,9 @@ impl PutMetadataOperation {
                 Ok(current) => current.unwrap_or_default(),
                 Err(error) => return self.fail(error.into()),
             };
-            if current != *expected {
+            // A retry of a write that already applied finds its own metadata and succeeds.
+            let applied = current == self.metadata.clone().unwrap_or_default();
+            if current != *expected && !applied {
                 return self.fail(PutMetadataError::Changed);
             }
         }
@@ -544,9 +546,13 @@ mod tests {
             bucket_metadata(&context, "db", &info).await,
             Ok(Some(metadata.clone()))
         );
-        // A conditional write applies only while the stored metadata is what it expects.
-        let stale = put(admin).expecting(BucketMetadata::default());
+        // A conditional write applies only while the stored metadata is what it expects, or
+        // already holds what it writes, so a retry of an applied write succeeds.
+        let mut stale = put(admin).expecting(BucketMetadata::default());
+        stale.metadata = None;
         assert_eq!(drive(stale, &context).await, Err(PutMetadataError::Changed));
+        let retried = put(admin).expecting(BucketMetadata::default());
+        drive(retried, &context).await.unwrap();
         let current = put(admin).expecting(metadata.clone());
         drive(current, &context).await.unwrap();
     }

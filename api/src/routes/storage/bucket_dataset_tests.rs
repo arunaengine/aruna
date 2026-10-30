@@ -164,3 +164,22 @@ async fn unlinked_dataset_removed() {
     assert_eq!(read.description, None, "the dataset is gone");
     assert!(read.description_unavailable.is_some());
 }
+
+// Only a refused link deletes the new dataset; an unknown outcome may have linked it.
+#[test]
+fn keeps_uncertain_links() {
+    for refusal in [
+        ServerError::Conflict("changed".to_string()),
+        ServerError::BadRequestMessage("invalid".to_string()),
+        ServerError::Forbidden,
+        ServerError::NotFound,
+    ] {
+        assert!(refused(&refusal), "{refusal:?}");
+    }
+    for unknown in [
+        ServerError::ServiceUnavailableReason("publisher node is unreachable".to_string()),
+        ServerError::InternalError("status".to_string()),
+    ] {
+        assert!(!refused(&unknown), "{unknown:?}");
+    }
+}
