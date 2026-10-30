@@ -374,7 +374,7 @@ impl PublishOperation {
             requester: self.requester(),
         };
         let accepted = postcard::to_allocvec(&accepted).map_err(ConversionError::from)?;
-        let catch_up = !view.snapshot().catching_up().is_empty();
+        let catch_up = view.snapshot().bootstrap_open();
         let mut writes = vec![
             (
                 DISTRIBUTION_KEYSPACE.to_string(),
@@ -398,7 +398,7 @@ impl PublishOperation {
         ];
         // A marker carries its revision, so a pass that settled an older one keeps it.
         let tag = revision.number.to_be_bytes().to_vec();
-        // The publisher may coordinate ranges too; it finds catching-up members like any node.
+        // The publisher may coordinate ranges too; it finds the members it walks like any node.
         if catch_up {
             let key = set_id.to_bytes().to_vec().into();
             writes.push((CATCH_UP_KEYSPACE.to_string(), key, tag.clone().into()));

@@ -239,8 +239,8 @@ async fn distribution_writes(
     let head = view.snapshot();
     let revision =
         postcard::to_allocvec(&head.revision()).map_err(|error| bootstrap(error.to_string()))?;
-    // Coordinators find the sets whose catching-up members they bootstrap through this row.
-    let catch_up = (!head.catching_up().is_empty()).then(|| {
+    // Coordinators find the sets whose catching-up members or new copies they walk here.
+    let catch_up = head.bootstrap_open().then(|| {
         let key = set_id.to_bytes().to_vec().into();
         (CATCH_UP_KEYSPACE.to_string(), key, Value::from(Vec::new()))
     });

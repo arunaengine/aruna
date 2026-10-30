@@ -1,5 +1,5 @@
 //! Sends a group admin's membership and ownership changes of a distributed bucket to its
-//! publisher: join, leave, transfer, settings and deletion.
+//! publisher: join, leave, new copies, splits, transfers, settings and deletion.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,6 +11,8 @@ use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
 use aruna_core::structs::storage::distribution::capacity::RangeSize;
+use aruna_core::structs::storage::distribution::snapshot::RangeFill;
+use aruna_core::structs::storage::distribution::split::split_ids;
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionError, DistributionMember, DistributionRequest, DistributionRevision,
     DistributionSettings, DistributionSnapshot, MemberState, MetadataCoverage, RangeBehaviour,
@@ -19,6 +21,7 @@ use aruna_core::structs::storage::distribution::{
 use ulid::Ulid;
 
 use super::create::{CreateError, CreationReport, admit_pending, send_admin};
+use super::sharding::{range_sample, split_point};
 use super::status::{Reach, node_reach, read_view};
 use crate::driver::DriverContext;
 use crate::forward::authorize::is_sync_eligible;
@@ -121,6 +124,78 @@ fn eligible_target(
     )))
 }
 
+/// Refuses a new copy on a member that cannot take one, naming the members that can.
+fn copy_target(
+    snapshot: &DistributionSnapshot,
+    range_id: Ulid,
+    member_id: Ulid,
+) -> Result<(), CreateError> {
+    let range = (snapshot.config.ranges.iter())
+        .find(|range| range.range_id == range_id)
+        .ok_or_else(|| CreateError::Invalid(format!("range {range_id} is not part of the set")))?;
+    let candidates: Vec<_> = (snapshot.config.members.iter())
+        .filter(|m| m.state == MemberState::Ready && m.strategy == DataStrategy::Copy)
+        .filter(|m| m.member_id != range.coordinator && !range.replicas.contains(&m.member_id))
+        .collect();
+    if candidates.iter().any(|m| m.member_id == member_id) {
+        return Ok(());
+    }
+    let eligible = match candidates.is_empty() {
+        true => "none; add a member with the copy strategy first".to_string(),
+        false => (candidates.iter())
+            .map(|m| format!("{} (node {})", m.member_id, m.node_id))
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    Err(CreateError::Invalid(format!(
+        "member {member_id} cannot take a copy of range {range_id}: only a ready member with \
+         the copy strategy that keeps no copy of the range yet can; eligible members: {eligible}"
+    )))
+}
+
+/// A split of one range at a key, as the publisher applies it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitPlan {
+    pub range_id: Ulid,
+    pub split_key: String,
+    pub lower_id: Ulid,
+    pub upper_id: Ulid,
+}
+
+/// The split of `range_id` at `split_key`, or at the middle of this node's key sample of the
+/// range by object count when no key is given.
+pub async fn plan_split(
+    context: &DriverContext,
+    snapshot: &DistributionSnapshot,
+    range_id: Ulid,
+    split_key: Option<String>,
+) -> Result<SplitPlan, CreateError> {
+    let range = (snapshot.config.ranges.iter())
+        .find(|range| range.range_id == range_id)
+        .ok_or_else(|| CreateError::Invalid(format!("range {range_id} is not part of the set")))?;
+    let split_key = match split_key {
+        Some(key) => key,
+        None => {
+            let sample = range_sample(context, snapshot.set_id(), range_id).await;
+            let node = snapshot.member(range.coordinator).map(|m| m.node_id);
+            (sample.and_then(|keys| split_point(&keys, range))).ok_or_else(|| {
+                let node = node.map(|node| node.to_string()).unwrap_or_default();
+                CreateError::Invalid(format!(
+                    "this node has no key sample of range {range_id} with keys on both sides of \
+                     a middle key; give `split_key`, or ask the range's coordinator node {node}"
+                ))
+            })?
+        }
+    };
+    let [_, lower_id, upper_id] = split_ids(snapshot.set_id(), range_id, range.epoch, &split_key);
+    Ok(SplitPlan {
+        range_id,
+        split_key,
+        lower_id,
+        upper_id,
+    })
+}
+
 /// Adds a member on `input.node_id`, then creates and admits its bucket there under the
 /// caller's bearer token. The member catches up from the coordinators before it is ready.
 pub async fn join_member(
@@ -198,6 +273,54 @@ pub async fn transfer_range(
         role,
     };
     send(context, (local, &snapshot), caller, request).await
+}
+
+/// Adds a copy of one range on a ready `copy` member, then admits the member again under the
+/// caller's bearer token: its node opens the range against its capacity and the expected
+/// `sizes`. The range's coordinator fills the copy.
+pub async fn add_copy(
+    context: &Arc<DriverContext>,
+    caller: Caller<'_>,
+    set_id: Ulid,
+    (range_id, member_id, sizes): (Ulid, Ulid, &[RangeSize]),
+) -> Result<CreationReport, CreateError> {
+    let (local, snapshot) = head(context, set_id).await?;
+    copy_target(&snapshot, range_id, member_id)?;
+    needs_coordinator(context, &snapshot, range_id, "the new copy")?;
+    let fill = RangeFill {
+        fill_id: Ulid::generate(),
+        range_id,
+        member_id,
+    };
+    let request = DistributionRequest::AddCopy { fill };
+    send(context, (local, &snapshot), caller.clone(), request).await?;
+    admit_pending(context, caller.0, caller.1, set_id, sizes).await
+}
+
+/// Splits one range by hand; `dry_run` only plans the split.
+pub async fn split_range(
+    context: &Arc<DriverContext>,
+    caller: Caller<'_>,
+    set_id: Ulid,
+    (range_id, split_key, dry_run): (Ulid, Option<String>, bool),
+) -> Result<(SplitPlan, Option<DistributionRevision>), CreateError> {
+    let (local, snapshot) = head(context, set_id).await?;
+    let plan = plan_split(context, &snapshot, range_id, split_key).await?;
+    if dry_run {
+        return Ok((plan, None));
+    }
+    needs_coordinator(context, &snapshot, range_id, "the split")?;
+    let epoch = (snapshot.config.ranges.iter())
+        .find(|range| range.range_id == range_id)
+        .map(|range| range.epoch)
+        .unwrap_or_default();
+    let request = DistributionRequest::Split {
+        range_id,
+        epoch,
+        split_key: plan.split_key.clone(),
+    };
+    let revision = send(context, (local, &snapshot), caller, request).await?;
+    Ok((plan, Some(revision)))
 }
 
 pub async fn change_settings(

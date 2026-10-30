@@ -1,5 +1,6 @@
-//! Bootstraps a catching-up member from its coordinators: bounded pages over the ordered
-//! inventory with a durable cursor, each waiting for its jobs while live publications overlap.
+//! Bootstraps a catching-up member or a new copy of a range from its coordinators: bounded pages
+//! over the ordered inventory with a durable cursor, each waiting for its jobs while live
+//! publications overlap.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -26,6 +27,7 @@ use aruna_core::structs::storage::distribution::bootstrap::{
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, Position, VersionEntry, range_interval,
 };
+use aruna_core::structs::storage::distribution::snapshot::RangeFill;
 use aruna_core::structs::storage::distribution::{
     DistributionMember, DistributionSnapshot, KeyRange, Statement, StatementClaim,
 };
@@ -264,8 +266,10 @@ impl BootstrapPage {
             let Entry::Version { version_id, .. } = position.entry else {
                 continue;
             };
-            let marker = VersionEntry::from_bytes(value)?.marker;
-            let job = self.job(position.key, version_id, marker);
+            let entry = VersionEntry::from_bytes(value)?;
+            self.cursor.versions += 1;
+            self.cursor.bytes = self.cursor.bytes.saturating_add(entry.size);
+            let job = self.job(position.key, version_id, entry.marker);
             let job_key = blob_job_key(&job)?;
             pending.push(job_key.to_vec());
             writes.push((
@@ -429,7 +433,7 @@ async fn delete(context: &DriverContext, deletes: Vec<(String, Key)>) -> Result<
 }
 
 /// One stored cursor, read on its own key.
-async fn read_cursor(
+pub(crate) async fn read_cursor(
     context: &DriverContext,
     key: Vec<u8>,
 ) -> Result<Option<BootstrapCursor>, String> {
@@ -573,9 +577,21 @@ impl SetWalk {
             .members
             .iter()
             .find(|m| m.node_id == self.local);
-        let (Some(local), false) = (local, targets.is_empty()) else {
+        let Some(local) = local else {
             return self.clear(context).await;
         };
+        let deleting = snapshot.lifecycle.deletion.is_some();
+        let fills: Vec<&RangeFill> = (snapshot.lifecycle.fills.iter())
+            .filter(|_| !deleting)
+            .filter(|fill| {
+                (snapshot.config.ranges.iter()).any(|range| {
+                    range.range_id == fill.range_id && range.coordinator == local.member_id
+                })
+            })
+            .collect();
+        if targets.is_empty() && fills.is_empty() {
+            return self.clear(context).await;
+        }
         // Only the admitted incarnation of this member's bucket publishes.
         let info = drive(
             GetBucketOperation::new(snapshot.config.bucket.clone()),
@@ -592,13 +608,68 @@ impl SetWalk {
         if !bound {
             return self.clear(context).await;
         }
-        self.clear_departed(context, &targets).await?;
+        let mut walked: Vec<Ulid> = targets.iter().map(|target| target.member_id).collect();
+        walked.extend(fills.iter().map(|fill| fill.member_id));
+        self.clear_departed(context, &walked).await?;
         let mut outcome = Outcome::Settled;
         for target in targets {
             let walked = self.walk(context, &snapshot, local, target, budget).await?;
             outcome = outcome.and(walked);
         }
+        for fill in fills {
+            let filled = self.fill(context, &snapshot, local, fill, budget).await?;
+            outcome = outcome.and(filled);
+        }
         Ok(outcome)
+    }
+
+    /// Walks one range for its new copy; when the walk ended, states the copy filled.
+    async fn fill(
+        &self,
+        context: &DriverContext,
+        snapshot: &DistributionSnapshot,
+        local: &DistributionMember,
+        fill: &RangeFill,
+        budget: &mut usize,
+    ) -> Result<Outcome, String> {
+        let range = (snapshot.config.ranges.iter()).find(|range| range.range_id == fill.range_id);
+        let (Some(range), Some(target)) = (range, snapshot.member(fill.member_id)) else {
+            return Ok(Outcome::Settled);
+        };
+        let intent = fill.intent();
+        let key = bootstrap_key(self.set_id, fill.member_id, range.range_id);
+        let cursor = (read_cursor(context, key).await?).filter(|c| c.intent == intent);
+        let watermark = match cursor {
+            Some(cursor) if cursor.done => cursor.watermark,
+            _ if *budget == 0 => return Ok(Outcome::Waiting),
+            _ => {
+                *budget -= 1;
+                let page = BootstrapPage::new(PageConfig {
+                    realm_id: self.realm_id,
+                    bucket: snapshot.config.bucket.clone(),
+                    set_id: self.set_id,
+                    member_id: fill.member_id,
+                    node_id: target.node_id,
+                    intent,
+                    range: range.clone(),
+                    now_ms: unix_timestamp_millis(),
+                    rows: PAGE_ROWS,
+                });
+                match drive(page, context).await.map_err(|e| e.to_string())? {
+                    PageProgress::Done { watermark } => watermark,
+                    PageProgress::Waiting | PageProgress::Queued(_) => return Ok(Outcome::Waiting),
+                }
+            }
+        };
+        let statement = Statement::copy_filled(
+            self.realm_id,
+            self.set_id,
+            local,
+            fill,
+            (range.epoch, watermark),
+        );
+        self.hand(context, snapshot, statement, fill.member_id)
+            .await
     }
 
     /// Walks the ranges this node publishes to `target`; when every walk ended, states the
@@ -679,6 +750,18 @@ impl SetWalk {
         let cover = snapshot.catch_up_cover(local.member_id, target.member_id);
         let statement =
             Statement::caught_up(self.realm_id, self.set_id, local, target, cover, watermark);
+        self.hand(context, snapshot, statement, target.member_id)
+            .await
+    }
+
+    /// Signs a statement about the walks for `member_id` and hands it to the publisher.
+    async fn hand(
+        &self,
+        context: &DriverContext,
+        snapshot: &DistributionSnapshot,
+        statement: Statement,
+        member_id: Ulid,
+    ) -> Result<Outcome, String> {
         let claim = StatementClaim {
             signer: self.local,
             statement,
@@ -692,7 +775,7 @@ impl SetWalk {
         match submit(&shared, publisher, self.local, signed).await {
             Ok(()) => Ok(Outcome::Stated),
             Err(refusal) => {
-                debug!(set_id = %self.set_id, member_id = %target.member_id, %refusal, "Catch-up statement not taken yet");
+                debug!(set_id = %self.set_id, %member_id, %refusal, "Bootstrap statement not taken yet");
                 Ok(Outcome::Waiting)
             }
         }
@@ -741,13 +824,9 @@ impl SetWalk {
         Ok(None)
     }
 
-    /// Deletes the cursors of members that no longer catch up, such as a member that left,
+    /// Deletes the cursors of members that are no longer walked, such as a member that left,
     /// in one bounded batch per drain.
-    async fn clear_departed(
-        &self,
-        context: &DriverContext,
-        targets: &[&DistributionMember],
-    ) -> Result<(), String> {
+    async fn clear_departed(&self, context: &DriverContext, walked: &[Ulid]) -> Result<(), String> {
         let prefix = bootstrap_prefix(self.set_id);
         let rows = scan(
             context,
@@ -758,7 +837,7 @@ impl SetWalk {
         .await?;
         let departed = |key: &[u8]| {
             let member = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
-            member.is_some_and(|id| !targets.iter().any(|t| t.member_id.to_bytes() == id))
+            member.is_some_and(|id| !walked.iter().any(|walked| walked.to_bytes() == id))
         };
         let deletes = (rows.into_iter())
             .filter(|(key, _)| departed(key))
