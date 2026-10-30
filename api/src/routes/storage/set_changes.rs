@@ -1,5 +1,6 @@
 //! Serves the routes that change a distributed bucket after its creation: join and leave of
-//! members, fenced transfers of ranges, bucket-wide settings and deletion of the set.
+//! members, new copies and splits of ranges, fenced transfers of ranges, bucket-wide settings
+//! and deletion of the set.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,7 +11,8 @@ use aruna_core::structs::storage::distribution::{
     DistributionRevision, MetadataCoverage, TransferRole,
 };
 use aruna_operations::distribution::change::{
-    JoinInput, change_settings, delete_set, join_member, leave_member, transfer_range,
+    JoinInput, add_copy, change_settings, delete_set, join_member, leave_member, split_range,
+    transfer_range,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -39,6 +41,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(SetChangesDoc::openapi())
         .routes(routes!(join_distributed))
         .routes(routes!(leave_distributed))
+        .routes(routes!(copy_distributed))
+        .routes(routes!(split_distributed))
         .routes(routes!(transfer_distributed))
         .routes(routes!(settings_distributed))
         .routes(routes!(delete_distributed))
@@ -81,6 +85,38 @@ pub struct TransferRequest {
     /// The member that coordinates the range afterwards; a ready `copy` replica of it.
     pub to: String,
     pub role: RoleName,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct CopyRequest {
+    pub range_id: String,
+    /// A ready member with the `copy` strategy that keeps no copy of the range yet.
+    pub member_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SplitRequest {
+    pub range_id: String,
+    /// The first key of the upper part; omitted splits near the middle by object count.
+    #[serde(default)]
+    pub split_key: Option<String>,
+    /// Only answers the split that would be made, without making it.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SplitResponse {
+    pub set_id: String,
+    /// The record revision that took the split; omitted for a dry run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    pub range_id: String,
+    pub split_key: String,
+    /// The part below `split_key`.
+    pub lower_id: String,
+    /// The part from `split_key` on.
+    pub upper_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -241,6 +277,139 @@ pub async fn leave_distributed(
         .await
         .map_err(map_create_error)?;
     Ok(Json(change_response(set_id, revision)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/groups/{group_id}/distributed-buckets/{set_id}/copies",
+    tag = "data/storage",
+    summary = "Copy a range to another member",
+    description = r#"Adds a copy of one range on a member that keeps none yet; the range's coordinator fills it.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path, and WRITE on the bucket path of the member's node, which admits the member again for the new range. The publisher and the member node check the forwarded token again.
+
+**Behavior**
+- The member must be ready and use the `copy` strategy; a refusal names the eligible members.
+- The member becomes a replica of the range at once and receives every new write. Its node
+  opens the range when the storage capacity, the sum of its backend quotas, holds the range's
+  expected bytes; a refused admission shows in the answer and is retried through the
+  admission route. The coordinator copies the versions the range held before, page by page.
+- Until the coordinator states the copy filled, reads and listings of the range avoid the
+  member and the range can be neither moved to it nor split. Then the member is a ready copy
+  and can take the range in a transfer.
+- Progress shows per range in `filling` of the bucket status; the copied counts come only
+  from the coordinator's node.
+- The answer is 202 once the copy is recorded. While the coordinator is unreachable the
+  request is refused with 503."#,
+    params(
+        ("group_id" = String, Path, description = "Owner group id"),
+        ("set_id" = String, Path, description = "Distributed bucket set id")
+    ),
+    request_body(
+        content = CopyRequest,
+        description = "The range and the member that keeps the new copy",
+        example = json!({
+            "range_id": "01JMPRT2123456789ABCDEFGHJ",
+            "member_id": "01JMPRT3123456789ABCDEFGHJ"
+        })
+    ),
+    responses(
+        (status = 202, description = "The member's admission for the new copy", body = AdmissionResponse, example = admission_example),
+        (status = 400, description = "Unknown range, or the member cannot take a copy of it; the message names the eligible members", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
+        (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
+        (status = 409, description = "The publisher refused the change, for example while the range moves", body = ErrorResponse),
+        (status = 503, description = "Coordinator or publisher unreachable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn copy_distributed(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    Path((group_id, set_id)): Path<(Ulid, Ulid)>,
+    Json(request): Json<CopyRequest>,
+) -> ServerResult<(StatusCode, Json<AdmissionResponse>)> {
+    let relay = bearer.clone();
+    let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
+    let sizes = range_sizes(&state, relay.as_ref(), set_id).await?;
+    let copy = (id(&request.range_id)?, id(&request.member_id)?, &sizes[..]);
+    let report = add_copy(&state.get_ctx(), (&auth, bearer), set_id, copy)
+        .await
+        .map_err(map_create_error)?;
+    Ok((StatusCode::ACCEPTED, Json(admission_response(report))))
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/groups/{group_id}/distributed-buckets/{set_id}/splits",
+    tag = "data/storage",
+    summary = "Split a distributed bucket range",
+    description = r#"Splits one range into two at a key, with the checks of an automatic split.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path; the publisher checks the forwarded token again.
+
+**Behavior**
+- Both parts keep the coordinator, epoch and copies of the range. No data moves and nothing
+  is fenced; afterwards each part can be moved on its own.
+- Without `split_key` the key comes from this node's key sample of the range: near its middle
+  by object count, at a folder boundary when one leaves keys on both sides. Only a node that
+  holds the range keeps a sample; the coordinator's node always does.
+- `dry_run` answers the split without making it, for example to show the key first.
+- A split of the same range at the same key and epoch is the same split, with the same ids.
+- Refused while a transfer of the range is open, a new copy of it is still filling, the set
+  is being deleted, or the set holds the most ranges it may hold."#,
+    params(
+        ("group_id" = String, Path, description = "Owner group id"),
+        ("set_id" = String, Path, description = "Distributed bucket set id")
+    ),
+    request_body(
+        content = SplitRequest,
+        description = "The range and where to split it",
+        example = json!({
+            "range_id": "01JMPRT2123456789ABCDEFGHJ",
+            "split_key": "GCF_013/"
+        })
+    ),
+    responses(
+        (status = 200, description = "The split, and the revision that took it", body = SplitResponse, example = json!({
+            "set_id": "01JMPRT0123456789ABCDEFGHJ",
+            "revision": 6,
+            "range_id": "01JMPRT2123456789ABCDEFGHJ",
+            "split_key": "GCF_013/",
+            "lower_id": "01JMPRT4123456789ABCDEFGHJ",
+            "upper_id": "01JMPRT5123456789ABCDEFGHJ"
+        })),
+        (status = 400, description = "Unknown range, or no key given and this node keeps no key sample of the range", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
+        (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
+        (status = 409, description = "The publisher refused the split: a key outside the range, an open transfer, a filling copy or a deletion", body = ErrorResponse),
+        (status = 503, description = "Coordinator or publisher unreachable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn split_distributed(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    Path((group_id, set_id)): Path<(Ulid, Ulid)>,
+    Json(request): Json<SplitRequest>,
+) -> ServerResult<Json<SplitResponse>> {
+    let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
+    let split = (id(&request.range_id)?, request.split_key, request.dry_run);
+    let (plan, revision) = split_range(&state.get_ctx(), (&auth, bearer), set_id, split)
+        .await
+        .map_err(map_create_error)?;
+    Ok(Json(SplitResponse {
+        set_id: set_id.to_string(),
+        revision: revision.map(|revision| revision.number),
+        range_id: plan.range_id.to_string(),
+        split_key: plan.split_key,
+        lower_id: plan.lower_id.to_string(),
+        upper_id: plan.upper_id.to_string(),
+    }))
 }
 
 #[utoipa::path(

@@ -6,7 +6,8 @@ use aruna_core::NodeId;
 use aruna_core::structs::storage::distribution::{DistributionError, DistributionRevision};
 use aruna_operations::distribution::index_feed::IndexProgress;
 use aruna_operations::distribution::status::{
-    CopyStatus, DeletionStatus, LifecycleStatus, MemberStatus, RangeStatus, TransferStatus,
+    CopyStatus, DeletionStatus, FillProgress, FillStatus, LifecycleStatus, MemberStatus,
+    RangeStatus, TransferStatus,
 };
 use aruna_operations::replication::members::CopyLag;
 
@@ -133,6 +134,22 @@ fn degraded_names_coordinator() {
                     oldest_ms: Some(0),
                 },
             }],
+            fills: vec![
+                FillStatus {
+                    fill_id: Ulid::from_bytes([6; 16]),
+                    member_id: Ulid::from_bytes([5; 16]),
+                    progress: Some(FillProgress {
+                        versions: 40,
+                        bytes: 4096,
+                        walked: true,
+                    }),
+                },
+                FillStatus {
+                    fill_id: Ulid::from_bytes([7; 16]),
+                    member_id: Ulid::from_bytes([8; 16]),
+                    progress: None,
+                },
+            ],
         }],
         recommended_grant: "/r/g/9/data/*/spire/**".to_string(),
         settings: DistributionSettings {
@@ -179,6 +196,19 @@ fn degraded_names_coordinator() {
     assert_eq!(copy.pending_versions, 2);
     assert!(copy.oldest_lag_ms.is_some_and(|lag| lag > 0));
     assert!(response.copies_behind && response.copies_counted);
+    // The coordinator's node reports how far a new copy got; others only that it fills.
+    let [walked, unknown] = &response.ranges[0].filling[..] else {
+        panic!("both filling copies are reported");
+    };
+    assert_eq!(
+        (walked.copied_versions, walked.copied_bytes),
+        (Some(40), Some(4096))
+    );
+    assert_eq!(walked.state.as_deref(), Some("finishing"));
+    assert_eq!(
+        (unknown.copied_versions, unknown.state.as_deref()),
+        (None, None)
+    );
     let settings = &response.settings;
     assert_eq!(settings.range_behaviour, Some(BehaviourName::ServeAndFill));
     assert!(settings.public && !settings.search_index);

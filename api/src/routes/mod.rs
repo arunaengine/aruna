@@ -709,6 +709,14 @@ pub(crate) mod tests {
         ),
         (
             "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/copies",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/splits",
+        ),
+        (
+            "POST",
             "/data/groups/{group_id}/distributed-buckets/{set_id}/transfers",
         ),
         (

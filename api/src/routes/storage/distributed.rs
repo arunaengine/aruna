@@ -184,6 +184,25 @@ pub struct RangeResponse {
     /// coordinator's node lists them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub copies: Vec<CopyResponse>,
+    /// New copies of the range that are still filling; reads avoid them until they are filled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filling: Vec<FillResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct FillResponse {
+    pub fill_id: String,
+    pub member_id: String,
+    /// Versions and delete markers copied so far; only the coordinator's node reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_versions: Option<u64>,
+    /// Bytes of those versions; only the coordinator's node reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_bytes: Option<u64>,
+    /// `copying`, or `finishing` once the coordinator walked the whole range and the last
+    /// versions are still being delivered; omitted where the coordinator's progress is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -469,6 +488,18 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
                     oldest_lag_ms: (copy.lag.oldest_ms).map(|ms| now_ms.saturating_sub(ms)),
                 })
                 .collect(),
+            filling: (range.fills.iter())
+                .map(|fill| FillResponse {
+                    fill_id: fill.fill_id.to_string(),
+                    member_id: fill.member_id.to_string(),
+                    copied_versions: fill.progress.map(|progress| progress.versions),
+                    copied_bytes: fill.progress.map(|progress| progress.bytes),
+                    state: (fill.progress).map(|progress| match progress.walked {
+                        true => "finishing".to_string(),
+                        false => "copying".to_string(),
+                    }),
+                })
+                .collect(),
         })
         .collect::<Vec<_>>();
     let copies_behind =
@@ -583,6 +614,13 @@ const STATUS_EXAMPLE: &str = r#"{
             "caught_up": false,
             "pending_versions": 4096,
             "oldest_lag_ms": 25200000
+        }],
+        "filling": [{
+            "fill_id": "01JMPRT6123456789ABCDEFGHJ",
+            "member_id": "01JMPRT3123456789ABCDEFGHJ",
+            "copied_versions": 120000,
+            "copied_bytes": 52428800000,
+            "state": "copying"
         }]
     }],
     "copies_behind": true,
@@ -699,6 +737,7 @@ pub async fn create_distributed(
 **Behavior**
 - Runs on any node that holds the set's record. Admissions and activation go to the publisher.
 - A retry finds a member's own bucket from an earlier attempt and admits it once.
+- A member with a filling copy of a range is admitted again, so its node opens that range.
 - If the publisher is unreachable, the answer is 503 and nothing is queued."#,
     params(
         ("group_id" = String, Path, description = "Owner group id"),
