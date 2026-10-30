@@ -429,6 +429,7 @@ async fn add_fills(context: &DriverContext, set_id: Ulid, range: &mut RangeStatu
             fill_id: fill.fill_id,
             range_id: range.range_id,
             member_id: fill.member_id,
+            admitted: true,
         }
         .intent();
         let cursor = read_cursor(context, key).await.ok().flatten();

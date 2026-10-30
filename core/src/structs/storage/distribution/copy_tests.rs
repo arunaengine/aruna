@@ -64,7 +64,17 @@ fn fill(range: &KeyRange, seed: u8) -> RangeFill {
         fill_id: Ulid::from_bytes([40 + seed; 16]),
         range_id: range.range_id,
         member_id: member(seed),
+        admitted: false,
     }
+}
+
+/// The statement of the copy's member `signer` that its node opened the copies `fills`.
+fn admitted(head: &DistributionSnapshot, signer: u8, fills: &[&RangeFill]) -> DistributionRequest {
+    let member = head.member(member(signer)).unwrap();
+    let identity = (member.member_id, member.incarnation.unwrap(), member.intent);
+    let ids = fills.iter().map(|fill| fill.fill_id).collect();
+    let statement = Statement::copy_admitted(realm(), head.set_id(), identity, ids);
+    DistributionRequest::Statement(Box::new(statement.sign(&secret(signer))))
 }
 
 fn add(
@@ -117,8 +127,22 @@ fn copy_fills_range() {
     assert_eq!(next.read_route(member(2), "", true), Ok(holder));
     assert!(next.transfer_targets(range).is_empty());
     assert!(next_snapshot(realm(), Some(&next), &transfer(range, 2)).is_err());
-    // Only the coordinator states the copy filled, and only at the range's epoch.
+    // Only an admitted copy fills, and only its own member admits it, once.
     let epoch = range.epoch;
+    assert!(next_snapshot(realm(), Some(&next), &filled(&next, 1, &copy, epoch)).is_err());
+    assert!(next_snapshot(realm(), Some(&next), &admitted(&next, 1, &[&copy])).is_err());
+    let unknown = fill(range, 3);
+    let refused = next_snapshot(
+        realm(),
+        Some(&next),
+        &admitted(&next, 2, &[&copy, &unknown]),
+    );
+    assert!(refused.is_err());
+    let next = next_snapshot(realm(), Some(&next), &admitted(&next, 2, &[&copy])).unwrap();
+    assert!(next.lifecycle.fills[0].admitted && next.filling(range.range_id, member(2)));
+    let replay = next_snapshot(realm(), Some(&next), &admitted(&next, 2, &[&copy]));
+    assert!(matches!(replay, Err(DistributionError::Replayed(_))));
+    // Only the coordinator states the copy filled, and only at the range's epoch.
     assert!(next_snapshot(realm(), Some(&next), &filled(&next, 2, &copy, epoch)).is_err());
     assert!(next_snapshot(realm(), Some(&next), &filled(&next, 1, &copy, epoch + 1)).is_err());
     let done = next_snapshot(realm(), Some(&next), &filled(&next, 1, &copy, epoch)).unwrap();
@@ -145,6 +169,12 @@ fn copy_refusals() {
         ..fill(&lower, 2)
     };
     assert!(add(&head, &unknown).is_err());
+    // A copy is never added as admitted.
+    let claimed = RangeFill {
+        admitted: true,
+        ..fill(&lower, 2)
+    };
+    assert!(!add(&head, &claimed).unwrap().lifecycle.fills[0].admitted);
     // A second copy on the same member, or one under the same id, is refused.
     let next = add(&head, &fill(&lower, 2)).unwrap();
     assert!(add(&next, &fill(&lower, 2)).is_err());

@@ -181,7 +181,7 @@ pub async fn create_set(
 /// Admits every unadmitted member and activates the set once every coordinator and replica is in.
 /// A failed member keeps the set pending; a member refused for capacity loses its empty bucket.
 /// Each member checks capacity against `sizes`; a range no admitted member holds is empty. A
-/// member with a filling copy is admitted again, which opens the new range on its node.
+/// member with a copy not admitted yet is admitted again, which opens the new range on its node.
 pub async fn admit_pending(
     context: &Arc<DriverContext>,
     auth: &AuthContext,
@@ -207,7 +207,9 @@ pub async fn admit_pending(
     let sizes = sizes.as_slice();
     let mut admitted = BTreeSet::new();
     let mut members = Vec::with_capacity(snapshot.config.members.len());
-    let filling = |member_id| (snapshot.lifecycle.fills.iter()).any(|f| f.member_id == member_id);
+    let filling = |member_id| {
+        (snapshot.lifecycle.fills.iter()).any(|f| f.member_id == member_id && !f.admitted)
+    };
     for member in &snapshot.config.members {
         let outcome = match member.incarnation {
             Some(_) if !filling(member.member_id) => Ok(()),

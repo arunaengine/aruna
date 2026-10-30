@@ -52,6 +52,7 @@ fn config() -> AdmitConfig {
         coverage: MetadataCoverage::Assigned,
         sizes: ranges().iter().map(|range| empty(range.range_id)).collect(),
         capacity: None,
+        fills: Vec::new(),
     }
 }
 
@@ -187,6 +188,26 @@ async fn opens_ranges_once() {
     assert!(opened(&handle, None).await);
     // A retry finds the ranges open and signs the very same statement again.
     assert_eq!(run(&handle, true).await.unwrap(), first);
+}
+
+/// A member with new copies states their admission, not its own, once their ranges opened.
+#[tokio::test]
+async fn admits_new_copies() {
+    let (_dir, handle) = open();
+    bucket(&handle, member_id(), 42, 42).await;
+    let mut copies = config();
+    copies.fills = vec![RangeFill {
+        fill_id: Ulid::from_bytes([30; 16]),
+        range_id: ranges()[1].range_id,
+        member_id: member_id(),
+        admitted: false,
+    }];
+    let signed = run_with(&handle, copies, true).await.unwrap();
+    let identity = (member_id(), 42, [7; 32]);
+    let fill_ids = vec![Ulid::from_bytes([30; 16])];
+    let expected = Statement::copy_admitted(realm(), set_id(), identity, fill_ids);
+    assert_eq!(signed.statement, expected);
+    assert!(opened(&handle, None).await);
 }
 
 #[tokio::test]

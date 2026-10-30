@@ -20,6 +20,7 @@ use aruna_core::structs::storage::distribution::accounting::account_key;
 use aruna_core::structs::storage::distribution::capacity::{
     MemberNeed, MemberReservation, RangeSize, member_need,
 };
+use aruna_core::structs::storage::distribution::snapshot::RangeFill;
 use aruna_core::structs::storage::distribution::{
     DataStrategy, KeyRange, MetadataCoverage, SignedStatement, Statement, StatementClaim,
 };
@@ -54,6 +55,8 @@ pub struct AdmitConfig {
     pub sizes: Vec<RangeSize>,
     /// The bytes this node may store, the sum of its backend quotas; `None` without quotas.
     pub capacity: Option<u64>,
+    /// The member's new copies not admitted yet; the admission then states them instead.
+    pub fills: Vec<RangeFill>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -182,13 +185,22 @@ impl AdmitOperation {
             .filter(|(_, account)| account.is_none())
             .map(|(range, _)| range.clone())
             .collect();
-        let statement = Statement::admit(
-            self.config.realm_id,
-            self.config.set_id,
-            self.config.member_id,
-            binding.incarnation,
-            self.config.intent,
-        );
+        let config = &self.config;
+        let statement = match config.fills.is_empty() {
+            true => Statement::admit(
+                config.realm_id,
+                config.set_id,
+                config.member_id,
+                binding.incarnation,
+                config.intent,
+            ),
+            false => Statement::copy_admitted(
+                config.realm_id,
+                config.set_id,
+                (config.member_id, binding.incarnation, config.intent),
+                config.fills.iter().map(|fill| fill.fill_id).collect(),
+            ),
+        };
         let claim = StatementClaim {
             signer: self.config.node_id,
             statement,

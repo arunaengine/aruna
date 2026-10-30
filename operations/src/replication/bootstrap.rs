@@ -636,6 +636,10 @@ impl SetWalk {
         let (Some(range), Some(target)) = (range, snapshot.member(fill.member_id)) else {
             return Ok(Outcome::Settled);
         };
+        // Until its node opened the range, the copy has nowhere to receive versions.
+        if !fill.admitted {
+            return Ok(Outcome::Waiting);
+        }
         let intent = fill.intent();
         let key = bootstrap_key(self.set_id, fill.member_id, range.range_id);
         let cursor = (read_cursor(context, key).await?).filter(|c| c.intent == intent);

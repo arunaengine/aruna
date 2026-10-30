@@ -155,7 +155,48 @@ pub(super) fn add_copy(
         return Err(refused("the member already keeps a copy of the range"));
     }
     range.replicas.push(fill.member_id);
-    next.lifecycle.fills.push(fill.clone());
+    next.lifecycle.fills.push(RangeFill {
+        admitted: false,
+        ..fill.clone()
+    });
+    Ok(())
+}
+
+/// Takes the member's statement that its node opened the ranges of its new copies; only then
+/// may their coordinators fill them.
+pub(super) fn copy_admitted(
+    next: &mut DistributionSnapshot,
+    statement: &Statement,
+) -> Result<(), DistributionError> {
+    let invalid = DistributionError::InvalidStatement;
+    let StatementKind::CopyAdmitted { fill_ids } = &statement.kind else {
+        return Err(invalid("not an admitted copy"));
+    };
+    let member = next
+        .member(statement.member_id)
+        .ok_or(DistributionError::NoMember(statement.member_id))?;
+    if member.incarnation != Some(statement.incarnation) || member.intent != statement.intent {
+        return Err(invalid(
+            "the admission does not answer the member's incarnation",
+        ));
+    }
+    let named = |fill: &RangeFill| fill_ids.contains(&fill.fill_id);
+    let fills = (next.lifecycle.fills.iter()).filter(|fill| named(fill));
+    if fill_ids.is_empty() || fills.clone().count() != fill_ids.len() {
+        return Err(invalid("the statement names a copy that is not filling"));
+    }
+    if fills
+        .clone()
+        .any(|fill| fill.member_id != statement.member_id)
+    {
+        return Err(invalid("only the copy's own member admits it"));
+    }
+    if fills.clone().all(|fill| fill.admitted) {
+        return Err(DistributionError::Replayed(statement.statement_id));
+    }
+    (next.lifecycle.fills.iter_mut())
+        .filter(|fill| named(fill))
+        .for_each(|fill| fill.admitted = true);
     Ok(())
 }
 
@@ -180,6 +221,9 @@ pub(super) fn copy_filled(
         .position(|fill| fill.fill_id == *fill_id)
         .ok_or(invalid("the copy is not filling"))?;
     let fill = &next.lifecycle.fills[index];
+    if !fill.admitted {
+        return Err(invalid("the copy's node has not admitted it yet"));
+    }
     let range = (next.config.ranges.iter()).find(|range| range.range_id == fill.range_id);
     let current = range
         .is_some_and(|range| range.coordinator == statement.member_id && range.epoch == *epoch);

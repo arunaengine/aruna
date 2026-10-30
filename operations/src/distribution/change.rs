@@ -292,6 +292,7 @@ pub async fn add_copy(
         fill_id: Ulid::generate(),
         range_id,
         member_id,
+        admitted: false,
     };
     let request = DistributionRequest::AddCopy { fill };
     send(context, (local, &snapshot), caller.clone(), request).await?;

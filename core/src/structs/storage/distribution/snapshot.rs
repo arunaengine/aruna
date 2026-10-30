@@ -41,6 +41,8 @@ pub struct RangeFill {
     pub fill_id: Ulid,
     pub range_id: Ulid,
     pub member_id: Ulid,
+    /// The member's node opened the range for the copy; only then does the copy fill.
+    pub admitted: bool,
 }
 
 impl RangeFill {

@@ -12,7 +12,7 @@ use super::lifecycle::{
     TransferPlan, activate_transfer, commit_deletion, deletion_fenced, prepare_deletion,
     prepare_transfer, transfer_complete, transfer_fenced,
 };
-use super::membership::{add_copy, changeable, copy_filled, join, leave};
+use super::membership::{add_copy, changeable, copy_admitted, copy_filled, join, leave};
 use super::snapshot::RangeFill;
 use super::snapshot::{DistributionSnapshot, Lifecycle};
 use super::split::{admin_split, apply_split};
@@ -379,6 +379,7 @@ fn embed(
             Ok(())
         }
         StatementKind::CopyFilled { .. } => copy_filled(next, statement),
+        StatementKind::CopyAdmitted { .. } => copy_admitted(next, statement),
         StatementKind::TransferFenced { .. } => transfer_fenced(next, signed),
         StatementKind::TransferComplete { .. } => transfer_complete(next, signed),
         StatementKind::DeleteFenced { .. } => deletion_fenced(next, signed),
