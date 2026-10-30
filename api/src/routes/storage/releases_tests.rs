@@ -243,3 +243,100 @@ async fn lists_only_read_crates() {
     assert_eq!(listed.releases[0].label, "6.0");
     assert!(listed.complete);
 }
+
+async fn files(
+    node: &Node,
+    auth: &AuthContext,
+    version_id: &str,
+    params: ReleaseFilesParams,
+) -> ServerResult<ReleaseFilesResponse> {
+    list_release_files(
+        State(node.state.clone()),
+        Extension(Some(auth.clone())),
+        Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+        HeaderMap::new(),
+        Path((BUCKET.to_string(), version_id.to_string())),
+        Query(params),
+    )
+    .await
+    .map(|Json(answer)| answer)
+}
+
+fn params(prefix: Option<&str>, delimiter: Option<&str>) -> ReleaseFilesParams {
+    ReleaseFilesParams {
+        key: "db/release.json".to_string(),
+        prefix: prefix.map(str::to_string),
+        delimiter: delimiter.map(str::to_string),
+        after: None,
+        limit: None,
+    }
+}
+
+#[tokio::test]
+async fn browses_release_files() {
+    let node = node_state().await;
+    store(&node, "db/a.fasta", ">a").await;
+    store(&node, "db/sub/b.fasta", ">bb").await;
+    store(&node, "other/c.fasta", ">c").await;
+    let doi = "https://doi.org/10.5281/zenodo.1";
+    let release = publish(&node, &node.owner, request(doi)).await.unwrap();
+    let version = release.version_id.as_str();
+
+    let folders = files(&node, &node.owner, version, params(Some("db/"), Some("/")))
+        .await
+        .unwrap();
+    assert_eq!(
+        (folders.label.as_str(), folders.prefix.as_str()),
+        ("6.0", "db/")
+    );
+    let keys: Vec<&str> = folders.files.iter().map(|file| file.key.as_str()).collect();
+    assert_eq!(
+        (keys, folders.folders.clone()),
+        (vec!["db/a.fasta"], vec!["db/sub/".to_string()])
+    );
+    assert_eq!(folders.files[0].size, 2);
+    let pinned = folders.files[0].version_id.clone();
+    // A newer version of a pinned key leaves the release as it was.
+    store(&node, "db/a.fasta", ">a2").await;
+    let all = files(&node, &node.owner, version, params(None, None))
+        .await
+        .unwrap();
+    let keys: Vec<&str> = all.files.iter().map(|file| file.key.as_str()).collect();
+    assert_eq!(keys, ["db/a.fasta", "db/sub/b.fasta"]);
+    assert_eq!(all.files[0].version_id, pinned);
+    assert_eq!(all.next, None);
+
+    let stranger = files(&node, &node.stranger, version, params(None, None)).await;
+    assert!(
+        matches!(stranger, Err(ServerError::Forbidden)),
+        "{stranger:?}"
+    );
+    let unknown = files(
+        &node,
+        &node.owner,
+        &Ulid::from_bytes([77; 16]).to_string(),
+        params(None, None),
+    )
+    .await;
+    assert!(matches!(unknown, Err(ServerError::NotFound)), "{unknown:?}");
+    let pinned_file = ReleaseFilesParams {
+        key: "db/a.fasta".to_string(),
+        ..params(None, None)
+    };
+    let untagged = files(&node, &node.owner, &pinned, pinned_file).await;
+    assert!(
+        matches!(untagged, Err(ServerError::NotFound)),
+        "{untagged:?}"
+    );
+    for bad in [
+        ReleaseFilesParams {
+            limit: Some(0),
+            ..params(None, None)
+        },
+        params(None, Some(",")),
+    ] {
+        let refused = files(&node, &node.owner, version, bad).await;
+        assert!(matches!(refused, Err(ServerError::BadRequestMessage(_))));
+    }
+}
+
