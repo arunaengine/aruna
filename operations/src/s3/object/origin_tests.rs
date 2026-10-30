@@ -84,7 +84,6 @@ async fn seed(context: &DriverContext, actor: &Actor, listed: bool) -> Ulid {
         database: true,
         dataset: Some(Ulid::from_bytes([9; 16])),
         parser: Some(parser),
-        ..BucketMetadata::default()
     };
     let stored = StoredMetadata {
         incarnation: 0,
