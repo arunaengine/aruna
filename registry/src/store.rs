@@ -306,6 +306,8 @@ pub(crate) mod tests {
             description: String::new(),
             api_url: Url::parse(&format!("{base}/api/v1")).unwrap(),
             portal_url: Url::parse(base).unwrap(),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at: 1,
         };
         let registration = Registration {

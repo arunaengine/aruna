@@ -705,10 +705,15 @@ fn federation_settings_materialize() {
         description: String::new(),
         api_url: url("https://api.example.org"),
         portal_url: url("https://portal.example.org"),
+        contact: None,
+        login_providers: Vec::new(),
         issued_at: 1,
     };
     let settings = FederationSettings {
         name: descriptor.name.clone(),
+        description: String::new(),
+        contact: None,
+        login_providers: Vec::new(),
         api_url: descriptor.api_url.clone(),
         portal_url: descriptor.portal_url.clone(),
         registry_url: None,

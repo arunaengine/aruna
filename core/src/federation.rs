@@ -20,6 +20,10 @@ pub const WITHDRAWAL_DOMAIN: &str = "aruna-registry-withdrawal-v1";
 
 /// Longest realm name a descriptor carries.
 pub const MAX_NAME_LEN: usize = 128;
+/// Longest realm description, so a descriptor stays well below the registry's fetch bound.
+pub const MAX_DESCRIPTION_LEN: usize = 4096;
+/// Longest contact address (the RFC 5321 path limit).
+pub const MAX_CONTACT_LEN: usize = 254;
 /// Most realms an `Only` admission list may name.
 pub const MAX_ACCEPTED_REALMS: usize = 1024;
 
@@ -53,7 +57,18 @@ pub struct RealmDescriptor {
     pub description: String,
     pub api_url: Url,
     pub portal_url: Url,
+    /// Public contact email address of the realm operator.
+    pub contact: Option<String>,
+    /// Login providers the realm shows to other realms and the registry.
+    pub login_providers: Vec<LoginProvider>,
     pub issued_at: u64,
+}
+
+/// An OIDC provider of the realm by its configured id and issuer URL.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginProvider {
+    pub id: String,
+    pub issuer: String,
 }
 
 impl Signable for RealmDescriptor {
@@ -226,6 +241,10 @@ impl AcceptedRealms {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederationSettings {
     pub name: String,
+    pub description: String,
+    pub contact: Option<String>,
+    /// Ids of the realm's OIDC providers shown in the descriptor, in order.
+    pub login_providers: Vec<String>,
     pub api_url: Url,
     pub portal_url: Url,
     /// No URL means no registry traffic.
@@ -246,6 +265,22 @@ impl FederationSettings {
         if self.name.trim().is_empty() || self.name.chars().count() > MAX_NAME_LEN {
             return Err(FederationError::InvalidSettings("name length"));
         }
+        if self.description.chars().count() > MAX_DESCRIPTION_LEN {
+            return Err(FederationError::InvalidSettings("description length"));
+        }
+        if !self.contact.as_deref().is_none_or(valid_contact) {
+            return Err(FederationError::InvalidSettings(
+                "contact must be an email address",
+            ));
+        }
+        let mut providers = self.login_providers.clone();
+        providers.sort();
+        providers.dedup();
+        if providers.len() != self.login_providers.len() {
+            return Err(FederationError::InvalidSettings(
+                "login provider listed twice",
+            ));
+        }
         let urls = [
             Some(&self.api_url),
             Some(&self.portal_url),
@@ -259,7 +294,14 @@ impl FederationSettings {
             return Err(FederationError::InvalidSettings("too many accepted realms"));
         }
         let descriptor = &self.descriptor.payload;
+        let provider_ids = descriptor
+            .login_providers
+            .iter()
+            .map(|provider| &provider.id);
         if descriptor.name != self.name
+            || descriptor.description != self.description
+            || descriptor.contact != self.contact
+            || !provider_ids.eq(self.login_providers.iter())
             || descriptor.api_url != self.api_url
             || descriptor.portal_url != self.portal_url
         {
@@ -269,6 +311,15 @@ impl FederationSettings {
         }
         self.descriptor.verify(realm_id)
     }
+}
+
+/// One `local@domain` address without spaces or control characters.
+fn valid_contact(contact: &str) -> bool {
+    let plain = !contact.chars().any(|c| c.is_whitespace() || c.is_control());
+    let parts = contact.split_once('@').filter(|(local, domain)| {
+        !local.is_empty() && domain.contains('.') && !domain.contains('@')
+    });
+    plain && parts.is_some() && contact.len() <= MAX_CONTACT_LEN
 }
 
 /// HTTPS, or plain HTTP to a loopback host for local development.
@@ -308,6 +359,8 @@ mod tests {
             description: String::new(),
             api_url: Url::parse("https://api.example.org").unwrap(),
             portal_url: Url::parse("https://portal.example.org").unwrap(),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at: 10,
         }
     }
@@ -426,6 +479,9 @@ mod tests {
         let signed = Signed::sign(descriptor(realm_id), &management(&key)).unwrap();
         let mut settings = FederationSettings {
             name: "Realm".to_string(),
+            description: String::new(),
+            contact: None,
+            login_providers: Vec::new(),
             api_url: signed.payload.api_url.clone(),
             portal_url: signed.payload.portal_url.clone(),
             registry_url: None,
@@ -436,6 +492,48 @@ mod tests {
         assert_eq!(settings.validate(&realm_id), Ok(()));
         settings.portal_url = Url::parse("https://other.example.org").unwrap();
         assert!(settings.validate(&realm_id).is_err());
+    }
+
+    #[test]
+    fn settings_check_facts() {
+        // Contact, description and provider lists are bounded and must match the descriptor.
+        let key = realm_key(1);
+        let realm_id = realm_of(&key);
+        let mut payload = descriptor(realm_id);
+        payload.contact = Some("data@example.org".to_string());
+        let signed = Signed::sign(payload, &management(&key)).unwrap();
+        let settings = FederationSettings {
+            name: "Realm".to_string(),
+            description: String::new(),
+            contact: Some("data@example.org".to_string()),
+            login_providers: Vec::new(),
+            api_url: signed.payload.api_url.clone(),
+            portal_url: signed.payload.portal_url.clone(),
+            registry_url: None,
+            registration: RegistrationMode::Enabled,
+            accepted_realms: AcceptedRealms::None,
+            descriptor: signed,
+        };
+        assert_eq!(settings.validate(&realm_id), Ok(()));
+        for contact in ["data", "@example.org", "a b@example.org", "data@example"] {
+            let mut bad = settings.clone();
+            bad.contact = Some(contact.to_string());
+            assert!(bad.validate(&realm_id).is_err(), "{contact}");
+        }
+        let mut long = settings.clone();
+        long.description = "a".repeat(MAX_DESCRIPTION_LEN + 1);
+        assert!(long.validate(&realm_id).is_err());
+        let mut twice = settings.clone();
+        twice.login_providers = vec!["a".to_string(), "a".to_string()];
+        assert!(twice.validate(&realm_id).is_err());
+        let mut unsigned = settings;
+        unsigned.contact = None;
+        assert_eq!(
+            unsigned.validate(&realm_id),
+            Err(FederationError::InvalidSettings(
+                "descriptor does not match"
+            ))
+        );
     }
 
     #[test]

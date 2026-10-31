@@ -187,10 +187,15 @@ mod tests {
             description: String::new(),
             api_url: url("https://b.example.org/api/v1"),
             portal_url: url("https://b.example.org"),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at,
         };
         FederationSettings {
             name: descriptor.name.clone(),
+            description: String::new(),
+            contact: None,
+            login_providers: Vec::new(),
             api_url: descriptor.api_url.clone(),
             portal_url: descriptor.portal_url.clone(),
             registry_url: None,
