@@ -1059,7 +1059,7 @@ pub(crate) async fn store_text(
         bucket_info,
         (&input.bucket, &input.key),
         (body, Some(size as u64)),
-        metadata,
+        (metadata, false),
     )
     .await?;
     Ok(WriteObjectOutput {
@@ -1082,7 +1082,7 @@ pub(crate) async fn store_stream(
         BackendStream<Result<Bytes, aruna_core::stream::StreamError>>,
         Option<u64>,
     ),
-    metadata: HashMap<String, String>,
+    (metadata, create_only): (HashMap<String, String>, bool),
 ) -> Result<PutObjectResult, crate::error::ServerError> {
     use crate::error::ServerError;
     let internal = |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string());
@@ -1123,6 +1123,9 @@ pub(crate) async fn store_stream(
     .with_restrictions(auth.path_restrictions.clone());
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
+    }
+    if create_only {
+        operation = operation.create_only();
     }
     let result = drive(operation, &state.get_ctx())
         .await
@@ -1336,9 +1339,11 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
         PutObjectError::InvalidPreassignedVersion => {
             ServerError::InternalError("invalid object version".to_string())
         }
-        PutObjectError::ObjectExists => {
-            ServerError::InternalError("object already exists".to_string())
-        }
+        PutObjectError::ObjectExists => ServerError::Refused(
+            http::StatusCode::CONFLICT,
+            "name_taken",
+            "another file took this name during the upload; upload again".to_string(),
+        ),
         PutObjectError::PutObjectFailed => {
             ServerError::InternalError("object write failed".to_string())
         }

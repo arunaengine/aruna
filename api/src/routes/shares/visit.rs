@@ -20,8 +20,12 @@ use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::s3::object::get::{GetObjectInput, get_object_routed};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_operations::shares::lifecycle::{
+    OpenShareConfig, OpenShareOperation, OpenedShare, ShareError,
+};
+use aruna_operations::shares::names::{ClaimNameOperation, ReleaseNameOperation};
 use aruna_operations::shares::rules::{
-    numbered_key, relative_path, scope_pattern, upload_key, visit_context, visit_expiry,
+    numbered_key, relative_path, scope_pattern, upload_key, visit_context,
 };
 use aruna_operations::shares::store::GetShareOperation;
 use aruna_operations::staging::offered_directory::guard_bucket_write;
@@ -49,6 +53,8 @@ use crate::server::state::ServerState;
 
 /// Entries per listing page when the visitor names no limit.
 const PAGE: usize = 100;
+/// Bytes of a visitor JSON body; none of them needs more.
+const MAX_JSON_BYTES: usize = 64 * 1024;
 /// The longest one upload may take; a stalled body also ends after the import idle timeout.
 const UPLOAD_SECS: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -57,14 +63,15 @@ const UPLOAD_SECS: std::time::Duration = std::time::Duration::from_secs(24 * 60 
 pub struct VisitDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(VisitDoc::openapi())
+    // Uploads stream their body unbuffered; every other visitor body is small JSON.
+    let small = OpenApiRouter::with_openapi(VisitDoc::openapi())
         .routes(routes!(open_share))
         .routes(routes!(list_files))
         .routes(routes!(create_ticket))
         .routes(routes!(download_file))
-        .routes(routes!(upload_file))
-        .layer(DefaultBodyLimit::disable())
         .merge(super::dataset::router())
+        .layer(DefaultBodyLimit::max(MAX_JSON_BYTES));
+    small.routes(routes!(upload_file))
 }
 
 #[derive(Clone, Debug, Default, Deserialize, ToSchema)]
@@ -155,6 +162,26 @@ pub struct UploadResponse {
     pub size: u64,
 }
 
+/// The answer a visitor gets for an operation error.
+pub(crate) fn visit_error(error: ShareError) -> ServerError {
+    match error {
+        ShareError::Unavailable => unavailable(),
+        ShareError::PasswordRequired => ServerError::Refused(
+            StatusCode::UNAUTHORIZED,
+            "password_required",
+            "this link needs a password".to_string(),
+        ),
+        ShareError::WrongPassword => ServerError::Refused(
+            StatusCode::UNAUTHORIZED,
+            "wrong_password",
+            "the password is not correct".to_string(),
+        ),
+        ShareError::Denied => ServerError::Forbidden,
+        ShareError::Rule(error) => ServerError::BadRequestReason(error.to_string()),
+        error => ServerError::InternalError(error.to_string()),
+    }
+}
+
 /// The one answer for unknown, expired, revoked and mistyped links.
 pub(crate) fn unavailable() -> ServerError {
     ServerError::Refused(
@@ -200,19 +227,20 @@ async fn active_link(state: &ServerState, id: Ulid, now: u64) -> ServerResult<Sh
     Ok(link)
 }
 
-/// The link a visit token in `headers` opens; link tokens are only accepted by `open`.
+/// The link a visit token in `headers` opens and when the visit ends (Unix seconds); link
+/// tokens are only accepted by `open`.
 pub(crate) async fn visited_link(
     state: &ServerState,
     headers: &HeaderMap,
-) -> ServerResult<ShareLink> {
+) -> ServerResult<(ShareLink, u64)> {
     let token = share_token(headers).ok_or_else(unavailable)?;
-    if !matches!(token, ShareToken::Visit { .. }) {
+    let ShareToken::Visit { expires_at, .. } = token else {
         return Err(unavailable());
-    }
+    };
     let now = unix_now();
     let link = active_link(state, token.share_id(), now).await?;
     match link.admits(&token, now) {
-        true => Ok(link),
+        true => Ok((link, expires_at)),
         false => Err(unavailable()),
     }
 }
@@ -339,34 +367,31 @@ pub async fn open_share(
             "too many attempts; wait a minute".to_string(),
         ));
     }
-    let now = unix_now();
-    let link = active_link(&state, token.share_id(), now).await?;
-    if !link.admits(&token, now) {
-        return Err(unavailable());
-    }
-    if let Some(hash) = link.password.clone() {
-        let password =
-            request
-                .and_then(|Json(request)| request.password)
-                .ok_or(ServerError::Refused(
-                    StatusCode::UNAUTHORIZED,
-                    "password_required",
-                    "this link needs a password".to_string(),
-                ))?;
-        let valid = tokio::task::spawn_blocking(move || hash.verify(&password))
-            .await
-            .unwrap_or(false);
-        if !valid {
-            log_event(&state, link.id, event(ShareAction::WrongPassword, None, ip)).await;
-            return Err(ServerError::Refused(
-                StatusCode::UNAUTHORIZED,
-                "wrong_password",
-                "the password is not correct".to_string(),
-            ));
-        }
-    }
-    log_event(&state, link.id, event(ShareAction::Open, None, ip)).await;
-    let expires_at = visit_expiry(&link, now);
+    let config = OpenShareConfig {
+        token,
+        password: request.and_then(|Json(request)| request.password),
+        now: unix_now(),
+        entry_id: Ulid::generate(),
+        client: client_network(ip),
+    };
+    // The password check is CPU work; it runs off the request threads.
+    let context = state.get_ctx();
+    let runtime = tokio::runtime::Handle::current();
+    let opened = tokio::task::spawn_blocking(move || {
+        runtime.block_on(drive(OpenShareOperation::new(config), &context))
+    })
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?
+    .map_err(visit_error)?;
+    let OpenedShare {
+        link,
+        visit_token,
+        expires_at,
+    } = opened;
+    // A deactivated creator ends every link at once.
+    crate::routes::access::users::ensure_active(&state, link.created_by)
+        .await
+        .map_err(|_| unavailable())?;
     let (kind, name) = match &link.target {
         ShareTarget::Bucket { bucket } => ("bucket", Some(bucket.clone())),
         ShareTarget::Folder { prefix, .. } => (
@@ -381,7 +406,7 @@ pub async fn open_share(
         ShareTarget::Dataset { .. } => ("dataset", None),
     };
     Ok(Json(OpenShareResponse {
-        visit_token: link.visit_token(expires_at),
+        visit_token,
         expires_at: rfc3339(expires_at),
         share: VisitInfo {
             kind: kind.to_string(),
@@ -418,32 +443,48 @@ pub async fn list_files(
     headers: HeaderMap,
     Query(query): Query<VisitListQuery>,
 ) -> ServerResult<Json<VisitListing>> {
-    let link = visited_link(&state, &headers).await?;
+    let (link, _) = visited_link(&state, &headers).await?;
     require_reads(&link)?;
     let (bucket, info, auth) = visit_scope(&state, &link).await?;
+    let root = root(&link.target).to_string();
+    let covers = |key: &str| link.target.covers(&bucket, key);
+    let scope = (bucket.as_str(), &info, &auth);
+    let listing = list_below(&state, scope, &root, query, link.expires_at, covers).await?;
+    Ok(Json(listing))
+}
+
+/// One folder level below `root` of a bucket as the narrowed creator sees it, names relative
+/// to `root`; only keys `covers` admits show.
+pub(crate) async fn list_below(
+    state: &ServerState,
+    (bucket, info, auth): (&str, &BucketInfo, &AuthContext),
+    root: &str,
+    query: VisitListQuery,
+    link_expiry: Option<u64>,
+    covers: impl Fn(&str) -> bool,
+) -> ServerResult<VisitListing> {
     let limit = query.limit.unwrap_or(PAGE);
     if !(1..=1000).contains(&limit) {
         return Err(ServerError::BadRequestReason(
             "limit must be 1 to 1000".into(),
         ));
     }
-    let root = root(&link.target).to_string();
     let folder = relative_folder(query.prefix.as_deref())?;
     let request = ListRequest {
-        bucket: bucket.clone(),
+        bucket: bucket.to_string(),
         prefix: Some(format!("{root}{folder}")),
         delimiter: Some("/".to_string()),
         cursor: query.cursor,
         limit,
     };
-    let expiry = link.expires_at.unwrap_or(u64::MAX);
-    let page = object_page(&state, &info, (None, Some((&auth, expiry))), request).await?;
-    let relative = |key: &str| key.strip_prefix(&root).map(str::to_string);
-    Ok(Json(VisitListing {
+    let expiry = link_expiry.unwrap_or(u64::MAX);
+    let page = object_page(state, info, (None, Some((auth, expiry))), request).await?;
+    let relative = |key: &str| key.strip_prefix(root).map(str::to_string);
+    Ok(VisitListing {
         files: page
             .objects
             .iter()
-            .filter(|object| link.target.covers(&bucket, &object.key))
+            .filter(|object| covers(&object.key))
             .filter_map(|object| {
                 Some(VisitFile {
                     name: relative(&object.key)?,
@@ -458,7 +499,7 @@ pub async fn list_files(
             .filter_map(|prefix| relative(prefix))
             .collect(),
         next_cursor: page.next_cursor,
-    }))
+    })
 }
 
 fn require_reads(link: &ShareLink) -> ServerResult<()> {
@@ -473,12 +514,13 @@ fn require_reads(link: &ShareLink) -> ServerResult<()> {
 }
 
 /// Signs a one-minute single-use ticket for `bucket`/`key` of `link`.
+/// A ticket never outlives the visit that asked for it.
 pub(crate) fn sign_ticket(
-    link: &ShareLink,
+    (link, visit_end): (&ShareLink, u64),
     (bucket, key): (&str, &str),
     version_id: Option<Ulid>,
 ) -> ServerResult<TicketResponse> {
-    let expires_at = unix_now() + TICKET_SECS;
+    let expires_at = (unix_now() + TICKET_SECS).min(visit_end);
     let body = TicketBody {
         share_id: link.id,
         bucket: bucket.to_string(),
@@ -542,7 +584,7 @@ pub async fn create_ticket(
     headers: HeaderMap,
     Json(request): Json<TicketRequest>,
 ) -> ServerResult<Json<TicketResponse>> {
-    let link = visited_link(&state, &headers).await?;
+    let (link, visit_end) = visited_link(&state, &headers).await?;
     require_reads(&link)?;
     relative_path(&request.name)
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
@@ -560,7 +602,11 @@ pub async fn create_ticket(
     )
     .await?;
     let version = current_version(&state, &bucket, &key).await?;
-    Ok(Json(sign_ticket(&link, (&bucket, &key), version)?))
+    Ok(Json(sign_ticket(
+        (&link, visit_end),
+        (&bucket, &key),
+        version,
+    )?))
 }
 
 /// Reads the share id out of a ticket before its signature can be checked.
@@ -673,25 +719,40 @@ pub async fn download_file(
     Ok(response.into_response())
 }
 
-/// The first free key of `key`, `key (1)`, `key (2)` and so on; an upload never replaces a file.
-async fn free_key(state: &ServerState, bucket: &str, key: &str) -> ServerResult<String> {
-    let mut candidate = key.to_string();
+/// Claims the first free key of `wanted`, `wanted (1)` and so on that the visit may write.
+/// The claim keeps concurrent share uploads apart; the create-only write keeps every file.
+async fn claim_key(
+    state: &ServerState,
+    auth: &AuthContext,
+    (bucket, info): (&str, &BucketInfo),
+    wanted: &str,
+) -> ServerResult<String> {
+    let now = unix_now();
+    let until = now + UPLOAD_SECS.as_secs();
     let mut number = 0;
     loop {
+        let candidate = match number {
+            0 => wanted.to_string(),
+            number => numbered_key(wanted, number),
+        };
+        number += 1;
         match current_version(state, bucket, &candidate).await {
-            Err(ServerError::NotFound) => return Ok(candidate),
+            Err(ServerError::NotFound) => {}
             Err(error) => return Err(error),
-            Ok(_) => {
-                number += 1;
-                candidate = numbered_key(key, number);
-            }
+            Ok(_) => continue,
+        }
+        let permission = (Permission::WRITE, "share.upload");
+        authorize_object(state, auth, (bucket, info), &candidate, permission).await?;
+        let claim = ClaimNameOperation::new(bucket, &candidate, now, until);
+        if drive(claim, &state.get_ctx()).await.map_err(visit_error)? {
+            return Ok(candidate);
         }
     }
 }
 
 #[utoipa::path(
     put,
-    path = "/shares/visit/files",
+    path = "/shares/visit/uploads",
     tag = "shares",
     summary = "Upload a file through a share link",
     description = r#"Stores the request body as a new file below the shared bucket or folder.
@@ -702,6 +763,8 @@ async fn free_key(state: &ServerState, bucket: &str, key: &str) -> ServerResult<
 - The file lands like any upload of the link's creator: everyone with access to the bucket sees
   it, and it counts against the bucket's group quota.
 - An upload never replaces a file: a taken name gets a number, such as `report (1).pdf`.
+  When another writer creates the same name during the upload, it fails with 409
+  `name_taken` and the client uploads again.
 - The owner gets a notification and an access log entry for each upload."#,
     params(UploadQuery),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
@@ -710,7 +773,7 @@ async fn free_key(state: &ServerState, bucket: &str, key: &str) -> ServerResult<
         (status = 400, description = "The name is not a valid relative path", body = ErrorResponse),
         (status = 403, description = "The link does not accept uploads, or the folder is read-only", body = ErrorResponse),
         (status = 404, description = "`share_unavailable`", body = ErrorResponse),
-        (status = 409, description = "The group storage quota is exhausted", body = ErrorResponse)
+        (status = 409, description = "The group storage quota is exhausted, or `name_taken`", body = ErrorResponse)
     ),
     security(("share_token" = []))
 )]
@@ -722,7 +785,7 @@ pub async fn upload_file(
     body: Body,
 ) -> ServerResult<(StatusCode, Json<UploadResponse>)> {
     let ip = visitor_ip(&state, peer, &headers);
-    let link = visited_link(&state, &headers).await?;
+    let (link, _) = visited_link(&state, &headers).await?;
     if !link.mode.uploads() {
         return Err(ServerError::Refused(
             StatusCode::FORBIDDEN,
@@ -738,15 +801,7 @@ pub async fn upload_file(
     guard_bucket_write(state.get_ctx().as_ref(), &bucket)
         .await
         .map_err(|_| ServerError::Forbidden)?;
-    authorize_object(
-        &state,
-        &auth,
-        (&bucket, &info),
-        &wanted,
-        (Permission::WRITE, "share.upload"),
-    )
-    .await?;
-    let key = free_key(&state, &bucket, &wanted).await?;
+    let key = claim_key(&state, &auth, (&bucket, &info), &wanted).await?;
     let content_length = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -765,9 +820,14 @@ pub async fn upload_file(
         &info,
         (&bucket, &key),
         (stream, content_length),
-        [(CONTENT_TYPE_KEY.to_string(), content_type)].into(),
+        ([(CONTENT_TYPE_KEY.to_string(), content_type)].into(), true),
     )
-    .await?;
+    .await;
+    let release = ReleaseNameOperation::new(&bucket, &key);
+    if let Err(error) = drive(release, &state.get_ctx()).await {
+        tracing::warn!(share_id = %link.id, error = %error, "Share upload name claim not released");
+    }
+    let stored = stored?;
     let size = stored.location.blob_size;
     let mut logged = event(ShareAction::Upload, Some(key.clone()), ip);
     logged.bytes = Some(size);
