@@ -45,6 +45,24 @@ impl AdminState {
     pub fn approved(&self) -> bool {
         self.status == RealmStatus::Approved
     }
+
+    /// The one resolver rule: only approved realms are targets, retired ones are gone.
+    pub fn may_resolve(&self) -> ResolveGate {
+        match self.status {
+            RealmStatus::Approved => ResolveGate::Allowed,
+            RealmStatus::Retired => ResolveGate::Retired,
+            RealmStatus::Listed | RealmStatus::Hidden => ResolveGate::Refused,
+        }
+    }
+}
+
+/// What a resolver route may do with an identifier of a realm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveGate {
+    Allowed,
+    /// Answer 410, so old identifiers explain themselves.
+    Retired,
+    Refused,
 }
 
 /// One admin change: who made it, when, and the state before and after.
@@ -138,6 +156,10 @@ mod tests {
         }
         assert!(state(Approved, None).approved() && state(Approved, None).listed());
         assert!(!state(Hidden, None).listed() && !state(Retired, None).listed());
+        assert_eq!(state(Approved, None).may_resolve(), ResolveGate::Allowed);
+        assert_eq!(state(Retired, None).may_resolve(), ResolveGate::Retired);
+        assert_eq!(state(Listed, None).may_resolve(), ResolveGate::Refused);
+        assert_eq!(state(Hidden, None).may_resolve(), ResolveGate::Refused);
     }
 
     #[test]

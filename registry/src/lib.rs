@@ -30,7 +30,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
-use crate::admin::RealmStatus;
+use crate::admin::{RealmStatus, ResolveGate};
 use crate::admin_api::AdminAuth;
 use crate::store::{Entry, Store, StoreError, is_stale};
 use crate::verify::verify_routes;
@@ -248,8 +248,8 @@ fn resolve_target(api_url: &url::Url, path: &str) -> Option<String> {
 }
 
 /// A resolve answer; never cached, so withdrawals and endpoint changes apply at once.
-fn uncached(status: StatusCode, location: Option<&str>, message: &'static str) -> Response {
-    let mut response = (status, message).into_response();
+fn uncached(status: StatusCode, location: Option<&str>, message: impl Into<String>) -> Response {
+    let mut response = (status, message.into()).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     if let Some(value) = location.and_then(|location| HeaderValue::from_str(location).ok()) {
@@ -258,28 +258,42 @@ fn uncached(status: StatusCode, location: Option<&str>, message: &'static str) -
     response
 }
 
+fn storage_unavailable(error: StoreError) -> Response {
+    warn!(error = %error, "Registry storage failed");
+    uncached(
+        StatusCode::SERVICE_UNAVAILABLE,
+        None,
+        "registry unavailable",
+    )
+}
+
 /// Sends a w3id data id to its realm: 307 to the realm API's resolve route for a leased,
-/// verified realm, 404 otherwise.
+/// approved realm, 410 for a retired realm, 404 otherwise.
 async fn resolve_id(State(state): State<Arc<RegistryState>>, uri: Uri) -> Response {
     let tail = uri.path().strip_prefix(RESOLVE_PREFIX).unwrap_or_default();
     let Some((realm_id, path)) = parse_tail(tail) else {
         return uncached(StatusCode::NOT_FOUND, None, "not an Aruna data id");
     };
+    match state.store.may_resolve(&realm_id) {
+        Ok(ResolveGate::Allowed) => {}
+        Ok(ResolveGate::Retired) => {
+            let names = state.store.names(&realm_id).unwrap_or_default();
+            let message = match names.last() {
+                Some(record) => format!("realm {} is retired", record.name),
+                None => "realm is retired".to_string(),
+            };
+            return uncached(StatusCode::GONE, None, message);
+        }
+        Ok(ResolveGate::Refused) => {
+            return uncached(StatusCode::NOT_FOUND, None, "realm not approved");
+        }
+        Err(error) => return storage_unavailable(error),
+    }
     let entry = match state.store.entry(&realm_id, unix_timestamp_secs()) {
         Ok(Some(entry)) => entry,
         Ok(None) => return uncached(StatusCode::NOT_FOUND, None, "realm not found"),
-        Err(error) => {
-            warn!(error = %error, "Registry storage failed");
-            return uncached(
-                StatusCode::SERVICE_UNAVAILABLE,
-                None,
-                "registry unavailable",
-            );
-        }
+        Err(error) => return storage_unavailable(error),
     };
-    if !entry.verified {
-        return uncached(StatusCode::NOT_FOUND, None, "realm not publicly reachable");
-    }
     let api_url = &entry.registration.payload.descriptor.payload.api_url;
     match resolve_target(api_url, &path) {
         Some(target) => uncached(StatusCode::TEMPORARY_REDIRECT, Some(&target), ""),
@@ -337,6 +351,7 @@ async fn delete_realm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::AdminState;
     use crate::store::tests::{capabilities, realm_id, registration};
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use ed25519_dalek::SigningKey;
@@ -460,7 +475,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_verified_realms() {
+    async fn resolves_approved_realms() {
+        // Only approval opens the resolver; verification is shown, never checked here.
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(RegistryState::new(
             Store::open(dir.path()).unwrap(),
@@ -472,22 +488,30 @@ mod tests {
         let missing = resolve_id(State(state.clone()), uri.clone()).await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-store");
-        // Each renewal is issued later than the one before.
-        let entry = |verified, issued_at| Entry {
-            registration: registration("https://realm.example.org", issued_at),
+        let entry = Entry {
+            registration: registration("https://realm.example.org", now),
             received_at: now,
-            verified,
+            verified: false,
             problems: Vec::new(),
         };
-        let earlier = entry(false, now - 10);
-        state.store.register(&realm_id(), &earlier, now).unwrap();
-        let private = resolve_id(State(state.clone()), uri.clone()).await;
-        assert_eq!(private.status(), StatusCode::NOT_FOUND);
-        state
-            .store
-            .register(&realm_id(), &entry(true, now), now)
-            .unwrap();
-        let found = resolve_id(State(state), uri).await;
+        state.store.register(&realm_id(), &entry, now).unwrap();
+        let set = |status| {
+            let next = AdminState {
+                status,
+                ..AdminState::default()
+            };
+            state
+                .store
+                .update_admin(&realm_id(), next, "test", now)
+                .unwrap();
+        };
+        for status in [RealmStatus::Listed, RealmStatus::Hidden] {
+            set(status);
+            let refused = resolve_id(State(state.clone()), uri.clone()).await;
+            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{status:?}");
+        }
+        set(RealmStatus::Approved);
+        let found = resolve_id(State(state.clone()), uri.clone()).await;
         assert_eq!(found.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(found.headers()[header::CACHE_CONTROL], "no-store");
         let location = found.headers()[header::LOCATION]
@@ -502,6 +526,15 @@ mod tests {
             location.starts_with("https://realm.example.org"),
             "{location}"
         );
+        // A retired realm answers 410 with its name, also after it withdrew.
+        set(RealmStatus::Retired);
+        state.store.withdraw(&realm_id(), now + 1, now + 1).unwrap();
+        let gone = resolve_id(State(state), uri).await;
+        assert_eq!(gone.status(), StatusCode::GONE);
+        let text = axum::body::to_bytes(gone.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&text[..], b"realm Realm is retired");
     }
 
     async fn body(response: Response) -> serde_json::Value {

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::admin::{AdminError, AdminState, AuditRecord, transition};
+use crate::admin::{AdminError, AdminState, AuditRecord, ResolveGate, transition};
 
 /// An entry leaves the listing this long after its last renewal.
 pub const LEASE_SECS: u64 = 72 * 3600;
@@ -188,6 +188,11 @@ impl Store {
             .map(|value| postcard::from_bytes(&value))
             .transpose()?
             .unwrap_or_default())
+    }
+
+    /// The resolver gate of the realm, shared by every resolver route.
+    pub fn may_resolve(&self, realm_id: &RealmId) -> Result<ResolveGate, StoreError> {
+        Ok(self.admin(realm_id)?.may_resolve())
     }
 
     /// The realm's admin state; a realm nobody changed is listed.
