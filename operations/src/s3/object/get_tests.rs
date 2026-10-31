@@ -3389,3 +3389,56 @@ fn candidates_count_proof() {
     ];
     assert_eq!(costs.map(|cost| cost.bytes), [2, 9, 9]);
 }
+
+// A source whose connector id was cleared, as on another node, takes the weight its resolution
+// found on the matched connector.
+#[test]
+fn matched_weight_counts() {
+    let mut operation = mirrored_operation(digested(9, 7));
+    operation.source_binding = operation
+        .source_binding
+        .take()
+        .map(|b| b.without_connectors());
+    let mut mirror = http_access("mirror/file.txt");
+    let ResolvedSourceAccess::OpenDal { config, .. } = &mut mirror;
+    config.insert("weight".to_string(), "1000".to_string());
+    resolve_all(
+        &mut operation,
+        vec![http_access("folder/file.txt"), mirror],
+        &[],
+    );
+    assert_eq!(operation.source_weights, [1.0, 1000.0]);
+}
+
+// The first source failing its checksums leaves the read to another source; only a pinned read
+// with no source left is refused.
+#[test]
+fn first_proof_moves_on() {
+    let mut operation = mirrored_operation(digested(9, 7));
+    let effects = ranked_head(&mut operation, vec![false, false]);
+    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(9),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+    ));
+    operation.step(source_read(observation(9)));
+    let effects = operation.step(spooled(8));
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let mut pinned = mirrored_operation(digested(9, 7));
+    pinned.reference_explicit = true;
+    ranked_head(&mut pinned, vec![false, false]);
+    let effects = pinned.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: digested(12, 7),
+    }));
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    pinned.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: digested(12, 7),
+    }));
+    assert!(matches!(
+        pinned.finalize(),
+        Err(GetObjectError::HistoricalReferenceUnavailable)
+    ));
+}

@@ -1111,8 +1111,14 @@ impl GetObjectOperation {
             let connector_id = binding.and_then(|binding| binding.source_at(slot)?.connector_id);
             connector_id.and_then(|id| weights.get(&id).copied())
         };
-        let weights = self.source_queue.iter().map(|(slot, _)| weight(*slot));
-        self.source_weights = weights.map(|weight| weight.unwrap_or(1.0)).collect();
+        // A source without a connector id reads through the connector its resolution matched.
+        let weights = (self.source_queue.iter()).map(|(slot, access)| {
+            let ResolvedSourceAccess::OpenDal { config, .. } = access;
+            weight(*slot)
+                .or_else(|| source_weight(config))
+                .unwrap_or(1.0)
+        });
+        self.source_weights = weights.collect();
         self.state = GetObjectState::RankSources;
         let accesses = self.source_queue.iter().map(|(_, access)| access.clone());
         smallvec![Effect::StagingSource(StagingSourceEffect::Health {
@@ -1517,18 +1523,18 @@ impl GetObjectOperation {
                     return self.serve_reference_source(served, false);
                 }
                 // Another source that disagrees gives way to the remaining ones first.
-                if self.mirror_remains() {
+                if mirror && self.others_remain() {
                     return self.source_failed(GetObjectError::ReferenceSourceChanged);
                 }
                 // A pinned historical version cannot serve drifted bytes:
                 // its bytes were never cached (#375 deferred).
                 if self.reference_explicit {
-                    return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                    return self.proof_failed(GetObjectError::HistoricalReferenceUnavailable);
                 }
                 // Recorded digests bind the bytes, so a drifted source never replaces them.
                 let bound = self.reference_cached.as_ref();
                 if bound.is_some_and(|stored| !stored.enforced_checksums().is_empty()) {
-                    return self.emit_error(GetObjectError::ReferenceChecksumMismatch);
+                    return self.proof_failed(GetObjectError::ReferenceChecksumMismatch);
                 }
                 // Current drift records a same-binding successor, but repeated
                 // change fails rather than serving mismatched bytes.
@@ -2070,11 +2076,11 @@ impl GetObjectOperation {
                 };
                 let comparison = head_metadata.compare(&metadata);
                 if comparison == ObservationMatch::Changed {
-                    if self.mirror_remains() {
+                    if self.source_slot > 0 && self.others_remain() {
                         return self.source_failed(GetObjectError::ReferenceSourceChanged);
                     }
                     if self.reference_explicit {
-                        return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                        return self.proof_failed(GetObjectError::HistoricalReferenceUnavailable);
                     }
                     return self.restart_after_conflict();
                 }
@@ -2194,15 +2200,15 @@ impl GetObjectOperation {
         self.finish_reference_output()
     }
 
-    /// Whether another source than the first is read and further sources remain to try.
-    fn mirror_remains(&self) -> bool {
-        self.source_slot > 0 && !self.source_queue.is_empty()
+    /// Whether further sources remain to try.
+    fn others_remain(&self) -> bool {
+        !self.source_queue.is_empty()
     }
 
-    /// Bytes of another source that fail their proof were not served, so the remaining sources
-    /// are tried; the first source's failure stands.
+    /// Bytes that fail their proof were not served, so any remaining source is tried; the
+    /// failure stands once none is left.
     fn proof_failed(&mut self, error: GetObjectError) -> Effects {
-        match self.mirror_remains() {
+        match self.others_remain() {
             true => self.source_failed(error),
             false => self.emit_error(error),
         }
