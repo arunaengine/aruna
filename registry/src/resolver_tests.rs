@@ -60,20 +60,45 @@ fn minted() -> Ulid {
 }
 
 /// Fake sites: each URL says what the map holds, anything else is absent; asks are counted.
+/// Realm nodes answer the route check with `routes`, counted apart.
 struct Sites {
     said: HashMap<String, Holding>,
     asked: AtomicUsize,
+    routes: Holding,
+    checks: AtomicUsize,
 }
 
 impl Sites {
     fn new(said: &[(&str, Holding)]) -> Self {
+        Self::serving(said, Holding::Holds)
+    }
+
+    /// Sites whose realm nodes predate the w3id route.
+    fn old(said: &[(&str, Holding)]) -> Self {
+        Self::serving(said, Holding::Absent)
+    }
+
+    fn serving(said: &[(&str, Holding)], routes: Holding) -> Self {
         Self {
             said: said
                 .iter()
                 .map(|(url, holding)| ((*url).to_string(), *holding))
                 .collect(),
             asked: AtomicUsize::new(0),
+            routes,
+            checks: AtomicUsize::new(0),
         }
+    }
+
+    fn probe(&self, url: &Url, source: Source) -> Holding {
+        if source == Source::Routes {
+            assert_eq!(url.path(), format!("/api/v1/w3id/data/{ROUTE_CHECK}"));
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            return self.routes;
+        }
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        let holding = self.said.get(url.as_str()).copied();
+        holding.unwrap_or(Holding::Absent)
     }
 
     async fn ask(&self, resolver: &Resolver, path: &str, now: u64) -> Answer {
@@ -82,12 +107,23 @@ impl Sites {
     }
 
     async fn ask_from(&self, resolver: &Resolver, path: &str, now: u64, client: IpAddr) -> Answer {
-        let probe = |url: Url, _| {
-            self.asked.fetch_add(1, Ordering::SeqCst);
-            let holding = self.said.get(url.as_str()).copied();
-            async move { holding.unwrap_or(Holding::Absent) }
+        let probe = |url: Url, source| {
+            let holding = self.probe(&url, source);
+            async move { holding }
         };
         resolver.answer(parse_path(path), now, client, probe).await
+    }
+
+    async fn owned(&self, resolver: &Resolver, rest: &str, now: u64) -> Answer {
+        let probe = |url: Url, source| {
+            let holding = self.probe(&url, source);
+            async move { holding }
+        };
+        resolver.owned(rest, now, &probe).await
+    }
+
+    fn checks(&self) -> usize {
+        self.checks.load(Ordering::SeqCst)
     }
 
     fn asked(&self) -> usize {
@@ -226,6 +262,10 @@ fn maps_site_statuses() {
         (Source::Legacy, 404, Holding::Absent),
         (Source::Legacy, 302, Holding::Unavailable),
         (Source::Legacy, 502, Holding::Unavailable),
+        (Source::Routes, 307, Holding::Holds),
+        (Source::Routes, 404, Holding::Absent),
+        (Source::Routes, 302, Holding::Unavailable),
+        (Source::Routes, 503, Holding::Unavailable),
     ];
     for (source, status, expected) in cases {
         let status = StatusCode::from_u16(status).unwrap();
@@ -278,6 +318,8 @@ async fn kept_realms_rechecked() {
         redirect(&target)
     );
     assert_eq!(sites.asked(), 3);
+    // The new URL's routes are checked again, since another node may answer there.
+    assert_eq!(sites.checks(), 2);
     // A withdrawn realm is never a kept target: the id is guessed again without it.
     store.withdraw(&realm_id(), now + 2, now).unwrap();
     let page = redirect(&format!("{}{id}", V2.page));
@@ -441,6 +483,66 @@ async fn retired_realms_gone() {
 }
 
 #[tokio::test]
+async fn old_nodes_use_pid() {
+    // Nodes without the w3id route are asked and reached through their PID routes.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let id = minted();
+    let pid = format!("{API}/pid/{id}");
+    let sites = Sites::old(&[(&pid, Holding::Holds)]);
+    assert_eq!(
+        sites.ask(&resolver, &id.to_string(), now).await,
+        redirect(&pid)
+    );
+    assert_eq!((sites.asked(), sites.checks()), (3, 1));
+    // The kept hit and the other shapes use the same routes; the check itself is kept too.
+    assert_eq!(
+        sites.ask(&resolver, &id.to_string(), now + 1).await,
+        redirect(&pid)
+    );
+    let profile = format!("profile/{id}");
+    let target = redirect(&format!("{API}/profile/{id}"));
+    let profiles = Sites::old(&[(&format!("{API}/profile/{id}"), Holding::Holds)]);
+    assert_eq!(profiles.ask(&resolver, &profile, now + 1).await, target);
+    let hash = "ab".repeat(32);
+    let data = sites.ask(&resolver, &format!("data/{hash}"), now + 1).await;
+    assert_eq!(data, redirect(&format!("{API}/resolve/{hash}")));
+    assert_eq!(sites.checks() + profiles.checks(), 1);
+    let later = now + ROUTES_SECS;
+    sites.ask(&resolver, &format!("data/{hash}"), later).await;
+    assert_eq!(sites.checks(), 2);
+}
+
+#[tokio::test]
+async fn old_nodes_never_absent() {
+    // An older node answers 503 for ids it cannot place, which must not send v3 ids to v2.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let pid = format!("{API}/pid/{LEGACY}");
+    let sites = Sites::old(&[(&pid, Holding::Unavailable)]);
+    assert_eq!(sites.ask(&resolver, LEGACY, now).await, Answer::Unavailable);
+    // A v2 site that knows the id still wins, as it would on newer nodes.
+    let dev_api = format!("{}{LEGACY}", V2_DEV.api);
+    let known = Sites::old(&[(&pid, Holding::Unavailable), (&dev_api, Holding::Holds)]);
+    let page = redirect(&format!("{}{LEGACY}", V2_DEV.page));
+    assert_eq!(known.ask(&resolver, LEGACY, now).await, page);
+}
+
+#[tokio::test]
+async fn unclear_check_uses_pid() {
+    // An unreachable route check picks the routes every node serves and is asked again later.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let sites = Sites::serving(&[], Holding::Unavailable);
+    let hash = "ab".repeat(32);
+    let target = redirect(&format!("{API}/resolve/{hash}"));
+    for _ in 0..2 {
+        assert_eq!(
+            sites.ask(&resolver, &format!("data/{hash}"), now).await,
+            target
+        );
+    }
+    assert_eq!(sites.checks(), 2);
+}
+
+#[tokio::test]
 async fn data_ids_direct() {
     let (_dir, resolver, now) = resolver(BASE, true);
     let sites = Sites::new(&[]);
@@ -567,25 +669,21 @@ async fn handlers_set_headers() {
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     assert_eq!(unknown.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
 
-    let owned = |path: String| {
-        let uri: Uri = path.parse().unwrap();
-        resolve_owned(State(resolver.clone()), uri)
-    };
-    let response = owned(format!("/realm/{realm}/profile/{id}")).await;
-    assert_eq!(response.status(), StatusCode::FOUND);
-    let target = format!("{API}/w3id/profile/{id}");
-    assert_eq!(response.headers()[header::LOCATION], target.as_str());
+    let sites = Sites::new(&[]);
+    let now = unix_timestamp_secs();
+    let answer = sites
+        .owned(&resolver, &format!("{realm}/profile/{id}"), now)
+        .await;
+    assert_eq!(answer, redirect(&format!("{API}/w3id/profile/{id}")));
     let other = aruna_core::structs::identity::realm::RealmId::from_bytes([3; 32]);
-    for path in [
-        format!("/realm/{realm}/terms/Release"),
-        format!("/realm/{other}/{id}"),
-        format!("/realm/not-a-realm/{id}"),
+    for rest in [
+        format!("{realm}/terms/Release"),
+        format!("{other}/{id}"),
+        format!("not-a-realm/{id}"),
+        realm.to_string(),
     ] {
-        assert_eq!(
-            owned(path.clone()).await.status(),
-            StatusCode::NOT_FOUND,
-            "{path}"
-        );
+        let answer = sites.owned(&resolver, &rest, now).await;
+        assert!(matches!(answer, Answer::NotFound(_)), "{rest}: {answer:?}");
     }
 }
 
