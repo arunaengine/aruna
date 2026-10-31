@@ -16,7 +16,7 @@ use aruna_core::structs::execution::offered_directory::{
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };
 use aruna_core::structs::execution::source_access::{
-    ResolvedSourceAccess, ResolvedSourceConnector,
+    ResolvedSourceAccess, ResolvedSourceConnector, SOURCE_WEIGHT,
 };
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
@@ -103,6 +103,8 @@ pub struct ResolveBindingOperation {
     state: ResolveBindingState,
     output: Option<Result<ResolvedSourceAccess, SourceResolutionError>>,
     pages: usize,
+    /// The current weight hint of the connector matched by source root, passed to the reader.
+    matched_weight: Option<String>,
 }
 
 impl ResolveConnectorOperation {
@@ -187,6 +189,7 @@ impl ResolveBindingOperation {
             state: ResolveBindingState::Init,
             output: None,
             pages: 0,
+            matched_weight: None,
         }
     }
 
@@ -264,6 +267,7 @@ impl ResolveBindingOperation {
         });
         if let Some(connector) = matched {
             self.input.source.connector_id = Some(connector.connector_id);
+            self.matched_weight = connector.public_config.get(SOURCE_WEIGHT).cloned();
             return self.read_secret();
         }
         match (next, self.input.group_id) {
@@ -292,10 +296,14 @@ impl ResolveBindingOperation {
     }
 
     fn handle_secret_read(&mut self, event: Event) -> Effects {
-        let access = match resolve_binding_access(&self.input.source, event) {
+        let mut access = match resolve_binding_access(&self.input.source, event) {
             Ok(access) => access,
             Err(error) => return self.emit_error(error),
         };
+        if let Some(weight) = self.matched_weight.take() {
+            let ResolvedSourceAccess::OpenDal { config, .. } = &mut access;
+            config.insert(SOURCE_WEIGHT.to_string(), weight);
+        }
 
         self.state = ResolveBindingState::Finish;
         self.output = Some(Ok(access));
@@ -833,10 +841,13 @@ mod tests {
             created_by: Default::default(),
             name: format!("dav-{user}"),
             kind: SourceConnectorKind::Webdav,
-            public_config: HashMap::from([(
-                "endpoint".to_string(),
-                "https://dav.example.org".to_string(),
-            )]),
+            public_config: HashMap::from([
+                (
+                    "endpoint".to_string(),
+                    "https://dav.example.org".to_string(),
+                ),
+                (SOURCE_WEIGHT.to_string(), "4".to_string()),
+            ]),
             secret_config: HashMap::from([
                 ("username".to_string(), user.to_string()),
                 ("password".to_string(), "secret".to_string()),
@@ -875,6 +886,9 @@ mod tests {
         let ResolvedSourceAccess::OpenDal { config, .. } =
             drive(resolve(Some(group_id)), &context).await.unwrap();
         assert_eq!(config.get("username").map(String::as_str), Some("alice"));
+        // The matched connector's current weight reaches the reader, not the stored source.
+        assert_eq!(config.get(SOURCE_WEIGHT).map(String::as_str), Some("4"));
+        assert!(!source.descriptor.public_config.contains_key(SOURCE_WEIGHT));
         assert_eq!(
             drive(resolve(Some(Ulid::generate())), &context).await,
             Err(SourceResolutionError::ResolveFailed)
