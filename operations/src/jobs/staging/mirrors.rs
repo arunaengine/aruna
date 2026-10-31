@@ -23,13 +23,13 @@ use crate::staging::page::rows::PageEntry;
 
 /// Adds the further sources of each entry. An entry whose further source is invalid or not
 /// readable by the submitter is recorded as failed and dropped; a connector that is gone fails
-/// the job.
+/// the job. The connectors come back for the page to check again when it commits.
 pub(super) async fn add_mirrors(
     ctx: &JobContext,
     (spec, rules): (&StagingJobSpec, &PermissionRules),
     next: &mut StagingJobCheckpoint,
     entries: Vec<(PageEntry, Vec<(Ulid, String)>)>,
-) -> Result<Vec<PageEntry>, PageFailure> {
+) -> Result<(Vec<PageEntry>, Vec<SourceConnector>), PageFailure> {
     let mut connectors: HashMap<Ulid, SourceConnector> = HashMap::new();
     let mut kept = Vec::with_capacity(entries.len());
     'entries: for (mut entry, rendered) in entries {
@@ -74,7 +74,7 @@ pub(super) async fn add_mirrors(
         }
         kept.push(entry);
     }
-    Ok(kept)
+    Ok((kept, connectors.into_values().collect()))
 }
 
 /// A connector of the job's group, so a job never reads through another group's connector.

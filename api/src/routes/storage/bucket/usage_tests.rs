@@ -312,6 +312,7 @@ async fn reference_import_counted() {
         deletes: Vec::new(),
         now: SystemTime::UNIX_EPOCH + Duration::from_secs(120),
         ranges: None,
+        mirror_connectors: Vec::new(),
     };
     drive(PageImportOperation::new(page), ctx.as_ref())
         .await

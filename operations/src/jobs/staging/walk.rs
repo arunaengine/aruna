@@ -860,7 +860,8 @@ pub(super) async fn import_page(
             Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
         }
     }
-    let entries = super::mirrors::add_mirrors(ctx, (spec, &rules), &mut next, entries).await?;
+    let (entries, mirror_connectors) =
+        super::mirrors::add_mirrors(ctx, (spec, &rules), &mut next, entries).await?;
     // Files a table row describes are not headed; the page then resolves its connector itself.
     let source = match (source, entries.first()) {
         (Some(source), _) => source,
@@ -887,6 +888,7 @@ pub(super) async fn import_page(
         deletes,
         now: SystemTime::now(),
         ranges: None,
+        mirror_connectors,
     };
     let result = {
         // Listing and the reads above run in parallel; the page transactions take turns.

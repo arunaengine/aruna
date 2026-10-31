@@ -142,6 +142,7 @@ fn input(entries: Vec<PageEntry>) -> PageImportInput {
         deletes: Vec::new(),
         now: SystemTime::UNIX_EPOCH + Duration::from_secs(2_000),
         ranges: None,
+        mirror_connectors: Vec::new(),
     }
 }
 
@@ -1237,5 +1238,47 @@ async fn page_exchanges_measured() {
         println!(
             "gathered page {page}: {exchanges} storage exchanges, {elapsed} ms for {GATHERED} keys"
         );
+    }
+}
+
+// A further source's connector is read again with the page's guards: replaced or removed since
+// the page resolved it, the page stops.
+#[test]
+fn mirror_connector_rechecked() {
+    let mirror = SourceConnector::new(
+        Ulid::from_bytes([3; 16]),
+        Ulid::from_bytes([1; 16]),
+        "mirror".to_string(),
+        SourceConnectorKind::S3,
+        HashMap::from([("bucket".to_string(), "mirror".to_string())]),
+        SystemTime::UNIX_EPOCH,
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+    );
+    let input = PageImportInput {
+        mirror_connectors: vec![mirror.clone()],
+        ..input(vec![entry("a")])
+    };
+    let reads = crate::staging::page::rows::guard_reads(&input).unwrap();
+    assert_eq!(reads.len(), GUARD_READS + 1);
+    let values = |found: Option<&SourceConnector>| {
+        let Event::Storage(StorageEvent::BatchReadResult { mut values }) =
+            guards(None, &record(token()))
+        else {
+            unreachable!()
+        };
+        let found = found.map(|connector| connector.to_bytes().unwrap().into());
+        values.push((Key::from(b"mirror".to_vec()), found));
+        values
+    };
+    let check = crate::staging::page::rows::check_guards;
+    assert!(check(&input, values(Some(&mirror))).is_ok());
+    let mut replaced = mirror.clone();
+    replaced
+        .public_config
+        .insert("bucket".to_string(), "other".to_string());
+    for found in [None, Some(&replaced)] {
+        let result = check(&input, values(found)).map(|_| ());
+        assert_eq!(result, Err(PageImportError::ConnectorChanged));
     }
 }
