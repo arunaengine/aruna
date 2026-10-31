@@ -9,7 +9,7 @@ use crate::blob::promote::{
     PromoteError, PromotePendingOperation, Promotion, drop_mismatch, reject_archive,
 };
 use crate::blob::records::blob_location_read;
-use crate::connectors::repository::connector_reference_write;
+use crate::connectors::repository::{connector_reference_write, source_connector_key};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::pull::{
     HeldElsewhere, PullRequest, kept_location, kept_reads, kept_source_location, kept_source_reads,
@@ -40,7 +40,7 @@ use aruna_core::errors::{
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     ABE_GRANT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
+    OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
@@ -50,7 +50,7 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::source_access::{
     ObservationMatch, ResolvedSourceAccess, SourceMetadata, SourceStats, source_weight,
 };
-use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
@@ -64,6 +64,7 @@ use aruna_core::structs::storage::blob::{
     BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
 use aruna_core::structs::storage::distribution::on_use::{ATTACHMENT_NAMESPACE, CACHE_NAMESPACE};
+use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease, TokenCredential,
 };
@@ -106,7 +107,9 @@ pub enum GetObjectState {
     ReadSourceBucket,
     ReadSourceKept,
     ResolveReferenceAccess,
-    /// Asks which of several sources failed lately, so the others are tried first.
+    /// Reads the connectors of several sources for their current weight hint.
+    ReadSourceWeights,
+    /// Asks how several sources performed lately, to pick the one this read uses.
     RankSources,
     ReadMultipartSummary,
     CommitTransaction,
@@ -396,8 +399,10 @@ pub struct GetObjectOperation {
     source_queue: VecDeque<(usize, ResolvedSourceAccess)>,
     /// The slot of the source being resolved, then of the source being read.
     source_slot: usize,
-    /// The slot this read reads; a restarted read keeps it, so one read uses one source.
-    chosen_slot: Option<usize>,
+    /// The source this read reads; a restarted read keeps it, so one read uses one source.
+    chosen_source: Option<VersionSourceBinding>,
+    /// The operator's weight of each queued source, read from its connector at ranking.
+    source_weights: Vec<f64>,
     /// Why the last source failed, reported when no other source serves.
     source_failure: Option<GetObjectError>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
@@ -455,7 +460,8 @@ impl GetObjectOperation {
             source_set: None,
             source_queue: VecDeque::new(),
             source_slot: 0,
-            chosen_slot: None,
+            chosen_source: None,
+            source_weights: Vec::new(),
             source_failure: None,
             output: None,
             reference_key: None,
@@ -785,13 +791,20 @@ impl GetObjectOperation {
                 });
             }
         };
-        let candidates: Vec<Candidate> = (self.source_queue.iter().zip(stats))
-            .map(|((slot, access), stats)| self.candidate(*slot, access, stats))
+        let weights = self.source_weights.iter().copied();
+        let candidates: Vec<Candidate> = (self.source_queue.iter().zip(stats).zip(weights))
+            .map(|(((slot, access), stats), weight)| self.candidate(*slot, access, stats, weight))
             .collect();
         let choice = choose_source(&candidates, draw);
         let mut order = choice.order;
+        let binding = self.source_binding.as_ref();
+        let chosen = self.chosen_source.as_ref();
         let kept = (order.iter()).position(|&index| {
-            Some(self.source_queue[index].0) == self.chosen_slot && !candidates[index].stats.failing
+            let source = binding.and_then(|binding| binding.source_at(self.source_queue[index].0));
+            let same = chosen
+                .zip(source.as_ref())
+                .is_some_and(|(a, b)| RootEntry::same_source(a, b));
+            same && !candidates[index].stats.failing
         });
         if let Some(position) = kept {
             let index = order.remove(position);
@@ -812,28 +825,36 @@ impl GetObjectOperation {
         self.next_source()
     }
 
-    /// One source as a choice for this read. Another source than the first serves only bytes
-    /// recorded checksums prove; a source that cannot bind the ETag is then read whole.
+    /// One source as a choice for this read. The first source binds the recorded ETag; another
+    /// one serves bytes the recorded checksums prove, read whole until its HEAD shows an equal
+    /// strong ETag it enforces, or only bound to that ETag when there are no checksums.
     fn candidate(
         &self,
         slot: usize,
         access: &ResolvedSourceAccess,
         stats: SourceStats,
+        weight: f64,
     ) -> Candidate {
-        let ResolvedSourceAccess::OpenDal { kind, config, .. } = access;
+        let ResolvedSourceAccess::OpenDal { kind, .. } = access;
         let cached = self.reference_cached.as_ref();
         let proven = cached.is_some_and(|cached| !cached.enforced_checksums().is_empty());
+        let binds = kind.enforces_if_match()
+            && cached.is_some_and(|cached| strong_validator(cached.etag.as_deref()));
         let length = cached.map_or(0, |cached| cached.content_length);
         let range = (self.input.range.as_ref()).and_then(|range| range.resolve(length).ok());
-        let bytes = match proven && !kind.enforces_if_match() {
-            true => length,
-            false => range.map_or(length, |range| range.range.end - range.range.start),
+        let ranged = match slot {
+            0 => binds || !proven,
+            _ => !proven,
+        };
+        let bytes = match ranged {
+            true => range.map_or(length, |range| range.range.end - range.range.start),
+            false => length,
         };
         Candidate {
             stats,
-            weight: source_weight(config).unwrap_or(1.0),
+            weight,
             bytes,
-            eligible: slot == 0 || proven,
+            eligible: slot == 0 || proven || binds,
         }
     }
 
@@ -844,7 +865,7 @@ impl GetObjectOperation {
             return self.source_failed(error.unwrap_or(GetObjectError::GetObjectFailed));
         };
         self.source_slot = slot;
-        self.chosen_slot = Some(slot);
+        self.chosen_source = self.source_binding.as_ref().and_then(|b| b.source_at(slot));
         self.reference_access = Some(access.clone());
         self.verify_digests.clear();
         if self.txn_id.is_some() {
@@ -1035,6 +1056,63 @@ impl GetObjectOperation {
         if self.source_queue.len() < 2 {
             return self.next_source();
         }
+        self.read_weights()
+    }
+
+    /// Reads the connectors of the queued sources, whose weight hint may change any time.
+    fn read_weights(&mut self) -> Effects {
+        let binding = self.source_binding.as_ref();
+        let group_id = self.input.group_id;
+        let reads: Vec<_> = (self.source_queue.iter())
+            .filter_map(|(slot, _)| binding?.source_at(*slot)?.connector_id)
+            .map(|id| {
+                let key = source_connector_key(group_id, id);
+                (SOURCE_INDEX_KEYSPACE.to_string(), key)
+            })
+            .collect();
+        if reads.is_empty() {
+            return self.ask_health(HashMap::new());
+        }
+        self.state = GetObjectState::ReadSourceWeights;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn weights_read(&mut self, event: Event) -> Effects {
+        let values = match event {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
+            other => {
+                return self.emit_error(GetObjectError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::Storage(StorageEvent::BatchReadResult)",
+                    received: other,
+                });
+            }
+        };
+        let connectors = values.iter().filter_map(|(_, value)| value.as_deref());
+        let weights = connectors
+            .filter_map(|value| SourceConnector::from_bytes(value).ok())
+            .filter_map(|connector| {
+                Some((
+                    connector.connector_id,
+                    source_weight(&connector.public_config)?,
+                ))
+            })
+            .collect();
+        self.ask_health(weights)
+    }
+
+    fn ask_health(&mut self, weights: HashMap<Ulid, f64>) -> Effects {
+        let binding = self.source_binding.as_ref();
+        let weight = |slot: usize| {
+            let connector_id = binding.and_then(|binding| binding.source_at(slot)?.connector_id);
+            connector_id.and_then(|id| weights.get(&id).copied())
+        };
+        let weights = self.source_queue.iter().map(|(slot, _)| weight(*slot));
+        self.source_weights = weights.map(|weight| weight.unwrap_or(1.0)).collect();
         self.state = GetObjectState::RankSources;
         let accesses = self.source_queue.iter().map(|(_, access)| access.clone());
         smallvec![Effect::StagingSource(StagingSourceEffect::Health {
@@ -1438,6 +1516,10 @@ impl GetObjectOperation {
                     self.verify_digests = enforced;
                     return self.serve_reference_source(served, false);
                 }
+                // Another source that disagrees gives way to the remaining ones first.
+                if self.mirror_remains() {
+                    return self.source_failed(GetObjectError::ReferenceSourceChanged);
+                }
                 // A pinned historical version cannot serve drifted bytes:
                 // its bytes were never cached (#375 deferred).
                 if self.reference_explicit {
@@ -1457,7 +1539,6 @@ impl GetObjectOperation {
                         self.source_binding =
                             binding.and_then(|binding| binding.promoted(self.source_slot));
                         self.source_slot = 0;
-                        self.chosen_slot = Some(0);
                     }
                     return self.begin_reference_advance(metadata);
                 }
@@ -1989,6 +2070,9 @@ impl GetObjectOperation {
                 };
                 let comparison = head_metadata.compare(&metadata);
                 if comparison == ObservationMatch::Changed {
+                    if self.mirror_remains() {
+                        return self.source_failed(GetObjectError::ReferenceSourceChanged);
+                    }
                     if self.reference_explicit {
                         return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                     }
@@ -2092,7 +2176,7 @@ impl GetObjectOperation {
             }
             // A source that sent other bytes than it announced changed behind the version.
             Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
-                return self.emit_error(GetObjectError::ReferenceSourceChanged);
+                return self.proof_failed(GetObjectError::ReferenceSourceChanged);
             }
             // Nothing was served yet, so a broken transfer tries the other sources.
             Event::Blob(BlobEvent::Error(error)) => {
@@ -2104,10 +2188,24 @@ impl GetObjectOperation {
         let expected = std::mem::take(&mut self.verify_digests);
         // Dropping the stream of a spool that missed the digests removes the spool.
         if unmatched_checksum(&expected, &hashes).is_some() {
-            return self.emit_error(GetObjectError::ReferenceChecksumMismatch);
+            return self.proof_failed(GetObjectError::ReferenceChecksumMismatch);
         }
         self.reference_stream = Some(blob);
         self.finish_reference_output()
+    }
+
+    /// Whether another source than the first is read and further sources remain to try.
+    fn mirror_remains(&self) -> bool {
+        self.source_slot > 0 && !self.source_queue.is_empty()
+    }
+
+    /// Bytes of another source that fail their proof were not served, so the remaining sources
+    /// are tried; the first source's failure stands.
+    fn proof_failed(&mut self, error: GetObjectError) -> Effects {
+        match self.mirror_remains() {
+            true => self.source_failed(error),
+            false => self.emit_error(error),
+        }
     }
 
     fn finish_reference_output(&mut self) -> Effects {
@@ -2195,6 +2293,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::ReadSourceBucket => self.source_bucket_read(event),
             GetObjectState::ReadSourceKept => self.source_kept_read(event),
             GetObjectState::ResolveReferenceAccess => self.reference_access_resolved(event),
+            GetObjectState::ReadSourceWeights => self.weights_read(event),
             GetObjectState::RankSources => self.sources_ranked(event),
             GetObjectState::ReadMultipartSummary => self.summary_read(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
