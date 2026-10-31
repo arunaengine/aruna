@@ -15,7 +15,10 @@ aruna-blob = { workspace = true }
 aruna-core = { workspace = true }
 axum = { workspace = true }
 fjall = { workspace = true }
+futures = { workspace = true }
 governor = { workspace = true }
+lru = { workspace = true }
+percent-encoding = { workspace = true }
 postcard = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -26,6 +29,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

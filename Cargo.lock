@@ -724,7 +724,10 @@ dependencies = [
  "axum",
  "ed25519-dalek 3.0.0",
  "fjall",
+ "futures",
  "governor",
+ "lru 0.18.5",
+ "percent-encoding",
  "postcard",
  "reqwest 0.13.5",
  "serde",
@@ -737,6 +740,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "ulid 3.0.0",
  "url",
 ]
 

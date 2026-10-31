@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod admin_api;
+pub mod resolver;
 pub mod store;
 pub mod verify;
 
@@ -234,9 +235,9 @@ fn parse_tail(tail: &str) -> Option<(RealmId, String)> {
     Some((id.realm_id(), path.trim_start_matches('/').to_string()))
 }
 
-/// The node route for `path` under the realm's API base path; only an `https` API URL without
+/// The node `route` for `path` under the realm's API base path; only an `https` API URL without
 /// user info, query or fragment qualifies, and the target never carries one either.
-fn resolve_target(api_url: &url::Url, path: &str) -> Option<String> {
+pub(crate) fn resolve_target(api_url: &url::Url, route: &str, path: &str) -> Option<String> {
     let usable = api_url.scheme() == "https"
         && api_url.host().is_some()
         && api_url.username().is_empty()
@@ -247,7 +248,7 @@ fn resolve_target(api_url: &url::Url, path: &str) -> Option<String> {
         return None;
     }
     let base = api_url.as_str().trim_end_matches('/');
-    let target = format!("{base}/{NODE_RESOLVE_ROUTE}/{path}");
+    let target = format!("{base}/{route}/{path}");
     let parsed = url::Url::parse(&target).ok()?;
     (parsed.query().is_none() && parsed.fragment().is_none()).then_some(target)
 }
@@ -300,7 +301,7 @@ async fn resolve_id(State(state): State<Arc<RegistryState>>, uri: Uri) -> Respon
         Err(error) => return storage_unavailable(error),
     };
     let api_url = &entry.registration.payload.descriptor.payload.api_url;
-    match resolve_target(api_url, &path) {
+    match resolve_target(api_url, NODE_RESOLVE_ROUTE, &path) {
         Some(target) => uncached(StatusCode::TEMPORARY_REDIRECT, Some(&target), ""),
         None => uncached(StatusCode::NOT_FOUND, None, "realm not publicly reachable"),
     }
@@ -489,11 +490,19 @@ mod tests {
     fn https_targets_only() {
         let url = |value: &str| url::Url::parse(value).unwrap();
         assert_eq!(
-            resolve_target(&url("https://realm.example.org/api/v1"), "r/v"),
+            resolve_target(
+                &url("https://realm.example.org/api/v1"),
+                NODE_RESOLVE_ROUTE,
+                "r/v"
+            ),
             Some("https://realm.example.org/api/v1/resolve/r/v".to_string())
         );
         assert_eq!(
-            resolve_target(&url("https://realm.example.org/api/v1/"), "r/v"),
+            resolve_target(
+                &url("https://realm.example.org/api/v1/"),
+                NODE_RESOLVE_ROUTE,
+                "r/v"
+            ),
             Some("https://realm.example.org/api/v1/resolve/r/v".to_string())
         );
         for refused in [
@@ -502,7 +511,11 @@ mod tests {
             "https://realm.example.org/api/v1?x=1",
             "https://realm.example.org/api/v1#top",
         ] {
-            assert_eq!(resolve_target(&url(refused), "r/v"), None, "{refused}");
+            assert_eq!(
+                resolve_target(&url(refused), NODE_RESOLVE_ROUTE, "r/v"),
+                None,
+                "{refused}"
+            );
         }
     }
 
