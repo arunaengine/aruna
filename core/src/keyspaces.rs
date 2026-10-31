@@ -529,6 +529,8 @@ pub const SHARE_LINK_KEYSPACE: &str = "share_links";
 pub const SHARE_OWNER_KEYSPACE: &str = "share_owners";
 /// Per-link access log entries by link id and time-ordered entry id.
 pub const SHARE_EVENT_KEYSPACE: &str = "share_events";
+/// Upload names claimed by running share uploads, by bucket and key, with the claim's end.
+pub const SHARE_NAME_KEYSPACE: &str = "share_upload_names";
 
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
@@ -805,6 +807,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SHARE_LINK_KEYSPACE,
     SHARE_OWNER_KEYSPACE,
     SHARE_EVENT_KEYSPACE,
+    SHARE_NAME_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,
