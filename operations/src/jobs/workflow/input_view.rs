@@ -164,6 +164,37 @@ fn exact_key(key: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+/// The KubeDAL file list of a run's cached entries, once its creator may still read
+/// (GetObject) each of them, since a worker cache serves them without another read here.
+/// `None` when the run caches nothing.
+pub async fn read_manifest(
+    context: &DriverContext,
+    record: &JobRecord,
+    entries: &[ViewEntry],
+    local: NodeId,
+) -> Result<Option<Vec<u8>>, ViewError> {
+    manifest_for(context, &creator(record, context), entries, local).await
+}
+
+async fn manifest_for(
+    context: &DriverContext,
+    auth: &AuthContext,
+    entries: &[ViewEntry],
+    local: NodeId,
+) -> Result<Option<Vec<u8>>, ViewError> {
+    let cached = cached_keys(context, entries, local).await?;
+    if cached.is_empty() {
+        return Ok(None);
+    }
+    // Cached entries are stored copies on this node, so they are authorized here.
+    for entry in entries.iter().filter(|entry| cached.contains(&entry.key)) {
+        authorize_read(context, auth, local, source_of(entry), READ_OPERATION)
+            .await
+            .map_err(source_error)?;
+    }
+    Ok(Some(cache_manifest(entries, &cached)))
+}
+
 /// The KubeDAL file list of the cached entries, each checked against its BLAKE3 and size.
 pub fn cache_manifest(entries: &[ViewEntry], cached: &BTreeSet<String>) -> Vec<u8> {
     let files = entries
@@ -704,6 +735,61 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn manifest_needs_object_reads() {
+        // A rule that denies only GetObject keeps an input out of the file list.
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+        use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+        use aruna_core::structs::storage::blob::BucketInfo;
+        use aruna_core::structs::storage::format::Compression;
+
+        let (_directory, storage) = crate::tests::s3::test_storage();
+        let context = crate::tests::s3::test_context(storage);
+        let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
+        let group_id = Ulid::from_parts(2, 2);
+        let local = entry("a").captured.source_node_id;
+        let policy = RequestPolicy {
+            policy_id: Ulid::from_parts(3, 3),
+            name: "no-object-reads".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "operation == 's3.GetObject' && path.endsWith('/blocked')".to_string(),
+            enabled: true,
+        };
+        let scope = (realm_id, group_id, local);
+        let owner =
+            crate::tests::access::seed_open_access(&context, scope, "none/**", None, vec![policy])
+                .await;
+        let info = BucketInfo {
+            group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        let effect = StorageEffect::Write {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: b"b".to_vec().into(),
+            value: info.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(effect).await;
+
+        let open = [entry("a")];
+        let manifest = manifest_for(&context, &owner, &open, local).await.unwrap();
+        assert!(manifest.is_some());
+        let blocked = [entry("a"), entry("blocked")];
+        let head = authorize_read(&context, &owner, local, ("b", "blocked"), HEAD_OPERATION);
+        assert!(head.await.is_ok());
+        let denied = manifest_for(&context, &owner, &blocked, local).await;
+        assert_eq!(denied, Err(ViewError::Denied));
     }
 
     #[test]

@@ -7,8 +7,8 @@ use aruna_core::compute::CACHE_MANIFEST_KEY;
 use aruna_core::structs::execution::job::{JobId, JobRecord};
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::jobs::workflow::input_view::{
-    MAX_VIEW_KEYS, ViewEntry, ViewError, ViewFrom, cache_manifest, cached_keys, decode_token,
-    encode_token, head_entry, list_shown, read_entry, view_bucket, view_entries,
+    MAX_VIEW_KEYS, ViewEntry, ViewError, ViewFrom, decode_token, encode_token, head_entry,
+    list_shown, read_entry, read_manifest, view_bucket, view_entries,
 };
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::visible::{is_sealed, open_cursor, seal_cursor};
@@ -76,25 +76,16 @@ impl ArunaS3Service {
         }
     }
 
-    /// The run's cache manifest and its ETag. It names only inputs the creator may still read,
-    /// since a worker cache serves them without another read here.
+    /// The run's cache manifest and its ETag.
     async fn view_manifest(
         &self,
         record: &JobRecord,
         entries: &[ViewEntry],
     ) -> S3Result<(bytes::Bytes, String)> {
-        let cached = cached_keys(&self.state, entries, self.node_id)
+        let body = read_manifest(&self.state, record, entries, self.node_id)
             .await
-            .map_err(view_error)?;
-        if cached.is_empty() {
-            return Err(s3_error!(NoSuchKey, "The specified key does not exist."));
-        }
-        for entry in entries.iter().filter(|entry| cached.contains(&entry.key)) {
-            head_entry(&self.state, record, entry, self.node_id)
-                .await
-                .map_err(view_error)?;
-        }
-        let body = cache_manifest(entries, &cached);
+            .map_err(view_error)?
+            .ok_or_else(|| s3_error!(NoSuchKey, "The specified key does not exist."))?;
         let etag = blake3::hash(&body).to_hex().to_string();
         Ok((bytes::Bytes::from(body), etag))
     }
