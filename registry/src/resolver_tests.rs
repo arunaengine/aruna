@@ -119,7 +119,9 @@ impl Sites {
             let holding = self.probe(&url, source);
             async move { holding }
         };
-        resolver.owned(rest, now, &probe).await
+        resolver
+            .owned(rest, now, IpAddr::from([192, 0, 2, 1]), &probe)
+            .await
     }
 
     fn checks(&self) -> usize {
@@ -554,18 +556,77 @@ async fn old_nodes_never_absent() {
 
 #[tokio::test]
 async fn unclear_check_uses_pid() {
-    // An unreachable route check picks the routes every node serves and is asked again later.
+    // An unreachable route check picks the routes every node serves and waits before the next.
     let (_dir, resolver, now) = resolver(BASE, true);
     let sites = Sites::serving(&[], Holding::Unavailable);
     let hash = "ab".repeat(32);
+    let path = format!("data/{hash}");
     let target = redirect(&format!("{API}/resolve/{hash}"));
-    for _ in 0..2 {
-        assert_eq!(
-            sites.ask(&resolver, &format!("data/{hash}"), now).await,
-            target
-        );
+    for at in [now, now + 1, now + RETRY_SECS - 1] {
+        assert_eq!(sites.ask(&resolver, &path, at).await, target);
     }
+    assert_eq!(sites.checks(), 1);
+    assert_eq!(sites.ask(&resolver, &path, now + RETRY_SECS).await, target);
     assert_eq!(sites.checks(), 2);
+}
+
+#[tokio::test]
+async fn checks_run_once() {
+    // Concurrent lookups share one route check; the others use the older routes meanwhile.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let entry = resolver
+        .registry
+        .store
+        .entry(&realm_id(), now)
+        .unwrap()
+        .unwrap();
+    let release = tokio::sync::Notify::new();
+    let checks = AtomicUsize::new(0);
+    let probe = |_: Url, _| {
+        checks.fetch_add(1, Ordering::SeqCst);
+        let release = &release;
+        async move {
+            release.notified().await;
+            Holding::Holds
+        }
+    };
+    let (first, second, ()) = tokio::join!(
+        resolver.routes(&entry, now, &probe),
+        resolver.routes(&entry, now, &probe),
+        async { release.notify_one() },
+    );
+    // Whichever call starts the check gets its answer; the other does not wait for it.
+    let mut got = [first, second];
+    got.sort_by_key(|routes| *routes == Routes::Legacy);
+    assert_eq!(got, [Routes::W3id, Routes::Legacy]);
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+    assert_eq!(resolver.routes(&entry, now, &probe).await, Routes::W3id);
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn direct_lookups_charged() {
+    // Data ids cost no guess, but one client still cannot send unlimited lookups.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let sites = Sites::new(&[]);
+    let busy = IpAddr::from([198, 51, 100, 1]);
+    let path = format!("data/{}", "ab".repeat(32));
+    for _ in 0..CLIENT_BURST {
+        let answer = sites.ask_from(&resolver, &path, now, busy).await;
+        assert!(matches!(answer, Answer::Redirect(_)));
+    }
+    assert_eq!(
+        sites.ask_from(&resolver, &path, now, busy).await,
+        Answer::Busy
+    );
+    let other = IpAddr::from([198, 51, 100, 2]);
+    assert!(matches!(
+        sites.ask_from(&resolver, &path, now, other).await,
+        Answer::Redirect(_)
+    ));
+    let probe = |_: Url, _| async { Holding::Holds };
+    let rest = format!("{}/{}", realm_id(), minted());
+    assert_eq!(resolver.owned(&rest, now, busy, &probe).await, Answer::Busy);
 }
 
 #[tokio::test]

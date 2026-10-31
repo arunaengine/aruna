@@ -51,6 +51,10 @@ const NODE_ROUTE: &str = "w3id";
 const ROUTE_CHECK: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 /// How long a realm's route check is kept.
 const ROUTES_SECS: u64 = 600;
+/// How long a failed route check waits before the next one; the older routes serve meanwhile.
+const RETRY_SECS: u64 = 60;
+/// How long a running route check holds off others, well above the probe timeout.
+const CHECKING_SECS: u64 = 10;
 /// v2 minted `https://w3id.org/aruna/{ULID}` on both sites; the w3id rule sent it to the first.
 const V2: Legacy = Legacy {
     page: "https://aruna-engine.org/objects/",
@@ -178,6 +182,16 @@ impl Item {
     }
 }
 
+/// What is known about a realm's routes at one API URL, until a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteState {
+    Known(Routes),
+    /// One check runs; others use the older routes instead of starting their own.
+    Checking,
+    /// The last check got no answer; the older routes serve until it may run again.
+    Failed,
+}
+
 /// A kept guess. A winning realm is kept by id and its target rebuilt from the live
 /// registration on each use, so withdrawal, lease expiry and URL changes apply at once.
 #[derive(Clone)]
@@ -193,7 +207,7 @@ pub struct Resolver {
     default_realm: Option<RealmId>,
     cache: Mutex<LruCache<String, (Kept, u64)>>,
     /// The routes each approved realm serves, with the API URL they were checked at.
-    routes: Mutex<HashMap<RealmId, (Url, Routes, u64)>>,
+    routes: Mutex<HashMap<RealmId, (Url, RouteState, u64)>>,
     clock: RequestClock,
     guesses: SharedLimiter,
     clients: ClientLimiter,
@@ -239,6 +253,7 @@ impl Resolver {
         match shape {
             Shape::Home => Answer::Redirect(HOME.to_string()),
             Shape::Unknown => Answer::NotFound("not an Aruna identifier"),
+            Shape::Data(..) if !self.admit(client, now) => Answer::Busy,
             Shape::Data(realm, path) => match realm.or(self.default_realm) {
                 Some(realm) => {
                     let item = Item::Data(path);
@@ -248,6 +263,16 @@ impl Resolver {
             },
             shape => self.guess(shape, now, client, probe).await,
         }
+    }
+
+    /// Charges one lookup to the client's share; idle client keys are dropped now and then.
+    fn admit(&self, client: IpAddr, now: u64) -> bool {
+        self.clock.advance_to(now);
+        let admitted = self.clients.check_key(&client).is_ok();
+        if self.clients.len() > CLIENT_ENTRIES {
+            self.clients.retain_recent();
+        }
+        admitted
     }
 
     /// A redirect to an approved realm's node route, without asking it about the id. `kept`
@@ -302,12 +327,7 @@ impl Resolver {
         if let Some(answer) = self.cached(&key, &item, now, &probe).await {
             return answer;
         }
-        self.clock.advance_to(now);
-        let refused = self.clients.check_key(&client).is_err() || self.guesses.check().is_err();
-        if self.clients.len() > CLIENT_ENTRIES {
-            self.clients.retain_recent();
-        }
-        if refused {
+        if !self.admit(client, now) || self.guesses.check().is_err() {
             return Answer::Busy;
         }
         // A ULID with the reserved placement handle was never minted by a v3 realm.
@@ -476,28 +496,42 @@ impl Resolver {
     {
         let api_url = &entry.registration.payload.descriptor.payload.api_url;
         let realm = entry.registration.payload.descriptor.payload.realm_id;
-        if let Ok(known) = self.routes.lock()
-            && let Some((url, routes, expires_at)) = known.get(&realm)
-            && url == api_url
-            && *expires_at > now
         {
-            return *routes;
+            let Ok(mut known) = self.routes.lock() else {
+                return Routes::Legacy;
+            };
+            match known.get(&realm) {
+                Some((url, state, until)) if url == api_url && *until > now => {
+                    return match state {
+                        RouteState::Known(routes) => *routes,
+                        RouteState::Checking | RouteState::Failed => Routes::Legacy,
+                    };
+                }
+                _ => {
+                    let checking = (api_url.clone(), RouteState::Checking, now + CHECKING_SECS);
+                    known.insert(realm, checking);
+                }
+            }
         }
         let check = Item::Data(ROUTE_CHECK.to_string());
-        let Some(url) =
-            entry_target(entry, &check, Routes::W3id).and_then(|target| Url::parse(&target).ok())
-        else {
-            return Routes::Legacy;
+        let url =
+            entry_target(entry, &check, Routes::W3id).and_then(|target| Url::parse(&target).ok());
+        let holding = match url {
+            Some(url) => probe(url, Source::Routes).await,
+            None => Holding::Absent,
         };
-        let routes = match probe(url, Source::Routes).await {
-            Holding::Holds => Routes::W3id,
-            Holding::Absent => Routes::Legacy,
-            Holding::Unavailable => return Routes::Legacy,
+        let (state, until) = match holding {
+            Holding::Holds => (RouteState::Known(Routes::W3id), now + ROUTES_SECS),
+            Holding::Absent => (RouteState::Known(Routes::Legacy), now + ROUTES_SECS),
+            Holding::Unavailable => (RouteState::Failed, now + RETRY_SECS),
         };
         if let Ok(mut known) = self.routes.lock() {
-            known.insert(realm, (api_url.clone(), routes, now + ROUTES_SECS));
+            known.insert(realm, (api_url.clone(), state, until));
         }
-        routes
+        match state {
+            RouteState::Known(routes) => routes,
+            RouteState::Checking | RouteState::Failed => Routes::Legacy,
+        }
     }
 }
 
@@ -707,20 +741,32 @@ fn client_address(headers: &HeaderMap, header: Option<&HeaderName>, peer: IpAddr
 }
 
 /// A namespace a realm owns at w3id.org, whose rule names the realm id in the target.
-async fn resolve_owned(State(resolver): State<Arc<Resolver>>, uri: Uri) -> Response {
+async fn resolve_owned(
+    State(resolver): State<Arc<Resolver>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
     let rest = uri.path().strip_prefix("/realm/").unwrap_or_default();
+    let client = client_address(&headers, resolver.client_header.as_ref(), peer.ip());
     let egress = &resolver.registry.egress;
     let probe = |url, source| probe(egress, url, source);
-    respond(resolver.owned(rest, unix_timestamp_secs(), &probe).await)
+    let answer = resolver
+        .owned(rest, unix_timestamp_secs(), client, &probe)
+        .await;
+    respond(answer)
 }
 
 impl Resolver {
     /// `{realm-id}/{path}` of a namespace the realm owns, sent to that realm only.
-    async fn owned<P, F>(&self, rest: &str, now: u64, probe: &P) -> Answer
+    async fn owned<P, F>(&self, rest: &str, now: u64, client: IpAddr, probe: &P) -> Answer
     where
         P: Fn(Url, Source) -> F,
         F: Future<Output = Holding>,
     {
+        if !self.admit(client, now) {
+            return Answer::Busy;
+        }
         let Some((realm, path)) = rest.split_once('/') else {
             return Answer::NotFound("not an Aruna identifier");
         };
