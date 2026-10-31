@@ -382,7 +382,8 @@ async fn legacy_ids_guessed() {
             expected,
             "{said:?}"
         );
-        assert_eq!(sites.asked(), 3);
+        // The realm's w3id 404 is confirmed on its PID route before v2 is trusted.
+        assert_eq!(sites.asked(), 4);
     }
 }
 
@@ -414,7 +415,8 @@ async fn failures_never_cached() {
     let page = redirect(&format!("{}{id}", V2.page));
     assert_eq!(partial.ask(&resolver, &path, now).await, page);
     assert_eq!(partial.ask(&resolver, &path, now).await, page);
-    assert_eq!(partial.asked(), 6);
+    // Each guess asks the realm's w3id and PID routes and both v2 sites.
+    assert_eq!(partial.asked(), 8);
 }
 
 #[tokio::test]
@@ -509,6 +511,30 @@ async fn old_nodes_use_pid() {
     assert_eq!(sites.checks() + profiles.checks(), 1);
     let later = now + ROUTES_SECS;
     sites.ask(&resolver, &format!("data/{hash}"), later).await;
+    assert_eq!(sites.checks(), 2);
+}
+
+#[tokio::test]
+async fn mixed_backends_fall_back() {
+    // A node without the w3id route behind a checked address: its PID route still decides.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let id = minted();
+    let pid = format!("{API}/pid/{id}");
+    let sites = Sites::new(&[(&pid, Holding::Holds)]);
+    assert_eq!(
+        sites.ask(&resolver, &id.to_string(), now).await,
+        redirect(&pid)
+    );
+    assert_eq!((sites.asked(), sites.checks()), (4, 1));
+    // The kept hit stays on the PID route; the dropped route check runs again for others.
+    assert_eq!(
+        sites.ask(&resolver, &id.to_string(), now).await,
+        redirect(&pid)
+    );
+    assert_eq!((sites.asked(), sites.checks()), (4, 1));
+    sites
+        .ask(&resolver, &format!("data/{}", "ab".repeat(32)), now)
+        .await;
     assert_eq!(sites.checks(), 2);
 }
 
