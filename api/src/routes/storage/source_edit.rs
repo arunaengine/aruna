@@ -86,6 +86,8 @@ pub struct SourceEditResponse {
     pub changed: u64,
     /// Reference versions that kept a matching source because it is their only one.
     pub kept_last: u64,
+    /// Reference versions that kept their first source, as no checksums prove the next one.
+    pub kept_unproven: u64,
     /// Pass as `after` to continue; absent once every row was read.
     pub next: Option<String>,
 }
@@ -96,6 +98,7 @@ impl From<SourceEditResult> for SourceEditResponse {
             scanned: result.scanned,
             changed: result.changed,
             kept_last: result.kept_last,
+            kept_unproven: result.kept_unproven,
             next: result.next.map(hex::encode),
         }
     }
@@ -209,7 +212,7 @@ it is absent."#,
             status = 200,
             description = "What one page changed",
             body = SourceEditResponse,
-            example = json!({"scanned": 1000, "changed": 998, "kept_last": 0, "next": "0a6e6362692d72656673657131"})
+            example = json!({"scanned": 1000, "changed": 998, "kept_last": 0, "kept_unproven": 0, "next": "0a6e6362692d72656673657131"})
         ),
         (status = 400, description = "Invalid connector id or `after`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -259,7 +262,8 @@ pub async fn add_sources(
 - A version keeps at least one source: when every source matches, none is removed and the
   version counts in `kept_last`.
 - When the source whose ETag and time the version recorded goes, the next source takes its
-  place and the recorded ETag and time are dropped. Reads then rely on the recorded checksums.
+  place and the recorded ETag and time are dropped. Reads then rely on the recorded checksums,
+  so a version without checksums keeps that source and counts in `kept_unproven`.
 - The edit is node-local: replicas on other nodes keep their sources.
 
 **Paging**: as for adding sources."#,
@@ -274,7 +278,7 @@ pub async fn add_sources(
             status = 200,
             description = "What one page changed",
             body = SourceEditResponse,
-            example = json!({"scanned": 2, "changed": 1, "kept_last": 1})
+            example = json!({"scanned": 2, "changed": 1, "kept_last": 1, "kept_unproven": 0})
         ),
         (status = 400, description = "Invalid connector id or `after`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),

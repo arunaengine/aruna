@@ -178,6 +178,21 @@ fn removal_keeps_last() {
     assert_eq!(kept, source);
     assert_eq!(metadata.etag.as_deref(), Some("first"));
     let first = Some(Ulid::from_bytes([1; 16]));
+    // Without checksums nothing proves the next source's bytes, so the first one stays.
+    let mut unproven = source.clone();
+    assert_eq!(
+        removed(&mut unproven, &mut metadata, first, "genomes/"),
+        Removal::Unproven
+    );
+    assert_eq!(unproven, source);
+    metadata.digests.insert(
+        aruna_core::structs::checksum::ChecksumAlgorithm::Sha256,
+        aruna_core::structs::execution::source_access::SourceDigest {
+            digest: vec![1; 32],
+            scope: aruna_core::structs::execution::source_access::DigestScope::FullObject,
+            origin: aruna_core::structs::execution::source_access::DigestOrigin::Manifest,
+        },
+    );
     assert_eq!(
         removed(&mut source, &mut metadata, first, "genomes/"),
         Removal::Removed

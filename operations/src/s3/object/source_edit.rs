@@ -56,6 +56,8 @@ pub struct SourceEditResult {
     pub changed: u64,
     /// Reference versions keeping a source the change would remove, as it is their last.
     pub kept_last: u64,
+    /// Reference versions keeping their first source, as no checksums prove the next one.
+    pub kept_unproven: u64,
     /// Where the next page starts; `None` once every row was read.
     pub next: Option<Vec<u8>>,
 }
@@ -160,6 +162,10 @@ impl SourceEditOperation {
                         Removal::Removed => true,
                         Removal::Last => {
                             self.result.kept_last += 1;
+                            false
+                        }
+                        Removal::Unproven => {
+                            self.result.kept_unproven += 1;
                             false
                         }
                         Removal::None => false,
@@ -276,11 +282,14 @@ enum Removal {
     Removed,
     /// Every source matched, so the binding keeps them all.
     Last,
+    /// The first source matched, and no checksums prove the bytes of the next one.
+    Unproven,
     None,
 }
 
 /// Removes the matching sources. When the first one goes, the next becomes first and the
-/// recorded ETag and time, which were the first one's, are dropped.
+/// recorded ETag and time, which were the first one's, are dropped; only recorded checksums
+/// can then prove its bytes, so without them the first source stays.
 fn removed(
     source: &mut VersionSourceBinding,
     observed: &mut SourceMetadata,
@@ -308,6 +317,9 @@ fn removed(
         })
         .collect();
     let first_removed = matches(&sources[0]);
+    if first_removed && observed.enforced_checksums().is_empty() {
+        return Removal::Unproven;
+    }
     *source = VersionSourceBinding {
         mirrors,
         ..(*first).clone()
