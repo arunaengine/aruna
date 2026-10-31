@@ -7,6 +7,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,7 +24,12 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::StreamExt;
-use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter};
+use governor::clock::Clock;
+use governor::middleware::NoOpMiddleware;
+use governor::nanos::Nanos;
+use governor::state::keyed::DashMapStateStore;
+use governor::state::{InMemoryState, NotKeyed};
+use governor::{Quota, RateLimiter};
 use lru::LruCache;
 use percent_encoding::percent_decode_str;
 use tracing::warn;
@@ -108,6 +114,30 @@ enum Shape {
     Unknown,
 }
 
+/// The limiters' clock: the latest request time the resolver was given, never going back, so
+/// limits follow the same time as the cache and tests choose it.
+#[derive(Clone, Debug, Default)]
+struct RequestClock(Arc<AtomicU64>);
+
+impl RequestClock {
+    fn advance_to(&self, now_secs: u64) {
+        let nanos = now_secs.saturating_mul(1_000_000_000);
+        self.0.fetch_max(nanos, Ordering::Relaxed);
+    }
+}
+
+impl Clock for RequestClock {
+    type Instant = Nanos;
+
+    fn now(&self) -> Nanos {
+        Nanos::from(self.0.load(Ordering::Relaxed))
+    }
+}
+
+type SharedLimiter = RateLimiter<NotKeyed, InMemoryState, RequestClock, NoOpMiddleware<Nanos>>;
+type ClientLimiter =
+    RateLimiter<IpAddr, DashMapStateStore<IpAddr>, RequestClock, NoOpMiddleware<Nanos>>;
+
 /// A kept guess. A winning realm is kept by id and its target rebuilt from the live
 /// registration on each use, so withdrawal, lease expiry and URL changes apply at once.
 #[derive(Clone)]
@@ -121,8 +151,9 @@ pub struct Resolver {
     /// Approved realms, the default realm first; only these are asked and redirected to.
     approved: Vec<RealmId>,
     cache: Mutex<LruCache<String, (Kept, u64)>>,
-    guesses: DefaultDirectRateLimiter,
-    clients: DefaultKeyedRateLimiter<IpAddr>,
+    clock: RequestClock,
+    guesses: SharedLimiter,
+    clients: ClientLimiter,
     /// The header in which the ingress names the client address; the peer address otherwise.
     client_header: Option<HeaderName>,
 }
@@ -141,6 +172,7 @@ impl Resolver {
                 .into_iter()
                 .filter(|realm| Some(*realm) != default_realm),
         );
+        let clock = RequestClock::default();
         let quota = Quota::per_minute(NonZeroU32::new(GUESSES_PER_MINUTE).expect("nonzero rate"))
             .allow_burst(NonZeroU32::new(GUESS_BURST).expect("nonzero burst"));
         Self {
@@ -149,13 +181,15 @@ impl Resolver {
             cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(CACHE_ENTRIES).expect("nonzero cache"),
             )),
-            guesses: RateLimiter::direct(quota),
-            clients: RateLimiter::keyed(
+            guesses: RateLimiter::direct_with_clock(quota, clock.clone()),
+            clients: RateLimiter::dashmap_with_clock(
                 Quota::per_minute(
                     NonZeroU32::new(CLIENT_GUESSES_PER_MINUTE).expect("nonzero rate"),
                 )
                 .allow_burst(NonZeroU32::new(CLIENT_BURST).expect("nonzero burst")),
+                clock.clone(),
             ),
+            clock,
             client_header,
         }
     }
@@ -203,6 +237,7 @@ impl Resolver {
         if let Some(answer) = self.cached(&key, &node_path, now) {
             return answer;
         }
+        self.clock.advance_to(now);
         let refused = self.clients.check_key(&client).is_err() || self.guesses.check().is_err();
         if self.clients.len() > CLIENT_ENTRIES {
             self.clients.retain_recent();

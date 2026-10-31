@@ -453,21 +453,45 @@ async fn clients_limited_separately() {
         id.as_ulid().to_string()
     };
     let busy = IpAddr::from([198, 51, 100, 1]);
+    let ask = |nonce, at, client| {
+        let path = fresh(nonce);
+        let sites = &sites;
+        let resolver = &resolver;
+        async move { sites.ask_from(resolver, &path, at, client).await }
+    };
     for nonce in 0..u64::from(CLIENT_BURST) {
-        let answer = sites.ask_from(&resolver, &fresh(nonce), now, busy).await;
+        assert!(
+            matches!(ask(nonce, now, busy).await, Answer::Redirect(_)),
+            "{nonce}"
+        );
+    }
+    assert_eq!(ask(100, now, busy).await, Answer::Busy);
+    let other = IpAddr::from([198, 51, 100, 2]);
+    assert!(matches!(ask(101, now, other).await, Answer::Redirect(_)));
+    // The share refills with request time: one guess per second at 60 per minute.
+    assert!(matches!(ask(102, now + 1, busy).await, Answer::Redirect(_)));
+    assert_eq!(ask(103, now + 1, busy).await, Answer::Busy);
+}
+
+#[tokio::test]
+async fn shared_budget_bounds() {
+    // Many clients together stop at the shared burst, whatever their own shares say.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let sites = Sites::new(&[]);
+    for nonce in 0..u64::from(GUESS_BURST) {
+        let handle = PlacementHandle::new(1).unwrap();
+        let id = MetaResourceId::from_parts(1, handle, BucketId::new(0).unwrap(), nonce).unwrap();
+        let client = IpAddr::from([198, 51, 100, nonce as u8]);
+        let answer = sites
+            .ask_from(&resolver, &id.as_ulid().to_string(), now, client)
+            .await;
         assert!(matches!(answer, Answer::Redirect(_)), "{nonce}");
     }
-    let mut refused = false;
-    for nonce in 100..100 + u64::from(GUESS_BURST) {
-        if sites.ask_from(&resolver, &fresh(nonce), now, busy).await == Answer::Busy {
-            refused = true;
-            break;
-        }
-    }
-    assert!(refused);
-    let other = IpAddr::from([198, 51, 100, 2]);
-    let answer = sites.ask_from(&resolver, &fresh(1000), now, other).await;
-    assert!(matches!(answer, Answer::Redirect(_)), "{answer:?}");
+    let client = IpAddr::from([203, 0, 113, 1]);
+    assert_eq!(
+        sites.ask_from(&resolver, LEGACY, now, client).await,
+        Answer::Busy
+    );
 }
 
 #[test]
