@@ -68,7 +68,10 @@ use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use crate::staging::native_source::{body_stream, granted_read};
+use aruna_core::structs::execution::staging::VersionSourceBinding;
+use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::origin::SourcePin;
+use tracing::warn;
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.
 const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);
@@ -429,7 +432,7 @@ pub async fn load_direct_inputs(
     mounted: &BTreeSet<String>,
 ) -> Result<Vec<TaskInput>, JobError> {
     let mut files = Vec::with_capacity(spec.inputs.len());
-    let mut served = Vec::new();
+    let mut served = BTreeMap::new();
     let mut total_bytes = 0u64;
     for input in spec
         .inputs
@@ -460,34 +463,58 @@ pub async fn load_direct_inputs(
                 "staged inputs need more than {total_bytes} bytes, the run requests {budget}"
             )));
         }
-        served.extend((staged.served_by).map(|pin| (input.dest_key.clone(), pin)));
+        if let Some(source) = staged.served_source {
+            served.insert(input.dest_key.clone(), serving_pin(context, source).await);
+        }
         let stream = staged
             .blob
             .map(|chunk| chunk.map_err(std::io::Error::other));
         files.push(TaskInput::from_stream(source.path, size, Box::pin(stream)));
     }
-    record_served(context, record.job_id, served).await?;
+    record_served(context, record, served).await?;
     Ok(files)
 }
 
-/// Keeps which source delivered each staged reference input, for the run record.
+/// The pin of the source that served a reference, with the settings of its source root put
+/// back, so a public source is named by its URL; without its root it stays unnamed.
+async fn serving_pin(context: &DriverContext, source: VersionSourceBinding) -> SourcePin {
+    let Some(digest) = source.descriptor.root else {
+        return SourcePin::of(&source.descriptor);
+    };
+    let event = context
+        .storage_handle
+        .send_storage_effect(crate::staging::root_record::read_root(digest, None))
+        .await;
+    let root = crate::staging::root_record::parse_root(event)
+        .ok()
+        .flatten();
+    let full = root.and_then(|root| RootEntry::hydrate(&source, &root).ok().flatten());
+    if full.is_none() {
+        warn!("The source root of a served input is missing; its pin names no URL");
+    }
+    SourcePin::of(&full.unwrap_or(source).descriptor)
+}
+
+/// Keeps which source delivered each staged reference input of this preparation, for the run
+/// record, and clears the pins earlier preparations left. Only the claim that prepared writes.
 async fn record_served(
     context: &DriverContext,
-    job_id: aruna_core::structs::execution::job::JobId,
-    served: Vec<(String, SourcePin)>,
+    prepared: &JobRecord,
+    served: BTreeMap<String, SourcePin>,
 ) -> Result<(), JobError> {
-    if served.is_empty() {
+    let Some(token) = prepared.claim.as_ref().map(|claim| claim.claim_token) else {
         return Ok(());
-    }
+    };
     let storage = &context.storage_handle;
-    let result = crate::jobs::store::mutate_job(storage, job_id, |record| {
+    let result = crate::jobs::store::mutate_job(storage, prepared.job_id, |record| {
+        if record.claim.as_ref().map(|claim| claim.claim_token) != Some(token) {
+            return Err(crate::jobs::store::JobMutationError::TokenMismatch);
+        }
         let mut changed = false;
-        for (destination, pin) in &served {
-            let inputs = record.captured_inputs.iter_mut();
-            for input in inputs.filter(|input| &input.destination_key == destination) {
-                changed |= input.served_by.as_ref() != Some(pin);
-                input.served_by = Some(pin.clone());
-            }
+        for input in &mut record.captured_inputs {
+            let pin = served.get(&input.destination_key).cloned();
+            changed |= input.served_by != pin;
+            input.served_by = pin;
         }
         Ok(match changed {
             true => crate::jobs::store::JobMutation::Persist,
@@ -1303,7 +1330,7 @@ struct StagedSource {
     location: Option<BackendLocation>,
     size: Option<u64>,
     /// The source of a reference that delivered the bytes.
-    served_by: Option<SourcePin>,
+    served_source: Option<VersionSourceBinding>,
 }
 
 impl StagedSource {
@@ -1315,7 +1342,7 @@ impl StagedSource {
                 .source_metadata
                 .as_ref()
                 .map(|metadata| metadata.content_length),
-            served_by: (get.served_source.as_ref()).map(|source| SourcePin::of(&source.descriptor)),
+            served_source: get.served_source,
         }
     }
 }
@@ -1362,7 +1389,7 @@ async fn remote_source(
         blob: staged.blob,
         location: None,
         size: Some(captured.bytes),
-        served_by: None,
+        served_source: None,
     })
 }
 
@@ -1390,7 +1417,7 @@ async fn granted_source(
         blob: body_stream(stream),
         location: None,
         size: Some(captured.bytes),
-        served_by: None,
+        served_source: None,
     })
 }
 
@@ -1445,7 +1472,7 @@ async fn device_source(
             blob,
             location: None,
             size: Some(size),
-            served_by: None,
+            served_source: None,
         }),
         Ok(BaoReadOutput::Metadata { .. }) => Err(JobError::retryable(format!(
             "staging {bucket}/{key} received no bytes"
@@ -2393,6 +2420,49 @@ mod tests {
         net.shutdown().await;
     }
 
+    // A served source stored by its root's digest is named by its public URL once the root's
+    // settings are back.
+    #[tokio::test]
+    async fn compact_pins_hydrated() {
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_core::structs::execution::staging::{PortableSourceDescriptor, StagingStrategy};
+        let test_context = crate::tests::staging::setup_driver_context().await;
+        let context = &test_context.driver_context;
+        let full = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::S3,
+                public_config: [
+                    ("endpoint", "https://s3.example.org"),
+                    ("bucket", "refseq"),
+                    ("skip_signature", "true"),
+                ]
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .into(),
+                source_path: "genomes/a.fna".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+                namespace: None,
+                root: None,
+            },
+            connector_id: None,
+            mirrors: Vec::new(),
+        };
+        let (compact, root) = RootEntry::compact(&full).unwrap().unwrap();
+        let (key_space, key, value) = crate::staging::root_record::root_write(&root).unwrap();
+        let write = aruna_core::effects::StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(write).await;
+        let pin = serving_pin(context, compact).await;
+        let url = "https://s3.example.org/refseq/genomes/a.fna";
+        assert_eq!(pin.url.as_deref(), Some(url));
+    }
+
     // The source that served a staged reference input is kept on the stored record, where
     // the run record reads it.
     #[tokio::test]
@@ -2432,7 +2502,13 @@ mod tests {
             releases_complete: true,
             grant: None,
         });
-        crate::jobs::store::insert_job(&context.storage_handle, &record)
+        record.claim = Some(aruna_core::structs::execution::job::JobClaim {
+            holder_node_id: node_id,
+            claim_token: Ulid::from_bytes([8; 16]),
+            lease_expires_ms: u64::MAX,
+        });
+        let storage = &context.storage_handle;
+        crate::jobs::store::insert_job(storage, &record)
             .await
             .unwrap();
         let pin = SourcePin {
@@ -2440,14 +2516,31 @@ mod tests {
             path: "in.txt".to_string(),
             source_version: None,
         };
-        let served = vec![("inputs/in.txt".to_string(), pin.clone())];
-        record_served(context, record.job_id, served).await.unwrap();
-        let stored =
-            crate::jobs::store::read_job_record(&context.storage_handle, record.job_id, None)
+        let stored = || async {
+            let read = crate::jobs::store::read_job_record(storage, record.job_id, None).await;
+            read.unwrap().unwrap().captured_inputs[0].served_by.clone()
+        };
+        let served = BTreeMap::from([("inputs/in.txt".to_string(), pin.clone())]);
+        record_served(context, &record, served.clone())
+            .await
+            .unwrap();
+        assert_eq!(stored().await, Some(pin.clone()));
+        // A preparation under another claim writes nothing.
+        let mut stale = record.clone();
+        if let Some(claim) = stale.claim.as_mut() {
+            claim.claim_token = Ulid::from_bytes([9; 16]);
+        }
+        assert!(
+            record_served(context, &stale, BTreeMap::new())
                 .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(stored.captured_inputs[0].served_by, Some(pin));
+                .is_err()
+        );
+        assert_eq!(stored().await, Some(pin));
+        // A later preparation that served nothing clears the earlier pin.
+        record_served(context, &record, BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(stored().await, None);
     }
 
     #[tokio::test]
