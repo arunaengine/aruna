@@ -28,7 +28,7 @@ use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_MD5, HASH_SHA256};
 use aruna_core::structs::execution::source_access::{
-    DigestOrigin, DigestScope, ResolvedSourceAccess, SourceDigest, SourceMetadata,
+    DigestOrigin, DigestScope, ResolvedSourceAccess, SourceDigest, SourceMetadata, SourceStats,
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{
@@ -2968,6 +2968,20 @@ fn ranked_head(
     operation: &mut GetObjectOperation,
     failing: Vec<bool>,
 ) -> aruna_core::types::Effects {
+    let stats = failing.into_iter().map(|failing| SourceStats {
+        failing,
+        ..SourceStats::default()
+    });
+    ranked_with(operation, stats.collect(), 0)
+}
+
+/// Resolves both sources, ranks them with `stats` and `draw` and opens the read up to the
+/// first HEAD.
+fn ranked_with(
+    operation: &mut GetObjectOperation,
+    stats: Vec<SourceStats>,
+    draw: u64,
+) -> aruna_core::types::Effects {
     let resolved = |access| {
         Event::SubOperation(SubOperationEvent::VersionAccessResolved { result: Ok(access) })
     };
@@ -2978,7 +2992,8 @@ fn ranked_head(
         [Effect::StagingSource(StagingSourceEffect::Health { accesses })] if accesses.len() == 2
     ));
     let effects = operation.step(Event::StagingSource(StagingSourceEvent::HealthResult {
-        failing,
+        stats,
+        draw,
     }));
     assert!(matches!(
         effects.as_slice(),
@@ -3167,5 +3182,54 @@ fn broken_spool_fails_over() {
     ));
     let broken = BlobError::StreamFailed("connection reset".to_string());
     let effects = operation.step(Event::Blob(BlobEvent::Error(broken)));
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+}
+
+// Equal sources share reads by the draw; a read keeps the source it picked when it restarts.
+#[test]
+fn read_keeps_source() {
+    let mut operation = mirrored_operation(digested(9, 7));
+    let effects = ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX);
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let mut operation = mirrored_operation(digested(9, 7));
+    let effects = ranked_with(&mut operation, vec![SourceStats::default(); 2], 0);
+    assert_eq!(headed_path(&effects), "folder/file.txt");
+    // A restarted read picks again with a draw that favours the other source, yet keeps its own.
+    let mut operation = mirrored_operation(digested(9, 7));
+    ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX);
+    operation.resolve_reference();
+    let resolved = |access| {
+        Event::SubOperation(SubOperationEvent::VersionAccessResolved { result: Ok(access) })
+    };
+    operation.step(resolved(http_access("folder/file.txt")));
+    operation.step(resolved(http_access("mirror/file.txt")));
+    operation.step(Event::StagingSource(StagingSourceEvent::HealthResult {
+        stats: vec![SourceStats::default(); 2],
+        draw: 0,
+    }));
+    let Some(ResolvedSourceAccess::OpenDal { path, .. }) = &operation.reference_access else {
+        panic!("expected a picked source")
+    };
+    assert_eq!(path, "mirror/file.txt");
+}
+
+// Without recorded checksums only the first source can serve, so a faster mirror waits.
+#[test]
+fn unproven_mirror_waits() {
+    let fast = SourceStats {
+        first_byte_ms: Some(1.0),
+        bytes_per_sec: Some(1e9),
+        ..SourceStats::default()
+    };
+    let slow = SourceStats {
+        first_byte_ms: Some(900.0),
+        bytes_per_sec: Some(1e3),
+        ..SourceStats::default()
+    };
+    let mut operation = mirrored_operation(observation(9));
+    let effects = ranked_with(&mut operation, vec![slow, fast], u64::MAX);
+    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let mut operation = mirrored_operation(digested(9, 7));
+    let effects = ranked_with(&mut operation, vec![slow, fast], u64::MAX / 2);
     assert_eq!(headed_path(&effects), "mirror/file.txt");
 }

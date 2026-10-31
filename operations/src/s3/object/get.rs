@@ -31,6 +31,7 @@ use crate::s3::object::lookup::{
     multipart_summary_read, summary_from_read,
 };
 use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
+use crate::s3::object::source_choice::{Candidate, choose_source};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
@@ -47,7 +48,7 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::checksum::{ExpectedChecksum, unmatched_checksum};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::source_access::{
-    ObservationMatch, ResolvedSourceAccess, SourceMetadata,
+    ObservationMatch, ResolvedSourceAccess, SourceMetadata, SourceStats, source_weight,
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
@@ -395,6 +396,8 @@ pub struct GetObjectOperation {
     source_queue: VecDeque<(usize, ResolvedSourceAccess)>,
     /// The slot of the source being resolved, then of the source being read.
     source_slot: usize,
+    /// The slot this read reads; a restarted read keeps it, so one read uses one source.
+    chosen_slot: Option<usize>,
     /// Why the last source failed, reported when no other source serves.
     source_failure: Option<GetObjectError>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
@@ -452,6 +455,7 @@ impl GetObjectOperation {
             source_set: None,
             source_queue: VecDeque::new(),
             source_slot: 0,
+            chosen_slot: None,
             source_failure: None,
             output: None,
             reference_key: None,
@@ -764,13 +768,14 @@ impl GetObjectOperation {
         })]
     }
 
-    /// Orders the resolved sources: those that failed lately go last, the others keep their order.
+    /// Orders the resolved sources: one picked by measured speed, then the others in their
+    /// order, failing ones last. A restarted read keeps its source while it is not failing.
     fn sources_ranked(&mut self, event: Event) -> Effects {
-        let failing = match event {
-            Event::StagingSource(StagingSourceEvent::HealthResult { failing })
-                if failing.len() == self.source_queue.len() =>
+        let (stats, draw) = match event {
+            Event::StagingSource(StagingSourceEvent::HealthResult { stats, draw })
+                if stats.len() == self.source_queue.len() =>
             {
-                failing
+                (stats, draw)
             }
             other => {
                 return self.emit_error(GetObjectError::InvalidStateEvent {
@@ -780,10 +785,56 @@ impl GetObjectOperation {
                 });
             }
         };
-        let mut ranked: Vec<_> = self.source_queue.drain(..).zip(failing).collect();
-        ranked.sort_by_key(|(_, failing)| *failing);
-        self.source_queue = ranked.into_iter().map(|(source, _)| source).collect();
+        let candidates: Vec<Candidate> = (self.source_queue.iter().zip(stats))
+            .map(|((slot, access), stats)| self.candidate(*slot, access, stats))
+            .collect();
+        let choice = choose_source(&candidates, draw);
+        let mut order = choice.order;
+        let kept = (order.iter()).position(|&index| {
+            Some(self.source_queue[index].0) == self.chosen_slot && !candidates[index].stats.failing
+        });
+        if let Some(position) = kept {
+            let index = order.remove(position);
+            order.insert(0, index);
+        }
+        let mut queue: Vec<_> = self.source_queue.drain(..).map(Some).collect();
+        self.source_queue = order
+            .iter()
+            .filter_map(|&index| queue[index].take())
+            .collect();
+        debug!(
+            slot = self.source_queue.front().map(|(slot, _)| *slot),
+            sources = candidates.len(),
+            share = choice.share,
+            kept = kept.is_some(),
+            "Picked a reference source"
+        );
         self.next_source()
+    }
+
+    /// One source as a choice for this read. Another source than the first serves only bytes
+    /// recorded checksums prove; a source that cannot bind the ETag is then read whole.
+    fn candidate(
+        &self,
+        slot: usize,
+        access: &ResolvedSourceAccess,
+        stats: SourceStats,
+    ) -> Candidate {
+        let ResolvedSourceAccess::OpenDal { kind, config, .. } = access;
+        let cached = self.reference_cached.as_ref();
+        let proven = cached.is_some_and(|cached| !cached.enforced_checksums().is_empty());
+        let length = cached.map_or(0, |cached| cached.content_length);
+        let range = (self.input.range.as_ref()).and_then(|range| range.resolve(length).ok());
+        let bytes = match proven && !kind.enforces_if_match() {
+            true => length,
+            false => range.map_or(length, |range| range.range.end - range.range.start),
+        };
+        Candidate {
+            stats,
+            weight: source_weight(config).unwrap_or(1.0),
+            bytes,
+            eligible: slot == 0 || proven,
+        }
     }
 
     /// Reads the next source: the first opens the read, a later one only heads its source.
@@ -793,6 +844,7 @@ impl GetObjectOperation {
             return self.source_failed(error.unwrap_or(GetObjectError::GetObjectFailed));
         };
         self.source_slot = slot;
+        self.chosen_slot = Some(slot);
         self.reference_access = Some(access.clone());
         self.verify_digests.clear();
         if self.txn_id.is_some() {
@@ -1405,6 +1457,7 @@ impl GetObjectOperation {
                         self.source_binding =
                             binding.and_then(|binding| binding.promoted(self.source_slot));
                         self.source_slot = 0;
+                        self.chosen_slot = Some(0);
                     }
                     return self.begin_reference_advance(metadata);
                 }
