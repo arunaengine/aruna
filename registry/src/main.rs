@@ -10,13 +10,18 @@ use aruna_blob::egress::EgressGuard;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_registry::admin_api::AdminAuth;
+use aruna_registry::host::on_host;
 use aruna_registry::resolver::{ClientSource, Resolver, parse_proxies};
 use aruna_registry::store::Store;
-use aruna_registry::{RegistryState, resolver, router};
+use aruna_registry::{RegistryState, resolve_router, resolver, router};
 use tracing::info;
 
 const LISTEN_VAR: &str = "ARUNA_REGISTRY_LISTEN";
 const DATA_VAR: &str = "ARUNA_REGISTRY_DATA";
+/// The host name the registry and admin routes answer on; every host if unset.
+const REGISTRY_HOST_VAR: &str = "ARUNA_REGISTRY_HOST";
+/// The host name the resolver routes answer on; every host if unset.
+const RESOLVER_HOST_VAR: &str = "ARUNA_RESOLVER_HOST";
 /// The realm of ids that name none, such as content hashes; such ids answer 404 if unset.
 const DEFAULT_REALM_VAR: &str = "ARUNA_RESOLVER_DEFAULT_REALM";
 /// The header the ingress sets to the client address, for example `x-real-ip`.
@@ -54,7 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolver = Arc::new(Resolver::new(state.clone(), default_realm, client_source));
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(listen = %listen, data = %data.display(), admin_enabled, "Registry listening");
-    let app = router(state).merge(resolver::router(resolver));
+    let registry = on_host(router(state.clone()), host_var(REGISTRY_HOST_VAR));
+    let resolving = resolver::router(resolver).merge(resolve_router(state));
+    let app = registry.merge(on_host(resolving, host_var(RESOLVER_HOST_VAR)));
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -64,4 +71,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
     Ok(())
+}
+
+/// A host name setting; unset or empty means every host.
+fn host_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }

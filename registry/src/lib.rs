@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod admin_api;
+pub mod host;
 pub mod resolver;
 pub mod store;
 pub mod verify;
@@ -154,8 +155,14 @@ pub fn router(state: Arc<RegistryState>) -> Router {
             "/v1/realms/{realm_id}",
             get(get_realm).put(put_realm).delete(delete_realm),
         )
-        .route("/v1/resolve/{*id}", get(resolve_id))
         .merge(admin_api::router())
+        .with_state(state)
+}
+
+/// The data id resolve route, which belongs to the resolver host.
+pub fn resolve_router(state: Arc<RegistryState>) -> Router {
+    Router::new()
+        .route("/v1/resolve/{*id}", get(resolve_id))
         .with_state(state)
 }
 
@@ -395,6 +402,28 @@ mod tests {
         }
         let result = delete_realm(State(state), Path(path), Json(forged)).await;
         assert!(matches!(result, Err(RegistryError::RateLimited)));
+    }
+
+    #[tokio::test]
+    async fn resolve_route_split() {
+        // The data id route belongs to the resolver routes, never to the registry host's.
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(RegistryState::new(
+            Store::open(dir.path()).unwrap(),
+            EgressGuard::new(aruna_core::egress::EgressPolicy::strict()).unwrap(),
+        ));
+        let request = || {
+            axum::http::Request::get("/v1/resolve/x")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let registry = router(state.clone()).oneshot(request()).await.unwrap();
+        assert_eq!(registry.status(), StatusCode::NOT_FOUND);
+        assert!(registry.headers().get(header::CACHE_CONTROL).is_none());
+        let resolving = resolve_router(state).oneshot(request()).await.unwrap();
+        assert_eq!(resolving.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resolving.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]
