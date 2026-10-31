@@ -3,12 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::compute::CACHE_MANIFEST_KEY;
 use aruna_core::structs::execution::job::{JobId, JobRecord};
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::jobs::workflow::input_view::{
     MAX_VIEW_KEYS, ViewEntry, ViewError, ViewFrom, decode_token, encode_token, head_entry,
-    list_shown, read_entry, read_manifest, view_bucket, view_entries,
+    list_shown, names_manifest, read_entry, read_manifest, view_bucket, view_entries,
 };
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::visible::{is_sealed, open_cursor, seal_cursor};
@@ -205,7 +204,7 @@ impl ArunaS3Service {
         input: HeadObjectInput,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let (record, entries) = self.view_record(view).await?;
-        if input.key == CACHE_MANIFEST_KEY {
+        if names_manifest(&entries, &input.key) {
             let (body, etag) = self.view_manifest(&record, &entries).await?;
             return Ok(S3Response::new(HeadObjectOutput {
                 content_length: i64::try_from(body.len()).ok(),
@@ -238,7 +237,7 @@ impl ArunaS3Service {
         input: GetObjectInput,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let (record, entries) = self.view_record(view).await?;
-        if input.key == CACHE_MANIFEST_KEY {
+        if names_manifest(&entries, &input.key) {
             if input.range.is_some() {
                 return Err(s3_error!(NotImplemented, "The file list is read whole"));
             }

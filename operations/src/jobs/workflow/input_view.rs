@@ -164,6 +164,11 @@ fn exact_key(key: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+/// Whether a view read of `key` is for the cache file list; an input at that key wins.
+pub fn names_manifest(entries: &[ViewEntry], key: &str) -> bool {
+    key == CACHE_MANIFEST_KEY && !entries.iter().any(|entry| entry.key == key)
+}
+
 /// The KubeDAL file list of a run's cached entries, once its creator may still read
 /// (GetObject) each of them, since a worker cache serves them without another read here.
 /// `None` when the run caches nothing.
@@ -727,7 +732,7 @@ mod tests {
         });
         assert_eq!(manifest, serde_json::json!({"version":1,"files":[file]}));
 
-        // An input at the manifest key turns the cache off for the whole run.
+        // An input at the manifest key turns the cache off and is read as that input.
         let taken = [entry("a"), entry(CACHE_MANIFEST_KEY)];
         assert!(
             cached_keys(&context, &taken, local)
@@ -735,6 +740,9 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(!names_manifest(&taken, CACHE_MANIFEST_KEY));
+        assert!(names_manifest(&entries, CACHE_MANIFEST_KEY));
+        assert!(!names_manifest(&entries, "a"));
     }
 
     #[tokio::test]
