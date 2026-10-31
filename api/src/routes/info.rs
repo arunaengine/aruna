@@ -302,6 +302,10 @@ pub struct RealmInfoResponse {
     /// API base urls of the realm's management nodes, from their node
     /// information documents; a device follows one to enroll. Public.
     pub management_urls: Vec<String>,
+    /// Realm server and management nodes with the api base url each published, so a page
+    /// without sign-in reaches a named node. Public; user devices are never listed.
+    #[serde(default)]
+    pub public_nodes: Vec<PublicNode>,
     /// Realm discovery configuration. Realm-authenticated callers only.
     #[schema(value_type = Object)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,6 +316,13 @@ pub struct RealmInfoResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<RealmQuotaConfig>,
     pub interfaces: InterfaceServicesStatus,
+}
+
+/// A realm node a public page can reach: its id and published api base url only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublicNode {
+    pub node_id: String,
+    pub api_url: String,
 }
 
 /// Public, count-only realm overview. Nullable fields mean this node could not
@@ -1091,6 +1102,9 @@ token of another realm or one this node cannot validate, the response is the pub
   `management_urls` lists the api base urls the management nodes published, this node's own first.
   Only a management node mints enrollments and issues the realm's credentials, so a device or a
   client that reached any other node follows one of these urls instead.
+- `public_nodes` is also public: each server and management node's id and published api base url,
+  nothing else, so a page without sign-in (such as a share link) reaches the node it names. User
+  devices are never listed.
 - `public_overview` carries three nullable aggregates: `live_datasets`, the realm's lifecycle-live
   metadata registry count, never caller-filtered or replica-multiplied; `groups`, the realm's
   stored group count; and `nodes_configured`, the membership count in this node's replicated realm
@@ -1137,6 +1151,7 @@ token of another realm or one this node cannot validate, the response is the pub
                         },
                         "is_management_node": false,
                         "management_urls": ["https://mgmt.example.test/api/v1"],
+                        "public_nodes": [{"node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978", "api_url": "https://node.example.test/api/v1"}],
                         "oidc_providers": [
                             {
                                 "id": "example",
@@ -1165,6 +1180,7 @@ token of another realm or one this node cannot validate, the response is the pub
                         },
                         "is_management_node": true,
                         "management_urls": ["https://node.example.test/api/v1"],
+                        "public_nodes": [{"node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978", "api_url": "https://node.example.test/api/v1"}],
                         "oidc_providers": [],
                         "discovery": {"Dynamic": {"methods": [{"DhtSigned": {"ttl_secs": 3600, "refresh_after_secs": 1800}}]}},
                         "nodes": [
@@ -1296,6 +1312,13 @@ pub(crate) async fn run_realm_info(
         management_urls = installed_management_urls(&state.get_ctx(), config.realm_id).await;
     }
 
+    let public_nodes = public_nodes(
+        state,
+        &config,
+        &node_info_docs,
+        interfaces.rest.url.as_deref(),
+    );
+
     let (discovery, nodes, quota) = if realm_authenticated {
         let present_nodes = load_realm_presence(state).await;
         let discovery = serde_json::to_value(&config.discovery)
@@ -1337,6 +1360,7 @@ pub(crate) async fn run_realm_info(
         public_overview,
         is_management_node: state.is_management_node(),
         management_urls,
+        public_nodes,
         discovery,
         nodes,
         quota,
@@ -1383,6 +1407,38 @@ pub(crate) fn management_node_urls(
                 .get(&node_id)
                 .and_then(|doc| doc.urls.api.clone());
             (node_id, url)
+        })
+        .collect()
+}
+
+/// Server and management nodes with a published api url, in realm-config order; this node
+/// names its own interface while its document has not landed yet.
+fn public_nodes(
+    state: &ServerState,
+    config: &RealmConfigDocument,
+    node_info_docs: &BTreeMap<
+        aruna_core::NodeId,
+        aruna_core::structs::storage::node_info::NodeInfoDocument,
+    >,
+    own_url: Option<&str>,
+) -> Vec<PublicNode> {
+    let current = state.get_node_id();
+    config
+        .nodes
+        .iter()
+        .filter(|node| !matches!(node.kind, RealmNodeKind::User { .. }))
+        .filter_map(|node| node.node_id.parse::<aruna_core::NodeId>().ok())
+        .filter_map(|node_id| {
+            let published = node_info_docs
+                .get(&node_id)
+                .and_then(|doc| doc.urls.api.clone());
+            let own = (node_id == current)
+                .then(|| own_url.map(str::to_string))
+                .flatten();
+            Some(PublicNode {
+                node_id: node_id.to_string(),
+                api_url: published.or(own)?,
+            })
         })
         .collect()
 }
