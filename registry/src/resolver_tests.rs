@@ -1,0 +1,464 @@
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use crate::store::tests::{realm_id, registration};
+use crate::store::{Entry, Store};
+use aruna_core::egress::EgressPolicy;
+use aruna_core::{BucketId, PlacementHandle, StructuredId};
+use axum::extract::State;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tempfile::TempDir;
+
+const BASE: &str = "https://realm.example.org";
+const API: &str = "https://realm.example.org/api/v1";
+/// A v2 style id: random entropy, so it parses as a structured id with some placement handle.
+const LEGACY: &str = "01H8Y3R7Z5X9C2V4B6N8M0Q1W3";
+
+/// A resolver whose registry holds the test realm at `base`, approved when `approved` is set.
+fn resolver(base: &str, approved: bool) -> (TempDir, Resolver, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(RegistryState::new(
+        Store::open(dir.path()).unwrap(),
+        EgressGuard::new(EgressPolicy::strict()).unwrap(),
+    ));
+    let now = unix_timestamp_secs();
+    let entry = Entry {
+        registration: registration(base, now),
+        received_at: now,
+        verified: false,
+    };
+    state.store.register(&realm_id(), &entry, now).unwrap();
+    let approved = match approved {
+        true => vec![realm_id()],
+        false => Vec::new(),
+    };
+    (dir, Resolver::new(state, approved, None), now)
+}
+
+/// A document id as a v3 realm mints it, on the metadata placement handle.
+fn minted() -> Ulid {
+    let handle = PlacementHandle::new(1).unwrap();
+    MetaResourceId::from_parts(1_790_000_000_000, handle, BucketId::new(0).unwrap(), 9)
+        .unwrap()
+        .as_ulid()
+}
+
+/// Fake sites: each URL says what the map holds, anything else is absent; asks are counted.
+struct Sites {
+    said: HashMap<String, Holding>,
+    asked: AtomicUsize,
+}
+
+impl Sites {
+    fn new(said: &[(&str, Holding)]) -> Self {
+        Self {
+            said: said
+                .iter()
+                .map(|(url, holding)| ((*url).to_string(), *holding))
+                .collect(),
+            asked: AtomicUsize::new(0),
+        }
+    }
+
+    async fn ask(&self, resolver: &Resolver, path: &str, now: u64) -> Answer {
+        let probe = |url: Url, _| {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let holding = self.said.get(url.as_str()).copied();
+            async move { holding.unwrap_or(Holding::Absent) }
+        };
+        resolver.answer(parse_path(path), now, probe).await
+    }
+
+    fn asked(&self) -> usize {
+        self.asked.load(Ordering::SeqCst)
+    }
+}
+
+fn node_id() -> aruna_core::NodeId {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
+    aruna_core::NodeId::from_bytes(key.as_bytes()).unwrap()
+}
+
+fn redirect(target: &str) -> Answer {
+    Answer::Redirect(target.to_string())
+}
+
+#[test]
+fn parses_every_pattern() {
+    let id = Ulid::from_string("01JMETADATA0123456789ABCDE").unwrap();
+    let realm = realm_id();
+    let hash = "ab".repeat(32);
+    let key = node_id();
+    let arn = format!("arn:aruna:{realm}:{key}:s3/reads/a%20b%2Bc@{id}");
+    let cases = [
+        ("", Shape::Home),
+        ("terms/Release", Shape::Home),
+        ("invenio/metadata", Shape::Home),
+        ("profiles/repository/zenodo", Shape::Home),
+        ("01JMETADATA0123456789ABCDE", Shape::Document(id)),
+        ("01jmetadata0123456789abcde", Shape::Document(id)),
+        ("profile/01JMETADATA0123456789ABCDE", Shape::Profile(id)),
+        ("dev/01JMETADATA0123456789ABCDE", Shape::Dev(id)),
+        (&format!("data/{hash}"), Shape::Data(None, hash.clone())),
+        (
+            &format!("data/{realm}/{id}"),
+            Shape::Data(Some(realm), format!("{realm}/{id}")),
+        ),
+        (
+            &format!("data/{realm}/{id}/"),
+            Shape::Data(Some(realm), format!("{realm}/{id}/")),
+        ),
+        (
+            &format!("data/{arn}"),
+            Shape::Data(Some(realm), arn.clone()),
+        ),
+        // w3id.org passes keys decoded once and leaves `+` raw; both come out canonical.
+        (
+            &format!("data/arn:aruna:{realm}:{key}:s3/reads/a%20b+c@{id}"),
+            Shape::Data(Some(realm), arn.clone()),
+        ),
+    ];
+    for (path, shape) in cases {
+        assert_eq!(parse_path(path), shape, "{path}");
+    }
+    for unknown in [
+        "x",
+        "8ZZZZZZZZZZZZZZZZZZZZZZZZZ",
+        "01JMETADATA0123456789ABCDE/x",
+        "profile/x",
+        "dev/",
+        "data/",
+        "data/not-an-id",
+        &format!("data/{realm}/not-a-ulid"),
+        &format!("data/arn:aruna:{realm}:{key}:s3/reads/a@not-a-ulid"),
+        "../x",
+        "https://evil.example",
+        // The node route and the owned namespace prefix never resolve, so nothing loops.
+        "w3id/01JMETADATA0123456789ABCDE",
+        &format!("realm/{realm}/01JMETADATA0123456789ABCDE"),
+    ] {
+        assert_eq!(parse_path(unknown), Shape::Unknown, "{unknown}");
+    }
+}
+
+#[test]
+fn decides_by_priority() {
+    use Holding::{Absent, Holds, Unavailable};
+    let id = minted();
+    let realm = |holding| ("realm".to_string(), Source::Realm, holding);
+    let other = |holding| ("other".to_string(), Source::Realm, holding);
+    let prod = |holding| (format!("{}{id}", V2.page), Source::Legacy, holding);
+    let dev = |holding| (format!("{}{id}", V2_DEV.page), Source::Legacy, holding);
+    let document = Shape::Document(id);
+    let prod_page = redirect(&format!("{}{id}", V2.page));
+    let dev_page = redirect(&format!("{}{id}", V2_DEV.page));
+    let cases = [
+        (vec![realm(Holds), prod(Holds)], redirect("realm")),
+        (vec![realm(Holds), other(Holds)], Answer::Conflict),
+        (vec![realm(Holds), other(Unavailable)], redirect("realm")),
+        (
+            vec![realm(Absent), prod(Holds), dev(Holds)],
+            prod_page.clone(),
+        ),
+        (
+            vec![realm(Absent), prod(Absent), dev(Holds)],
+            dev_page.clone(),
+        ),
+        (vec![realm(Unavailable), dev(Holds)], dev_page.clone()),
+        // Nobody knows the id: the page the old w3id rule named, unless a realm may hold it.
+        (
+            vec![realm(Absent), prod(Absent), dev(Absent)],
+            prod_page.clone(),
+        ),
+        (vec![realm(Absent), prod(Unavailable)], prod_page.clone()),
+        (vec![prod(Absent)], prod_page),
+        (vec![realm(Unavailable), prod(Absent)], Answer::Unavailable),
+    ];
+    for (answers, expected) in cases {
+        assert_eq!(decide(&document, &answers), expected, "{answers:?}");
+    }
+    // A dev id goes to v2 dev unless a realm holds it, also while a realm is unreachable.
+    let dev_id = Shape::Dev(id);
+    assert_eq!(decide(&dev_id, &[realm(Holds)]), redirect("realm"));
+    assert_eq!(decide(&dev_id, &[realm(Unavailable)]), dev_page);
+    assert_eq!(decide(&dev_id, &[]), dev_page);
+    let profile = Shape::Profile(id);
+    assert_eq!(decide(&profile, &[realm(Holds)]), redirect("realm"));
+    assert!(matches!(
+        decide(&profile, &[realm(Absent)]),
+        Answer::NotFound(_)
+    ));
+    assert_eq!(decide(&profile, &[realm(Unavailable)]), Answer::Unavailable);
+}
+
+#[test]
+fn maps_site_statuses() {
+    let cases = [
+        (Source::Realm, 302, Holding::Holds),
+        (Source::Realm, 307, Holding::Holds),
+        (Source::Realm, 410, Holding::Holds),
+        (Source::Realm, 404, Holding::Absent),
+        (Source::Realm, 200, Holding::Unavailable),
+        (Source::Realm, 503, Holding::Unavailable),
+        (Source::Legacy, 200, Holding::Holds),
+        (Source::Legacy, 400, Holding::Holds),
+        (Source::Legacy, 404, Holding::Absent),
+        (Source::Legacy, 302, Holding::Unavailable),
+        (Source::Legacy, 502, Holding::Unavailable),
+    ];
+    for (source, status, expected) in cases {
+        let status = StatusCode::from_u16(status).unwrap();
+        assert_eq!(holding(source, status), expected, "{source:?} {status}");
+    }
+}
+
+#[tokio::test]
+async fn realm_hit_cached() {
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let id = minted();
+    let target = format!("{API}/w3id/{id}");
+    let sites = Sites::new(&[(&target, Holding::Holds)]);
+    let path = id.to_string();
+    assert_eq!(sites.ask(&resolver, &path, now).await, redirect(&target));
+    // The realm and both v2 sites are asked once; the answer is then kept briefly.
+    assert_eq!(sites.asked(), 3);
+    assert_eq!(
+        sites.ask(&resolver, &path, now + 1).await,
+        redirect(&target)
+    );
+    assert_eq!(sites.asked(), 3);
+    let later = now + CACHE_SECS;
+    assert_eq!(sites.ask(&resolver, &path, later).await, redirect(&target));
+    assert_eq!(sites.asked(), 6);
+}
+
+#[tokio::test]
+async fn legacy_ids_guessed() {
+    let dev_api = format!("{}{LEGACY}", V2_DEV.api);
+    let prod_api = format!("{}{LEGACY}", V2.api);
+    let dev_page = redirect(&format!("{}{LEGACY}", V2_DEV.page));
+    let prod_page = redirect(&format!("{}{LEGACY}", V2.page));
+    let cases = [
+        (vec![(dev_api.as_str(), Holding::Holds)], dev_page),
+        (
+            vec![
+                (dev_api.as_str(), Holding::Holds),
+                (prod_api.as_str(), Holding::Holds),
+            ],
+            prod_page.clone(),
+        ),
+        // Unknown everywhere: the old rule's page, which explains itself.
+        (Vec::new(), prod_page),
+    ];
+    for (said, expected) in cases {
+        // A fresh resolver each time, so no case reads another's cached answer.
+        let (_dir, resolver, now) = resolver(BASE, true);
+        let sites = Sites::new(&said);
+        assert_eq!(
+            sites.ask(&resolver, LEGACY, now).await,
+            expected,
+            "{said:?}"
+        );
+        assert_eq!(sites.asked(), 3);
+    }
+}
+
+#[tokio::test]
+async fn reserved_handle_skips() {
+    // A ULID on the reserved placement handle cannot be a v3 id, so no realm is asked.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let id = Ulid::from_parts(1_700_000_000_000, 0x1234_5678);
+    assert!(MetaResourceId::from_str(&id.to_string()).is_err());
+    let sites = Sites::new(&[(&format!("{API}/w3id/{id}"), Holding::Holds)]);
+    let answer = sites.ask(&resolver, &id.to_string(), now).await;
+    assert_eq!(answer, redirect(&format!("{}{id}", V2.page)));
+    assert_eq!(sites.asked(), 2);
+}
+
+#[tokio::test]
+async fn failures_never_cached() {
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let id = minted();
+    let target = format!("{API}/w3id/{id}");
+    let sites = Sites::new(&[(&target, Holding::Unavailable)]);
+    let path = id.to_string();
+    assert_eq!(sites.ask(&resolver, &path, now).await, Answer::Unavailable);
+    assert_eq!(sites.ask(&resolver, &path, now).await, Answer::Unavailable);
+    assert_eq!(sites.asked(), 6);
+    // A guess made while a site was unreachable is not kept either.
+    let prod = format!("{}{id}", V2.api);
+    let partial = Sites::new(&[(&prod, Holding::Unavailable)]);
+    let page = redirect(&format!("{}{id}", V2.page));
+    assert_eq!(partial.ask(&resolver, &path, now).await, page);
+    assert_eq!(partial.ask(&resolver, &path, now).await, page);
+    assert_eq!(partial.asked(), 6);
+}
+
+#[tokio::test]
+async fn dev_and_profiles() {
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let id = minted();
+    let held = format!("{API}/w3id/{id}");
+    let sites = Sites::new(&[(&held, Holding::Holds)]);
+    let dev = format!("dev/{id}");
+    assert_eq!(sites.ask(&resolver, &dev, now).await, redirect(&held));
+    // Only realms are asked for a dev id; v2 dev is the answer when none holds it.
+    assert_eq!(sites.asked(), 1);
+    let down = Sites::new(&[(&format!("{API}/w3id/{LEGACY}"), Holding::Unavailable)]);
+    let legacy = format!("dev/{LEGACY}");
+    let page = redirect(&format!("{}{LEGACY}", V2_DEV.page));
+    assert_eq!(down.ask(&resolver, &legacy, now).await, page);
+
+    let profile = format!("{API}/w3id/profile/{id}");
+    let sites = Sites::new(&[(&profile, Holding::Holds)]);
+    let path = format!("profile/{id}");
+    assert_eq!(sites.ask(&resolver, &path, now).await, redirect(&profile));
+    assert_eq!(sites.asked(), 1);
+    let missing = format!("profile/{LEGACY}");
+    assert!(matches!(
+        sites.ask(&resolver, &missing, now).await,
+        Answer::NotFound(_)
+    ));
+}
+
+#[tokio::test]
+async fn unapproved_never_asked() {
+    let (_dir, resolver, now) = resolver(BASE, false);
+    let id = minted();
+    let sites = Sites::new(&[(&format!("{API}/w3id/{id}"), Holding::Holds)]);
+    let answer = sites.ask(&resolver, &id.to_string(), now).await;
+    assert_eq!(answer, redirect(&format!("{}{id}", V2.page)));
+    assert_eq!(sites.asked(), 2);
+    let realm = realm_id();
+    let global = format!("data/{realm}/{id}");
+    for path in [global, format!("data/{}", "ab".repeat(32))] {
+        let answer = sites.ask(&resolver, &path, now).await;
+        assert!(matches!(answer, Answer::NotFound(_)), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn data_ids_direct() {
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let sites = Sites::new(&[]);
+    let realm = realm_id();
+    let id = minted();
+    let hash = "ab".repeat(32);
+    let key = node_id();
+    let arn = format!("arn:aruna:{realm}:{key}:s3/reads/a%20b@{id}");
+    let cases = [
+        (format!("data/{hash}"), format!("{API}/w3id/data/{hash}")),
+        (
+            format!("data/{realm}/{id}"),
+            format!("{API}/w3id/data/{realm}/{id}"),
+        ),
+        (
+            format!("data/arn:aruna:{realm}:{key}:s3/reads/a b@{id}"),
+            format!("{API}/w3id/data/{arn}"),
+        ),
+    ];
+    for (path, target) in cases {
+        assert_eq!(sites.ask(&resolver, &path, now).await, redirect(&target));
+    }
+    assert_eq!(sites.asked(), 0);
+}
+
+#[tokio::test]
+async fn w3id_host_refused() {
+    // A realm API on w3id.org would send the redirect back to this resolver.
+    let (_dir, resolver, now) = resolver("https://w3id.org/aruna", true);
+    let path = format!("data/{}", "ab".repeat(32));
+    let answer = Sites::new(&[]).ask(&resolver, &path, now).await;
+    assert!(matches!(answer, Answer::NotFound(_)), "{answer:?}");
+}
+
+#[tokio::test]
+async fn handlers_set_headers() {
+    let (_dir, resolver, _) = resolver(BASE, true);
+    let resolver = Arc::new(resolver);
+    let realm = realm_id();
+    let id = minted();
+    let shared = |path: &str| {
+        let uri: Uri = path.parse().unwrap();
+        resolve_shared(State(resolver.clone()), uri)
+    };
+    for path in ["/aruna", "/aruna/", "/aruna/terms/Release"] {
+        let response = shared(path).await;
+        assert_eq!(response.status(), StatusCode::FOUND, "{path}");
+        assert_eq!(response.headers()[header::LOCATION], HOME);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    }
+    let unknown = shared("/aruna/x").await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(unknown.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+
+    let owned = |path: String| {
+        let uri: Uri = path.parse().unwrap();
+        resolve_owned(State(resolver.clone()), uri)
+    };
+    let response = owned(format!("/realm/{realm}/profile/{id}")).await;
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let target = format!("{API}/w3id/profile/{id}");
+    assert_eq!(response.headers()[header::LOCATION], target.as_str());
+    let other = aruna_core::structs::identity::realm::RealmId::from_bytes([3; 32]);
+    for path in [
+        format!("/realm/{realm}/terms/Release"),
+        format!("/realm/{other}/{id}"),
+        format!("/realm/not-a-realm/{id}"),
+    ] {
+        assert_eq!(
+            owned(path.clone()).await.status(),
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn probes_follow_nothing() {
+    use axum::routing::get;
+    let followed = Arc::new(AtomicUsize::new(0));
+    let counter = followed.clone();
+    let status = |code: u16| move || async move { StatusCode::from_u16(code).unwrap() };
+    let router = Router::new()
+        .route(
+            "/moved",
+            get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/target")]) }),
+        )
+        .route(
+            "/target",
+            get(move || async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }),
+        )
+        .route("/gone", get(status(410)))
+        .route("/down", get(status(503)))
+        .route("/ok", get(status(200)))
+        .route("/private", get(status(400)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let egress = EgressGuard::new(EgressPolicy::loopback()).unwrap();
+    let url = |path: &str| Url::parse(&format!("{base}{path}")).unwrap();
+    let cases = [
+        ("/moved", Source::Realm, Holding::Holds),
+        ("/gone", Source::Realm, Holding::Holds),
+        ("/missing", Source::Realm, Holding::Absent),
+        ("/down", Source::Realm, Holding::Unavailable),
+        ("/ok", Source::Legacy, Holding::Holds),
+        ("/private", Source::Legacy, Holding::Holds),
+        ("/missing", Source::Legacy, Holding::Absent),
+    ];
+    for (path, source, expected) in cases {
+        assert_eq!(probe(&egress, url(path), source).await, expected, "{path}");
+    }
+    assert_eq!(followed.load(Ordering::SeqCst), 0);
+    // The production policy refuses loopback, which counts as unreachable.
+    let strict = EgressGuard::new(EgressPolicy::strict()).unwrap();
+    let refused = probe(&strict, url("/ok"), Source::Legacy).await;
+    assert_eq!(refused, Holding::Unavailable);
+}
