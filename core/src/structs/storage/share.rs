@@ -303,6 +303,36 @@ impl ShareEvent {
     }
 }
 
+/// How often a link was used, kept beside the record so owners need not read the log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareUses {
+    pub downloads: u64,
+    pub uploads: u64,
+    /// Unix milliseconds of the last open, download or upload.
+    pub last_access_at: Option<u64>,
+}
+
+impl ShareUses {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// Counts one log entry; a wrong password is no access.
+    pub fn record(&mut self, event: &ShareEvent) {
+        match event.action {
+            ShareAction::Download => self.downloads += 1,
+            ShareAction::Upload => self.uploads += 1,
+            ShareAction::Open => {}
+            ShareAction::WrongPassword => return,
+        }
+        self.last_access_at = Some(self.last_access_at.map_or(event.at, |at| at.max(event.at)));
+    }
+}
+
 /// Owner index row: the creator's storage key, then the link id.
 pub fn owner_key(user: &UserId, share_id: Ulid) -> Vec<u8> {
     [user.to_storage_key(), share_id.to_bytes().to_vec()].concat()

@@ -73,9 +73,7 @@ fn batch_written() -> Event {
 }
 
 fn log_written() -> Event {
-    Event::Storage(StorageEvent::WriteResult {
-        key: Vec::new().into(),
-    })
+    Event::SubOperation(SubOperationEvent::ShareLogged { result: Ok(()) })
 }
 
 #[test]
@@ -142,10 +140,7 @@ fn open_checks_password() {
     let mut wrong = open(&guarded, Some("guess"));
     wrong.start();
     let log = wrong.step(read_result(&guarded));
-    assert!(matches!(
-        log[0],
-        Effect::Storage(StorageEffect::Write { .. })
-    ));
+    assert!(matches!(log[0], Effect::SubOperation(_)));
     wrong.step(log_written());
     assert_eq!(wrong.finalize(), Err(ShareError::WrongPassword));
     let mut right = open(&guarded, Some("secret"));

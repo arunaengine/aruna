@@ -122,6 +122,31 @@ fn targets_cover_scope() {
 }
 
 #[test]
+fn uses_count_accesses() {
+    let event = |action, at| ShareEvent {
+        at,
+        action,
+        key: None,
+        bytes: None,
+        client: None,
+    };
+    let mut uses = ShareUses::default();
+    uses.record(&event(ShareAction::WrongPassword, 50));
+    assert_eq!(uses, ShareUses::default());
+    uses.record(&event(ShareAction::Download, 100));
+    uses.record(&event(ShareAction::Upload, 90));
+    uses.record(&event(ShareAction::Open, 80));
+    assert_eq!(
+        uses,
+        ShareUses {
+            downloads: 1,
+            uploads: 1,
+            last_access_at: Some(100),
+        }
+    );
+}
+
+#[test]
 fn client_network_truncated() {
     assert_eq!(
         client_network("192.0.2.77".parse().unwrap()),

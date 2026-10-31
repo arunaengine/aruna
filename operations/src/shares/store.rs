@@ -6,10 +6,12 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{SHARE_EVENT_KEYSPACE, SHARE_LINK_KEYSPACE, SHARE_OWNER_KEYSPACE};
+use aruna_core::keyspaces::{
+    SHARE_EVENT_KEYSPACE, SHARE_LINK_KEYSPACE, SHARE_OWNER_KEYSPACE, SHARE_USE_KEYSPACE,
+};
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::share::{ShareEvent, ShareLink, event_key, owner_key};
-use aruna_core::types::{Effects, Key};
+use aruna_core::structs::storage::share::{ShareEvent, ShareLink, ShareUses, event_key, owner_key};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -51,20 +53,6 @@ pub fn save_effect(link: &ShareLink) -> Result<Effect, ConversionError> {
                 Vec::new().into(),
             ),
         ],
-        txn_id: None,
-    }))
-}
-
-/// The write of one access log entry.
-pub fn event_effect(
-    share_id: Ulid,
-    entry_id: Ulid,
-    event: &ShareEvent,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: SHARE_EVENT_KEYSPACE.to_string(),
-        key: event_key(share_id, entry_id).into(),
-        value: event.to_bytes()?.into(),
         txn_id: None,
     }))
 }
@@ -260,13 +248,25 @@ impl Operation for ListSharesOperation {
     }
 }
 
-/// Appends one access log entry to a link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogState {
+    Begin,
+    Read(TxnId),
+    Write(TxnId),
+    Commit,
+    Done,
+    Failed,
+}
+
+/// Appends one access log entry and counts it in the link's use row, in one transaction; a
+/// conflicting writer makes it start over, so concurrent visits never lose a count.
 #[derive(Debug, PartialEq)]
 pub struct LogShareOperation {
     share_id: Ulid,
     entry_id: Ulid,
     event: ShareEvent,
-    output: Option<Result<(), ShareStoreError>>,
+    state: LogState,
+    error: Option<ShareStoreError>,
 }
 
 impl LogShareOperation {
@@ -276,8 +276,45 @@ impl LogShareOperation {
             share_id,
             entry_id,
             event,
-            output: None,
+            state: LogState::Begin,
+            error: None,
         }
+    }
+
+    fn begin(&mut self) -> Effects {
+        self.state = LogState::Begin;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn fail(&mut self, error: ShareStoreError, txn_id: Option<TxnId>) -> Effects {
+        self.state = LogState::Failed;
+        self.error = Some(error);
+        match txn_id {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
+    }
+
+    fn writes(&self, uses: Option<&[u8]>) -> Result<Vec<(String, Key, Value)>, ConversionError> {
+        let mut counted = uses
+            .map(ShareUses::from_bytes)
+            .transpose()?
+            .unwrap_or_default();
+        counted.record(&self.event);
+        Ok(vec![
+            (
+                SHARE_EVENT_KEYSPACE.to_string(),
+                event_key(self.share_id, self.entry_id).into(),
+                self.event.to_bytes()?.into(),
+            ),
+            (
+                SHARE_USE_KEYSPACE.to_string(),
+                self.share_id.to_bytes().to_vec().into(),
+                counted.to_bytes()?.into(),
+            ),
+        ])
     }
 }
 
@@ -286,19 +323,126 @@ impl Operation for LogShareOperation {
     type Error = ShareStoreError;
 
     fn start(&mut self) -> Effects {
-        match event_effect(self.share_id, self.entry_id, &self.event) {
-            Ok(effect) => smallvec![effect],
-            Err(error) => {
-                self.output = Some(Err(error.into()));
+        self.begin()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (self.state, event) {
+            (LogState::Begin, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.state = LogState::Read(txn_id);
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: SHARE_USE_KEYSPACE.to_string(),
+                    key: self.share_id.to_bytes().to_vec().into(),
+                    txn_id: Some(txn_id),
+                })]
+            }
+            (LogState::Read(txn_id), Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                match self.writes(value.as_deref()) {
+                    Ok(writes) => {
+                        self.state = LogState::Write(txn_id);
+                        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                            writes,
+                            txn_id: Some(txn_id),
+                        })]
+                    }
+                    Err(error) => self.fail(error.into(), Some(txn_id)),
+                }
+            }
+            (LogState::Write(txn_id), Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                self.state = LogState::Commit;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            (LogState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
+                self.state = LogState::Done;
                 smallvec![]
             }
+            (
+                LogState::Commit,
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }),
+            ) => self.begin(),
+            (LogState::Read(txn_id) | LogState::Write(txn_id), event) => {
+                self.fail(storage_error(event), Some(txn_id))
+            }
+            (_, event) => self.fail(storage_error(event), None),
         }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, LogState::Done | LogState::Failed)
+    }
+
+    fn finalize(self) -> Result<(), ShareStoreError> {
+        match (self.state, self.error) {
+            (LogState::Done, _) => Ok(()),
+            (_, Some(error)) => Err(error),
+            _ => Err(ShareStoreError::NotFinished),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        match self.state {
+            LogState::Read(txn_id) | LogState::Write(txn_id) => {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            _ => smallvec![],
+        }
+    }
+}
+
+/// Reads the use counters of `ids`, in order; a link never used counts zero.
+#[derive(Debug, PartialEq)]
+pub struct ReadUsesOperation {
+    ids: Vec<Ulid>,
+    output: Option<Result<Vec<ShareUses>, ShareStoreError>>,
+}
+
+impl ReadUsesOperation {
+    pub fn new(ids: Vec<Ulid>) -> Self {
+        Self { ids, output: None }
+    }
+}
+
+impl Operation for ReadUsesOperation {
+    type Output = Vec<ShareUses>;
+    type Error = ShareStoreError;
+
+    fn start(&mut self) -> Effects {
+        if self.ids.is_empty() {
+            self.output = Some(Ok(Vec::new()));
+            return smallvec![];
+        }
+        let reads = self
+            .ids
+            .iter()
+            .map(|id| {
+                (
+                    SHARE_USE_KEYSPACE.to_string(),
+                    id.to_bytes().to_vec().into(),
+                )
+            })
+            .collect();
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         if self.output.is_none() {
             self.output = Some(match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+                Event::Storage(StorageEvent::BatchReadResult { values })
+                    if values.len() == self.ids.len() =>
+                {
+                    values
+                        .into_iter()
+                        .map(|(_, value)| match value {
+                            Some(bytes) => ShareUses::from_bytes(&bytes).map_err(Into::into),
+                            None => Ok(ShareUses::default()),
+                        })
+                        .collect()
+                }
                 event => Err(storage_error(event)),
             });
         }
@@ -309,7 +453,7 @@ impl Operation for LogShareOperation {
         self.output.is_some()
     }
 
-    fn finalize(self) -> Result<(), ShareStoreError> {
+    fn finalize(self) -> Result<Vec<ShareUses>, ShareStoreError> {
         self.output.unwrap_or(Err(ShareStoreError::NotFinished))
     }
 

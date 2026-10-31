@@ -4,7 +4,7 @@
 use super::*;
 use crate::driver::{DriverContext, drive};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::share::{ShareAction, ShareMode, ShareTarget};
+use aruna_core::structs::storage::share::{ShareAction, ShareMode, ShareTarget, ShareUses};
 use aruna_storage::storage::FjallStorage;
 
 fn context(dir: &tempfile::TempDir) -> DriverContext {
@@ -107,4 +107,38 @@ async fn log_pages_in_order() {
         .unwrap();
     assert_eq!(rest.iter().map(|(_, e)| e.at).collect::<Vec<_>>(), [2]);
     assert_eq!(end, None);
+    // Each entry counts in the link's use row; the other link keeps its own.
+    let uses = drive(
+        ReadUsesOperation::new(vec![share, other, Ulid::nil()]),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(uses[0].downloads, 3);
+    assert_eq!(uses[0].last_access_at, Some(2));
+    assert_eq!(uses[1].downloads, 1);
+    assert_eq!(uses[2], ShareUses::default());
+}
+
+#[tokio::test]
+async fn concurrent_logs_keep_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let context = context(&dir);
+    let share = Ulid::from_bytes([7; 16]);
+    let event = ShareEvent {
+        at: 1,
+        action: ShareAction::Upload,
+        key: None,
+        bytes: None,
+        client: None,
+    };
+    let log = |entry: u64| LogShareOperation::new(share, Ulid::from_parts(entry, 0), event.clone());
+    let runs: Vec<_> = (1..=8).map(|entry| drive(log(entry), &context)).collect();
+    for result in futures_util::future::join_all(runs).await {
+        result.unwrap();
+    }
+    let uses = drive(ReadUsesOperation::new(vec![share]), &context)
+        .await
+        .unwrap();
+    assert_eq!(uses[0].uploads, 8);
 }

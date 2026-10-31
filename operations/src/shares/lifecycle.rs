@@ -19,7 +19,7 @@ use ulid::Ulid;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::request_authorization::{AuthorizeError, check_error};
 use crate::shares::rules::{ShareRuleError, required_permission, validate_link, visit_expiry};
-use crate::shares::store::{ShareStoreError, event_effect, save_effect};
+use crate::shares::store::{LogShareOperation, ShareStoreError, save_effect};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ShareError {
@@ -38,6 +38,8 @@ pub enum ShareError {
     PasswordRequired,
     #[error("the password is not correct")]
     WrongPassword,
+    #[error("the access log was not written: {0}")]
+    Log(String),
     #[error("unexpected event in share state {0}")]
     UnexpectedEvent(&'static str),
     #[error("share operation did not finish")]
@@ -88,6 +90,15 @@ fn written(event: Event, state: &'static str) -> Result<(), ShareError> {
         ) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         _ => Err(ShareError::UnexpectedEvent(state)),
+    }
+}
+
+fn logged(event: Event) -> Result<(), ShareError> {
+    match event {
+        Event::SubOperation(SubOperationEvent::ShareLogged { result }) => {
+            result.map_err(ShareError::Log)
+        }
+        _ => Err(ShareError::UnexpectedEvent("log")),
     }
 }
 
@@ -280,13 +291,12 @@ impl OpenShareOperation {
             client: Some(self.config.client.clone()),
         };
         let share_id = self.config.token.share_id();
-        match event_effect(share_id, self.config.entry_id, &event) {
-            Ok(effect) => {
-                self.state = state;
-                smallvec![effect]
-            }
-            Err(error) => self.fail(error.into()),
-        }
+        self.state = state;
+        let log = LogShareOperation::new(share_id, self.config.entry_id, event);
+        smallvec![Effect::SubOperation(boxed_suboperation(log, |result| {
+            let result = result.map_err(|error| error.to_string());
+            Event::SubOperation(SubOperationEvent::ShareLogged { result })
+        }))]
     }
 
     fn loaded(&mut self, link: Option<ShareLink>) -> Effects {
@@ -334,14 +344,14 @@ impl Operation for OpenShareOperation {
                 Ok(link) => self.loaded(link),
                 Err(error) => self.fail(error),
             },
-            OpenState::LogOpen => match written(event, "log") {
+            OpenState::LogOpen => match logged(event) {
                 Ok(()) => {
                     self.state = OpenState::Done;
                     smallvec![]
                 }
                 Err(error) => self.fail(error),
             },
-            OpenState::LogWrong => match written(event, "log") {
+            OpenState::LogWrong => match logged(event) {
                 Ok(()) => self.fail(ShareError::WrongPassword),
                 Err(error) => self.fail(error),
             },

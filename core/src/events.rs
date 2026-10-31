@@ -98,6 +98,10 @@ pub enum SubOperationEvent {
         result: Result<GroupRoutingInputs, String>,
     },
     NotificationsEmitted,
+    /// A share link's access log entry and use counters were written.
+    ShareLogged {
+        result: Result<(), String>,
+    },
     TokenRevoked {
         result: Result<(), String>,
     },
