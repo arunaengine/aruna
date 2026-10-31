@@ -22,6 +22,7 @@ use aruna_core::structs::storage::distribution::{
 use ulid::Ulid;
 
 use super::create::{CreateError, CreationReport, admit_pending, send_admin};
+use super::forward::PublishRefusal;
 use super::sharding::{range_sample, split_point};
 use super::status::{Reach, node_reach, read_view};
 use crate::driver::DriverContext;
@@ -332,7 +333,8 @@ fn checked_split(
         epoch,
         split_key: plan.split_key.clone(),
     };
-    next_snapshot(realm_id, Some(snapshot), &request)?;
+    next_snapshot(realm_id, Some(snapshot), &request)
+        .map_err(|error| PublishRefusal::Rejected(error.to_string()))?;
     Ok(request)
 }
 
@@ -438,13 +440,19 @@ mod tests {
         assert!(checked_split(&snapshot, realm(), &plan("f")).is_ok());
         let refused = checked_split(&snapshot, realm(), &plan("x"));
         assert!(
-            matches!(refused, Err(CreateError::Distribution(_))),
+            matches!(
+                refused,
+                Err(CreateError::Publish(PublishRefusal::Rejected(_)))
+            ),
             "{refused:?}"
         );
         let (pending, _) = record(false);
         let refused = checked_split(&pending, realm(), &plan("f"));
         assert!(
-            matches!(refused, Err(CreateError::Distribution(_))),
+            matches!(
+                refused,
+                Err(CreateError::Publish(PublishRefusal::Rejected(_)))
+            ),
             "{refused:?}"
         );
     }
