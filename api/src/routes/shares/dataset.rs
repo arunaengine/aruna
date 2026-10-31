@@ -181,14 +181,14 @@ async fn local_parts(
             "this link does not share a dataset".to_string(),
         ));
     };
-    let (_, jsonld) = export_here(state, dataset_reader(link, state), document_id)
+    let (record, jsonld) = export_here(state, dataset_reader(link, state), document_id)
         .await
         .map_err(|_| unavailable())?;
     let rocrate: serde_json::Value = serde_json::from_str(&jsonld)
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let (realm, node) = (state.get_realm_id(), state.get_node_id());
     let mut parts = Vec::new();
-    for file in dataset_files(&rocrate, realm, node) {
+    for file in dataset_files(&rocrate, &record.graph_iri, realm, node) {
         let (bucket, key, version_id, folder) = match &file.place {
             FilePlace::Object {
                 bucket,

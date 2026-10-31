@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::id::NodeId;
+use aruna_core::repo_layout::root_id;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::data::identity::{DataIdentity, text_values};
 use aruna_core::structs::storage::data::link::DataLink;
 use serde_json::Value as JsonValue;
+use std::collections::HashSet;
 use ulid::Ulid;
 
 use crate::metadata::public_preview::is_file;
@@ -32,17 +34,54 @@ pub struct DatasetFile {
     pub place: FilePlace,
 }
 
-/// The crate's files, folders and buckets this node can serve, in graph order. Parts of other
-/// nodes, of other realms, of distributed buckets and outside Aruna are left out.
-pub fn dataset_files(rocrate: &JsonValue, realm_id: RealmId, node_id: NodeId) -> Vec<DatasetFile> {
+/// The ids the root's `hasPart` names directly; the root is `graph_iri`, `./` or the entity
+/// the metadata descriptor is `about`, as for linked parts.
+fn root_parts(graph: &[JsonValue], graph_iri: &str) -> HashSet<String> {
+    let mut roots = HashSet::from([graph_iri.to_string(), "./".to_string()]);
+    if let Some(about) = root_id(&serde_json::json!({ "@graph": graph })) {
+        roots.insert(about);
+    }
+    let reference = |value: &JsonValue| {
+        value
+            .as_str()
+            .or_else(|| value.get("@id").and_then(JsonValue::as_str))
+            .map(str::to_string)
+    };
+    graph
+        .iter()
+        .filter(|entity| {
+            let id = entity.get("@id").and_then(JsonValue::as_str);
+            id.is_some_and(|id| roots.contains(id))
+        })
+        .filter_map(|root| root.get("hasPart"))
+        .flat_map(|parts| match parts.as_array() {
+            Some(parts) => parts.iter().filter_map(reference).collect::<Vec<_>>(),
+            None => reference(parts).into_iter().collect(),
+        })
+        .collect()
+}
+
+/// The parts the root's `hasPart` names directly that this node can serve: files, folders and
+/// buckets, in graph order. Other mentions, other nodes and realms, distributed buckets and
+/// data outside Aruna are left out.
+pub fn dataset_files(
+    rocrate: &JsonValue,
+    graph_iri: &str,
+    realm_id: RealmId,
+    node_id: NodeId,
+) -> Vec<DatasetFile> {
     let Some(graph) = rocrate.get("@graph").and_then(JsonValue::as_array) else {
         return Vec::new();
     };
+    let parts = root_parts(graph, graph_iri);
     graph
         .iter()
         .filter_map(|entity| {
             let entity = entity.as_object()?;
             let entity_id = entity.get("@id")?.as_str()?;
+            if !parts.contains(entity_id) {
+                return None;
+            }
             let kind = entity.get("@type")?;
             let name = entity
                 .get("name")
@@ -118,16 +157,21 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
+        let runs = format!("arn:aruna:{realm}:{here}:s3/data/runs/");
+        let remote = format!("arn:aruna:{realm}:{there}:s3/data/");
         let crate_json = json!({"@graph": [
-            {"@id": "./", "@type": "Dataset"},
+            {"@id": "./", "@type": "Dataset", "hasPart": [
+                {"@id": arn(here)}, {"@id": arn(there)}, {"@id": "b.txt"},
+                {"@id": "https://example.org/c.txt"}, {"@id": runs}, {"@id": remote},
+            ]},
             {"@id": arn(here), "@type": "File", "name": "A"},
             {"@id": arn(there), "@type": "File"},
             {"@id": "b.txt", "@type": "File", "contentUrl": "s3://data/in/b.txt"},
             {"@id": "https://example.org/c.txt", "@type": "File"},
-            {"@id": format!("arn:aruna:{realm}:{here}:s3/data/runs/"), "@type": "Dataset"},
-            {"@id": format!("arn:aruna:{realm}:{there}:s3/data/"), "@type": "Dataset"},
+            {"@id": runs, "@type": "Dataset"},
+            {"@id": remote, "@type": "Dataset"},
         ]});
-        let files = dataset_files(&crate_json, realm, here);
+        let files = dataset_files(&crate_json, "https://w3id.org/aruna/x", realm, here);
         assert_eq!(files.len(), 3);
         assert_eq!(
             files[2].place,
@@ -151,6 +195,33 @@ mod tests {
                 bucket: "data".into(),
                 key: "in/b.txt".into(),
                 version_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn only_root_parts() {
+        // A bucket the dataset is only based on, or a file no root part names, stays closed.
+        let realm = RealmId::from_bytes([1; 32]);
+        let here = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let bucket = format!("arn:aruna:{realm}:{here}:s3/private/");
+        let folder = format!("arn:aruna:{realm}:{here}:s3/data/shared/");
+        let crate_json = json!({"@graph": [
+            {"@id": "ro-crate-metadata.json", "about": {"@id": "https://w3id.org/aruna/x"}},
+            {"@id": "https://w3id.org/aruna/x", "@type": "Dataset",
+                "hasPart": {"@id": folder}, "isBasedOn": {"@id": bucket}},
+            {"@id": bucket, "@type": "Dataset"},
+            {"@id": folder, "@type": "Dataset", "hasPart": [{"@id": "nested.txt"}]},
+            {"@id": "nested.txt", "@type": "File", "contentUrl": "s3://private/nested.txt"},
+            {"@id": "loose.txt", "@type": "File", "contentUrl": "s3://private/loose.txt"},
+        ]});
+        let files = dataset_files(&crate_json, "https://w3id.org/aruna/other", realm, here);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].place,
+            FilePlace::Prefix {
+                bucket: "data".into(),
+                prefix: "shared/".into(),
             }
         );
     }
