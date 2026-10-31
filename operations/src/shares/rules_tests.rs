@@ -26,6 +26,7 @@ fn link(target: ShareTarget, mode: ShareMode) -> ShareLink {
         expires_at: Some(1_000),
         password: None,
         secret: [6; 32],
+        signing_key: [6; 32],
         revoked_at: None,
     }
 }

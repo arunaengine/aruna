@@ -20,6 +20,7 @@ fn link(secret: u8) -> ShareLink {
         expires_at: Some(1_000),
         password: None,
         secret: [secret; 32],
+        signing_key: [!secret; 32],
         revoked_at: None,
     }
 }
@@ -55,6 +56,24 @@ fn visit_token_bounded() {
         mac,
     };
     assert!(!own.admits(&moved, 500));
+}
+
+#[test]
+fn link_secret_signs_nothing() {
+    // Whoever holds the link URL must not mint a visit token that skips the password.
+    let own = link(7);
+    let forged = blake3::Hasher::new_keyed(&own.secret)
+        .update(VISIT_DOMAIN)
+        .update(&own.id.to_bytes())
+        .update(&600u64.to_be_bytes())
+        .finalize();
+    let token = format!(
+        "v.{}.600.{}",
+        own.id,
+        URL_SAFE_NO_PAD.encode(forged.as_bytes())
+    );
+    assert!(!own.admits(&ShareToken::parse(&token).unwrap(), 500));
+    assert!(own.admits(&ShareToken::parse(&own.visit_token(600)).unwrap(), 500));
 }
 
 #[test]

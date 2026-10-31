@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// The link secret is sealed at rest with the record; tokens and tickets are never logged.
+// Both keys are sealed at rest with the record; tokens and tickets are never logged.
 
 use std::net::IpAddr;
 
@@ -114,7 +114,10 @@ pub struct ShareLink {
     /// Unix seconds after which the link no longer opens.
     pub expires_at: Option<u64>,
     pub password: Option<PasswordHash>,
+    /// Disclosed in the link URL; it only opens the link.
     pub secret: [u8; 32],
+    /// Never leaves the node; it signs visit tokens and download tickets.
+    pub signing_key: [u8; 32],
     pub revoked_at: Option<u64>,
 }
 
@@ -205,7 +208,7 @@ impl ShareLink {
     }
 
     fn mac(&self, domain: &[u8], payload: &[u8]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_keyed(&self.secret);
+        let mut hasher = blake3::Hasher::new_keyed(&self.signing_key);
         hasher.update(domain);
         hasher.update(&self.id.to_bytes());
         hasher.update(payload);
