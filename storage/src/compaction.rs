@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aruna_core::telemetry::duration_ms;
 use fjall::{
@@ -16,6 +16,9 @@ use tracing::{debug, warn};
 
 pub(crate) const DELETE_THRESHOLD: u64 = 5_000;
 pub(crate) const MAX_KEYSPACE_BYTES: u64 = 256 * 1024 * 1024;
+/// Least time between two compactions of one keyspace. Each flushes its memtable while every
+/// commit waits, so a queue that deletes thousands of rows a second must not compact each time.
+pub(crate) const COMPACT_INTERVAL: Duration = Duration::from_secs(60);
 /// Key a checkpoint writes back unchanged, or removes while it is absent.
 const CHECKPOINT: &[u8] = b"\xffcheckpoint";
 /// Journal count that calls for a sweep, about twice Fjall's own 512 MiB journal limit.
@@ -34,6 +37,10 @@ pub(crate) struct Compactor {
     thread: Option<thread::JoinHandle<()>>,
     pub(crate) active: Arc<Mutex<HashSet<String>>>,
     pub(crate) stopping: Arc<AtomicBool>,
+    /// When each keyspace was last queued for compaction.
+    pub(crate) queued: HashMap<String, Instant>,
+    /// Least time from one queued compaction of a keyspace to its next.
+    pub(crate) interval: Duration,
 }
 
 impl Compactor {
@@ -56,6 +63,8 @@ impl Compactor {
             thread: Some(thread),
             active,
             stopping,
+            queued: HashMap::new(),
+            interval: COMPACT_INTERVAL,
         }
     }
 
@@ -66,6 +75,8 @@ impl Compactor {
             thread: None,
             active: Arc::new(Mutex::new(HashSet::new())),
             stopping: Arc::new(AtomicBool::new(false)),
+            queued: HashMap::new(),
+            interval: Duration::ZERO,
         }
     }
 
@@ -76,11 +87,13 @@ impl Compactor {
             thread: None,
             active: Arc::new(Mutex::new(HashSet::new())),
             stopping: Arc::new(AtomicBool::new(false)),
+            queued: HashMap::new(),
+            interval: Duration::ZERO,
         }
     }
 
     pub(crate) fn submit(
-        &self,
+        &mut self,
         key_space: &str,
         deletes: u64,
         db: OptimisticTxDatabase,
@@ -89,6 +102,11 @@ impl Compactor {
         let Some(sender) = self.sender.as_ref() else {
             return;
         };
+        let now = Instant::now();
+        let last = self.queued.get(key_space);
+        if last.is_some_and(|last| now.duration_since(*last) < self.interval) {
+            return;
+        }
         if !self
             .active
             .lock()
@@ -97,6 +115,7 @@ impl Compactor {
         {
             return;
         }
+        self.queued.insert(key_space.to_string(), now);
         let job = CompactionJob {
             key_space: key_space.to_string(),
             deletes,
