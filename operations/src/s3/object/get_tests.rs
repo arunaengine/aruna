@@ -32,7 +32,7 @@ use aruna_core::structs::execution::source_access::{
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{
-    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    PortableSourceDescriptor, SourceMirror, StagingStrategy, VersionSourceBinding,
 };
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -1025,6 +1025,7 @@ async fn bound_connector_used() {
             root: None,
         },
         connector_id: Some(connector_id),
+        mirrors: Vec::new(),
     };
 
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
@@ -1194,6 +1195,7 @@ async fn drift_creates_successor() {
             root: None,
         },
         connector_id: Some(Ulid::generate()),
+        mirrors: Vec::new(),
     };
 
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
@@ -1382,6 +1384,7 @@ fn reference_source() -> VersionSourceBinding {
             root: None,
         },
         connector_id: Some(Ulid::generate()),
+        mirrors: Vec::new(),
     }
 }
 
@@ -2278,6 +2281,7 @@ async fn historical_drift_fails() {
             root: None,
         },
         connector_id: Some(Ulid::generate()),
+        mirrors: Vec::new(),
     };
 
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
@@ -2924,4 +2928,182 @@ fn failed_source_identity() {
     };
     assert_eq!((held.identity, held.blake3), ([6; 32], None));
     assert!(!held.info().hashes.contains_key("blake3"));
+}
+
+fn http_access(path: &str) -> ResolvedSourceAccess {
+    ResolvedSourceAccess::OpenDal {
+        kind: SourceConnectorKind::Http,
+        config: HashMap::new(),
+        path: path.to_string(),
+        version: None,
+    }
+}
+
+/// A current read of a reference with a second source, in its open read transaction.
+fn mirrored_operation(stored: SourceMetadata) -> GetObjectOperation {
+    let mut binding = reference_source();
+    let mut mirror = binding.descriptor.clone();
+    mirror.source_path = "mirror/file.txt".to_string();
+    binding.mirrors = vec![SourceMirror {
+        descriptor: mirror,
+        connector_id: Some(Ulid::generate()),
+    }];
+    let mut operation = drifted_operation();
+    operation.advance_observation = None;
+    operation.reference_access = None;
+    operation.txn_id = Some(Ulid::generate());
+    let version = BlobVersion::reference(
+        binding,
+        stored,
+        SystemTime::UNIX_EPOCH,
+        UserId::local(Ulid::from_parts(1, 1), RealmId([0u8; 32])),
+        SystemTime::UNIX_EPOCH,
+    );
+    let _ = operation.read_version(Ulid::generate(), version, false);
+    operation
+}
+
+/// Resolves both sources, ranks them with `failing` and opens the read up to the first HEAD.
+fn ranked_head(
+    operation: &mut GetObjectOperation,
+    failing: Vec<bool>,
+) -> aruna_core::types::Effects {
+    let resolved = |access| {
+        Event::SubOperation(SubOperationEvent::VersionAccessResolved { result: Ok(access) })
+    };
+    operation.step(resolved(http_access("folder/file.txt")));
+    let effects = operation.step(resolved(http_access("mirror/file.txt")));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Health { accesses })] if accesses.len() == 2
+    ));
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HealthResult {
+        failing,
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { .. })]
+    ));
+    let txn_id = operation.txn_id.unwrap();
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: None,
+    }));
+    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id,
+    }))
+}
+
+fn headed_path(effects: &aruna_core::types::Effects) -> String {
+    let [Effect::StagingSource(StagingSourceEffect::Head { access })] = effects.as_slice() else {
+        panic!("expected a source HEAD, got {effects:?}")
+    };
+    let ResolvedSourceAccess::OpenDal { path, .. } = access;
+    path.clone()
+}
+
+// A failing source is tried last; when the first fails, another source proves the version's
+// digests on the whole bytes and serves them under the version's own ETag.
+#[test]
+fn sources_fail_over() {
+    let stored = digested(9, 7);
+    let mut operation = mirrored_operation(stored.clone());
+    let effects = ranked_head(&mut operation, vec![true, false]);
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let failed = StagingSourceError::StatError("timed out".to_string());
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
+        error: failed,
+    }));
+    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let mut operation = mirrored_operation(stored.clone());
+    let effects = ranked_head(&mut operation, vec![false, false]);
+    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
+        error: StagingSourceError::StatError("refused".to_string()),
+    }));
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let mut fresh = observation(9);
+    fresh.etag = Some("mirror-etag".to_string());
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: fresh.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read {
+            expected: None,
+            ..
+        })]
+    ));
+    operation.step(source_read(fresh));
+    assert!(operation.step(spooled(7)).is_empty());
+    let result = operation.finalize().unwrap();
+    assert_eq!(result.source_metadata.unwrap().etag, stored.etag);
+    let served = result.served_source.unwrap();
+    assert_eq!(served.descriptor.source_path, "mirror/file.txt");
+}
+
+// Without digests nothing proves another source's bytes, so the read moves on to the source
+// whose validators the version recorded.
+#[test]
+fn unproven_source_skipped() {
+    let mut operation = mirrored_operation(observation(9));
+    let effects = ranked_head(&mut operation, vec![true, false]);
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let mut fresh = observation(9);
+    fresh.etag = Some("mirror-etag".to_string());
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: fresh,
+    }));
+    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(9),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+    ));
+    // With every source failing, the last failure is reported.
+    let mut operation = mirrored_operation(observation(9));
+    ranked_head(&mut operation, vec![false, true]);
+    for _ in 0..2 {
+        operation.step(Event::StagingSource(StagingSourceEvent::Error {
+            error: StagingSourceError::StatError("down".to_string()),
+        }));
+    }
+    assert!(matches!(
+        operation.finalize(),
+        Err(GetObjectError::StagingSourceError(
+            StagingSourceError::StatError(_)
+        ))
+    ));
+}
+
+// A source that disagrees on the size is a changed source: the successor records it first.
+#[test]
+fn disagreeing_source_drifts() {
+    let mut operation = mirrored_operation(observation(9));
+    let effects = ranked_head(&mut operation, vec![true, false]);
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(12),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction { .. })]
+    ));
+    let binding = operation.source_binding.clone().unwrap();
+    assert_eq!(binding.descriptor.source_path, "mirror/file.txt");
+    assert_eq!(binding.mirrors[0].descriptor.source_path, "folder/file.txt");
+    assert_eq!(operation.advance_observation, Some(observation(12)));
+    // A pinned version never serves bytes another source disagrees on.
+    let mut pinned = mirrored_operation(digested(9, 7));
+    pinned.reference_explicit = true;
+    ranked_head(&mut pinned, vec![true, false]);
+    pinned.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: digested(9, 8),
+    }));
+    assert!(matches!(
+        pinned.finalize(),
+        Err(GetObjectError::HistoricalReferenceUnavailable)
+    ));
 }

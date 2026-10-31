@@ -75,11 +75,11 @@ use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use smallvec::{SmallVec, smallvec};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Maximum successors attempted before a still-changing current read fails.
 const MAX_DRIFT_ATTEMPTS: u8 = 3;
@@ -105,6 +105,8 @@ pub enum GetObjectState {
     ReadSourceBucket,
     ReadSourceKept,
     ResolveReferenceAccess,
+    /// Asks which of several sources failed lately, so the others are tried first.
+    RankSources,
     ReadMultipartSummary,
     CommitTransaction,
     HeadReferenceSource,
@@ -327,6 +329,8 @@ pub struct GetObjectResult {
     /// Refs stored on the version that was read. A copy unions them with its
     /// destination default, so a copy is never less constrained than its source.
     pub source_policies: Vec<PlacementPolicyRef>,
+    /// The one source of a reference that delivered the bytes.
+    pub served_source: Option<VersionSourceBinding>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -387,6 +391,12 @@ pub struct GetObjectOperation {
     source_identity: Option<[u8; 32]>,
     /// The distributed bucket of such a reference, whose members may keep its bytes.
     source_set: Option<Ulid>,
+    /// Resolved sources of the reference not tried yet, by slot, in the order they are tried.
+    source_queue: VecDeque<(usize, ResolvedSourceAccess)>,
+    /// The slot of the source being resolved, then of the source being read.
+    source_slot: usize,
+    /// Why the last source failed, reported when no other source serves.
+    source_failure: Option<GetObjectError>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
     /// Active key of an encrypting bucket whose reference or unsealed copy is read.
     reference_key: Option<BucketKeyRef>,
@@ -440,6 +450,9 @@ impl GetObjectOperation {
             held: None,
             source_identity: None,
             source_set: None,
+            source_queue: VecDeque::new(),
+            source_slot: 0,
+            source_failure: None,
             output: None,
             reference_key: None,
             reference_lease: None,
@@ -731,7 +744,16 @@ impl GetObjectOperation {
     }
 
     fn resolve_reference(&mut self) -> Effects {
-        let Some(source) = self.source_binding.clone() else {
+        self.source_queue.clear();
+        self.source_slot = 0;
+        self.source_failure = None;
+        self.resolve_source()
+    }
+
+    /// Resolves the source in `source_slot`; the sources of a binding resolve one by one.
+    fn resolve_source(&mut self) -> Effects {
+        let source = self.source_binding.as_ref();
+        let Some(source) = source.and_then(|binding| binding.source_at(self.source_slot)) else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
         self.state = GetObjectState::ResolveReferenceAccess;
@@ -740,6 +762,44 @@ impl GetObjectOperation {
             source,
             group_id
         })]
+    }
+
+    /// Orders the resolved sources: those that failed lately go last, the others keep their order.
+    fn sources_ranked(&mut self, event: Event) -> Effects {
+        let failing = match event {
+            Event::StagingSource(StagingSourceEvent::HealthResult { failing })
+                if failing.len() == self.source_queue.len() =>
+            {
+                failing
+            }
+            other => {
+                return self.emit_error(GetObjectError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::StagingSource(StagingSourceEvent::HealthResult)",
+                    received: other,
+                });
+            }
+        };
+        let mut ranked: Vec<_> = self.source_queue.drain(..).zip(failing).collect();
+        ranked.sort_by_key(|(_, failing)| *failing);
+        self.source_queue = ranked.into_iter().map(|(source, _)| source).collect();
+        self.next_source()
+    }
+
+    /// Reads the next source: the first opens the read, a later one only heads its source.
+    fn next_source(&mut self) -> Effects {
+        let Some((slot, access)) = self.source_queue.pop_front() else {
+            let error = self.source_failure.take();
+            return self.source_failed(error.unwrap_or(GetObjectError::GetObjectFailed));
+        };
+        self.source_slot = slot;
+        self.reference_access = Some(access.clone());
+        self.verify_digests.clear();
+        if self.txn_id.is_some() {
+            return self.read_reference();
+        }
+        self.state = GetObjectState::HeadReferenceSource;
+        smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
     }
 
     /// A member of a distributed bucket looks for its kept copy of the reference first.
@@ -793,6 +853,11 @@ impl GetObjectOperation {
     /// A distributed member whose source failed reads the bytes from a member keeping a copy,
     /// so data stays readable without its origin; elsewhere the failure stands.
     fn source_failed(&mut self, error: GetObjectError) -> Effects {
+        if !self.source_queue.is_empty() {
+            debug!(slot = self.source_slot, error = %error, "Reference source failed, trying another");
+            self.source_failure = Some(error);
+            return self.next_source();
+        }
         let held = (self.source_set.zip(self.source_identity))
             .zip(self.resolved_version_id.zip(self.reference_cached.as_ref()))
             .map(|((set_id, identity), (version_id, cached))| HeldElsewhere {
@@ -896,22 +961,33 @@ impl GetObjectOperation {
     }
 
     fn reference_access_resolved(&mut self, event: Event) -> Effects {
-        match event {
-            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
-                result: Ok(access),
-            }) => {
-                self.reference_access = Some(access);
-                self.read_reference()
+        let result = match event {
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }) => result,
+            other => {
+                return self.emit_error(GetObjectError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
+                    received: other,
+                });
             }
-            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
-                result: Err(error),
-            }) => self.source_failed(error.into()),
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
-                received: other,
-            }),
+        };
+        let count = (self.source_binding.as_ref()).map_or(1, VersionSourceBinding::source_count);
+        match result {
+            Ok(access) => self.source_queue.push_back((self.source_slot, access)),
+            Err(error) => self.source_failure = Some(error.into()),
         }
+        self.source_slot += 1;
+        if self.source_slot < count {
+            return self.resolve_source();
+        }
+        if self.source_queue.len() < 2 {
+            return self.next_source();
+        }
+        self.state = GetObjectState::RankSources;
+        let accesses = self.source_queue.iter().map(|(_, access)| access.clone());
+        smallvec![Effect::StagingSource(StagingSourceEffect::Health {
+            accesses: accesses.collect()
+        })]
     }
 
     fn read_multipart_summary(
@@ -1233,18 +1309,35 @@ impl GetObjectOperation {
         match event {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
                 let stored = self.reference_cached.clone();
-                let comparison = stored.as_ref().map_or(ObservationMatch::Changed, |stored| {
-                    stored.compare(&metadata)
-                });
+                // Only the first source's validators are recorded; others must match the bytes.
+                let mirror = self.source_slot > 0;
+                let comparison =
+                    stored
+                        .as_ref()
+                        .map_or(ObservationMatch::Changed, |stored| match mirror {
+                            true => stored.compare_mirror(&metadata),
+                            false => stored.compare(&metadata),
+                        });
                 if let (ObservationMatch::Same, Some(stored)) = (comparison, stored) {
                     // Undrifted: serve the recorded observation, bound to its ETag. Without a
                     // source that enforces that binding, recorded digests are checked on the
                     // whole bytes, and the read response must still match the observation.
                     self.last_refresh = self.reference_last_refresh;
-                    let content_type = stored.content_type.clone().or(metadata.content_type);
-                    let served = SourceMetadata {
-                        content_type,
-                        ..stored
+                    let content_type = stored
+                        .content_type
+                        .clone()
+                        .or(metadata.content_type.clone());
+                    // Another source is read under its own validators and the version's digests.
+                    let served = match mirror {
+                        false => SourceMetadata {
+                            content_type,
+                            ..stored
+                        },
+                        true => SourceMetadata {
+                            content_type,
+                            digests: stored.digests,
+                            ..metadata
+                        },
                     };
                     let enforces = self.reference_access.as_ref().is_some_and(|access| {
                         let ResolvedSourceAccess::OpenDal { kind, .. } = access;
@@ -1257,10 +1350,11 @@ impl GetObjectOperation {
                     return self.serve_reference_source(served, bound);
                 }
                 // Recorded digests decide over a changed time or ETag of the same length.
-                let digests_decide = self.reference_cached.as_ref().is_some_and(|stored| {
-                    !stored.enforced_checksums().is_empty()
-                        && stored.content_length == metadata.content_length
-                });
+                let digests_decide = !mirror
+                    && self.reference_cached.as_ref().is_some_and(|stored| {
+                        !stored.enforced_checksums().is_empty()
+                            && stored.content_length == metadata.content_length
+                    });
                 if comparison == ObservationMatch::Unknown || digests_decide {
                     // Nothing proves the bytes unchanged. The whole bytes are checked against the
                     // recorded digests before any is served; without digests a pinned version is
@@ -1275,6 +1369,13 @@ impl GetObjectOperation {
                         ..metadata
                     };
                     let enforced = served.enforced_checksums();
+                    // Nothing proves that another source holds the version's bytes.
+                    if mirror && enforced.is_empty() {
+                        let failure = self.source_failure.take();
+                        return self.source_failed(
+                            failure.unwrap_or(GetObjectError::ReferenceSourceChanged),
+                        );
+                    }
                     if self.reference_explicit && enforced.is_empty() {
                         return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                     }
@@ -1294,6 +1395,13 @@ impl GetObjectOperation {
                 // Current drift records a same-binding successor, but repeated
                 // change fails rather than serving mismatched bytes.
                 if self.drift_attempts < MAX_DRIFT_ATTEMPTS {
+                    // The successor records the source that changed first, with its observation.
+                    if mirror {
+                        let binding = self.source_binding.as_ref();
+                        self.source_binding =
+                            binding.and_then(|binding| binding.promoted(self.source_slot));
+                        self.source_slot = 0;
+                    }
                     return self.begin_reference_advance(metadata);
                 }
                 self.emit_error(GetObjectError::ReferenceSourceChanged)
@@ -1340,6 +1448,8 @@ impl GetObjectOperation {
     /// Opens the write transaction that records a same-binding successor for a
     /// drifted current-version read.
     fn begin_reference_advance(&mut self, observation: SourceMetadata) -> Effects {
+        // The successor is read from the source it records, never from another one.
+        self.source_queue.clear();
         self.drift_attempts = self.drift_attempts.saturating_add(1);
         self.advance_observation = Some(observation);
         self.state = GetObjectState::StartAdvanceTransaction;
@@ -1733,6 +1843,7 @@ impl GetObjectOperation {
     fn restart_reference_read(&mut self) -> Effects {
         self.txn_id = None;
         self.reference_access = None;
+        self.source_queue.clear();
         self.reference_cached = None;
         self.reference_last_refresh = None;
         self.verify_digests = Vec::new();
@@ -1801,6 +1912,7 @@ impl GetObjectOperation {
                 resolved_version_id: self.resolved_version_id,
                 resolved_range: self.resolved_range.clone(),
                 source_policies: self.source_policies.clone(),
+                served_source: None,
             }));
             smallvec![]
         } else {
@@ -1848,7 +1960,7 @@ impl GetObjectOperation {
             }
             Event::StagingSource(StagingSourceEvent::Error {
                 error: StagingSourceError::ConditionFailed,
-            }) => self.queue_changed_refresh(),
+            }) if self.source_queue.is_empty() => self.queue_changed_refresh(),
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
                 self.source_failed(error.into())
             }
@@ -1943,9 +2055,18 @@ impl GetObjectOperation {
         if let Some(lease) = self.reference_lease.take() {
             blob = leased(blob, lease);
         }
-        let Some(source_metadata) = self.source_metadata.clone() else {
+        let Some(mut source_metadata) = self.source_metadata.clone() else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
+        // Bytes from another source answer with the version's own validators.
+        if let Some(cached) = self
+            .reference_cached
+            .as_ref()
+            .filter(|_| self.source_slot > 0)
+        {
+            source_metadata.etag = cached.etag.clone();
+            source_metadata.last_modified = cached.last_modified;
+        }
         let Some(info) = self.object_info(None, Some(&source_metadata)) else {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
@@ -1963,6 +2084,8 @@ impl GetObjectOperation {
             resolved_version_id: self.resolved_version_id,
             resolved_range: self.resolved_range.clone(),
             source_policies: self.source_policies.clone(),
+            served_source: (self.source_binding.as_ref())
+                .and_then(|binding| binding.source_at(self.source_slot)),
         }));
         smallvec![]
     }
@@ -2008,6 +2131,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::ReadSourceBucket => self.source_bucket_read(event),
             GetObjectState::ReadSourceKept => self.source_kept_read(event),
             GetObjectState::ResolveReferenceAccess => self.reference_access_resolved(event),
+            GetObjectState::RankSources => self.sources_ranked(event),
             GetObjectState::ReadMultipartSummary => self.summary_read(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectState::HeadReferenceSource => self.reference_head_received(event),
@@ -2676,6 +2800,7 @@ fn routed_result(
         resolved_version_id: read.version_id,
         resolved_range: None,
         source_policies: read.source_policies,
+        served_source: None,
     }
 }
 

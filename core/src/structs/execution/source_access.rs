@@ -187,6 +187,36 @@ impl SourceMetadata {
         }
     }
 
+    /// Compares the fresh observation of another source of the same bytes with this one. Its
+    /// ETag and time are not this one's, so only the length, an equal strong ETag and shipped
+    /// or verified digests count.
+    pub fn compare_mirror(&self, fresh: &SourceMetadata) -> ObservationMatch {
+        if self.content_length != fresh.content_length {
+            return ObservationMatch::Changed;
+        }
+        let strong = |etag: &str| !etag.trim().starts_with("W/");
+        let mut compared = matches!(
+            (self.etag.as_deref(), fresh.etag.as_deref()),
+            (Some(stored), Some(seen))
+                if strong(stored) && strong(seen) && etag_value(stored) == etag_value(seen)
+        );
+        let shipped = |digest: &&SourceDigest| digest.origin != DigestOrigin::ListingEtag;
+        for (algorithm, stored) in self.digests.iter().filter(|(_, d)| shipped(d)) {
+            if let Some(seen) = fresh.digests.get(algorithm).filter(shipped)
+                && seen.scope == stored.scope
+            {
+                if seen.digest != stored.digest {
+                    return ObservationMatch::Changed;
+                }
+                compared = true;
+            }
+        }
+        match compared {
+            true => ObservationMatch::Same,
+            false => ObservationMatch::Unknown,
+        }
+    }
+
     /// Full-object digests a complete read must match before its bytes are kept.
     pub fn enforced_checksums(&self) -> Vec<ExpectedChecksum> {
         self.digests
@@ -429,6 +459,38 @@ mod tests {
         let mut longer = stored.clone();
         longer.content_length = 43;
         assert_eq!(stored.compare(&longer), ObservationMatch::Changed);
+    }
+
+    #[test]
+    fn mirror_needs_proof() {
+        // Another server's ETag and time differ without changing the bytes.
+        let stored = metadata();
+        let mut mirror = stored.clone();
+        mirror.etag = Some("other".to_string());
+        mirror.last_modified = None;
+        mirror.content_type = Some("application/octet-stream".to_string());
+        assert_eq!(stored.compare_mirror(&mirror), ObservationMatch::Unknown);
+        assert_eq!(stored.compare_mirror(&stored), ObservationMatch::Same);
+
+        let digest = |byte: u8| SourceDigest {
+            digest: vec![byte; 32],
+            scope: DigestScope::FullObject,
+            origin: DigestOrigin::Manifest,
+        };
+        let mut shipped = stored.clone();
+        shipped.digests.insert(ChecksumAlgorithm::Sha256, digest(1));
+        mirror.digests.insert(ChecksumAlgorithm::Sha256, digest(1));
+        assert_eq!(shipped.compare_mirror(&mirror), ObservationMatch::Same);
+        mirror.digests.insert(ChecksumAlgorithm::Sha256, digest(2));
+        assert_eq!(shipped.compare_mirror(&mirror), ObservationMatch::Changed);
+
+        let mut shorter = stored.clone();
+        shorter.content_length = 41;
+        assert_eq!(stored.compare_mirror(&shorter), ObservationMatch::Changed);
+
+        let mut weak = stored.clone();
+        weak.etag = Some("W/\"abc\"".to_string());
+        assert_eq!(weak.compare_mirror(&weak), ObservationMatch::Unknown);
     }
 
     #[test]

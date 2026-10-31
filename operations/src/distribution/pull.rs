@@ -294,6 +294,7 @@ pub async fn pull_through(
         resolved_version_id: Some(held.version_id),
         resolved_range: resolved,
         source_policies: held.source_policies,
+        served_source: None,
     })
 }
 
