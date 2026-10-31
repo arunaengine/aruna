@@ -3442,3 +3442,63 @@ fn first_proof_moves_on() {
         Err(GetObjectError::HistoricalReferenceUnavailable)
     ));
 }
+
+/// A pinned read of a version without checksums whose second source is an S3 mirror, up to the
+/// first source's HEAD.
+fn pinned_s3_mirror() -> (GetObjectOperation, aruna_core::types::Effects) {
+    let mut operation = mirrored_operation(observation(9));
+    operation.reference_explicit = true;
+    let accesses = vec![http_access("folder/file.txt"), s3_access("mirror/file.txt")];
+    resolve_all(&mut operation, accesses, &[]);
+    operation.step(Event::StagingSource(StagingSourceEvent::HealthResult {
+        stats: vec![SourceStats::default(); 2],
+        draw: 0,
+    }));
+    let txn_id = operation.txn_id.unwrap();
+    operation.step(Event::Storage(StorageEvent::ReadResult {
+        key: b"bucket".to_vec().into(),
+        value: None,
+    }));
+    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id,
+    }));
+    (operation, effects)
+}
+
+// A pinned read whose first source answers without the recorded validator moves on to a mirror
+// that enforces the recorded strong ETag; with none left it is refused.
+#[test]
+fn missing_validator_moves_on() {
+    let (mut operation, effects) = pinned_s3_mirror();
+    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let mut unvalidated = observation(9);
+    unvalidated.etag = None;
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: unvalidated.clone(),
+    }));
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(9),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read {
+            expected: Some(_),
+            ..
+        })]
+    ));
+    // The same on the read: its answer lacks the validator its HEAD showed.
+    let (mut operation, _) = pinned_s3_mirror();
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(9),
+    }));
+    let effects = operation.step(source_read(unvalidated.clone()));
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: unvalidated,
+    }));
+    assert!(matches!(
+        operation.finalize(),
+        Err(GetObjectError::HistoricalReferenceUnavailable)
+    ));
+}

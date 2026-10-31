@@ -1517,7 +1517,7 @@ impl GetObjectOperation {
                         );
                     }
                     if self.reference_explicit && enforced.is_empty() {
-                        return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                        return self.proof_failed(GetObjectError::HistoricalReferenceUnavailable);
                     }
                     self.verify_digests = enforced;
                     return self.serve_reference_source(served, false);
@@ -2089,7 +2089,7 @@ impl GetObjectOperation {
                     && self.reference_explicit
                     && self.verify_digests.is_empty()
                 {
-                    return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                    return self.proof_failed(GetObjectError::HistoricalReferenceUnavailable);
                 }
                 self.advance_observation = None;
                 // `last_refresh` was set by the head handler from the drift check.
