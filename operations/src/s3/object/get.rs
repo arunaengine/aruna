@@ -1323,18 +1323,14 @@ impl GetObjectOperation {
                     // source that enforces that binding, recorded digests are checked on the
                     // whole bytes, and the read response must still match the observation.
                     self.last_refresh = self.reference_last_refresh;
-                    let content_type = stored
-                        .content_type
-                        .clone()
-                        .or(metadata.content_type.clone());
-                    // Another source is read under its own validators and the version's digests.
+                    // Another source is read under its own validators and the version's digests;
+                    // the version's own content type applies to the output only.
                     let served = match mirror {
                         false => SourceMetadata {
-                            content_type,
+                            content_type: stored.content_type.clone().or(metadata.content_type),
                             ..stored
                         },
                         true => SourceMetadata {
-                            content_type,
                             digests: stored.digests,
                             ..metadata
                         },
@@ -1346,6 +1342,14 @@ impl GetObjectOperation {
                     let bound = enforces && strong_validator(served.etag.as_deref());
                     if !bound {
                         self.verify_digests = served.enforced_checksums();
+                    }
+                    // A source that does not enforce its ETag may send other bytes than its HEAD
+                    // promised, so another source serves only bytes the checksums prove.
+                    if mirror && !bound && self.verify_digests.is_empty() {
+                        let failure = self.source_failure.take();
+                        return self.source_failed(
+                            failure.unwrap_or(GetObjectError::ReferenceSourceChanged),
+                        );
                     }
                     return self.serve_reference_source(served, bound);
                 }
@@ -2066,6 +2070,8 @@ impl GetObjectOperation {
         {
             source_metadata.etag = cached.etag.clone();
             source_metadata.last_modified = cached.last_modified;
+            let content_type = cached.content_type.clone();
+            source_metadata.content_type = content_type.or(source_metadata.content_type);
         }
         let Some(info) = self.object_info(None, Some(&source_metadata)) else {
             return self.emit_error(GetObjectError::GetObjectFailed);

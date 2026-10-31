@@ -3107,3 +3107,43 @@ fn disagreeing_source_drifts() {
         Err(GetObjectError::HistoricalReferenceUnavailable)
     ));
 }
+
+// An HTTP source does not enforce its ETag, so an equal ETag alone never lets another source
+// serve: without checksums the read moves on.
+#[test]
+fn etag_alone_refused() {
+    let mut operation = mirrored_operation(observation(9));
+    let effects = ranked_head(&mut operation, vec![true, false]);
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(9),
+    }));
+    assert_eq!(headed_path(&effects), "folder/file.txt");
+}
+
+// Another source's own content type is what its read must repeat; the version's type is only
+// answered to the caller.
+#[test]
+fn mirror_type_kept() {
+    let mut stored = digested(9, 7);
+    stored.content_type = Some("text/plain".to_string());
+    let mut operation = mirrored_operation(stored);
+    ranked_head(&mut operation, vec![true, false]);
+    let mut fresh = observation(9);
+    fresh.content_type = Some("application/octet-stream".to_string());
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: fresh.clone(),
+    }));
+    let effects = operation.step(source_read(fresh));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::SpoolLocal { .. })]
+        ),
+        "{effects:?}"
+    );
+    assert!(operation.step(spooled(7)).is_empty());
+    let result = operation.finalize().unwrap();
+    let served = result.source_metadata.unwrap();
+    assert_eq!(served.content_type.as_deref(), Some("text/plain"));
+}
