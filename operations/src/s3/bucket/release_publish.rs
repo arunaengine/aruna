@@ -490,13 +490,16 @@ async fn coordinated_files(
     Ok(files)
 }
 
+/// A version row a write must still read as given: keyspace, key and row.
+type Guard = (String, Key, Option<Row>);
+
 /// The version rows of an ordinary bucket's pinned files as they are now. The crate's write
 /// keeps them, so a file deleted meanwhile fails the publish instead of breaking the release.
 async fn file_guards(
     context: &DriverContext,
     scope: BucketScope<'_>,
     files: &[ReleaseFile],
-) -> Result<Vec<(String, Key, Option<Row>)>, PublishError> {
+) -> Result<Vec<Guard>, PublishError> {
     if scope.info.distribution.is_some() {
         return Ok(Vec::new());
     }
@@ -539,7 +542,7 @@ async fn put_crate(
     context: &DriverContext,
     scope: BucketScope<'_>,
     input: &PublishInput,
-    (bytes, head, guards): (Vec<u8>, Option<Ulid>, Vec<(String, Key, Option<Row>)>),
+    (bytes, head, guards): (Vec<u8>, Option<Ulid>, Vec<Guard>),
 ) -> Result<Option<Ulid>, PublishError> {
     let failed = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
     let realm = drive(GetConfigOperation::new(scope.realm_id), context)
