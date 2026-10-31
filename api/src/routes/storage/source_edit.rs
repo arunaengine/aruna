@@ -7,7 +7,7 @@ use std::sync::Arc;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::execution::staging::SourceMapping;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::bucket_permission_path;
+use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_operations::auth::permission_rules::permission_rules;
 use aruna_operations::connectors::get_connector::{
     GetSourceError, GetSourceInput, GetSourceOperation,
@@ -114,7 +114,7 @@ async fn authorize(
     state: &ServerState,
     auth: Option<AuthContext>,
     bucket: &str,
-) -> ServerResult<(AuthContext, Ulid)> {
+) -> ServerResult<(AuthContext, BucketInfo)> {
     let auth = require_realm_auth(state, auth)?;
     if auth.path_restrictions.is_some() {
         return Err(ServerError::Forbidden);
@@ -140,7 +140,7 @@ async fn authorize(
         let reason = "sources of a distributed bucket cannot be edited in place";
         return Err(ServerError::Conflict(reason.to_string()));
     }
-    Ok((auth, info.group_id))
+    Ok((auth, info))
 }
 
 fn ulid(value: &str) -> ServerResult<Ulid> {
@@ -150,7 +150,7 @@ fn ulid(value: &str) -> ServerResult<Ulid> {
 
 async fn edit(
     state: &ServerState,
-    bucket: String,
+    (bucket, info): (String, BucketInfo),
     (key, prefix, after): (Option<String>, String, Option<String>),
     change: SourceChange,
 ) -> ServerResult<Json<SourceEditResponse>> {
@@ -161,6 +161,7 @@ async fn edit(
     let input = SourceEditInput {
         node_id: state.get_node_id(),
         bucket,
+        expected_bucket: info.identity(),
         exact: key.is_some(),
         prefix: key.unwrap_or(prefix),
         change,
@@ -172,6 +173,9 @@ async fn edit(
         Err(SourceEditError::Storage(StorageError::TransactionConflict)) => Err(
             ServerError::Conflict("the bucket changed during the edit; try again".to_string()),
         ),
+        Err(error @ (SourceEditError::BucketChanged | SourceEditError::ConnectorChanged)) => {
+            Err(ServerError::Conflict(error.to_string()))
+        }
         Err(error) => Err(ServerError::InternalError(error.to_string())),
     }
 }
@@ -224,7 +228,7 @@ it is absent."#,
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "Bucket or connector not found on this node", body = ErrorResponse),
-        (status = 409, description = "A distributed bucket, or the bucket changed during the edit", body = ErrorResponse)
+        (status = 409, description = "A distributed bucket, or the bucket or connector changed during the edit", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -234,7 +238,8 @@ pub async fn add_sources(
     Path(bucket): Path<String>,
     Json(request): Json<AddSourcesRequest>,
 ) -> ServerResult<Json<SourceEditResponse>> {
-    let (auth, group_id) = authorize(&state, auth, &bucket).await?;
+    let (auth, info) = authorize(&state, auth, &bucket).await?;
+    let group_id = info.group_id;
     let connector_id = ulid(&request.connector_id)?;
     let input = GetSourceInput {
         group_id,
@@ -266,7 +271,7 @@ pub async fn add_sources(
         read_root,
     };
     let keys = (request.key, request.prefix, request.after);
-    edit(&state, bucket, keys, change).await
+    edit(&state, (bucket, info), keys, change).await
 }
 
 #[utoipa::path(
@@ -304,7 +309,7 @@ pub async fn add_sources(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
-        (status = 409, description = "A distributed bucket, or the bucket changed during the edit", body = ErrorResponse)
+        (status = 409, description = "A distributed bucket, or the bucket or connector changed during the edit", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -314,12 +319,12 @@ pub async fn remove_sources(
     Path(bucket): Path<String>,
     Json(request): Json<RemoveSourcesRequest>,
 ) -> ServerResult<Json<SourceEditResponse>> {
-    authorize(&state, auth, &bucket).await?;
+    let (_, info) = authorize(&state, auth, &bucket).await?;
     let connector_id = request.connector_id.as_deref().map(ulid).transpose()?;
     let change = SourceChange::Remove {
         connector_id,
         from: request.from,
     };
     let keys = (request.key, request.prefix, request.after);
-    edit(&state, bucket, keys, change).await
+    edit(&state, (bucket, info), keys, change).await
 }

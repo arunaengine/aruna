@@ -65,10 +65,38 @@ fn row(key: &str, version: &BlobVersion) -> (Key, Value) {
     )
 }
 
-fn edit(change: SourceChange) -> SourceEditOperation {
+fn bucket() -> BucketInfo {
+    BucketInfo {
+        group_id: Ulid::from_bytes([9; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: aruna_core::structs::storage::format::Compression::Off,
+        distribution: None,
+    }
+}
+
+/// The edit's guard reads, answered with `bucket` and, for an addition, `connector`.
+fn guarded(bucket: &BucketInfo, connector: Option<&SourceConnector>) -> Event {
+    let mut values = vec![(
+        Key::from(b"bucket".to_vec()),
+        Some(bucket.to_bytes().unwrap().into()),
+    )];
+    if let Some(connector) = connector {
+        let value = Some(connector.to_bytes().unwrap().into());
+        values.push((Key::from(b"connector".to_vec()), value));
+    }
+    Event::Storage(StorageEvent::BatchReadResult { values })
+}
+
+fn started(change: SourceChange) -> SourceEditOperation {
     let mut operation = SourceEditOperation::new(SourceEditInput {
         node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
         bucket: "refseq".to_string(),
+        expected_bucket: bucket().identity(),
         prefix: "genomes/".to_string(),
         exact: false,
         change,
@@ -77,8 +105,64 @@ fn edit(change: SourceChange) -> SourceEditOperation {
     });
     operation.start();
     let txn_id = Ulid::generate();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { .. })]
+    ));
     operation
+}
+
+fn edit(change: SourceChange) -> SourceEditOperation {
+    let connector = match &change {
+        SourceChange::Add { connector, .. } => Some(connector.clone()),
+        SourceChange::Remove { .. } => None,
+    };
+    let mut operation = started(change);
+    operation.step(guarded(&bucket(), connector.as_ref()));
+    operation
+}
+
+// A bucket recreated under the name, or a connector replaced since authorization, ends the
+// edit before any row is read.
+#[test]
+fn changed_guards_refused() {
+    let mirror = connector(5, "https://mirror.example.org");
+    let add = || SourceChange::Add {
+        mapping: SourceMapping {
+            connector_id: mirror.connector_id,
+            from: String::new(),
+            to: String::new(),
+        },
+        connector: mirror.clone(),
+        rules: PermissionRules::default(),
+        read_root: String::new(),
+    };
+    let mut recreated = bucket();
+    recreated.created_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+    let mut replaced = mirror.clone();
+    replaced
+        .public_config
+        .insert("endpoint".into(), "https://other.example.org".into());
+    let cases = [
+        (
+            guarded(&recreated, Some(&mirror)),
+            SourceEditError::BucketChanged,
+        ),
+        (
+            guarded(&bucket(), Some(&replaced)),
+            SourceEditError::ConnectorChanged,
+        ),
+    ];
+    for (event, expected) in cases {
+        let mut operation = started(add());
+        let effects = operation.step(event);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        ));
+        assert_eq!(operation.finalize(), Err(expected));
+    }
 }
 
 fn written(effects: &Effects) -> Vec<(KeySpace, Key, Value)> {

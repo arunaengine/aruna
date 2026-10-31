@@ -7,20 +7,23 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{SourceMapping, SourceMirror, VersionSourceBinding};
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
+use aruna_core::structs::storage::blob::{
+    BlobVersion, BlobVersionState, BucketIdentity, BucketInfo, VersionKey,
+};
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::permission_rules::PermissionRules;
-use crate::connectors::repository::connector_reference_write;
+use crate::connectors::repository::{connector_reference_write, source_connector_key};
 use crate::staging::descriptor::build_source_descriptor;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,6 +47,8 @@ pub enum SourceChange {
 pub struct SourceEditInput {
     pub node_id: NodeId,
     pub bucket: String,
+    /// The bucket as authorized; a bucket recreated under the name since then is not edited.
+    pub expected_bucket: BucketIdentity,
     /// Keys starting with this prefix, or exactly this key when `exact`.
     pub prefix: String,
     pub exact: bool,
@@ -75,6 +80,10 @@ pub enum SourceEditError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error("the bucket changed since the edit was authorized")]
+    BucketChanged,
+    #[error("the connector changed since the edit was authorized")]
+    ConnectorChanged,
     #[error("unexpected event in state {state:?}: {received}")]
     UnexpectedEvent {
         state: SourceEditState,
@@ -86,6 +95,7 @@ pub enum SourceEditError {
 pub enum SourceEditState {
     Init,
     Started,
+    Guards,
     Scan,
     Write,
     Commit,
@@ -117,6 +127,41 @@ impl SourceEditOperation {
         self.state = SourceEditState::Error;
         self.output = Some(Err(error));
         self.abort()
+    }
+
+    /// Reads the bucket and the new source's connector in the edit transaction.
+    fn read_guards(&mut self) -> Effects {
+        let bucket = ByteView::from(self.input.bucket.as_bytes().to_vec());
+        let mut reads = vec![(S3_BUCKET_KEYSPACE.to_string(), bucket)];
+        if let SourceChange::Add { connector, .. } = &self.input.change {
+            let key = source_connector_key(connector.group_id, connector.connector_id);
+            reads.push((SOURCE_INDEX_KEYSPACE.to_string(), key));
+        }
+        self.state = SourceEditState::Guards;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn check_guards(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<(), SourceEditError> {
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let bucket = values.next().flatten();
+        let bucket = bucket.map(|value| BucketInfo::from_bytes(value.as_ref()));
+        match bucket.transpose()? {
+            Some(bucket)
+                if bucket.identity() == self.input.expected_bucket
+                    && bucket.distribution.is_none() => {}
+            _ => return Err(SourceEditError::BucketChanged),
+        }
+        if let SourceChange::Add { connector, .. } = &self.input.change {
+            let found = values.next().flatten();
+            let found = found.map(|value| SourceConnector::from_bytes(value.as_ref()));
+            if found.transpose()?.as_ref() != Some(connector) {
+                return Err(SourceEditError::ConnectorChanged);
+            }
+        }
+        Ok(())
     }
 
     fn scan(&mut self) -> Result<Effects, SourceEditError> {
@@ -226,6 +271,10 @@ impl SourceEditOperation {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }),
             ) => {
                 self.txn_id = Some(txn_id);
+                Ok(self.read_guards())
+            }
+            (SourceEditState::Guards, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.check_guards(values)?;
                 self.scan()
             }
             (
