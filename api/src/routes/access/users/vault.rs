@@ -178,7 +178,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(get_vault, put_vault, delete_vault))
 }
 
-const HEAD_EXAMPLE: &str = "{\"version\":1,\"kdf\":{\"name\":\"pbkdf2-sha256\",\"iterations\":600000,\"salt\":\"c2FsdA==\"},\"keys\":[]}";
+const HEAD_EXAMPLE: &str = "{\"version\":1,\"kdf\":{\"name\":\"argon2id\",\"iterations\":3,\"memory_kib\":65536,\"parallelism\":1,\"salt\":\"c2FsdA==\"},\"keys\":[]}";
 
 #[utoipa::path(
     get,
@@ -461,6 +461,24 @@ pub(super) mod tests {
         let mut payloads: Vec<&str> = heads.iter().map(|head| head.payload.as_str()).collect();
         payloads.sort_unstable();
         payloads
+    }
+
+    #[tokio::test]
+    async fn stores_upgraded_vault() {
+        // The portal re-wraps a pbkdf2 vault to argon2id on unlock; the node stores it unchanged.
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../../core/tests/vectors/vault.json"))
+                .unwrap();
+        let legacy = vectors["vault"]["payload"].as_str().unwrap();
+        let upgraded = vectors["argon2_vault"]["payload"].as_str().unwrap();
+        let (state, _dir, auth) = vault_realm(true).await;
+        let heads = save(&state, &auth, legacy, &[]).await.unwrap();
+        let revision = heads[0].revision.clone();
+        save(&state, &auth, upgraded, &[&revision]).await.unwrap();
+        let heads = read_heads(&state, &auth).await.unwrap();
+        assert_eq!(payloads(&heads), [upgraded]);
+        let stored = aruna_core::vault_format::VaultPayload::parse(&heads[0].payload).unwrap();
+        assert_eq!(stored.kdf.params.name, aruna_core::password::ARGON2_NAME);
     }
 
     #[tokio::test]

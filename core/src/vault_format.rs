@@ -243,55 +243,6 @@ impl VaultPayload {
         let kek = derive_kek(code.as_slice(), &decode(&recovery.salt)?, params.kdf()?)?;
         unwrap_master(&kek, &recovery.nonce, &recovery.wrapped)
     }
-
-    /// True while the passphrase wrap still uses pbkdf2; the next unlock should upgrade it.
-    pub fn needs_upgrade(&self) -> bool {
-        self.kdf.params.name != ARGON2_NAME
-    }
-
-    /// Re-wraps the master key under the passphrase with `kdf`, keeping the recovery wrap readable.
-    pub fn upgrade_passphrase(
-        &self,
-        passphrase: &str,
-        kdf: Kdf,
-        salt: [u8; 16],
-        nonce: [u8; 12],
-    ) -> Result<Self, VaultFormatError> {
-        let master = self.unlock_passphrase(passphrase)?;
-        let mut next = self.clone();
-        next.master = master.wrap(passphrase.as_bytes(), &salt, kdf, nonce)?;
-        next.kdf = VaultKdf {
-            params: KdfParams::from(kdf),
-            salt: STANDARD.encode(salt),
-        };
-        if let Some(recovery) = next.recovery.as_mut() {
-            let current = recovery.kdf.take().unwrap_or(self.kdf.params.clone());
-            recovery.kdf = (current != next.kdf.params).then_some(current);
-        }
-        Ok(next)
-    }
-
-    /// Re-wraps the master key under the recovery code with `kdf`.
-    pub fn upgrade_recovery(
-        &self,
-        code: &str,
-        kdf: Kdf,
-        salt: [u8; 16],
-        nonce: [u8; 12],
-    ) -> Result<Self, VaultFormatError> {
-        let master = self.unlock_recovery(code)?;
-        let bytes = parse_recovery(code)?;
-        let wrapped = master.wrap(bytes.as_slice(), &salt, kdf, nonce)?;
-        let params = KdfParams::from(kdf);
-        let mut next = self.clone();
-        next.recovery = Some(RecoveryBlock {
-            salt: STANDARD.encode(salt),
-            nonce: wrapped.nonce,
-            wrapped: wrapped.wrapped,
-            kdf: (params != self.kdf.params).then_some(params),
-        });
-        Ok(next)
-    }
 }
 
 impl KdfParams {
@@ -530,45 +481,40 @@ mod tests {
         lanes: 1,
     };
 
+    /// The portal's upgrade on unlock: re-wrap under argon2id, keep the recovery wrap readable.
+    fn upgrade_passphrase(
+        payload: &VaultPayload,
+        passphrase: &str,
+        salt: [u8; 16],
+        nonce: [u8; 12],
+    ) -> VaultPayload {
+        let master = payload.unlock_passphrase(passphrase).unwrap();
+        let mut next = payload.clone();
+        next.master = master
+            .wrap(passphrase.as_bytes(), &salt, VECTOR_KDF, nonce)
+            .unwrap();
+        next.kdf = VaultKdf {
+            params: KdfParams::from(VECTOR_KDF),
+            salt: STANDARD.encode(salt),
+        };
+        if let Some(recovery) = next.recovery.as_mut() {
+            recovery.kdf = Some(payload.kdf.params.clone());
+        }
+        next
+    }
+
     #[test]
-    fn upgrades_legacy_vault() {
-        // An old pbkdf2 vault opens, then re-wraps to the shared argon2id vector.
+    fn reproduces_upgraded_vector() {
+        // The shared argon2id vector is the pbkdf2 vector after this upgrade; both still open.
         let vector = vector();
-        assert!(vector.payload.needs_upgrade());
         let salt: [u8; 16] = std::array::from_fn(|index| 16 + index as u8);
         let nonce: [u8; 12] = std::array::from_fn(|index| 40 + index as u8);
-        let upgraded = vector
-            .payload
-            .upgrade_passphrase(&vector.passphrase, VECTOR_KDF, salt, nonce)
-            .unwrap();
+        let upgraded = upgrade_passphrase(&vector.payload, &vector.passphrase, salt, nonce);
         assert_eq!(upgraded, argon2_payload());
-        assert!(!upgraded.needs_upgrade());
         let master = upgraded.unlock_passphrase(&vector.passphrase).unwrap();
         assert_eq!(*master.0, vector.master);
         let recovered = upgraded.unlock_recovery(&vector.code).unwrap();
         assert_eq!(*recovered.0, vector.master);
-        assert_eq!(
-            vector
-                .payload
-                .upgrade_passphrase("wrong passphrase", VECTOR_KDF, salt, nonce)
-                .err(),
-            Some(VaultFormatError::WrongSecret)
-        );
-    }
-
-    #[test]
-    fn upgrades_recovery_wrap() {
-        let vector = vector();
-        let payload = argon2_payload();
-        let upgraded = payload
-            .upgrade_recovery(&vector.code, VECTOR_KDF, [3; 16], [4; 12])
-            .unwrap();
-        let recovery = upgraded.recovery.as_ref().unwrap();
-        assert_eq!(recovery.kdf, None);
-        assert_eq!(
-            *upgraded.unlock_recovery(&vector.code).unwrap().0,
-            vector.master
-        );
         let text = serde_json::to_string(&upgraded).unwrap();
         assert_eq!(VaultPayload::parse(&text).unwrap(), upgraded);
     }
