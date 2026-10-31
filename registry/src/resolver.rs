@@ -517,8 +517,13 @@ impl Resolver {
         }
         let target = entry_target(entry, item, Routes::Legacy)?;
         let holding = probe(Url::parse(&target).ok()?, Source::Realm).await;
+        // Drop only the stale route check this ask relied on; a newer check or cooldown stays.
+        let api_url = &entry.registration.payload.descriptor.payload.api_url;
         if holding == Holding::Holds
             && let Ok(mut known) = self.routes.lock()
+            && known.get(&realm).is_some_and(|(url, state, _)| {
+                url == api_url && matches!(state, RouteState::Known(Routes::W3id))
+            })
         {
             known.remove(&realm);
         }

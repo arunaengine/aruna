@@ -835,3 +835,48 @@ async fn probes_follow_nothing() {
     let refused = probe(&strict, url("/ok"), Source::Legacy).await;
     assert_eq!(refused, Holding::Unavailable);
 }
+
+#[tokio::test]
+async fn late_fallback_keeps_cooldown() {
+    // A PID fallback that finishes late must not clear a newer check or its cooldown.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let entry = resolver
+        .registry
+        .store
+        .entry(&realm_id(), now)
+        .unwrap()
+        .unwrap();
+    let api_url = entry
+        .registration
+        .payload
+        .descriptor
+        .payload
+        .api_url
+        .clone();
+    let item = Item::Document(minted());
+    let probe = |url: Url, _| async move {
+        match url.path().contains("/w3id/") {
+            true => Holding::Absent,
+            false => Holding::Holds,
+        }
+    };
+    for state in [RouteState::Failed, RouteState::Checking] {
+        let kept = (api_url.clone(), state, now + RETRY_SECS);
+        resolver.routes.lock().unwrap().insert(realm_id(), kept);
+        let asked = resolver
+            .ask_realm(realm_id(), &entry, Routes::W3id, &item, &probe)
+            .await;
+        assert_eq!(
+            asked.map(|(_, routes, _, held)| (routes, held)),
+            Some((Routes::Legacy, Holding::Holds))
+        );
+        assert!(resolver.routes.lock().unwrap().contains_key(&realm_id()));
+    }
+    // A stale positive check at the same address is dropped.
+    let known = (api_url, RouteState::Known(Routes::W3id), now + ROUTES_SECS);
+    resolver.routes.lock().unwrap().insert(realm_id(), known);
+    resolver
+        .ask_realm(realm_id(), &entry, Routes::W3id, &item, &probe)
+        .await;
+    assert!(!resolver.routes.lock().unwrap().contains_key(&realm_id()));
+}
