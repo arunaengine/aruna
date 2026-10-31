@@ -17,9 +17,7 @@ use tracing::info;
 
 const LISTEN_VAR: &str = "ARUNA_REGISTRY_LISTEN";
 const DATA_VAR: &str = "ARUNA_REGISTRY_DATA";
-/// Comma-separated realm ids the resolver may send w3id paths to.
-const REALMS_VAR: &str = "ARUNA_RESOLVER_REALMS";
-/// The realm of ids that name none, such as content hashes; the first approved one if unset.
+/// The realm of ids that name none, such as content hashes; such ids answer 404 if unset.
 const DEFAULT_REALM_VAR: &str = "ARUNA_RESOLVER_DEFAULT_REALM";
 /// The header the ingress sets to the client address, for example `x-real-ip`.
 const CLIENT_HEADER_VAR: &str = "ARUNA_RESOLVER_CLIENT_HEADER";
@@ -40,27 +38,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_admin(admin_auth),
     );
-    let approved = std::env::var(REALMS_VAR)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(RealmId::from_base64)
-        .collect::<Result<Vec<_>, _>>()?;
     let default_realm = match std::env::var(DEFAULT_REALM_VAR) {
         Ok(value) => Some(RealmId::from_base64(value.trim())?),
-        Err(_) => approved.first().copied(),
+        Err(_) => None,
     };
     let client_header = match std::env::var(CLIENT_HEADER_VAR) {
         Ok(value) => Some(axum::http::HeaderName::try_from(value.trim())?),
         Err(_) => None,
     };
-    let resolver = Arc::new(Resolver::new(
-        state.clone(),
-        approved,
-        default_realm,
-        client_header,
-    ));
+    let resolver = Arc::new(Resolver::new(state.clone(), default_realm, client_header));
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(listen = %listen, data = %data.display(), admin_enabled, "Registry listening");
     let app = router(state).merge(resolver::router(resolver));

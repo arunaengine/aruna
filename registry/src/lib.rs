@@ -273,6 +273,14 @@ fn storage_unavailable(error: StoreError) -> Response {
     )
 }
 
+/// Why a retired realm's ids answer 410, naming the realm by its last known name.
+pub(crate) fn retired_message(store: &Store, realm_id: &RealmId) -> String {
+    match store.names(realm_id).unwrap_or_default().last() {
+        Some(record) => format!("realm {} is retired", record.name),
+        None => "realm is retired".to_string(),
+    }
+}
+
 /// Sends a w3id data id to its realm: 307 to the realm API's resolve route for a leased,
 /// approved realm, 410 for a retired realm, 404 otherwise.
 async fn resolve_id(State(state): State<Arc<RegistryState>>, uri: Uri) -> Response {
@@ -283,11 +291,7 @@ async fn resolve_id(State(state): State<Arc<RegistryState>>, uri: Uri) -> Respon
     match state.store.may_resolve(&realm_id) {
         Ok(ResolveGate::Allowed) => {}
         Ok(ResolveGate::Retired) => {
-            let names = state.store.names(&realm_id).unwrap_or_default();
-            let message = match names.last() {
-                Some(record) => format!("realm {} is retired", record.name),
-                None => "realm is retired".to_string(),
-            };
+            let message = retired_message(&state.store, &realm_id);
             return uncached(StatusCode::GONE, None, message);
         }
         Ok(ResolveGate::Refused) => {

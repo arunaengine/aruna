@@ -36,8 +36,9 @@ use tracing::warn;
 use ulid::Ulid;
 use url::Url;
 
-use crate::store::StoreError;
-use crate::{RegistryState, resolve_target};
+use crate::admin::ResolveGate;
+use crate::store::{Entry, StoreError};
+use crate::{RegistryState, resolve_target, retired_message};
 
 /// The project home, also the page of vocabulary terms until they have their own.
 const HOME: &str = "https://aruna-engine.org/";
@@ -97,6 +98,8 @@ type Asked = (String, Source, Holding);
 enum Answer {
     Redirect(String),
     NotFound(&'static str),
+    /// The realm that minted the id is retired; the message names it.
+    Gone(String),
     Conflict,
     Unavailable,
     Busy,
@@ -148,8 +151,8 @@ enum Kept {
 
 pub struct Resolver {
     registry: Arc<RegistryState>,
-    /// Approved realms, the default realm first; only these are asked and redirected to.
-    approved: Vec<RealmId>,
+    /// The realm of ids that name none, such as content hashes; used only while approved.
+    default_realm: Option<RealmId>,
     cache: Mutex<LruCache<String, (Kept, u64)>>,
     clock: RequestClock,
     guesses: SharedLimiter,
@@ -159,25 +162,18 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    /// `default_realm` answers ids that name no realm; it counts as approved.
+    /// Only realms a registry admin approved are asked and redirected to.
     pub fn new(
         registry: Arc<RegistryState>,
-        approved: Vec<RealmId>,
         default_realm: Option<RealmId>,
         client_header: Option<HeaderName>,
     ) -> Self {
-        let mut realms: Vec<RealmId> = default_realm.into_iter().collect();
-        realms.extend(
-            approved
-                .into_iter()
-                .filter(|realm| Some(*realm) != default_realm),
-        );
         let clock = RequestClock::default();
         let quota = Quota::per_minute(NonZeroU32::new(GUESSES_PER_MINUTE).expect("nonzero rate"))
             .allow_burst(NonZeroU32::new(GUESS_BURST).expect("nonzero burst"));
         Self {
             registry,
-            approved: realms,
+            default_realm,
             cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(CACHE_ENTRIES).expect("nonzero cache"),
             )),
@@ -202,7 +198,7 @@ impl Resolver {
         match shape {
             Shape::Home => Answer::Redirect(HOME.to_string()),
             Shape::Unknown => Answer::NotFound("not an Aruna identifier"),
-            Shape::Data(realm, path) => match realm.or(self.approved.first().copied()) {
+            Shape::Data(realm, path) => match realm.or(self.default_realm) {
                 Some(realm) => self.direct(realm, &format!("data/{path}"), now),
                 None => Answer::NotFound("no realm resolves this identifier"),
             },
@@ -212,8 +208,13 @@ impl Resolver {
 
     /// A redirect to an approved realm's node route, without asking it.
     fn direct(&self, realm: RealmId, path: &str, now: u64) -> Answer {
-        if !self.approved.contains(&realm) {
-            return Answer::NotFound("realm not resolved here");
+        match self.registry.store.may_resolve(&realm) {
+            Ok(ResolveGate::Allowed) => {}
+            Ok(ResolveGate::Retired) => {
+                return Answer::Gone(retired_message(&self.registry.store, &realm));
+            }
+            Ok(ResolveGate::Refused) => return Answer::NotFound("realm not approved"),
+            Err(error) => return storage_failed(error),
         }
         match self.realm_target(realm, now, path) {
             Ok(Some(target)) => Answer::Redirect(target),
@@ -327,14 +328,19 @@ impl Resolver {
         }
     }
 
-    /// The node route for `path` of each approved realm with a live lease, in approval order.
+    /// The node route for `path` of each approved realm with a live lease, the default first.
     fn realm_targets(&self, now: u64, path: &str) -> Result<Vec<(RealmId, String)>, StoreError> {
         let mut targets = Vec::new();
-        for realm in &self.approved {
-            if let Some(target) = self.realm_target(*realm, now, path)? {
-                targets.push((*realm, target));
+        for entry in self.registry.store.entries(now)? {
+            let realm = entry.registration.payload.descriptor.payload.realm_id;
+            if self.registry.store.may_resolve(&realm)? != ResolveGate::Allowed {
+                continue;
+            }
+            if let Some(target) = entry_target(&entry, path) {
+                targets.push((realm, target));
             }
         }
+        targets.sort_by_key(|(realm, _)| Some(*realm) != self.default_realm);
         Ok(targets)
     }
 
@@ -345,16 +351,19 @@ impl Resolver {
         now: u64,
         path: &str,
     ) -> Result<Option<String>, StoreError> {
-        let Some(entry) = self.registry.store.entry(&realm, now)? else {
-            return Ok(None);
-        };
-        let api_url = &entry.registration.payload.descriptor.payload.api_url;
-        // w3id.org would send the redirect back here; refusing it keeps every chain finite.
-        if api_url.host_str() == Some("w3id.org") {
-            return Ok(None);
-        }
-        Ok(resolve_target(api_url, NODE_ROUTE, path))
+        let entry = self.registry.store.entry(&realm, now)?;
+        Ok(entry.and_then(|entry| entry_target(&entry, path)))
     }
+}
+
+/// The node route for `path` under the entry's API URL.
+fn entry_target(entry: &Entry, path: &str) -> Option<String> {
+    let api_url = &entry.registration.payload.descriptor.payload.api_url;
+    // w3id.org would send the redirect back here; refusing it keeps every chain finite.
+    if api_url.host_str() == Some("w3id.org") {
+        return None;
+    }
+    resolve_target(api_url, NODE_ROUTE, path)
 }
 
 fn storage_failed(error: StoreError) -> Answer {
@@ -478,22 +487,23 @@ fn data_path(tail: &str) -> Option<(Option<RealmId>, String)> {
 /// A resolver answer: never cached by clients, readable from any origin.
 fn respond(answer: Answer) -> Response {
     let (status, location, message) = match answer {
-        Answer::Redirect(target) => (StatusCode::FOUND, Some(target), ""),
-        Answer::NotFound(message) => (StatusCode::NOT_FOUND, None, message),
+        Answer::Redirect(target) => (StatusCode::FOUND, Some(target), "".to_string()),
+        Answer::NotFound(message) => (StatusCode::NOT_FOUND, None, message.to_string()),
+        Answer::Gone(message) => (StatusCode::GONE, None, message),
         Answer::Conflict => (
             StatusCode::CONFLICT,
             None,
-            "more than one realm claims this identifier",
+            "more than one realm claims this identifier".to_string(),
         ),
         Answer::Unavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
             None,
-            "a realm that may hold this identifier is unreachable, retry later",
+            "a realm that may hold this identifier is unreachable, retry later".to_string(),
         ),
         Answer::Busy => (
             StatusCode::TOO_MANY_REQUESTS,
             None,
-            "too many lookups, retry later",
+            "too many lookups, retry later".to_string(),
         ),
     };
     let mut response = (status, message).into_response();

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::admin::{AdminState, RealmStatus};
 use crate::store::tests::{realm_id, registration};
 use crate::store::{Entry, Store};
 use aruna_core::egress::EgressPolicy;
@@ -17,7 +18,8 @@ const API: &str = "https://realm.example.org/api/v1";
 /// A v2 style id: random entropy, so it parses as a structured id with some placement handle.
 const LEGACY: &str = "01H8Y3R7Z5X9C2V4B6N8M0Q1W3";
 
-/// A resolver whose registry holds the test realm at `base`, approved when `approved` is set.
+/// A resolver whose registry holds the test realm at `base` as its default realm, approved by
+/// the registry admin when `approved` is set.
 fn resolver(base: &str, approved: bool) -> (TempDir, Resolver, u64) {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(RegistryState::new(
@@ -32,11 +34,21 @@ fn resolver(base: &str, approved: bool) -> (TempDir, Resolver, u64) {
         problems: Vec::new(),
     };
     state.store.register(&realm_id(), &entry, now).unwrap();
-    let approved = match approved {
-        true => vec![realm_id()],
-        false => Vec::new(),
+    if approved {
+        set_status(&state, RealmStatus::Approved, now);
+    }
+    (dir, Resolver::new(state, Some(realm_id()), None), now)
+}
+
+fn set_status(state: &RegistryState, status: RealmStatus, now: u64) {
+    let next = AdminState {
+        status,
+        ..AdminState::default()
     };
-    (dir, Resolver::new(state, approved, None, None), now)
+    state
+        .store
+        .update_admin(&realm_id(), next, "test", now)
+        .unwrap();
 }
 
 /// A document id as a v3 realm mints it, on the metadata placement handle.
@@ -404,6 +416,28 @@ async fn unapproved_never_asked() {
         let answer = sites.ask(&resolver, &path, now).await;
         assert!(matches!(answer, Answer::NotFound(_)), "{path}");
     }
+}
+
+#[tokio::test]
+async fn retired_realms_gone() {
+    // Ids naming a retired realm explain themselves; guesses no longer ask it.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    set_status(&resolver.registry, RealmStatus::Retired, now);
+    let realm = realm_id();
+    let id = minted();
+    let sites = Sites::new(&[(&format!("{API}/w3id/{id}"), Holding::Holds)]);
+    for path in [
+        format!("data/{realm}/{id}"),
+        format!("data/{}", "ab".repeat(32)),
+    ] {
+        let answer = sites.ask(&resolver, &path, now).await;
+        assert!(matches!(answer, Answer::Gone(_)), "{path}: {answer:?}");
+    }
+    let answer = sites.ask(&resolver, &id.to_string(), now).await;
+    assert_eq!(answer, redirect(&format!("{}{id}", V2.page)));
+    assert_eq!(sites.asked(), 2);
+    let response = respond(Answer::Gone("realm Realm is retired".to_string()));
+    assert_eq!(response.status(), StatusCode::GONE);
 }
 
 #[tokio::test]
