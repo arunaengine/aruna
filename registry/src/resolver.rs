@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -17,12 +18,12 @@ use aruna_core::structs::storage::replication::{
 };
 use aruna_core::time::unix_timestamp_secs;
 use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode, Uri, header};
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::StreamExt;
-use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter};
 use lru::LruCache;
 use percent_encoding::percent_decode_str;
 use tracing::warn;
@@ -56,6 +57,11 @@ const PROBE_SLOTS: usize = 8;
 /// Guesses that ask other sites, per minute across all clients, and their burst.
 const GUESSES_PER_MINUTE: u32 = 600;
 const GUESS_BURST: u32 = 60;
+/// The stricter share of one client, charged first, so one caller cannot use up the budget.
+const CLIENT_GUESSES_PER_MINUTE: u32 = 60;
+const CLIENT_BURST: u32 = 20;
+/// Client limiter keys above which idle ones are dropped.
+const CLIENT_ENTRIES: usize = 10_000;
 
 /// A v2 site: its object page and the public API route that answers 404 for unknown ids.
 struct Legacy {
@@ -116,6 +122,9 @@ pub struct Resolver {
     approved: Vec<RealmId>,
     cache: Mutex<LruCache<String, (Kept, u64)>>,
     guesses: DefaultDirectRateLimiter,
+    clients: DefaultKeyedRateLimiter<IpAddr>,
+    /// The header in which the ingress names the client address; the peer address otherwise.
+    client_header: Option<HeaderName>,
 }
 
 impl Resolver {
@@ -124,6 +133,7 @@ impl Resolver {
         registry: Arc<RegistryState>,
         approved: Vec<RealmId>,
         default_realm: Option<RealmId>,
+        client_header: Option<HeaderName>,
     ) -> Self {
         let mut realms: Vec<RealmId> = default_realm.into_iter().collect();
         realms.extend(
@@ -140,10 +150,17 @@ impl Resolver {
                 NonZeroUsize::new(CACHE_ENTRIES).expect("nonzero cache"),
             )),
             guesses: RateLimiter::direct(quota),
+            clients: RateLimiter::keyed(
+                Quota::per_minute(
+                    NonZeroU32::new(CLIENT_GUESSES_PER_MINUTE).expect("nonzero rate"),
+                )
+                .allow_burst(NonZeroU32::new(CLIENT_BURST).expect("nonzero burst")),
+            ),
+            client_header,
         }
     }
 
-    async fn answer<P, F>(&self, shape: Shape, now: u64, probe: P) -> Answer
+    async fn answer<P, F>(&self, shape: Shape, now: u64, client: IpAddr, probe: P) -> Answer
     where
         P: Fn(Url, Source) -> F,
         F: Future<Output = Holding>,
@@ -155,7 +172,7 @@ impl Resolver {
                 Some(realm) => self.direct(realm, &format!("data/{path}"), now),
                 None => Answer::NotFound("no realm resolves this identifier"),
             },
-            shape => self.guess(shape, now, probe).await,
+            shape => self.guess(shape, now, client, probe).await,
         }
     }
 
@@ -172,7 +189,7 @@ impl Resolver {
     }
 
     /// Asks the approved realms, and for a bare id the v2 sites, which one holds `shape`.
-    async fn guess<P, F>(&self, shape: Shape, now: u64, probe: P) -> Answer
+    async fn guess<P, F>(&self, shape: Shape, now: u64, client: IpAddr, probe: P) -> Answer
     where
         P: Fn(Url, Source) -> F,
         F: Future<Output = Holding>,
@@ -186,7 +203,11 @@ impl Resolver {
         if let Some(answer) = self.cached(&key, &node_path, now) {
             return answer;
         }
-        if self.guesses.check().is_err() {
+        let refused = self.clients.check_key(&client).is_err() || self.guesses.check().is_err();
+        if self.clients.len() > CLIENT_ENTRIES {
+            self.clients.retain_recent();
+        }
+        if refused {
             return Answer::Busy;
         }
         // A ULID with the reserved placement handle was never minted by a v3 realm.
@@ -463,16 +484,33 @@ pub fn router(resolver: Arc<Resolver>) -> Router {
 }
 
 /// The shared `https://w3id.org/aruna/` namespace; the raw path keeps ARN keys encoded.
-async fn resolve_shared(State(resolver): State<Arc<Resolver>>, uri: Uri) -> Response {
+async fn resolve_shared(
+    State(resolver): State<Arc<Resolver>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
     let path = uri.path().strip_prefix("/aruna").unwrap_or_default();
     let shape = parse_path(path.strip_prefix('/').unwrap_or(path));
+    let client = client_address(&headers, resolver.client_header.as_ref(), peer.ip());
     let egress = &resolver.registry.egress;
     let answer = resolver
-        .answer(shape, unix_timestamp_secs(), |url, source| {
+        .answer(shape, unix_timestamp_secs(), client, |url, source| {
             probe(egress, url, source)
         })
         .await;
     respond(answer)
+}
+
+/// The client as the ingress names it: the last address of the configured header, which the
+/// closest proxy appended. Without a usable value the peer address counts.
+fn client_address(headers: &HeaderMap, header: Option<&HeaderName>, peer: IpAddr) -> IpAddr {
+    header
+        .and_then(|name| headers.get_all(name).iter().next_back())
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|address| address.trim().parse().ok())
+        .unwrap_or(peer)
 }
 
 /// A namespace a realm owns at w3id.org, whose rule names the realm id in the target.

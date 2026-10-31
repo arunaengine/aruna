@@ -8,6 +8,7 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::{BucketId, PlacementHandle, StructuredId};
 use axum::extract::State;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
@@ -34,7 +35,7 @@ fn resolver(base: &str, approved: bool) -> (TempDir, Resolver, u64) {
         true => vec![realm_id()],
         false => Vec::new(),
     };
-    (dir, Resolver::new(state, approved, None), now)
+    (dir, Resolver::new(state, approved, None, None), now)
 }
 
 /// A document id as a v3 realm mints it, on the metadata placement handle.
@@ -63,12 +64,17 @@ impl Sites {
     }
 
     async fn ask(&self, resolver: &Resolver, path: &str, now: u64) -> Answer {
+        self.ask_from(resolver, path, now, IpAddr::from([192, 0, 2, 1]))
+            .await
+    }
+
+    async fn ask_from(&self, resolver: &Resolver, path: &str, now: u64, client: IpAddr) -> Answer {
         let probe = |url: Url, _| {
             self.asked.fetch_add(1, Ordering::SeqCst);
             let holding = self.said.get(url.as_str()).copied();
             async move { holding.unwrap_or(Holding::Absent) }
         };
-        resolver.answer(parse_path(path), now, probe).await
+        resolver.answer(parse_path(path), now, client, probe).await
     }
 
     fn asked(&self) -> usize {
@@ -433,6 +439,52 @@ async fn w3id_host_refused() {
 }
 
 #[tokio::test]
+async fn clients_limited_separately() {
+    // One client runs out of its share long before the shared budget, so others still resolve.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let sites = Sites::new(&[]);
+    let fresh = |nonce| {
+        let handle = PlacementHandle::new(1).unwrap();
+        let bucket = BucketId::new(0).unwrap();
+        let id = MetaResourceId::from_parts(1, handle, bucket, nonce).unwrap();
+        id.as_ulid().to_string()
+    };
+    let busy = IpAddr::from([198, 51, 100, 1]);
+    for nonce in 0..u64::from(CLIENT_BURST) {
+        let answer = sites.ask_from(&resolver, &fresh(nonce), now, busy).await;
+        assert!(matches!(answer, Answer::Redirect(_)), "{nonce}");
+    }
+    let mut refused = false;
+    for nonce in 100..100 + u64::from(GUESS_BURST) {
+        if sites.ask_from(&resolver, &fresh(nonce), now, busy).await == Answer::Busy {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused);
+    let other = IpAddr::from([198, 51, 100, 2]);
+    let answer = sites.ask_from(&resolver, &fresh(1000), now, other).await;
+    assert!(matches!(answer, Answer::Redirect(_)), "{answer:?}");
+}
+
+#[test]
+fn client_from_ingress() {
+    let peer = IpAddr::from([10, 0, 0, 7]);
+    let header = HeaderName::from_static("x-forwarded-for");
+    let mut headers = HeaderMap::new();
+    assert_eq!(client_address(&headers, Some(&header), peer), peer);
+    headers.append(&header, HeaderValue::from_static("203.0.113.5"));
+    // A client may send its own value first; the proxy appends the real one last.
+    headers.append(&header, HeaderValue::from_static("192.0.2.4, 198.51.100.7"));
+    let last = IpAddr::from([198, 51, 100, 7]);
+    assert_eq!(client_address(&headers, Some(&header), peer), last);
+    assert_eq!(client_address(&headers, None, peer), peer);
+    let mut bad = HeaderMap::new();
+    bad.insert(&header, HeaderValue::from_static("unknown"));
+    assert_eq!(client_address(&bad, Some(&header), peer), peer);
+}
+
+#[tokio::test]
 async fn handlers_set_headers() {
     let (_dir, resolver, _) = resolver(BASE, true);
     let resolver = Arc::new(resolver);
@@ -440,7 +492,8 @@ async fn handlers_set_headers() {
     let id = minted();
     let shared = |path: &str| {
         let uri: Uri = path.parse().unwrap();
-        resolve_shared(State(resolver.clone()), uri)
+        let peer = ConnectInfo(SocketAddr::from(([192, 0, 2, 9], 4000)));
+        resolve_shared(State(resolver.clone()), peer, HeaderMap::new(), uri)
     };
     for path in ["/aruna", "/aruna/", "/aruna/terms/Release"] {
         let response = shared(path).await;

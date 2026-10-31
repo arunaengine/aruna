@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,6 +21,8 @@ const DATA_VAR: &str = "ARUNA_REGISTRY_DATA";
 const REALMS_VAR: &str = "ARUNA_RESOLVER_REALMS";
 /// The realm of ids that name none, such as content hashes; the first approved one if unset.
 const DEFAULT_REALM_VAR: &str = "ARUNA_RESOLVER_DEFAULT_REALM";
+/// The header the ingress sets to the client address, for example `x-real-ip`.
+const CLIENT_HEADER_VAR: &str = "ARUNA_RESOLVER_CLIENT_HEADER";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,13 +51,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(value) => Some(RealmId::from_base64(value.trim())?),
         Err(_) => approved.first().copied(),
     };
-    let resolver = Arc::new(Resolver::new(state.clone(), approved, default_realm));
+    let client_header = match std::env::var(CLIENT_HEADER_VAR) {
+        Ok(value) => Some(axum::http::HeaderName::try_from(value.trim())?),
+        Err(_) => None,
+    };
+    let resolver = Arc::new(Resolver::new(
+        state.clone(),
+        approved,
+        default_realm,
+        client_header,
+    ));
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(listen = %listen, data = %data.display(), admin_enabled, "Registry listening");
-    axum::serve(listener, router(state).merge(resolver::router(resolver)))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let app = router(state).merge(resolver::router(resolver));
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     Ok(())
 }
