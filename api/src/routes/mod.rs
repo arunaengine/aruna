@@ -86,6 +86,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::organize::router())
         .merge(storage::origin::router())
         .merge(storage::source_edit::router())
+        .merge(storage::source_health::router())
         .merge(storage::provenance::router())
         .merge(storage::routing::router())
         .merge(sync::router())
@@ -291,6 +292,7 @@ pub(crate) mod tests {
         ("GET", "/data/provenance/crate"),
         ("GET", "/data/buckets/{bucket}/objects/part-of"),
         ("GET", "/data/buckets/{bucket}/sources"),
+        ("GET", "/data/buckets/{bucket}/sources/health"),
         ("POST", "/data/buckets/{bucket}/sources/add"),
         ("POST", "/data/buckets/{bucket}/sources/remove"),
         ("POST", "/data/identifier-rules/test"),

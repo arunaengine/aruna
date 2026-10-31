@@ -5,11 +5,11 @@
 
 use std::time::SystemTime;
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
+use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
-use aruna_core::structs::execution::source_access::SourceDigest;
+use aruna_core::structs::execution::source_access::{SourceDigest, SourceStats};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::identifier::{CompiledParser, Identifier};
 use aruna_core::structs::identity::realm::RealmId;
@@ -21,11 +21,14 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
     OriginProjection, SyncHop, VersionOrigin, project, public_source_url, publishable,
 };
+use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use crate::driver::{DriverContext, drive};
+use crate::effect_adapters::dispatch_effect;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::metadata::bucket_metadata;
 
@@ -64,12 +67,80 @@ pub struct SourcePlace {
 fn places(source: &VersionSourceBinding) -> Vec<SourcePlace> {
     (0..source.source_count())
         .filter_map(|slot| source.source_at(slot))
-        .map(|single| SourcePlace {
-            url: public_source_url(&single.descriptor),
-            path: single.descriptor.source_path,
-            connector_id: single.connector_id,
-        })
+        .map(|single| place(&single))
         .collect()
+}
+
+fn place(single: &VersionSourceBinding) -> SourcePlace {
+    SourcePlace {
+        url: public_source_url(&single.descriptor),
+        path: single.descriptor.source_path.clone(),
+        connector_id: single.connector_id,
+    }
+}
+
+/// One source of a version with this node's measurements of it.
+#[derive(Clone, Debug)]
+pub struct SourceHealth {
+    pub place: SourcePlace,
+    /// `None` when this node cannot resolve the source, as it lacks its connector.
+    pub stats: Option<SourceStats>,
+}
+
+/// This node's measurements of every source of `version_id`, or of the current version, in
+/// the binding's order; empty for a version without an external source.
+pub async fn source_health(
+    context: &DriverContext,
+    group_id: GroupId,
+    (bucket, key): (&str, &str),
+    version_id: Option<Ulid>,
+) -> Result<Vec<SourceHealth>, OriginError> {
+    let (_, version) = read_version(context, bucket, key, version_id).await?;
+    let binding = match version.state {
+        BlobVersionState::Reference { source, .. }
+        | BlobVersionState::Materialized {
+            source: Some(source),
+            ..
+        }
+        | BlobVersionState::PendingContent {
+            source: Some(source),
+            ..
+        } => source,
+        _ => return Ok(Vec::new()),
+    };
+    let mut sources = Vec::new();
+    for single in (0..binding.source_count()).filter_map(|slot| binding.source_at(slot)) {
+        let input = ResolveBindingInput {
+            source: single.clone(),
+            group_id: Some(group_id),
+        };
+        let access = drive(ResolveBindingOperation::new(input), context)
+            .await
+            .ok();
+        sources.push((place(&single), access));
+    }
+    let accesses: Vec<_> = sources
+        .iter()
+        .filter_map(|(_, access)| access.clone())
+        .collect();
+    let mut stats = match accesses.is_empty() {
+        true => Vec::new(),
+        false => {
+            let health = Effect::StagingSource(StagingSourceEffect::Health { accesses });
+            match dispatch_effect(health, context, 0).await {
+                Event::StagingSource(StagingSourceEvent::HealthResult { stats, .. }) => stats,
+                _ => return Err(OriginError::Storage("no source health answer".to_string())),
+            }
+        }
+    }
+    .into_iter();
+    Ok(sources
+        .into_iter()
+        .map(|(place, access)| SourceHealth {
+            place,
+            stats: access.and_then(|_| stats.next()),
+        })
+        .collect())
 }
 
 /// Everything file readers see about one version's origin.
@@ -109,32 +180,7 @@ pub async fn read_origin(
             GetBucketError::NotFound => OriginError::BucketMissing,
             other => OriginError::Storage(other.to_string()),
         })?;
-    let version_id = match version_id {
-        Some(version_id) => version_id,
-        None => {
-            let head = BlobHeadKey::new(bucket, key)
-                .to_bytes()
-                .map_err(|error| OriginError::Storage(error.to_string()))?;
-            let value = read(context, BLOB_HEAD_KEYSPACE, head)
-                .await?
-                .ok_or(OriginError::VersionMissing)?;
-            CurrentVersionPointer::from_bytes(&value)
-                .map_err(|error| OriginError::Storage(error.to_string()))?
-                .version_id
-        }
-    };
-    let row = VersionKey::new(bucket, key, version_id)
-        .to_bytes()
-        .map_err(|error| OriginError::Storage(error.to_string()))?;
-    let value = read(context, BLOB_VERSIONS_KEYSPACE, row)
-        .await?
-        .ok_or(OriginError::VersionMissing)?;
-    let version =
-        BlobVersion::from_bytes(&value).map_err(|error| OriginError::Storage(error.to_string()))?;
-    // The source's public address comes from the root this node keeps once.
-    let version = crate::staging::root_record::hydrate_version(context, version)
-        .await
-        .map_err(OriginError::Storage)?;
+    let (version_id, version) = read_version(context, bucket, key, version_id).await?;
     let global = info.distribution.as_ref().map(|_| GlobalId::Version {
         realm_id,
         version_id,
@@ -235,6 +281,42 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         identifiers: Vec::new(),
         size: None,
     }
+}
+
+/// Reads `version_id`, or the current version, of a local bucket's key, with its source root.
+async fn read_version(
+    context: &DriverContext,
+    bucket: &str,
+    key: &str,
+    version_id: Option<Ulid>,
+) -> Result<(Ulid, BlobVersion), OriginError> {
+    let version_id = match version_id {
+        Some(version_id) => version_id,
+        None => {
+            let head = BlobHeadKey::new(bucket, key)
+                .to_bytes()
+                .map_err(|error| OriginError::Storage(error.to_string()))?;
+            let value = read(context, BLOB_HEAD_KEYSPACE, head)
+                .await?
+                .ok_or(OriginError::VersionMissing)?;
+            CurrentVersionPointer::from_bytes(&value)
+                .map_err(|error| OriginError::Storage(error.to_string()))?
+                .version_id
+        }
+    };
+    let row = VersionKey::new(bucket, key, version_id)
+        .to_bytes()
+        .map_err(|error| OriginError::Storage(error.to_string()))?;
+    let value = read(context, BLOB_VERSIONS_KEYSPACE, row)
+        .await?
+        .ok_or(OriginError::VersionMissing)?;
+    let version =
+        BlobVersion::from_bytes(&value).map_err(|error| OriginError::Storage(error.to_string()))?;
+    // The source's public address comes from the root this node keeps once.
+    let version = crate::staging::root_record::hydrate_version(context, version)
+        .await
+        .map_err(OriginError::Storage)?;
+    Ok((version_id, version))
 }
 
 /// The size of one version: its blob location row, or a reference's cached observation.
