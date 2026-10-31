@@ -11,11 +11,17 @@ use aruna_core::structs::storage::blob::{bucket_permission_path, object_permissi
 use aruna_core::structs::storage::share::{
     ShareAction, ShareEvent, ShareLink, ShareMode, ShareTarget,
 };
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::auth::request_authorization::AuthorizeError;
+use aruna_operations::auth::request_policy::{
+    PolicyRequestExtras, enforce_policies, policy_request_with,
+};
 use aruna_operations::driver::drive;
-use aruna_operations::shares::rules::{ShareRuleError, required_permission, validate_link};
+use aruna_operations::shares::lifecycle::{
+    CreateShareConfig, CreateShareOperation, RevokeShareOperation, ShareError,
+};
+use aruna_operations::shares::rules::required_permission;
 use aruna_operations::shares::store::{
-    GetShareOperation, ListSharesOperation, SaveShareOperation, ShareEventsOperation,
+    GetShareOperation, ListSharesOperation, ShareEventsOperation,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -27,7 +33,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission_with, require_unrestricted_auth};
+use crate::auth::{map_authorize_error, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
@@ -228,10 +234,6 @@ pub(crate) fn share_info(link: &ShareLink, now: u64) -> ShareInfo {
     }
 }
 
-fn rule_error(error: ShareRuleError) -> ServerError {
-    ServerError::BadRequestReason(error.to_string())
-}
-
 fn store_error(error: impl std::fmt::Display) -> ServerError {
     ServerError::InternalError(error.to_string())
 }
@@ -251,23 +253,23 @@ fn require_creator(state: &ServerState, auth: Option<AuthContext>) -> ServerResu
 /// Loads one of the caller's links; another user's link answers 404 like an unknown one.
 async fn own_share(state: &ServerState, auth: &AuthContext, id: &str) -> ServerResult<ShareLink> {
     let id = Ulid::from_string(id).map_err(|_| ServerError::NotFound)?;
-    match drive(GetShareOperation::new(id), &state.get_ctx()).await {
-        Ok(Some(link)) if link.created_by == auth.user_id => Ok(link),
-        Ok(_) => Err(ServerError::NotFound),
+    let read = GetShareOperation::for_owner(id, auth.user_id);
+    match drive(read, &state.get_ctx()).await {
+        Ok(Some(link)) => Ok(link),
+        Ok(None) => Err(ServerError::NotFound),
         Err(error) => Err(store_error(error)),
     }
 }
 
-/// The group and target of a requested link, after checking the creator's access to it.
-async fn checked_target(
+/// The group, target and permission path of a requested link on this node.
+async fn resolve_target(
     state: &ServerState,
     auth: &AuthContext,
-    request: &CreateShareRequest,
-) -> ServerResult<(Ulid, ShareTarget)> {
-    let mode = ShareMode::from(request.mode);
-    let (bucket, target) = match &request.target {
+    target: &ShareTargetBody,
+) -> ServerResult<(Ulid, ShareTarget, String)> {
+    let (bucket, target) = match target {
         ShareTargetBody::Dataset { dataset_id } => {
-            return dataset::checked_dataset(state, auth, dataset_id).await;
+            return dataset::resolve_dataset(state, auth, dataset_id).await;
         }
         ShareTargetBody::Bucket { bucket } => (
             bucket,
@@ -306,12 +308,37 @@ async fn checked_target(
         }
         _ => bucket_permission_path(realm, info.group_id, node, bucket),
     };
+    Ok((info.group_id, target, path))
+}
+
+/// Realm and group policies see the same `share.create` request for every kind of target.
+async fn share_policies(
+    state: &ServerState,
+    auth: &AuthContext,
+    path: &str,
+    request: &CreateShareRequest,
+) -> ServerResult<()> {
     let mut extras = PolicyRequestExtras::operation("share.create");
-    extras.body = serde_json::to_value(&request.target)
-        .ok()
-        .map(|target| serde_json::json!({ "target": target, "mode": request.mode, "expires": request.expires_at.is_some(), "password": request.password.is_some() }));
-    ensure_permission_with(state, auth, path, required_permission(mode), extras).await?;
-    Ok((info.group_id, target))
+    extras.body = Some(serde_json::json!({
+        "target": request.target,
+        "mode": request.mode,
+        "expires": request.expires_at.is_some(),
+        "password": request.password.is_some(),
+    }));
+    let permission = required_permission(request.mode.into());
+    let policy = policy_request_with(path, &permission, Some(auth), extras);
+    enforce_policies(&state.get_ctx(), state.get_realm_id(), &policy)
+        .await
+        .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))
+}
+
+fn share_error(error: ShareError) -> ServerError {
+    match error {
+        ShareError::Rule(error) => ServerError::BadRequestReason(error.to_string()),
+        ShareError::Denied => ServerError::Forbidden,
+        ShareError::Unavailable => ServerError::NotFound,
+        error => ServerError::InternalError(error.to_string()),
+    }
 }
 
 #[utoipa::path(
@@ -365,13 +392,20 @@ pub async fn create_share(
                 "a password has 1 to {MAX_PASSWORD} bytes"
             )));
         }
-        Some(password) => Some(
-            PasswordHash::new(password, Kdf::SHARE, rand::random())
-                .map_err(|error| ServerError::InternalError(error.to_string()))?,
-        ),
+        Some(password) => {
+            // Hashing is CPU work; it runs off the request threads.
+            let (password, salt) = (password.to_string(), rand::random());
+            let hash =
+                tokio::task::spawn_blocking(move || PasswordHash::new(&password, Kdf::SHARE, salt))
+                    .await
+                    .map_err(|error| ServerError::InternalError(error.to_string()))?
+                    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+            Some(hash)
+        }
         None => None,
     };
-    let (group_id, target) = checked_target(&state, &auth, &request).await?;
+    let (group_id, target, path) = resolve_target(&state, &auth, &request.target).await?;
+    share_policies(&state, &auth, &path, &request).await?;
     let link = ShareLink {
         id: Ulid::generate(),
         group_id,
@@ -385,12 +419,18 @@ pub async fn create_share(
             .map(|expiry| expiry.timestamp().max(0) as u64),
         password,
         secret: rand::random(),
+        signing_key: rand::random(),
         revoked_at: None,
     };
-    validate_link(&link, now).map_err(rule_error)?;
-    drive(SaveShareOperation::new(link.clone()), &state.get_ctx())
+    let config = CreateShareConfig {
+        auth,
+        link,
+        path,
+        now,
+    };
+    let link = drive(CreateShareOperation::new(config), &state.get_ctx())
         .await
-        .map_err(store_error)?;
+        .map_err(share_error)?;
     tracing::info!(share_id = %link.id, "Created share link");
     let details = ShareDetails {
         share: share_info(&link, now),
@@ -485,14 +525,10 @@ pub async fn revoke_share(
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let mut link = own_share(&state, &auth, &id).await?;
-    if link.revoked_at.is_none() {
-        link.revoked_at = Some(unix_now());
-        drive(SaveShareOperation::new(link.clone()), &state.get_ctx())
-            .await
-            .map_err(store_error)?;
-        tracing::info!(share_id = %link.id, "Revoked share link");
-    }
+    let id = Ulid::from_string(&id).map_err(|_| ServerError::NotFound)?;
+    let revoke = RevokeShareOperation::new(auth.user_id, id, unix_now());
+    drive(revoke, &state.get_ctx()).await.map_err(share_error)?;
+    tracing::info!(share_id = %id, "Revoked share link");
     Ok(StatusCode::NO_CONTENT)
 }
 
