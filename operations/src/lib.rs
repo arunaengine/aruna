@@ -36,6 +36,7 @@ pub mod replication;
 pub mod s3;
 pub mod session;
 pub mod shard;
+pub mod shares;
 pub mod staging;
 mod storage_read;
 pub mod sync;
