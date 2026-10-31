@@ -52,6 +52,12 @@ pub trait Signable: Serialize {
     fn signing_bytes(&self) -> Result<Vec<u8>, FederationError> {
         encode(&(Self::DOMAIN, self))
     }
+
+    /// The bytes of a payload type's older layout, which nodes from before it grew signed;
+    /// checked only when the current layout does not verify.
+    fn legacy_signing_bytes(&self) -> Option<Result<Vec<u8>, FederationError>> {
+        None
+    }
 }
 
 fn encode(value: &impl Serialize) -> Result<Vec<u8>, FederationError> {
@@ -126,8 +132,8 @@ impl Signable for RealmDescriptor {
         self.realm_id
     }
 
-    fn signing_bytes(&self) -> Result<Vec<u8>, FederationError> {
-        encode(&(Self::DOMAIN, self.layout()))
+    fn legacy_signing_bytes(&self) -> Option<Result<Vec<u8>, FederationError>> {
+        Some(encode(&(Self::DOMAIN, self.factless()?)))
     }
 }
 
@@ -142,29 +148,21 @@ struct FactlessDescriptor<'a> {
     issued_at: u64,
 }
 
-/// The signed encoding of a descriptor: the older layout while it carries none of the newer
-/// facts, so signatures of older nodes still verify, and the full layout otherwise.
+/// `Signed<RealmDescriptor>` with its descriptor in the older layout.
 #[derive(Serialize)]
-#[serde(untagged)]
-enum DescriptorLayout<'a> {
-    Factless(FactlessDescriptor<'a>),
-    Full(&'a RealmDescriptor),
-}
-
-/// `Signed<RealmDescriptor>` with its descriptor in the signed layout.
-#[derive(Serialize)]
-pub(crate) struct SignedLayout<'a> {
-    payload: DescriptorLayout<'a>,
+pub(crate) struct FactlessSigned<'a> {
+    payload: FactlessDescriptor<'a>,
     signer: &'a Signer,
     signature: &'a str,
 }
 
 impl RealmDescriptor {
-    fn layout(&self) -> DescriptorLayout<'_> {
+    /// The descriptor in the older layout, which can only carry one without the newer facts.
+    fn factless(&self) -> Option<FactlessDescriptor<'_>> {
         if self.contact.is_some() || !self.login_providers.is_empty() {
-            return DescriptorLayout::Full(self);
+            return None;
         }
-        DescriptorLayout::Factless(FactlessDescriptor {
+        Some(FactlessDescriptor {
             realm_id: self.realm_id,
             name: &self.name,
             description: &self.description,
@@ -176,13 +174,13 @@ impl RealmDescriptor {
 }
 
 impl Signed<RealmDescriptor> {
-    /// The encoding signatures and digests over a signed descriptor cover.
-    pub(crate) fn layout(&self) -> SignedLayout<'_> {
-        SignedLayout {
-            payload: self.payload.layout(),
+    /// The signed descriptor in the older layout, if its descriptor fits it.
+    pub(crate) fn factless(&self) -> Option<FactlessSigned<'_>> {
+        Some(FactlessSigned {
+            payload: self.payload.factless()?,
             signer: &self.signer,
             signature: &self.signature,
-        }
+        })
     }
 }
 
@@ -208,14 +206,14 @@ impl Signable for Registration {
         self.descriptor.payload.realm_id
     }
 
-    fn signing_bytes(&self) -> Result<Vec<u8>, FederationError> {
+    fn legacy_signing_bytes(&self) -> Option<Result<Vec<u8>, FederationError>> {
         let layout = (
-            self.descriptor.layout(),
+            self.descriptor.factless()?,
             &self.kpis,
             self.observed_at,
             self.issued_at,
         );
-        encode(&(Self::DOMAIN, layout))
+        Some(encode(&(Self::DOMAIN, layout)))
     }
 }
 
@@ -286,6 +284,11 @@ impl<T: Signable> Signed<T> {
 
     /// Accepts only a payload naming `realm_id`, signed by that realm's key or its delegate.
     pub fn verify(&self, realm_id: &RealmId) -> Result<(), FederationError> {
+        self.verified_layout(realm_id).map(|_| ())
+    }
+
+    /// The layout the signature verifies in: the current one, else the payload's older one.
+    pub(crate) fn verified_layout(&self, realm_id: &RealmId) -> Result<Layout, FederationError> {
         if self.payload.realm_id() != *realm_id {
             return Err(FederationError::RealmMismatch);
         }
@@ -310,9 +313,27 @@ impl<T: Signable> Signed<T> {
             }
         };
         let signature = parse_signature(&self.signature)?;
-        key.verify_strict(&signing_bytes(&self.payload)?, &signature)
-            .map_err(|_| FederationError::BadSignature)
+        if key
+            .verify_strict(&signing_bytes(&self.payload)?, &signature)
+            .is_ok()
+        {
+            return Ok(Layout::Current);
+        }
+        let legacy = self
+            .payload
+            .legacy_signing_bytes()
+            .ok_or(FederationError::BadSignature)??;
+        key.verify_strict(&legacy, &signature)
+            .map_err(|_| FederationError::BadSignature)?;
+        Ok(Layout::Older)
     }
+}
+
+/// Which layout of a payload its signature covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Layout {
+    Current,
+    Older,
 }
 
 fn sign_hex(key: &SigningKey, bytes: &[u8]) -> String {
@@ -443,6 +464,7 @@ pub fn valid_federation_url(url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn realm_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -517,6 +539,7 @@ mod tests {
             portal_url: Url::parse("https://portal.example.org/").unwrap(),
             issued_at: 10,
         };
+        let old_payload = old.clone();
         let old_descriptor = old_signed(&key, DESCRIPTOR_DOMAIN, old);
         let json = serde_json::to_value(&old_descriptor).unwrap();
         assert!(json["payload"].get("login_providers").is_none());
@@ -535,10 +558,48 @@ mod tests {
         let parsed: Signed<Registration> = serde_json::from_value(wire.unwrap()).unwrap();
         parsed.verify(&realm_id).unwrap();
         parsed.payload.descriptor.verify(&realm_id).unwrap();
+        assert_eq!(descriptor.verified_layout(&realm_id), Ok(Layout::Older));
+        // An older node digests its own layout; the digest here must match it.
+        let old_bytes = postcard::to_allocvec(&old_signed(&key, DESCRIPTOR_DOMAIN, old_payload));
+        let old_digest = hex::encode(Sha256::digest(old_bytes.unwrap()));
+        assert_eq!(
+            crate::handoff::descriptor_digest(&descriptor).unwrap(),
+            old_digest
+        );
         // The new facts are signed: adding one breaks the old signature.
         let mut changed = descriptor;
         changed.payload.contact = Some("ops@example.org".to_string());
         assert!(changed.verify(&realm_id).is_err());
+    }
+
+    #[test]
+    fn factless_signed_fully() {
+        // Descriptors and registrations without facts are signed in the full layout, as before.
+        let key = realm_key(9);
+        let realm_id = realm_of(&key);
+        let signed = Signed::sign(descriptor(realm_id), &management(&key)).unwrap();
+        let full = postcard::to_allocvec(&(DESCRIPTOR_DOMAIN, &signed.payload)).unwrap();
+        let signature = parse_signature(&signed.signature).unwrap();
+        key.verifying_key()
+            .verify_strict(&full, &signature)
+            .unwrap();
+        assert_eq!(signed.verified_layout(&realm_id), Ok(Layout::Current));
+        let registration = Registration {
+            descriptor: signed.clone(),
+            kpis: RealmKpis::default(),
+            observed_at: 11,
+            issued_at: 12,
+        };
+        let outer = Signed::sign(registration, &management(&key)).unwrap();
+        let full = postcard::to_allocvec(&(REGISTRATION_DOMAIN, &outer.payload)).unwrap();
+        let signature = parse_signature(&outer.signature).unwrap();
+        key.verifying_key()
+            .verify_strict(&full, &signature)
+            .unwrap();
+        assert_eq!(outer.verified_layout(&realm_id), Ok(Layout::Current));
+        // The digest is that of the full layout, as nodes on the full layout compute it.
+        let digest = hex::encode(Sha256::digest(postcard::to_allocvec(&signed).unwrap()));
+        assert_eq!(crate::handoff::descriptor_digest(&signed).unwrap(), digest);
     }
 
     #[test]
