@@ -107,6 +107,8 @@ pub enum SessionKind {
     Api,
     /// A session this realm issued for a user of another realm after a login handoff.
     Federated,
+    /// A share link visit acting for the link's creator; never minted into a bearer token.
+    Share,
 }
 
 impl fmt::Display for SessionKind {
@@ -116,6 +118,7 @@ impl fmt::Display for SessionKind {
             Self::Assistant => "assistant",
             Self::Api => "api",
             Self::Federated => "federated",
+            Self::Share => "share",
         })
     }
 }

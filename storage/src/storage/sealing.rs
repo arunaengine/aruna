@@ -6,11 +6,11 @@ use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, sea
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
-use aruna_core::keyspaces::CONNECTOR_SECRET_KEYSPACE;
+use aruna_core::keyspaces::{CONNECTOR_SECRET_KEYSPACE, SHARE_LINK_KEYSPACE};
 use aruna_core::types::{Key, Value};
 
-/// Keyspaces whose rows hold plain repository connector credentials.
-pub const SEALED_KEYSPACES: [&str; 1] = [CONNECTOR_SECRET_KEYSPACE];
+/// Keyspaces whose rows hold plain secrets: connector credentials and share link secrets.
+pub const SEALED_KEYSPACES: [&str; 2] = [CONNECTOR_SECRET_KEYSPACE, SHARE_LINK_KEYSPACE];
 
 /// Which sealed rows a read returns, captured before its effect is dispatched.
 pub(super) enum Opening {
