@@ -3147,3 +3147,25 @@ fn mirror_type_kept() {
     let served = result.source_metadata.unwrap();
     assert_eq!(served.content_type.as_deref(), Some("text/plain"));
 }
+
+// A transfer that breaks while its bytes are spooled for the checksum check moves on to the
+// next source, as nothing was served yet.
+#[test]
+fn broken_spool_fails_over() {
+    let mut operation = mirrored_operation(digested(9, 7));
+    let effects = ranked_head(&mut operation, vec![false, false]);
+    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let mut fresh = observation(9);
+    fresh.etag = None;
+    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: fresh.clone(),
+    }));
+    let effects = operation.step(source_read(fresh));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Blob(BlobEffect::SpoolLocal { .. })]
+    ));
+    let broken = BlobError::StreamFailed("connection reset".to_string());
+    let effects = operation.step(Event::Blob(BlobEvent::Error(broken)));
+    assert_eq!(headed_path(&effects), "mirror/file.txt");
+}

@@ -2041,6 +2041,11 @@ impl GetObjectOperation {
             Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
                 return self.emit_error(GetObjectError::ReferenceSourceChanged);
             }
+            // Nothing was served yet, so a broken transfer tries the other sources.
+            Event::Blob(BlobEvent::Error(error)) => {
+                debug!(error = %error, "Spooling a reference source failed");
+                return self.source_failed(GetObjectError::GetObjectFailed);
+            }
             _ => return self.emit_error(GetObjectError::GetObjectFailed),
         };
         let expected = std::mem::take(&mut self.verify_digests);
