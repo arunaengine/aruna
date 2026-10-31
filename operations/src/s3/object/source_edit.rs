@@ -12,21 +12,26 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{SourceMapping, SourceMirror, VersionSourceBinding};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::auth::permission_rules::PermissionRules;
 use crate::connectors::repository::connector_reference_write;
 use crate::staging::descriptor::build_source_descriptor;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SourceChange {
-    /// Adds the connector's path for each source path the mapping covers.
+    /// Adds the connector's path for each source path the mapping covers, when the caller's
+    /// `rules` allow READ on it below `read_root`, the connector's permission path.
     Add {
         mapping: SourceMapping,
         connector: SourceConnector,
+        rules: PermissionRules,
+        read_root: String,
     },
     /// Removes the sources below `from`, of `connector_id` when given; never the last one.
     Remove {
@@ -58,6 +63,8 @@ pub struct SourceEditResult {
     pub kept_last: u64,
     /// Reference versions keeping their first source, as no checksums prove the next one.
     pub kept_unproven: u64,
+    /// Reference versions left alone, as the caller may not read their new source.
+    pub denied: u64,
     /// Where the next page starts; `None` once every row was read.
     pub next: Option<Vec<u8>>,
 }
@@ -151,12 +158,25 @@ impl SourceEditOperation {
                 continue;
             };
             let edited = match &self.input.change {
-                SourceChange::Add { mapping, connector } => added(
-                    source,
-                    cached_metadata,
-                    (mapping, connector),
-                    self.input.node_id,
-                ),
+                SourceChange::Add {
+                    mapping,
+                    connector,
+                    rules,
+                    read_root,
+                } => {
+                    let readable = |path: &str| {
+                        rules.allows(&format!("{read_root}/{path}"), &Permission::READ)
+                    };
+                    let rule = (mapping, connector);
+                    match added(source, cached_metadata, rule, self.input.node_id, readable) {
+                        Addition::Added => true,
+                        Addition::Denied => {
+                            self.result.denied += 1;
+                            false
+                        }
+                        Addition::None => false,
+                    }
+                }
                 SourceChange::Remove { connector_id, from } => {
                     match removed(source, cached_metadata, *connector_id, from) {
                         Removal::Removed => true,
@@ -244,19 +264,29 @@ impl SourceEditOperation {
     }
 }
 
-/// Adds the mapped path of the first source the mapping covers, unless the binding has it.
+#[derive(Debug, Eq, PartialEq)]
+enum Addition {
+    Added,
+    /// The caller may not read the new source.
+    Denied,
+    None,
+}
+
+/// Adds the mapped path of the first source the mapping covers, unless the binding has it or
+/// `readable` refuses it.
 fn added(
     source: &mut VersionSourceBinding,
     observed: &SourceMetadata,
     (mapping, connector): (&SourceMapping, &SourceConnector),
     node_id: NodeId,
-) -> bool {
+    readable: impl Fn(&str) -> bool,
+) -> Addition {
     let paths = (0..source.source_count()).filter_map(|slot| source.source_at(slot));
     let Some(path) = paths
         .map(|single| single.descriptor.source_path)
         .find_map(|path| mapping.map(&path))
     else {
-        return false;
+        return Addition::None;
     };
     let has = (0..source.source_count())
         .filter_map(|slot| source.source_at(slot))
@@ -265,7 +295,10 @@ fn added(
                 && single.descriptor.source_path == path
         });
     if has {
-        return false;
+        return Addition::None;
+    }
+    if !readable(&path) {
+        return Addition::Denied;
     }
     let mut descriptor = build_source_descriptor(connector, observed, path, Some(node_id));
     // A version id names one server's copy, never another's.
@@ -274,7 +307,7 @@ fn added(
         descriptor,
         connector_id: Some(connector.connector_id),
     });
-    true
+    Addition::Added
 }
 
 #[derive(Debug, Eq, PartialEq)]

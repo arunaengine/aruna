@@ -101,12 +101,16 @@ fn mapping_adds_sources() {
     let mut operation = edit(SourceChange::Add {
         mapping,
         connector: mirror.clone(),
+        rules: readers("/sources/refseq/a*"),
+        read_root: "/sources".to_string(),
     });
     let first = reference("genomes/a.fna");
     let effects = operation.step(Event::Storage(StorageEvent::IterResult {
         values: vec![
             row("genomes/a.fna", &first),
             row("other/b.fna", &reference("genomes/b.fna")),
+            // The caller may not read this file's new source, so it stays as it is.
+            row("genomes/c.fna", &reference("genomes/c.fna")),
         ],
         next_start_after: Some(b"cursor".to_vec().into()),
     }));
@@ -147,7 +151,7 @@ fn mapping_adds_sources() {
         txn_id,
     }));
     let result = operation.finalize().unwrap();
-    assert_eq!((result.scanned, result.changed), (2, 1));
+    assert_eq!((result.scanned, result.changed, result.denied), (3, 1, 1));
     assert_eq!(result.next.as_deref(), Some(&b"cursor"[..]));
 }
 
@@ -156,7 +160,25 @@ fn added_twice(
     rule: (&SourceMapping, &SourceConnector),
     node_id: NodeId,
 ) -> bool {
-    added(source, &observed(), rule, node_id)
+    added(source, &observed(), rule, node_id, |_| true) == Addition::Added
+}
+
+/// Rules granting READ on `pattern` only.
+fn readers(pattern: &str) -> PermissionRules {
+    use crate::auth::permission_rules::CollectedRole;
+    use aruna_core::structs::identity::auth::{Permission, Role};
+    let role = Role {
+        role_id: Ulid::from_bytes([6; 16]),
+        name: "reader".into(),
+        permissions: [(pattern.to_string(), Permission::READ)].into(),
+        assigned_users: Default::default(),
+    };
+    let collected = CollectedRole {
+        role,
+        direct: true,
+        public: false,
+    };
+    PermissionRules::from_roles(vec![collected], None).unwrap()
 }
 
 // Removing the first source makes the next one first and drops the first one's validators;
@@ -171,7 +193,9 @@ fn removal_keeps_last() {
         to: "refseq/".to_string(),
     };
     let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
-    assert!(added(&mut source, &observed(), (&mapping, &mirror), node));
+    let rule = (&mapping, &mirror);
+    let addition = added(&mut source, &observed(), rule, node, |_| true);
+    assert_eq!(addition, Addition::Added);
     let mut kept = source.clone();
     let mut metadata = observed();
     assert_eq!(removed(&mut kept, &mut metadata, None, ""), Removal::Last);

@@ -8,6 +8,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::execution::staging::SourceMapping;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
+use aruna_operations::auth::permission_rules::permission_rules;
 use aruna_operations::connectors::get_connector::{
     GetSourceError, GetSourceInput, GetSourceOperation,
 };
@@ -88,6 +89,8 @@ pub struct SourceEditResponse {
     pub kept_last: u64,
     /// Reference versions that kept their first source, as no checksums prove the next one.
     pub kept_unproven: u64,
+    /// Reference versions left alone, as the caller may not read their new source.
+    pub denied: u64,
     /// Pass as `after` to continue; absent once every row was read.
     pub next: Option<String>,
 }
@@ -99,6 +102,7 @@ impl From<SourceEditResult> for SourceEditResponse {
             changed: result.changed,
             kept_last: result.kept_last,
             kept_unproven: result.kept_unproven,
+            denied: result.denied,
             next: result.next.map(hex::encode),
         }
     }
@@ -110,7 +114,7 @@ async fn authorize(
     state: &ServerState,
     auth: Option<AuthContext>,
     bucket: &str,
-) -> ServerResult<Ulid> {
+) -> ServerResult<(AuthContext, Ulid)> {
     let auth = require_realm_auth(state, auth)?;
     if auth.path_restrictions.is_some() {
         return Err(ServerError::Forbidden);
@@ -136,7 +140,7 @@ async fn authorize(
         let reason = "sources of a distributed bucket cannot be edited in place";
         return Err(ServerError::Conflict(reason.to_string()));
     }
-    Ok(info.group_id)
+    Ok((auth, info.group_id))
 }
 
 fn ulid(value: &str) -> ServerResult<Ulid> {
@@ -179,7 +183,9 @@ async fn edit(
     summary = "Add a source to referenced files",
     description = r#"Adds another source of the same bytes to the reference versions of one key or of every key under a prefix, such as a second mirror of a public database.
 
-**Authentication**: realm bearer token with WRITE on the bucket. Tokens with path restrictions are refused.
+**Authentication**: realm bearer token with WRITE on the bucket and READ on each new source path
+below the connector (`_sources/{connector_id}/...`). Tokens with path restrictions are refused.
+A version whose new source the caller may not read stays as it is and counts in `denied`.
 
 **Behavior**
 - For each reference version, the first of its sources whose path starts with `from` gives the new
@@ -212,7 +218,7 @@ it is absent."#,
             status = 200,
             description = "What one page changed",
             body = SourceEditResponse,
-            example = json!({"scanned": 1000, "changed": 998, "kept_last": 0, "kept_unproven": 0, "next": "0a6e6362692d72656673657131"})
+            example = json!({"scanned": 1000, "changed": 998, "kept_last": 0, "kept_unproven": 0, "denied": 0, "next": "0a6e6362692d72656673657131"})
         ),
         (status = 400, description = "Invalid connector id or `after`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -228,7 +234,7 @@ pub async fn add_sources(
     Path(bucket): Path<String>,
     Json(request): Json<AddSourcesRequest>,
 ) -> ServerResult<Json<SourceEditResponse>> {
-    let group_id = authorize(&state, auth, &bucket).await?;
+    let (auth, group_id) = authorize(&state, auth, &bucket).await?;
     let connector_id = ulid(&request.connector_id)?;
     let input = GetSourceInput {
         group_id,
@@ -244,7 +250,21 @@ pub async fn add_sources(
         from: request.from,
         to: request.to,
     };
-    let change = SourceChange::Add { mapping, connector };
+    // The caller must be allowed to read every new source; each is checked in the edit.
+    let read_root = format!(
+        "/{}/g/{group_id}/data/{}/_sources/{connector_id}",
+        state.get_realm_id(),
+        state.get_node_id()
+    );
+    let rules = permission_rules(&state.get_ctx(), &auth, &read_root)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let change = SourceChange::Add {
+        mapping,
+        connector,
+        rules,
+        read_root,
+    };
     let keys = (request.key, request.prefix, request.after);
     edit(&state, bucket, keys, change).await
 }
@@ -278,7 +298,7 @@ pub async fn add_sources(
             status = 200,
             description = "What one page changed",
             body = SourceEditResponse,
-            example = json!({"scanned": 2, "changed": 1, "kept_last": 1, "kept_unproven": 0})
+            example = json!({"scanned": 2, "changed": 1, "kept_last": 1, "kept_unproven": 0, "denied": 0})
         ),
         (status = 400, description = "Invalid connector id or `after`", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
