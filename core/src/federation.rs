@@ -71,6 +71,44 @@ pub struct LoginProvider {
     pub issuer: String,
 }
 
+impl RealmDescriptor {
+    /// The same bounds realm settings enforce, so a receiver can check a foreign descriptor.
+    pub fn check_facts(&self) -> Result<(), FederationError> {
+        let ids = self
+            .login_providers
+            .iter()
+            .map(|provider| provider.id.as_str());
+        check_facts(&self.name, &self.description, self.contact.as_deref(), ids)
+    }
+}
+
+/// Name, description and contact bounds, and login provider ids listed once each.
+fn check_facts<'a>(
+    name: &str,
+    description: &str,
+    contact: Option<&str>,
+    provider_ids: impl Iterator<Item = &'a str>,
+) -> Result<(), FederationError> {
+    if name.trim().is_empty() || name.chars().count() > MAX_NAME_LEN {
+        return Err(FederationError::InvalidSettings("name length"));
+    }
+    if description.chars().count() > MAX_DESCRIPTION_LEN {
+        return Err(FederationError::InvalidSettings("description length"));
+    }
+    if !contact.is_none_or(valid_contact) {
+        return Err(FederationError::InvalidSettings(
+            "contact must be an email address",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if !provider_ids.into_iter().all(|id| seen.insert(id)) {
+        return Err(FederationError::InvalidSettings(
+            "login provider listed twice",
+        ));
+    }
+    Ok(())
+}
+
 impl Signable for RealmDescriptor {
     const DOMAIN: &'static str = DESCRIPTOR_DOMAIN;
     fn realm_id(&self) -> RealmId {
@@ -262,25 +300,12 @@ impl FederationSettings {
 
     /// Checks bounds, URL rules and that the descriptor is signed for these values.
     pub fn validate(&self, realm_id: &RealmId) -> Result<(), FederationError> {
-        if self.name.trim().is_empty() || self.name.chars().count() > MAX_NAME_LEN {
-            return Err(FederationError::InvalidSettings("name length"));
-        }
-        if self.description.chars().count() > MAX_DESCRIPTION_LEN {
-            return Err(FederationError::InvalidSettings("description length"));
-        }
-        if !self.contact.as_deref().is_none_or(valid_contact) {
-            return Err(FederationError::InvalidSettings(
-                "contact must be an email address",
-            ));
-        }
-        let mut providers = self.login_providers.clone();
-        providers.sort();
-        providers.dedup();
-        if providers.len() != self.login_providers.len() {
-            return Err(FederationError::InvalidSettings(
-                "login provider listed twice",
-            ));
-        }
+        check_facts(
+            &self.name,
+            &self.description,
+            self.contact.as_deref(),
+            self.login_providers.iter().map(String::as_str),
+        )?;
         let urls = [
             Some(&self.api_url),
             Some(&self.portal_url),

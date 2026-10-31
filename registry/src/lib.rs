@@ -83,6 +83,8 @@ pub enum RegistryError {
     BadRealm,
     #[error("descriptor URLs must be HTTPS, or HTTP to a loopback host")]
     BadUrl,
+    #[error("invalid descriptor: {0}")]
+    BadDescriptor(FederationError),
     #[error("too many registry writes, retry later")]
     RateLimited,
     #[error(transparent)]
@@ -94,7 +96,7 @@ pub enum RegistryError {
 impl IntoResponse for RegistryError {
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::BadRealm | Self::BadUrl => StatusCode::BAD_REQUEST,
+            Self::BadRealm | Self::BadUrl | Self::BadDescriptor(_) => StatusCode::BAD_REQUEST,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Store(StoreError::NotFound) => StatusCode::NOT_FOUND,
             Self::Signature(_) => StatusCode::FORBIDDEN,
@@ -170,8 +172,8 @@ fn public(body: impl Serialize) -> Response {
     response
 }
 
-/// The registration and its descriptor must both be signed for the path realm and the
-/// descriptor URLs must follow the federation URL rule.
+/// The registration and its descriptor must both be signed for the path realm, the descriptor
+/// URLs must follow the federation URL rule and its facts the realm settings bounds.
 fn check_registration(
     realm_id: &RealmId,
     signed: &Signed<Registration>,
@@ -184,7 +186,10 @@ fn check_registration(
     {
         return Err(RegistryError::BadUrl);
     }
-    Ok(())
+    descriptor
+        .payload
+        .check_facts()
+        .map_err(RegistryError::BadDescriptor)
 }
 
 /// Listed and approved realms, approved first; hidden and retired ones are left out.
@@ -405,6 +410,33 @@ mod tests {
         }
         let private = registration("https://10.0.0.5", 10);
         assert!(check_registration(&realm_id(), &private).is_ok());
+    }
+
+    #[test]
+    fn rejects_oversized_facts() {
+        // Signed descriptors still meet the settings bounds before any fetch or history write.
+        let resign = |edit: &dyn Fn(&mut aruna_core::federation::RealmDescriptor)| {
+            let mut payload = registration("https://realm.example.org", 10).payload;
+            let mut descriptor = payload.descriptor.payload.clone();
+            edit(&mut descriptor);
+            payload.descriptor = Signed::sign(descriptor, &capabilities()).unwrap();
+            Signed::sign(payload, &capabilities()).unwrap()
+        };
+        let long = aruna_core::federation::MAX_NAME_LEN + 1;
+        let edits: [&dyn Fn(&mut aruna_core::federation::RealmDescriptor); 4] = [
+            &|d| d.name = "a".repeat(long),
+            &|d| d.name = " ".to_string(),
+            &|d| d.description = "a".repeat(aruna_core::federation::MAX_DESCRIPTION_LEN + 1),
+            &|d| d.contact = Some("not an address".to_string()),
+        ];
+        for edit in edits {
+            assert!(matches!(
+                check_registration(&realm_id(), &resign(edit)),
+                Err(RegistryError::BadDescriptor(_))
+            ));
+        }
+        let fits = resign(&|d| d.name = "a".repeat(long - 1));
+        assert!(check_registration(&realm_id(), &fits).is_ok());
     }
 
     #[test]
