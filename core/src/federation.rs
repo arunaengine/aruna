@@ -47,6 +47,15 @@ pub enum FederationError {
 pub trait Signable: Serialize {
     const DOMAIN: &'static str;
     fn realm_id(&self) -> RealmId;
+
+    /// The domain-tagged bytes a signature covers.
+    fn signing_bytes(&self) -> Result<Vec<u8>, FederationError> {
+        encode(&(Self::DOMAIN, self))
+    }
+}
+
+fn encode(value: &impl Serialize) -> Result<Vec<u8>, FederationError> {
+    postcard::to_allocvec(value).map_err(|error| FederationError::Encoding(error.to_string()))
 }
 
 /// Public realm facts. A newer `issued_at` supersedes older descriptors.
@@ -58,8 +67,10 @@ pub struct RealmDescriptor {
     pub api_url: Url,
     pub portal_url: Url,
     /// Public contact email address of the realm operator.
+    #[serde(default)]
     pub contact: Option<String>,
     /// Login providers the realm shows to other realms and the registry.
+    #[serde(default)]
     pub login_providers: Vec<LoginProvider>,
     pub issued_at: u64,
 }
@@ -114,6 +125,65 @@ impl Signable for RealmDescriptor {
     fn realm_id(&self) -> RealmId {
         self.realm_id
     }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>, FederationError> {
+        encode(&(Self::DOMAIN, self.layout()))
+    }
+}
+
+/// A descriptor in the layout of nodes that predate the contact and login provider facts.
+#[derive(Serialize)]
+struct FactlessDescriptor<'a> {
+    realm_id: RealmId,
+    name: &'a str,
+    description: &'a str,
+    api_url: &'a Url,
+    portal_url: &'a Url,
+    issued_at: u64,
+}
+
+/// The signed encoding of a descriptor: the older layout while it carries none of the newer
+/// facts, so signatures of older nodes still verify, and the full layout otherwise.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum DescriptorLayout<'a> {
+    Factless(FactlessDescriptor<'a>),
+    Full(&'a RealmDescriptor),
+}
+
+/// `Signed<RealmDescriptor>` with its descriptor in the signed layout.
+#[derive(Serialize)]
+pub(crate) struct SignedLayout<'a> {
+    payload: DescriptorLayout<'a>,
+    signer: &'a Signer,
+    signature: &'a str,
+}
+
+impl RealmDescriptor {
+    fn layout(&self) -> DescriptorLayout<'_> {
+        if self.contact.is_some() || !self.login_providers.is_empty() {
+            return DescriptorLayout::Full(self);
+        }
+        DescriptorLayout::Factless(FactlessDescriptor {
+            realm_id: self.realm_id,
+            name: &self.name,
+            description: &self.description,
+            api_url: &self.api_url,
+            portal_url: &self.portal_url,
+            issued_at: self.issued_at,
+        })
+    }
+}
+
+impl Signed<RealmDescriptor> {
+    /// The encoding signatures and digests over a signed descriptor cover.
+    pub(crate) fn layout(&self) -> SignedLayout<'_> {
+        SignedLayout {
+            payload: self.payload.layout(),
+            signer: &self.signer,
+            signature: &self.signature,
+        }
+    }
 }
 
 /// Self-reported realm totals. `None` means unknown, never zero.
@@ -136,6 +206,16 @@ impl Signable for Registration {
     const DOMAIN: &'static str = REGISTRATION_DOMAIN;
     fn realm_id(&self) -> RealmId {
         self.descriptor.payload.realm_id
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>, FederationError> {
+        let layout = (
+            self.descriptor.layout(),
+            &self.kpis,
+            self.observed_at,
+            self.issued_at,
+        );
+        encode(&(Self::DOMAIN, layout))
     }
 }
 
@@ -172,8 +252,7 @@ pub struct Signed<T> {
 
 /// The domain-tagged bytes a signature covers.
 pub fn signing_bytes<T: Signable>(payload: &T) -> Result<Vec<u8>, FederationError> {
-    postcard::to_allocvec(&(T::DOMAIN, payload))
-        .map_err(|error| FederationError::Encoding(error.to_string()))
+    payload.signing_bytes()
 }
 
 impl<T: Signable> Signed<T> {
@@ -388,6 +467,96 @@ mod tests {
             login_providers: Vec::new(),
             issued_at: 10,
         }
+    }
+
+    /// The descriptor of nodes that predate the contact and login provider facts.
+    #[derive(Clone, Serialize)]
+    struct OldDescriptor {
+        realm_id: RealmId,
+        name: String,
+        description: String,
+        api_url: Url,
+        portal_url: Url,
+        issued_at: u64,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct OldSigned<T> {
+        payload: T,
+        signer: Signer,
+        signature: String,
+    }
+
+    #[derive(Serialize)]
+    struct OldRegistration {
+        descriptor: OldSigned<OldDescriptor>,
+        kpis: RealmKpis,
+        observed_at: u64,
+        issued_at: u64,
+    }
+
+    /// What an older node sends: its own layout, signed with the realm key.
+    fn old_signed<T: Serialize>(key: &SigningKey, domain: &str, payload: T) -> OldSigned<T> {
+        let bytes = postcard::to_allocvec(&(domain, &payload)).unwrap();
+        OldSigned {
+            signature: sign_hex(key, &bytes),
+            signer: Signer::Realm,
+            payload,
+        }
+    }
+
+    #[test]
+    fn old_descriptors_verify() {
+        let key = realm_key(9);
+        let realm_id = realm_of(&key);
+        let old = OldDescriptor {
+            realm_id,
+            name: "Realm".to_string(),
+            description: "Old node".to_string(),
+            api_url: Url::parse("https://api.example.org/api/v1").unwrap(),
+            portal_url: Url::parse("https://portal.example.org/").unwrap(),
+            issued_at: 10,
+        };
+        let old_descriptor = old_signed(&key, DESCRIPTOR_DOMAIN, old);
+        let json = serde_json::to_value(&old_descriptor).unwrap();
+        assert!(json["payload"].get("login_providers").is_none());
+        let descriptor: Signed<RealmDescriptor> = serde_json::from_value(json).unwrap();
+        assert_eq!(descriptor.payload.contact, None);
+        assert!(descriptor.payload.login_providers.is_empty());
+        descriptor.verify(&realm_id).unwrap();
+        // A registration that embeds the old descriptor verifies too.
+        let registration = OldRegistration {
+            descriptor: old_descriptor,
+            kpis: RealmKpis::default(),
+            observed_at: 11,
+            issued_at: 12,
+        };
+        let wire = serde_json::to_value(old_signed(&key, REGISTRATION_DOMAIN, registration));
+        let parsed: Signed<Registration> = serde_json::from_value(wire.unwrap()).unwrap();
+        parsed.verify(&realm_id).unwrap();
+        parsed.payload.descriptor.verify(&realm_id).unwrap();
+        // The new facts are signed: adding one breaks the old signature.
+        let mut changed = descriptor;
+        changed.payload.contact = Some("ops@example.org".to_string());
+        assert!(changed.verify(&realm_id).is_err());
+    }
+
+    #[test]
+    fn facts_signed_fully() {
+        // A descriptor with facts signs and verifies in the full layout.
+        let key = realm_key(9);
+        let realm_id = realm_of(&key);
+        let mut facts = descriptor(realm_id);
+        facts.contact = Some("ops@example.org".to_string());
+        facts.login_providers.push(LoginProvider {
+            id: "keycloak".to_string(),
+            issuer: "https://login.example.org/realms/aruna".to_string(),
+        });
+        let signed = Signed::sign(facts, &management(&key)).unwrap();
+        signed.verify(&realm_id).unwrap();
+        let mut stripped = signed;
+        stripped.payload.login_providers.clear();
+        assert!(stripped.verify(&realm_id).is_err());
     }
 
     fn delegated(realm: &SigningKey, issuer: &SigningKey) -> NodeCapabilities {

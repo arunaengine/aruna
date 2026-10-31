@@ -66,9 +66,10 @@ pub enum HandoffError {
     NameTooLong,
 }
 
-/// Hex SHA-256 over the postcard encoding of the signed descriptor.
+/// Hex SHA-256 over the postcard encoding of the signed descriptor in its signed layout, so
+/// nodes from before the newer descriptor facts compute the same digest.
 pub fn descriptor_digest(descriptor: &Signed<RealmDescriptor>) -> Result<String, FederationError> {
-    let bytes = postcard::to_allocvec(descriptor)
+    let bytes = postcard::to_allocvec(&descriptor.layout())
         .map_err(|error| FederationError::Encoding(error.to_string()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
