@@ -770,9 +770,8 @@ async fn record_import_rate() {
     );
     let jobs = count("ARUNA_BENCH_JOBS", 1).max(1);
     let background = count("ARUNA_BENCH_BACKGROUND", 1) > 0;
-    let started = std::time::Instant::now();
-    let (completed, failed, conflicts) = import_records(rows, empty, jobs, background).await;
-    let elapsed = started.elapsed().as_secs_f64();
+    let ((completed, failed, conflicts), elapsed) =
+        import_records(rows, empty, jobs, background).await;
     println!(
         "record import: {rows} rows, {empty} empty, {jobs} jobs, {completed} completed, \
          {failed} failed, {conflicts} conflicts, {elapsed:.1} s, {:.0} rows/s",
@@ -783,18 +782,18 @@ async fn record_import_rate() {
 // Empty rows of one job and record rows of another write one range in turns, not in conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn empty_rows_alternate() {
-    assert_eq!(import_records(400, 100, 2, false).await, (500, 0, 0));
+    assert_eq!(import_records(400, 100, 2, false).await.0, (500, 0, 0));
 }
 
 /// Imports `rows` record rows and `empty` empty rows spread over `jobs` tables at once, the
 /// drain and the search feed running beside them when `background`; returns the completed and
-/// failed rows and the storage conflicts meanwhile.
+/// failed rows, the storage conflicts meanwhile and the seconds the jobs took.
 async fn import_records(
     rows: usize,
     empty: usize,
     jobs: usize,
     background: bool,
-) -> (u64, u64, u64) {
+) -> ((u64, u64, u64), f64) {
     let (endpoint, _site, server) = serve(Site::ncbi).await;
     let table = serde_json::json!({
         "source": { "object": { "bucket": "lists", "key": "records-0.tsv" } },
@@ -865,10 +864,12 @@ async fn import_records(
     });
     let storage = &fixture.driver.storage_handle;
     let conflicts = storage.snapshot_metrics().conflicts_total;
+    let started = std::time::Instant::now();
     let outcomes = futures_util::future::join_all(
         (runs.iter()).map(|(job, spec)| crate::jobs::staging::run_staging_job(job, spec)),
     )
     .await;
+    let elapsed = started.elapsed().as_secs_f64();
     let conflicts = storage.snapshot_metrics().conflicts_total - conflicts;
     drain.abort();
     feed.abort();
@@ -887,7 +888,7 @@ async fn import_records(
         };
         (completed, failed) = (completed + completed_items, failed + failed_items);
     }
-    (completed, failed, conflicts)
+    ((completed, failed, conflicts), elapsed)
 }
 
 /// Makes the job's bucket a searched distributed set whose upper range, holding keys from `m`,
