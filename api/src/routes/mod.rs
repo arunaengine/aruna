@@ -36,6 +36,7 @@ pub mod promotion;
 pub mod repository;
 pub mod rocrate_import;
 pub mod search;
+pub mod shares;
 pub mod staging;
 pub mod storage;
 pub mod sync;
@@ -115,6 +116,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(portal::router())
         .merge(promotion::router())
         .merge(search::router())
+        .merge(shares::router())
         .merge(access::service_accounts::router())
         .merge(access::sessions::router())
         .merge(execution::tes::router())
@@ -436,6 +438,18 @@ pub(crate) mod tests {
         ("GET", "/access/policies/group/{group_id}"),
         ("GET", "/access/policies/realm"),
         ("GET", "/search"),
+        ("POST", "/shares"),
+        ("GET", "/shares"),
+        ("GET", "/shares/{id}"),
+        ("DELETE", "/shares/{id}"),
+        ("GET", "/shares/{id}/log"),
+        ("POST", "/shares/open"),
+        ("GET", "/shares/visit/files"),
+        ("PUT", "/shares/visit/files"),
+        ("POST", "/shares/visit/tickets"),
+        ("GET", "/shares/download"),
+        ("GET", "/shares/visit/dataset"),
+        ("POST", "/shares/visit/dataset/tickets"),
         ("GET", "/search/buckets"),
         ("GET", "/search/objects"),
         ("GET", "/data/staging/jobs"),
