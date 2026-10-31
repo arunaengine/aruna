@@ -14,6 +14,7 @@ use crate::node_vault::VaultEntry;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::execution::source_access::{
     ListCursor, ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
+    SourceStats,
 };
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::VaultRecords;
@@ -321,7 +322,9 @@ pub enum StagingSourceEvent {
         stream: BackendStream<Result<Bytes, BackendStreamError>>,
     },
     HealthResult {
-        failing: Vec<bool>,
+        stats: Vec<SourceStats>,
+        /// Uniformly random, so the operation can pick among sources deterministically.
+        draw: u64,
     },
     Error {
         error: StagingSourceError,

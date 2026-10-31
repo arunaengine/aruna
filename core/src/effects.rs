@@ -456,7 +456,7 @@ pub enum StagingSourceEffect {
         /// `If-Match` without a fresh HEAD, and a failed condition is `ConditionFailed`.
         expected: Option<SourceMetadata>,
     },
-    /// Which of these sources failed lately without answering since, in their order.
+    /// This node's measurements of these sources, in their order, and a random draw.
     Health {
         accesses: Vec<ResolvedSourceAccess>,
     },

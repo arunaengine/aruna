@@ -37,6 +37,30 @@ impl fmt::Debug for ResolvedSourceAccess {
     }
 }
 
+/// Public connector setting: the traffic share of a source relative to equal ones, default 1.
+pub const SOURCE_WEIGHT: &str = "weight";
+
+/// The weight `config` sets, when it is a positive number.
+pub fn source_weight(config: &HashMap<String, String>) -> Option<f64> {
+    let weight = config.get(SOURCE_WEIGHT)?.trim().parse::<f64>().ok()?;
+    (weight.is_finite() && weight > 0.0).then_some(weight)
+}
+
+/// What this node measured of one source lately. Kept in memory only.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SourceStats {
+    /// Decaying average time to the first answer, in milliseconds; `None` before one.
+    pub first_byte_ms: Option<f64>,
+    /// Decaying average transfer rate in bytes per second; `None` before a long enough read.
+    pub bytes_per_sec: Option<f64>,
+    /// Share of recent requests the server failed, from 0 to 1, fading while none fail.
+    pub error_rate: f64,
+    /// Reads streaming from the source now.
+    pub in_flight: u32,
+    /// Failed lately without answering since.
+    pub failing: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedSourceConnector {
     pub connector: SourceConnector,

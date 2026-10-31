@@ -87,8 +87,8 @@ pub struct BlobHandler {
     close_lock: Arc<StdRwLock<()>>,
     rejected_writes: Arc<AtomicU64>,
     frame_indexes: Arc<StdMutex<frames::IndexCache>>,
-    /// When each external source last failed without answering since. Memory only.
-    source_failures: Arc<StdMutex<source::SourceFailures>>,
+    /// This node's measurements of each external source. Memory only.
+    source_stats: Arc<StdMutex<source::SourceTable>>,
     writes_in_flight: Arc<AtomicUsize>,
     writes_drained: Arc<Notify>,
     /// Stops the backend-status monitor at shutdown so its handler clone, and
