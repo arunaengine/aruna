@@ -12,6 +12,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{SourceMapping, SourceMirror, VersionSourceBinding};
+use aruna_core::structs::execution::table::mirror_path;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{
     BlobVersion, BlobVersionState, BucketIdentity, BucketInfo, VersionKey,
@@ -68,7 +69,8 @@ pub struct SourceEditResult {
     pub kept_last: u64,
     /// Reference versions keeping their first source, as no checksums prove the next one.
     pub kept_unproven: u64,
-    /// Reference versions left alone, as the caller may not read their new source.
+    /// Reference versions left alone, as the caller may not read their new source or its
+    /// path is not canonical.
     pub denied: u64,
     /// Where the next page starts; `None` once every row was read.
     pub next: Option<Vec<u8>>,
@@ -316,7 +318,7 @@ impl SourceEditOperation {
 #[derive(Debug, Eq, PartialEq)]
 enum Addition {
     Added,
-    /// The caller may not read the new source.
+    /// The caller may not read the new source, or its path is not canonical.
     Denied,
     None,
 }
@@ -331,11 +333,15 @@ fn added(
     readable: impl Fn(&str) -> bool,
 ) -> Addition {
     let paths = (0..source.source_count()).filter_map(|slot| source.source_at(slot));
-    let Some(path) = paths
+    let Some(mapped) = paths
         .map(|single| single.descriptor.source_path)
         .find_map(|path| mapping.map(&path))
     else {
         return Addition::None;
+    };
+    // The path the READ check names is the one stored and read.
+    let Ok(path) = mirror_path(&mapped, None) else {
+        return Addition::Denied;
     };
     let has = (0..source.source_count())
         .filter_map(|slot| source.source_at(slot))

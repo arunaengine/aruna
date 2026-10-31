@@ -897,6 +897,18 @@ pub fn source_path(value: &str, base: Option<&str>) -> Result<String, String> {
     canonical_path(&path).ok_or_else(|| format!("the source `{value}` is not a canonical path"))
 }
 
+/// A further source's path: canonical, with no segment a server would trim, so its READ check
+/// and its reads name the same file.
+pub fn mirror_path(value: &str, base: Option<&str>) -> Result<String, String> {
+    let path = source_path(value, base)?;
+    match path.split('/').all(|segment| segment.trim() == segment) {
+        true => Ok(path),
+        false => Err(format!(
+            "the source `{value}` has a segment with outer spaces"
+        )),
+    }
+}
+
 fn connector_path(value: &str, base: Option<&str>) -> Result<String, String> {
     if !value.contains("://") {
         return Ok(value.to_string());

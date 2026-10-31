@@ -185,7 +185,7 @@ fn mapping_adds_sources() {
     let mut operation = edit(SourceChange::Add {
         mapping,
         connector: mirror.clone(),
-        rules: readers("/sources/refseq/a*"),
+        rules: readers("/sources/refseq/*a.fna"),
         read_root: "/sources".to_string(),
     });
     let first = reference("genomes/a.fna");
@@ -195,6 +195,8 @@ fn mapping_adds_sources() {
             row("other/b.fna", &reference("genomes/b.fna")),
             // The caller may not read this file's new source, so it stays as it is.
             row("genomes/c.fna", &reference("genomes/c.fna")),
+            // A mapped path a server would trim to a readable one is refused.
+            row("genomes/ a.fna", &reference("genomes/ a.fna")),
         ],
         next_start_after: Some(b"cursor".to_vec().into()),
     }));
@@ -235,7 +237,7 @@ fn mapping_adds_sources() {
         txn_id,
     }));
     let result = operation.finalize().unwrap();
-    assert_eq!((result.scanned, result.changed, result.denied), (3, 1, 1));
+    assert_eq!((result.scanned, result.changed, result.denied), (4, 1, 2));
     assert_eq!(result.next.as_deref(), Some(&b"cursor"[..]));
 }
 

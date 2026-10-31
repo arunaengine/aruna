@@ -610,3 +610,16 @@ fn record_kind_appended() {
     assert_eq!(postcard::to_allocvec(&RowKind::Folder).unwrap(), [1]);
     assert_eq!(postcard::to_allocvec(&RowKind::Record).unwrap(), [2]);
 }
+
+// A further source's path names exactly the file its READ check names: a segment a server
+// would trim or a repeated separator is refused.
+#[test]
+fn mirror_paths_canonical() {
+    assert_eq!(
+        mirror_path("/refseq/a.fna", None).as_deref(),
+        Ok("refseq/a.fna")
+    );
+    for bad in [" private/file", "private /file", "private//file", "a/../b"] {
+        assert!(mirror_path(bad, None).is_err(), "{bad}");
+    }
+}

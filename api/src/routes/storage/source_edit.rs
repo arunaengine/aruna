@@ -89,7 +89,8 @@ pub struct SourceEditResponse {
     pub kept_last: u64,
     /// Reference versions that kept their first source, as no checksums prove the next one.
     pub kept_unproven: u64,
-    /// Reference versions left alone, as the caller may not read their new source.
+    /// Reference versions left alone, as the caller may not read their new source or its
+    /// path is not canonical.
     pub denied: u64,
     /// Pass as `after` to continue; absent once every row was read.
     pub next: Option<String>,
@@ -189,7 +190,8 @@ async fn edit(
 
 **Authentication**: realm bearer token with WRITE on the bucket and READ on each new source path
 below the connector (`_sources/{connector_id}/...`). Tokens with path restrictions are refused.
-A version whose new source the caller may not read stays as it is and counts in `denied`.
+A version whose new source the caller may not read, or whose new path is not canonical (empty,
+`.` or `..` segments, or segments with outer spaces), stays as it is and counts in `denied`.
 
 **Behavior**
 - For each reference version, the first of its sources whose path starts with `from` gives the new

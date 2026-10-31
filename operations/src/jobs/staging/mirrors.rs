@@ -9,7 +9,7 @@ use std::collections::hash_map::Entry;
 use aruna_core::structs::execution::job::{StagingJobCheckpoint, StagingJobSpec};
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::SourceMirror;
-use aruna_core::structs::execution::table::source_path;
+use aruna_core::structs::execution::table::mirror_path;
 use aruna_core::structs::identity::auth::Permission;
 use ulid::Ulid;
 
@@ -49,7 +49,7 @@ pub(super) async fn add_mirrors(
                     })?)
                 }
             };
-            let path = source_path(&value, connector.base_url().as_deref()).and_then(|path| {
+            let path = mirror_path(&value, connector.base_url().as_deref()).and_then(|path| {
                 let allowed = connector_permission_path(spec, connector_id, &path);
                 match rules.allows(&allowed, &Permission::READ) {
                     true => Ok(path),
@@ -102,7 +102,7 @@ pub(super) async fn item_mirrors(
         };
         let connector = group_connector(ctx, spec, mapping.connector_id).await?;
         let path =
-            source_path(&value, connector.base_url().as_deref()).map_err(ItemFailure::Stage)?;
+            mirror_path(&value, connector.base_url().as_deref()).map_err(ItemFailure::Stage)?;
         let allowed = connector_permission_path(spec, mapping.connector_id, &path);
         if !rules.allows(&allowed, &Permission::READ) {
             return Err(ItemFailure::Denied("permission denied".to_string()));
