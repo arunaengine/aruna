@@ -5,6 +5,7 @@
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::data::identity::{DataIdentity, text_values};
+use aruna_core::structs::storage::data::link::DataLink;
 use serde_json::Value as JsonValue;
 use ulid::Ulid;
 
@@ -20,6 +21,8 @@ pub enum FilePlace {
     },
     /// Only a content hash; the local hash index names the object.
     Hash([u8; 32]),
+    /// A folder or a whole ordinary bucket of this node; every key below `prefix` belongs to it.
+    Prefix { bucket: String, prefix: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,8 +32,8 @@ pub struct DatasetFile {
     pub place: FilePlace,
 }
 
-/// The crate's file entities this node can serve, in graph order. Files of other nodes,
-/// of other realms and outside Aruna are left out.
+/// The crate's files, folders and buckets this node can serve, in graph order. Parts of other
+/// nodes, of other realms, of distributed buckets and outside Aruna are left out.
 pub fn dataset_files(rocrate: &JsonValue, realm_id: RealmId, node_id: NodeId) -> Vec<DatasetFile> {
     let Some(graph) = rocrate.get("@graph").and_then(JsonValue::as_array) else {
         return Vec::new();
@@ -40,7 +43,27 @@ pub fn dataset_files(rocrate: &JsonValue, realm_id: RealmId, node_id: NodeId) ->
         .filter_map(|entity| {
             let entity = entity.as_object()?;
             let entity_id = entity.get("@id")?.as_str()?;
-            if !is_file(entity.get("@type")?) {
+            let kind = entity.get("@type")?;
+            let name = entity
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string);
+            if let Some(DataLink::NodePrefix {
+                realm_id: realm,
+                node_id: node,
+                bucket,
+                prefix,
+            }) = DataLink::parse(entity_id)
+            {
+                return (realm == realm_id && node == node_id && is_part(kind)).then(|| {
+                    DatasetFile {
+                        entity_id: entity_id.to_string(),
+                        name,
+                        place: FilePlace::Prefix { bucket, prefix },
+                    }
+                });
+            }
+            if !is_file(kind) {
                 return None;
             }
             let identity = DataIdentity::read(entity_id, &text_values(entity.get("contentUrl")));
@@ -59,10 +82,6 @@ pub fn dataset_files(rocrate: &JsonValue, realm_id: RealmId, node_id: NodeId) ->
                 (None, None, Some(hash)) => FilePlace::Hash(hash),
                 (None, None, None) => return None,
             };
-            let name = entity
-                .get("name")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string);
             Some(DatasetFile {
                 entity_id: entity_id.to_string(),
                 name,
@@ -70,6 +89,16 @@ pub fn dataset_files(rocrate: &JsonValue, realm_id: RealmId, node_id: NodeId) ->
             })
         })
         .collect()
+}
+
+/// A `Dataset` (folder or bucket) or a file entity.
+fn is_part(kind: &JsonValue) -> bool {
+    let dataset = |value: &JsonValue| value.as_str() == Some("Dataset");
+    is_file(kind)
+        || dataset(kind)
+        || kind
+            .as_array()
+            .is_some_and(|kinds| kinds.iter().any(dataset))
 }
 
 #[cfg(test)]
@@ -95,9 +124,18 @@ mod tests {
             {"@id": arn(there), "@type": "File"},
             {"@id": "b.txt", "@type": "File", "contentUrl": "s3://data/in/b.txt"},
             {"@id": "https://example.org/c.txt", "@type": "File"},
+            {"@id": format!("arn:aruna:{realm}:{here}:s3/data/runs/"), "@type": "Dataset"},
+            {"@id": format!("arn:aruna:{realm}:{there}:s3/data/"), "@type": "Dataset"},
         ]});
         let files = dataset_files(&crate_json, realm, here);
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
+        assert_eq!(
+            files[2].place,
+            FilePlace::Prefix {
+                bucket: "data".into(),
+                prefix: "runs/".into(),
+            }
+        );
         assert_eq!(files[0].name.as_deref(), Some("A"));
         assert_eq!(
             files[0].place,
