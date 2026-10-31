@@ -68,6 +68,7 @@ use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use crate::staging::native_source::{body_stream, granted_read};
+use aruna_core::structs::storage::origin::SourcePin;
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.
 const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);
@@ -428,6 +429,7 @@ pub async fn load_direct_inputs(
     mounted: &BTreeSet<String>,
 ) -> Result<Vec<TaskInput>, JobError> {
     let mut files = Vec::with_capacity(spec.inputs.len());
+    let mut served = Vec::new();
     let mut total_bytes = 0u64;
     for input in spec
         .inputs
@@ -458,12 +460,44 @@ pub async fn load_direct_inputs(
                 "staged inputs need more than {total_bytes} bytes, the run requests {budget}"
             )));
         }
+        served.extend((staged.served_by).map(|pin| (input.dest_key.clone(), pin)));
         let stream = staged
             .blob
             .map(|chunk| chunk.map_err(std::io::Error::other));
         files.push(TaskInput::from_stream(source.path, size, Box::pin(stream)));
     }
+    record_served(context, record.job_id, served).await?;
     Ok(files)
+}
+
+/// Keeps which source delivered each staged reference input, for the run record.
+async fn record_served(
+    context: &DriverContext,
+    job_id: aruna_core::structs::execution::job::JobId,
+    served: Vec<(String, SourcePin)>,
+) -> Result<(), JobError> {
+    if served.is_empty() {
+        return Ok(());
+    }
+    let storage = &context.storage_handle;
+    let result = crate::jobs::store::mutate_job(storage, job_id, |record| {
+        let mut changed = false;
+        for (destination, pin) in &served {
+            let inputs = record.captured_inputs.iter_mut();
+            for input in inputs.filter(|input| &input.destination_key == destination) {
+                changed |= input.served_by.as_ref() != Some(pin);
+                input.served_by = Some(pin.clone());
+            }
+        }
+        Ok(match changed {
+            true => crate::jobs::store::JobMutation::Persist,
+            false => crate::jobs::store::JobMutation::Skip,
+        })
+    })
+    .await;
+    result
+        .map(|_| ())
+        .map_err(|error| JobError::retryable(format!("served sources not kept: {error}")))
 }
 
 /// The bytes of one input: the local copy when this node holds it, and the exact
@@ -1268,6 +1302,8 @@ struct StagedSource {
     blob: BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>>,
     location: Option<BackendLocation>,
     size: Option<u64>,
+    /// The source of a reference that delivered the bytes.
+    served_by: Option<SourcePin>,
 }
 
 impl StagedSource {
@@ -1279,6 +1315,7 @@ impl StagedSource {
                 .source_metadata
                 .as_ref()
                 .map(|metadata| metadata.content_length),
+            served_by: (get.served_source.as_ref()).map(|source| SourcePin::of(&source.descriptor)),
         }
     }
 }
@@ -1325,6 +1362,7 @@ async fn remote_source(
         blob: staged.blob,
         location: None,
         size: Some(captured.bytes),
+        served_by: None,
     })
 }
 
@@ -1352,6 +1390,7 @@ async fn granted_source(
         blob: body_stream(stream),
         location: None,
         size: Some(captured.bytes),
+        served_by: None,
     })
 }
 
@@ -1406,6 +1445,7 @@ async fn device_source(
             blob,
             location: None,
             size: Some(size),
+            served_by: None,
         }),
         Ok(BaoReadOutput::Metadata { .. }) => Err(JobError::retryable(format!(
             "staging {bucket}/{key} received no bytes"
@@ -2353,6 +2393,63 @@ mod tests {
         net.shutdown().await;
     }
 
+    // The source that served a staged reference input is kept on the stored record, where
+    // the run record reads it.
+    #[tokio::test]
+    async fn served_sources_kept() {
+        use aruna_core::structs::execution::job::{CapturedInput, InputContent};
+        let test_context = crate::tests::staging::setup_driver_context().await;
+        let context = &test_context.driver_context;
+        let realm_id = RealmId([1; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let mut record = JobRecord::new(
+            JobId::from_bytes([5; 16]),
+            JobPayload::Execution(spec(Vec::new())),
+            user_id,
+            node_id,
+            1,
+            1,
+            None,
+        );
+        record.captured_inputs.push(CapturedInput {
+            destination_key: "inputs/in.txt".to_string(),
+            source_node_id: node_id,
+            version_id: Ulid::from_bytes([6; 16]),
+            content: InputContent::Reference {
+                etag: None,
+                range_bound: false,
+            },
+            bytes: 3,
+            policies: Vec::new(),
+            source_group_id: Ulid::from_bytes([7; 16]),
+            public: false,
+            link: None,
+            source_pin: None,
+            served_by: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: true,
+            grant: None,
+        });
+        crate::jobs::store::insert_job(&context.storage_handle, &record)
+            .await
+            .unwrap();
+        let pin = SourcePin {
+            url: Some("https://mirror.example.org/in.txt".to_string()),
+            path: "in.txt".to_string(),
+            source_version: None,
+        };
+        let served = vec![("inputs/in.txt".to_string(), pin.clone())];
+        record_served(context, record.job_id, served).await.unwrap();
+        let stored =
+            crate::jobs::store::read_job_record(&context.storage_handle, record.job_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored.captured_inputs[0].served_by, Some(pin));
+    }
+
     #[tokio::test]
     async fn rejects_oversized_mounts() {
         // Fifty patterns are the issuance cap, so twenty-five mounted buckets
@@ -2471,6 +2568,7 @@ mod tests {
             releases: Vec::new(),
             releases_complete: false,
             grant: None,
+            served_by: None,
         });
 
         assert_eq!(

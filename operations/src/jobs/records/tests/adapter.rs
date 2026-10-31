@@ -174,6 +174,7 @@ async fn holds_bound_pages() {
             releases: Vec::new(),
             releases_complete: false,
             grant: None,
+            served_by: None,
         },
     );
     let (manifest, pages) = paginate(&[pair], PageEntries::Spec).expect("pages");

@@ -1453,6 +1453,7 @@ async fn recovery_reuses_credential() {
         releases: Vec::new(),
         releases_complete: false,
         grant: None,
+        served_by: None,
     };
     let scope = (RealmId([1; 32]), spec.group_id, local);
     let owner = crate::tests::access::seed_access(&ctx, scope, "/none")
