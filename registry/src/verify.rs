@@ -11,13 +11,22 @@ use url::Url;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BODY: usize = 64 * 1024;
 
-/// True only when the API and portal routes both serve exactly this signed descriptor.
-pub async fn verify_routes(egress: &EgressGuard, descriptor: &Signed<RealmDescriptor>) -> bool {
+/// The reasons the descriptor routes do not prove `descriptor`; none means verified.
+pub async fn verify_routes(
+    egress: &EgressGuard,
+    descriptor: &Signed<RealmDescriptor>,
+) -> Vec<String> {
     let Some((api, portal)) = descriptor_urls(&descriptor.payload) else {
-        return false;
+        return vec!["descriptor URLs are not valid federation URLs".to_string()];
     };
-    let (api, portal) = tokio::join!(fetch(egress, api), fetch(egress, portal));
-    api.as_ref() == Some(descriptor) && portal.as_ref() == Some(descriptor)
+    let (api_check, portal_check) = tokio::join!(
+        check(egress, api.clone(), descriptor),
+        check(egress, portal.clone(), descriptor)
+    );
+    [(api, api_check), (portal, portal_check)]
+        .into_iter()
+        .filter_map(|(url, check)| check.err().map(|reason| format!("{url}: {reason}")))
+        .collect()
 }
 
 fn descriptor_urls(descriptor: &RealmDescriptor) -> Option<(Url, Url)> {
@@ -37,25 +46,59 @@ fn descriptor_urls(descriptor: &RealmDescriptor) -> Option<(Url, Url)> {
     ))
 }
 
-async fn fetch(egress: &EgressGuard, url: Url) -> Option<Signed<RealmDescriptor>> {
+async fn check(
+    egress: &EgressGuard,
+    url: Url,
+    descriptor: &Signed<RealmDescriptor>,
+) -> Result<(), String> {
+    let served = fetch(egress, url).await?;
+    if served == *descriptor {
+        return Ok(());
+    }
+    if served.payload.realm_id != descriptor.payload.realm_id {
+        return Err("serves the descriptor of another realm".to_string());
+    }
+    Err(format!(
+        "serves another descriptor (issued_at {}, registered {})",
+        served.payload.issued_at, descriptor.payload.issued_at
+    ))
+}
+
+async fn fetch(egress: &EgressGuard, url: Url) -> Result<Signed<RealmDescriptor>, String> {
     let mut response = egress
         .request(url)
-        .ok()?
+        .map_err(|error| format!("refused by the egress policy: {error}"))?
         .timeout(FETCH_TIMEOUT)
         .send()
         .await
-        .ok()?;
+        .map_err(|error| format!("request failed: {}", error_chain(&error)))?;
     if !response.status().is_success() {
-        return None;
+        return Err(format!("answered {}", response.status()));
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("body failed: {}", error_chain(&error)))?
+    {
         if body.len() + chunk.len() > MAX_BODY {
-            return None;
+            return Err(format!("body exceeds {MAX_BODY} bytes"));
         }
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).ok()
+    serde_json::from_slice(&body).map_err(|error| format!("body is not a descriptor: {error}"))
+}
+
+/// The error with its sources, since reqwest keeps the connect cause in the chain.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 #[cfg(test)]
@@ -105,7 +148,7 @@ mod tests {
         let (listener, base) = bind().await;
         let descriptor = descriptor(&base);
         serve(listener, descriptor.clone(), Some(descriptor.clone()));
-        assert!(verify_routes(&guard(), &descriptor).await);
+        assert!(verify_routes(&guard(), &descriptor).await.is_empty());
     }
 
     #[tokio::test]
@@ -114,7 +157,12 @@ mod tests {
         let (listener, base) = bind().await;
         let descriptor = descriptor(&base);
         serve(listener, descriptor.clone(), None);
-        assert!(!verify_routes(&guard(), &descriptor).await);
+        let problems = verify_routes(&guard(), &descriptor).await;
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("aruna-realm: answered 404"),
+            "{problems:?}"
+        );
     }
 
     #[tokio::test]
@@ -123,7 +171,9 @@ mod tests {
         let (listener, base) = bind().await;
         let other = descriptor("https://other.example.org");
         serve(listener, other.clone(), Some(other));
-        assert!(!verify_routes(&guard(), &descriptor(&base)).await);
+        let problems = verify_routes(&guard(), &descriptor(&base)).await;
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("another descriptor"), "{problems:?}");
     }
 
     #[tokio::test]
@@ -133,6 +183,8 @@ mod tests {
         let descriptor = descriptor(&base);
         serve(listener, descriptor.clone(), Some(descriptor.clone()));
         let strict = EgressGuard::new(EgressPolicy::strict()).unwrap();
-        assert!(!verify_routes(&strict, &descriptor).await);
+        let problems = verify_routes(&strict, &descriptor).await;
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("egress policy"), "{problems:?}");
     }
 }
