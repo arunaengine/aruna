@@ -9,7 +9,7 @@ use aruna_core::password::{Kdf, PasswordHash};
 use aruna_core::structs::identity::auth::{AuthContext, SessionKind};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::share::{
-    ShareAction, ShareEvent, ShareLink, ShareMode, ShareTarget,
+    ShareAction, ShareEvent, ShareLink, ShareMode, ShareTarget, ShareUses,
 };
 use aruna_operations::auth::request_authorization::AuthorizeError;
 use aruna_operations::auth::request_policy::{
@@ -21,7 +21,7 @@ use aruna_operations::shares::lifecycle::{
 };
 use aruna_operations::shares::rules::required_permission;
 use aruna_operations::shares::store::{
-    GetShareOperation, ListSharesOperation, ShareEventsOperation,
+    GetShareOperation, ListSharesOperation, ReadUsesOperation, ShareEventsOperation,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -163,6 +163,11 @@ pub struct ShareInfo {
     pub password: bool,
     pub revoked_at: Option<String>,
     pub status: ShareStatus,
+    /// Downloads and uploads through the link, counted as they are logged.
+    pub downloads: u64,
+    pub uploads: u64,
+    /// The last open, download or upload; absent while the link was never used.
+    pub last_access_at: Option<String>,
 }
 
 /// A link and the token its URL carries in the fragment: `/s/<node>#<token>`.
@@ -215,7 +220,7 @@ pub(crate) fn rfc3339(secs: u64) -> String {
         .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-pub(crate) fn share_info(link: &ShareLink, now: u64) -> ShareInfo {
+pub(crate) fn share_info(link: &ShareLink, uses: ShareUses, now: u64) -> ShareInfo {
     let status = match (link.revoked_at, link.active(now)) {
         (Some(_), _) => ShareStatus::Revoked,
         (None, true) => ShareStatus::Active,
@@ -231,7 +236,22 @@ pub(crate) fn share_info(link: &ShareLink, now: u64) -> ShareInfo {
         password: link.password.is_some(),
         revoked_at: link.revoked_at.map(rfc3339),
         status,
+        downloads: uses.downloads,
+        uploads: uses.uploads,
+        last_access_at: uses.last_access_at.map(|at| {
+            DateTime::<Utc>::from_timestamp_millis(at as i64)
+                .unwrap_or_default()
+                .to_rfc3339_opts(SecondsFormat::Millis, true)
+        }),
     }
+}
+
+/// The use counters of `links`, in order.
+async fn link_uses(state: &ServerState, links: &[ShareLink]) -> ServerResult<Vec<ShareUses>> {
+    let ids = links.iter().map(|link| link.id).collect();
+    drive(ReadUsesOperation::new(ids), &state.get_ctx())
+        .await
+        .map_err(store_error)
 }
 
 fn store_error(error: impl std::fmt::Display) -> ServerError {
@@ -370,7 +390,7 @@ The caller needs READ on the target, or WRITE for `read_upload` and `upload`.
         })
     ),
     responses(
-        (status = 201, description = "The link and its token", body = ShareDetails, example = json!({"share": {"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active"}, "token": "01JSHARE0123456789ABCDEFGH.<link-secret-shown-to-the-owner-only>"})),
+        (status = 201, description = "The link and its token", body = ShareDetails, example = json!({"share": {"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active", "downloads": 12, "uploads": 0, "last_access_at": "2026-10-31T10:00:00.000Z"}, "token": "01JSHARE0123456789ABCDEFGH.<link-secret-shown-to-the-owner-only>"})),
         (status = 400, description = "Malformed target, upload mode on an object or dataset, an expiry in the past, or a label or password that is too long", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller lacks access to the target, holds a restricted, assistant or federated session, or a policy denies the link", body = ErrorResponse),
@@ -433,7 +453,7 @@ pub async fn create_share(
         .map_err(share_error)?;
     tracing::info!(share_id = %link.id, "Created share link");
     let details = ShareDetails {
-        share: share_info(&link, now),
+        share: share_info(&link, ShareUses::default(), now),
         token: link.link_token(),
     };
     Ok((StatusCode::CREATED, Json(details)))
@@ -448,9 +468,12 @@ pub async fn create_share(
 
 **Authentication**: realm bearer token without path restrictions.
 
-**Behavior**: tokens are not listed; read one link to copy its token again."#,
+**Behavior**
+- Tokens are not listed; read one link to copy its token again.
+- `downloads`, `uploads` and `last_access_at` are counted with each access log entry, so the
+  list needs no log reads."#,
     responses(
-        (status = 200, description = "The caller's links", body = ShareList, example = json!({"shares": [{"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active"}]})),
+        (status = 200, description = "The caller's links", body = ShareList, example = json!({"shares": [{"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active", "downloads": 12, "uploads": 0, "last_access_at": "2026-10-31T10:00:00.000Z"}]})),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is restricted or belongs to another realm", body = ErrorResponse)
     ),
@@ -464,8 +487,13 @@ pub async fn list_shares(
     let links = drive(ListSharesOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(store_error)?;
+    let uses = link_uses(&state, &links).await?;
     let now = unix_now();
-    let shares = links.iter().map(|link| share_info(link, now)).collect();
+    let shares = links
+        .iter()
+        .zip(uses)
+        .map(|(link, uses)| share_info(link, uses, now))
+        .collect();
     Ok(Json(ShareList { shares }))
 }
 
@@ -480,7 +508,7 @@ pub async fn list_shares(
 link, every other caller gets 404."#,
     params(("id" = String, Path, description = "Share link id")),
     responses(
-        (status = 200, description = "The link and its token", body = ShareDetails, example = json!({"share": {"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active"}, "token": "01JSHARE0123456789ABCDEFGH.<link-secret-shown-to-the-owner-only>"})),
+        (status = 200, description = "The link and its token", body = ShareDetails, example = json!({"share": {"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active", "downloads": 12, "uploads": 0, "last_access_at": "2026-10-31T10:00:00.000Z"}, "token": "01JSHARE0123456789ABCDEFGH.<link-secret-shown-to-the-owner-only>"})),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No link of the caller has this id", body = ErrorResponse)
@@ -494,8 +522,10 @@ pub async fn get_share(
 ) -> ServerResult<Json<ShareDetails>> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let link = own_share(&state, &auth, &id).await?;
+    let uses = link_uses(&state, std::slice::from_ref(&link)).await?;
+    let uses = uses.first().copied().unwrap_or_default();
     Ok(Json(ShareDetails {
-        share: share_info(&link, unix_now()),
+        share: share_info(&link, uses, unix_now()),
         token: link.link_token(),
     }))
 }

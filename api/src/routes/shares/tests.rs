@@ -576,3 +576,39 @@ async fn ticket_ends_with_visit() {
     .unwrap();
     assert_eq!(ticket.expires_at, rfc3339(visit_end));
 }
+
+#[tokio::test]
+async fn owner_sees_use_counts() {
+    let node = node_state().await;
+    put_text(&node, "drop/a.txt", "alpha").await;
+    let link = create(
+        &node,
+        &node.owner,
+        folder_request("drop/", ShareModeBody::ReadUpload),
+    )
+    .await
+    .unwrap();
+    assert_eq!((link.share.downloads, link.share.uploads), (0, 0));
+    assert!(link.share.last_access_at.is_none());
+    let visit = open(&node, &link.token, None).await.unwrap();
+    download(&node, &visit, "a.txt").await.unwrap();
+    download(&node, &visit, "a.txt").await.unwrap();
+    upload(&node, &visit, "b.txt", "beta").await.unwrap();
+    let Json(listed) = list_shares(
+        State(node.state.clone()),
+        Extension(Some(node.owner.clone())),
+    )
+    .await
+    .unwrap();
+    let share = &listed.shares[0];
+    assert_eq!((share.downloads, share.uploads), (2, 1));
+    assert!(share.last_access_at.is_some());
+    let Json(details) = get_share(
+        State(node.state.clone()),
+        Extension(Some(node.owner.clone())),
+        Path(link.share.id.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!((details.share.downloads, details.share.uploads), (2, 1));
+}
