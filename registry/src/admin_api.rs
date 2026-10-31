@@ -267,3 +267,232 @@ async fn audit(
     let records: Vec<AuditRecord> = state.store.audit(&admin_realm(&realm_id)?)?;
     Ok(private(records))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::RealmStatus;
+    use crate::store::Store;
+    use crate::store::tests::{named_registration, realm_id, registration};
+    use aruna_blob::egress::EgressGuard;
+    use aruna_core::egress::EgressPolicy;
+    use aruna_core::structs::identity::auth::NodeCapabilities;
+    use axum::body::Body;
+    use axum::http::Request;
+    use ed25519_dalek::SigningKey;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "test-admin-token-0123456789abcdef";
+
+    fn state(dir: &std::path::Path, auth: AdminAuth) -> Arc<RegistryState> {
+        let egress = EgressGuard::new(EgressPolicy::strict()).unwrap();
+        Arc::new(RegistryState::new(Store::open(dir).unwrap(), egress).with_admin(auth))
+    }
+
+    fn register(state: &RegistryState, name: &str, issued_at: u64) {
+        let mut entry = Entry {
+            registration: registration("https://realm.example.org", issued_at),
+            received_at: issued_at,
+            verified: false,
+            problems: vec![
+                "https://realm.example.org/.well-known/aruna-realm: answered 404".into(),
+            ],
+        };
+        entry.registration.payload.descriptor.payload.name = name.to_string();
+        state
+            .store
+            .register(&realm_id(), &entry, issued_at)
+            .unwrap();
+    }
+
+    async fn call(
+        state: &Arc<RegistryState>,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder().method(method).uri(path);
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let body = match body {
+            Some(body) => {
+                request = request.header(header::CONTENT_TYPE, "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = crate::router(state.clone())
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into()));
+        (status, value)
+    }
+
+    #[test]
+    fn short_token_refused() {
+        assert!(matches!(
+            AdminAuth::token("short"),
+            Err(AuthSetupError::ShortToken)
+        ));
+        assert!(AdminAuth::token(TOKEN).unwrap().enabled());
+    }
+
+    #[tokio::test]
+    async fn admin_needs_token() {
+        // Without a configured token every admin route is absent; with one, only it passes.
+        let (dir, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let disabled = state(other.path(), AdminAuth::Disabled);
+        let (status, _) = call(&disabled, "GET", "/v1/admin/realms", Some(TOKEN), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let state = state(dir.path(), AdminAuth::token(TOKEN).unwrap());
+        for token in [
+            None,
+            Some("wrong"),
+            Some("test-admin-token-0123456789abcdeX"),
+        ] {
+            let (status, _) = call(&state, "GET", "/v1/admin/whoami", token, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{token:?}");
+        }
+        let (status, admin) = call(&state, "GET", "/v1/admin/whoami", Some(TOKEN), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(admin["method"], "token");
+        let path = format!("/v1/admin/realms/{}", realm_id());
+        let body = serde_json::json!({"status": "approved", "namespace": null, "note": ""});
+        let (status, _) = call(&state, "PUT", &path, Some("wrong"), Some(body)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_changes_audited() {
+        // A change is stored with an audit record and shapes the public listing.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), AdminAuth::token(TOKEN).unwrap());
+        let now = unix_timestamp_secs();
+        let path = format!("/v1/admin/realms/{}", realm_id());
+        let approve =
+            serde_json::json!({"status": "approved", "namespace": "giessen", "note": "v3"});
+        let (status, _) = call(&state, "PUT", &path, Some(TOKEN), Some(approve.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "unknown realms have no admin state"
+        );
+        register(&state, "Realm", now);
+        let (status, stored) = call(&state, "PUT", &path, Some(TOKEN), Some(approve)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored["namespace"], "giessen");
+        let (_, listed) = call(&state, "GET", "/v1/realms", None, None).await;
+        assert_eq!(listed[0]["status"], "approved");
+        let (_, admin) = call(&state, "GET", "/v1/admin/realms", Some(TOKEN), None).await;
+        assert_eq!(admin[0]["admin"]["status"], "approved");
+        assert_eq!(admin[0]["verified"], false);
+        assert!(
+            admin[0]["problems"][0]
+                .as_str()
+                .unwrap()
+                .contains("answered 404")
+        );
+        let hide = serde_json::json!({"status": "hidden", "namespace": "giessen", "note": "spam"});
+        call(&state, "PUT", &path, Some(TOKEN), Some(hide)).await;
+        let (_, listed) = call(&state, "GET", "/v1/realms", None, None).await;
+        assert_eq!(listed, serde_json::json!([]));
+        let (_, records) = call(&state, "GET", &format!("{path}/audit"), Some(TOKEN), None).await;
+        assert_eq!(records.as_array().unwrap().len(), 2);
+        assert_eq!(records[0]["before"]["status"], "listed");
+        assert_eq!(records[1]["after"]["status"], "hidden");
+        assert_eq!(records[1]["actor"], TOKEN_ACTOR);
+        assert!(!records.to_string().contains(TOKEN));
+    }
+
+    #[tokio::test]
+    async fn retired_refused_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), AdminAuth::token(TOKEN).unwrap());
+        register(&state, "Realm", unix_timestamp_secs());
+        let path = format!("/v1/admin/realms/{}", realm_id());
+        let retire = serde_json::json!({"status": "retired", "namespace": null, "note": ""});
+        call(&state, "PUT", &path, Some(TOKEN), Some(retire)).await;
+        let back = serde_json::json!({"status": "listed", "namespace": null, "note": ""});
+        let (status, _) = call(&state, "PUT", &path, Some(TOKEN), Some(back)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            state.store.admin(&realm_id()).unwrap().status,
+            RealmStatus::Retired
+        );
+    }
+
+    #[tokio::test]
+    async fn renames_keep_admin() {
+        // A realm's own renames are recorded as name history and never touch its admin state.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), AdminAuth::token(TOKEN).unwrap());
+        let now = unix_timestamp_secs();
+        register(&state, "Old name", now - 20);
+        let path = format!("/v1/admin/realms/{}", realm_id());
+        let approve = serde_json::json!({"status": "approved", "namespace": null, "note": ""});
+        call(&state, "PUT", &path, Some(TOKEN), Some(approve)).await;
+        register(&state, "Old name", now - 10);
+        register(&state, "New name", now);
+        let (_, admin) = call(&state, "GET", "/v1/admin/realms", Some(TOKEN), None).await;
+        let names: Vec<&str> = admin[0]["names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Old name", "New name"]);
+        assert_eq!(admin[0]["names"][1]["since"], now);
+        assert_eq!(admin[0]["admin"]["status"], "approved");
+    }
+
+    #[tokio::test]
+    async fn signed_rename_propagates() {
+        // A renewal signed by the realm key renames the entry; another key is refused.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), AdminAuth::token(TOKEN).unwrap());
+        let now = unix_timestamp_secs();
+        // A private address literal fails verification at once, without any lookup.
+        let base = "https://10.0.0.5";
+        let path = format!("/v1/realms/{}", realm_id());
+        let first = serde_json::to_value(named_registration(base, "Old", now - 1)).unwrap();
+        let (status, _) = call(&state, "PUT", &path, None, Some(first)).await;
+        assert_eq!(status, StatusCode::OK);
+        let renamed = serde_json::to_value(named_registration(base, "New", now)).unwrap();
+        let (status, listing) = call(&state, "PUT", &path, None, Some(renamed)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listing["registration"]["payload"]["descriptor"]["payload"]["name"],
+            "New"
+        );
+        let other = NodeCapabilities::management_node(SigningKey::from_bytes(&[8; 32])).unwrap();
+        let mut forged = named_registration(base, "Taken over", now + 1).payload;
+        forged.descriptor = Signed::sign(forged.descriptor.payload, &other).unwrap();
+        let forged = serde_json::to_value(Signed::sign(forged, &other).unwrap()).unwrap();
+        let (status, _) = call(&state, "PUT", &path, None, Some(forged)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let names = state.store.names(&realm_id()).unwrap();
+        let names: Vec<&str> = names.iter().map(|record| record.name.as_str()).collect();
+        assert_eq!(names, ["Old", "New"]);
+    }
+
+    #[tokio::test]
+    async fn page_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), AdminAuth::Disabled);
+        let response = crate::router(state)
+            .oneshot(Request::get("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let policy = &response.headers()[header::CONTENT_SECURITY_POLICY];
+        assert!(policy.to_str().unwrap().contains("script-src 'self'"));
+    }
+}
