@@ -29,7 +29,7 @@ use aruna_operations::s3::object::get::{
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::list::{ListBucketInput, ListBucketOperation, ListedObject};
 use aruna_operations::s3::object::put::{
-    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use bytes::Bytes;
@@ -1041,13 +1041,51 @@ pub(crate) async fn store_text(
     input: WriteObjectInput,
     tags: HashMap<String, String>,
 ) -> Result<WriteObjectOutput, crate::error::ServerError> {
-    use crate::error::ServerError;
-    let internal = |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string());
     let size = input.text.len();
     let content_type = input
         .content_type
         .clone()
         .unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
+    let body = BackendStream::new(stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(
+        input.text.into_bytes(),
+    ))]));
+    let metadata = tags
+        .into_iter()
+        .chain([(CONTENT_TYPE_KEY.to_string(), content_type.clone())])
+        .collect();
+    let result = store_stream(
+        state,
+        auth,
+        bucket_info,
+        (&input.bucket, &input.key),
+        (body, Some(size as u64)),
+        metadata,
+    )
+    .await?;
+    Ok(WriteObjectOutput {
+        bucket: input.bucket,
+        key: input.key,
+        version_id: result.version_id.to_string(),
+        size: result.location.blob_size,
+        content_type,
+    })
+}
+
+/// Stores `body` as a new version of `key` with the caller's quota, routing and restrictions,
+/// then queues replication like every other write.
+pub(crate) async fn store_stream(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+    bucket_info: &BucketInfo,
+    (bucket, key): (&str, &str),
+    (body, content_length): (
+        BackendStream<Result<Bytes, aruna_core::stream::StreamError>>,
+        Option<u64>,
+    ),
+    metadata: HashMap<String, String>,
+) -> Result<PutObjectResult, crate::error::ServerError> {
+    use crate::error::ServerError;
+    let internal = |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string());
     let realm = drive(
         GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
@@ -1061,18 +1099,15 @@ pub(crate) async fn store_text(
     let gate = gate_context(&state.get_ctx(), state.get_realm_id(), now_ms())
         .await
         .map_err(|error| internal(&error))?;
-    let body = BackendStream::new(stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(
-        input.text.into_bytes(),
-    ))]));
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: auth.user_id,
         group_id: bucket_info.group_id,
         realm_id: state.get_realm_id(),
         node_id: state.get_node_id(),
         request: PutObjectInput {
-            bucket: input.bucket.clone(),
-            key: input.key.clone(),
-            content_length: Some(size as u64),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            content_length,
             body: Some(body),
         },
         expected_checksums: Vec::new(),
@@ -1084,11 +1119,7 @@ pub(crate) async fn store_text(
         routing,
     })
     .with_rocrate_limits(state.rocrate_limits().clone())
-    .with_metadata(
-        tags.into_iter()
-            .chain([(CONTENT_TYPE_KEY.to_string(), content_type.clone())])
-            .collect(),
-    )
+    .with_metadata(metadata)
     .with_restrictions(auth.path_restrictions.clone());
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
@@ -1102,19 +1133,13 @@ pub(crate) async fn store_text(
         state.get_node_id(),
         auth.clone(),
         bucket_info.group_id,
-        input.bucket.clone(),
-        input.key.clone(),
+        bucket.to_string(),
+        key.to_string(),
         result.version_id,
         result.location.blob_size,
     )
     .await;
-    Ok(WriteObjectOutput {
-        bucket: input.bucket,
-        key: input.key,
-        version_id: result.version_id.to_string(),
-        size: result.location.blob_size,
-        content_type,
-    })
+    Ok(result)
 }
 
 fn object_error(error: crate::error::ServerError, action: &str) -> CallToolResult {
