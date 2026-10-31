@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::endpoint_screening;
 use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET;
+use aruna_core::structs::execution::source_access::{SOURCE_WEIGHT, source_weight};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use thiserror::Error;
 
@@ -43,6 +44,8 @@ pub enum ValidationError {
     EmptySecretValue { key: String },
     #[error("public config key `{key}` must be `true` or `false`")]
     InvalidBoolValue { key: String },
+    #[error("public config key `{SOURCE_WEIGHT}` must be a positive number")]
+    InvalidWeight,
     #[error("endpoint must be spelled as the http client parses it")]
     AmbiguousEndpoint,
     #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
@@ -114,6 +117,10 @@ pub fn validate_connector_input(
         }
     }
 
+    if public_config.contains_key(SOURCE_WEIGHT) && source_weight(public_config).is_none() {
+        return Err(ValidationError::InvalidWeight);
+    }
+
     for key in rules.required_public_keys {
         if !public_config.contains_key(*key) {
             return Err(ValidationError::PublicKeyMissing {
@@ -164,17 +171,24 @@ pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorRules {
     match kind {
         SourceConnectorKind::Http => SourceConnectorRules {
             required_public_keys: &["endpoint"],
-            allowed_public_keys: &["endpoint", "root"],
+            allowed_public_keys: &["endpoint", "root", SOURCE_WEIGHT],
             allowed_secret_keys: &["username", "password", "token"],
         },
         SourceConnectorKind::S3 => SourceConnectorRules {
             required_public_keys: &["bucket", "endpoint"],
-            allowed_public_keys: &["bucket", "endpoint", "region", "root", S3_SKIP_SIGNATURE],
+            allowed_public_keys: &[
+                "bucket",
+                "endpoint",
+                "region",
+                "root",
+                S3_SKIP_SIGNATURE,
+                SOURCE_WEIGHT,
+            ],
             allowed_secret_keys: &["access_key_id", "secret_access_key"],
         },
         SourceConnectorKind::Webdav => SourceConnectorRules {
             required_public_keys: &["endpoint"],
-            allowed_public_keys: &["endpoint", "root"],
+            allowed_public_keys: &["endpoint", "root", SOURCE_WEIGHT],
             allowed_secret_keys: &["username", "password", "token"],
         },
         SourceConnectorKind::Ftp => SourceConnectorRules {
@@ -422,6 +436,28 @@ mod pure_tests {
                 key: S3_SKIP_SIGNATURE.to_string(),
             }
         );
+    }
+
+    #[test]
+    fn checks_source_weight() {
+        let config = |weight: &str| {
+            HashMap::from([
+                ("endpoint".to_string(), "https://example.org".to_string()),
+                (SOURCE_WEIGHT.to_string(), weight.to_string()),
+            ])
+        };
+        let none = HashMap::new();
+        let validate = |weight| {
+            validate_connector_input("mirror", SourceConnectorKind::Http, &config(weight), &none)
+        };
+        assert_eq!(validate("2.5"), Ok(()));
+        for weight in ["0", "-1", "NaN", "inf", "fast"] {
+            assert_eq!(
+                validate(weight),
+                Err(ValidationError::InvalidWeight),
+                "{weight}"
+            );
+        }
     }
 
     #[test]
