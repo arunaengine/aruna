@@ -618,7 +618,10 @@ async fn empty_objects(
         ))
         .await
         {
-            Ok(()) => {}
+            Ok(()) => {
+                next.items_current = next.items_current.saturating_add(1);
+                next.items_succeeded = next.items_succeeded.saturating_add(1);
+            }
             Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
                 record_failure(next, "", &entry.target, message)
             }

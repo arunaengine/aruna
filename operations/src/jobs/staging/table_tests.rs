@@ -734,7 +734,8 @@ async fn record_rows_trusted() {
         .ok()
         .unwrap();
 
-    fixture.run(41).await;
+    // The empty row counts as imported, like the row with a source.
+    assert_eq!(fixture.run(41).await, (2, 0));
     assert!(site.requests.lock().unwrap().is_empty());
     let observation = fixture.observation("coli/sums.txt").await;
     let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_401_101);
