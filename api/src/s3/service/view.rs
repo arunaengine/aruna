@@ -3,11 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::compute::CACHE_MANIFEST_KEY;
 use aruna_core::structs::execution::job::{JobId, JobRecord};
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::jobs::workflow::input_view::{
-    MAX_VIEW_KEYS, ViewEntry, ViewError, ViewFrom, decode_token, encode_token, head_entry,
-    list_shown, read_entry, view_bucket, view_entries,
+    MAX_VIEW_KEYS, ViewEntry, ViewError, ViewFrom, cache_manifest, cached_keys, decode_token,
+    encode_token, head_entry, list_shown, read_entry, view_bucket, view_entries,
 };
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::visible::{is_sealed, open_cursor, seal_cursor};
@@ -73,6 +74,29 @@ impl ArunaS3Service {
             )),
             _ => Ok(entry),
         }
+    }
+
+    /// The run's cache manifest and its ETag. It names only inputs the creator may still read,
+    /// since a worker cache serves them without another read here.
+    async fn view_manifest(
+        &self,
+        record: &JobRecord,
+        entries: &[ViewEntry],
+    ) -> S3Result<(bytes::Bytes, String)> {
+        let cached = cached_keys(&self.state, entries, self.node_id)
+            .await
+            .map_err(view_error)?;
+        if cached.is_empty() {
+            return Err(s3_error!(NoSuchKey, "The specified key does not exist."));
+        }
+        for entry in entries.iter().filter(|entry| cached.contains(&entry.key)) {
+            head_entry(&self.state, record, entry, self.node_id)
+                .await
+                .map_err(view_error)?;
+        }
+        let body = cache_manifest(entries, &cached);
+        let etag = blake3::hash(&body).to_hex().to_string();
+        Ok((bytes::Bytes::from(body), etag))
     }
 
     fn view_modified(record: &JobRecord) -> Timestamp {
@@ -190,6 +214,16 @@ impl ArunaS3Service {
         input: HeadObjectInput,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let (record, entries) = self.view_record(view).await?;
+        if input.key == CACHE_MANIFEST_KEY {
+            let (body, etag) = self.view_manifest(&record, &entries).await?;
+            return Ok(S3Response::new(HeadObjectOutput {
+                content_length: i64::try_from(body.len()).ok(),
+                content_type: Some("application/json".to_string()),
+                e_tag: Some(ETag::Strong(etag)),
+                last_modified: Some(Self::view_modified(&record)),
+                ..Default::default()
+            }));
+        }
         let entry = Self::view_entry(&entries, &input.key, input.version_id.as_deref())?;
         if !matches(input.if_match.as_ref(), entry) {
             return Err(s3_error!(PreconditionFailed, "The ETag does not match"));
@@ -213,6 +247,20 @@ impl ArunaS3Service {
         input: GetObjectInput,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let (record, entries) = self.view_record(view).await?;
+        if input.key == CACHE_MANIFEST_KEY {
+            if input.range.is_some() {
+                return Err(s3_error!(NotImplemented, "The file list is read whole"));
+            }
+            let (body, etag) = self.view_manifest(&record, &entries).await?;
+            return Ok(S3Response::new(GetObjectOutput {
+                content_length: i64::try_from(body.len()).ok(),
+                content_type: Some("application/json".to_string()),
+                e_tag: Some(ETag::Strong(etag)),
+                last_modified: Some(Self::view_modified(&record)),
+                body: Some(StreamingBlob::from(body)),
+                ..Default::default()
+            }));
+        }
         let entry = Self::view_entry(&entries, &input.key, input.version_id.as_deref())?;
         if !matches(input.if_match.as_ref(), entry) {
             return Err(s3_error!(PreconditionFailed, "The ETag does not match"));

@@ -3,15 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use aruna_core::NodeId;
+use aruna_core::compute::CACHE_MANIFEST_KEY;
+use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
     CapturedInput, InputContent, InputMode, InputSelection, InputSource, JobId, JobPayload,
     JobRecord, credential_job_id,
 };
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -19,6 +23,7 @@ use futures_util::future::BoxFuture;
 use thiserror::Error;
 
 use crate::driver::{DriverContext, drive};
+use crate::jobs::key_wake::read_row;
 use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION, SourceReadError, authorize_read};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
@@ -106,6 +111,75 @@ pub fn view_entries(record: &JobRecord) -> Result<Vec<ViewEntry>, ViewError> {
     }
     entries.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(entries)
+}
+
+/// The keys of entries a worker cache may keep after the run: stored copies on this node with
+/// no placement policy, from buckets that do not encrypt, under keys KubeDAL reads as written.
+pub async fn cached_keys(
+    context: &DriverContext,
+    entries: &[ViewEntry],
+    local: NodeId,
+) -> Result<BTreeSet<String>, ViewError> {
+    let mut keys = BTreeSet::new();
+    if entries.iter().any(|entry| entry.key == CACHE_MANIFEST_KEY) {
+        return Ok(keys);
+    }
+    let mut encrypted: BTreeMap<&str, bool> = BTreeMap::new();
+    for entry in entries {
+        let captured = &entry.captured;
+        let candidate = captured.content.blake3().is_some()
+            && captured.source_node_id == local
+            && captured.policies.is_empty()
+            && captured.link.is_none()
+            && exact_key(&entry.key);
+        if !candidate {
+            continue;
+        }
+        let (bucket, _) = source_of(entry);
+        let sealed = match encrypted.get(bucket) {
+            Some(sealed) => *sealed,
+            None => {
+                let row = bucket.as_bytes().to_vec();
+                let row = read_row(&context.storage_handle, BUCKET_ENCRYPTION_KEYSPACE, row)
+                    .await
+                    .map_err(ViewError::Unavailable)?;
+                let settings = BucketEncryption::from_row(row.as_deref())
+                    .map_err(|error| ViewError::Unavailable(error.to_string()))?;
+                *encrypted.entry(bucket).or_insert(settings.is_encrypted())
+            }
+        };
+        if !sealed {
+            keys.insert(entry.key.clone());
+        }
+    }
+    Ok(keys)
+}
+
+/// Whether storage reads `key` exactly as written: no white space at its ends, no empty, "."
+/// or ".." parts. KubeDAL refuses a file list with any other key.
+fn exact_key(key: &str) -> bool {
+    key.trim() == key
+        && key
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// The KubeDAL file list of the cached entries, each checked against its BLAKE3 and size.
+pub fn cache_manifest(entries: &[ViewEntry], cached: &BTreeSet<String>) -> Vec<u8> {
+    let files = entries
+        .iter()
+        .filter(|entry| cached.contains(&entry.key))
+        .filter_map(|entry| {
+            let blake3 = entry.captured.content.blake3()?;
+            Some(serde_json::json!({
+                "path":entry.key,
+                "source":entry.key,
+                "blake3":hex::encode(blake3),
+                "size":entry.captured.bytes
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({"version":1,"files":files})).unwrap_or_default()
 }
 
 /// Where a view page resumes: after a marker, or among hidden entries after the last one
@@ -567,6 +641,69 @@ mod tests {
         assert_eq!(view_job(&access, &view_bucket(job)), Some(job));
         assert_eq!(view_job(&access, "in-other"), None);
         assert_eq!(view_job("AKIAOTHER", &view_bucket(job)), None);
+    }
+
+    #[tokio::test]
+    async fn caches_plain_local_copies() {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::structs::storage::encryption::EncryptionMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = DriverContext {
+            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let locked = BucketEncryption {
+            mode: EncryptionMode::NodeManaged,
+            bucket_id: Some(Ulid::from_parts(3, 3)),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let effect = StorageEffect::Write {
+            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            key: b"locked".to_vec().into(),
+            value: locked.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(effect).await;
+        let local = entry("a").captured.source_node_id;
+        let mut sealed = entry("sealed");
+        sealed.input.source = InputSource::S3 {
+            bucket: "locked".to_string(),
+            key: "sealed".to_string(),
+            version_id: None,
+        };
+        let mut remote = entry("remote");
+        remote.captured.source_node_id = iroh::SecretKey::from_bytes(&[9; 32]).public();
+        let mut reference = entry("reference");
+        reference.captured.content = InputContent::Reference {
+            etag: None,
+            range_bound: true,
+        };
+        let entries = [entry("a"), sealed, remote, reference, entry("b ")];
+
+        let keys = cached_keys(&context, &entries, local).await.unwrap();
+        assert_eq!(keys, BTreeSet::from(["a".to_string()]));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&cache_manifest(&entries, &keys)).unwrap();
+        let file = serde_json::json!({
+            "path":"a","source":"a","blake3":hex::encode([1; 32]),"size":1
+        });
+        assert_eq!(manifest, serde_json::json!({"version":1,"files":[file]}));
+
+        // An input at the manifest key turns the cache off for the whole run.
+        let taken = [entry("a"), entry(CACHE_MANIFEST_KEY)];
+        assert!(
+            cached_keys(&context, &taken, local)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

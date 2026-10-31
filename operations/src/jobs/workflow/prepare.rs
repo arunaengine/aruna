@@ -17,7 +17,7 @@ use aruna_core::structs::execution::job::{ExecutionSpec, JobError, JobRecord, Wo
 use super::DEFAULT_WALLTIME;
 use crate::driver::DriverContext;
 use crate::jobs::lifecycle::ids::session_of;
-use crate::jobs::workflow::input_view::{view_bucket, view_entries};
+use crate::jobs::workflow::input_view::{cached_keys, view_bucket, view_entries};
 use crate::jobs::workflow::workspace::{
     check_workspace_bucket, ensure_group_write, load_direct_inputs, mint_input_credential,
     mint_workspace_credential,
@@ -129,12 +129,16 @@ async fn prepare_inputs(
         });
     }
     let view = view_bucket(record.job_id);
+    let cached = Box::pin(cached_keys(context, &entries, node_id))
+        .await
+        .map_err(|error| JobError::retryable(error.to_string()))?;
     let mounts = entries
         .iter()
         .map(|entry| S3Mount {
             bucket: view.clone(),
             key: entry.key.clone(),
             path: entry.input.container_path.clone().unwrap_or_default(),
+            cached: cached.contains(&entry.key),
         })
         .collect();
     let mut secrets = BTreeMap::new();
