@@ -10,6 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::source_access::SourceDigest;
+use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::identifier::{CompiledParser, Identifier};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
@@ -47,6 +48,28 @@ pub struct SourceView {
     pub version: Option<String>,
     pub etag: Option<String>,
     pub digests: Vec<(ChecksumAlgorithm, SourceDigest)>,
+    /// Every source of the version, equal ones; the first is the one above.
+    pub sources: Vec<SourcePlace>,
+}
+
+/// Where one source of a version reads the bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourcePlace {
+    pub url: Option<String>,
+    pub path: String,
+    /// This node's connector the source reads through; `None` for a public or native source.
+    pub connector_id: Option<Ulid>,
+}
+
+fn places(source: &VersionSourceBinding) -> Vec<SourcePlace> {
+    (0..source.source_count())
+        .filter_map(|slot| source.source_at(slot))
+        .map(|single| SourcePlace {
+            url: public_source_url(&single.descriptor),
+            path: single.descriptor.source_path,
+            connector_id: single.connector_id,
+        })
+        .collect()
 }
 
 /// Everything file readers see about one version's origin.
@@ -173,6 +196,7 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
                 .iter()
                 .map(|(algorithm, digest)| (*algorithm, digest.clone()))
                 .collect(),
+            sources: places(source),
         }),
         BlobVersionState::Materialized {
             source: Some(source),
@@ -187,6 +211,7 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
             version: source.descriptor.version_selector.clone(),
             etag: None,
             digests: Vec::new(),
+            sources: places(source),
         }),
         _ => None,
     };

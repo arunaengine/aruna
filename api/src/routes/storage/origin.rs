@@ -119,6 +119,18 @@ pub struct SourceBody {
     pub path: String,
     pub etag: Option<String>,
     pub digests: Vec<SourceDigestBody>,
+    /// Every source of the version. All are equal: a read uses any source that proves the
+    /// bytes, healthy ones first. The first one is the source `url` and `path` name.
+    pub sources: Vec<SourcePlaceBody>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SourcePlaceBody {
+    /// Public URL of the object at this source, when the source has one.
+    pub url: Option<String>,
+    pub path: String,
+    /// The connector of this node the source reads through; absent for a public source.
+    pub connector_id: Option<String>,
 }
 
 /// One statement a dataset may add when this file joins it.
@@ -260,6 +272,13 @@ impl From<OriginView> for OriginResponse {
                             DigestOrigin::VerifiedRead => "verified_read",
                         }
                         .to_string(),
+                    })
+                    .collect(),
+                sources: (source.sources.into_iter())
+                    .map(|place| SourcePlaceBody {
+                        url: place.url,
+                        path: place.path,
+                        connector_id: place.connector_id.map(|id| id.to_string()),
                     })
                     .collect(),
             }),
