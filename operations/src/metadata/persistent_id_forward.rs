@@ -51,6 +51,12 @@ pub(crate) fn pid_authority_node(
     resolve_shard_holders(config, &placement).first().copied()
 }
 
+/// True when the id names no metadata placement of this realm, so no PID was minted for it
+/// here: an id of another realm or a legacy one is unknown, not an unreachable authority.
+fn outside_realm(config: &RealmConfigDocument, realm_id: RealmId, document_id: Ulid) -> bool {
+    resolve_metadata_id(config, realm_id, None, document_id).is_err()
+}
+
 pub(super) async fn pid_authority(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -394,7 +400,14 @@ pub async fn resolve_pid_routed(
     if context.net_handle.is_none() {
         return local_pid_resolution(context, realm_id, document_id, &pid).await;
     }
-    let (config, authority) = pid_authority(context, realm_id, document_id).await?;
+    let config = load_realm_config(context, realm_id)
+        .await
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    if outside_realm(&config, realm_id, document_id) {
+        return Ok(PersistentIdResolution::Missing);
+    }
+    let authority = pid_authority_node(&config, realm_id, document_id)
+        .ok_or(MetadataApiError::ServiceUnavailable)?;
     if is_local_node(context, authority) {
         return local_pid_resolution(context, realm_id, document_id, &pid).await;
     }
@@ -708,5 +721,27 @@ pub(super) fn pid_error(
             MetadataApiError::NotFound
         }
         error => MetadataApiError::Internal(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::placement::record::METADATA_HANDLE;
+    use aruna_core::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
+
+    #[test]
+    fn legacy_ids_outside() {
+        // A v2 object id carries no metadata placement, so resolving it is a 404, not a 503.
+        let realm_id = RealmId::from_bytes([5; 32]);
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.seed_default_placement();
+        let legacy = Ulid::from_string("01H8Y3R7Z5X9C2V4B6N8M0Q1W3").unwrap();
+        assert!(outside_realm(&config, realm_id, legacy));
+        let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
+        let minted = MetaResourceId::from_parts(1, handle, BucketId::new(0).unwrap(), 7).unwrap();
+        assert!(!outside_realm(&config, realm_id, minted.as_ulid()));
+        let other = RealmId::from_bytes([6; 32]);
+        assert!(outside_realm(&config, other, minted.as_ulid()));
     }
 }
