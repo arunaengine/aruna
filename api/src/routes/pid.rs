@@ -215,8 +215,9 @@ async fn profile_landing(
 - `profile/{document_id}`: a Profile, resolved as `GET /profile/{document_id}`.
 - `data/{id}`: a content hash, global id or versioned ARN, redirected to `GET /resolve/{id}`.
 
-A browser (`Accept` names `text/html`) is sent to the portal page of an active public document
-or Profile when the realm's federation settings name a portal; other clients get the RO-Crate.
+A browser (`Accept` ranks `text/html` above zero and above `application/ld+json`) is sent to the
+portal page of an active public document or Profile when the realm's federation settings name a
+portal; other clients get the RO-Crate.
 An id that names no metadata placement of this realm, such as a legacy object id, is a 404."#,
     params(("rest" = String, Path, description = "The w3id path after `https://w3id.org/aruna/`, for example `01JMETADATA0123456789ABCDE` or `profile/01JMETADATA0123456789ABCDE`")),
     responses(
@@ -273,12 +274,33 @@ fn data_redirect(id: &str) -> Response {
     response
 }
 
+/// True when `Accept` ranks `text/html` above zero and above `application/ld+json`; wildcards
+/// name neither, so a client without a preference gets the RO-Crate.
 fn wants_page(headers: &axum::http::HeaderMap) -> bool {
-    headers
+    let mut html = 0.0_f32;
+    let mut crate_json = 0.0_f32;
+    let ranges = headers
         .get_all(header::ACCEPT)
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .any(|value| value.contains("text/html"))
+        .flat_map(|value| value.split(','))
+        .filter_map(|range| range.trim().parse::<mime::Mime>().ok());
+    for range in ranges {
+        let quality = match range.get_param("q") {
+            Some(value) => match value.as_str().parse::<f32>() {
+                Ok(quality) if (0.0..=1.0).contains(&quality) => quality,
+                _ => continue,
+            },
+            None => 1.0,
+        };
+        let slot = match range.essence_str() {
+            "text/html" => &mut html,
+            "application/ld+json" => &mut crate_json,
+            _ => continue,
+        };
+        *slot = slot.max(quality);
+    }
+    html > 0.0 && html > crate_json
 }
 
 /// The portal page of a document or Profile, when the federation settings name a portal.
@@ -1097,6 +1119,35 @@ mod tests {
         // The document is no Profile, so its profile form names nothing, not even for a browser.
         let profile = w3id(&state, &format!("profile/{id}"), html).await;
         assert_eq!(profile.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn page_follows_quality() {
+        let wants = |accept: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT, HeaderValue::from_str(accept).unwrap());
+            wants_page(&headers)
+        };
+        for browser in [
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "TEXT/HTML",
+            "application/ld+json;q=0.5, text/html",
+        ] {
+            assert!(wants(browser), "{browser}");
+        }
+        for client in [
+            "application/ld+json,text/html;q=0",
+            "application/ld+json, text/html;q=0.5",
+            "text/html, application/ld+json",
+            "text/htmlx",
+            "*/*",
+            "text/*",
+            "text/html;q=abc",
+            "text/html;q=2",
+            "",
+        ] {
+            assert!(!wants(client), "{client}");
+        }
     }
 
     #[tokio::test]
