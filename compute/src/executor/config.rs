@@ -155,6 +155,17 @@ pub struct KubedalMount {
     pub driver: String,
     pub endpoint: String,
     pub region: String,
+    /// Worker cache for cached inputs; `None` mounts every input through FUSE.
+    pub cache: Option<KubedalCache>,
+}
+
+/// The KubeDAL content cache this node's runs share on their workers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KubedalCache {
+    /// KubeDAL `cacheScope` of the runs' DataNodes, shared inside the compute namespace.
+    pub scope: String,
+    /// Labels of workers with a cache volume, which runs with cached inputs prefer.
+    pub worker_labels: BTreeMap<String, String>,
 }
 
 impl KubernetesConfig {

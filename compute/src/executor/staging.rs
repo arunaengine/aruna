@@ -31,6 +31,7 @@ pub struct MountedPath {
     pub path: PathBuf,
     pub bucket: String,
     pub key: String,
+    pub cached: bool,
 }
 
 pub struct StagePlan {
@@ -109,6 +110,7 @@ impl StageLayout {
                 path,
                 bucket: mount.bucket.clone(),
                 key: mount.key.clone(),
+                cached: mount.cached,
             });
         }
         for path in &input_paths {
@@ -200,10 +202,11 @@ impl StageLayout {
             .collect::<Vec<_>>();
         rows.extend(self.mounts.iter().map(|mount| {
             format!(
-                "m\0{}\0{}\0{}",
+                "m\0{}\0{}\0{}{}",
                 mount.path.display(),
                 mount.bucket,
-                mount.key
+                mount.key,
+                if mount.cached { "\0cached" } else { "" }
             )
         }));
         rows.extend(
@@ -327,6 +330,7 @@ mod tests {
             bucket: "bucket".to_string(),
             key: "../escape".to_string(),
             path: "/input".to_string(),
+            cached: false,
         });
         spec.secret_env
             .insert("access_key_id".to_string(), Secret::new("key"));

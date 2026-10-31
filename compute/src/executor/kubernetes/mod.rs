@@ -1613,11 +1613,24 @@ fn validate_config(config: &KubernetesConfig) -> Result<(), BackendError> {
     let bounded = |entries: &std::collections::BTreeMap<String, String>| {
         entries.len() <= MAX_SELECTOR_ENTRIES && entries.keys().all(|key| !key.trim().is_empty())
     };
-    if !bounded(&config.node_selector) || !bounded(&config.execution_labels) {
+    let cache = config
+        .kubedal
+        .as_ref()
+        .and_then(|kubedal| kubedal.cache.as_ref());
+    let cache_labels = cache.map(|cache| &cache.worker_labels);
+    if !bounded(&config.node_selector)
+        || !bounded(&config.execution_labels)
+        || !cache_labels.is_none_or(bounded)
+    {
         return Err(BackendError::InvalidSpec(format!(
             "Kubernetes selectors and worker labels are at most \
              {MAX_SELECTOR_ENTRIES} named entries"
         )));
+    }
+    if cache.is_some_and(|cache| cache.scope.trim().is_empty()) {
+        return Err(BackendError::InvalidSpec(
+            "the KubeDAL cache scope must not be empty".to_string(),
+        ));
     }
     Ok(())
 }
@@ -2555,6 +2568,7 @@ mod tests {
             driver: "kubedal.arunaengine.org".to_string(),
             endpoint: "https://s3.example".to_string(),
             region: String::new(),
+            cache: None,
         }));
         let backend = KubernetesBackend {
             client,
@@ -2657,6 +2671,7 @@ mod tests {
             driver: "kubedal.arunaengine.org".to_string(),
             endpoint: "https://s3.example".to_string(),
             region: String::new(),
+            cache: None,
         }));
         let backend = KubernetesBackend {
             client,
