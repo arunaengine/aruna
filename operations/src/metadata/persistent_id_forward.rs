@@ -14,6 +14,7 @@ use crate::metadata::protocol::PersistentIdRequest;
 use crate::metadata::protocol::PersistentIdResolution;
 use crate::placement::process_placements::load_realm_config;
 use crate::placement::resolve_shard_holders;
+use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::MintPersistentSpec;
@@ -23,6 +24,7 @@ use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::record::{DocumentClass, PlacementScope};
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use std::sync::Arc;
 use tracing::warn;
@@ -51,10 +53,25 @@ pub(crate) fn pid_authority_node(
     resolve_shard_holders(config, &placement).first().copied()
 }
 
-/// True when the id names no metadata placement of this realm, so no PID was minted for it
-/// here: an id of another realm or a legacy one is unknown, not an unreachable authority.
+/// True only when the id provably names no metadata placement of this realm: it is no
+/// structured id, or its binding has another class or realm. Unknown, conflicting or partial
+/// bindings may still be replicating, so they stay an unreachable authority.
 fn outside_realm(config: &RealmConfigDocument, realm_id: RealmId, document_id: Ulid) -> bool {
-    resolve_metadata_id(config, realm_id, None, document_id).is_err()
+    let Ok(id) = MetaResourceId::from_bytes(document_id.to_bytes()) else {
+        return true;
+    };
+    let bucket_count = |strategy_id: Ulid| {
+        config
+            .strategy(&strategy_id)
+            .and_then(|strategy| u16::try_from(strategy.shard_count).ok())
+    };
+    match config.binding_directory().resolve_id(&id, bucket_count) {
+        Ok(binding) => {
+            binding.document_class != DocumentClass::Metadata
+                || matches!(binding.scope, PlacementScope::Realm(owner) if owner != realm_id)
+        }
+        Err(_) => false,
+    }
 }
 
 pub(super) async fn pid_authority(
@@ -727,21 +744,82 @@ pub(super) fn pid_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::placement::record::METADATA_HANDLE;
-    use aruna_core::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
+    use aruna_core::structs::placement::record::{
+        FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, METADATA_HANDLE, PlacementBinding,
+    };
+    use aruna_core::{BucketId, PlacementHandle, StructuredId};
+
+    fn minted(handle: u32) -> Ulid {
+        let handle = PlacementHandle::new(handle).unwrap();
+        let bucket = BucketId::new(0).unwrap();
+        MetaResourceId::from_parts(1, handle, bucket, 7)
+            .unwrap()
+            .as_ulid()
+    }
 
     #[test]
-    fn legacy_ids_outside() {
-        // A v2 object id carries no metadata placement, so resolving it is a 404, not a 503.
+    fn outside_only_provably() {
         let realm_id = RealmId::from_bytes([5; 32]);
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         config.seed_default_placement();
-        let legacy = Ulid::from_string("01H8Y3R7Z5X9C2V4B6N8M0Q1W3").unwrap();
-        assert!(outside_realm(&config, realm_id, legacy));
-        let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
-        let minted = MetaResourceId::from_parts(1, handle, BucketId::new(0).unwrap(), 7).unwrap();
-        assert!(!outside_realm(&config, realm_id, minted.as_ulid()));
+        let strategy_id = config.default_strategy_id.unwrap();
+        let owner = iroh::SecretKey::from_bytes(&[8; 32]).public();
+        let range_id = Ulid::from_bytes([19; 16]);
+        config.placement_handle_ranges.push(HandleRange {
+            range_id,
+            owner,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: FIRST_GRANTABLE_HANDLE + HANDLE_RANGE_SIZE,
+        });
+        let bind = |handle, scope, document_class| PlacementBinding {
+            handle: PlacementHandle::new(handle).unwrap(),
+            scope,
+            document_class,
+            strategy_id,
+            allocator_range_id: Some(range_id),
+            allocated_by: Some(owner),
+            allocated_at_ms: Some(1),
+        };
         let other = RealmId::from_bytes([6; 32]);
-        assert!(outside_realm(&config, other, minted.as_ulid()));
+        config.placement_bindings.extend([
+            bind(
+                500,
+                PlacementScope::Realm(realm_id),
+                DocumentClass::JobControl,
+            ),
+            bind(501, PlacementScope::Realm(other), DocumentClass::Metadata),
+            bind(
+                502,
+                PlacementScope::Group(Ulid::from_bytes([1; 16])),
+                DocumentClass::Metadata,
+            ),
+            bind(
+                504,
+                PlacementScope::Realm(realm_id),
+                DocumentClass::Metadata,
+            ),
+            bind(504, PlacementScope::Realm(other), DocumentClass::Metadata),
+        ]);
+        // No structured id, another class or another realm: never minted here, a 404.
+        let reserved = Ulid::from_parts(1_700_000_000_000, 0x1234_5678);
+        assert!(outside_realm(&config, realm_id, reserved));
+        assert!(outside_realm(&config, realm_id, minted(500)));
+        assert!(outside_realm(&config, realm_id, minted(501)));
+        assert!(!outside_realm(&config, realm_id, minted(METADATA_HANDLE)));
+        assert!(!outside_realm(&config, realm_id, minted(502)));
+        // An unbound, conflicting or out of range placement, as a v2 id carries, may still be
+        // replicating: unavailable, not 404.
+        let legacy = Ulid::from_string("01H8Y3R7Z5X9C2V4B6N8M0Q1W3").unwrap();
+        assert!(!outside_realm(&config, realm_id, legacy));
+        assert!(!outside_realm(&config, realm_id, minted(503)));
+        assert!(!outside_realm(&config, realm_id, minted(504)));
+        let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
+        let far = MetaResourceId::from_parts(1, handle, BucketId::new(4095).unwrap(), 7).unwrap();
+        assert!(!outside_realm(&config, realm_id, far.as_ulid()));
+        // A strategy unknown here is indeterminate too.
+        config
+            .strategies
+            .retain(|strategy| strategy.strategy_id != strategy_id);
+        assert!(!outside_realm(&config, realm_id, minted(METADATA_HANDLE)));
     }
 }
