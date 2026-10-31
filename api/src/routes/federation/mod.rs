@@ -69,6 +69,15 @@ pub enum AcceptedRealmsSetting {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct RealmFederation {
     pub name: String,
+    /// Public realm description; a request without it keeps the stored one.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Public contact email address.
+    #[serde(default)]
+    pub contact: Option<String>,
+    /// Ids of configured OIDC providers shown to other realms, in order.
+    #[serde(default)]
+    pub login_providers: Vec<String>,
     pub api_url: String,
     pub portal_url: String,
     /// No URL means no registry traffic.
@@ -88,6 +97,9 @@ impl RealmFederation {
     fn from_settings(settings: &FederationSettings) -> ServerResult<Self> {
         Ok(Self {
             name: settings.name.clone(),
+            description: Some(settings.description.clone()),
+            contact: settings.contact.clone(),
+            login_providers: settings.login_providers.clone(),
             api_url: settings.api_url.to_string(),
             portal_url: settings.portal_url.to_string(),
             registry_url: settings.registry_url.as_ref().map(Url::to_string),
@@ -187,6 +199,9 @@ fn expected_settings(headers: &HeaderMap) -> ServerResult<Option<String>> {
             headers(("ETag" = String, description = "Quoted digest of the stored settings")),
             example = json!({
                 "name": "Example realm",
+                "description": "",
+                "contact": null,
+                "login_providers": [],
                 "api_url": "https://api.example.org/api/v1",
                 "portal_url": "https://portal.example.org/",
                 "registry_url": "https://registry.example.org/",
@@ -199,6 +214,8 @@ fn expected_settings(headers: &HeaderMap) -> ServerResult<Option<String>> {
                         "description": "",
                         "api_url": "https://api.example.org/api/v1",
                         "portal_url": "https://portal.example.org/",
+                        "contact": null,
+                        "login_providers": [],
                         "issued_at": 1791000000
                     },
                     "signer": "Realm",
@@ -246,8 +263,13 @@ pub async fn get_realm_federation(
 management node serves the call and signs the descriptor; every other node relays it to one.
 
 **Behavior**
-- `name`, `api_url` and `portal_url` are the realm's public entry points and form the signed
-  descriptor, together with the realm description. Each change issues a newer descriptor.
+- `name`, `description`, `contact`, `login_providers`, `api_url` and `portal_url` form the signed
+  descriptor. Each change issues a newer descriptor, and the reporting management node sends it
+  to the registry within seconds. The realm id never changes.
+- `description` is optional; a request without it keeps the stored description (at first setup,
+  the realm description). `contact` is an optional email address; an empty value clears it.
+- `login_providers` names configured OIDC provider ids; the descriptor carries each with its
+  issuer. An unknown id answers 400.
 - `registry_url` is optional; without it the realm sends nothing to a registry.
 - `registration` acts only when a registry URL is set.
 - `accepted_realms` defaults to `none`. `any` must be chosen explicitly.
@@ -260,12 +282,16 @@ management node serves the call and signs the descriptor; every other node relay
 
 **Limits**
 - URLs must use HTTPS; plain HTTP is accepted only for loopback hosts.
-- `name` must not be empty and holds at most 128 characters; `only` lists at most 1024 realms."#,
+- `name` must not be empty and holds at most 128 characters; `description` holds at most 4096
+  and `contact` at most 254; `only` lists at most 1024 realms."#,
     request_body(
         content = RealmFederation,
         description = "The complete federation settings to store",
         example = json!({
             "name": "Example realm",
+            "description": "Research data of the example institute",
+            "contact": "data@example.org",
+            "login_providers": ["default"],
             "api_url": "https://api.example.org/api/v1",
             "portal_url": "https://portal.example.org/",
             "registry_url": "https://registry.example.org/",
@@ -282,6 +308,9 @@ management node serves the call and signs the descriptor; every other node relay
             headers(("ETag" = String, description = "Quoted digest of the new settings")),
             example = json!({
                 "name": "Example realm",
+                "description": "",
+                "contact": null,
+                "login_providers": [],
                 "api_url": "https://api.example.org/api/v1",
                 "portal_url": "https://portal.example.org/",
                 "registry_url": "https://registry.example.org/",
@@ -294,13 +323,15 @@ management node serves the call and signs the descriptor; every other node relay
                         "description": "",
                         "api_url": "https://api.example.org/api/v1",
                         "portal_url": "https://portal.example.org/",
+                        "contact": null,
+                        "login_providers": [],
                         "issued_at": 1791000000
                     },
                     "signer": "Realm",
                     "signature": "<hex ed25519 signature>"
                 }
             })),
-        (status = 400, description = "A malformed or non-HTTPS URL, an empty or too long name, a malformed realm id or too many accepted realms", body = crate::error::ErrorResponse),
+        (status = 400, description = "A malformed or non-HTTPS URL, an empty or too long name, a too long description, a malformed contact, an unknown or repeated login provider, a malformed realm id or too many accepted realms", body = crate::error::ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = crate::error::ErrorResponse),
@@ -349,6 +380,9 @@ pub async fn set_realm_federation(
         auth_context: Some(auth),
         node_capabilities: state.node_capabilities().clone(),
         name: request.name,
+        description: request.description,
+        contact: request.contact.filter(|contact| !contact.trim().is_empty()),
+        login_providers: request.login_providers,
         api_url: parse_url(&request.api_url)?,
         portal_url: parse_url(&request.portal_url)?,
         registry_url: request.registry_url.as_deref().map(parse_url).transpose()?,
@@ -417,6 +451,8 @@ fn map_federation_error(error: SetFederationError) -> ServerError {
                     "description": "",
                     "api_url": "https://api.example.org/api/v1",
                     "portal_url": "https://portal.example.org/",
+                    "contact": null,
+                    "login_providers": [],
                     "issued_at": 1791000000
                 },
                 "signer": "Realm",

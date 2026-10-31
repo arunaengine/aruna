@@ -652,6 +652,8 @@ mod tests {
             description: String::new(),
             api_url: Url::parse("https://b.example.org/api/v1").unwrap(),
             portal_url: Url::parse("https://b.example.org/").unwrap(),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at: 1,
         };
         Signed::sign(descriptor, &capabilities()).unwrap()
@@ -731,6 +733,9 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
         config.federation = Some(FederationSettings {
             name: "B".to_string(),
+            description: String::new(),
+            contact: None,
+            login_providers: Vec::new(),
             api_url: descriptor.payload.api_url.clone(),
             portal_url: descriptor.payload.portal_url.clone(),
             registry_url: None,

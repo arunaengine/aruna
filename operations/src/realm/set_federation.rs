@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::federation::{
-    AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode, Signed,
+    AcceptedRealms, FederationSettings, LoginProvider, RealmDescriptor, RegistrationMode, Signed,
 };
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -44,6 +44,11 @@ pub struct SetFederationConfig {
     /// Signs the descriptor; only a management node passes the node check.
     pub node_capabilities: NodeCapabilities,
     pub name: String,
+    /// `None` keeps the stored description, or the realm description at first setup.
+    pub description: Option<String>,
+    pub contact: Option<String>,
+    /// Ids of configured OIDC providers to show in the descriptor.
+    pub login_providers: Vec<String>,
     pub api_url: Url,
     pub portal_url: Url,
     pub registry_url: Option<Url>,
@@ -257,12 +262,33 @@ impl SetFederationOperation {
     ) -> Result<FederationSettings, SetFederationError> {
         let config = &self.config;
         let previous = latest_issued(document, reducer_state);
+        let description = config.description.clone().unwrap_or_else(|| {
+            let stored = document.federation.as_ref();
+            stored.map_or_else(|| document.description.clone(), |s| s.description.clone())
+        });
+        let login_providers = config
+            .login_providers
+            .iter()
+            .map(|id| {
+                let provider = document.oidc_providers.iter().find(|p| p.id == *id);
+                provider
+                    .map(|provider| LoginProvider {
+                        id: provider.id.clone(),
+                        issuer: provider.issuer.clone(),
+                    })
+                    .ok_or_else(|| SetFederationError::InvalidSettings {
+                        reason: format!("{id}: no such login provider"),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let descriptor = RealmDescriptor {
             realm_id: config.actor.realm_id,
             name: config.name.clone(),
-            description: document.description.clone(),
+            description: description.clone(),
             api_url: config.api_url.clone(),
             portal_url: config.portal_url.clone(),
+            contact: config.contact.clone(),
+            login_providers,
             issued_at: config.now.max(previous.saturating_add(1)),
         };
         let invalid =
@@ -271,6 +297,9 @@ impl SetFederationOperation {
             };
         let settings = FederationSettings {
             name: config.name.clone(),
+            description,
+            contact: config.contact.clone(),
+            login_providers: config.login_providers.clone(),
             api_url: config.api_url.clone(),
             portal_url: config.portal_url.clone(),
             registry_url: config.registry_url.clone(),
@@ -536,7 +565,7 @@ mod tests {
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::reducer::{AdminConflict, AdminConflictValue};
     use aruna_core::structs::identity::realm::{
-        RealmAuthorizationDocument, RealmId, RealmNodeKind,
+        OidcProviderConfig, RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
@@ -577,6 +606,9 @@ mod tests {
             }),
             node_capabilities: NodeCapabilities::management_node(realm_key()).unwrap(),
             name: "Realm".to_string(),
+            description: None,
+            contact: None,
+            login_providers: Vec::new(),
             api_url: Url::parse(api_url).unwrap(),
             portal_url: Url::parse("https://portal.example.org").unwrap(),
             registry_url: None,
@@ -662,6 +694,68 @@ mod tests {
             .expect("settings store again");
         let second = stored(&ctx, &actor).await.expect("settings stored");
         assert_eq!(second.descriptor.payload.issued_at, 101);
+    }
+
+    #[tokio::test]
+    async fn renames_resign_descriptor() {
+        // A rename re-signs the descriptor with the realm key and keeps the other public facts.
+        let dir = tempdir().unwrap();
+        let ctx = context(dir.path().to_str().unwrap());
+        let actor = actor();
+        seed(&ctx, &actor, RealmNodeKind::Management, true).await;
+        let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        document.ensure_node(actor.node_id, RealmNodeKind::Management);
+        document.oidc_providers.push(OidcProviderConfig {
+            id: "default".to_string(),
+            issuer: "https://login.example.org/realms/aruna".to_string(),
+            audience: "aruna".to_string(),
+            discovery_url: String::new(),
+        });
+        let target = DocumentTarget::RealmConfig {
+            realm_id: actor.realm_id,
+        };
+        let value = document.to_bytes(&actor).unwrap();
+        write(
+            &ctx,
+            target.storage_keyspace(),
+            target.storage_key().to_vec(),
+            value,
+        )
+        .await;
+
+        let mut config = request(&actor, "https://api.example.org");
+        config.description = Some("About the realm".to_string());
+        config.contact = Some("data@example.org".to_string());
+        config.login_providers = vec!["default".to_string()];
+        drive(SetFederationOperation::new(config.clone()), &ctx)
+            .await
+            .expect("settings store");
+        let first = stored(&ctx, &actor).await.expect("settings stored");
+        let issuer = &first.descriptor.payload.login_providers[0].issuer;
+        assert_eq!(issuer, "https://login.example.org/realms/aruna");
+
+        config.expected = Some(first.digest().unwrap());
+        config.name = "Renamed".to_string();
+        config.description = None;
+        drive(SetFederationOperation::new(config.clone()), &ctx)
+            .await
+            .expect("rename stores");
+        let renamed = stored(&ctx, &actor).await.expect("settings stored");
+        let payload = &renamed.descriptor.payload;
+        assert_eq!(renamed.descriptor.verify(&actor.realm_id), Ok(()));
+        assert_eq!(payload.realm_id, actor.realm_id);
+        assert_eq!(payload.name, "Renamed");
+        assert_eq!(payload.description, "About the realm");
+        assert_eq!(payload.contact.as_deref(), Some("data@example.org"));
+        assert!(payload.issued_at > first.descriptor.payload.issued_at);
+
+        config.expected = Some(renamed.digest().unwrap());
+        config.login_providers = vec!["unknown".to_string()];
+        let error = drive(SetFederationOperation::new(config), &ctx)
+            .await
+            .expect_err("an unknown provider is refused");
+        assert!(matches!(error, SetFederationError::InvalidSettings { .. }));
+        assert_eq!(stored(&ctx, &actor).await, Some(renamed));
     }
 
     #[test]

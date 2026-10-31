@@ -1222,6 +1222,9 @@ async fn admin_sets_quota() {
 fn federation_body(name: &str) -> RealmFederation {
     RealmFederation {
         name: name.to_string(),
+        description: None,
+        contact: None,
+        login_providers: Vec::new(),
         api_url: "https://api.example.org/api/v1".to_string(),
         portal_url: "https://portal.example.org/".to_string(),
         registry_url: Some("https://registry.example.org/".to_string()),

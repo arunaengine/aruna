@@ -37,8 +37,8 @@ use crate::tasks::task_persistence::persist_task_effect;
 
 /// How often the reporting node renews its registration.
 pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-/// Delay of the first publication after a settings change on this node.
-pub const PUBLISH_SOON: Duration = Duration::from_secs(60);
+/// Delay of the first publication after a settings change, so renames reach the registry at once.
+pub const PUBLISH_SOON: Duration = Duration::from_secs(5);
 /// Withdrawals sent while registration is disabled and the registry URL is kept.
 pub const MAX_WITHDRAWALS: u8 = 3;
 const STATE_KEY: &[u8] = b"publication";
@@ -487,6 +487,8 @@ mod tests {
             description: String::new(),
             api_url: url("https://api.example.org"),
             portal_url: url("https://portal.example.org"),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at: 1,
         };
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -496,6 +498,9 @@ mod tests {
         config.ensure_node(node(3), RealmNodeKind::Server);
         config.federation = Some(FederationSettings {
             name: descriptor.name.clone(),
+            description: String::new(),
+            contact: None,
+            login_providers: Vec::new(),
             api_url: descriptor.api_url.clone(),
             portal_url: descriptor.portal_url.clone(),
             registry_url: registry.then(|| url("https://registry.example.org")),
@@ -635,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialized_change_shortens() {
-        // Replicated settings arriving at the reporter persist a due time one minute away.
+        // Replicated settings arriving at the reporter persist a due time a few seconds away.
         let dir = tempdir().unwrap();
         let context = DriverContext {
             storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
@@ -670,7 +675,7 @@ mod tests {
         assert_eq!(read_timer(storage, &key).await.unwrap(), None);
         publish_soon(&context, config.realm_id, reporter()).await;
         let due = read_timer(storage, &key).await.unwrap().unwrap();
-        let limit = (unix_timestamp_secs() + 61) * 1000;
+        let limit = (unix_timestamp_secs() + PUBLISH_SOON.as_secs() + 1) * 1000;
         assert!(due.due_unix_millis <= limit);
     }
 
