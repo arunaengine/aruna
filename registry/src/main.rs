@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use aruna_blob::egress::EgressGuard;
 use aruna_core::egress::EgressPolicy;
+use aruna_registry::admin_api::AdminAuth;
 use aruna_registry::store::Store;
 use aruna_registry::{RegistryState, router};
 use tracing::info;
@@ -21,12 +22,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let listen = std::env::var(LISTEN_VAR).unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let data = PathBuf::from(std::env::var(DATA_VAR).unwrap_or_else(|_| "data".to_string()));
-    let state = Arc::new(RegistryState::new(
-        Store::open(&data)?,
-        EgressGuard::new(EgressPolicy::strict())?,
-    ));
+    let admin_auth = AdminAuth::from_env()?;
+    let admin_enabled = admin_auth.enabled();
+    let state = Arc::new(
+        RegistryState::new(
+            Store::open(&data)?,
+            EgressGuard::new(EgressPolicy::strict())?,
+        )
+        .with_admin(admin_auth),
+    );
     let listener = tokio::net::TcpListener::bind(&listen).await?;
-    info!(listen = %listen, data = %data.display(), "Registry listening");
+    info!(listen = %listen, data = %data.display(), admin_enabled, "Registry listening");
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

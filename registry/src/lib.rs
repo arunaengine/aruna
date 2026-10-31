@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod admin;
+pub mod admin_api;
 pub mod store;
 pub mod verify;
 
@@ -28,6 +30,8 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
+use crate::admin::RealmStatus;
+use crate::admin_api::AdminAuth;
 use crate::store::{Entry, Store, StoreError, is_stale};
 use crate::verify::verify_routes;
 
@@ -44,6 +48,7 @@ const NODE_RESOLVE_ROUTE: &str = "resolve";
 pub struct RegistryState {
     pub store: Store,
     pub egress: EgressGuard,
+    pub admin_auth: AdminAuth,
     writes: DefaultDirectRateLimiter,
     verifications: Semaphore,
 }
@@ -55,9 +60,15 @@ impl RegistryState {
         Self {
             store,
             egress,
+            admin_auth: AdminAuth::Disabled,
             writes: RateLimiter::direct(quota),
             verifications: Semaphore::new(VERIFY_SLOTS),
         }
+    }
+
+    pub fn with_admin(mut self, admin_auth: AdminAuth) -> Self {
+        self.admin_auth = admin_auth;
+        self
     }
 
     /// Counts one write; runs before any signature check or fetch.
@@ -105,12 +116,16 @@ pub struct Listing {
     pub registration: Signed<Registration>,
     pub received_at: u64,
     pub verified: bool,
+    /// Why the descriptor routes did not verify, so the realm admin can fix them.
+    pub problems: Vec<String>,
     /// The KPIs were observed more than 24 hours ago.
     pub stale: bool,
+    /// Registry-owned status; `approved` realms are resolved through w3id.org.
+    pub status: RealmStatus,
 }
 
 impl Listing {
-    fn new(entry: Entry, now: u64) -> Self {
+    fn new(entry: Entry, now: u64, status: RealmStatus) -> Self {
         Self {
             realm_id: entry
                 .registration
@@ -122,7 +137,9 @@ impl Listing {
             stale: is_stale(&entry, now),
             received_at: entry.received_at,
             verified: entry.verified,
+            problems: entry.problems,
             registration: entry.registration,
+            status,
         }
     }
 }
@@ -135,10 +152,11 @@ pub fn router(state: Arc<RegistryState>) -> Router {
             get(get_realm).put(put_realm).delete(delete_realm),
         )
         .route("/v1/resolve/{*id}", get(resolve_id))
+        .merge(admin_api::router())
         .with_state(state)
 }
 
-fn parse_realm(value: &str) -> Result<RealmId, RegistryError> {
+pub(crate) fn parse_realm(value: &str) -> Result<RealmId, RegistryError> {
     RealmId::from_base64(value).map_err(|_| RegistryError::BadRealm)
 }
 
@@ -169,14 +187,18 @@ fn check_registration(
     Ok(())
 }
 
+/// Listed and approved realms, approved first; hidden and retired ones are left out.
 async fn list_realms(State(state): State<Arc<RegistryState>>) -> Result<Response, RegistryError> {
     let now = unix_timestamp_secs();
-    let listings: Vec<Listing> = state
-        .store
-        .entries(now)?
-        .into_iter()
-        .map(|entry| Listing::new(entry, now))
-        .collect();
+    let mut listings = Vec::new();
+    for entry in state.store.entries(now)? {
+        let realm_id = entry.registration.payload.descriptor.payload.realm_id;
+        let admin = state.store.admin(&realm_id)?;
+        if admin.listed() {
+            listings.push(Listing::new(entry, now, admin.status));
+        }
+    }
+    listings.sort_by_key(|listing| listing.status != RealmStatus::Approved);
     Ok(public(listings))
 }
 
@@ -185,8 +207,12 @@ async fn get_realm(
     Path(realm_id): Path<String>,
 ) -> Result<Response, RegistryError> {
     let now = unix_timestamp_secs();
-    match state.store.entry(&parse_realm(&realm_id)?, now)? {
-        Some(entry) => Ok(public(Listing::new(entry, now))),
+    let realm_id = parse_realm(&realm_id)?;
+    match state.store.entry(&realm_id, now)? {
+        Some(entry) => {
+            let status = state.store.admin(&realm_id)?.status;
+            Ok(public(Listing::new(entry, now, status)))
+        }
         None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
@@ -274,7 +300,7 @@ async fn put_realm(
     state
         .store
         .check_issued(&realm_id, signed.payload.issued_at, now)?;
-    let verified = {
+    let problems = {
         let _slot = state
             .verifications
             .acquire()
@@ -285,10 +311,12 @@ async fn put_realm(
     let entry = Entry {
         registration: signed,
         received_at: now,
-        verified,
+        verified: problems.is_empty(),
+        problems,
     };
     state.store.register(&realm_id, &entry, now)?;
-    Ok(Json(Listing::new(entry, now)))
+    let status = state.store.admin(&realm_id)?.status;
+    Ok(Json(Listing::new(entry, now, status)))
 }
 
 async fn delete_realm(
@@ -449,6 +477,7 @@ mod tests {
             registration: registration("https://realm.example.org", issued_at),
             received_at: now,
             verified,
+            problems: Vec::new(),
         };
         let earlier = entry(false, now - 10);
         state.store.register(&realm_id(), &earlier, now).unwrap();
@@ -493,6 +522,7 @@ mod tests {
             registration: registration("https://realm.example.org", observed_at),
             received_at: now,
             verified: false,
+            problems: Vec::new(),
         };
         let observed = now - crate::store::STALE_SECS;
         state
