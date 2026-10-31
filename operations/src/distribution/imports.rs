@@ -206,7 +206,7 @@ pub(crate) async fn staging_spec(
     let shared = (!source.has_secret_config).then(|| connector.clone());
     let root = SourceRoot {
         kind: connector.kind,
-        public_config: connector.public_config.into_iter().collect(),
+        public_config: connector.source_config().into_iter().collect(),
         namespace: connector.namespace,
     };
     let resume = at.map(|at| handed_checkpoint(&spec, &at));
@@ -326,8 +326,7 @@ async fn local_connector(
     .await
     .map_err(|error| error.to_string())?;
     let matched = listed.connectors.into_iter().find(|connector| {
-        let config: BTreeMap<String, String> =
-            connector.public_config.clone().into_iter().collect();
+        let config: BTreeMap<String, String> = connector.source_config().into_iter().collect();
         connector.kind == root.kind
             && config == root.public_config
             && connector.namespace == root.namespace

@@ -6,6 +6,7 @@ use crate::UserId;
 use crate::compute::SecretBytes;
 use crate::errors::ConversionError;
 use crate::node_vault::{VaultEntry, VaultPurpose};
+use crate::structs::execution::source_access::SOURCE_WEIGHT;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -145,6 +146,14 @@ impl SourceConnector {
         }
     }
 
+    /// The public settings that name the source; the weight hint is not one, so changing it
+    /// never makes the connector another source.
+    pub fn source_config(&self) -> HashMap<String, String> {
+        let mut config = self.public_config.clone();
+        config.remove(SOURCE_WEIGHT);
+        config
+    }
+
     /// Records the namespace the stored credentials select.
     pub fn with_namespace(mut self, secret_config: &HashMap<String, String>) -> Self {
         self.namespace = source_namespace(self.kind, secret_config);
@@ -220,6 +229,30 @@ mod tests {
 
     fn test_user_id(seed: u8) -> UserId {
         UserId::local(Ulid::from_bytes([seed; 16]), RealmId([seed; 32]))
+    }
+
+    #[test]
+    fn weight_names_no_source() {
+        // Sources bound through a connector stay one source whatever weight it gets later.
+        let endpoint = ("endpoint".to_string(), "https://a.example.org".to_string());
+        let weighted = HashMap::from([endpoint.clone(), (SOURCE_WEIGHT.to_string(), "5".into())]);
+        let connector = |config| {
+            let time = SystemTime::UNIX_EPOCH;
+            let kind = SourceConnectorKind::Http;
+            let name = "a".to_string();
+            SourceConnector::new(
+                Ulid::nil(),
+                Ulid::nil(),
+                name,
+                kind,
+                config,
+                time,
+                time,
+                test_user_id(1),
+            )
+        };
+        let plain = connector(HashMap::from([endpoint])).source_config();
+        assert_eq!(connector(weighted).source_config(), plain);
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub fn build_source_descriptor(
     let native = connector.kind == SourceConnectorKind::ArunaNative;
     PortableSourceDescriptor {
         kind: connector.kind,
-        public_config: connector.public_config.clone(),
+        public_config: connector.source_config(),
         source_path,
         version_selector: source_version_selector(metadata),
         capabilities: Vec::new(),

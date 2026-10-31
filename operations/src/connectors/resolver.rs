@@ -259,7 +259,7 @@ impl ResolveBindingOperation {
         let descriptor = &self.input.source.descriptor;
         let matched = connectors.iter().find(|connector| {
             connector.kind == descriptor.kind
-                && connector.public_config == descriptor.public_config
+                && connector.source_config() == descriptor.public_config
                 && connector.namespace == descriptor.namespace
         });
         if let Some(connector) = matched {
