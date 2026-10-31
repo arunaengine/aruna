@@ -27,4 +27,5 @@ pub mod releases;
 pub mod rename;
 pub mod routing;
 pub mod set_changes;
+pub mod source_edit;
 pub mod text;
