@@ -66,6 +66,14 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         ))
 }
 
+/// A canonical ULID; `from_string` alone maps a first digit above 7 onto another id.
+fn landing_id(value: &str) -> Option<Ulid> {
+    match value.as_bytes().first() {
+        Some(b'0'..=b'7') => Ulid::from_string(value).ok(),
+        _ => None,
+    }
+}
+
 fn rocrate_location(document_id: Ulid) -> String {
     format!("/api/v1/metadata/{document_id}/rocrate")
 }
@@ -105,7 +113,7 @@ async fn resolve_pid(
     State(state): State<Arc<ServerState>>,
     Path(document_id): Path<String>,
 ) -> Response {
-    let Ok(document_id) = Ulid::from_string(&document_id) else {
+    let Some(document_id) = landing_id(&document_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     document_landing(&state, document_id, None).await
@@ -176,7 +184,7 @@ async fn resolve_profile_pid(
     State(state): State<Arc<ServerState>>,
     Path(document_id): Path<String>,
 ) -> Response {
-    let Ok(document_id) = Ulid::from_string(&document_id) else {
+    let Some(document_id) = landing_id(&document_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     profile_landing(&state, document_id, None).await
@@ -243,7 +251,7 @@ async fn resolve_w3id(
         Some(id) => (true, id),
         None => (false, rest),
     };
-    let Ok(document_id) = Ulid::from_string(id) else {
+    let Some(document_id) = landing_id(id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let page = match wants_page(&headers) {
@@ -1041,8 +1049,17 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(location, rocrate_location(document_id));
-        let malformed = resolve_pid(State(state), Path("not-a-ulid".to_string())).await;
+        let malformed = resolve_pid(State(state.clone()), Path("not-a-ulid".to_string())).await;
         assert_eq!(malformed.status(), StatusCode::NOT_FOUND);
+        // A first digit above 7 overflows and would otherwise alias the same document.
+        let alias = format!("8{}", &document_id.to_string()[1..]);
+        assert_eq!(Ulid::from_string(&alias).unwrap(), document_id);
+        let document = resolve_pid(State(state.clone()), Path(alias.clone())).await;
+        assert_eq!(document.status(), StatusCode::NOT_FOUND);
+        let profile = resolve_profile_pid(State(state.clone()), Path(alias.clone())).await;
+        assert_eq!(profile.status(), StatusCode::NOT_FOUND);
+        let response = w3id(&state, &alias, "application/ld+json").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     async fn w3id(state: &Arc<ServerState>, rest: &str, accept: &str) -> Response {
@@ -1176,6 +1193,7 @@ mod tests {
             "terms/Release",
             "dev/01H8Y3R7Z5X9C2V4B6N8M0Q1W3",
             "01JMETADATA0123456789ABCDE/x",
+            "profile/81JMETADATA0123456789ABCDE",
         ] {
             let response = w3id(&state, rest, "*/*").await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{rest}");
