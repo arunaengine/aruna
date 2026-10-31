@@ -206,8 +206,9 @@ A version whose new source the caller may not read, or whose new path is not can
 - Version ids, observations and current versions stay. Nothing is read from any source.
 - The edit is node-local: replicas on other nodes keep their sources.
 
-**Paging**: one call reads up to 1000 version rows of the bucket. Pass `next` as `after` until
-it is absent."#,
+**Limits**
+- One call reads up to 1000 version rows of the bucket. Pass `next` as `after` until it is
+  absent."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     request_body(
         content = AddSourcesRequest,
@@ -293,7 +294,9 @@ pub async fn add_sources(
   so a version without checksums keeps that source and counts in `kept_unproven`.
 - The edit is node-local: replicas on other nodes keep their sources.
 
-**Paging**: as for adding sources."#,
+**Limits**
+- One call reads up to 1000 version rows of the bucket. Pass `next` as `after` until it is
+  absent."#,
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     request_body(
         content = RemoveSourcesRequest,

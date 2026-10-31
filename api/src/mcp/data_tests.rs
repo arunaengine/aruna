@@ -251,13 +251,17 @@ fn put_errors_mapped() {
         set_id,
     )));
     assert!(!matches!(moved, ServerError::InternalError(_)));
+    let taken = put_server_error(PutObjectError::ObjectExists);
+    assert!(matches!(
+        taken,
+        ServerError::Refused(http::StatusCode::CONFLICT, "name_taken", _)
+    ));
     for error in [
         PutObjectError::InvalidOperationState,
         PutObjectError::NoTransactionFound,
         PutObjectError::MissingOutput,
         PutObjectError::MissingHash("blake3".to_string()),
         PutObjectError::InvalidPreassignedVersion,
-        PutObjectError::ObjectExists,
         PutObjectError::PutObjectFailed,
         PutObjectError::HeadChanged,
         PutObjectError::FenceTaken,
