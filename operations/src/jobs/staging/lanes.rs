@@ -592,6 +592,7 @@ mod tests {
                 digests: Default::default(),
             },
             metadata: Default::default(),
+            mirrors: Vec::new(),
         });
         PageImportInput {
             job_id: ctx.job_id,

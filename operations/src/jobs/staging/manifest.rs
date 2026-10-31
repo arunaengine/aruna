@@ -312,6 +312,7 @@ mod tests {
             }],
             checksum_manifest: Some("MD5SUMS".to_string()),
             table: None,
+            mirrors: Vec::new(),
         }
     }
 

@@ -256,6 +256,9 @@ pub struct StagingJobSpec {
     pub checksum_manifest: Option<String>,
     /// A table whose rows name the files or folders to import, instead of items and prefixes.
     pub table: Option<crate::structs::execution::table::TableImport>,
+    /// Further sources each imported file gets, mapped from its source path.
+    #[serde(default)]
+    pub mirrors: Vec<crate::structs::execution::staging::SourceMapping>,
 }
 
 /// One server-side object copy run outside a request, for a source whose bytes

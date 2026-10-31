@@ -291,6 +291,7 @@ async fn reference_import_counted() {
             digests: Default::default(),
         },
         metadata: Default::default(),
+        mirrors: Vec::new(),
     };
     let page = PageImportInput {
         job_id,

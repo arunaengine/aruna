@@ -90,6 +90,7 @@ fn entry(path: &str) -> PageEntry {
         target_key: path.to_string(),
         observation: observation(path),
         metadata: Default::default(),
+        mirrors: Vec::new(),
     }
 }
 
@@ -1054,6 +1055,7 @@ fn bakrep_entry(index: usize) -> PageEntry {
             digests: Default::default(),
         },
         metadata: Default::default(),
+        mirrors: Vec::new(),
     }
 }
 

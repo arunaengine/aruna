@@ -513,6 +513,7 @@ mod tests {
             }],
             checksum_manifest: None,
             table: None,
+            mirrors: Vec::new(),
         }
     }
 

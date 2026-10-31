@@ -48,6 +48,7 @@ impl From<LegacyStaging> for StagingJobSpec {
             prefixes: old.prefixes,
             checksum_manifest: None,
             table: None,
+            mirrors: Vec::new(),
         }
     }
 }

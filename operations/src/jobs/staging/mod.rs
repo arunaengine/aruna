@@ -6,6 +6,7 @@
 mod lanes;
 mod limiter;
 mod manifest;
+mod mirrors;
 mod table;
 mod walk;
 
@@ -618,6 +619,7 @@ mod pure_tests {
             }],
             checksum_manifest: None,
             table: None,
+            mirrors: Vec::new(),
         }
     }
 
