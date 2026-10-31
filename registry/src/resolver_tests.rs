@@ -37,7 +37,8 @@ fn resolver(base: &str, approved: bool) -> (TempDir, Resolver, u64) {
     if approved {
         set_status(&state, RealmStatus::Approved, now);
     }
-    (dir, Resolver::new(state, Some(realm_id()), None), now)
+    let source = ClientSource::default();
+    (dir, Resolver::new(state, Some(realm_id()), source), now)
 }
 
 fn set_status(state: &RegistryState, status: RealmStatus, now: u64) {
@@ -719,19 +720,34 @@ async fn shared_budget_bounds() {
 
 #[test]
 fn client_from_ingress() {
-    let peer = IpAddr::from([10, 0, 0, 7]);
+    let proxy = IpAddr::from([10, 0, 0, 7]);
+    let source = ClientSource {
+        header: Some(HeaderName::from_static("x-forwarded-for")),
+        trusted_proxies: parse_proxies("10.0.0.0/24, 192.0.2.9").unwrap(),
+    };
     let header = HeaderName::from_static("x-forwarded-for");
     let mut headers = HeaderMap::new();
-    assert_eq!(client_address(&headers, Some(&header), peer), peer);
+    assert_eq!(source.address(&headers, proxy), proxy);
     headers.append(&header, HeaderValue::from_static("203.0.113.5"));
     // A client may send its own value first; the proxy appends the real one last.
     headers.append(&header, HeaderValue::from_static("192.0.2.4, 198.51.100.7"));
     let last = IpAddr::from([198, 51, 100, 7]);
-    assert_eq!(client_address(&headers, Some(&header), peer), last);
-    assert_eq!(client_address(&headers, None, peer), peer);
+    assert_eq!(source.address(&headers, proxy), last);
+    assert_eq!(source.address(&headers, IpAddr::from([192, 0, 2, 9])), last);
+    // A peer outside the trusted proxies is keyed by its own address, whatever it sends.
+    let direct = IpAddr::from([198, 51, 100, 99]);
+    assert_eq!(source.address(&headers, direct), direct);
+    let untrusted = ClientSource {
+        trusted_proxies: Vec::new(),
+        ..source.clone()
+    };
+    assert_eq!(untrusted.address(&headers, proxy), proxy);
     let mut bad = HeaderMap::new();
     bad.insert(&header, HeaderValue::from_static("unknown"));
-    assert_eq!(client_address(&bad, Some(&header), peer), peer);
+    assert_eq!(source.address(&bad, proxy), proxy);
+    assert!(parse_proxies("").unwrap().is_empty());
+    assert!(parse_proxies("10.0.0.0/33").is_err());
+    assert!(parse_proxies("proxy.example.org").is_err());
 }
 
 #[tokio::test]

@@ -10,7 +10,7 @@ use aruna_blob::egress::EgressGuard;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_registry::admin_api::AdminAuth;
-use aruna_registry::resolver::Resolver;
+use aruna_registry::resolver::{ClientSource, Resolver, parse_proxies};
 use aruna_registry::store::Store;
 use aruna_registry::{RegistryState, resolver, router};
 use tracing::info;
@@ -21,6 +21,8 @@ const DATA_VAR: &str = "ARUNA_REGISTRY_DATA";
 const DEFAULT_REALM_VAR: &str = "ARUNA_RESOLVER_DEFAULT_REALM";
 /// The header the ingress sets to the client address, for example `x-real-ip`.
 const CLIENT_HEADER_VAR: &str = "ARUNA_RESOLVER_CLIENT_HEADER";
+/// The proxy addresses or ranges whose client header is honoured, comma-separated.
+const TRUSTED_PROXIES_VAR: &str = "ARUNA_RESOLVER_TRUSTED_PROXIES";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,11 +44,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(value) => Some(RealmId::from_base64(value.trim())?),
         Err(_) => None,
     };
-    let client_header = match std::env::var(CLIENT_HEADER_VAR) {
-        Ok(value) => Some(axum::http::HeaderName::try_from(value.trim())?),
-        Err(_) => None,
+    let client_source = ClientSource {
+        header: match std::env::var(CLIENT_HEADER_VAR) {
+            Ok(value) => Some(axum::http::HeaderName::try_from(value.trim())?),
+            Err(_) => None,
+        },
+        trusted_proxies: parse_proxies(&std::env::var(TRUSTED_PROXIES_VAR).unwrap_or_default())?,
     };
-    let resolver = Arc::new(Resolver::new(state.clone(), default_realm, client_header));
+    let resolver = Arc::new(Resolver::new(state.clone(), default_realm, client_source));
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(listen = %listen, data = %data.display(), admin_enabled, "Registry listening");
     let app = router(state).merge(resolver::router(resolver));

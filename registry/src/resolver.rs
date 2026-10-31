@@ -31,6 +31,7 @@ use governor::nanos::Nanos;
 use governor::state::keyed::DashMapStateStore;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
+use ipnet::IpNet;
 use lru::LruCache;
 use percent_encoding::percent_decode_str;
 use tracing::warn;
@@ -211,8 +212,45 @@ pub struct Resolver {
     clock: RequestClock,
     guesses: SharedLimiter,
     clients: ClientLimiter,
-    /// The header in which the ingress names the client address; the peer address otherwise.
-    client_header: Option<HeaderName>,
+    client_source: ClientSource,
+}
+
+/// Where the client address comes from: a header the ingress sets, honoured only from the
+/// trusted proxy addresses, else the peer address.
+#[derive(Clone, Debug, Default)]
+pub struct ClientSource {
+    pub header: Option<HeaderName>,
+    pub trusted_proxies: Vec<IpNet>,
+}
+
+impl ClientSource {
+    /// The last address of the header, which the closest proxy appended; without a trusted
+    /// peer or a usable value the peer address counts.
+    fn address(&self, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+        if !self.trusted_proxies.iter().any(|net| net.contains(&peer)) {
+            return peer;
+        }
+        self.header
+            .as_ref()
+            .and_then(|name| headers.get_all(name).iter().next_back())
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit(',').next())
+            .and_then(|address| address.trim().parse().ok())
+            .unwrap_or(peer)
+    }
+}
+
+/// Comma-separated proxy addresses or ranges, for example `10.0.0.0/8, 192.0.2.7`.
+pub fn parse_proxies(value: &str) -> Result<Vec<IpNet>, ipnet::AddrParseError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.parse::<IpAddr>() {
+            Ok(address) => Ok(IpNet::from(address)),
+            Err(_) => entry.parse::<IpNet>(),
+        })
+        .collect()
 }
 
 impl Resolver {
@@ -220,7 +258,7 @@ impl Resolver {
     pub fn new(
         registry: Arc<RegistryState>,
         default_realm: Option<RealmId>,
-        client_header: Option<HeaderName>,
+        client_source: ClientSource,
     ) -> Self {
         let clock = RequestClock::default();
         let quota = Quota::per_minute(NonZeroU32::new(GUESSES_PER_MINUTE).expect("nonzero rate"))
@@ -241,7 +279,7 @@ impl Resolver {
             ),
             routes: Mutex::new(HashMap::new()),
             clock,
-            client_header,
+            client_source,
         }
     }
 
@@ -719,7 +757,7 @@ async fn resolve_shared(
 ) -> Response {
     let path = uri.path().strip_prefix("/aruna").unwrap_or_default();
     let shape = parse_path(path.strip_prefix('/').unwrap_or(path));
-    let client = client_address(&headers, resolver.client_header.as_ref(), peer.ip());
+    let client = resolver.client_source.address(&headers, peer.ip());
     let egress = &resolver.registry.egress;
     let answer = resolver
         .answer(shape, unix_timestamp_secs(), client, |url, source| {
@@ -727,17 +765,6 @@ async fn resolve_shared(
         })
         .await;
     respond(answer)
-}
-
-/// The client as the ingress names it: the last address of the configured header, which the
-/// closest proxy appended. Without a usable value the peer address counts.
-fn client_address(headers: &HeaderMap, header: Option<&HeaderName>, peer: IpAddr) -> IpAddr {
-    header
-        .and_then(|name| headers.get_all(name).iter().next_back())
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.rsplit(',').next())
-        .and_then(|address| address.trim().parse().ok())
-        .unwrap_or(peer)
 }
 
 /// A namespace a realm owns at w3id.org, whose rule names the realm id in the target.
@@ -748,7 +775,7 @@ async fn resolve_owned(
     uri: Uri,
 ) -> Response {
     let rest = uri.path().strip_prefix("/realm/").unwrap_or_default();
-    let client = client_address(&headers, resolver.client_header.as_ref(), peer.ip());
+    let client = resolver.client_source.address(&headers, peer.ip());
     let egress = &resolver.registry.egress;
     let probe = |url, source| probe(egress, url, source);
     let answer = resolver

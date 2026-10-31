@@ -17,6 +17,7 @@ axum = { workspace = true }
 fjall = { workspace = true }
 futures = { workspace = true }
 governor = { workspace = true }
+ipnet = { workspace = true }
 lru = { workspace = true }
 percent-encoding = { workspace = true }
 postcard = { workspace = true }
