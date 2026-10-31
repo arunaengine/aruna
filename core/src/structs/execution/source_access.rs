@@ -39,11 +39,13 @@ impl fmt::Debug for ResolvedSourceAccess {
 
 /// Public connector setting: the traffic share of a source relative to equal ones, default 1.
 pub const SOURCE_WEIGHT: &str = "weight";
+/// The largest weight, so weighted scores stay finite numbers.
+pub const MAX_WEIGHT: f64 = 1000.0;
 
-/// The weight `config` sets, when it is a positive number.
+/// The weight `config` sets, when it is a number above 0 and at most [`MAX_WEIGHT`].
 pub fn source_weight(config: &HashMap<String, String>) -> Option<f64> {
     let weight = config.get(SOURCE_WEIGHT)?.trim().parse::<f64>().ok()?;
-    (weight.is_finite() && weight > 0.0).then_some(weight)
+    (weight > 0.0 && weight <= MAX_WEIGHT).then_some(weight)
 }
 
 /// What this node measured of one source lately. Kept in memory only.

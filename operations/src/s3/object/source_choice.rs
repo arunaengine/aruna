@@ -61,10 +61,16 @@ fn pick(candidates: &[Candidate], pool: &[usize], draw: u64) -> Option<(usize, f
         stats().filter_map(|stats| stats.bytes_per_sec),
         BYTES_PER_SEC,
     );
+    // Weights count relative to the largest, so no score overflows.
+    let weights = pool.iter().map(|&index| candidates[index].weight);
+    let heaviest = weights
+        .filter(|weight| weight.is_finite())
+        .fold(0.0, f64::max);
     let scores: Vec<f64> = (pool.iter())
-        .map(|&index| score(&candidates[index], first_ms, rate))
+        .map(|&index| score(&candidates[index], (first_ms, rate), heaviest))
         .collect();
     let total: f64 = scores.iter().sum();
+    let total = if total.is_finite() { total } else { 0.0 };
     let even = 1.0 / pool.len() as f64;
     let mut point = (draw >> 11) as f64 / (1u64 << 53) as f64;
     let mut picked = None;
@@ -84,6 +90,7 @@ fn pick(candidates: &[Candidate], pool: &[usize], draw: u64) -> Option<(usize, f
 
 /// The mean of the measured values; unmeasured sources count as average, so they get tried.
 fn mean(values: impl Iterator<Item = f64>, default: f64) -> f64 {
+    let values = values.filter(|value| value.is_finite());
     let (sum, count) = values.fold((0.0, 0u32), |(sum, count), value| (sum + value, count + 1));
     match count {
         0 => default,
@@ -91,16 +98,22 @@ fn mean(values: impl Iterator<Item = f64>, default: f64) -> f64 {
     }
 }
 
-/// Reads per second the source is expected to finish, scaled by its weight and health.
-fn score(candidate: &Candidate, first_ms: f64, rate: f64) -> f64 {
+/// Reads per second the source is expected to finish, scaled by its weight and health; 0 for
+/// anything not a finite number. Values that are no finite numbers count as unmeasured.
+fn score(candidate: &Candidate, (first_ms, rate): (f64, f64), heaviest: f64) -> f64 {
     let stats = candidate.stats;
-    let first = stats.first_byte_ms.unwrap_or(first_ms) / 1000.0;
-    let rate = stats.bytes_per_sec.unwrap_or(rate).max(1.0);
+    let finite = |value: Option<f64>| value.filter(|value| value.is_finite());
+    let first = finite(stats.first_byte_ms).unwrap_or(first_ms) / 1000.0;
+    let rate = finite(stats.bytes_per_sec).unwrap_or(rate).max(1.0);
     // Reads in flight share the source's rate with this one.
     let sharing = 1.0 + f64::from(stats.in_flight);
     let seconds = (first + candidate.bytes as f64 * sharing / rate).max(1e-6);
     let healthy = (1.0 - stats.error_rate.clamp(0.0, 1.0)).powi(2);
-    candidate.weight * healthy / seconds
+    let score = candidate.weight / heaviest * healthy / seconds;
+    match score.is_finite() && score > 0.0 {
+        true => score,
+        false => 0.0,
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +215,24 @@ mod tests {
         heavy.weight = 3.0;
         let shares = shares(&[heavy, measured(50.0, 10.0 * MB)], 20_000);
         assert!((shares[0] - 0.7375).abs() < 0.02, "{shares:?}");
+    }
+
+    #[test]
+    fn extreme_weights_stay_numbers() {
+        // Huge, invalid or unmeasurable inputs never turn the shares into NaN.
+        let mut huge = measured(50.0, 10.0 * MB);
+        huge.weight = 1e308;
+        let mut nan = measured(f64::NAN, 10.0 * MB);
+        nan.weight = f64::NAN;
+        let split = shares(&[huge, measured(50.0, 10.0 * MB), nan], 20_000);
+        assert!(split[0] > 0.9, "{split:?}");
+        let mut lost = [nan, nan];
+        lost[1].stats.error_rate = f64::NAN;
+        let split = shares(&lost, 20_000);
+        assert!(
+            split.iter().all(|share| (share - 0.5).abs() < 0.02),
+            "{split:?}"
+        );
     }
 
     #[test]

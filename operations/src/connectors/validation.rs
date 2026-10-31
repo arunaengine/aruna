@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::endpoint_screening;
 use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET;
-use aruna_core::structs::execution::source_access::{SOURCE_WEIGHT, source_weight};
+use aruna_core::structs::execution::source_access::{MAX_WEIGHT, SOURCE_WEIGHT, source_weight};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use thiserror::Error;
 
@@ -44,7 +44,9 @@ pub enum ValidationError {
     EmptySecretValue { key: String },
     #[error("public config key `{key}` must be `true` or `false`")]
     InvalidBoolValue { key: String },
-    #[error("public config key `{SOURCE_WEIGHT}` must be a positive number")]
+    #[error(
+        "public config key `{SOURCE_WEIGHT}` must be a number above 0 and at most {MAX_WEIGHT}"
+    )]
     InvalidWeight,
     #[error("endpoint must be spelled as the http client parses it")]
     AmbiguousEndpoint,
@@ -451,7 +453,8 @@ mod pure_tests {
             validate_connector_input("mirror", SourceConnectorKind::Http, &config(weight), &none)
         };
         assert_eq!(validate("2.5"), Ok(()));
-        for weight in ["0", "-1", "NaN", "inf", "fast"] {
+        assert_eq!(validate("1000"), Ok(()));
+        for weight in ["0", "-1", "NaN", "inf", "1e308", "1000.5", "fast"] {
             assert_eq!(
                 validate(weight),
                 Err(ValidationError::InvalidWeight),
