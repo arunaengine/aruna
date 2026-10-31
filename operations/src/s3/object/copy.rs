@@ -1002,6 +1002,7 @@ pub(crate) mod test {
                 root: None,
             },
             connector_id: Some(Ulid::generate()),
+            mirrors: Vec::new(),
         };
         write_version(
             &context,
@@ -1112,6 +1113,7 @@ pub(crate) mod test {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
         write_version(
             &context,
@@ -1216,6 +1218,7 @@ pub(crate) mod test {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
         let metadata = SourceMetadata {
             content_length: 15,
@@ -1481,6 +1484,7 @@ pub(crate) mod test {
                 root: None,
             },
             connector_id: Some(Ulid::generate()),
+            mirrors: Vec::new(),
         };
         write_version(
             &context,

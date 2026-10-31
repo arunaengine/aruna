@@ -42,22 +42,23 @@ pub fn connector_reference_key(
     Ok(ByteView::from(bytes))
 }
 
-/// The row a write adds beside a reference version bound to a connector.
+/// The rows a write adds beside a reference version, one per connector its sources name.
 pub fn connector_reference_write(
     version: &BlobVersion,
     version_key: &VersionKey,
-) -> Result<Option<(String, Key, Value)>, ConversionError> {
+) -> Result<Vec<(String, Key, Value)>, ConversionError> {
     let BlobVersionState::Reference { source, .. } = &version.state else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let Some(connector_id) = source.connector_id else {
-        return Ok(None);
-    };
-    Ok(Some((
-        CONNECTOR_REFERENCE_KEYSPACE.to_string(),
-        connector_reference_key(connector_id, version_key)?,
-        ByteView::from(Vec::new()),
-    )))
+    (source.connector_ids().into_iter())
+        .map(|connector_id| {
+            Ok((
+                CONNECTOR_REFERENCE_KEYSPACE.to_string(),
+                connector_reference_key(connector_id, version_key)?,
+                ByteView::from(Vec::new()),
+            ))
+        })
+        .collect()
 }
 
 pub fn source_connector_prefix(group_id: GroupId) -> Key {
@@ -142,7 +143,8 @@ pub fn parse_connector_iter(
 pub fn references_connector(version: &BlobVersion, connector_id: Ulid) -> bool {
     matches!(
         &version.state,
-        BlobVersionState::Reference { source, .. } if source.connector_id == Some(connector_id)
+        BlobVersionState::Reference { source, .. }
+            if source.connector_ids().contains(&connector_id)
     )
 }
 

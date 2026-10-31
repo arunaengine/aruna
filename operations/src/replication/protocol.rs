@@ -807,6 +807,7 @@ mod pure_tests {
                 root: None,
             },
             connector_id: Some(Ulid::from_parts(3, 3)),
+            mirrors: Vec::new(),
         });
         manifest.reference_intent = true;
         manifest.reference_metadata = Some(SourceMetadata {

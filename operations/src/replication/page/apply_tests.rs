@@ -105,6 +105,7 @@ pub(crate) fn source(key: &str) -> VersionSourceBinding {
             root: None,
         },
         connector_id: None,
+        mirrors: Vec::new(),
     }
 }
 

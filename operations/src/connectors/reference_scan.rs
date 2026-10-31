@@ -193,6 +193,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(connector_id),
+            mirrors: Vec::new(),
         };
         let metadata = SourceMetadata {
             content_length: 1,

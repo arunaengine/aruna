@@ -1957,6 +1957,7 @@ mod pure_tests {
                     root: None,
                 },
                 connector_id: None,
+                mirrors: Vec::new(),
             },
             SourceMetadata {
                 content_length: size,
@@ -2674,6 +2675,7 @@ mod pure_tests {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
         let observed = SourceMetadata {
             content_length: 42,
@@ -2764,6 +2766,7 @@ mod pure_tests {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
         let observed = SourceMetadata {
             content_length: 42,
@@ -2840,6 +2843,7 @@ mod pure_tests {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
         let observed = SourceMetadata {
             content_length: 42,

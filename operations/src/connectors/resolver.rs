@@ -902,6 +902,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
+            mirrors: Vec::new(),
         };
 
         let access = build_binding_access(
@@ -944,6 +945,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
+            mirrors: Vec::new(),
         };
 
         assert_eq!(
@@ -970,6 +972,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
+            mirrors: Vec::new(),
         };
 
         let access = build_binding_access(&source, None).unwrap();
@@ -995,6 +998,7 @@ mod tests {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
 
         assert_eq!(
@@ -1230,6 +1234,7 @@ mod tests {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
 
         let mut operation = ResolveBindingOperation::new(ResolveBindingInput {
@@ -1271,6 +1276,7 @@ mod tests {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
 
         assert_eq!(
@@ -1296,6 +1302,7 @@ mod tests {
                 root: None,
             },
             connector_id,
+            mirrors: Vec::new(),
         }
     }
 
@@ -1370,6 +1377,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(connector.connector_id),
+            mirrors: Vec::new(),
         };
         let token = |access: ResolvedSourceAccess| {
             let ResolvedSourceAccess::OpenDal { config, .. } = access;

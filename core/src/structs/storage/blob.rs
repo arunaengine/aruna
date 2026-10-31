@@ -1728,6 +1728,7 @@ mod tests {
                     root: None,
                 },
                 connector_id,
+                mirrors: Vec::new(),
             };
             let metadata = SourceMetadata {
                 content_length: 42,
@@ -2029,6 +2030,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
+            mirrors: Vec::new(),
         };
         let reference_metadata = SourceMetadata {
             content_length: 42,

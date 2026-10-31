@@ -2034,10 +2034,7 @@ impl ReplicateObjectOperation {
                     .ok_or(ReplicateObjectError::UnresolvedReferenceVersion)?;
                 // Members of a set read the source themselves; connector ids are node-local.
                 let source = match sync.distribution {
-                    Some(_) => VersionSourceBinding {
-                        connector_id: None,
-                        ..source
-                    },
+                    Some(_) => source.without_connectors(),
                     None => self.reference_binding(sync),
                 };
                 Ok(ManifestVersionParts {
@@ -2208,6 +2205,7 @@ impl ReplicateObjectOperation {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         }
     }
 
@@ -3446,6 +3444,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
+            mirrors: Vec::new(),
         }
     }
 

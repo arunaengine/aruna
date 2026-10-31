@@ -43,6 +43,7 @@ pub fn build_source_binding(
         strategy,
         descriptor: build_source_descriptor(connector, metadata, source_path, origin_node_id),
         connector_id,
+        mirrors: Vec::new(),
     }
 }
 

@@ -403,6 +403,7 @@ mod tests {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
         let now = SystemTime::UNIX_EPOCH;
         let predecessor =

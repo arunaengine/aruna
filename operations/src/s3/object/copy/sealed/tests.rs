@@ -195,6 +195,7 @@ async fn copy_releases_observation() {
             root: None,
         },
         connector_id: None,
+        mirrors: Vec::new(),
     };
     let metadata = SourceMetadata {
         content_length: 7,

@@ -1972,6 +1972,7 @@ mod pure_tests {
                     root: None,
                 },
                 connector_id: None,
+                mirrors: Vec::new(),
             },
             aruna_core::structs::execution::source_access::SourceMetadata {
                 content_length: REFERENCE_BYTES,

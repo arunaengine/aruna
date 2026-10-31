@@ -316,6 +316,7 @@ fn reference_counts_content() {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         },
         SourceMetadata {
             content_length: 1_000_000,

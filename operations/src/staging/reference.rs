@@ -335,7 +335,7 @@ pub async fn write_reference_version(
             write_version_effect(&version_key, &version, Some(txn_id))?,
         )
         .await?;
-        if let Some((key_space, key, value)) = connector_reference_write(&version, &version_key)? {
+        for (key_space, key, value) in connector_reference_write(&version, &version_key)? {
             let row = StorageEffect::Write {
                 key_space,
                 key,
@@ -1347,6 +1347,7 @@ mod tests {
                     root: None,
                 },
                 connector_id: Some(Ulid::generate()),
+                mirrors: Vec::new(),
             },
             metadata: SourceMetadata {
                 content_length: 4,
