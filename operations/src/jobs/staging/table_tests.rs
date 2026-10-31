@@ -223,12 +223,17 @@ impl Fixture {
     }
 
     async fn context(&self, seed: u8) -> JobContext {
+        self.context_for(&self.spec, seed).await
+    }
+
+    /// A claimed job of `spec`.
+    async fn context_for(&self, spec: &StagingJobSpec, seed: u8) -> JobContext {
         let (job_id, claim_token) = (JobId::from_bytes([seed; 16]), Ulid::from_bytes([seed; 16]));
-        let owner = self.spec.auth_context.user_id;
-        let payload = JobPayload::Staging(self.spec.clone());
-        let mut record = JobRecord::new(job_id, payload, owner, self.spec.node_id, 1, 1, None);
+        let owner = spec.auth_context.user_id;
+        let payload = JobPayload::Staging(spec.clone());
+        let mut record = JobRecord::new(job_id, payload, owner, spec.node_id, 1, 1, None);
         record.claim = Some(JobClaim {
-            holder_node_id: self.spec.node_id,
+            holder_node_id: spec.node_id,
             claim_token,
             lease_expires_ms: u64::MAX,
         });
@@ -744,4 +749,177 @@ async fn record_rows_trusted() {
     found.sort();
     assert_eq!(found, ["coli/", "coli/sums.txt"]);
     server.abort();
+}
+
+/// Rows per second of a trusted record import into a searched distributed bucket:
+/// `ARUNA_BENCH_ROWS` source rows and `ARUNA_BENCH_EMPTY` empty rows, spread over
+/// `ARUNA_BENCH_JOBS` tables imported at once. Run with `--ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark"]
+async fn record_import_rate() {
+    let count = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let (rows, empty) = (
+        count("ARUNA_BENCH_ROWS", 100_000),
+        count("ARUNA_BENCH_EMPTY", 0),
+    );
+    let jobs = count("ARUNA_BENCH_JOBS", 1).max(1);
+    let (endpoint, _site, server) = serve(Site::ncbi).await;
+    let table = serde_json::json!({
+        "source": { "object": { "bucket": "lists", "key": "records-0.tsv" } },
+        "format": { "delimiter": "\t", "quote": null, "nulls": [""] },
+        "rows": { "kind": "record", "source": "{source}", "target": "{key}", "keep": [],
+                  "size": "size", "modified": "modified",
+                  "checksums": [{ "algorithm": "md5", "column": "md5" }] }
+    });
+    let fixture = Fixture::new(&endpoint, table.clone()).await;
+    let meta = r#"{"note":"sample"}"#;
+    let header = "key\tsource\tsize\tmodified\tetag\tcontent_type\tmd5\tmetadata\n";
+    let mut tables = vec![String::from(header); jobs];
+    for row in 0..rows {
+        let md5 = format!("{:x}", md5::compute(row.to_le_bytes()));
+        tables[row % jobs].push_str(&format!(
+            "samn{row:08}/assembly.fna.gz\t{COLI}{row:08}.fna.gz\t{row}\t2025-11-17T17:38:21Z\t\
+             \"{md5}\"\tapplication/gzip\t{md5}\t{meta}\n"
+        ));
+    }
+    for row in 0..empty {
+        tables[row % jobs].push_str(&format!("samn{row:08}/\t\t0\t\t\t\t\t{meta}\n"));
+    }
+    let ctx = fixture.context(40).await;
+    searched_set(&ctx, &fixture.spec).await;
+    let lists = drive(
+        GetBucketOperation::new("lists".to_string()),
+        &fixture.driver,
+    )
+    .await;
+    let lists = ("lists", &lists.unwrap());
+    let mut runs = Vec::new();
+    for (index, tsv) in tables.into_iter().enumerate() {
+        let key = format!("records-{index}.tsv");
+        let body = (Bytes::from(tsv), &BTreeMap::new());
+        write_object(&ctx, &fixture.spec, lists, &key, body)
+            .await
+            .ok()
+            .unwrap();
+        let mut spec = fixture.spec.clone();
+        let mut import = table.clone();
+        import["source"]["object"]["key"] = key.into();
+        spec.table = Some(serde_json::from_value(import).unwrap());
+        let mut job = fixture.context_for(&spec, 41 + index as u8).await;
+        // Jobs of one node share their range turns.
+        job.range_turns = ctx.range_turns.clone();
+        runs.push((job, spec));
+    }
+
+    // The replication drain and the search feed run beside the import, as on a node.
+    let drain = fixture.driver.clone();
+    let drain = tokio::spawn(async move {
+        loop {
+            let _ = crate::replication::queue::process_blob_batch(&drain).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+    let feed = fixture.driver.clone();
+    let indexes = fixture._dir.path().join("range-indexes");
+    let feed = tokio::spawn(async move {
+        use crate::distribution::index_feed::{FeedLimits, Feeder};
+        use crate::distribution::key_index::RangeIndexes;
+        let mut feeder = Feeder::new(Arc::new(RangeIndexes::new(indexes)), FeedLimits::default());
+        loop {
+            if !feeder.pass(&feed).await {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    });
+    let storage = &fixture.driver.storage_handle;
+    let conflicts = storage.snapshot_metrics().conflicts_total;
+    let started = std::time::Instant::now();
+    let outcomes = futures_util::future::join_all(
+        (runs.iter()).map(|(job, spec)| crate::jobs::staging::run_staging_job(job, spec)),
+    )
+    .await;
+    let elapsed = started.elapsed().as_secs_f64();
+    let conflicts = storage.snapshot_metrics().conflicts_total - conflicts;
+    drain.abort();
+    feed.abort();
+    let (mut completed, mut failed) = (0, 0);
+    for outcome in outcomes {
+        let JobRunOutcome::Succeeded(JobResultPayload::Staging {
+            completed_items,
+            failed_items,
+        }) = outcome
+        else {
+            panic!("the table import did not finish");
+        };
+        (completed, failed) = (completed + completed_items, failed + failed_items);
+    }
+    let total = (rows + empty) as f64;
+    println!(
+        "record import: {rows} rows, {empty} empty, {jobs} jobs, {completed} completed, \
+         {failed} failed, {conflicts} conflicts, {elapsed:.1} s, {:.0} rows/s",
+        total / elapsed
+    );
+    server.abort();
+}
+
+/// Makes the job's bucket a searched distributed set whose upper range, holding keys from `m`,
+/// this member coordinates, with a full key sample like a large bucket.
+async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) {
+    use crate::distribution::test_record::{binding, searched, store_record};
+    use crate::distribution::test_store::{begin, commit, install, range};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{KEY_SAMPLE_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::structs::storage::distribution::KeyRange;
+    use aruna_core::structs::storage::distribution::accounting::{
+        RangeCounters, SAMPLE_SIZE, SampleEntry, sample_count_key,
+    };
+    let handle = &ctx.driver.storage_handle;
+    let (snapshot, bytes) = searched();
+    let set_id = snapshot.set_id();
+    store_record(handle, set_id, bytes).await;
+    let mut bucket = pinned_bucket(ctx, spec).await.ok().unwrap();
+    bucket.distribution = Some(binding(&snapshot, 2, 5));
+    let range_id = snapshot.range_for("samn").unwrap().range_id;
+    let ranges = [KeyRange {
+        range_id,
+        ..range(1, "m", None)
+    }];
+    install(handle, set_id, &ranges).await;
+    let full = RangeCounters {
+        sampled: i128::from(SAMPLE_SIZE),
+        ..RangeCounters::default()
+    };
+    let largest = SampleEntry {
+        priority: u64::MAX,
+        key: "largest".to_string(),
+    };
+    let txn_id = begin(handle).await;
+    let effects = [
+        StorageEffect::Write {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: spec.bucket.as_bytes().to_vec().into(),
+            value: bucket.to_bytes().unwrap().into(),
+            txn_id: Some(txn_id),
+        },
+        StorageEffect::AddCounters {
+            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+            deltas: vec![(sample_count_key(set_id, range_id).into(), full)],
+            txn_id,
+        },
+        StorageEffect::Write {
+            key_space: KEY_SAMPLE_KEYSPACE.to_string(),
+            key: largest.row_key(set_id, range_id).into(),
+            value: Vec::new().into(),
+            txn_id: Some(txn_id),
+        },
+    ];
+    for effect in effects {
+        handle.send_storage_effect(effect).await;
+    }
+    assert!(commit(handle, txn_id).await);
 }
