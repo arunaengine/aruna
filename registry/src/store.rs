@@ -15,6 +15,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::admin::{AdminError, AdminState, AuditRecord, ResolveGate, transition};
+use crate::verify::RouteProblem;
 
 /// An entry leaves the listing this long after its last renewal.
 pub const LEASE_SECS: u64 = 72 * 3600;
@@ -30,7 +31,7 @@ pub struct Entry {
     /// Both descriptor routes returned the registered descriptor.
     pub verified: bool,
     /// Why the descriptor routes did not verify; empty when verified.
-    pub problems: Vec<String>,
+    pub problems: Vec<RouteProblem>,
 }
 
 /// A realm name and the receive time of the first registration that carried it.

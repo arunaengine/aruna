@@ -33,7 +33,7 @@ use tracing::warn;
 use crate::admin::{RealmStatus, ResolveGate};
 use crate::admin_api::AdminAuth;
 use crate::store::{Entry, Store, StoreError, is_stale};
-use crate::verify::verify_routes;
+use crate::verify::{RouteProblem, verify_routes};
 
 /// Writes accepted per minute across all clients, and their burst.
 const WRITES_PER_MINUTE: u32 = 60;
@@ -116,7 +116,7 @@ pub struct Listing {
     pub registration: Signed<Registration>,
     pub received_at: u64,
     pub verified: bool,
-    /// Why the descriptor routes did not verify, so the realm admin can fix them.
+    /// Short reasons the descriptor routes did not verify, without addresses or error chains.
     pub problems: Vec<String>,
     /// The KPIs were observed more than 24 hours ago.
     pub stale: bool,
@@ -137,7 +137,7 @@ impl Listing {
             stale: is_stale(&entry, now),
             received_at: entry.received_at,
             verified: entry.verified,
-            problems: entry.problems,
+            problems: entry.problems.iter().map(RouteProblem::summary).collect(),
             registration: entry.registration,
             status,
         }

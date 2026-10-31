@@ -21,6 +21,7 @@ use tracing::warn;
 
 use crate::admin::{AdminState, AuditRecord};
 use crate::store::{NameRecord, StoreError, is_stale, leased};
+use crate::verify::RouteProblem;
 use crate::{RegistryState, parse_realm};
 
 /// Environment variable holding the admin bearer token, set from a Kubernetes Secret.
@@ -145,7 +146,8 @@ pub struct AdminListing {
     pub withdrawn: bool,
     pub leased: bool,
     pub verified: bool,
-    pub problems: Vec<String>,
+    /// Full route problems with addresses and error chains, for admins only.
+    pub problems: Vec<RouteProblem>,
     pub stale: bool,
     pub admin: AdminState,
     /// Every name the realm registered with, oldest first; the last is the current one.
@@ -278,8 +280,8 @@ async fn audit(
 mod tests {
     use super::*;
     use crate::admin::RealmStatus;
-    use crate::store::{Entry, Store};
     use crate::store::tests::{named_registration, realm_id, registration};
+    use crate::store::{Entry, Store};
     use aruna_blob::egress::EgressGuard;
     use aruna_core::egress::EgressPolicy;
     use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -300,9 +302,11 @@ mod tests {
             registration: registration("https://realm.example.org", issued_at),
             received_at: issued_at,
             verified: false,
-            problems: vec![
-                "https://realm.example.org/.well-known/aruna-realm: answered 404".into(),
-            ],
+            problems: vec![RouteProblem {
+                route: "portal".to_string(),
+                reason: "connection failed".to_string(),
+                detail: "https://10.1.2.3/.well-known/aruna-realm?t=1: connection refused".into(),
+            }],
         };
         entry.registration.payload.descriptor.payload.name = name.to_string();
         state
@@ -395,17 +399,16 @@ mod tests {
         let (status, stored) = call(&state, "PUT", &path, Some(TOKEN), Some(approve)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(stored["namespace"], "giessen");
+        // The public listing shows only the short reason; the admin view keeps the detail.
         let (_, listed) = call(&state, "GET", "/v1/realms", None, None).await;
         assert_eq!(listed[0]["status"], "approved");
+        assert_eq!(listed[0]["problems"][0], "portal route: connection failed");
+        assert!(!listed.to_string().contains("10.1.2.3"));
         let (_, admin) = call(&state, "GET", "/v1/admin/realms", Some(TOKEN), None).await;
         assert_eq!(admin[0]["admin"]["status"], "approved");
         assert_eq!(admin[0]["verified"], false);
-        assert!(
-            admin[0]["problems"][0]
-                .as_str()
-                .unwrap()
-                .contains("answered 404")
-        );
+        let detail = admin[0]["problems"][0]["detail"].as_str().unwrap();
+        assert!(detail.contains("10.1.2.3"), "{detail}");
         let hide = serde_json::json!({"status": "hidden", "namespace": "giessen", "note": "spam"});
         call(&state, "PUT", &path, Some(TOKEN), Some(hide)).await;
         let (_, listed) = call(&state, "GET", "/v1/realms", None, None).await;

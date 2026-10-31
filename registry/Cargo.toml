@@ -17,6 +17,7 @@ axum = { workspace = true }
 fjall = { workspace = true }
 governor = { workspace = true }
 postcard = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
