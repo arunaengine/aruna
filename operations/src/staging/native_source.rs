@@ -111,6 +111,7 @@ pub(crate) fn is_native_effect(effect: &StagingSourceEffect) -> bool {
         | StagingSourceEffect::Head { access }
         | StagingSourceEffect::List { access, .. }
         | StagingSourceEffect::Read { access, .. } => access,
+        StagingSourceEffect::Health { .. } => return false,
     };
     matches!(
         access,
@@ -130,9 +131,11 @@ pub(crate) async fn send_native_effect(
         StagingSourceEffect::Read { access, range, .. } => {
             native_read(context, access, range).await
         }
-        StagingSourceEffect::Check { .. } | StagingSourceEffect::List { .. } => Err(
-            StagingSourceError::UnsupportedKind(SourceConnectorKind::ArunaNative.to_string()),
-        ),
+        StagingSourceEffect::Check { .. }
+        | StagingSourceEffect::List { .. }
+        | StagingSourceEffect::Health { .. } => Err(StagingSourceError::UnsupportedKind(
+            SourceConnectorKind::ArunaNative.to_string(),
+        )),
     };
     match result {
         Ok(event) => Event::StagingSource(event),

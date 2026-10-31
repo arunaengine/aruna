@@ -320,6 +320,9 @@ pub enum StagingSourceEvent {
         metadata: SourceMetadata,
         stream: BackendStream<Result<Bytes, BackendStreamError>>,
     },
+    HealthResult {
+        failing: Vec<bool>,
+    },
     Error {
         error: StagingSourceError,
     },

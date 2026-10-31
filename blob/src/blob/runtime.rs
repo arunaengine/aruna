@@ -466,6 +466,7 @@ impl BlobHandle {
                     .read_staging_source(access, range, expected)
                     .await
             }
+            StagingSourceEffect::Health { accesses } => self.handler.source_health(&accesses),
         };
 
         Event::StagingSource(staging_source_event)
@@ -612,6 +613,7 @@ impl BlobHandler {
             inflight: Arc::new(AtomicUsize::new(0)),
             group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_indexes: Arc::new(std::sync::Mutex::new(super::frames::IndexCache::new())),
+            source_failures: Default::default(),
             reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             part_chains: Arc::default(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),

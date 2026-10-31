@@ -33,6 +33,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             StagingSourceEvent::ReadResult { .. } => {
                 "Event::StagingSource(StagingSourceEvent::ReadResult)".to_string()
             }
+            StagingSourceEvent::HealthResult { .. } => {
+                "Event::StagingSource(StagingSourceEvent::HealthResult)".to_string()
+            }
             StagingSourceEvent::Error { .. } => {
                 "Event::StagingSource(StagingSourceEvent::Error)".to_string()
             }

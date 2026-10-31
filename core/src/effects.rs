@@ -456,6 +456,10 @@ pub enum StagingSourceEffect {
         /// `If-Match` without a fresh HEAD, and a failed condition is `ConditionFailed`.
         expected: Option<SourceMetadata>,
     },
+    /// Which of these sources failed lately without answering since, in their order.
+    Health {
+        accesses: Vec<ResolvedSourceAccess>,
+    },
 }
 
 /// Writes into a folder the owner bound on their own machine. Every variant is non-destructive by
