@@ -190,7 +190,7 @@ mod tests {
             sequence: beat.sequence,
             utilization: beat.utilization,
             availability: beat.availability.clone(),
-            reservation: beat.reservation.clone(),
+            reservation: beat.reservation,
             demand: beat.demand.clone(),
         }
     }
