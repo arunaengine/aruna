@@ -398,6 +398,54 @@ mod tests {
     }
 
     #[test]
+    fn accepts_old_registration() {
+        // An older node signs its own layout, without contact and login providers.
+        use aruna_core::federation::{DESCRIPTOR_DOMAIN, REGISTRATION_DOMAIN, RealmKpis, Signer};
+        use ed25519_dalek::Signer as _;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let sign = |domain: &str, payload: &[u8]| {
+            let mut bytes = postcard::to_allocvec(&domain).unwrap();
+            bytes.extend_from_slice(payload);
+            key.sign(&bytes).to_string()
+        };
+        let (api, portal) = (
+            "https://realm.example.org/api/v1",
+            "https://realm.example.org/",
+        );
+        let fields = (realm_id(), "Realm", "", api, portal, 1_u64);
+        let signature = sign(DESCRIPTOR_DOMAIN, &postcard::to_allocvec(&fields).unwrap());
+        let kpis = RealmKpis::default();
+        let registration = (fields, Signer::Realm, &signature, kpis, 10_u64, 10_u64);
+        let outer = sign(
+            REGISTRATION_DOMAIN,
+            &postcard::to_allocvec(&registration).unwrap(),
+        );
+        let wire = serde_json::json!({
+            "payload": {
+                "descriptor": {
+                    "payload": {
+                        "realm_id": realm_id(),
+                        "name": "Realm",
+                        "description": "",
+                        "api_url": api,
+                        "portal_url": portal,
+                        "issued_at": 1,
+                    },
+                    "signer": "Realm",
+                    "signature": signature,
+                },
+                "kpis": kpis,
+                "observed_at": 10,
+                "issued_at": 10,
+            },
+            "signer": "Realm",
+            "signature": outer,
+        });
+        let signed: Signed<Registration> = serde_json::from_value(wire).unwrap();
+        check_registration(&realm_id(), &signed).unwrap();
+    }
+
+    #[test]
     fn accepts_signed_registration() {
         let signed = registration("https://realm.example.org", 10);
         assert!(check_registration(&realm_id(), &signed).is_ok());
