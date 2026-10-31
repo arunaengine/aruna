@@ -29,6 +29,7 @@ fn resolver(base: &str, approved: bool) -> (TempDir, Resolver, u64) {
         registration: registration(base, now),
         received_at: now,
         verified: false,
+        problems: Vec::new(),
     };
     state.store.register(&realm_id(), &entry, now).unwrap();
     let approved = match approved {
@@ -255,6 +256,7 @@ async fn kept_realms_rechecked() {
         registration: registration("https://moved.example.org", now + 1),
         received_at: now,
         verified: false,
+        problems: Vec::new(),
     };
     let store = &resolver.registry.store;
     store.register(&realm_id(), &moved, now).unwrap();
@@ -279,6 +281,7 @@ async fn expired_lease_rechecked() {
         registration: registration(BASE, now + 1),
         received_at: leased,
         verified: false,
+        problems: Vec::new(),
     };
     resolver
         .registry
