@@ -1105,11 +1105,16 @@ mod tests {
             description: String::new(),
             api_url: url::Url::parse("https://api.example.org/api/v1").unwrap(),
             portal_url: url::Url::parse("https://portal.example.org/portal").unwrap(),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at: 1,
         };
         let signer = NodeCapabilities::management_node(generate_signing_key()).unwrap();
         config.federation = Some(FederationSettings {
             name: descriptor.name.clone(),
+            description: String::new(),
+            contact: None,
+            login_providers: Vec::new(),
             api_url: descriptor.api_url.clone(),
             portal_url: descriptor.portal_url.clone(),
             registry_url: None,
