@@ -139,21 +139,31 @@ impl SourceTable {
     }
 }
 
-/// Passes a read's bytes through and tells the table how long the source kept it waiting.
-struct Metered {
-    inner: BoxStream<'static, Result<Bytes, StreamError>>,
+/// One read in flight, counted from before its request until it ends, fails or is dropped, so
+/// a read cancelled while waiting for its answer is no longer counted either.
+struct ReadGuard {
     table: Arc<StdMutex<SourceTable>>,
     key: [u8; 32],
-    started: Instant,
-    /// Since when the reader waits on the source for the next chunk.
-    polled_at: Option<Instant>,
-    first: bool,
     bytes: u64,
+    /// Time waited on the source after the first byte.
     waited: Duration,
     ended: bool,
 }
 
-impl Metered {
+impl ReadGuard {
+    fn start(table: &Arc<StdMutex<SourceTable>>, key: [u8; 32], now: Instant) -> Self {
+        if let Ok(mut table) = table.lock() {
+            table.started(key, now);
+        }
+        Self {
+            table: table.clone(),
+            key,
+            bytes: 0,
+            waited: Duration::ZERO,
+            ended: false,
+        }
+    }
+
     fn end(&mut self, failed: bool, now: Instant) {
         if std::mem::replace(&mut self.ended, true) {
             return;
@@ -167,6 +177,22 @@ impl Metered {
     }
 }
 
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        self.end(false, Instant::now());
+    }
+}
+
+/// Passes a read's bytes through and tells the table how long the source kept it waiting.
+struct Metered {
+    inner: BoxStream<'static, Result<Bytes, StreamError>>,
+    guard: ReadGuard,
+    started: Instant,
+    /// Since when the reader waits on the source for the next chunk.
+    polled_at: Option<Instant>,
+    first: bool,
+}
+
 impl Stream for Metered {
     type Item = Result<Bytes, StreamError>;
 
@@ -176,28 +202,24 @@ impl Stream for Metered {
         let item = ready!(this.inner.as_mut().poll_next(cx));
         let now = Instant::now();
         this.polled_at = None;
+        let guard = &mut this.guard;
         match &item {
             Some(Ok(chunk)) if this.first => {
                 this.first = false;
-                this.bytes += chunk.len() as u64;
-                if let Ok(mut table) = this.table.lock() {
-                    table.first_byte(this.key, now.saturating_duration_since(this.started), now);
+                guard.bytes += chunk.len() as u64;
+                let waited = now.saturating_duration_since(this.started);
+                if let Ok(mut table) = guard.table.lock() {
+                    table.first_byte(guard.key, waited, now);
                 }
             }
             Some(Ok(chunk)) => {
-                this.bytes += chunk.len() as u64;
-                this.waited += now.saturating_duration_since(polled_at);
+                guard.bytes += chunk.len() as u64;
+                guard.waited += now.saturating_duration_since(polled_at);
             }
-            Some(Err(_)) => this.end(true, now),
-            None => this.end(false, now),
+            Some(Err(_)) => guard.end(true, now),
+            None => guard.end(false, now),
         }
         Poll::Ready(item)
-    }
-}
-
-impl Drop for Metered {
-    fn drop(&mut self) {
-        self.end(false, Instant::now());
     }
 }
 
@@ -269,7 +291,7 @@ impl BlobHandler {
     ) -> StagingSourceEvent {
         let key = source_key(&access);
         let started = Instant::now();
-        self.with_table(|table| table.started(key, started));
+        let guard = ReadGuard::start(&self.source_stats, key, started);
         let result = read_staging_source(&self.egress, &access, range, expected.as_ref()).await;
         let now = Instant::now();
         self.with_table(|table| table.answered(key, result.as_ref().err(), now));
@@ -277,21 +299,14 @@ impl BlobHandler {
             Ok((metadata, stream)) => {
                 let stream = BackendStream(Box::pin(Metered {
                     inner: stream.0,
-                    table: self.source_stats.clone(),
-                    key,
+                    guard,
                     started,
                     polled_at: None,
                     first: true,
-                    bytes: 0,
-                    waited: Duration::ZERO,
-                    ended: false,
                 }));
                 StagingSourceEvent::ReadResult { metadata, stream }
             }
-            Err(error) => {
-                self.with_table(|table| table.ended(key, (0, Duration::ZERO), now));
-                StagingSourceEvent::Error { error }
-            }
+            Err(error) => StagingSourceEvent::Error { error },
         }
     }
 
@@ -418,20 +433,12 @@ mod tests {
         table: &Arc<StdMutex<SourceTable>>,
         chunks: Vec<Result<Bytes, StreamError>>,
     ) -> Metered {
-        table
-            .lock()
-            .unwrap()
-            .started(key("https://a"), Instant::now());
         Metered {
             inner: Box::pin(futures::stream::iter(chunks)),
-            table: table.clone(),
-            key: key("https://a"),
+            guard: ReadGuard::start(table, key("https://a"), Instant::now()),
             started: Instant::now(),
             polled_at: None,
             first: true,
-            bytes: 0,
-            waited: Duration::ZERO,
-            ended: false,
         }
     }
 
@@ -452,7 +459,7 @@ mod tests {
         let mut cut = metered(&table, vec![chunk(), chunk()]);
         assert_eq!(in_flight(&table), 2);
         while whole.next().await.is_some() {}
-        assert_eq!((whole.bytes, in_flight(&table)), (6, 1));
+        assert_eq!((whole.guard.bytes, in_flight(&table)), (6, 1));
         assert!(cut.next().await.is_some());
         // A reader that stops early ends the read without blaming the source.
         drop(cut);
@@ -473,5 +480,20 @@ mod tests {
                 .stats(&key("https://a"), Instant::now())
                 .failing
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_ends() {
+        // A read dropped while it still waits for the source's answer stops counting at once.
+        let table = Arc::new(StdMutex::new(SourceTable::default()));
+        let waiting = async {
+            let _guard = ReadGuard::start(&table, key("https://a"), Instant::now());
+            std::future::pending::<()>().await;
+        };
+        let mut waiting = Box::pin(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(in_flight(&table), 1);
+        drop(waiting);
+        assert_eq!(in_flight(&table), 0);
     }
 }
