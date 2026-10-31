@@ -612,3 +612,66 @@ async fn owner_sees_use_counts() {
     .unwrap();
     assert_eq!((details.share.downloads, details.share.uploads), (2, 1));
 }
+
+#[tokio::test]
+async fn deactivated_creator_ends_open() {
+    use aruna_core::document::DocumentTarget;
+    use aruna_core::effects::Effect;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::user::User;
+    let node = node_state().await;
+    let mut request = folder_request("shared/", ShareModeBody::Read);
+    request.password = Some("correct horse".into());
+    let link = create(&node, &node.owner, request).await.unwrap();
+    let creator = DocumentTarget::User {
+        user_id: node.owner.user_id,
+    };
+    let account = User {
+        user_id: node.owner.user_id,
+        name: "owner".into(),
+        subject_ids: Vec::new(),
+        alias_user_ids: Default::default(),
+        attributes: [(
+            aruna_core::user::validation::DEACTIVATED_ATTRIBUTE.to_string(),
+            "true".to_string(),
+        )]
+        .into(),
+    };
+    let actor = Actor {
+        node_id: node.state.get_node_id(),
+        user_id: node.owner.user_id,
+        realm_id: node.owner.realm_id,
+    };
+    let bytes = account.to_bytes(&actor).unwrap();
+    let write = aruna_operations::document_repository::write_effect(&creator, bytes, None);
+    let Effect::Storage(write) = write else {
+        panic!("a user document is one storage write");
+    };
+    node.state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(write)
+        .await;
+    // No password step and no log entry: the link answers like an ended one.
+    for password in [None, Some("wrong"), Some("correct horse")] {
+        let error = open(&node, &link.token, password).await.unwrap_err();
+        assert_eq!(code(error), "share_unavailable");
+    }
+    let Json(details) = get_share(
+        State(node.state.clone()),
+        Extension(Some(node.owner.clone())),
+        Path(link.share.id.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(details.share.last_access_at.is_none());
+    let Json(log) = share_log(
+        State(node.state.clone()),
+        Extension(Some(node.owner.clone())),
+        Path(link.share.id.clone()),
+        Query(ShareLogQuery::default()),
+    )
+    .await
+    .unwrap();
+    assert!(log.entries.is_empty());
+}

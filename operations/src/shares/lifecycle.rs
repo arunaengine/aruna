@@ -16,8 +16,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use aruna_core::document::DocumentTarget;
+use aruna_core::structs::identity::user::User;
+
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::request_authorization::{AuthorizeError, check_error};
+use crate::document_repository::read_effect;
 use crate::shares::rules::{ShareRuleError, required_permission, validate_link, visit_expiry};
 use crate::shares::store::{LogShareOperation, ShareStoreError, save_effect};
 
@@ -251,6 +255,8 @@ pub struct OpenedShare {
 enum OpenState {
     Init,
     Load,
+    /// Reads the creator's account; a deactivated creator ends the link before any password.
+    CheckCreator,
     LogOpen,
     LogWrong,
     Done,
@@ -262,6 +268,7 @@ enum OpenState {
 pub struct OpenShareOperation {
     config: OpenShareConfig,
     state: OpenState,
+    link: Option<ShareLink>,
     opened: Option<OpenedShare>,
     error: Option<ShareError>,
 }
@@ -271,6 +278,7 @@ impl OpenShareOperation {
         Self {
             config,
             state: OpenState::Init,
+            link: None,
             opened: None,
             error: None,
         }
@@ -311,6 +319,34 @@ impl OpenShareOperation {
             }
             _ => return self.fail(ShareError::Unavailable),
         };
+        let creator = DocumentTarget::User {
+            user_id: link.created_by,
+        };
+        self.link = Some(link);
+        self.state = OpenState::CheckCreator;
+        smallvec![read_effect(&creator, None)]
+    }
+
+    fn creator_read(&mut self, event: Event) -> Effects {
+        let active = match event {
+            // An account without a user document counts as active, as everywhere else.
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+                .map(|bytes| User::from_bytes(&bytes).map(|user| !user.is_deactivated()))
+                .transpose()
+                .map(|active| active.unwrap_or(true)),
+            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
+            _ => return self.fail(ShareError::UnexpectedEvent("creator")),
+        };
+        match (active, self.link.take()) {
+            (Ok(true), Some(link)) => self.admit(link),
+            (Ok(false), _) => self.fail(ShareError::Unavailable),
+            (Err(error), _) => self.fail(error.into()),
+            (Ok(true), None) => self.fail(ShareError::UnexpectedEvent("creator")),
+        }
+    }
+
+    fn admit(&mut self, link: ShareLink) -> Effects {
+        let now = self.config.now;
         if let Some(hash) = &link.password {
             let Some(password) = self.config.password.as_deref() else {
                 return self.fail(ShareError::PasswordRequired);
@@ -344,6 +380,7 @@ impl Operation for OpenShareOperation {
                 Ok(link) => self.loaded(link),
                 Err(error) => self.fail(error),
             },
+            OpenState::CheckCreator => self.creator_read(event),
             OpenState::LogOpen => match logged(event) {
                 Ok(()) => {
                     self.state = OpenState::Done;

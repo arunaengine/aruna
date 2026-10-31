@@ -388,10 +388,6 @@ pub async fn open_share(
         visit_token,
         expires_at,
     } = opened;
-    // A deactivated creator ends every link at once.
-    crate::routes::access::users::ensure_active(&state, link.created_by)
-        .await
-        .map_err(|_| unavailable())?;
     let (kind, name) = match &link.target {
         ShareTarget::Bucket { bucket } => ("bucket", Some(bucket.clone())),
         ShareTarget::Folder { prefix, .. } => (
