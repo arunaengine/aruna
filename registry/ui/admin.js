@@ -96,7 +96,7 @@ function render() {
   const showAll = $('show-all').checked;
   const shown = realms
     .filter((realm) => showAll || (realm.leased && ['listed', 'approved'].includes(realm.admin.status)))
-    .sort((a, b) => statusOrder(a) - statusOrder(b) || b.received_at - a.received_at);
+    .sort((a, b) => statusOrder(a) - statusOrder(b) || (b.received_at ?? 0) - (a.received_at ?? 0));
   const list = $('list');
   if (shown.length === 0) {
     list.replaceChildren(el('p', { class: 'muted' }, 'No realms to show.'));
@@ -189,43 +189,53 @@ function link(url) {
 }
 
 function realmCard(realm) {
-  const descriptor = realm.registration.payload.descriptor.payload;
-  const kpis = realm.registration.payload.kpis;
+  // A withdrawn realm has no registration left, only its names and admin state.
+  const descriptor = realm.registration?.payload.descriptor.payload;
+  const kpis = realm.registration?.payload.kpis;
+  const name = descriptor?.name ?? realm.names.at(-1)?.name ?? realm.realm_id;
   const previous = realm.names
     .slice(0, -1)
     .map((record, index) => ({ name: record.name, until: realm.names[index + 1].since }))
     .reverse();
-  const verification = realm.verified
+  let verification = realm.verified
     ? el('span', { class: 'badge ok' }, 'verified')
     : el('span', { class: 'badge bad' }, 'unverified');
-  const count = (value) => (value === null || value === undefined ? 'unknown' : String(value));
+  if (realm.withdrawn) verification = el('span', { class: 'badge warn' }, 'withdrawn');
   return el('article', { class: 'card' },
     el('div', { class: 'realm-head' },
-      el('h3', {}, descriptor.name),
+      el('h3', {}, name),
       el('span', { class: `badge ${realm.admin.status}` }, realm.admin.status),
       verification,
-      realm.leased ? null : el('span', { class: 'badge warn' }, 'lease expired'),
+      realm.leased || realm.withdrawn ? null : el('span', { class: 'badge warn' }, 'lease expired'),
       realm.stale ? el('span', { class: 'badge warn' }, 'stale KPIs') : null),
     el('dl', { class: 'facts' },
       el('dt', {}, 'Realm id'), el('dd', { class: 'mono' }, realm.realm_id),
       previous.length ? [el('dt', {}, 'Previous names'),
         el('dd', {}, previous.map((record) => `${record.name} (until ${time(record.until)})`).join(', '))] : null,
-      descriptor.description ? [el('dt', {}, 'Description'), el('dd', {}, descriptor.description)] : null,
-      el('dt', {}, 'API'), el('dd', {}, link(descriptor.api_url)),
-      el('dt', {}, 'Portal'), el('dd', {}, link(descriptor.portal_url)),
-      descriptor.contact ? [el('dt', {}, 'Contact'), el('dd', {}, descriptor.contact)] : null,
-      descriptor.login_providers?.length ? [el('dt', {}, 'Login providers'),
-        el('dd', {}, descriptor.login_providers.map((provider) => `${provider.id} (${provider.issuer})`).join(', '))] : null,
-      el('dt', {}, 'Last registration'), el('dd', {}, time(realm.received_at)),
-      el('dt', {}, 'Datasets / groups / nodes'),
-      el('dd', {}, `${count(kpis.live_datasets)} / ${count(kpis.groups)} / ${count(kpis.nodes_configured)}`),
+      descriptor ? descriptorFacts(descriptor, kpis, realm.received_at) : [el('dt', {}, 'Registration'),
+        el('dd', {}, 'Withdrawn by the realm')],
       realm.problems.length ? [el('dt', {}, 'Verification'),
         el('dd', {}, el('ul', { class: 'problems' }, realm.problems.map((problem) => el('li', {}, problem))))] : null),
     el('div', { class: 'actions' }, statusActions(realm)),
     editForm(realm),
     auditDetails(realm),
-    el('details', {}, el('summary', {}, 'Signed self-description'),
-      el('pre', {}, JSON.stringify(realm.registration, null, 2))));
+    realm.registration ? el('details', {}, el('summary', {}, 'Signed self-description'),
+      el('pre', {}, JSON.stringify(realm.registration, null, 2))) : null);
+}
+
+function descriptorFacts(descriptor, kpis, receivedAt) {
+  const count = (value) => (value === null || value === undefined ? 'unknown' : String(value));
+  return [
+    descriptor.description ? [el('dt', {}, 'Description'), el('dd', {}, descriptor.description)] : null,
+    el('dt', {}, 'API'), el('dd', {}, link(descriptor.api_url)),
+    el('dt', {}, 'Portal'), el('dd', {}, link(descriptor.portal_url)),
+    descriptor.contact ? [el('dt', {}, 'Contact'), el('dd', {}, descriptor.contact)] : null,
+    descriptor.login_providers?.length ? [el('dt', {}, 'Login providers'),
+      el('dd', {}, descriptor.login_providers.map((provider) => `${provider.id} (${provider.issuer})`).join(', '))] : null,
+    el('dt', {}, 'Last registration'), el('dd', {}, time(receivedAt)),
+    el('dt', {}, 'Datasets / groups / nodes'),
+    el('dd', {}, `${count(kpis.live_datasets)} / ${count(kpis.groups)} / ${count(kpis.nodes_configured)}`),
+  ];
 }
 
 document.addEventListener('DOMContentLoaded', () => {

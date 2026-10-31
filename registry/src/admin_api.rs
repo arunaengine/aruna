@@ -20,7 +20,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::admin::{AdminState, AuditRecord};
-use crate::store::{Entry, NameRecord, StoreError, is_stale, leased};
+use crate::store::{NameRecord, StoreError, is_stale, leased};
 use crate::{RegistryState, parse_realm};
 
 /// Environment variable holding the admin bearer token, set from a Kubernetes Secret.
@@ -139,8 +139,10 @@ impl IntoResponse for AdminApiError {
 #[derive(Debug, Serialize)]
 pub struct AdminListing {
     pub realm_id: String,
-    pub registration: Signed<Registration>,
-    pub received_at: u64,
+    /// The last registration; `None` once the realm withdrew it.
+    pub registration: Option<Signed<Registration>>,
+    pub received_at: Option<u64>,
+    pub withdrawn: bool,
     pub leased: bool,
     pub verified: bool,
     pub problems: Vec<String>,
@@ -210,20 +212,24 @@ async fn whoami(
 
 fn admin_listing(
     state: &RegistryState,
-    entry: Entry,
+    realm_id: RealmId,
     now: u64,
 ) -> Result<AdminListing, AdminApiError> {
-    let realm_id = entry.registration.payload.descriptor.payload.realm_id;
+    let entry = state.store.stored_entry(&realm_id)?;
+    let entry = entry.as_ref();
     Ok(AdminListing {
         realm_id: realm_id.to_string(),
-        received_at: entry.received_at,
-        leased: leased(&entry, now),
-        verified: entry.verified,
-        stale: is_stale(&entry, now),
+        received_at: entry.map(|entry| entry.received_at),
+        withdrawn: entry.is_none(),
+        leased: entry.is_some_and(|entry| leased(entry, now)),
+        verified: entry.is_some_and(|entry| entry.verified),
+        stale: entry.is_some_and(|entry| is_stale(entry, now)),
         admin: state.store.admin(&realm_id)?,
         names: state.store.names(&realm_id)?,
-        problems: entry.problems,
-        registration: entry.registration,
+        problems: entry
+            .map(|entry| entry.problems.clone())
+            .unwrap_or_default(),
+        registration: entry.map(|entry| entry.registration.clone()),
     })
 }
 
@@ -235,9 +241,9 @@ async fn list_admin(
     let now = unix_timestamp_secs();
     let listings = state
         .store
-        .all_entries()?
+        .known_realms()?
         .into_iter()
-        .map(|entry| admin_listing(&state, entry, now))
+        .map(|realm_id| admin_listing(&state, realm_id, now))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(private(listings))
 }
@@ -272,7 +278,7 @@ async fn audit(
 mod tests {
     use super::*;
     use crate::admin::RealmStatus;
-    use crate::store::Store;
+    use crate::store::{Entry, Store};
     use crate::store::tests::{named_registration, realm_id, registration};
     use aruna_blob::egress::EgressGuard;
     use aruna_core::egress::EgressPolicy;
@@ -481,6 +487,28 @@ mod tests {
         let names = state.store.names(&realm_id()).unwrap();
         let names: Vec<&str> = names.iter().map(|record| record.name.as_str()).collect();
         assert_eq!(names, ["Old", "New"]);
+    }
+
+    #[tokio::test]
+    async fn withdrawn_stays_manageable() {
+        // A withdrawn realm keeps its admin record, is listed as withdrawn and can be retired.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), AdminAuth::token(TOKEN).unwrap());
+        let now = unix_timestamp_secs();
+        register(&state, "Realm", now - 10);
+        let path = format!("/v1/admin/realms/{}", realm_id());
+        let grant = serde_json::json!({"status": "approved", "namespace": "giessen", "note": ""});
+        call(&state, "PUT", &path, Some(TOKEN), Some(grant)).await;
+        state.store.withdraw(&realm_id(), now, now).unwrap();
+        let (_, admin) = call(&state, "GET", "/v1/admin/realms", Some(TOKEN), None).await;
+        assert_eq!(admin[0]["withdrawn"], true);
+        assert_eq!(admin[0]["registration"], serde_json::Value::Null);
+        assert_eq!(admin[0]["admin"]["namespace"], "giessen");
+        assert_eq!(admin[0]["names"][0]["name"], "Realm");
+        let retire = serde_json::json!({"status": "retired", "namespace": "giessen", "note": ""});
+        let (status, stored) = call(&state, "PUT", &path, Some(TOKEN), Some(retire)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored["status"], "retired");
     }
 
     #[tokio::test]

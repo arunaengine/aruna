@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -181,6 +182,34 @@ impl Store {
         Ok(entries)
     }
 
+    /// The realm's stored entry, also after its lease ended.
+    pub fn stored_entry(&self, realm_id: &RealmId) -> Result<Option<Entry>, StoreError> {
+        let value = self.entries.get(realm_id.as_bytes())?;
+        Ok(value.and_then(|value| decode_entry(&value)))
+    }
+
+    /// Every realm with an entry, a name history or admin state, so withdrawn realms stay
+    /// manageable; in realm id order.
+    pub fn known_realms(&self) -> Result<Vec<RealmId>, StoreError> {
+        let mut realms = BTreeSet::new();
+        for keyspace in [&self.entries, &self.names, &self.admin] {
+            for item in keyspace.iter() {
+                let (key, _) = item.into_inner()?;
+                if let Ok(bytes) = <[u8; 32]>::try_from(key.as_ref()) {
+                    realms.insert(bytes);
+                }
+            }
+        }
+        Ok(realms.into_iter().map(RealmId::from_bytes).collect())
+    }
+
+    fn known(&self, realm_id: &RealmId) -> Result<bool, StoreError> {
+        let key = realm_id.as_bytes();
+        Ok(self.entries.contains_key(key)?
+            || self.names.contains_key(key)?
+            || self.admin.contains_key(key)?)
+    }
+
     /// The names the realm registered with, oldest first.
     pub fn names(&self, realm_id: &RealmId) -> Result<Vec<NameRecord>, StoreError> {
         let value = self.names.get(realm_id.as_bytes())?;
@@ -204,7 +233,7 @@ impl Store {
             .unwrap_or_default())
     }
 
-    /// Applies an admin change to a stored realm and appends its audit record atomically.
+    /// Applies an admin change to a known realm and appends its audit record atomically.
     pub fn update_admin(
         &self,
         realm_id: &RealmId,
@@ -213,7 +242,7 @@ impl Store {
         now: u64,
     ) -> Result<AdminState, StoreError> {
         let _guard = self.writer.lock().map_err(|_| StoreError::Poisoned)?;
-        if !self.entries.contains_key(realm_id.as_bytes())? {
+        if !self.known(realm_id)? {
             return Err(StoreError::NotFound);
         }
         let current = self.admin(realm_id)?;
