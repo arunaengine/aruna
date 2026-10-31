@@ -386,3 +386,193 @@ async fn upload_never_overwrites() {
         .unwrap();
     assert_eq!(uploaded, b"new");
 }
+
+/// Gives `user` a role in the node's group with exactly `rules` below the bucket.
+async fn grant(node: &Node, user: aruna_core::UserId, rules: &[(&str, Permission)]) {
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::structs::identity::auth::{Actor, Role};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::storage::blob::object_permission_path;
+    let (realm, group_id) = (node.owner.realm_id, node.group_id);
+    let mut group_auth =
+        GroupAuthorizationDocument::default_group_doc(node.owner.user_id, realm, group_id);
+    let role_id = Ulid::from_bytes([42; 16]);
+    let node_id = node.state.get_node_id();
+    let permissions = rules
+        .iter()
+        .map(|(key, permission)| {
+            let path = object_permission_path(realm, group_id, node_id, BUCKET, key);
+            (path, permission.clone())
+        })
+        .collect();
+    group_auth.roles.insert(
+        role_id,
+        Role {
+            role_id,
+            name: "drop".into(),
+            permissions,
+            assigned_users: [user].into(),
+        },
+    );
+    let group = Group {
+        display_name: "routed".into(),
+        group_id,
+        realm_id: realm,
+        roles: group_auth.roles.keys().copied().collect(),
+        owner: node.owner.user_id,
+    };
+    let actor = Actor {
+        node_id,
+        user_id: node.owner.user_id,
+        realm_id: realm,
+    };
+    let context = node.state.get_ctx();
+    let rows = [
+        (AUTH_KEYSPACE, group_auth.to_bytes(&actor).unwrap()),
+        (GROUP_KEYSPACE, group.to_bytes(&actor).unwrap()),
+    ];
+    for (key_space, value) in rows {
+        let key = group_id.to_bytes().to_vec().into();
+        crate::tests::routes::write_doc(&context, key_space, key, value.into()).await;
+    }
+}
+
+#[tokio::test]
+async fn upload_authorizes_final_name() {
+    // The creator may write `report.txt` only; a renamed upload must not slip past that.
+    let node = node_state().await;
+    put_text(&node, "drop/report.txt", "original").await;
+    let writer = node.stranger.clone();
+    let rules = [
+        ("drop/", Permission::WRITE),
+        ("drop/report.txt", Permission::WRITE),
+    ];
+    grant(&node, writer.user_id, &rules).await;
+    let link = create(
+        &node,
+        &writer,
+        folder_request("drop/", ShareModeBody::Upload),
+    )
+    .await
+    .unwrap();
+    let visit = open(&node, &link.token, None).await.unwrap();
+    let error = upload(&node, &visit, "report.txt", "new")
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), "share_unavailable");
+    let info = bucket_info(&node.state, BUCKET).await.unwrap();
+    let renamed = super::visit::current_version(&node.state, BUCKET, "drop/report (1).txt").await;
+    assert!(matches!(renamed, Err(ServerError::NotFound)), "{info:?}");
+}
+
+#[tokio::test]
+async fn uploads_never_share_a_name() {
+    let node = node_state().await;
+    let link = create(
+        &node,
+        &node.owner,
+        folder_request("drop/", ShareModeBody::Upload),
+    )
+    .await
+    .unwrap();
+    let visit = open(&node, &link.token, None).await.unwrap();
+    // A running upload holds its name, so the next one takes another.
+    let claim = aruna_operations::shares::names::ClaimNameOperation::new(
+        BUCKET,
+        "drop/a.txt",
+        unix_now(),
+        unix_now() + 60,
+    );
+    assert!(drive(claim, &node.state.get_ctx()).await.unwrap());
+    assert_eq!(
+        upload(&node, &visit, "a.txt", "one").await.unwrap(),
+        "a (1).txt"
+    );
+    let (first, second) = tokio::join!(
+        upload(&node, &visit, "b.txt", "first"),
+        upload(&node, &visit, "b.txt", "second"),
+    );
+    let mut names = [first.unwrap(), second.unwrap()];
+    names.sort();
+    assert_eq!(names, ["b (1).txt", "b.txt"]);
+    let reader = create(
+        &node,
+        &node.owner,
+        folder_request("drop/", ShareModeBody::Read),
+    )
+    .await
+    .unwrap();
+    let read_visit = open(&node, &reader.token, None).await.unwrap();
+    let (_, one) = download(&node, &read_visit, "b.txt").await.unwrap();
+    let (_, two) = download(&node, &read_visit, "b (1).txt").await.unwrap();
+    let mut bodies = [one, two];
+    bodies.sort();
+    assert_eq!(bodies, [b"first".to_vec(), b"second".to_vec()]);
+}
+
+#[tokio::test]
+async fn only_uploads_take_large_bodies() {
+    use tower::ServiceExt;
+    let node = node_state().await;
+    let link = create(
+        &node,
+        &node.owner,
+        folder_request("drop/", ShareModeBody::Upload),
+    )
+    .await
+    .unwrap();
+    let visit = open(&node, &link.token, None).await.unwrap();
+    let app = super::router()
+        .split_for_parts()
+        .0
+        .with_state(node.state.clone());
+    let large = "x".repeat(100 * 1024);
+    let request = |method: &str, uri: &str, token: &str, body: String| {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Share {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(peer());
+        request
+    };
+    let password = format!("{{\"password\":\"{large}\"}}");
+    let open = request("POST", "/shares/open", &link.token, password);
+    let answer = app.clone().oneshot(open).await.unwrap();
+    assert_eq!(answer.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let upload = request("PUT", "/shares/visit/uploads?name=big.txt", &visit, large);
+    let answer = app.oneshot(upload).await.unwrap();
+    assert_eq!(answer.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn ticket_ends_with_visit() {
+    let node = node_state().await;
+    put_text(&node, "shared/a.txt", "alpha").await;
+    let link = create(
+        &node,
+        &node.owner,
+        folder_request("shared/", ShareModeBody::Read),
+    )
+    .await
+    .unwrap();
+    let id = Ulid::from_string(&link.share.id).unwrap();
+    let stored = drive(GetShareOperation::new(id), &node.state.get_ctx())
+        .await
+        .unwrap()
+        .unwrap();
+    let visit_end = unix_now() + 5;
+    let short_visit = stored.visit_token(visit_end);
+    let Json(ticket) = create_ticket(
+        State(node.state.clone()),
+        share_headers(&short_visit),
+        Json(TicketRequest {
+            name: "a.txt".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ticket.expires_at, rfc3339(visit_end));
+}
