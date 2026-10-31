@@ -237,7 +237,7 @@ function descriptorFacts(descriptor, kpis, receivedAt) {
     el('dt', {}, 'Last registration'), el('dd', {}, time(receivedAt)),
     el('dt', {}, 'Datasets / groups / nodes'),
     el('dd', {}, `${count(kpis.live_datasets)} / ${count(kpis.groups)} / ${count(kpis.nodes_configured)}`),
-  ];
+  ].flat();
 }
 
 document.addEventListener('DOMContentLoaded', () => {
