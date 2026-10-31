@@ -118,6 +118,7 @@ pub(crate) async fn write_reference(
             inherited_policies: Vec::new(),
             connector_guard: None,
             restrictions: spec.auth_context.path_restrictions.clone(),
+            mirror_guards: Vec::new(),
         },
     )
     .await

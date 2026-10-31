@@ -588,6 +588,7 @@ async fn preserve_reference(
             metadata: metadata.clone(),
             inherited_policies: head.source_policies,
             connector_guard: None,
+            mirror_guards: Vec::new(),
             restrictions: input.restrictions,
         },
     )

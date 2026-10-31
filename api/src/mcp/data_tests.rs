@@ -441,6 +441,7 @@ mod distributed {
             inherited_policies: Vec::new(),
             connector_guard: None,
             restrictions: None,
+            mirror_guards: Vec::new(),
         };
         write_reference_version(&node.context, write).await.unwrap();
     }

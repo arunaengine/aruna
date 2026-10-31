@@ -200,6 +200,7 @@ pub(crate) async fn hidden_link(node: &Node, key: &str) {
         inherited_policies: Vec::new(),
         connector_guard: None,
         restrictions: None,
+        mirror_guards: Vec::new(),
     };
     write_reference_version(&node.state.get_ctx(), write)
         .await

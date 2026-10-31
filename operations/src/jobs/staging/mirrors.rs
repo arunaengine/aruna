@@ -13,7 +13,8 @@ use aruna_core::structs::execution::table::source_path;
 use aruna_core::structs::identity::auth::Permission;
 use ulid::Ulid;
 
-use super::walk::{PageFailure, connector_permission_path, record_failure};
+use super::ItemFailure;
+use super::walk::{PageFailure, access_rules, connector_permission_path, record_failure};
 use crate::auth::permission_rules::PermissionRules;
 use crate::connectors::get_connector::{GetSourceError, GetSourceInput, GetSourceOperation};
 use crate::driver::drive;
@@ -39,7 +40,13 @@ pub(super) async fn add_mirrors(
             let connector = match connectors.entry(connector_id) {
                 Entry::Occupied(found) => found.into_mut(),
                 Entry::Vacant(entry) => {
-                    entry.insert(group_connector(ctx, spec, connector_id).await?)
+                    let found = group_connector(ctx, spec, connector_id).await;
+                    entry.insert(found.map_err(|failure| match failure {
+                        ItemFailure::Lasting(message) => PageFailure::Permanent(message),
+                        ItemFailure::Denied(message)
+                        | ItemFailure::Stage(message)
+                        | ItemFailure::System(message) => PageFailure::Retry(message),
+                    })?)
                 }
             };
             let path = source_path(&value, connector.base_url().as_deref()).and_then(|path| {
@@ -77,21 +84,49 @@ pub(super) async fn add_mirrors(
     Ok((kept, connectors.into_values().collect()))
 }
 
+/// The further sources of one listed file, each readable by the submitter, with their
+/// connectors for the write to check again when it commits.
+pub(super) async fn item_mirrors(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    file_path: &str,
+) -> Result<Vec<(SourceConnector, String)>, ItemFailure> {
+    if spec.mirrors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rules = access_rules(ctx, spec).await.map_err(ItemFailure::System)?;
+    let mut mirrors = Vec::with_capacity(spec.mirrors.len());
+    for mapping in &spec.mirrors {
+        let Some(value) = mapping.map(file_path) else {
+            continue;
+        };
+        let connector = group_connector(ctx, spec, mapping.connector_id).await?;
+        let path =
+            source_path(&value, connector.base_url().as_deref()).map_err(ItemFailure::Stage)?;
+        let allowed = connector_permission_path(spec, mapping.connector_id, &path);
+        if !rules.allows(&allowed, &Permission::READ) {
+            return Err(ItemFailure::Denied("permission denied".to_string()));
+        }
+        mirrors.push((connector, path));
+    }
+    Ok(mirrors)
+}
+
 /// A connector of the job's group, so a job never reads through another group's connector.
 async fn group_connector(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     connector_id: Ulid,
-) -> Result<SourceConnector, PageFailure> {
+) -> Result<SourceConnector, ItemFailure> {
     let input = GetSourceInput {
         group_id: spec.group_id,
         connector_id,
     };
     match drive(GetSourceOperation::new(input), &ctx.driver).await {
         Ok(found) => Ok(found.connector),
-        Err(GetSourceError::NotFound) => Err(PageFailure::Permanent(format!(
+        Err(GetSourceError::NotFound) => Err(ItemFailure::Lasting(format!(
             "the mirror connector {connector_id} is gone"
         ))),
-        Err(error) => Err(PageFailure::Retry(error.to_string())),
+        Err(error) => Err(ItemFailure::System(error.to_string())),
     }
 }

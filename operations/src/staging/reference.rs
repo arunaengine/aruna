@@ -18,7 +18,7 @@ use crate::node::usage_stats::{
 };
 use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::staging::descriptor::build_source_binding;
+use crate::staging::descriptor::{build_source_binding, build_source_descriptor};
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
 use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::UserId;
@@ -32,7 +32,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
-use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::execution::staging::{
+    SourceMirror, StagingStrategy, VersionSourceBinding,
+};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -65,6 +67,8 @@ pub struct MaterializeReferenceInput {
     pub inherited_policies: Vec<PlacementPolicyRef>,
     /// The writer's path restrictions, which its replication obligation keeps.
     pub restrictions: Option<Vec<PathRestriction>>,
+    /// Further sources of the same file: each connector of the group with the file's path there.
+    pub mirrors: Vec<(SourceConnector, String)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -107,7 +111,7 @@ pub async fn stage_reference_blob(
     )
     .await?;
 
-    let version_source = build_source_binding(
+    let mut version_source = build_source_binding(
         StagingStrategy::Reference,
         &head_result.connector,
         &head_result.metadata,
@@ -115,6 +119,18 @@ pub async fn stage_reference_blob(
         Some(input.node_id),
         Some(head_result.connector.connector_id),
     );
+    for (connector, path) in &input.mirrors {
+        let metadata = &head_result.metadata;
+        let mut descriptor =
+            build_source_descriptor(connector, metadata, path.clone(), Some(input.node_id));
+        // A version id names one server's copy, never another's.
+        descriptor.version_selector = None;
+        version_source.mirrors.push(SourceMirror {
+            descriptor,
+            connector_id: Some(connector.connector_id),
+        });
+    }
+    let mirror_guards = (input.mirrors.into_iter()).map(|(connector, _)| connector);
     let (version_id, _changed) = write_reference_version(
         context,
         ReferenceWrite {
@@ -134,6 +150,7 @@ pub async fn stage_reference_blob(
                 head_result.connector.clone(),
                 head_result.secret_fingerprint,
             )),
+            mirror_guards: mirror_guards.collect(),
         },
     )
     .await?;
@@ -164,6 +181,8 @@ pub struct ReferenceWrite {
     pub inherited_policies: Vec<PlacementPolicyRef>,
     /// The connector the binding was resolved through, re-checked at commit.
     pub connector_guard: Option<(SourceConnector, Option<[u8; 16]>)>,
+    /// The connectors of further sources, re-checked at commit as well.
+    pub mirror_guards: Vec<SourceConnector>,
     /// The writer's path restrictions, which its replication obligation keeps.
     pub restrictions: Option<Vec<PathRestriction>>,
 }
@@ -221,6 +240,9 @@ pub async fn write_reference_version(
         policies.extend(write.inherited_policies.iter().copied());
         if let Some((connector, fingerprint)) = write.connector_guard.as_ref() {
             guard_connector_unchanged(context, txn_id, connector, *fingerprint).await?;
+        }
+        for connector in &write.mirror_guards {
+            guard_record_unchanged(context, txn_id, connector).await?;
         }
 
         if write.preassigned_version_id.is_some()
@@ -563,11 +585,11 @@ async fn read_blob_version(
     }
 }
 
-async fn guard_connector_unchanged(
+/// The connector record unchanged since it was resolved, read in the write transaction.
+async fn guard_record_unchanged(
     context: &DriverContext,
     txn_id: TxnId,
     resolved_connector: &SourceConnector,
-    resolved_secret_fingerprint: Option<[u8; 16]>,
 ) -> Result<(), MaterializeReferenceError> {
     let current_connector = match context
         .storage_handle
@@ -589,7 +611,16 @@ async fn guard_connector_unchanged(
     if current_connector.as_ref() != Some(resolved_connector) {
         return Err(StorageError::TransactionConflict.into());
     }
+    Ok(())
+}
 
+async fn guard_connector_unchanged(
+    context: &DriverContext,
+    txn_id: TxnId,
+    resolved_connector: &SourceConnector,
+    resolved_secret_fingerprint: Option<[u8; 16]>,
+) -> Result<(), MaterializeReferenceError> {
+    guard_record_unchanged(context, txn_id, resolved_connector).await?;
     let connector_id = resolved_connector.connector_id;
     let event = context
         .storage_handle
@@ -1022,6 +1053,7 @@ mod tests {
                 expected_bucket,
                 inherited_policies: Vec::new(),
                 restrictions: None,
+                mirrors: Vec::new(),
             },
         )
         .await
@@ -1124,6 +1156,7 @@ mod tests {
                 expected_bucket,
                 inherited_policies: Vec::new(),
                 restrictions: None,
+                mirrors: Vec::new(),
             },
         )
         .await;
@@ -1193,6 +1226,7 @@ mod tests {
             expected_bucket,
             inherited_policies: Vec::new(),
             restrictions: None,
+            mirrors: Vec::new(),
         };
 
         let first = stage_reference_blob(context, input.clone()).await.unwrap();
@@ -1216,6 +1250,56 @@ mod tests {
         );
         let usage = read_usage_counters(context, usage_group_key(group_id)).await;
         assert_eq!(usage.referenced_bytes, 8);
+    }
+
+    // An item's further sources join its binding without a version id; a further source's
+    // connector that changed before the write commits refuses the write.
+    #[tokio::test]
+    async fn mirror_connector_guarded() {
+        let test_context = setup_driver_context().await;
+        let context = &test_context.driver_context;
+        let group_id = Ulid::generate();
+        let realm_id = RealmId::from_bytes([7; 32]);
+        let node_id = iroh::SecretKey::generate().public();
+        let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
+        let (server, endpoint) = spawn_reference_server("ref-data").await;
+        let connector = create_http_connector(context, group_id, &endpoint).await;
+        let mirror = create_http_connector(context, group_id, &endpoint).await;
+        let input = |key: &str, mirror: SourceConnector| MaterializeReferenceInput {
+            group_id,
+            user_id,
+            realm_id,
+            node_id,
+            connector_id: connector.connector_id,
+            source_path: "folder/file.txt".into(),
+            bucket: "bucket-a".into(),
+            key: key.into(),
+            expected_bucket: bucket.clone(),
+            inherited_policies: Vec::new(),
+            restrictions: None,
+            mirrors: vec![(mirror, "mirror/file.txt".into())],
+        };
+        let staged = stage_reference_blob(context, input("a.txt", mirror.clone()))
+            .await
+            .unwrap();
+        let added = &staged.version_source.mirrors[0];
+        assert_eq!(added.connector_id, Some(mirror.connector_id));
+        assert_eq!(added.descriptor.source_path, "mirror/file.txt");
+        assert_eq!(added.descriptor.version_selector, None);
+        let mut replaced = mirror.clone();
+        replaced.name = "replaced".to_string();
+        let refused = stage_reference_blob(context, input("b.txt", replaced)).await;
+        assert!(
+            matches!(
+                refused,
+                Err(MaterializeReferenceError::Storage(
+                    StorageError::TransactionConflict
+                ))
+            ),
+            "{refused:?}"
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -1243,6 +1327,7 @@ mod tests {
                 expected_bucket: bucket.clone(),
                 inherited_policies: Vec::new(),
                 restrictions: None,
+                mirrors: Vec::new(),
             },
         )
         .await
@@ -1266,6 +1351,7 @@ mod tests {
             },
             inherited_policies: Vec::new(),
             connector_guard: None,
+            mirror_guards: Vec::new(),
             restrictions: None,
         };
         assert_eq!(
@@ -1360,6 +1446,7 @@ mod tests {
             inherited_policies: Vec::new(),
             connector_guard: None,
             restrictions: None,
+            mirror_guards: Vec::new(),
         };
         write_reference_version(context, write).await.unwrap();
 

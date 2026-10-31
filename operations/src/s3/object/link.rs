@@ -231,6 +231,7 @@ pub async fn create_link(
         inherited_policies: Vec::new(),
         connector_guard: None,
         restrictions: caller.auth.path_restrictions.clone(),
+        mirror_guards: Vec::new(),
     };
     let (version, _) = Box::pin(write_reference_version(context, write))
         .await
