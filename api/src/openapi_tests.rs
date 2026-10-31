@@ -698,6 +698,7 @@ fn pins_transport_docs() {
                 "/metadata/rocrate/uploads"
                     | "/git/{repository}/info/lfs/objects/{oid}"
                     | "/git/{repository}/{service}"
+                    | "/shares/visit/files"
             ) {
                 assert!(responses["408"]["content"].is_null());
             } else {
