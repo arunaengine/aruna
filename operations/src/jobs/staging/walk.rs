@@ -558,6 +558,21 @@ pub(super) async fn coordinated(
     Ok(ranges.iter().map(Option::is_some).collect())
 }
 
+/// The range turn each of `keys` is written in, `None` for a key this node does not import; a
+/// bucket without ranges needs no turn.
+pub(super) async fn key_turns(
+    ctx: &JobContext,
+    bucket: &BucketInfo,
+    keys: &[&str],
+) -> Result<Vec<Option<BTreeSet<(Ulid, Ulid)>>>, String> {
+    let Some(binding) = bucket.distribution.as_ref() else {
+        return Ok(vec![Some(BTreeSet::new()); keys.len()]);
+    };
+    let ranges = local_ranges(ctx, binding, keys).await?;
+    let turn = |range| BTreeSet::from([(binding.set_id, range)]);
+    Ok(ranges.into_iter().map(|range| range.map(turn)).collect())
+}
+
 /// The range of each of `keys` if this node coordinates it, else `None`.
 async fn local_ranges(
     ctx: &JobContext,

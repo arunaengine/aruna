@@ -26,7 +26,7 @@ use futures_util::StreamExt;
 use super::limiter::retried;
 use super::manifest::{lasting_head, lasting_resolution, lasting_source};
 use super::walk::{
-    PageFailure, StagedFile, access_rules, commit_rows, coordinated, import_page, own_ranges,
+    PageFailure, StagedFile, access_rules, commit_rows, import_page, key_turns, own_ranges,
     record_failure, source_permission_path,
 };
 use super::{ItemFailure, pinned_bucket, queue_key};
@@ -593,7 +593,9 @@ async fn empty_objects(
 ) -> Result<(), PageFailure> {
     let bucket = pinned_bucket(ctx, spec).await.map_err(page_failure)?;
     let rules = access_rules(ctx, spec).await.map_err(PageFailure::Retry)?;
-    for entry in entries {
+    let keys: Vec<&str> = entries.iter().map(|entry| entry.target.as_str()).collect();
+    let turns = key_turns(ctx, &bucket, &keys).await;
+    for (entry, turn) in entries.iter().zip(turns.map_err(PageFailure::Retry)?) {
         let target = object_permission_path(
             spec.auth_context.realm_id,
             spec.group_id,
@@ -605,10 +607,11 @@ async fn empty_objects(
             record_failure(next, "", &entry.target, "permission denied".to_string());
             continue;
         }
-        let own = coordinated(ctx, &bucket, &[entry.target.as_str()]).await;
-        if own.map_err(PageFailure::Retry)?.first() != Some(&true) {
+        let Some(turn) = turn else {
             continue;
-        }
+        };
+        // Pages of other jobs into the key's range wait instead of conflicting with the put.
+        let _turn = ctx.range_turns.take(&turn).await;
         match Box::pin(put_folder(
             ctx,
             spec,
@@ -669,8 +672,9 @@ async fn folder_rows(
             );
             continue;
         }
-        let own = coordinated(ctx, &bucket, &[prefix.as_str()]).await;
-        if own.map_err(PageFailure::Retry)?.first() == Some(&true) {
+        let turn = key_turns(ctx, &bucket, &[prefix.as_str()]).await;
+        if let Some(Some(turn)) = turn.map_err(PageFailure::Retry)?.pop() {
+            let _turn = ctx.range_turns.take(&turn).await;
             match Box::pin(put_folder(ctx, spec, &bucket, &prefix, &entry.metadata)).await {
                 Ok(()) => {}
                 Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
