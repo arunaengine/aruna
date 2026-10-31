@@ -235,6 +235,64 @@ async fn realm_hit_cached() {
 }
 
 #[tokio::test]
+async fn kept_realms_rechecked() {
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let id = minted();
+    let path = id.to_string();
+    let sites = Sites::new(&[(&format!("{API}/w3id/{id}"), Holding::Holds)]);
+    assert_eq!(
+        sites.ask(&resolver, &path, now).await,
+        redirect(&format!("{API}/w3id/{id}"))
+    );
+    // A new API URL applies to the kept hit at once, without asking anyone again.
+    let moved = Entry {
+        registration: registration("https://moved.example.org", now + 1),
+        received_at: now,
+        verified: false,
+    };
+    let store = &resolver.registry.store;
+    store.register(&realm_id(), &moved, now).unwrap();
+    let target = format!("https://moved.example.org/api/v1/w3id/{id}");
+    assert_eq!(
+        sites.ask(&resolver, &path, now + 1).await,
+        redirect(&target)
+    );
+    assert_eq!(sites.asked(), 3);
+    // A withdrawn realm is never a kept target: the id is guessed again without it.
+    store.withdraw(&realm_id(), now + 2, now).unwrap();
+    let page = redirect(&format!("{}{id}", V2.page));
+    assert_eq!(sites.ask(&resolver, &path, now + 2).await, page);
+    assert_eq!(sites.asked(), 5);
+}
+
+#[tokio::test]
+async fn expired_lease_rechecked() {
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let leased = now - crate::store::LEASE_SECS + 10;
+    let entry = Entry {
+        registration: registration(BASE, now + 1),
+        received_at: leased,
+        verified: false,
+    };
+    resolver
+        .registry
+        .store
+        .register(&realm_id(), &entry, now)
+        .unwrap();
+    let id = minted();
+    let path = id.to_string();
+    let sites = Sites::new(&[(&format!("{API}/w3id/{id}"), Holding::Holds)]);
+    assert_eq!(
+        sites.ask(&resolver, &path, now).await,
+        redirect(&format!("{API}/w3id/{id}"))
+    );
+    // The lease ends while the guess is still kept; the kept realm is no target any more.
+    let page = redirect(&format!("{}{id}", V2.page));
+    assert_eq!(sites.ask(&resolver, &path, now + 20).await, page);
+    assert_eq!(sites.asked(), 5);
+}
+
+#[tokio::test]
 async fn legacy_ids_guessed() {
     let dev_api = format!("{}{LEGACY}", V2_DEV.api);
     let prod_api = format!("{}{LEGACY}", V2.api);

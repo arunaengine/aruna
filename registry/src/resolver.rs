@@ -102,11 +102,19 @@ enum Shape {
     Unknown,
 }
 
+/// A kept guess. A winning realm is kept by id and its target rebuilt from the live
+/// registration on each use, so withdrawal, lease expiry and URL changes apply at once.
+#[derive(Clone)]
+enum Kept {
+    Realm(RealmId),
+    Fixed(Answer),
+}
+
 pub struct Resolver {
     registry: Arc<RegistryState>,
     /// Approved realms, the default realm first; only these are asked and redirected to.
     approved: Vec<RealmId>,
-    cache: Mutex<LruCache<String, (Answer, u64)>>,
+    cache: Mutex<LruCache<String, (Kept, u64)>>,
     guesses: DefaultDirectRateLimiter,
 }
 
@@ -156,11 +164,9 @@ impl Resolver {
         if !self.approved.contains(&realm) {
             return Answer::NotFound("realm not resolved here");
         }
-        match self.realm_targets(now, path) {
-            Ok(targets) => match targets.into_iter().find(|(id, _)| *id == realm) {
-                Some((_, target)) => Answer::Redirect(target),
-                None => Answer::NotFound("realm not publicly reachable"),
-            },
+        match self.realm_target(realm, now, path) {
+            Ok(Some(target)) => Answer::Redirect(target),
+            Ok(None) => Answer::NotFound("realm not publicly reachable"),
             Err(error) => storage_failed(error),
         }
     }
@@ -177,7 +183,7 @@ impl Resolver {
             Shape::Profile(id) => (format!("profile/{id}"), *id, format!("profile/{id}")),
             _ => return Answer::NotFound("not an Aruna identifier"),
         };
-        if let Some(answer) = self.cached(&key, now) {
+        if let Some(answer) = self.cached(&key, &node_path, now) {
             return answer;
         }
         if self.guesses.check().is_err() {
@@ -220,24 +226,48 @@ impl Resolver {
         let settled = answers
             .iter()
             .all(|(_, _, holding)| *holding != Holding::Unavailable);
+        let kept = match &answer {
+            Answer::Redirect(target) => realms
+                .iter()
+                .find(|(_, realm_target)| realm_target == target)
+                .map_or(Kept::Fixed(answer.clone()), |(realm, _)| {
+                    Kept::Realm(*realm)
+                }),
+            _ => Kept::Fixed(answer.clone()),
+        };
         if settled
             && matches!(answer, Answer::Redirect(_) | Answer::NotFound(_))
             && let Ok(mut cache) = self.cache.lock()
         {
-            cache.put(key, (answer.clone(), now + CACHE_SECS));
+            cache.put(key, (kept, now + CACHE_SECS));
         }
         answer
     }
 
-    fn cached(&self, key: &str, now: u64) -> Option<Answer> {
-        let mut cache = self.cache.lock().ok()?;
-        match cache.get(key) {
-            Some((answer, expires_at)) if *expires_at > now => Some(answer.clone()),
-            Some(_) => {
-                cache.pop(key);
-                None
+    /// A kept answer; a kept realm that is no longer redirectable is dropped and guessed again.
+    fn cached(&self, key: &str, node_path: &str, now: u64) -> Option<Answer> {
+        let kept = {
+            let mut cache = self.cache.lock().ok()?;
+            match cache.get(key) {
+                Some((kept, expires_at)) if *expires_at > now => kept.clone(),
+                Some(_) => {
+                    cache.pop(key);
+                    return None;
+                }
+                None => return None,
             }
-            None => None,
+        };
+        match kept {
+            Kept::Fixed(answer) => Some(answer),
+            Kept::Realm(realm) => match self.direct(realm, node_path, now) {
+                Answer::Redirect(target) => Some(Answer::Redirect(target)),
+                _ => {
+                    if let Ok(mut cache) = self.cache.lock() {
+                        cache.pop(key);
+                    }
+                    None
+                }
+            },
         }
     }
 
@@ -245,19 +275,29 @@ impl Resolver {
     fn realm_targets(&self, now: u64, path: &str) -> Result<Vec<(RealmId, String)>, StoreError> {
         let mut targets = Vec::new();
         for realm in &self.approved {
-            let Some(entry) = self.registry.store.entry(realm, now)? else {
-                continue;
-            };
-            let api_url = &entry.registration.payload.descriptor.payload.api_url;
-            // w3id.org would send the redirect back here; refusing it keeps every chain finite.
-            if api_url.host_str() == Some("w3id.org") {
-                continue;
-            }
-            if let Some(target) = resolve_target(api_url, NODE_ROUTE, path) {
+            if let Some(target) = self.realm_target(*realm, now, path)? {
                 targets.push((*realm, target));
             }
         }
         Ok(targets)
+    }
+
+    /// The node route for `path` of `realm` from its current registration, if leased.
+    fn realm_target(
+        &self,
+        realm: RealmId,
+        now: u64,
+        path: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let Some(entry) = self.registry.store.entry(&realm, now)? else {
+            return Ok(None);
+        };
+        let api_url = &entry.registration.payload.descriptor.payload.api_url;
+        // w3id.org would send the redirect back here; refusing it keeps every chain finite.
+        if api_url.host_str() == Some("w3id.org") {
+            return Ok(None);
+        }
+        Ok(resolve_target(api_url, NODE_ROUTE, path))
     }
 }
 
