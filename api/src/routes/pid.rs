@@ -22,11 +22,13 @@ use aruna_core::structs::secondary_id::{
     IdentifierOrigin, SecondaryIdKind, normalize_endpoint, normalize_value,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifier};
 use aruna_core::structs::{
     PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
     PersistentIdStatus,
 };
 use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::lookup_identifier_distributed;
@@ -35,6 +37,7 @@ use aruna_operations::metadata::persistent_id::forward::{
     read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
 use aruna_operations::metadata::secondary_ids::IdentifierMatch;
+use aruna_operations::realm::get_config::GetConfigOperation;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -56,6 +59,11 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(resolve_profile_pid))
         .routes(routes!(list_persistent_ids))
         .routes(routes!(lookup_identifier))
+        .merge(super::routes_at(
+            OpenApiRouter::new(),
+            "/w3id/{*rest}",
+            routes!(resolve_w3id),
+        ))
 }
 
 fn rocrate_location(document_id: Ulid) -> String {
@@ -100,6 +108,15 @@ async fn resolve_pid(
     let Ok(document_id) = Ulid::from_string(&document_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    document_landing(&state, document_id, None).await
+}
+
+/// The landing of a document PID; `page` replaces the RO-Crate target of an active public PID.
+async fn document_landing(
+    state: &Arc<ServerState>,
+    document_id: Ulid,
+    page: Option<String>,
+) -> Response {
     let ctx = state.get_ctx();
     let resolved = resolve_pid_routed(
         &ctx,
@@ -108,12 +125,16 @@ async fn resolve_pid(
         MetadataRegistryRecord::graph_iri_for(document_id),
     )
     .await;
-    if matches!(resolved, Ok(PersistentIdResolution::Redirect))
-        && let Some(holder) =
+    if matches!(resolved, Ok(PersistentIdResolution::Redirect)) {
+        if let Some(page) = page {
+            return redirect(&page);
+        }
+        if let Some(holder) =
             choose_holder(ctx.as_ref(), state.get_node_id(), document_id, now_ms()).await
-    {
-        let api = holder.urls.api.as_deref().unwrap_or_default();
-        return redirect(&rocrate_url(api, document_id));
+        {
+            let api = holder.urls.api.as_deref().unwrap_or_default();
+            return redirect(&rocrate_url(api, document_id));
+        }
     }
     landing_response(document_id, resolved)
 }
@@ -158,15 +179,125 @@ async fn resolve_profile_pid(
     let Ok(document_id) = Ulid::from_string(&document_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let ctx = state.get_ctx();
+    profile_landing(&state, document_id, None).await
+}
+
+/// The landing of a Profile PID; `page` replaces the RO-Crate target of an active public PID.
+async fn profile_landing(
+    state: &Arc<ServerState>,
+    document_id: Ulid,
+    page: Option<String>,
+) -> Response {
     let resolved = resolve_pid_routed(
-        &ctx,
+        &state.get_ctx(),
         state.get_realm_id(),
         document_id,
         PersistentIdMapping::profile_pid(document_id),
     )
     .await;
-    landing_response(document_id, resolved)
+    match (resolved, page) {
+        (Ok(PersistentIdResolution::Redirect), Some(page)) => redirect(&page),
+        (resolved, _) => landing_response(document_id, resolved),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/w3id/{rest}",
+    tag = "pid",
+    summary = "Resolve any Aruna w3id path",
+    description = r#"The node route the Aruna resolver redirects `https://w3id.org/aruna/{rest}` to.
+
+**Authentication**: none; public route, no bearer token is read.
+
+**Behavior**: `{rest}` is the path after `https://w3id.org/aruna/`:
+- `{document_id}`: a dataset, release or run, resolved as `GET /pid/{document_id}`.
+- `profile/{document_id}`: a Profile, resolved as `GET /profile/{document_id}`.
+- `data/{id}`: a content hash, global id or versioned ARN, redirected to `GET /resolve/{id}`.
+
+A browser (`Accept` names `text/html`) is sent to the portal page of an active public document
+or Profile when the realm's federation settings name a portal; other clients get the RO-Crate.
+An id that names no metadata placement of this realm, such as a legacy object id, is a 404."#,
+    params(("rest" = String, Path, description = "The w3id path after `https://w3id.org/aruna/`, for example `01JMETADATA0123456789ABCDE` or `profile/01JMETADATA0123456789ABCDE`")),
+    responses(
+        (status = 302, description = "Active public document or Profile; `Location` is its portal page for a browser, else its RO-Crate read route, and the answer varies by `Accept`"),
+        (status = 307, description = "A data id; `Location` is `/api/v1/resolve/{id}`"),
+        (status = 404, description = "Unknown shape, malformed id, or an identifier this realm does not resolve"),
+        (status = 410, description = "The identifier was withdrawn and stays withdrawn", body = Object, content_type = "application/json"),
+        (status = 503, description = "The PID authority is unreachable; retryable")
+    ),
+    security(())
+)]
+async fn resolve_w3id(
+    State(state): State<Arc<ServerState>>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    // The raw path keeps an ARN key percent-encoded, as its canonical form requires.
+    let rest = uri.path().split_once("/w3id/").map_or("", |(_, rest)| rest);
+    if let Some(id) = rest.strip_prefix("data/") {
+        return data_redirect(id);
+    }
+    let (profile, id) = match rest.strip_prefix("profile/") {
+        Some(id) => (true, id),
+        None => (false, rest),
+    };
+    let Ok(document_id) = Ulid::from_string(id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let page = match wants_page(&headers) {
+        true => portal_page(&state, profile, document_id).await,
+        false => None,
+    };
+    let mut response = match profile {
+        true => profile_landing(&state, document_id, page).await,
+        false => document_landing(&state, document_id, page).await,
+    };
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("accept"));
+    response
+}
+
+/// A 307 to the data resolve route for a well-formed data id, which is re-serialized.
+fn data_redirect(id: &str) -> Response {
+    let Ok(parsed) = W3idIdentifier::parse(&format!("{ARUNA_DATA_PREFIX}{id}")) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let canonical = parsed.to_w3id();
+    let id = canonical
+        .strip_prefix(ARUNA_DATA_PREFIX)
+        .unwrap_or_default();
+    let mut response = redirect(&format!("/api/v1/resolve/{id}"));
+    *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+    response
+}
+
+fn wants_page(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.contains("text/html"))
+}
+
+/// The portal page of a document or Profile, when the federation settings name a portal.
+async fn portal_page(state: &ServerState, profile: bool, document_id: Ulid) -> Option<String> {
+    let config = drive(
+        GetConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .ok()?;
+    let mut portal = config.federation?.portal_url;
+    if !portal.path().ends_with('/') {
+        portal.set_path(&format!("{}/", portal.path()));
+    }
+    let page = match profile {
+        true => format!("app/profiles/{document_id}"),
+        false => format!("app/datasets/{document_id}"),
+    };
+    portal.join(&page).ok().map(String::from)
 }
 
 fn landing_response(
@@ -782,21 +913,29 @@ mod tests {
         );
     }
 
-    /// An active public PID redirects to the RO-Crate read; with no holder chosen, on this node.
-    #[tokio::test]
-    async fn redirects_public_pid() {
+    use aruna_core::structs::identity::auth::Actor;
+    use axum::http::{HeaderMap, Uri};
+
+    /// A node whose realm holds one active public PID, and that document's id.
+    async fn public_pid() -> (
+        tempfile::TempDir,
+        Arc<ServerState>,
+        Ulid,
+        Arc<aruna_operations::driver::DriverContext>,
+        Actor,
+    ) {
         use crate::tests::routes::{
             seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state,
             test_storage, write_doc,
         };
         use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, ID_MAPPING_KEYSPACE};
         use aruna_core::storage_entries::metadata_document_key;
-        use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+        use aruna_core::structs::identity::auth::NodeCapabilities;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::persistent_id_key;
         use aruna_core::structs::placement::record::PlacementRef;
 
-        let (_dir, storage) = test_storage();
+        let (dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes(
             ed25519_dalek::SigningKey::from_bytes(&[7; 32])
                 .verifying_key()
@@ -864,7 +1003,14 @@ mod tests {
         let key = metadata_document_key(document_id);
         write_doc(&context, DOCUMENT_INDEX_KEYSPACE, key, record_row.into()).await;
         let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
-        let state = Arc::new(test_state(context, realm_id, node_id, capabilities).await);
+        let state = test_state(context.clone(), realm_id, node_id, capabilities).await;
+        (dir, Arc::new(state), document_id, context, actor)
+    }
+
+    /// An active public PID redirects to the RO-Crate read; with no holder chosen, on this node.
+    #[tokio::test]
+    async fn redirects_public_pid() {
+        let (_dir, state, document_id, _, _) = public_pid().await;
 
         let response = resolve_pid(State(state.clone()), Path(document_id.to_string())).await;
 
@@ -875,5 +1021,113 @@ mod tests {
         assert_eq!(location, rocrate_location(document_id));
         let malformed = resolve_pid(State(state), Path("not-a-ulid".to_string())).await;
         assert_eq!(malformed.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn w3id(state: &Arc<ServerState>, rest: &str, accept: &str) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, HeaderValue::from_str(accept).unwrap());
+        let uri: Uri = format!("/api/v1/w3id/{rest}").parse().unwrap();
+        resolve_w3id(State(state.clone()), headers, uri).await
+    }
+
+    fn location(response: &Response) -> &str {
+        response.headers()[header::LOCATION].to_str().unwrap()
+    }
+
+    /// Browsers get the portal page once the realm names a portal; clients keep the RO-Crate.
+    #[tokio::test]
+    async fn w3id_picks_pages() {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::federation::{
+            AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode, Signed,
+        };
+        use aruna_core::keys::generate_signing_key;
+        use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+        use aruna_core::structs::identity::auth::NodeCapabilities;
+
+        let (_dir, state, document_id, context, actor) = public_pid().await;
+        let id = document_id.to_string();
+        let client = w3id(&state, &id, "application/ld+json").await;
+        assert_eq!(client.status(), StatusCode::FOUND);
+        assert_eq!(location(&client), rocrate_location(document_id));
+        assert_eq!(client.headers()[header::VARY], "accept");
+        // Without federation settings no portal is known, so a browser gets the RO-Crate too.
+        let html = "text/html,application/xhtml+xml";
+        let browser = w3id(&state, &id, html).await;
+        assert_eq!(location(&browser), rocrate_location(document_id));
+
+        let mut config = drive(GetConfigOperation::new(actor.realm_id), &context)
+            .await
+            .unwrap();
+        let descriptor = RealmDescriptor {
+            realm_id: actor.realm_id,
+            name: "Realm".to_string(),
+            description: String::new(),
+            api_url: url::Url::parse("https://api.example.org/api/v1").unwrap(),
+            portal_url: url::Url::parse("https://portal.example.org/portal").unwrap(),
+            issued_at: 1,
+        };
+        let signer = NodeCapabilities::management_node(generate_signing_key()).unwrap();
+        config.federation = Some(FederationSettings {
+            name: descriptor.name.clone(),
+            api_url: descriptor.api_url.clone(),
+            portal_url: descriptor.portal_url.clone(),
+            registry_url: None,
+            registration: RegistrationMode::Enabled,
+            accepted_realms: AcceptedRealms::None,
+            descriptor: Signed::sign(descriptor, &signer).unwrap(),
+        });
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: actor.realm_id.as_bytes().to_vec().into(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        let browser = w3id(&state, &id, html).await;
+        assert_eq!(browser.status(), StatusCode::FOUND);
+        assert_eq!(
+            location(&browser),
+            format!("https://portal.example.org/portal/app/datasets/{id}")
+        );
+        let client = w3id(&state, &id, "application/ld+json").await;
+        assert_eq!(location(&client), rocrate_location(document_id));
+        // The document is no Profile, so its profile form names nothing, not even for a browser.
+        let profile = w3id(&state, &format!("profile/{id}"), html).await;
+        assert_eq!(profile.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn w3id_dispatches_shapes() {
+        let (_dir, state, _, _, _) = public_pid().await;
+        let hash = "ab".repeat(32);
+        let data = w3id(&state, &format!("data/{hash}"), "*/*").await;
+        assert_eq!(data.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(location(&data), format!("/api/v1/resolve/{hash}"));
+        let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([3; 32]);
+        let global = format!("{realm}/01JMETADATA0123456789ABCDE");
+        let version = w3id(&state, &format!("data/{global}"), "*/*").await;
+        assert_eq!(location(&version), format!("/api/v1/resolve/{global}"));
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let arn = format!("arn:aruna:{realm}:{node}:s3/reads/a%20b@01JMETADATA0123456789ABCDE");
+        let object = w3id(&state, &format!("data/{arn}"), "*/*").await;
+        assert_eq!(location(&object), format!("/api/v1/resolve/{arn}"));
+        // An unknown ULID, a legacy one included, is a 404 like every unknown shape.
+        let unknown = Ulid::from_bytes([42; 16]).to_string();
+        for rest in [
+            unknown.as_str(),
+            "01H8Y3R7Z5X9C2V4B6N8M0Q1W3",
+            "profile/01H8Y3R7Z5X9C2V4B6N8M0Q1W3",
+            "data/not-an-id",
+            "data/../../x",
+            "terms/Release",
+            "dev/01H8Y3R7Z5X9C2V4B6N8M0Q1W3",
+            "01JMETADATA0123456789ABCDE/x",
+        ] {
+            let response = w3id(&state, rest, "*/*").await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{rest}");
+        }
     }
 }

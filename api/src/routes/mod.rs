@@ -441,6 +441,7 @@ pub(crate) mod tests {
         ("GET", "/pid/{document_id}"),
         ("GET", "/pid/lookup"),
         ("GET", "/profile/{document_id}"),
+        ("GET", "/w3id/{*rest}"),
         ("GET", "/access/policies/effective"),
         ("GET", "/access/policies/group/{group_id}"),
         ("GET", "/access/policies/realm"),
@@ -744,6 +745,7 @@ pub(crate) mod tests {
             "/ga4gh/drs/v1/objects/{*object_id}",
         ),
         ("/resolve/{id}", "/resolve/{*id}"),
+        ("/w3id/{rest}", "/w3id/{*rest}"),
         (
             "/ga4gh/tes/v1/tasks/{id}:cancel",
             "/ga4gh/tes/v1/tasks/{id}",
