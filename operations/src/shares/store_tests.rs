@@ -18,6 +18,17 @@ fn context(dir: &tempfile::TempDir) -> DriverContext {
     }
 }
 
+async fn save(context: &DriverContext, link: ShareLink) {
+    let Ok(aruna_core::effects::Effect::Storage(effect)) = save_effect(&link) else {
+        panic!("a link saves with one storage batch");
+    };
+    let event = context.storage_handle.send_storage_effect(effect).await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+}
+
 fn link(owner: u8, id: u8) -> ShareLink {
     let realm = RealmId::from_bytes([1; 32]);
     ShareLink {
@@ -33,6 +44,7 @@ fn link(owner: u8, id: u8) -> ShareLink {
         expires_at: None,
         password: None,
         secret: [id; 32],
+        signing_key: [id; 32],
         revoked_at: None,
     }
 }
@@ -42,15 +54,11 @@ async fn lists_only_own_links() {
     let dir = tempfile::tempdir().unwrap();
     let context = context(&dir);
     for (owner, id) in [(3, 10), (3, 11), (4, 12)] {
-        drive(SaveShareOperation::new(link(owner, id)), &context)
-            .await
-            .unwrap();
+        save(&context, link(owner, id)).await;
     }
     let mut revoked = link(3, 10);
     revoked.revoked_at = Some(5);
-    drive(SaveShareOperation::new(revoked.clone()), &context)
-        .await
-        .unwrap();
+    save(&context, revoked.clone()).await;
     let mine = drive(ListSharesOperation::new(link(3, 0).created_by), &context)
         .await
         .unwrap();
@@ -63,6 +71,9 @@ async fn lists_only_own_links() {
         .await
         .unwrap();
     assert_eq!(missing, None);
+    // Another user reads someone else's link as missing.
+    let foreign = GetShareOperation::for_owner(Ulid::from_bytes([12; 16]), link(3, 0).created_by);
+    assert_eq!(drive(foreign, &context).await.unwrap(), None);
 }
 
 #[tokio::test]

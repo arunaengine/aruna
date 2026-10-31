@@ -36,81 +36,62 @@ fn storage_error(event: Event) -> ShareStoreError {
     }
 }
 
-/// Writes one link record and its owner index row in one batch.
-#[derive(Debug, PartialEq)]
-pub struct SaveShareOperation {
-    link: ShareLink,
-    output: Option<Result<(), ShareStoreError>>,
+/// The batch that writes one link record and its owner index row.
+pub fn save_effect(link: &ShareLink) -> Result<Effect, ConversionError> {
+    Ok(Effect::Storage(StorageEffect::BatchWrite {
+        writes: vec![
+            (
+                SHARE_LINK_KEYSPACE.to_string(),
+                link.id.to_bytes().to_vec().into(),
+                link.to_bytes()?.into(),
+            ),
+            (
+                SHARE_OWNER_KEYSPACE.to_string(),
+                owner_key(&link.created_by, link.id).into(),
+                Vec::new().into(),
+            ),
+        ],
+        txn_id: None,
+    }))
 }
 
-impl SaveShareOperation {
-    pub fn new(link: ShareLink) -> Self {
-        Self { link, output: None }
-    }
-}
-
-impl Operation for SaveShareOperation {
-    type Output = ();
-    type Error = ShareStoreError;
-
-    fn start(&mut self) -> Effects {
-        let value = match self.link.to_bytes() {
-            Ok(value) => value,
-            Err(error) => {
-                self.output = Some(Err(error.into()));
-                return smallvec![];
-            }
-        };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    SHARE_LINK_KEYSPACE.to_string(),
-                    self.link.id.to_bytes().to_vec().into(),
-                    value.into(),
-                ),
-                (
-                    SHARE_OWNER_KEYSPACE.to_string(),
-                    owner_key(&self.link.created_by, self.link.id).into(),
-                    Vec::new().into(),
-                ),
-            ],
-            txn_id: None,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if self.output.is_none() {
-            self.output = Some(match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-                event => Err(storage_error(event)),
-            });
-        }
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<(), ShareStoreError> {
-        self.output.unwrap_or(Err(ShareStoreError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
+/// The write of one access log entry.
+pub fn event_effect(
+    share_id: Ulid,
+    entry_id: Ulid,
+    event: &ShareEvent,
+) -> Result<Effect, ConversionError> {
+    Ok(Effect::Storage(StorageEffect::Write {
+        key_space: SHARE_EVENT_KEYSPACE.to_string(),
+        key: event_key(share_id, entry_id).into(),
+        value: event.to_bytes()?.into(),
+        txn_id: None,
+    }))
 }
 
 /// Reads one link record; `None` when the id is unknown.
 #[derive(Debug, PartialEq)]
 pub struct GetShareOperation {
     id: Ulid,
+    owner: Option<UserId>,
     output: Option<Result<Option<ShareLink>, ShareStoreError>>,
 }
 
 impl GetShareOperation {
     pub fn new(id: Ulid) -> Self {
-        Self { id, output: None }
+        Self {
+            id,
+            owner: None,
+            output: None,
+        }
+    }
+
+    /// Reads the link only when `owner` created it; another user's link reads as `None`.
+    pub fn for_owner(id: Ulid, owner: UserId) -> Self {
+        Self {
+            owner: Some(owner),
+            ..Self::new(id)
+        }
     }
 }
 
@@ -135,7 +116,9 @@ impl Operation for GetShareOperation {
                     .map_err(Into::into)
                     .and_then(|link| match link {
                         Some(link) if link.id != self.id => Err(ShareStoreError::UnexpectedEvent),
-                        link => Ok(link),
+                        link => Ok(link.filter(|link| {
+                            self.owner.is_none_or(|owner| link.created_by == owner)
+                        })),
                     }),
                 event => Err(storage_error(event)),
             });
@@ -303,19 +286,13 @@ impl Operation for LogShareOperation {
     type Error = ShareStoreError;
 
     fn start(&mut self) -> Effects {
-        let value = match self.event.to_bytes() {
-            Ok(value) => value,
+        match event_effect(self.share_id, self.entry_id, &self.event) {
+            Ok(effect) => smallvec![effect],
             Err(error) => {
                 self.output = Some(Err(error.into()));
-                return smallvec![];
+                smallvec![]
             }
-        };
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: SHARE_EVENT_KEYSPACE.to_string(),
-            key: event_key(self.share_id, self.entry_id).into(),
-            value: value.into(),
-            txn_id: None,
-        })]
+        }
     }
 
     fn step(&mut self, event: Event) -> Effects {

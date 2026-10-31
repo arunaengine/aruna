@@ -33,7 +33,7 @@ pub enum AuthorizeError {
 
 /// A missing or malformed target is an authorization failure, not an internal error, matching
 /// the choke points that fed this boundary.
-fn check_error(error: AuthorizationError) -> AuthorizeError {
+pub(crate) fn check_error(error: AuthorizationError) -> AuthorizeError {
     match error {
         AuthorizationError::InvalidRealmId
         | AuthorizationError::InvalidGroupId
