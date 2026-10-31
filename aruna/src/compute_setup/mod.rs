@@ -113,6 +113,8 @@ pub(super) struct KubernetesSettings {
     pub(super) mount_driver: Option<String>,
     /// KubeDAL driver for run input views and session data, which mount through this node's gateway.
     pub(super) kubedal_driver: Option<String>,
+    /// KubeDAL worker cache for cached run inputs, set by its scope.
+    pub(super) kubedal_cache: Option<aruna_compute::KubedalCache>,
     /// The node's S3 endpoint as task pods reach it, used for their S3 env instead of the
     /// public one.
     pub(super) session_endpoint: Option<String>,

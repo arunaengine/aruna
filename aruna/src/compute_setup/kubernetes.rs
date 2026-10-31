@@ -49,6 +49,7 @@ pub(super) async fn build(
                         driver,
                         endpoint,
                         region: "us-east-1".to_string(),
+                        cache: kubernetes.kubedal_cache.clone(),
                     })
                 }),
             policy_manifests: kubernetes.policy_manifests.clone(),
