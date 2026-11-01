@@ -641,8 +641,6 @@ initial realm administrator role.
   never creates a user of its own. The user document reaches the other realm nodes through
   document sync, so it may not be visible elsewhere immediately.
 - No access token is returned: exchange the same OIDC token at `GET /access/token`.
-
-**Existing account check**
 - When the subject is new and the provider marks the token's email verified, no account is created
   while an active account has the same verified email or the same name. The answer is 409 with
   code `account_match` and never says which account. Nothing is stored meanwhile.

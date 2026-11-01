@@ -36,7 +36,7 @@ const SHARE_OPENS_MINUTE: u32 = 30;
 const SHARE_OPENS_BURST: u32 = 10;
 /// Account merges and sign-in attaches per account: each checks a token of another account.
 const ACCOUNT_LINKS_MINUTE: u32 = 6;
-const ACCOUNT_LINKS_BURST: u32 = 3;
+const ACCOUNT_LINKS_BURST: u32 = 5;
 
 type Keyed<K> = RateLimiter<K, DefaultKeyedStateStore<K>, DefaultClock>;
 

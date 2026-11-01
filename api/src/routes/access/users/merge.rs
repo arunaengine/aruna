@@ -149,7 +149,6 @@ that account. Both prove control; a matching email or name is never enough.
         (status = 403, description = "A login is too old, the other token is invalid or of another realm, both name the same account, or an account is deactivated or a service account (code `merge_refused`)", body = ErrorResponse),
         (status = 404, description = "This node holds no record of one of the accounts", body = ErrorResponse),
         (status = 409, description = "The other account still holds a vault (code `vault_present`)", body = ErrorResponse),
-        (status = 429, description = "Too many attempts (code `rate_limited`)", body = ErrorResponse),
         (status = 503, description = "Storage or the vault holders were unavailable, or a document moved during the merge; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -234,11 +233,12 @@ minutes after its provider login.
         example = json!({ "token": "<OIDC token of the sign-in to attach>" })
     ),
     responses(
-        (status = 200, description = "The caller's account with the attached sign-in", body = GetUserResponse),
+        (status = 200, description = "The caller's account with the attached sign-in", body = GetUserResponse,
+            example = json!({ "user_id": "<caller user id>", "name": "Alice Example",
+                "subject_ids": ["<first sign-in>", "<attached sign-in>"], "attributes": {} })),
         (status = 401, description = "Missing or invalid bearer token, or an invalid OIDC token", body = ErrorResponse),
         (status = 403, description = "A login is too old (code `merge_refused`)", body = ErrorResponse),
-        (status = 409, description = "The sign-in belongs to another account (code `subject_taken`)", body = ErrorResponse),
-        (status = 429, description = "Too many attempts (code `rate_limited`)", body = ErrorResponse)
+        (status = 409, description = "The sign-in belongs to another account (code `subject_taken`)", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
