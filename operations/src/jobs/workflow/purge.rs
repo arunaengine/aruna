@@ -444,17 +444,13 @@ async fn delete_versions(
 }
 
 /// Refuses the batch while a release pins one of its versions, also one published after the
-/// purge was submitted; else the guards each delete keeps. A bucket purge deletes the releases
-/// with their files.
+/// purge was submitted; else the guards each delete keeps.
 async fn release_guards(
     ctx: &JobContext,
     spec: &StoragePurgeSpec,
     info: &BucketInfo,
     entries: &[BulkDeleteEntry],
 ) -> Result<ReleaseGuards, PurgeRunError> {
-    if spec.scope.is_bucket() {
-        return Ok(Vec::new());
-    }
     let scope = BucketScope {
         realm_id: spec.auth_context.realm_id,
         node_id: spec.node_id,
