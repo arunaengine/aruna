@@ -88,7 +88,7 @@ fn config_read(auth: &AuthContext) -> (String, ByteView) {
 
 /// An unrestricted portal session of a local account whose primary login was at most
 /// `MAX_LINK_SECS` ago; renewals keep that time and child sessions have none.
-fn fresh_local(auth: &AuthContext, auth_time: Option<u64>, now: u64) -> bool {
+pub(crate) fn fresh_local(auth: &AuthContext, auth_time: Option<u64>, now: u64) -> bool {
     let portal = auth.session.as_ref().map(|session| session.kind) == Some(SessionKind::Portal);
     portal
         && auth.path_restrictions.is_none()

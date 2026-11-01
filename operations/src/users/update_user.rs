@@ -741,7 +741,7 @@ impl Operation for UpdateUserOperation {
     }
 }
 
-fn local_sync_change(
+pub(crate) fn local_sync_change(
     previous_change: Option<&DocumentChange>,
     actor: &Actor,
     placement: PlacementRef,
