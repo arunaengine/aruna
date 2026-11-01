@@ -8,8 +8,10 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::UserId;
 use crate::id::NodeId;
 use crate::structs::execution::staging::PortableSourceDescriptor;
+use crate::structs::identity::s3_session::S3Session;
 use crate::structs::storage::global_id::GlobalId;
 use crate::structs::storage::replication::VersionedObjectArn;
 
@@ -42,7 +44,28 @@ impl OriginVersion {
     }
 }
 
-/// How a version's content got into its bucket.
+/// The kind of client an upload came through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum UploadClient {
+    /// S3 signed with a temporary session credential, which only the portal requests.
+    Portal,
+    /// S3 signed with a stored access key.
+    S3,
+    /// A desktop device published the file and this node pulled it.
+    Device,
+}
+
+impl UploadClient {
+    /// The client of an S3 upload, by the kind of credential that signed it.
+    pub fn from_access_key(access_key: &str) -> Self {
+        match S3Session::is_session_key(access_key) {
+            true => Self::Portal,
+            false => Self::S3,
+        }
+    }
+}
+
+/// How a version's content got into its bucket. `job_id` names the system job that wrote it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum VersionOrigin {
     /// A client wrote the bytes; the uploader and time are the version's creator and time.
@@ -50,16 +73,28 @@ pub enum VersionOrigin {
         node_id: NodeId,
         /// The authenticated device the file came from, when known.
         device: Option<String>,
+        client: Option<UploadClient>,
     },
     /// An external source, registered without copying or copied in. The source root, path and
     /// observation are the version's own source binding, never copied here.
-    Source,
+    Source { job_id: Option<Ulid> },
     /// CopyObject or a snapshot copy minted this version from another one.
-    Copy { from: OriginVersion },
+    Copy {
+        from: OriginVersion,
+        job_id: Option<Ulid>,
+    },
     /// Registered in place from a storage backend folder of the group.
-    Storage { backend_id: Ulid, key: String },
+    Storage {
+        backend_id: Ulid,
+        key: String,
+        job_id: Option<Ulid>,
+    },
     /// A compute job wrote the version as a result.
-    Job { run_id: Ulid },
+    Job {
+        run_id: Ulid,
+        /// The person who submitted the job; `None` when the system started it.
+        started_by: Option<UserId>,
+    },
 }
 
 impl VersionOrigin {
@@ -72,8 +107,9 @@ impl VersionOrigin {
             Self::Storage { key, .. } => key.len() <= MAX_KEY_BYTES,
             Self::Copy {
                 from: OriginVersion::Node(arn),
+                ..
             } => arn.key.len() <= MAX_KEY_BYTES,
-            Self::Source | Self::Copy { .. } | Self::Job { .. } => true,
+            Self::Source { .. } | Self::Copy { .. } | Self::Job { .. } => true,
         }
     }
 }
@@ -149,13 +185,13 @@ pub fn project(
 ) -> Vec<OriginProjection> {
     let mut projection = Vec::new();
     match origin {
-        Some(VersionOrigin::Source) => {
+        Some(VersionOrigin::Source { .. }) => {
             projection.extend(source_url.map(|id| OriginProjection::BasedOn { id }));
         }
-        Some(VersionOrigin::Copy { from }) if from.publishable() => {
+        Some(VersionOrigin::Copy { from, .. }) if from.publishable() => {
             projection.push(OriginProjection::BasedOn { id: from.to_id() })
         }
-        Some(VersionOrigin::Job { run_id }) => {
+        Some(VersionOrigin::Job { run_id, .. }) => {
             projection.push(OriginProjection::CreatedBy { run_id: *run_id })
         }
         Some(

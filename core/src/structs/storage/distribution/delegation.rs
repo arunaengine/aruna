@@ -332,6 +332,7 @@ mod tests {
                     realm_id: RealmId::from_bytes([9; 32]),
                     version_id: Ulid::from_bytes([3; 16]),
                 }),
+                job_id: None,
             }),
         };
         let encoded = context.encode().unwrap();
@@ -341,6 +342,7 @@ mod tests {
             origin: Some(VersionOrigin::Upload {
                 node_id: secret(1).public(),
                 device: None,
+                client: None,
             }),
         };
         let encoded = upload.encode().unwrap();
