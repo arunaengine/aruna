@@ -1030,3 +1030,29 @@ async fn empty_shape() {
     assert!(users.hits.is_empty());
     assert!(users.next_cursor.is_none());
 }
+
+#[tokio::test]
+async fn signed_out_buckets() {
+    // Signed out, only the buckets a public role grants READ on are listed.
+    use aruna_core::structs::storage::blob::bucket_permission_path;
+    let fx = setup().await;
+    seed_bucket(&fx.state, &fx.actor, "open-bucket", fx.groups[0]).await;
+    seed_bucket(&fx.state, &fx.actor, "closed-bucket", fx.groups[0]).await;
+    let node_id = fx.state.get_node_id();
+    let path = bucket_permission_path(fx.realm_id, fx.groups[0], node_id, "open-bucket");
+    let context = fx.state.get_ctx();
+    crate::tests::routes::open_paths(&context, &fx.actor, fx.groups[0], &[path]).await;
+    let (_, Json(section)) = bucket_search(
+        State(fx.state.clone()),
+        Extension(None),
+        Extension(None),
+        Query(BucketSearchParams {
+            q: "bucket".to_string(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let hits: Vec<_> = section.hits.into_iter().map(|hit| hit.bucket).collect();
+    assert_eq!(hits, vec!["open-bucket"]);
+}

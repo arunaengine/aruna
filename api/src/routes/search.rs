@@ -394,7 +394,8 @@ fn parse_search_types(types: Option<&str>) -> ServerResult<SearchTypes> {
     description = r#"Searches or lists bucket names across the realm's serving nodes and merges the authorized matches.
 
 **Authentication**: realm bearer token. Every node applies its own authorization and deny policies
-to its own buckets, so a bucket the caller may not read never appears.
+to its own buckets, so a bucket the caller may not read never appears. Without a token, only
+buckets that public roles grant READ on appear.
 
 **Behavior**
 - The search fans out over the realm's serving nodes under one shared deadline of about 12 seconds.
@@ -459,10 +460,10 @@ to its own buckets, so a bucket the caller may not read never appears.
             })
         ),
         (status = 400, description = "Query of 1 character, invalid group id or cursor, or otherwise malformed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
     ),
-    security(("bearer_auth" = []))
+    security(("bearer_auth" = []), ())
 )]
 pub async fn bucket_search(
     State(state): State<Arc<ServerState>>,
@@ -470,7 +471,8 @@ pub async fn bucket_search(
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<BucketSearchParams>,
 ) -> ServerResult<(StatusCode, Json<BucketsSection>)> {
-    let auth = require_realm_auth(&state, auth)?;
+    let auth = auth.unwrap_or_else(|| AuthContext::anonymous(state.get_realm_id()));
+    let auth = require_realm_auth(&state, Some(auth))?;
     let query = params.q.trim();
     if !query.is_empty() && query.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
