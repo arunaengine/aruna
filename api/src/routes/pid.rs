@@ -87,13 +87,16 @@ fn rocrate_location(document_id: Ulid) -> String {
 
 **Authentication**: none; public route, no bearer token is read.
 
-**Behavior**: a Profile resolves under `/profile/{document_id}`, so this path answers 404 for a
-Profile and never acts as a duplicate PID. A public document redirects to the RO-Crate route of
-one of its holders: two random holders with a fresh heartbeat, the one with more free download
-slots wins, and the chosen holder serves its own copy. Without a fresh holder the redirect stays on this node."#,
+**Behavior**
+- A Profile resolves under `/profile/{document_id}`, so this path answers 404 for a Profile and
+  never acts as a duplicate PID.
+- A public document redirects to the RO-Crate route of one of its holders: two random holders
+  with a fresh heartbeat, the one with more free download slots wins, and the chosen holder
+  serves its own copy. Without a fresh holder the redirect stays on this node.
+- A browser is sent to the document's portal page instead, as by `GET /w3id/{rest}`."#,
     params(("document_id" = String, Path, description = "Document ULID carried by the w3id PID, for example 01JMETADATA0123456789ABCDE")),
     responses(
-        (status = 302, description = "Active public identifier; the Location header points at the document's RO-Crate read route, which applies its own authorization: on one holder chosen by fresh heartbeat and free download slots (absolute URL with `here=true`), or on this node"),
+        (status = 302, description = "Active public identifier; the Location header points at the portal page for a browser, else at the document's RO-Crate read route, which applies its own authorization: on one holder chosen by fresh heartbeat and free download slots (absolute URL with `here=true`), or on this node"),
         (status = 404, description = "Unknown, malformed, private or Profile identifier, or a mapping still in `requested`, `processing` or `failed`"),
         (
             status = 410,
@@ -111,12 +114,34 @@ slots wins, and the chosen holder serves its own copy. Without a fresh holder th
 )]
 async fn resolve_pid(
     State(state): State<Arc<ServerState>>,
+    headers: axum::http::HeaderMap,
     Path(document_id): Path<String>,
 ) -> Response {
     let Some(document_id) = landing_id(&document_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    document_landing(&state, document_id, None).await
+    landing(&state, &headers, false, document_id).await
+}
+
+/// The landing of a document or Profile: its portal page for a browser, else its RO-Crate.
+async fn landing(
+    state: &Arc<ServerState>,
+    headers: &axum::http::HeaderMap,
+    profile: bool,
+    document_id: Ulid,
+) -> Response {
+    let page = match wants_page(headers) {
+        true => portal_page(state, profile, document_id).await,
+        false => None,
+    };
+    let mut response = match profile {
+        true => profile_landing(state, document_id, page).await,
+        false => document_landing(state, document_id, page).await,
+    };
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("accept"));
+    response
 }
 
 /// The landing of a document PID; `page` replaces the RO-Crate target of an active public PID.
@@ -170,10 +195,10 @@ fn now_ms() -> u64 {
 **Authentication**: none; public route, no bearer token is read.
 
 **Behavior**: resolves only when that exact value is the document's stored automatic primary PID.
-Privacy, lifecycle and authority handling match `GET /pid/{document_id}`."#,
+Privacy, lifecycle, authority and browser handling match `GET /pid/{document_id}`."#,
     params(("document_id" = String, Path, description = "Profile document ULID")),
     responses(
-        (status = 302, description = "Active public Profile identifier; the Location header points at the RO-Crate read route"),
+        (status = 302, description = "Active public Profile identifier; the Location header points at the portal page for a browser, else at the RO-Crate read route"),
         (status = 404, description = "Unknown, private, non-Profile or non-active identifier"),
         (status = 410, description = "The Profile identifier was withdrawn and stays withdrawn"),
         (status = 503, description = "The PID authority is unreachable; retryable")
@@ -182,12 +207,13 @@ Privacy, lifecycle and authority handling match `GET /pid/{document_id}`."#,
 )]
 async fn resolve_profile_pid(
     State(state): State<Arc<ServerState>>,
+    headers: axum::http::HeaderMap,
     Path(document_id): Path<String>,
 ) -> Response {
     let Some(document_id) = landing_id(&document_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    profile_landing(&state, document_id, None).await
+    landing(&state, &headers, true, document_id).await
 }
 
 /// The landing of a Profile PID; `page` replaces the RO-Crate target of an active public PID.
@@ -255,18 +281,7 @@ async fn resolve_w3id(
     let Some(document_id) = landing_id(id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let page = match wants_page(&headers) {
-        true => portal_page(&state, profile, document_id).await,
-        false => None,
-    };
-    let mut response = match profile {
-        true => profile_landing(&state, document_id, page).await,
-        false => document_landing(&state, document_id, page).await,
-    };
-    response
-        .headers_mut()
-        .insert(header::VARY, HeaderValue::from_static("accept"));
-    response
+    landing(&state, &headers, profile, document_id).await
 }
 
 /// A 307 to the data resolve route for a well-formed data id, which is re-serialized.
@@ -1057,21 +1072,33 @@ mod tests {
     async fn redirects_public_pid() {
         let (_dir, state, document_id, _, _) = public_pid().await;
 
-        let response = resolve_pid(State(state.clone()), Path(document_id.to_string())).await;
+        let response = resolve_pid(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(document_id.to_string()),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::FOUND);
         let location = response.headers()[axum::http::header::LOCATION]
             .to_str()
             .unwrap();
         assert_eq!(location, rocrate_location(document_id));
-        let malformed = resolve_pid(State(state.clone()), Path("not-a-ulid".to_string())).await;
+        let malformed = resolve_pid(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("not-a-ulid".to_string()),
+        )
+        .await;
         assert_eq!(malformed.status(), StatusCode::NOT_FOUND);
         // A first digit above 7 overflows and would otherwise alias the same document.
         let alias = format!("8{}", &document_id.to_string()[1..]);
         assert_eq!(Ulid::from_string(&alias).unwrap(), document_id);
-        let document = resolve_pid(State(state.clone()), Path(alias.clone())).await;
+        let document =
+            resolve_pid(State(state.clone()), HeaderMap::new(), Path(alias.clone())).await;
         assert_eq!(document.status(), StatusCode::NOT_FOUND);
-        let profile = resolve_profile_pid(State(state.clone()), Path(alias.clone())).await;
+        let profile =
+            resolve_profile_pid(State(state.clone()), HeaderMap::new(), Path(alias.clone())).await;
         assert_eq!(profile.status(), StatusCode::NOT_FOUND);
         let response = w3id(&state, &alias, "application/ld+json").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1087,7 +1114,8 @@ mod tests {
         ] {
             let (_dir, state, document_id, _, _) = seeded_pid(frozen, public).await;
             let id = document_id.to_string();
-            let response = resolve_pid(State(state.clone()), Path(id.clone())).await;
+            let response =
+                resolve_pid(State(state.clone()), HeaderMap::new(), Path(id.clone())).await;
             assert_eq!(
                 response.status(),
                 expected,
@@ -1180,6 +1208,11 @@ mod tests {
         );
         let client = w3id(&state, &id, "application/ld+json").await;
         assert_eq!(location(&client), rocrate_location(document_id));
+        // The node PID route sends a browser to the same page.
+        let mut accept = HeaderMap::new();
+        accept.insert(header::ACCEPT, HeaderValue::from_static(html));
+        let landing = resolve_pid(State(state.clone()), accept, Path(id.clone())).await;
+        assert_eq!(location(&landing), location(&browser));
         // The document is no Profile, so its profile form names nothing, not even for a browser.
         let profile = w3id(&state, &format!("profile/{id}"), html).await;
         assert_eq!(profile.status(), StatusCode::NOT_FOUND);
