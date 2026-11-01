@@ -15,6 +15,8 @@ use crate::structs::execution::job::{
     StagingJobCheckpoint, WorkspaceMode,
 };
 use crate::structs::storage::encryption::BucketKeyRef;
+use crate::structs::storage::storage_purge::StoragePurgeScope;
+use crate::types::GroupId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {
@@ -154,6 +156,88 @@ impl From<&JobRecord> for JobStatusView {
                 _ => None,
             },
             awaiting_keys: Vec::new(),
+        }
+    }
+}
+
+/// What a running job works on: a bucket with an optional key or prefix, or a dataset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobTarget {
+    Bucket {
+        bucket: String,
+        path: Option<String>,
+    },
+    Dataset {
+        dataset_id: Ulid,
+    },
+}
+
+/// A job running on this node now; the group and creator decide who may see its details.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunningJobView {
+    pub kind: JobKind,
+    pub target: Option<JobTarget>,
+    pub group_id: Option<GroupId>,
+    pub created_by: UserId,
+    /// Only set while the job counts something.
+    pub progress: Option<JobProgress>,
+    pub started_at_ms: u64,
+}
+
+impl RunningJobView {
+    pub fn new(record: &JobRecord, started_at_ms: u64) -> Self {
+        let bucket = |bucket: &str, path: &str| JobTarget::Bucket {
+            bucket: bucket.to_string(),
+            path: (!path.is_empty()).then(|| path.to_string()),
+        };
+        let dataset = |dataset_id: Ulid| Some(JobTarget::Dataset { dataset_id });
+        let (target, group_id) = match &record.payload {
+            JobPayload::Probe { .. }
+            | JobPayload::WriteRunCrate { .. }
+            | JobPayload::TerminalCleanup { .. } => (None, None),
+            JobPayload::Execution(spec) => (
+                record
+                    .workspace_bucket
+                    .as_deref()
+                    .map(|name| bucket(name, "")),
+                Some(spec.group_id),
+            ),
+            JobPayload::Staging(spec) => {
+                let path = match spec.prefixes.as_slice() {
+                    [prefix] => prefix.target_prefix.as_str(),
+                    _ => "",
+                };
+                (Some(bucket(&spec.bucket, path)), Some(spec.group_id))
+            }
+            JobPayload::ImportRoCrate(spec) => (
+                Some(bucket(&spec.target.bucket, &spec.target.prefix)),
+                Some(spec.metadata.group_id),
+            ),
+            JobPayload::ExportRoCrate(spec) => (dataset(spec.document_id), None),
+            JobPayload::Harvest(spec) => (None, Some(spec.group_id)),
+            JobPayload::MintPersistentId(spec) => (dataset(spec.document_id), None),
+            JobPayload::StoragePurge(spec) | JobPayload::StoragePurgeFiles(spec) => {
+                let path = match &spec.scope {
+                    StoragePurgeScope::File { key, .. } => key.as_str(),
+                    StoragePurgeScope::Prefix { prefix, .. } => prefix.as_str(),
+                    StoragePurgeScope::Bucket { .. } => "",
+                };
+                (Some(bucket(spec.scope.bucket(), path)), Some(spec.group_id))
+            }
+            JobPayload::CopyObject(spec) => (
+                Some(bucket(&spec.dest_bucket, &spec.dest_key)),
+                Some(spec.group_id),
+            ),
+            JobPayload::RegisterIdentifiers(spec) => (dataset(spec.document_id), None),
+            JobPayload::BackendImport(spec) => (None, Some(spec.group_id)),
+        };
+        Self {
+            kind: JobKind::from(&record.payload),
+            target,
+            group_id,
+            created_by: record.created_by,
+            progress: None,
+            started_at_ms,
         }
     }
 }
