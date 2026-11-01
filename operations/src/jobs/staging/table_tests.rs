@@ -994,7 +994,10 @@ async fn import_records(
     // The replication drain and the search feed run beside the import, as on a node.
     let drain = fixture.driver.clone();
     let drain = tokio::spawn(async move {
-        while background {
+        if !background {
+            return;
+        }
+        loop {
             let _ = crate::replication::queue::process_blob_batch(&drain).await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -1005,7 +1008,10 @@ async fn import_records(
         use crate::distribution::index_feed::{FeedLimits, Feeder};
         use crate::distribution::key_index::RangeIndexes;
         let mut feeder = Feeder::new(Arc::new(RangeIndexes::new(indexes)), FeedLimits::default());
-        while background {
+        if !background {
+            return;
+        }
+        loop {
             if !feeder.pass(&feed).await {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
