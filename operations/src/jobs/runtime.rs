@@ -168,13 +168,18 @@ impl JobsRuntime {
         self.state().running.len()
     }
 
-    /// Jobs running here and the staging imports among them, as counts for the node telemetry.
+    /// Jobs running here and the imports among them, as counts for the node telemetry.
     pub fn running_jobs(&self) -> RunningJobs {
         let state = self.state();
         let imports = state
             .running
             .values()
-            .filter(|job| job.view.kind == JobKind::Staging)
+            .filter(|job| {
+                matches!(
+                    job.view.kind,
+                    JobKind::Staging | JobKind::ImportRoCrate | JobKind::BackendImport
+                )
+            })
             .count();
         RunningJobs {
             total: u32::try_from(state.running.len()).unwrap_or(u32::MAX),
@@ -1957,14 +1962,20 @@ mod tests {
         assert_eq!(runtime.running_jobs(), RunningJobs::default());
 
         let nonce = runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
-        runtime.state().running.get_mut(&job_id).unwrap().view.kind = JobKind::Staging;
-        assert_eq!(
-            runtime.running_jobs(),
-            RunningJobs {
-                total: 1,
-                imports: 1
-            }
-        );
+        for kind in [
+            JobKind::Staging,
+            JobKind::ImportRoCrate,
+            JobKind::BackendImport,
+        ] {
+            runtime.state().running.get_mut(&job_id).unwrap().view.kind = kind;
+            assert_eq!(
+                runtime.running_jobs(),
+                RunningJobs {
+                    total: 1,
+                    imports: 1
+                }
+            );
+        }
         runtime.finish(&context(storage), job_id, nonce).await;
         assert_eq!(runtime.running_jobs(), RunningJobs::default());
     }
