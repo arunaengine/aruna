@@ -333,6 +333,7 @@ async fn unanswered_range_fails() {
 async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link::LinkTarget) {
     use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
     let write = ReferenceWrite {
+        job_id: None,
         preassigned_version_id: None,
         group_id: node.group_id,
         user_id: node.owner.user_id,

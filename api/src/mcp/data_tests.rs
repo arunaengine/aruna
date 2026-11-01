@@ -425,6 +425,7 @@ mod distributed {
             group_id: ulid::Ulid::from_parts(9, 9),
         };
         let write = ReferenceWrite {
+            job_id: None,
             preassigned_version_id: None,
             group_id: members.group_id,
             user_id: members.user.user_identity,

@@ -1026,6 +1026,7 @@ async fn stage_one(
             SessionInputStrategy::Snapshot => CopyReferences::Materialize,
             SessionInputStrategy::Reference => CopyReferences::Preserve,
         },
+        job_id: None,
     };
     copy_inline(state, auth, input, dest_key)
         .await

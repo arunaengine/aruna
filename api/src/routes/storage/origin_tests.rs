@@ -295,6 +295,7 @@ fn view_keeps_fields() {
         created_at: SystemTime::UNIX_EPOCH,
         origin: Some(VersionOrigin::Copy {
             from: OriginVersion::Global(global.clone()),
+            job_id: None,
         }),
         hop: Some(SyncHop {
             relationship_id: Ulid::from_bytes([47; 16]),
@@ -315,11 +316,13 @@ fn view_keeps_fields() {
                     url: Some("https://s3.example.org/a".to_string()),
                     path: "a".to_string(),
                     connector_id: None,
+                    connector_name: None,
                 },
                 aruna_operations::s3::object::origin::SourcePlace {
                     url: Some("https://mirror.example.org/a".to_string()),
                     path: "a".to_string(),
                     connector_id: Some(Ulid::from_bytes([48; 16])),
+                    connector_name: Some("Mirror".to_string()),
                 },
             ],
         }),
@@ -340,7 +343,7 @@ fn view_keeps_fields() {
     assert_eq!(response.global_id, Some(global.to_url()));
     assert!(matches!(
         response.origin,
-        Some(OriginBody::Copy { ref from }) if *from == global.to_url()
+        Some(OriginBody::Copy { ref from, .. }) if *from == global.to_url()
     ));
     assert_eq!(response.hop.unwrap().from, global.to_url());
     let source = response.source.unwrap();
@@ -369,6 +372,7 @@ fn view_keeps_fields() {
     assert_eq!(mirror.url.as_deref(), Some("https://mirror.example.org/a"));
     let connector = Ulid::from_bytes([48; 16]).to_string();
     assert_eq!(mirror.connector_id.as_deref(), Some(connector.as_str()));
+    assert_eq!(mirror.connector_name.as_deref(), Some("Mirror"));
     assert_eq!(response.projection.len(), 2);
     assert!(matches!(
         response.projection[1],
@@ -376,21 +380,35 @@ fn view_keeps_fields() {
     ));
 }
 
+// Each kind answers with its client, job or starter under the names the portal reads.
 #[test]
 fn origin_kinds_named() {
     let upload = VersionOrigin::Upload {
         node_id: node(),
         device: Some("laptop".to_string()),
+        client: Some(UploadClient::Device),
     };
+    let job = Ulid::from_bytes([53; 16]);
+    let user = UserId::local(Ulid::from_bytes([54; 16]), realm());
+    let from = OriginVersion::Global(GlobalId::Version {
+        realm_id: realm(),
+        version_id: Ulid::from_bytes([55; 16]),
+    });
     let kinds = [
         upload,
-        VersionOrigin::Source,
+        VersionOrigin::Source { job_id: Some(job) },
         VersionOrigin::Storage {
             backend_id: Ulid::from_bytes([50; 16]),
             key: "share/a.txt".to_string(),
+            job_id: Some(job),
         },
         VersionOrigin::Job {
             run_id: Ulid::from_bytes([51; 16]),
+            started_by: Some(user),
+        },
+        VersionOrigin::Copy {
+            from: from.clone(),
+            job_id: None,
         },
     ];
     let view = |origin| OriginView {
@@ -411,16 +429,31 @@ fn origin_kinds_named() {
         .into_iter()
         .map(|origin| OriginResponse::from(view(origin)).origin.unwrap())
         .collect();
-    assert!(matches!(
-        &bodies[0],
-        OriginBody::Upload { device: Some(device), .. } if device == "laptop"
-    ));
-    assert!(matches!(&bodies[1], OriginBody::Source));
-    assert!(matches!(
-        &bodies[2],
-        OriginBody::Storage { key, .. } if key == "share/a.txt"
-    ));
-    assert!(matches!(&bodies[3], OriginBody::Job { .. }));
+    let json: Vec<_> = (bodies.iter())
+        .map(|body| serde_json::to_value(body).unwrap())
+        .collect();
+    let job = job.to_string();
+    assert_eq!(
+        json,
+        vec![
+            serde_json::json!({
+                "kind": "upload", "node_id": node().to_string(), "device": "laptop",
+                "client": "device",
+            }),
+            serde_json::json!({"kind": "source", "job_id": job}),
+            serde_json::json!({
+                "kind": "storage", "backend_id": Ulid::from_bytes([50; 16]).to_string(),
+                "key": "share/a.txt", "job_id": job,
+            }),
+            serde_json::json!({
+                "kind": "job", "run_id": Ulid::from_bytes([51; 16]).to_string(),
+                "started_by": user.to_string(),
+            }),
+            serde_json::json!({"kind": "copy", "from": from.to_id(), "job_id": null}),
+        ]
+    );
+    let portal = serde_json::to_value(UploadClientBody::from(UploadClient::Portal)).unwrap();
+    assert_eq!(portal, "portal");
 }
 
 async fn seed_sources(node: &Node) {
@@ -709,6 +742,7 @@ async fn written_by(node: &Node, key: &str, run: u8) {
     let version = version.as_mut().unwrap();
     version.origin = Some(VersionOrigin::Job {
         run_id: Ulid::from_bytes([run; 16]),
+        started_by: None,
     });
     let bytes = version.to_bytes().unwrap();
     crate::tests::distributed::write(&node.state, BLOB_VERSIONS_KEYSPACE, row, bytes).await;
