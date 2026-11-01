@@ -122,6 +122,23 @@ Building from source needs the Rust version named in [rust-toolchain.toml](rust-
 The node then serves the API documentation on `http://127.0.0.1:3000/swagger-ui` and the S3
 interface on `http://127.0.0.1:1337`.
 
+## Command Line Client
+
+`aruna-cli` talks to a realm's REST and S3 APIs directly, without a local node. Create a token
+in the portal (Settings, API sessions) and sign in with it:
+
+```bash
+cargo install --path cli
+aruna-cli login --api https://node.example --token <TOKEN>
+aruna-cli buckets ls
+aruna-cli cp results.csv my-bucket/run-42/
+aruna-cli sync ./run-42 my-bucket/run-42 --dry-run
+aruna-cli meta search "proteomics"
+```
+
+The token is kept in the OS keyring, or in a private file when no keyring is available.
+`aruna-cli --help` and `aruna-cli <command> --help` describe every command.
+
 ## Encrypted Buckets
 
 A group admin can turn on encryption for a bucket, in the portal or with
