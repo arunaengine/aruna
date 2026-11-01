@@ -1056,21 +1056,37 @@ async fn import_records(
         runs.push((job, spec));
     }
 
-    // The replication drain and the search feed run beside the import, as on a node.
+    // The replication drain and the search feed run beside the import, as on a node, where each
+    // committed page schedules them: here every page a job commits wakes both.
+    let (pages, _) = tokio::sync::watch::channel(0u64);
+    let pages = Arc::new(pages);
+    let watchers: Vec<_> = (runs.iter())
+        .map(|(job, _)| {
+            let (progress, pages) = (job.progress.clone(), pages.clone());
+            tokio::spawn(async move {
+                loop {
+                    progress.flush_requested().await;
+                    pages.send_modify(|count| *count += 1);
+                }
+            })
+        })
+        .collect();
     let drain = fixture.driver.clone();
+    let mut woken = pages.subscribe();
     let drain = tokio::spawn(async move {
-        if !background {
-            return;
-        }
-        loop {
-            let _ = crate::replication::queue::process_blob_batch(&drain).await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        while background {
+            let drained = crate::replication::queue::process_blob_batch(&drain).await;
+            if !drained.is_ok_and(|drained| drained.has_more_due) && woken.changed().await.is_err()
+            {
+                return;
+            }
         }
     });
     let feed = fixture.driver.clone();
     let indexes = fixture._dir.path().join("range-indexes");
     let stop = CancellationToken::new();
     let stopping = stop.clone();
+    let mut woken = pages.subscribe();
     let feed = tokio::spawn(async move {
         use crate::distribution::index_feed::{FeedLimits, Feeder};
         use crate::distribution::key_index::RangeIndexes;
@@ -1079,7 +1095,7 @@ async fn import_records(
             if !feeder.pass(&feed).await {
                 tokio::select! {
                     _ = stopping.cancelled() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                    _ = woken.changed() => {}
                 }
             }
         }
@@ -1097,6 +1113,9 @@ async fn import_records(
     // The catch-up counts from the jobs' end, the feed's pass running then included.
     let ended = std::time::Instant::now();
     let conflicts = storage.snapshot_metrics().conflicts_total - conflicts;
+    for watcher in watchers {
+        watcher.abort();
+    }
     drain.abort();
     stop.cancel();
     let mut feeder = feed.await.unwrap();
