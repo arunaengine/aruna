@@ -282,3 +282,27 @@ fn credentials_stripped() {
     assert_eq!(SourcePin::of(&descriptor).url.as_deref(), Some(bare));
     assert_eq!(SourcePin::served(&descriptor).url.as_deref(), Some(bare));
 }
+
+// A run's workspace credential writes as its job; any other credential uploads.
+#[test]
+fn workspace_writes_job() {
+    use crate::structs::execution::job::{JobId, workspace_credential_id};
+    let user = UserId::new(Ulid::from_bytes([8; 16]), RealmId::from_bytes([1; 32]));
+    let job_id = JobId::from_bytes([5; 16]);
+    let access_key = workspace_credential_id(job_id);
+    assert_eq!(
+        VersionOrigin::s3_write(node(), &access_key, user),
+        VersionOrigin::Job {
+            run_id: Ulid::from_bytes([5; 16]),
+            started_by: Some(user),
+        }
+    );
+    assert_eq!(
+        VersionOrigin::s3_write(node(), "01ARZ3NDEKTSV4RRFFQ69G5FAV", user),
+        VersionOrigin::Upload {
+            node_id: node(),
+            device: None,
+            client: Some(UploadClient::S3),
+        }
+    );
+}

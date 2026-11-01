@@ -64,7 +64,7 @@ use aruna_core::structs::storage::multipart::{
     MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload,
     MultipartUploadStatus, WorkingShare,
 };
-use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::{PlainTarget, RoutingSnapshot};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -388,7 +388,7 @@ pub struct CompleteUploadOperation {
     fence: Option<crate::s3::object::put::fenced::FencedWrite>,
     /// The rules that read the composed path, as the finalize transaction reads them.
     readers: crate::s3::object::put::ReaderScan,
-    upload_client: Option<UploadClient>,
+    version_origin: Option<VersionOrigin>,
 }
 
 impl CompleteUploadOperation {
@@ -454,13 +454,13 @@ impl CompleteUploadOperation {
             written_intent: Vec::new(),
             fence: None,
             readers: Default::default(),
-            upload_client: None,
+            version_origin: None,
         }
     }
 
-    /// The client kind the upload origin records.
-    pub fn with_upload_client(mut self, client: UploadClient) -> Self {
-        self.upload_client = Some(client);
+    /// The origin the completed version records; an upload without a client by default.
+    pub fn with_version_origin(mut self, origin: VersionOrigin) -> Self {
+        self.version_origin = Some(origin);
         self
     }
 
@@ -1754,11 +1754,13 @@ impl CompleteUploadOperation {
             ),
         }
         .with_metadata(upload_record.metadata.clone())
-        .with_origin(Some(VersionOrigin::Upload {
-            node_id: self.input.node_id,
-            device: None,
-            client: self.upload_client,
-        }));
+        .with_origin(Some(self.version_origin.clone().unwrap_or(
+            VersionOrigin::Upload {
+                node_id: self.input.node_id,
+                device: None,
+                client: None,
+            },
+        )));
         // Union with what part copies inherited: a part-wise copy of a governed
         // source can only add refs to the composed object.
         let mut policies = self.bucket_policies.clone();

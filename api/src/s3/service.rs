@@ -79,7 +79,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
 use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::structs::storage::multipart::COMPLETION_DEADLINE_MS;
-use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
 use aruna_operations::auth::check_permissions::{
@@ -1119,11 +1119,11 @@ impl S3 for ArunaS3Service {
             Some(copied) => operation
                 .with_inherited_policies(copied.policies)
                 .with_version_origin(copied.origin),
-            None => operation.with_version_origin(Some(VersionOrigin::Upload {
-                node_id: self.node_id,
-                device: None,
-                client: Some(UploadClient::from_access_key(&user_access.access_key)),
-            })),
+            None => operation.with_version_origin(Some(VersionOrigin::s3_write(
+                self.node_id,
+                &user_access.access_key,
+                user_access.user_identity,
+            ))),
         };
         if let Some(gate) = gate {
             operation = operation.with_gate(gate);
@@ -1897,7 +1897,11 @@ impl S3 for ArunaS3Service {
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_restrictions(replication_auth.path_restrictions.clone())
         .with_routing(routing)
-        .with_upload_client(UploadClient::from_access_key(&user_access.access_key));
+        .with_version_origin(VersionOrigin::s3_write(
+            self.node_id,
+            &user_access.access_key,
+            user_access.user_identity,
+        ));
         if let Some(gate) = gate {
             operation = operation.with_gate(gate);
         }

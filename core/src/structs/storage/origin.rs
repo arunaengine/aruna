@@ -98,6 +98,22 @@ pub enum VersionOrigin {
 }
 
 impl VersionOrigin {
+    /// The origin of an S3 write: a run's workspace credential writes as its job.
+    pub fn s3_write(node_id: NodeId, access_key: &str, user_id: UserId) -> Self {
+        use crate::structs::execution::job::credential_job_id;
+        match credential_job_id(access_key) {
+            Some(job_id) => Self::Job {
+                run_id: Ulid::from_bytes(job_id.to_bytes()),
+                started_by: Some(user_id).filter(|user| !user.is_nil()),
+            },
+            None => Self::Upload {
+                node_id,
+                device: None,
+                client: Some(UploadClient::from_access_key(access_key)),
+            },
+        }
+    }
+
     /// Whether the record stays within its size budget.
     pub fn bounded(&self) -> bool {
         match self {
