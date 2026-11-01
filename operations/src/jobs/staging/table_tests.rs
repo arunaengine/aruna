@@ -865,10 +865,11 @@ async fn import_records(
     let storage = &fixture.driver.storage_handle;
     let conflicts = storage.snapshot_metrics().conflicts_total;
     let started = std::time::Instant::now();
-    let outcomes = futures_util::future::join_all(
-        (runs.iter()).map(|(job, spec)| crate::jobs::staging::run_staging_job(job, spec)),
-    )
-    .await;
+    // Each job runs as its own task, as on a node.
+    let runs = runs.into_iter().map(|(job, spec)| {
+        tokio::spawn(async move { crate::jobs::staging::run_staging_job(&job, &spec).await })
+    });
+    let outcomes = futures_util::future::join_all(runs).await;
     let elapsed = started.elapsed().as_secs_f64();
     let conflicts = storage.snapshot_metrics().conflicts_total - conflicts;
     drain.abort();
@@ -876,7 +877,7 @@ async fn import_records(
     server.abort();
     let (mut completed, mut failed) = (0, 0);
     for outcome in outcomes {
-        let (completed_items, failed_items) = match outcome {
+        let (completed_items, failed_items) = match outcome.unwrap() {
             JobRunOutcome::Succeeded(JobResultPayload::Staging {
                 completed_items,
                 failed_items,
