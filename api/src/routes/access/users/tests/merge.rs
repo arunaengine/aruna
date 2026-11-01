@@ -250,3 +250,44 @@ async fn merge_moves_signin() {
 
     stop(node, oidc_task).await;
 }
+
+#[tokio::test]
+async fn opposite_merges_one_wins() {
+    // A into B and B into A at once: exactly one commits and one account stays active.
+    let key = generate_signing_key();
+    let (provider, oidc_task) = spawn_oidc_provider(ISSUER, KID, &key).await;
+    let node = spawn_test_node(provider, true).await;
+    let (alice, alice_token) =
+        register_via_oidc(&node, ISSUER, KID, &key, "subject-a", "Alice", None).await;
+    let (bob, bob_token) =
+        register_via_oidc(&node, ISSUER, KID, &key, "subject-b", "Bob", None).await;
+    let merge = "/access/users/me/merge";
+    let (into_alice, into_bob) = tokio::join!(
+        post(&node, merge, &alice_token, json!({ "token": bob_token })),
+        post(&node, merge, &bob_token, json!({ "token": alice_token })),
+    );
+    let wins = [&into_alice, &into_bob]
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::OK)
+        .count();
+    assert_eq!(wins, 1, "{into_alice:?} {into_bob:?}");
+
+    let viewer = super::sign_aruna_token(&node, node.realm_admin_id, None);
+    let (status, resolved) = post(
+        &node,
+        "/access/users/resolve",
+        &viewer,
+        json!({ "user_ids": [alice.id, bob.id] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let merged = resolved
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.get("merged_into").is_some())
+        .count();
+    assert_eq!(merged, 1, "{resolved}");
+
+    stop(node, oidc_task).await;
+}

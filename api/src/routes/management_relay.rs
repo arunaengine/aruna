@@ -9,6 +9,7 @@ use aruna_core::NodeId;
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::users::merge::coordinator as merge_coordinator;
 use axum::body::Bytes;
 use axum::extract::{FromRequest, MatchedPath, OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
@@ -57,7 +58,6 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/access/onboarding/bootstrap"),
     ("POST", "/access/onboarding/secrets"),
     ("POST", "/access/sessions"),
-    ("POST", "/access/users/me/merge"),
     ("POST", "/access/users/me/subjects"),
     ("POST", "/access/users/register"),
     ("POST", "/system/realm/nodes/{node_id}/promote"),
@@ -68,6 +68,9 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("PUT", "/system/realm/portal-features"),
     ("PUT", "/system/realm/quota"),
 ];
+
+/// Routes every node passes to the realm's merge coordinator, a management node itself included.
+const COORDINATED_ROUTES: &[(&str, &str)] = &[("POST", "/access/users/me/merge")];
 
 static RELAY_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -96,6 +99,13 @@ pub(crate) async fn relay_middleware(
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_string());
     let has_hop = request.headers().contains_key(RELAY_HOP_HEADER);
+    if let Some(route) = coordinated_route(request.method(), matched.as_deref(), has_hop) {
+        return match coordinator_target(&state).await {
+            Ok(None) => next.run(request).await,
+            Ok(Some(url)) => relay(&state, route, vec![url], request).await,
+            Err(error) => error.into_response(),
+        };
+    }
     let route = relay_route(
         request.method(),
         matched.as_deref(),
@@ -128,6 +138,41 @@ fn relay_route(
         .find(|(route_method, route)| method.as_str() == *route_method && path == *route)
         .map(|(_, route)| *route)
         .filter(|_| !is_management)
+}
+
+/// The coordinated route this request names; a relayed request is answered where it arrived.
+fn coordinated_route(
+    method: &Method,
+    matched: Option<&str>,
+    has_hop: bool,
+) -> Option<&'static str> {
+    let path = matched?.strip_prefix(API_PREFIX).unwrap_or(matched?);
+    COORDINATED_ROUTES
+        .iter()
+        .find(|(route_method, route)| method.as_str() == *route_method && path == *route)
+        .map(|(_, route)| *route)
+        .filter(|_| !has_hop)
+}
+
+/// The api url of the merge coordinator, or `None` when this node is the coordinator.
+async fn coordinator_target(state: &Arc<ServerState>) -> Result<Option<String>, ServerError> {
+    let config = drive(
+        GetConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|_| ServerError::NoManagementNode)?;
+    let coordinator = merge_coordinator(&config).ok_or(ServerError::NoManagementNode)?;
+    if coordinator == state.get_node_id() {
+        return Ok(None);
+    }
+    let documents = load_node_documents(state, &config).await;
+    management_node_urls(&config, &documents)
+        .into_iter()
+        .find(|(node_id, _)| *node_id == coordinator)
+        .and_then(|(_, url)| url)
+        .map(Some)
+        .ok_or(ServerError::NoManagementNode)
 }
 
 async fn relay(

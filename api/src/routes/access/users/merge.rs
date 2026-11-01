@@ -98,10 +98,10 @@ fn map_merge_error(error: MergeError) -> ServerError {
             ServerError::Refused(StatusCode::CONFLICT, "role_conflict", message)
         }
         MergeError::NotFound => ServerError::NotFound,
-        MergeError::NotManagementNode => ServerError::Forbidden,
-        MergeError::Storage(_) | MergeError::Vault(_) | MergeError::PlacementFenced => {
-            ServerError::ServiceUnavailableReason(message)
-        }
+        MergeError::Storage(_)
+        | MergeError::Vault(_)
+        | MergeError::PlacementFenced
+        | MergeError::NotCoordinator => ServerError::ServiceUnavailableReason(message),
         _ => ServerError::InternalError(message),
     }
 }
@@ -134,8 +134,9 @@ that account. Both prove control; a matching email or name is never enough.
   after the merge is cut off on every node. Its share links stop, as for any deactivated account.
 - Runs, RO-Crates, provenance and other signed records keep naming the other account; reads of
   its id resolve to the primary.
-- The change, including the cutoff, is one transaction on a management node and replicates to
-  every node. Repeating a
+- The change, including the cutoff, is one transaction on the realm's merge coordinator, the
+  management node with the lowest id; every other node passes the call there unchanged. So two
+  opposite merges of the same accounts never both commit. It replicates to every node. Repeating a
   finished merge answers again with `repeated: true`, also with the then cut-off token.
 
 **Limits**

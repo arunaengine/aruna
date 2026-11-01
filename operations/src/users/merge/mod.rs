@@ -9,7 +9,6 @@ mod stage;
 #[cfg(test)]
 mod tests;
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::document::DocumentTarget;
@@ -26,11 +25,14 @@ use aruna_core::reducer::AdminDocumentError;
 use aruna_core::storage_entries::{reducer_state_key, subject_index_key, sync_revision_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, Value};
+use aruna_core::{NodeId, UserId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::time::Duration;
@@ -40,9 +42,19 @@ use tracing::info;
 use self::stage::Batch;
 use crate::auth::revoke_token::{RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation};
 use crate::federation::link::fresh_local;
-use crate::realm::mutate_placement::is_management;
 use crate::sync::document_outbox::schedule_drain_effect;
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
+
+/// The one node that runs account merges: the management node with the lowest id. Peers
+/// admit role grants and realm-config events of a merge only from a management node.
+pub fn coordinator(config: &RealmConfigDocument) -> Option<NodeId> {
+    config
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, RealmNodeKind::Management))
+        .filter_map(|node| node.node_id.parse::<NodeId>().ok())
+        .min()
+}
 
 /// Group authorization documents read per scan page.
 const SCAN_PAGE: usize = 256;
@@ -111,8 +123,8 @@ pub enum MergeError {
     VaultPresent,
     #[error("the vault of the other account could not be read: {0}")]
     Vault(String),
-    #[error("this node is not a realm management node")]
-    NotManagementNode,
+    #[error("this node does not coordinate account merges; retry the request")]
+    NotCoordinator,
     #[error("a document moved to new holders during the merge; retry it")]
     PlacementFenced,
     #[error("the credential cutoff of the merged account failed: {0}")]
@@ -359,10 +371,10 @@ impl MergeUsersOperation {
         let config = value(6)
             .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
             .transpose()?
-            .ok_or(MergeError::NotManagementNode)?;
-        // Peers admit role grants and realm-config events of a merge only from a management node.
-        if !is_management(&config, self.config.actor.node_id) {
-            return Err(MergeError::NotManagementNode);
+            .ok_or(MergeError::NotCoordinator)?;
+        // One node merges at a time, so opposite merges of two accounts never both commit.
+        if coordinator(&config) != Some(self.config.actor.node_id) {
+            return Err(MergeError::NotCoordinator);
         }
         let realm_auth = value(8)
             .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes))

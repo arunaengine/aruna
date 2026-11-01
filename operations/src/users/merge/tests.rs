@@ -353,6 +353,40 @@ fn failed_cutoff_aborts_merge() {
 }
 
 #[test]
+fn only_coordinator_merges() {
+    // A management node with a lower id coordinates; this node refuses before any write.
+    let lower = (1..=255u8)
+        .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+        .find(|candidate| *candidate < node())
+        .expect("some key sorts below this node");
+    let mut realm = RealmConfigDocument::new(REALM, Vec::new(), 3);
+    realm.ensure_node(node(), RealmNodeKind::Management);
+    realm.ensure_node(lower, RealmNodeKind::Management);
+    assert_eq!(super::coordinator(&realm), Some(lower));
+
+    let mut operation = MergeUsersOperation::new(config(id(1), id(2)));
+    operation.start();
+    operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
+    operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
+        result: Ok(false),
+    }));
+    let txn_id = TxnId::generate();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+        result: Ok(()),
+    }));
+    let realm_bytes = Some(realm.to_bytes(&actor(id(1))).unwrap().into());
+    let mut values = vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))];
+    values.extend([None, None, None, None, realm_bytes, None, None, None]);
+    let cleanup = operation.step(read(values));
+    assert!(matches!(
+        cleanup.first(),
+        Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
+    ));
+    assert_eq!(operation.finalize(), Err(MergeError::NotCoordinator));
+}
+
+#[test]
 fn repeat_only_cuts_off() {
     let mut merged = user(2, &[]);
     merged
