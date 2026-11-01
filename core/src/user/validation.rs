@@ -30,6 +30,13 @@ pub enum UserAttributeError {
     TooManyAttributes,
 }
 
+/// The stored form of a verified email: hex BLAKE3 of the trimmed, lowercased address.
+pub fn email_hash(email: &str) -> String {
+    blake3::hash(email.trim().to_lowercase().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 pub fn is_reserved_attribute(key: &str) -> bool {
     key.starts_with(RESERVED_PREFIX)
 }

@@ -1459,6 +1459,8 @@ mod test {
                 name: "capabilities-user".to_string(),
                 subject_id: "a-random-subject-id".to_string(),
                 issuer: "issuer_id".to_string(),
+                email_hash: None,
+                create_new: false,
             }),
             &driver_ctx,
         )
@@ -1750,6 +1752,8 @@ mod test {
                 name: "validation-user".to_string(),
                 subject_id: "validation-user-subject_id".to_string(),
                 issuer: "validation-user-issuer-id".to_string(),
+                email_hash: None,
+                create_new: false,
             }),
             &driver_ctx,
         )

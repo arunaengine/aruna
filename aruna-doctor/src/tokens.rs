@@ -153,6 +153,8 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
             subject_id: onboarding_secret.enrollment_id.to_string(),
             name: "local-admin".to_string(),
             user_id,
+            email_hash: None,
+            create_new: false,
         }),
         &driver_ctx,
     )
