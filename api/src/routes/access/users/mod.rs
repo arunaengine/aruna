@@ -219,9 +219,18 @@ pub struct UserInfoResponse {
     pub linked_logins: Vec<String>,
     /// Secondary accounts merged into this one; their ids resolve to this account.
     pub merged_user_ids: Vec<String>,
+    /// The same secondary accounts with their own names, in the order of `merged_user_ids`.
+    pub merged_users: Vec<MergedUserResponse>,
     pub realm: UserRealmResponse,
     pub groups: Vec<UserGroupResponse>,
     pub preferences: UserPreferencesResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MergedUserResponse {
+    pub user_id: String,
+    /// The secondary account's own name; null when this node holds no record of it.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -504,15 +513,27 @@ async fn build_user_response(
     let realm_roles = collect_realm_roles(read_realm_authorization(state).await?, auth.user_id);
     let groups = collect_group_memberships(state, auth.user_id).await?;
     let linked_logins = crate::routes::federation::link::linked_logins(&user).linked_logins;
-    let merged_user_ids = user
-        .merged_user_ids()
+    let mut merged_users = Vec::new();
+    for user_id in user.merged_user_ids() {
+        let name = match drive(ReadUserOperation::new(user_id), &state.get_ctx()).await {
+            Ok(merged) => Some(merged.name),
+            Err(ReadUserError::NotFound) => None,
+            Err(error) => return Err(map_user_error(error)),
+        };
+        merged_users.push(MergedUserResponse {
+            user_id: user_id.to_string(),
+            name,
+        });
+    }
+    let merged_user_ids = merged_users
         .iter()
-        .map(UserId::to_string)
+        .map(|merged| merged.user_id.clone())
         .collect();
 
     Ok(UserInfoResponse {
         linked_logins,
         merged_user_ids,
+        merged_users,
         user: user.into(),
         realm: UserRealmResponse {
             realm_id: state.get_realm_id().to_string(),
@@ -929,6 +950,7 @@ takes no user id.
                 ],
                 "linked_logins": [],
                 "merged_user_ids": [],
+                "merged_users": [],
                 "preferences": {
                     "preferred_profile_path": "datasets/proteomics",
                     "favourite_metadata_ids": ["01JMETADATA0123456789ABCDE"],
@@ -1027,6 +1049,7 @@ user document and takes no user id.
                 ],
                 "linked_logins": [],
                 "merged_user_ids": [],
+                "merged_users": [],
                 "preferences": {
                     "preferred_profile_path": null,
                     "favourite_metadata_ids": [],

@@ -230,6 +230,8 @@ async fn merge_moves_signin() {
     let (_, profile) = me(&node, &landed).await;
     assert_eq!(profile["user"]["user_id"], alice.id.as_str());
     assert_eq!(profile["merged_user_ids"], json!([bob.id]));
+    let own_name = json!([{ "user_id": bob.id, "name": "Bob" }]);
+    assert_eq!(profile["merged_users"], own_name);
 
     // Attaching Bob's sign-in again after the merge is a repeat, not a taken sign-in.
     let bob_again = login_token(&key, "subject-b", "Bob", None);
