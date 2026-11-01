@@ -806,6 +806,36 @@ async fn record_import_rate() {
     );
 }
 
+// With the drain and the feed beside the import, the catch-up leaves no feed row unapplied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_import_settles() {
+    let ((completed, failed, _), ..) = import_records(300, 0, (2, true), true).await;
+    assert_eq!((completed, failed), (300, 0));
+}
+
+/// The search feed rows still waiting for the feed.
+async fn feed_rows(fixture: &Fixture) -> Vec<(aruna_core::types::Key, aruna_core::types::Value)> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::SEARCH_FEED_KEYSPACE;
+    let read = StorageEffect::Iter {
+        key_space: SEARCH_FEED_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: 1,
+        txn_id: None,
+    };
+    match fixture
+        .driver
+        .storage_handle
+        .send_storage_effect(read)
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        event => panic!("the feed must be readable: {event:?}"),
+    }
+}
+
 // Empty rows of one job and record rows of another write one range in turns, not in conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn empty_rows_alternate() {
@@ -1064,15 +1094,22 @@ async fn import_records(
     });
     let outcomes = futures_util::future::join_all(runs).await;
     let elapsed = started.elapsed().as_secs_f64();
+    // The catch-up counts from the jobs' end, the feed's pass running then included.
+    let ended = std::time::Instant::now();
     let conflicts = storage.snapshot_metrics().conflicts_total - conflicts;
     drain.abort();
     stop.cancel();
     let mut feeder = feed.await.unwrap();
     server.abort();
     // The index catches up with what the jobs wrote.
-    let started = std::time::Instant::now();
     while background && feeder.pass(&fixture.driver).await {}
-    let index = started.elapsed().as_secs_f64();
+    let index = ended.elapsed().as_secs_f64();
+    if background {
+        assert!(
+            feed_rows(&fixture).await.is_empty(),
+            "the catch-up applied every feed row"
+        );
+    }
     let (mut completed, mut failed) = (0, 0);
     for outcome in outcomes {
         let (completed_items, failed_items) = match outcome.unwrap() {
