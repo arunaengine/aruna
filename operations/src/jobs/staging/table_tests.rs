@@ -794,11 +794,14 @@ async fn record_import_rate() {
     );
     let jobs = count("ARUNA_BENCH_JOBS", 1).max(1);
     let background = count("ARUNA_BENCH_BACKGROUND", 1) > 0;
-    let ((completed, failed, conflicts), elapsed) =
-        import_records(rows, empty, jobs, background).await;
+    // Contiguous key blocks per job, as a split export gives, instead of interleaved rows.
+    let blocks = count("ARUNA_BENCH_BLOCKS", 0) > 0;
+    let ((completed, failed, conflicts), elapsed, index) =
+        import_records(rows, empty, (jobs, blocks), background).await;
     println!(
         "record import: {rows} rows, {empty} empty, {jobs} jobs, {completed} completed, \
-         {failed} failed, {conflicts} conflicts, {elapsed:.1} s, {:.0} rows/s",
+         {failed} failed, {conflicts} conflicts, {elapsed:.1} s, {:.0} rows/s, \
+         index caught up {index:.1} s later",
         (rows + empty) as f64 / elapsed
     );
 }
@@ -806,7 +809,10 @@ async fn record_import_rate() {
 // Empty rows of one job and record rows of another write one range in turns, not in conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn empty_rows_alternate() {
-    assert_eq!(import_records(400, 100, 2, false).await.0, (500, 0, 0));
+    assert_eq!(
+        import_records(400, 100, (2, false), false).await.0,
+        (500, 0, 0)
+    );
 }
 
 /// The table line of record row `row`: key `samn<row>/assembly.fna.gz`, size `row`.
@@ -962,15 +968,16 @@ async fn record_pages_resume() {
     server.abort();
 }
 
-/// Imports `rows` record rows and `empty` empty rows spread over `jobs` tables at once, the
-/// drain and the search feed running beside them when `background`; returns the completed and
-/// failed rows, the storage conflicts meanwhile and the seconds the jobs took.
+/// Imports `rows` record rows and `empty` empty rows spread over `jobs` tables at once, in key
+/// blocks or interleaved, the drain and the search feed running beside them when `background`;
+/// returns the completed and failed rows, the storage conflicts meanwhile, the seconds the jobs
+/// took and the seconds the search index took after them to catch up.
 async fn import_records(
     rows: usize,
     empty: usize,
-    jobs: usize,
+    (jobs, blocks): (usize, bool),
     background: bool,
-) -> ((u64, u64, u64), f64) {
+) -> ((u64, u64, u64), f64, f64) {
     let (endpoint, _site, server) = serve(Site::ncbi).await;
     let table = serde_json::json!({
         "source": { "object": { "bucket": "lists", "key": "records-0.tsv" } },
@@ -984,7 +991,11 @@ async fn import_records(
     let header = "key\tsource\tsize\tmodified\tetag\tcontent_type\tmd5\tmetadata\n";
     let mut tables = vec![String::from(header); jobs];
     for row in 0..rows {
-        tables[row % jobs].push_str(&record_line(row, meta));
+        let table = match blocks {
+            true => row * jobs / rows,
+            false => row % jobs,
+        };
+        tables[table].push_str(&record_line(row, meta));
     }
     for row in 0..empty {
         tables[row % jobs].push_str(&format!("samn{row:08}/\t\t0\t\t\t\t\t{meta}\n"));
@@ -1028,18 +1039,21 @@ async fn import_records(
     });
     let feed = fixture.driver.clone();
     let indexes = fixture._dir.path().join("range-indexes");
+    let stop = CancellationToken::new();
+    let stopping = stop.clone();
     let feed = tokio::spawn(async move {
         use crate::distribution::index_feed::{FeedLimits, Feeder};
         use crate::distribution::key_index::RangeIndexes;
         let mut feeder = Feeder::new(Arc::new(RangeIndexes::new(indexes)), FeedLimits::default());
-        if !background {
-            return;
-        }
-        loop {
+        while background && !stopping.is_cancelled() {
             if !feeder.pass(&feed).await {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::select! {
+                    _ = stopping.cancelled() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                }
             }
         }
+        feeder
     });
     let storage = &fixture.driver.storage_handle;
     let conflicts = storage.snapshot_metrics().conflicts_total;
@@ -1052,8 +1066,13 @@ async fn import_records(
     let elapsed = started.elapsed().as_secs_f64();
     let conflicts = storage.snapshot_metrics().conflicts_total - conflicts;
     drain.abort();
-    feed.abort();
+    stop.cancel();
+    let mut feeder = feed.await.unwrap();
     server.abort();
+    // The index catches up with what the jobs wrote.
+    let started = std::time::Instant::now();
+    while background && feeder.pass(&fixture.driver).await {}
+    let index = started.elapsed().as_secs_f64();
     let (mut completed, mut failed) = (0, 0);
     for outcome in outcomes {
         let (completed_items, failed_items) = match outcome.unwrap() {
@@ -1068,7 +1087,7 @@ async fn import_records(
         };
         (completed, failed) = (completed + completed_items, failed + failed_items);
     }
-    ((completed, failed, conflicts), elapsed)
+    ((completed, failed, conflicts), elapsed, index)
 }
 
 /// Makes the job's bucket a searched distributed set whose upper range, holding keys from `m`,
