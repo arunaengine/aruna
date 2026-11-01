@@ -92,7 +92,7 @@ fn refused(message: String) -> ServerError {
     ServerError::Refused(StatusCode::FORBIDDEN, "merge_refused", message)
 }
 
-/// A merge or attach that reached a node which does not coordinate merges.
+/// A coordinated call that reached a node which does not coordinate merges.
 fn not_coordinator(message: String) -> ServerError {
     ServerError::Refused(StatusCode::SERVICE_UNAVAILABLE, "not_coordinator", message)
 }
@@ -361,7 +361,7 @@ async fn attach_subject(
         (status = 400, description = "The node id is malformed or names no management node of this realm", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller lacks the administration grant or the token is path-restricted", body = ErrorResponse),
-        (status = 503, description = "This node does not coordinate merges and could not pass the call on; retry", body = ErrorResponse)
+        (status = 503, description = "This node does not coordinate merges (code `not_coordinator`) or could not pass the call on (code `no_management_node`); retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -372,7 +372,7 @@ async fn hand_off(
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_auth(&state, auth)?;
     if !state.is_management_node() {
-        return Err(ServerError::Forbidden);
+        return Err(not_coordinator(MergeError::NotCoordinator.to_string()));
     }
     let node_id = request
         .node_id
@@ -444,12 +444,17 @@ mod tests {
             token: "unused".to_string(),
         };
         let attached = attach_subject(
-            State(state),
-            Extension(Some(auth)),
+            State(state.clone()),
+            Extension(Some(auth.clone())),
             Extension(None),
             Json(attach),
         )
         .await;
         assert_eq!(code(attached.err().unwrap()), expected);
+        let handoff = HandoffRequest {
+            node_id: node_id.to_string(),
+        };
+        let handed = hand_off(State(state), Extension(Some(auth)), Json(handoff)).await;
+        assert_eq!(code(handed.err().unwrap()), expected);
     }
 }
