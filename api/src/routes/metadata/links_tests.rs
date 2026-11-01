@@ -332,3 +332,71 @@ async fn confirms_hidden_dataset() {
     assert_eq!(reader.documents.len(), 1);
     assert!(!reader.confirmed);
 }
+
+async fn signed_out_target(test: &TestState, id: &str) -> ServerResult<PartTargetResponse> {
+    part_target(
+        State(test.state.clone()),
+        Extension(None),
+        Query(PartTargetParams { id: id.to_string() }),
+    )
+    .await
+    .map(|Json(response)| response)
+}
+
+#[tokio::test]
+async fn signed_out_parts() {
+    // Signed out, a part resolves only where a public role grants READ on it; a private, an
+    // absent bucket and an unknown set answer 401 alike.
+    use crate::tests::distributed::{PEER, distribute, node_id};
+    use crate::tests::routes::open_paths;
+    use aruna_core::structs::identity::auth::Actor;
+    let test = setup_state().await;
+    let realm_id = test.state.get_realm_id();
+    store_bucket(&test, BUCKET).await;
+    let set = distribute(&test.state, test.group_id, "spread").await;
+    let spread = LinkScope::Set {
+        realm_id,
+        set_id: set.set_id(),
+    };
+    let unknown = LinkScope::Set {
+        realm_id,
+        set_id: Ulid::from_bytes([62; 16]),
+    };
+    let absent = LinkScope::Node {
+        realm_id,
+        node_id: test.state.get_node_id(),
+        bucket: "absent".to_string(),
+    };
+    let (part, raw) = (spread.link("open/").to_id(), folder(&test, "raw/"));
+    let hidden = [unknown.link("open/").to_id(), absent.link("raw/").to_id()];
+    for id in [&part, &raw].into_iter().chain(&hidden) {
+        let refused = signed_out_target(&test, id).await;
+        assert!(matches!(refused, Err(ServerError::Unauthorized)), "{id}");
+    }
+
+    let actor = Actor {
+        node_id: test.state.get_node_id(),
+        user_id: test.auth.user_id,
+        realm_id,
+    };
+    // The set grants READ on its other member only, as a node outside the set sees it.
+    let peer = object_permission_path(realm_id, test.group_id, node_id(PEER), "spread", "open/**");
+    let local = test.state.get_node_id();
+    let raw_path = object_permission_path(realm_id, test.group_id, local, BUCKET, "raw/**");
+    open_paths(
+        &test.state.get_ctx(),
+        &actor,
+        test.group_id,
+        &[peer, raw_path],
+    )
+    .await;
+    let resolved = signed_out_target(&test, &part).await.unwrap();
+    assert_eq!(resolved.bucket.as_deref(), Some("spread"));
+    assert_eq!(resolved.prefix, "open/");
+    let folder = signed_out_target(&test, &raw).await.unwrap();
+    assert!(folder.held_here);
+    for id in &hidden {
+        let refused = signed_out_target(&test, id).await;
+        assert!(matches!(refused, Err(ServerError::Unauthorized)), "{id}");
+    }
+}
