@@ -92,6 +92,11 @@ fn refused(message: String) -> ServerError {
     ServerError::Refused(StatusCode::FORBIDDEN, "merge_refused", message)
 }
 
+/// A merge or attach that reached a node which does not coordinate merges.
+fn not_coordinator(message: String) -> ServerError {
+    ServerError::Refused(StatusCode::SERVICE_UNAVAILABLE, "not_coordinator", message)
+}
+
 fn map_merge_error(error: MergeError) -> ServerError {
     let message = error.to_string();
     match error {
@@ -110,10 +115,10 @@ fn map_merge_error(error: MergeError) -> ServerError {
         MergeError::NotFound => ServerError::NotFound,
         MergeError::Unauthorized => ServerError::Forbidden,
         MergeError::InvalidCoordinator => ServerError::BadRequestReason(message),
-        MergeError::Storage(_)
-        | MergeError::Vault(_)
-        | MergeError::PlacementFenced
-        | MergeError::NotCoordinator => ServerError::ServiceUnavailableReason(message),
+        MergeError::NotCoordinator => not_coordinator(message),
+        MergeError::Storage(_) | MergeError::Vault(_) | MergeError::PlacementFenced => {
+            ServerError::ServiceUnavailableReason(message)
+        }
         _ => ServerError::InternalError(message),
     }
 }
@@ -171,7 +176,8 @@ that account. Both prove control; a matching email or name is never enough.
         (status = 403, description = "A login is too old, the other token is invalid or of another realm, both name the same account, or an account is deactivated or a service account (code `merge_refused`)", body = ErrorResponse),
         (status = 404, description = "This node holds no record of one of the accounts", body = ErrorResponse),
         (status = 409, description = "The other account still holds a vault (code `vault_present`), or a role of it denies part of what it hands over and part of the caller's own access (code `role_conflict`, naming the role)", body = ErrorResponse),
-        (status = 503, description = "Storage or the vault holders were unavailable, or a document moved during the merge; retry", body = ErrorResponse)
+        (status = 502, description = "The call was passed on but its answer was lost, so it may have been applied (code `relay_failed`)", body = ErrorResponse),
+        (status = 503, description = "Storage or the vault holders were unavailable, or a document moved during the merge; retry. Code `not_coordinator` when the call reached a node that does not run merges, `no_management_node` when it could not be passed on", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -184,7 +190,7 @@ async fn merge_account(
     let auth = require_unrestricted_auth(&state, auth)?;
     charge(&state, auth.user_id)?;
     if !state.is_management_node() {
-        return Err(ServerError::Forbidden);
+        return Err(not_coordinator(MergeError::NotCoordinator.to_string()));
     }
     let survivor_login = bearer_auth_time(&state, bearer).await?;
     // A cut-off token still names its account, so a repeat of a finished merge is recognized.
@@ -250,6 +256,7 @@ minutes after its provider login.
 - Attaching a sign-in the account already has succeeds again unchanged.
 - A sign-in that already belongs to another account is refused with code `subject_taken`; merge
   that account with `POST /access/users/me/merge` instead.
+- Like a merge, it runs on the realm's merge coordinator; every other node passes the call there.
 - The change replicates to every node. At most 6 attempts per minute."#,
     request_body(
         content = AttachSubjectRequest,
@@ -261,7 +268,9 @@ minutes after its provider login.
                 "subject_ids": ["<first sign-in>", "<attached sign-in>"], "attributes": {} })),
         (status = 401, description = "Missing or invalid bearer token, or an invalid OIDC token", body = ErrorResponse),
         (status = 403, description = "A login is too old (code `merge_refused`)", body = ErrorResponse),
-        (status = 409, description = "The sign-in belongs to another account (code `subject_taken`)", body = ErrorResponse)
+        (status = 409, description = "The sign-in belongs to another account (code `subject_taken`)", body = ErrorResponse),
+        (status = 502, description = "The call was passed on but its answer was lost, so it may have been applied (code `relay_failed`)", body = ErrorResponse),
+        (status = 503, description = "The call reached a node that does not run merges (code `not_coordinator`) or could not be passed on (code `no_management_node`); retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -274,7 +283,7 @@ async fn attach_subject(
     let auth = require_unrestricted_auth(&state, auth)?;
     charge(&state, auth.user_id)?;
     if !state.is_management_node() {
-        return Err(ServerError::Forbidden);
+        return Err(not_coordinator(MergeError::NotCoordinator.to_string()));
     }
     let now = unix_timestamp_secs();
     let login = bearer_auth_time(&state, bearer).await?;
@@ -377,4 +386,65 @@ async fn hand_off(
         .await
         .map_err(map_merge_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::routes::{test_context, test_state, test_storage};
+    use aruna_core::structs::identity::auth::NodeCapabilities;
+    use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
+
+    fn code(error: ServerError) -> (StatusCode, String) {
+        (error.status_code(), error.response_body().code.unwrap())
+    }
+
+    #[tokio::test]
+    async fn refuses_off_coordinator() {
+        // A call relayed to a node that does not run merges names why, so a client can retry.
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
+        let state = test_state(
+            Arc::new(test_context(storage)),
+            realm_id,
+            node_id,
+            capabilities,
+        );
+        let state = Arc::new(state.await);
+        let auth = AuthContext {
+            user_id: UserId::new(Ulid::from_bytes([3u8; 16]), realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let expected = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_coordinator".to_string(),
+        );
+        let merge = MergeAccountRequest {
+            token: "unused".to_string(),
+        };
+        let merged = merge_account(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Extension(None),
+            Json(merge),
+        )
+        .await;
+        assert_eq!(code(merged.err().unwrap()), expected);
+        let attach = AttachSubjectRequest {
+            token: "unused".to_string(),
+        };
+        let attached = attach_subject(
+            State(state),
+            Extension(Some(auth)),
+            Extension(None),
+            Json(attach),
+        )
+        .await;
+        assert_eq!(code(attached.err().unwrap()), expected);
+    }
 }

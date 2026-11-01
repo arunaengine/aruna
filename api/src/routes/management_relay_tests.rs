@@ -103,6 +103,13 @@ fn merge_goes_to_coordinator() {
             .iter()
             .any(|(_, path)| *path == "/access/users/me/merge")
     );
+    // Attaching a sign-in runs where merges run, so it cannot race one on another node.
+    let attach = Some("/api/v1/access/users/me/subjects");
+    assert_eq!(
+        coordinated_route(&Method::POST, attach, false),
+        Some("/access/users/me/subjects")
+    );
+    assert_eq!(relay_route(&Method::POST, attach, false, false), None);
 }
 
 #[test]
