@@ -17,7 +17,10 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, RoleId, TxnId, Value};
-use aruna_core::user::validation::{DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX};
+use aruna_core::user::validation::{
+    DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, counted_attributes,
+    validate_attribute_count,
+};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::{BTreeSet, HashMap};
@@ -107,8 +110,9 @@ impl MergeUsersOperation {
                 });
             }
         }
-        let copied = plan::copied_attributes(&documents.survivor, &documents.merged);
+        let (copied, skipped) = plan::copied_attributes(&documents.survivor, &documents.merged);
         outcome.attributes = copied.len();
+        outcome.skipped_attributes = skipped;
         for (key, value) in copied {
             documents
                 .survivor
@@ -194,6 +198,8 @@ impl MergeUsersOperation {
         (state, revision): (&Option<Value>, &Option<Value>),
         ops: Vec<AdminDocumentOperation>,
     ) -> Result<(), MergeError> {
+        // A merge never leaves an account that its next update would refuse.
+        validate_attribute_count(counted_attributes(user.attributes.keys()))?;
         let actor = self.acting(user.user_id);
         let user_id = user.user_id;
         let mut change = Change::new(state.as_ref(), AdminDocumentTarget::User { user_id })?;

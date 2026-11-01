@@ -28,8 +28,8 @@ use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId};
 use aruna_core::user::validation::{
-    UserAttributeError, is_reserved_attribute, validate_attribute_count, validate_attribute_key,
-    validate_attribute_value,
+    UserAttributeError, counted_attributes, is_reserved_attribute, validate_attribute_count,
+    validate_attribute_key, validate_attribute_value,
 };
 use aruna_core::{
     DOCUMENT_STATE_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
@@ -988,7 +988,7 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
         user.attributes.insert(key.clone(), value.clone());
     }
 
-    validate_attribute_count(user.attributes.len())?;
+    validate_attribute_count(counted_attributes(user.attributes.keys()))?;
 
     Ok(())
 }

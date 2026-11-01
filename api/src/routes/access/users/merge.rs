@@ -53,6 +53,8 @@ pub struct MergeAccountResponse {
     pub realm_roles: usize,
     pub devices: usize,
     pub attributes: usize,
+    /// Attributes the caller's account had no room for; they stay on the other account.
+    pub attributes_not_copied: Vec<String>,
     /// Earlier secondaries of the other account that now point at `user_id`.
     pub secondaries: usize,
     /// The other account was already merged into the caller's; nothing changed.
@@ -129,7 +131,8 @@ that account. Both prove control; a matching email or name is never enough.
   overlaps a moved grant moves with it, and one that would also cut the primary's own access
   refuses the merge.
 - Its devices are re-owned by the primary and must sign in again.
-- Profile and preference attributes the primary lacks are copied.
+- Profile and preference attributes the primary lacks are copied while they fit its 128 own
+  attributes; `attributes_not_copied` names the rest. The list of secondaries does not count.
 - Every bearer token, S3 credential and S3 session of the other account issued up to five minutes
   after the merge is cut off on every node. Its share links stop, as for any deactivated account.
 - Runs, RO-Crates, provenance and other signed records keep naming the other account; reads of
@@ -151,6 +154,7 @@ that account. Both prove control; a matching email or name is never enough.
         (status = 200, description = "The other account is a secondary of the caller's", body = MergeAccountResponse,
             example = json!({ "user_id": "<caller user id>", "merged_user_id": "<other user id>",
                 "subjects": 1, "groups": 2, "realm_roles": 0, "devices": 1, "attributes": 3,
+                "attributes_not_copied": [],
                 "secondaries": 0, "repeated": false })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A login is too old, the other token is invalid or of another realm, both name the same account, or an account is deactivated or a service account (code `merge_refused`)", body = ErrorResponse),
@@ -210,6 +214,7 @@ async fn merge_account(
         realm_roles: outcome.realm_roles,
         devices: outcome.devices,
         attributes: outcome.attributes,
+        attributes_not_copied: outcome.skipped_attributes,
         secondaries: outcome.secondaries,
         repeated: outcome.repeated,
     }))

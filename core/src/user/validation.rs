@@ -67,6 +67,14 @@ pub fn validate_attribute_value(key: &str, value: &str) -> Result<(), UserAttrib
     Ok(())
 }
 
+/// Attributes that count towards [`MAX_USER_ATTRIBUTES`]: those a user sets. Reserved ones are
+/// set by Aruna alone, among them one per merged account, which has no limit.
+pub fn counted_attributes<'a>(keys: impl IntoIterator<Item = &'a String>) -> usize {
+    keys.into_iter()
+        .filter(|key| !is_reserved_attribute(key))
+        .count()
+}
+
 pub fn validate_attribute_count(count: usize) -> Result<(), UserAttributeError> {
     if count > MAX_USER_ATTRIBUTES {
         return Err(UserAttributeError::TooManyAttributes);
@@ -146,6 +154,11 @@ mod tests {
     #[test]
     fn user_attribute_limit() {
         assert_eq!(validate_attribute_count(MAX_USER_ATTRIBUTES), Ok(()));
+        let reserved = (0..MAX_USER_ATTRIBUTES + 5)
+            .map(|index| format!("{}{index}", super::MERGED_PREFIX))
+            .chain(["orcid".to_string()])
+            .collect::<Vec<_>>();
+        assert_eq!(super::counted_attributes(&reserved), 1);
         assert_eq!(
             validate_attribute_count(MAX_USER_ATTRIBUTES + 1),
             Err(UserAttributeError::TooManyAttributes)

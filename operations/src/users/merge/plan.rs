@@ -7,7 +7,9 @@ use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{Permission, Role};
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::RoleId;
-use aruna_core::user::validation::{MAX_USER_ATTRIBUTES, is_reserved_attribute};
+use aruna_core::user::validation::{
+    MAX_USER_ATTRIBUTES, counted_attributes, is_reserved_attribute,
+};
 use std::collections::{BTreeSet, HashMap};
 
 /// Refuses accounts that may not merge; `Ok(true)` when `merged` already merged into `survivor`.
@@ -144,8 +146,12 @@ fn level(permission: &Permission) -> u8 {
     }
 }
 
-/// Attributes of `merged` that `survivor` lacks, in key order; reserved ones never move.
-pub(super) fn copied_attributes(survivor: &User, merged: &User) -> Vec<(String, String)> {
+/// Attributes of `merged` that `survivor` lacks, in key order, as many as fit the survivor's
+/// budget, and the keys of those that did not fit. Reserved ones never move.
+pub(super) fn copied_attributes(
+    survivor: &User,
+    merged: &User,
+) -> (Vec<(String, String)>, Vec<String>) {
     let mut copied: Vec<_> = merged
         .attributes
         .iter()
@@ -153,8 +159,13 @@ pub(super) fn copied_attributes(survivor: &User, merged: &User) -> Vec<(String, 
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     copied.sort();
-    copied.truncate(MAX_USER_ATTRIBUTES.saturating_sub(survivor.attributes.len()));
-    copied
+    let room = MAX_USER_ATTRIBUTES.saturating_sub(counted_attributes(survivor.attributes.keys()));
+    let skipped = copied
+        .split_off(room.min(copied.len()))
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    (copied, skipped)
 }
 
 /// The owners of one subject once it moved from `merged` to `survivor`.

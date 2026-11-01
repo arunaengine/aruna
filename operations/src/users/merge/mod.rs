@@ -32,6 +32,7 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId, Value};
+use aruna_core::user::validation::UserAttributeError;
 use aruna_core::{NodeId, UserId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -87,6 +88,8 @@ pub struct MergeOutcome {
     pub realm_roles: usize,
     pub devices: usize,
     pub attributes: usize,
+    /// Keys of attributes the survivor had no room for; they stay on the merged account.
+    pub skipped_attributes: Vec<String>,
     /// Earlier secondaries of the merged account, now secondaries of the survivor.
     pub secondaries: usize,
     pub repeated: bool,
@@ -114,6 +117,8 @@ pub enum MergeError {
     Inactive,
     #[error("service accounts are never merged")]
     ServiceAccount,
+    #[error(transparent)]
+    Attributes(#[from] UserAttributeError),
     #[error(
         "the role {0} of the other account denies part of what it hands over and part of this \
          account's own access; remove the deny or the role first"
@@ -482,6 +487,7 @@ impl MergeUsersOperation {
             realm_roles: 0,
             devices: 0,
             attributes: 0,
+            skipped_attributes: Vec::new(),
             secondaries: 0,
             repeated,
         }

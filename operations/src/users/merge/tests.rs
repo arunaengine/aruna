@@ -285,7 +285,40 @@ fn copies_missing_attributes() {
         .insert(format!("{MERGED_PREFIX}{}", Ulid::nil()), id(5).to_string());
     assert_eq!(
         plan::copied_attributes(&survivor, &merged),
-        vec![("orcid".to_string(), "0000-0002-1825-0097".to_string())]
+        (
+            vec![("orcid".to_string(), "0000-0002-1825-0097".to_string())],
+            Vec::new()
+        )
+    );
+}
+
+#[test]
+fn copies_only_what_fits() {
+    // A full survivor takes what fits; merge markers never count towards its own attributes.
+    let mut survivor = user(1, &[]);
+    for index in 0..127 {
+        survivor
+            .attributes
+            .insert(format!("own.{index:03}"), "x".to_string());
+    }
+    for seed in 3..6 {
+        survivor.attributes.insert(
+            format!("{MERGED_PREFIX}{}", id(seed).user_ulid),
+            id(seed).to_string(),
+        );
+    }
+    let mut merged = user(2, &[]);
+    for key in ["a", "b", "c"] {
+        merged.attributes.insert(key.to_string(), "y".to_string());
+    }
+    let (copied, skipped) = plan::copied_attributes(&survivor, &merged);
+    assert_eq!(copied, vec![("a".to_string(), "y".to_string())]);
+    assert_eq!(skipped, vec!["b".to_string(), "c".to_string()]);
+    survivor.attributes.extend(copied);
+    let counted = aruna_core::user::validation::counted_attributes(survivor.attributes.keys());
+    assert_eq!(
+        aruna_core::user::validation::validate_attribute_count(counted),
+        Ok(())
     );
 }
 
