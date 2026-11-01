@@ -342,6 +342,7 @@ impl LinkLoginOperation {
                 issued_at: payload.foreign_issued_at,
                 now: config.now,
             }),
+            subject: None,
         }
     }
 }
@@ -490,6 +491,7 @@ impl UnlinkLoginOperation {
             remove_attributes: Vec::new(),
             system: true,
             alias: Some(AliasChange::Remove(config.alias)),
+            subject: None,
         }));
         let effects = update.update.start();
         self.state = UnlinkState::Update(update);

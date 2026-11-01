@@ -588,6 +588,8 @@ async fn register_admin(
             subject_id: oidc_identity.subject_id,
             name,
             user_id,
+            email_hash: None,
+            create_new: false,
         }),
         &state.get_ctx(),
     )
@@ -695,6 +697,8 @@ async fn register_user(
                     subject_id: oidc_identity.subject_id,
                     name,
                     user_id,
+                    email_hash: None,
+                    create_new: false,
                 }),
                 &state.get_ctx(),
             )
@@ -1013,6 +1017,7 @@ async fn patch_user_info(
             remove_attributes: request.remove_attributes,
             system: false,
             alias: None,
+            subject: None,
         }),
         &state.get_ctx(),
     )
