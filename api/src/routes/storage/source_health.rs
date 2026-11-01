@@ -89,7 +89,7 @@ impl From<SourceHealth> for SourceHealthBody {
     get,
     path = "/data/buckets/{bucket}/sources/health",
     tag = "data/storage",
-    summary = "Show how the sources of a file version perform",
+    summary = "Show how sources of a file version perform",
     description = r#"Lists every source of one file version with what this node measured of it lately.
 
 **Authentication**: realm bearer token with READ on the file.

@@ -259,7 +259,16 @@ does not know yet, as for a legacy object id, is a retryable 503."#,
         (status = 302, description = "Active public document or Profile; `Location` is its portal page for a browser, else its RO-Crate read route, and the answer varies by `Accept`"),
         (status = 307, description = "A data id; `Location` is `/api/v1/resolve/{id}`"),
         (status = 404, description = "Unknown shape, malformed id, or an identifier this realm does not resolve"),
-        (status = 410, description = "The identifier was withdrawn and stays withdrawn", body = Object, content_type = "application/json"),
+        (
+            status = 410,
+            description = "The identifier was withdrawn and stays withdrawn",
+            body = Object,
+            content_type = "application/json",
+            example = json!({
+                "pid": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                "status": "withdrawn"
+            })
+        ),
         (status = 503, description = "The PID authority is unreachable; retryable")
     ),
     security(())
