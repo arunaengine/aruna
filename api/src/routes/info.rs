@@ -337,6 +337,10 @@ pub struct RealmPublicOverview {
     /// Nodes in the replicated realm configuration, regardless of DHT presence
     /// or health.
     pub nodes_configured: Option<u64>,
+    /// Current objects in the realm, each counted once, private ones included.
+    pub objects: Option<u64>,
+    /// Bytes of every version in the realm, stored and referenced alike.
+    pub data_bytes: Option<u64>,
 }
 
 /// Realm-wide quota policy. Used both as the response for the current settings
@@ -1105,11 +1109,13 @@ token of another realm or one this node cannot validate, the response is the pub
 - `public_nodes` is also public: each server and management node's id and published api base url,
   nothing else, so a page without sign-in (such as a share link) reaches the node it names. User
   devices are never listed.
-- `public_overview` carries three nullable aggregates: `live_datasets`, the realm's lifecycle-live
+- `public_overview` carries five nullable aggregates: `live_datasets`, the realm's lifecycle-live
   metadata registry count, never caller-filtered or replica-multiplied; `groups`, the realm's
-  stored group count; and `nodes_configured`, the membership count in this node's replicated realm
-  configuration, never DHT presence or health. A null value means this node could not answer and is
-  never encoded as zero.
+  stored group count; `nodes_configured`, the membership count in this node's replicated realm
+  configuration, never DHT presence or health; and `objects` and `data_bytes`, the realm totals of
+  `GET /system/usage` (`realm.objects`, and `realm.logical_bytes` plus `realm.referenced_bytes`).
+  They count private data too but name no bucket or dataset. A null value means this node could
+  not answer and is never encoded as zero.
 - A bearer token of this realm additionally reveals the realm's discovery configuration, its quota
   policy, the node list and the interface listen addresses. Gated values are absent or empty, never
   restructured, so one parser handles both.
@@ -1147,7 +1153,9 @@ token of another realm or one this node cannot validate, the response is the pub
                         "public_overview": {
                             "live_datasets": 4096,
                             "groups": 12,
-                            "nodes_configured": 3
+                            "nodes_configured": 3,
+                            "objects": 44438184,
+                            "data_bytes": 42770615394304_u64
                         },
                         "is_management_node": false,
                         "management_urls": ["https://mgmt.example.test/api/v1"],
@@ -1176,7 +1184,9 @@ token of another realm or one this node cannot validate, the response is the pub
                         "public_overview": {
                             "live_datasets": 4096,
                             "groups": 12,
-                            "nodes_configured": 3
+                            "nodes_configured": 3,
+                            "objects": 44438184,
+                            "data_bytes": 42770615394304_u64
                         },
                         "is_management_node": true,
                         "management_urls": ["https://node.example.test/api/v1"],
@@ -1293,10 +1303,13 @@ pub(crate) async fn run_realm_info(
             None
         }
     };
+    let totals = realm_totals(state).await;
     let public_overview = Some(RealmPublicOverview {
         live_datasets,
         groups,
         nodes_configured: u64::try_from(config.nodes.len()).ok(),
+        objects: totals.map(|(objects, _)| objects),
+        data_bytes: totals.map(|(_, data_bytes)| data_bytes),
     });
 
     let node_info_docs = load_node_documents(state, &config).await;
@@ -2230,6 +2243,24 @@ pub(crate) async fn distinct_buckets(
         Ok(counts) => counts.distinct(buckets),
         Err(error) => {
             warn!(error = %error, "distributed bucket counts unavailable for usage response");
+            None
+        }
+    }
+}
+
+/// The realm's current objects and data bytes, stored and referenced alike, private data
+/// included; aggregates only, so no bucket or dataset is named. `None` when unknown here.
+pub(crate) async fn realm_totals(state: &ServerState) -> Option<(u64, u64)> {
+    match load_realm_usage(state, RealmUsageScope::Global).await {
+        Ok(usage) => {
+            let usage = usage.counters;
+            Some((
+                usage.objects,
+                usage.logical_bytes.saturating_add(usage.referenced_bytes),
+            ))
+        }
+        Err(error) => {
+            warn!(error = %error, "realm usage unavailable for the realm totals");
             None
         }
     }
