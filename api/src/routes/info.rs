@@ -1116,9 +1116,12 @@ token of another realm or one this node cannot validate, the response is the pub
   `GET /system/usage` (`realm.objects`, and `realm.logical_bytes` plus `realm.referenced_bytes`).
   They count private data too but name no bucket or dataset. A null value means this node could
   not answer and is never encoded as zero.
+- Without a token, `nodes` lists the server and management nodes with `node_id`, `kind`,
+  `configured`, `present`, `connection_status`, `display_name`, `place` and `coordinates` only;
+  owners, placement, node documents and devices are left out.
 - A bearer token of this realm additionally reveals the realm's discovery configuration, its quota
-  policy, the node list and the interface listen addresses. Gated values are absent or empty, never
-  restructured, so one parser handles both.
+  policy, the full node list and the interface listen addresses. Gated values are absent or empty,
+  never restructured, so one parser handles both.
 - The node list is the realm's configured membership read from this node's replicated realm
   configuration; `placement` is the node's entry in the placement map and `info` is the last node
   information document that reached this node, so both may lag or be absent, as may
@@ -1141,7 +1144,7 @@ token of another realm or one this node cannot validate, the response is the pub
     responses(
         (
             status = 200,
-            description = "Realm information at the caller's level of access; discovery, quota, nodes and interface bind addresses only for a caller holding a token of this realm",
+            description = "Realm information at the caller's level of access; discovery, quota, the full node list and interface bind addresses only for a caller holding a token of this realm",
             body = RealmInfoResponse,
             examples(
                 ("Anonymous" = (
@@ -1353,7 +1356,7 @@ pub(crate) async fn run_realm_info(
             Some(RealmQuotaConfig::from(config.quota.clone()).with_replicas(&config.replica_quota)),
         )
     } else {
-        (None, Vec::new(), None)
+        (None, visitor_nodes(state, &config).await, None)
     };
 
     Ok(RealmInfoResponse {
@@ -1379,6 +1382,36 @@ pub(crate) async fn run_realm_info(
         quota,
         interfaces,
     })
+}
+
+/// The realm's infrastructure nodes as a visitor sees them: name, place and whether they are
+/// online, without owners, placement, utilization or devices.
+async fn visitor_nodes(state: &ServerState, config: &RealmConfigDocument) -> Vec<NodeInfoResponse> {
+    let present_nodes = load_realm_presence(state).await;
+    let names = node_names(state, config.realm_id).await;
+    let contacts = state.peer_contacts();
+    let documents = BTreeMap::new();
+    let nodes = map_realm_nodes(
+        state,
+        config,
+        present_nodes,
+        documents,
+        &contacts,
+        &names,
+        0,
+    );
+    let infrastructure = nodes
+        .into_iter()
+        .filter(|node| node.kind != NodeKindInfo::User);
+    infrastructure
+        .map(|node| NodeInfoResponse {
+            owner: None,
+            last_seen_ms: None,
+            placement: None,
+            info: None,
+            ..node
+        })
+        .collect()
 }
 
 /// Node display names and map places. A device runs no document sync, so it shows the copy a

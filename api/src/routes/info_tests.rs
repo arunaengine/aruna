@@ -1372,7 +1372,11 @@ async fn realm_gates_detail() {
             .unwrap();
         assert_eq!(info.realm_id, realm_id.to_string());
         assert_eq!(info.description, "Realm");
-        assert!(info.nodes.is_empty(), "realm topology is not public");
+        // A visitor sees nodes by name and presence only.
+        assert!(info.nodes.iter().all(|node| node.kind != NodeKindInfo::User
+            && node.owner.is_none()
+            && node.placement.is_none()
+            && node.info.is_none()));
         assert!(info.is_management_node, "the node kind is public");
         assert_eq!(
             info.management_urls,
@@ -1446,7 +1450,11 @@ async fn anonymous_realm_overview() {
 
     let (status, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
     assert_eq!(status, StatusCode::OK);
-    assert!(info.nodes.is_empty());
+    // A visitor sees the infrastructure nodes, never owners, placement or node documents.
+    assert_eq!(info.nodes.len(), 1);
+    let node = &info.nodes[0];
+    assert!(node.kind != NodeKindInfo::User && node.present);
+    assert!(node.owner.is_none() && node.placement.is_none() && node.info.is_none());
     assert!(info.discovery.is_none());
     assert!(info.quota.is_none());
     let overview = info.public_overview.as_ref().expect("public overview");
@@ -1471,7 +1479,11 @@ async fn anonymous_realm_overview() {
     assert_ne!(body["public_overview"]["live_datasets"], 0);
     assert!(body.get("discovery").is_none());
     assert!(body.get("quota").is_none());
-    assert_eq!(body["nodes"], serde_json::json!([]));
+    assert!(
+        body["nodes"][0]
+            .get("info")
+            .is_none_or(serde_json::Value::is_null)
+    );
     assert!(!body.to_string().contains("Protected group title"));
 }
 
@@ -1541,7 +1553,7 @@ async fn management_urls_follow() {
             api_url: "https://mgmt.example/api/v1".to_string(),
         }]
     );
-    assert!(info.nodes.is_empty());
+    assert!(info.nodes.iter().all(|node| node.info.is_none()));
 }
 
 #[tokio::test]
