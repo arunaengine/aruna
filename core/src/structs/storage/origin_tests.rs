@@ -164,3 +164,37 @@ fn signed_source_unpublished() {
     descriptor.kind = SourceConnectorKind::Http;
     assert!(!publishable(&descriptor));
 }
+
+// An HTTP source that served a read is named by its server alone.
+#[test]
+fn served_http_server() {
+    use crate::structs::execution::source_connector::SourceConnectorKind;
+    use std::collections::HashMap;
+    let endpoint = "https://user:secret@ftp.ncbi.nlm.nih.gov:443/private/token?sig=abc";
+    let mut descriptor = PortableSourceDescriptor {
+        kind: SourceConnectorKind::Http,
+        public_config: HashMap::from([("endpoint".to_string(), endpoint.to_string())]),
+        source_path: "genomes/a.fna".to_string(),
+        version_selector: Some("v1".to_string()),
+        namespace: None,
+        capabilities: Vec::new(),
+        origin_node_id: None,
+        root: None,
+    };
+    let pin = SourcePin::served(&descriptor);
+    assert_eq!(pin.url.as_deref(), Some("https://ftp.ncbi.nlm.nih.gov"));
+    assert_eq!(pin.path, "genomes/a.fna");
+    // The pin recorded at submission keeps naming no URL for it.
+    assert_eq!(SourcePin::of(&descriptor).url, None);
+    // A public S3 source keeps its full URL; a signed one and other kinds stay unnamed.
+    descriptor.kind = SourceConnectorKind::S3;
+    assert_eq!(SourcePin::served(&descriptor).url, None);
+    descriptor.public_config = HashMap::from([
+        ("endpoint".to_string(), "https://s3.example.org".to_string()),
+        ("skip_signature".to_string(), "true".to_string()),
+    ]);
+    let url = SourcePin::served(&descriptor).url;
+    assert_eq!(url.as_deref(), Some("https://s3.example.org/genomes/a.fna"));
+    descriptor.kind = SourceConnectorKind::LocalDirectory;
+    assert_eq!(SourcePin::served(&descriptor).url, None);
+}

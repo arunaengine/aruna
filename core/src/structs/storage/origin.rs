@@ -107,6 +107,21 @@ impl SourcePin {
             source_version: descriptor.version_selector.clone(),
         }
     }
+
+    /// The pin of a source that served a read: an HTTP source without a public URL is named
+    /// by its server only, never by its path, credentials or query.
+    pub fn served(descriptor: &PortableSourceDescriptor) -> Self {
+        use crate::structs::execution::source_connector::SourceConnectorKind;
+        let mut pin = Self::of(descriptor);
+        if pin.url.is_none() && descriptor.kind == SourceConnectorKind::Http {
+            let endpoint = descriptor.public_config.get("endpoint");
+            let origin = endpoint.and_then(|endpoint| url::Url::parse(endpoint).ok());
+            pin.url = (origin.map(|url| url.origin()))
+                .filter(url::Origin::is_tuple)
+                .map(|origin| origin.ascii_serialization());
+        }
+        pin
+    }
 }
 
 /// What a dataset may say about a file's origin, read from the same pinned version. Uploads
