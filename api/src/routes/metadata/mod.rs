@@ -62,7 +62,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(validation::get_validation_status))
         .routes(routes!(validation::revalidate_profile))
         .routes(routes!(
-            rocrate::export_metadata_rocrate,
+            rocrate::negotiated_rocrate,
             rocrate::replace_metadata_rocrate
         ))
         .routes(routes!(rocrate::submit_rocrate_export))

@@ -301,8 +301,13 @@ fn data_redirect(id: &str) -> Response {
 /// True when `Accept` ranks `text/html` above zero and above `application/ld+json`; wildcards
 /// name neither, so a client without a preference gets the RO-Crate.
 fn wants_page(headers: &axum::http::HeaderMap) -> bool {
-    let mut html = 0.0_f32;
-    let mut crate_json = 0.0_f32;
+    ranks_above(headers, "text/html", "application/ld+json")
+}
+
+/// True when `Accept` ranks the `wanted` type above zero and above `other`, wildcards aside.
+pub(crate) fn ranks_above(headers: &axum::http::HeaderMap, wanted: &str, other: &str) -> bool {
+    let mut wanted_rank = 0.0_f32;
+    let mut other_rank = 0.0_f32;
     let ranges = headers
         .get_all(header::ACCEPT)
         .iter()
@@ -318,13 +323,13 @@ fn wants_page(headers: &axum::http::HeaderMap) -> bool {
             None => 1.0,
         };
         let slot = match range.essence_str() {
-            "text/html" => &mut html,
-            "application/ld+json" => &mut crate_json,
+            essence if essence == wanted => &mut wanted_rank,
+            essence if essence == other => &mut other_rank,
             _ => continue,
         };
         *slot = slot.max(quality);
     }
-    html > 0.0 && html > crate_json
+    wanted_rank > 0.0 && wanted_rank > other_rank
 }
 
 /// The portal page of a document or Profile, when the federation settings name a portal.
