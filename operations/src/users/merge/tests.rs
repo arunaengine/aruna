@@ -449,7 +449,8 @@ fn only_coordinator_merges() {
 
 #[test]
 fn pinned_node_coordinates() {
-    // The pin names a node; a node it does not list as management never counts.
+    // An unknown pinned node stays pinned, never absent; a known demoted one has left.
+    use super::Coordinator;
     let other = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
     let mut realm = RealmConfigDocument::new(REALM, Vec::new(), 3);
     realm.ensure_node(node(), RealmNodeKind::Management);
@@ -458,11 +459,18 @@ fn pinned_node_coordinates() {
     };
     assert_eq!(
         super::coordinator(&realm, Some(&state(node()))),
-        Some(node())
+        Coordinator::Pinned(node())
     );
-    assert_eq!(super::coordinator(&realm, Some(&state(other))), None);
+    assert_eq!(
+        super::coordinator(&realm, Some(&state(other))),
+        Coordinator::Pinned(other)
+    );
+    assert_eq!(super::coordinator(&realm, None), Coordinator::Unpinned);
     realm.ensure_node(other, RealmNodeKind::Server);
-    assert_eq!(super::coordinator(&realm, Some(&state(other))), None);
+    assert_eq!(
+        super::coordinator(&realm, Some(&state(other))),
+        Coordinator::Left
+    );
 }
 
 #[test]
@@ -678,10 +686,22 @@ fn merge_moves_everything() {
 
 /// Runs a handoff to `target` on this node, the config pinning `pinned`, up to its write.
 fn hand_off(target: NodeId, pinned: Option<NodeId>) -> Result<Option<NodeId>, MergeError> {
+    hand_off_in(target, pinned, &[])
+}
+
+/// As [`hand_off`], with `extra` nodes of the given kinds in the realm config.
+fn hand_off_in(
+    target: NodeId,
+    pinned: Option<NodeId>,
+    extra: &[(NodeId, RealmNodeKind)],
+) -> Result<Option<NodeId>, MergeError> {
     use super::handoff::{HandoffConfig, HandoffOperation};
     let mut realm = RealmConfigDocument::new(REALM, Vec::new(), 3);
     realm.ensure_node(node(), RealmNodeKind::Management);
     realm.ensure_node(target, RealmNodeKind::Management);
+    for (node_id, kind) in extra {
+        realm.ensure_node(*node_id, kind.clone());
+    }
     let mut operation = HandoffOperation::new(HandoffConfig {
         actor: actor(id(1)),
         auth_context: portal(id(1)),
@@ -708,12 +728,17 @@ fn hand_off(target: NodeId, pinned: Option<NodeId>) -> Result<Option<NodeId>, Me
 
 #[test]
 fn only_coordinator_hands_off() {
-    // The pinned node, or any management node while none is pinned, names the next one.
+    // The pinned node hands on; an administrator names one only while none is recorded or the
+    // recorded one has left management. An unknown recorded node is never replaced here.
     let target = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+    let old = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
     assert_eq!(hand_off(target, Some(node())), Ok(Some(target)));
     assert_eq!(hand_off(target, None), Ok(Some(target)));
     assert_eq!(
         hand_off(target, Some(target)),
         Err(MergeError::NotCoordinator)
     );
+    assert_eq!(hand_off(target, Some(old)), Err(MergeError::NotCoordinator));
+    let demoted = [(old, RealmNodeKind::Server)];
+    assert_eq!(hand_off_in(target, Some(old), &demoted), Ok(Some(target)));
 }

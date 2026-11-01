@@ -15,7 +15,7 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::users::merge::coordinator as merge_coordinator;
+use aruna_operations::users::merge::{Coordinator, coordinator as merge_coordinator};
 use axum::body::Bytes;
 use axum::extract::{FromRequest, MatchedPath, OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
@@ -164,8 +164,8 @@ fn coordinated_route(
 }
 
 /// Where a coordinated route goes: `None` when this node answers it, being the pinned merge
-/// coordinator or, while none is pinned, a management node; else the coordinator's url or, while
-/// none is pinned, the management nodes.
+/// coordinator or, while none is pinned or it left, a management node; else the coordinator's
+/// url, or the management nodes. An unknown pinned node has no url, so the call is refused.
 async fn coordinator_targets(state: &Arc<ServerState>) -> Result<Option<Vec<String>>, ServerError> {
     let config = drive(
         GetConfigOperation::new(state.get_realm_id()),
@@ -192,8 +192,8 @@ async fn coordinator_targets(state: &Arc<ServerState>) -> Result<Option<Vec<Stri
         _ => return Err(ServerError::NoManagementNode),
     };
     match merge_coordinator(&config, reducer.as_ref()) {
-        Some(node) if node == state.get_node_id() => Ok(None),
-        Some(node) => {
+        Coordinator::Pinned(node) if node == state.get_node_id() => Ok(None),
+        Coordinator::Pinned(node) => {
             let documents = load_node_documents(state, &config).await;
             management_node_urls(&config, &documents)
                 .into_iter()
@@ -202,8 +202,8 @@ async fn coordinator_targets(state: &Arc<ServerState>) -> Result<Option<Vec<Stri
                 .map(|url| Some(vec![url]))
                 .ok_or(ServerError::NoManagementNode)
         }
-        None if state.is_management_node() => Ok(None),
-        None => Ok(Some(management_targets(state).await)),
+        Coordinator::Unpinned | Coordinator::Left if state.is_management_node() => Ok(None),
+        Coordinator::Unpinned | Coordinator::Left => Ok(Some(management_targets(state).await)),
     }
 }
 

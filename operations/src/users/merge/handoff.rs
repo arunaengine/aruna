@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::stage::{Batch, Change};
-use super::{MergeError, coordinator};
+use super::{Coordinator, MergeError, coordinator};
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::DocumentTarget;
@@ -121,8 +121,13 @@ impl HandoffOperation {
         if !management(&self.config.node_id) {
             return Err(MergeError::InvalidCoordinator);
         }
-        let current = coordinator(&config, decoded.as_ref());
-        if !management(&node_id) || current.is_some_and(|current| current != node_id) {
+        // The coordinator hands the role on; an administrator names one only while none is
+        // recorded or the recorded one has left management, as this node sees it.
+        let allowed = match coordinator(&config, decoded.as_ref()) {
+            Coordinator::Pinned(current) => current == node_id,
+            Coordinator::Unpinned | Coordinator::Left => true,
+        };
+        if !management(&node_id) || !allowed {
             return Err(MergeError::NotCoordinator);
         }
         let realm_id = self.config.actor.realm_id;

@@ -48,19 +48,40 @@ use crate::federation::link::fresh_local;
 use crate::sync::document_outbox::schedule_drain_effect;
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 
-/// The one node that runs account merges: the management node the realm config names. Only
-/// that node hands the role on, so it stops merging before another one starts.
+/// What the realm config records about the one node that runs account merges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coordinator {
+    /// No node is recorded, as in a realm created before merges had a coordinator.
+    Unpinned,
+    /// The recorded node, a management node or one this node does not know yet; never treated
+    /// as absent, since peers defer a replacement of it too.
+    Pinned(NodeId),
+    /// The recorded node is known here as removed or as no longer a management node.
+    Left,
+}
+
+/// The merge coordinator the realm config names. Only that node hands the role on, so it stops
+/// merging before another one starts.
 pub fn coordinator(
     config: &RealmConfigDocument,
     state: Option<&AdminDocumentState>,
-) -> Option<NodeId> {
-    let pinned = state.and_then(AdminDocumentState::materialized_merge_coordinator)?;
-    let pinned_name = pinned.to_string();
-    config
+) -> Coordinator {
+    let Some(pinned) = state.and_then(AdminDocumentState::materialized_merge_coordinator) else {
+        return Coordinator::Unpinned;
+    };
+    let name = pinned.to_string();
+    let kind = config
         .nodes
         .iter()
-        .any(|node| node.node_id == pinned_name && matches!(node.kind, RealmNodeKind::Management))
-        .then_some(pinned)
+        .find(|node| node.node_id == name)
+        .map(|node| &node.kind);
+    let removed = state.is_some_and(|state| state.removed_config_nodes().contains(&pinned));
+    match kind {
+        Some(RealmNodeKind::Management) => Coordinator::Pinned(pinned),
+        Some(_) => Coordinator::Left,
+        None if removed => Coordinator::Left,
+        None => Coordinator::Pinned(pinned),
+    }
 }
 
 /// Group authorization documents read per scan page.
@@ -396,7 +417,9 @@ impl MergeUsersOperation {
         let config_state = value(7)
             .map(|bytes| decode_reducer_state(&bytes).map_err(ConversionError::from))
             .transpose()?;
-        if coordinator(&config, config_state.as_ref()) != Some(self.config.actor.node_id) {
+        if coordinator(&config, config_state.as_ref())
+            != Coordinator::Pinned(self.config.actor.node_id)
+        {
             return Err(MergeError::NotCoordinator);
         }
         let realm_auth = value(8)

@@ -331,9 +331,13 @@ async fn attach_subject(
 **Behavior**
 - Every node passes this call to the current merge coordinator. It writes the new name and stops
   merging in the same commit, so two nodes never merge at once.
-- A realm names its first node when it is created. While no management node is named, for
-  example after the named node left management, any management node may name one.
-- Merges run on the named node only and answer 503 elsewhere until the name has reached them."#,
+- A realm names its first node when it is created. Otherwise only an administrator names one,
+  and only while this node sees no coordinator recorded, or sees the recorded one removed from
+  the realm or no longer a management node. A recorded node this node does not know yet is
+  never replaced.
+- Merges run on the named node only and answer 503 everywhere until the name has reached them.
+- Name a new coordinator for a lost one only after the old coordinator is shut down: without
+  consensus, a node that still believes it coordinates could merge until it learns otherwise."#,
     request_body(
         content = HandoffRequest,
         example = json!({ "node_id": "<node id of a management node>" })
