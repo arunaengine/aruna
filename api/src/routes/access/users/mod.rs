@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod keys;
+mod merge;
 mod status;
 mod vault;
 
@@ -19,6 +20,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
+use aruna_core::user::validation::email_hash;
 use aruna_operations::auth::bearer_token::decode_bearer_token;
 use aruna_operations::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
 use aruna_operations::device::remove_node::{
@@ -45,7 +47,9 @@ use aruna_operations::session::{CreateSessionConfig, CreateSessionError, create_
 use aruna_operations::users::get_oidc::{GetOidcInput, GetOidcOperation};
 use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
-use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
+use aruna_operations::users::oidc_user::{
+    ResolveOidcError, ResolveOidcInput, ResolveOidcOperation,
+};
 use aruna_operations::users::read_document::{ReadUserError, ReadUserOperation};
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
@@ -87,11 +91,15 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(status::router())
         .merge(vault::router())
         .merge(keys::router())
+        .merge(merge::router())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RegisterUserRequest {
     pub onboarding_secret: Option<String>,
+    /// Create a new account although an account with this email or name exists.
+    #[serde(default)]
+    pub create_new: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -206,6 +214,8 @@ pub struct UserInfoResponse {
     pub user: GetUserResponse,
     /// Logins of other realms that open sessions of this account, for removal.
     pub linked_logins: Vec<String>,
+    /// Secondary accounts merged into this one; their ids resolve to this account.
+    pub merged_user_ids: Vec<String>,
     pub realm: UserRealmResponse,
     pub groups: Vec<UserGroupResponse>,
     pub preferences: UserPreferencesResponse,
@@ -491,9 +501,15 @@ async fn build_user_response(
     let realm_roles = collect_realm_roles(read_realm_authorization(state).await?, auth.user_id);
     let groups = collect_group_memberships(state, auth.user_id).await?;
     let linked_logins = crate::routes::federation::link::linked_logins(&user).linked_logins;
+    let merged_user_ids = user
+        .merged_user_ids()
+        .iter()
+        .map(UserId::to_string)
+        .collect();
 
     Ok(UserInfoResponse {
         linked_logins,
+        merged_user_ids,
         user: user.into(),
         realm: UserRealmResponse {
             realm_id: state.get_realm_id().to_string(),
@@ -621,7 +637,15 @@ initial realm administrator role.
 - A management node resolves the subject and every other node relays the call to one, so a device
   never creates a user of its own. The user document reaches the other realm nodes through
   document sync, so it may not be visible elsewhere immediately.
-- No access token is returned: exchange the same OIDC token at `GET /access/token`."#,
+- No access token is returned: exchange the same OIDC token at `GET /access/token`.
+
+**Existing account check**
+- When the subject is new and the provider marks the token's email verified, no account is created
+  while an active account has the same verified email or the same name. The answer is 409 with
+  code `account_match` and never says which account. Nothing is stored meanwhile.
+- The person then either signs in with the existing account and attaches this sign-in through
+  `POST /access/users/me/subjects`, or repeats this call with `create_new: true`.
+- A token without a verified email never gets this answer and registers directly."#,
     request_body(
         content = RegisterUserRequest,
         description = "Optional onboarding secret. Omit it, or send null, for ordinary self service registration; send the secret handed out by the node operator only to claim the initial realm administrator.",
@@ -631,6 +655,15 @@ initial realm administrator role.
                     summary = "Register the OIDC subject with no special role",
                     value = json!({
                         "onboarding_secret": null
+                    })
+                )
+            ),
+            (
+                "CreateNew" = (
+                    summary = "Create a new account although an existing one may match",
+                    value = json!({
+                        "onboarding_secret": null,
+                        "create_new": true
                     })
                 )
             ),
@@ -656,6 +689,7 @@ initial realm administrator role.
         ),
         (status = 400, description = "Malformed request body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid OIDC bearer token, or an onboarding secret that is unknown, expired, already claimed or issued for another realm", body = ErrorResponse),
+        (status = 409, description = "The sign-in is new and an account with this email or name already exists; nothing was created (code `account_match`)", body = ErrorResponse),
         (status = 403, description = "The onboarding secret was issued for another purpose than the initial realm administrator, or the call carries a relay hop to a node that is not a management node", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = ErrorResponse)
@@ -686,6 +720,7 @@ async fn register_user(
         }
         None => {
             let realm_id = state.get_realm_id();
+            let email_hash = oidc_identity.verified_email.as_deref().map(email_hash);
             drive(
                 ResolveOidcOperation::new(ResolveOidcInput {
                     actor: Actor {
@@ -697,13 +732,18 @@ async fn register_user(
                     subject_id: oidc_identity.subject_id,
                     name,
                     user_id,
-                    email_hash: None,
-                    create_new: false,
+                    email_hash,
+                    create_new: request.create_new,
                 }),
                 &state.get_ctx(),
             )
             .await
-            .map_err(|err| ServerError::InternalError(err.to_string()))?
+            .map_err(|err| match err {
+                ResolveOidcError::MatchPending => {
+                    ServerError::Refused(StatusCode::CONFLICT, "account_match", err.to_string())
+                }
+                other => ServerError::InternalError(other.to_string()),
+            })?
         }
     };
     Ok((
@@ -879,6 +919,7 @@ takes no user id.
                     }
                 ],
                 "linked_logins": [],
+                "merged_user_ids": [],
                 "preferences": {
                     "preferred_profile_path": "datasets/proteomics",
                     "favourite_metadata_ids": ["01JMETADATA0123456789ABCDE"],
@@ -976,6 +1017,7 @@ user document and takes no user id.
                     }
                 ],
                 "linked_logins": [],
+                "merged_user_ids": [],
                 "preferences": {
                     "preferred_profile_path": null,
                     "favourite_metadata_ids": [],
@@ -1565,6 +1607,7 @@ async fn update_user(
             remove_attributes: request.remove_attributes,
             system: false,
             alias: None,
+            subject: None,
         }),
         &state.get_ctx(),
     )

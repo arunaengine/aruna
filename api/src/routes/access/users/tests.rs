@@ -417,7 +417,10 @@ async fn register_via_oidc(
     let register = reqwest::Client::new()
         .post(format!("{}/api/v1/access/users/register", node.base_url))
         .bearer_auth(&oidc_token)
-        .json(&RegisterUserRequest { onboarding_secret })
+        .json(&RegisterUserRequest {
+            onboarding_secret,
+            create_new: false,
+        })
         .send()
         .await
         .unwrap();
@@ -1008,6 +1011,7 @@ async fn registration_consumes_secret() {
         ))
         .json(&RegisterUserRequest {
             onboarding_secret: Some(onboarding_secret),
+            create_new: false,
         })
         .send()
         .await
@@ -1043,6 +1047,7 @@ async fn refuses_local_registration() {
         ))
         .json(&RegisterUserRequest {
             onboarding_secret: None,
+            create_new: false,
         })
         .send()
         .await
@@ -1060,6 +1065,7 @@ async fn register_status(node: &TestNode, oidc_token: &str, onboarding_secret: &
         .bearer_auth(oidc_token)
         .json(&RegisterUserRequest {
             onboarding_secret: Some(onboarding_secret.to_string()),
+            create_new: false,
         })
         .send()
         .await
@@ -1564,6 +1570,7 @@ async fn registered_user_token() {
         .bearer_auth(&oidc_token)
         .json(&RegisterUserRequest {
             onboarding_secret: None,
+            create_new: false,
         })
         .send()
         .await
