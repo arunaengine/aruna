@@ -443,9 +443,9 @@ pub async fn resolve_pid_routed(
     }
 }
 
-/// The authority's own answer: a withdrawn mapping is a permanent 410 whatever
-/// the document's visibility, an active one redirects only while the document is
-/// anonymously readable, and everything else is indistinguishable from unminted.
+/// The authority's own answer: a withdrawn mapping of a public intent is a permanent 410,
+/// an active one redirects only while the document is anonymously readable now,
+/// and everything else is indistinguishable from unminted.
 pub(super) async fn local_pid_resolution(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -461,11 +461,12 @@ pub(super) async fn local_pid_resolution(
     if mapping.pid != expected_pid {
         return Ok(PersistentIdResolution::Missing);
     }
-    if mapping.public == Some(false) {
-        return Ok(PersistentIdResolution::Missing);
-    }
     if mapping.is_retired() {
-        return Ok(PersistentIdResolution::Gone { pid: mapping.pid });
+        // The record may be gone, so a withdrawal keeps the visibility frozen at creation.
+        return Ok(match mapping.public {
+            Some(false) => PersistentIdResolution::Missing,
+            _ => PersistentIdResolution::Gone { pid: mapping.pid },
+        });
     }
     if !mapping.is_active() {
         return Ok(PersistentIdResolution::Missing);

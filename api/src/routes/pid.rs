@@ -530,9 +530,9 @@ async fn require_status_visibility(
     mapping: Option<&PersistentIdMapping>,
     record: Option<&MetadataRegistryRecord>,
 ) -> ServerResult<()> {
-    let public = mapping
-        .and_then(|mapping| mapping.public)
-        .or_else(|| record.map(|record| record.public));
+    let public = record
+        .map(|record| record.public)
+        .or_else(|| mapping.and_then(|mapping| mapping.public));
     if public == Some(true) {
         return Ok(());
     }
@@ -955,6 +955,20 @@ mod tests {
         Arc<aruna_operations::driver::DriverContext>,
         Actor,
     ) {
+        seeded_pid(true, true).await
+    }
+
+    /// An active PID whose intent froze `frozen` and whose document is `public` now.
+    async fn seeded_pid(
+        frozen: bool,
+        public: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ServerState>,
+        Ulid,
+        Arc<aruna_operations::driver::DriverContext>,
+        Actor,
+    ) {
         use crate::tests::routes::{
             seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state,
             test_storage, write_doc,
@@ -996,7 +1010,7 @@ mod tests {
             false,
             user_id,
             aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
-            true,
+            frozen,
             path.clone(),
             revision,
         );
@@ -1007,7 +1021,7 @@ mod tests {
             document_id,
             document_path: path.clone(),
             graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
-            public: true,
+            public,
             permission_path: MetadataRegistryRecord::permission_path_for(
                 &realm_id,
                 group_id,
@@ -1061,6 +1075,33 @@ mod tests {
         assert_eq!(profile.status(), StatusCode::NOT_FOUND);
         let response = w3id(&state, &alias, "application/ld+json").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Resolution follows the document's visibility now, not the one frozen at creation.
+    #[tokio::test]
+    async fn follows_live_visibility() {
+        for (frozen, public, expected) in [
+            (false, true, StatusCode::FOUND),
+            (true, false, StatusCode::NOT_FOUND),
+            (false, false, StatusCode::NOT_FOUND),
+        ] {
+            let (_dir, state, document_id, _, _) = seeded_pid(frozen, public).await;
+            let id = document_id.to_string();
+            let response = resolve_pid(State(state.clone()), Path(id.clone())).await;
+            assert_eq!(
+                response.status(),
+                expected,
+                "frozen {frozen}, public {public}"
+            );
+            let response = w3id(&state, &id, "application/ld+json").await;
+            assert_eq!(
+                response.status(),
+                expected,
+                "frozen {frozen}, public {public}"
+            );
+            let status = list_persistent_ids(State(state), Extension(None), Path(id)).await;
+            assert_eq!(status.is_ok(), public, "frozen {frozen}, public {public}");
+        }
     }
 
     async fn w3id(state: &Arc<ServerState>, rest: &str, accept: &str) -> Response {
