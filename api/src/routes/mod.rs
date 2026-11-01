@@ -292,6 +292,7 @@ pub(crate) mod tests {
         ("GET", "/data/provenance/crate"),
         ("GET", "/data/buckets/{bucket}/objects/part-of"),
         ("GET", "/data/buckets/{bucket}/sources"),
+        ("GET", "/data/buckets/{bucket}/runs"),
         ("GET", "/data/buckets/{bucket}/sources/health"),
         ("POST", "/data/buckets/{bucket}/sources/add"),
         ("POST", "/data/buckets/{bucket}/sources/remove"),

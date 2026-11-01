@@ -284,6 +284,70 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
 }
 
 /// Reads `version_id`, or the current version, of a local bucket's key, with its source root.
+/// Current files one runs lookup reads at most; a larger scope answers incomplete.
+pub const RUN_SCAN_LIMIT: usize = 5000;
+/// Runs one lookup names at most.
+pub const RUN_LIMIT: usize = 50;
+
+/// The runs whose results are current files of a bucket under a prefix, newest first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BucketRuns {
+    pub run_ids: Vec<Ulid>,
+    /// Every current file under the prefix was read and no run was left out.
+    pub complete: bool,
+}
+
+/// The runs that wrote the current files of `bucket` under `prefix`, from their origins.
+pub async fn bucket_runs(
+    context: &DriverContext,
+    bucket: &str,
+    prefix: &str,
+) -> Result<BucketRuns, OriginError> {
+    let storage =
+        |error: aruna_core::errors::ConversionError| OriginError::Storage(error.to_string());
+    let scope = BlobHeadKey::object_prefix(bucket, prefix).map_err(storage)?;
+    let (mut runs, mut after, mut scanned) = (std::collections::BTreeSet::new(), None, 0);
+    let complete = loop {
+        let page = RUN_SCAN_LIMIT.saturating_sub(scanned).min(500);
+        let iter = StorageEffect::Iter {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: Some(scope.clone().into()),
+            start: after.take().map(aruna_core::effects::IterStart::After),
+            limit: page,
+            txn_id: None,
+        };
+        let (heads, next) = match context.storage_handle.send_storage_effect(iter).await {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            other => return Err(OriginError::Storage(format!("{other:?}"))),
+        };
+        scanned += heads.len();
+        for (head, pointer) in heads {
+            let key = BlobHeadKey::from_bytes(&head).map_err(storage)?;
+            let pointer = CurrentVersionPointer::from_bytes(&pointer).map_err(storage)?;
+            let row = VersionKey::new(bucket, &key.key, pointer.version_id).to_bytes();
+            let Some(value) = read(context, BLOB_VERSIONS_KEYSPACE, row.map_err(storage)?).await?
+            else {
+                continue;
+            };
+            let version = BlobVersion::from_bytes(&value).map_err(storage)?;
+            if let Some(VersionOrigin::Job { run_id }) = version.origin {
+                runs.insert(run_id);
+            }
+        }
+        match next {
+            None => break true,
+            Some(_) if scanned >= RUN_SCAN_LIMIT => break false,
+            next => after = next,
+        }
+    };
+    let complete = complete && runs.len() <= RUN_LIMIT;
+    let run_ids = runs.into_iter().rev().take(RUN_LIMIT).collect();
+    Ok(BucketRuns { run_ids, complete })
+}
+
 async fn read_version(
     context: &DriverContext,
     bucket: &str,
