@@ -18,6 +18,7 @@ use aruna_core::structs::execution::table::{
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::RoutingError;
 use bytes::Bytes;
 use byteview::ByteView;
@@ -770,7 +771,8 @@ async fn put_folder(
     .await
 }
 
-/// Writes `body` at `key` through the ordinary put, as the submitter, and queues its replication.
+/// Writes `body` at `key` through the ordinary put, as the submitter, and queues its replication;
+/// the version's origin is the job's import, like the references of its other rows.
 async fn write_object(
     ctx: &JobContext,
     spec: &StagingJobSpec,
@@ -813,6 +815,9 @@ async fn write_object(
         routing,
     })
     .with_bucket_guard(bucket.clone())
+    .with_version_origin(Some(VersionOrigin::Source {
+        job_id: Some(ctx.job_id.as_ulid()),
+    }))
     .with_restrictions(auth.path_restrictions.clone())
     .with_metadata(metadata.clone().into_iter().collect::<HashMap<_, _>>());
     if let Some(gate) = gate {

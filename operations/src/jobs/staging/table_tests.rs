@@ -10,6 +10,7 @@ use aruna_core::structs::execution::job::{
     JobClaim, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, StagingJobPrefix,
 };
 use aruna_core::structs::execution::table::{SEARCH_EXACT_KEY, TableImport};
+use aruna_core::structs::storage::origin::VersionOrigin;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
@@ -309,8 +310,19 @@ impl Fixture {
         &self,
         key: &str,
     ) -> aruna_core::structs::execution::source_access::SourceMetadata {
+        use aruna_core::structs::storage::blob::BlobVersionState;
+        match self.version(key).await.state {
+            BlobVersionState::Reference {
+                cached_metadata, ..
+            } => cached_metadata,
+            _ => panic!("the version must be a reference"),
+        }
+    }
+
+    /// The current version of `key` in the job's bucket.
+    async fn version(&self, key: &str) -> aruna_core::structs::storage::blob::BlobVersion {
         use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
-        use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
+        use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
         let bucket = self.spec.bucket.clone();
         let (version_id, _) = self.head(&bucket, key).await.unwrap();
         let read = aruna_core::effects::StorageEffect::Read {
@@ -329,12 +341,15 @@ impl Fixture {
         else {
             panic!("the version must exist");
         };
-        match BlobVersion::from_bytes(&value).unwrap().state {
-            BlobVersionState::Reference {
-                cached_metadata, ..
-            } => cached_metadata,
-            _ => panic!("the version must be a reference"),
-        }
+        BlobVersion::from_bytes(&value).unwrap()
+    }
+
+    /// The origin of the current version of `key`.
+    async fn origin(
+        &self,
+        key: &str,
+    ) -> Option<aruna_core::structs::storage::origin::VersionOrigin> {
+        self.version(key).await.origin
     }
 
     /// The whole object read through the ordinary read, or why it was refused.
@@ -394,6 +409,9 @@ async fn summary_imports_folders() {
     let folder = "GCF_000005845.2_ASM584v2/";
     let (folder_version, metadata) = fixture.head(&bucket, folder).await.unwrap();
     assert_eq!(metadata["taxid"], "511145");
+    let job_id = Some(JobId::from_bytes([7; 16]).as_ulid());
+    let origin = fixture.origin(folder).await;
+    assert_eq!(origin, Some(VersionOrigin::Source { job_id }));
     assert_eq!(
         metadata["organism_name"],
         "Escherichia coli str. K-12 substr. MG1655"
@@ -746,6 +764,12 @@ async fn record_rows_trusted() {
     let bucket = fixture.spec.bucket.clone();
     let (_, folder) = fixture.head(&bucket, "coli/").await.unwrap();
     assert_eq!(folder["note"], "coli sums");
+    // The empty object is the import's like the reference, not an upload.
+    let job_id = Some(JobId::from_bytes([41; 16]).as_ulid());
+    for key in ["coli/sums.txt", "coli/"] {
+        let origin = fixture.origin(key).await;
+        assert_eq!(origin, Some(VersionOrigin::Source { job_id }));
+    }
     let mut found = fixture.search("sums").await;
     found.sort();
     assert_eq!(found, ["coli/", "coli/sums.txt"]);
