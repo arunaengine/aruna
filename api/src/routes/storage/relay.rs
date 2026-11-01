@@ -393,8 +393,8 @@ async fn send_get(
     get_node(state, forward.node_id, path, bearer, sent).await
 }
 
-/// Sends a GET of `path` with the caller's token and `sent` headers to `node_id`; `None` when
-/// it did not answer.
+/// Sends a GET of `path` with the caller's token, if any, and `sent` headers to `node_id`;
+/// `None` when it did not answer.
 pub(crate) async fn get_node(
     state: &ServerState,
     node_id: NodeId,
@@ -402,16 +402,16 @@ pub(crate) async fn get_node(
     bearer: Option<&ValidatedBearer>,
     sent: HeaderMap,
 ) -> ServerResult<Option<reqwest::Response>> {
-    let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let urls = node_urls(state.get_ctx().as_ref(), node_id).await;
     let Some(base) = urls.and_then(|urls| urls.api) else {
         return Ok(None);
     };
-    let response = CLIENT
-        .get(relay_url(&base, path))
-        .headers(sent)
-        .header(header::AUTHORIZATION, format!("Bearer {}", bearer.as_str()))
-        .send();
+    let mut request = CLIENT.get(relay_url(&base, path)).headers(sent);
+    // Without a token the target answers as for any signed-out caller.
+    if let Some(bearer) = bearer {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {}", bearer.as_str()));
+    }
+    let response = request.send();
     match tokio::time::timeout(ANSWER_TIMEOUT, response).await {
         Ok(Ok(response)) => Ok(Some(response)),
         Err(_) => {

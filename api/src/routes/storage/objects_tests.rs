@@ -537,3 +537,107 @@ async fn resumed_copy_stale() {
     assert_eq!(keys(&page), vec!["z.md"]);
     assert_eq!(page.stale_ranges, [range_id]);
 }
+
+/// Grants READ on `pattern` below the test bucket to everyone, signed out included.
+async fn open_prefix(node: &Node, pattern: &str) {
+    use crate::tests::distributed::LOCAL;
+    use crate::tests::routes::write_doc;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::structs::identity::auth::{Actor, Role};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    let (realm_id, owner) = (node.owner.realm_id, node.owner.user_id);
+    let actor = Actor {
+        node_id: node_id(LOCAL),
+        user_id: owner,
+        realm_id,
+    };
+    let mut document =
+        GroupAuthorizationDocument::default_group_doc(owner, realm_id, node.group_id);
+    let role_id = ulid::Ulid::from_parts(6, 6);
+    let path = object_permission_path(
+        realm_id,
+        node.group_id,
+        node.state.get_node_id(),
+        BUCKET,
+        pattern,
+    );
+    let role = Role {
+        role_id,
+        name: "public".to_string(),
+        permissions: std::collections::HashMap::from([(path, Permission::READ)]),
+        assigned_users: std::collections::HashSet::from([aruna_core::UserId::nil(realm_id)]),
+    };
+    document.roles.insert(role_id, role);
+    let group = Group {
+        display_name: "routed".to_string(),
+        group_id: node.group_id,
+        realm_id,
+        roles: document.roles.keys().copied().collect(),
+        owner,
+    };
+    let key = node.group_id.to_bytes().to_vec();
+    let context = node.state.get_ctx();
+    let rows = [
+        (AUTH_KEYSPACE, document.to_bytes(&actor).unwrap()),
+        (GROUP_KEYSPACE, group.to_bytes(&actor).unwrap()),
+    ];
+    for (space, value) in rows {
+        write_doc(&context, space, key.clone().into(), value.into()).await;
+    }
+}
+
+async fn signed_out(
+    node: &Node,
+    bucket: &str,
+    query: ObjectListQuery,
+) -> ServerResult<ObjectListResponse> {
+    let listed = list_objects(
+        State(node.state.clone()),
+        Extension(None),
+        Extension(None),
+        HeaderMap::new(),
+        Path(bucket.to_string()),
+        Query(query),
+    )
+    .await?;
+    Ok(listed.0)
+}
+
+#[tokio::test]
+async fn signed_out_public() {
+    // Signed out, a listing shows only what a public role grants, and a refusal answers 401
+    // alike for a private and an absent bucket.
+    let node = node_state().await;
+    store(&node, &["a.md", "open/b.md", "open/c.md"]).await;
+    let open = || query(Some("open/"), None, 10);
+    let closed = signed_out(&node, BUCKET, open()).await;
+    assert!(matches!(closed, Err(ServerError::Unauthorized)));
+
+    open_prefix(&node, "open/**").await;
+    let page = signed_out(&node, BUCKET, open()).await.unwrap();
+    assert_eq!(keys(&page), vec!["open/b.md", "open/c.md"]);
+    let root = signed_out(&node, BUCKET, query(None, None, 10)).await;
+    assert!(matches!(root, Err(ServerError::Unauthorized)));
+    let absent = signed_out(&node, "absent", open()).await;
+    assert!(matches!(absent, Err(ServerError::Unauthorized)));
+}
+
+#[tokio::test]
+async fn signed_out_peer() {
+    // A peer's range is asked without a token, so the peer answers as for a signed-out caller.
+    let node = node_state().await;
+    distribute(&node.state, node.group_id, BUCKET).await;
+    open_prefix(&node, "public/**").await;
+    let answer = r#"{"bucket":"routed","objects":[{"key":"public/x.md","size":1,"etag":null,
+        "version_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+        "prefixes":[],"next_cursor":null}"#;
+    let peer = mock_peer(StatusCode::OK, answer).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+
+    let page = signed_out(&node, BUCKET, query(Some("public/"), None, 10))
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["public/x.md"]);
+    assert_eq!(peer.paths.lock().unwrap().len(), 1);
+}
