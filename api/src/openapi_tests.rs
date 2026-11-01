@@ -44,6 +44,7 @@ const OPTIONAL_AUTH: &[(&str, &str)] = &[
     ("/metadata/search", "get"),
     ("/pid/lookup", "get"),
     ("/system/info", "get"),
+    ("/system/jobs", "get"),
     ("/system/realm", "get"),
     ("/ga4gh/drs/v1/objects", "post"),
     ("/ga4gh/drs/v1/objects/{object_id}", "get"),

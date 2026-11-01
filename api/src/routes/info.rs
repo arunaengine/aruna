@@ -1614,13 +1614,13 @@ async fn require_realm_admin(
 /// How much of `/info` a caller may see. Foreign-realm tokens are treated like
 /// anonymous callers: `/info` answers every caller, it just answers with less.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InfoAccess {
+pub(crate) enum InfoAccess {
     Public,
     Realm,
     Admin,
 }
 
-async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAccess {
+pub(crate) async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAccess {
     let Some(auth) = auth else {
         return InfoAccess::Public;
     };

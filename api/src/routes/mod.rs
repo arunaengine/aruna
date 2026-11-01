@@ -35,6 +35,7 @@ pub mod portal;
 pub mod promotion;
 pub mod repository;
 pub mod rocrate_import;
+pub mod running_jobs;
 pub mod search;
 pub mod shares;
 pub mod staging;
@@ -55,6 +56,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(audit::router())
         .merge(assistant::router())
         .merge(info::router())
+        .merge(running_jobs::router())
         .merge(federation::router())
         .merge(federation::export::router())
         .merge(federation::import::router())
@@ -406,6 +408,7 @@ pub(crate) mod tests {
         ("GET", "/access/groups/{id}/deletion-blockers"),
         ("PATCH", "/access/groups/{id}"),
         ("GET", "/system/info"),
+        ("GET", "/system/jobs"),
         ("GET", "/system/realm"),
         ("GET", "/system/realm/descriptor"),
         ("GET", "/system/realm/federation"),

@@ -688,7 +688,7 @@ pub struct JobListResponse {
     pub next_cursor: Option<String>,
 }
 
-fn rfc3339(ms: u64) -> String {
+pub(crate) fn rfc3339(ms: u64) -> String {
     chrono::DateTime::from_timestamp_millis(ms as i64)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default()
