@@ -1425,3 +1425,72 @@ async fn root_takes_kept_claim() {
     let claims = apply_with_claims(users, BTreeSet::from([b]), c, op).await;
     assert_eq!(claims, BTreeSet::from([c]));
 }
+
+#[test]
+fn merge_handoff_needs_coordinator() {
+    // Only the pinned coordinator names the next one, unless none is pinned or it left management.
+    let realm_id = RealmId::from_bytes([68; 32]);
+    let user = UserId::local(Ulid::from_parts(1_700, 1), realm_id);
+    let (old, new) = (
+        test_actor(20, user, realm_id),
+        test_actor(21, user, realm_id),
+    );
+    let config = |old_kind: Option<RealmNodeKind>| {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(new.node_id, RealmNodeKind::Management);
+        if let Some(kind) = old_kind {
+            config.ensure_node(old.node_id, kind);
+        }
+        config
+    };
+    let pinned = |node_id| {
+        let mut state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        state
+            .apply_operation(
+                &old,
+                AdminDocumentOperation::MergeCoordinatorSet { node_id },
+            )
+            .expect("pin applies");
+        state
+    };
+    let handoff = |origin: &Actor| {
+        test_admin_event(
+            Ulid::from_parts(1_701, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            origin,
+            1,
+            AdminDocumentOperation::MergeCoordinatorSet {
+                node_id: new.node_id,
+            },
+        )
+    };
+    let judge = |config: RealmConfigDocument, state: Option<AdminDocumentState>, origin: &Actor| {
+        validate_config_authority(Some(&config), &handoff(origin), state.as_ref())
+            .expect("validation runs")
+    };
+    let management = Some(RealmNodeKind::Management);
+    assert!(matches!(
+        judge(config(management.clone()), Some(pinned(old.node_id)), &old),
+        AdminEventValidation::Accepted
+    ));
+    assert!(matches!(
+        judge(config(management.clone()), Some(pinned(old.node_id)), &new),
+        AdminEventValidation::Rejected(_)
+    ));
+    assert!(matches!(
+        judge(config(management), None, &new),
+        AdminEventValidation::Accepted
+    ));
+    assert!(matches!(
+        judge(
+            config(Some(RealmNodeKind::Server)),
+            Some(pinned(old.node_id)),
+            &new
+        ),
+        AdminEventValidation::Accepted
+    ));
+    assert!(matches!(
+        judge(config(None), Some(pinned(old.node_id)), &new),
+        AdminEventValidation::Deferred { .. }
+    ));
+}

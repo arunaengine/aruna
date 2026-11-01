@@ -301,6 +301,18 @@ impl AdminDocumentState {
             .and_then(|value| serde_json::from_str(value).ok())
     }
 
+    /// The node the events agree runs account merges; a conflict or no event names none.
+    pub fn materialized_merge_coordinator(&self) -> Option<NodeId> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+
+        self.user_subject_ids
+            .get(CONFIG_MERGE_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| value.parse().ok())
+    }
+
     /// The realm portal feature defaults the events agree on, if any.
     pub fn materialized_realm_portal(&self) -> Option<BTreeMap<String, bool>> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
