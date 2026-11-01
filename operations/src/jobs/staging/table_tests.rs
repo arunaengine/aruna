@@ -523,7 +523,7 @@ async fn rewritten_gzip_reopens() {
     let mut kept = None;
     let mut offset = 0;
     let failure = loop {
-        match gzip_chunk(&mut kept, (None, None, offset), open).await {
+        match gzip_chunk(&mut kept, (None, None, offset), TABLE_CHUNK, open).await {
             Ok((bytes, _, _)) => offset += bytes.len() as u64,
             Err(failure) => break failure,
         }
@@ -534,7 +534,7 @@ async fn rewritten_gzip_reopens() {
 
     // A freshly opened stream that is no valid gzip stays a lasting failure.
     let broken = || async { Ok((pieces(vec![0xFF; 1024]), None)) };
-    let failure = gzip_chunk(&mut None, (None, None, 0), broken).await;
+    let failure = gzip_chunk(&mut None, (None, None, 0), TABLE_CHUNK, broken).await;
     assert!(matches!(failure, Err(ChunkFailure::Lasting(_))));
 }
 

@@ -47,12 +47,23 @@ use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
+use crate::staging::page::rows::MAX_PAGE_ENTRIES;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 
 /// Directories the queue holds before the table is read further.
 pub(super) const QUEUE_PAUSE: u64 = 1024;
 /// Rows one step maps, so one page and its HEADs stay bounded.
 const STEP_ROWS: usize = 1000;
+/// Table bytes one step of record rows reads; they need no HEAD, so their pages are larger.
+const RECORD_WINDOW: usize = 4 << 20;
+
+/// The rows one step maps and the table bytes it reads for them.
+fn step_size(import: &TableImport) -> (usize, usize) {
+    match import.rows.kind {
+        RowKind::Record => (MAX_PAGE_ENTRIES, RECORD_WINDOW),
+        RowKind::File | RowKind::Folder => (STEP_ROWS, TABLE_CHUNK),
+    }
+}
 
 /// Whether the job reads its table next: the table is open, no directory is being listed
 /// and the queue has room.
@@ -158,9 +169,10 @@ pub(super) async fn read_table_chunk(
     let (mut rows, mut used) =
         parse_rows(&import.format, width, &chunk.bytes, chunk.complete).map_err(permanent)?;
     let mut complete = chunk.complete;
-    if rows.len() > STEP_ROWS {
-        used = rows[STEP_ROWS - 1].1;
-        rows.truncate(STEP_ROWS);
+    let (step_rows, _) = step_size(import);
+    if rows.len() > step_rows {
+        used = rows[step_rows - 1].1;
+        rows.truncate(step_rows);
         complete = false;
     }
     let mut entries = Vec::new();
@@ -289,7 +301,7 @@ async fn connector_chunk(
                 let stream = open_source(ctx, spec, path, observation, None).await?;
                 Ok((stream, None))
             };
-            let (bytes, complete, _) = gzip_chunk(kept, at, open).await?;
+            let (bytes, complete, _) = gzip_chunk(kept, at, step_size(import).1, open).await?;
             read.gzip = Some(true);
             return Ok(Chunk {
                 bytes,
@@ -297,7 +309,7 @@ async fn connector_chunk(
                 read,
             });
         }
-        let end = (read.offset + TABLE_CHUNK as u64).min(length);
+        let end = (read.offset + step_size(import).1 as u64).min(length);
         if read.offset >= end {
             return Ok(Chunk {
                 bytes: Vec::new(),
@@ -405,7 +417,7 @@ async fn object_chunk(
                 Ok((found.blob, found.resolved_version_id.or(found.version_id)))
             };
             let at = (version_id, None, read.offset);
-            let (bytes, complete, opened) = gzip_chunk(kept, at, open).await?;
+            let (bytes, complete, opened) = gzip_chunk(kept, at, step_size(import).1, open).await?;
             read.version_id = read.version_id.or(opened);
             read.gzip = Some(true);
             return Ok(Chunk {
@@ -417,7 +429,7 @@ async fn object_chunk(
         let start = read.offset;
         let range = Some(ObjectRangeRequest::StartEnd {
             start,
-            end: start + TABLE_CHUNK as u64 - 1,
+            end: start + step_size(import).1 as u64 - 1,
         });
         let input = input(read.version_id, range);
         let result = match get_object_routed(&ctx.driver, input, restrictions()).await {
@@ -472,12 +484,14 @@ async fn collect(
     Ok(bytes)
 }
 
-/// The decompressed chunk at `at`, a version, an observation and an offset, decoded on from the
-/// stream an earlier step of this run left open there; a new stream from `open` decodes from the
-/// start and skips to the offset once. Returns the version the stream opened, if it opened one.
+/// The decompressed chunk of at most `window` bytes at `at`, a version, an observation and an
+/// offset, decoded on from the stream an earlier step of this run left open there; a new stream
+/// from `open` decodes from the start and skips to the offset once. Returns the version the
+/// stream opened, if it opened one.
 async fn gzip_chunk<F, Opening>(
     kept: &mut Option<GzipStream>,
     (version_id, observation, offset): (Option<ulid::Ulid>, Option<SourceMetadata>, u64),
+    window: usize,
     mut open: F,
 ) -> Result<(Vec<u8>, bool, Option<ulid::Ulid>), ChunkFailure>
 where
@@ -499,7 +513,7 @@ where
                     version_id: version_id.or(version),
                     observation: observation.clone(),
                     stream,
-                    cursor: GzipCursor::new(offset, TABLE_CHUNK),
+                    cursor: GzipCursor::new(offset, window),
                 }
             }
         };
