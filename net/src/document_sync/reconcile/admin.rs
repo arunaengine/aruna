@@ -326,10 +326,19 @@ pub(in crate::document_sync) async fn user_batch(
         if user.subject_ids.contains(subject_id) {
             claims.insert(user_id);
         } else {
-            claims.remove(&user_id);
             // A merged account hands the subject to its primary, so the subject never lacks an
-            // owner while the primary's own addition is still on its way.
-            claims.extend(user.merged_into());
+            // owner while the primary's own addition is still on its way. Until the primary
+            // lists the account, its claim stays.
+            match verified_primary(storage, txn_id, &user).await? {
+                Some(primary) => {
+                    claims.remove(&user_id);
+                    claims.insert(primary);
+                }
+                None if user.merged_into().is_some() => {}
+                None => {
+                    claims.remove(&user_id);
+                }
+            }
         }
 
         if let Some(canonical_user_id) = claims.first().copied() {
@@ -1252,6 +1261,36 @@ pub(in crate::document_sync) fn materialize_realm_role(
         },
     );
     overlay_realm_role(auth_doc, reducer_state, role.role_id);
+}
+
+/// The primary `user` was merged into, once that primary exists in the same realm and lists
+/// `user` among its merged accounts; `None` while that is not shown.
+async fn verified_primary(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    user: &User,
+) -> Result<Option<UserId>> {
+    let Some(primary_id) = user.merged_into() else {
+        return Ok(None);
+    };
+    if primary_id.realm_id != user.user_id.realm_id {
+        return Ok(None);
+    }
+    let primary = transaction_read(
+        storage,
+        aruna_core::keyspaces::USER_KEYSPACE.to_string(),
+        primary_id.to_bytes().into(),
+        Some(txn_id),
+    )
+    .await?
+    .map(|bytes| User::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    Ok(primary
+        .filter(|primary| {
+            primary.user_id == primary_id && primary.merged_user_ids().contains(&user.user_id)
+        })
+        .map(|_| primary_id))
 }
 
 pub(in crate::document_sync) fn materialize_user_operation(

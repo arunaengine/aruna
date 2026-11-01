@@ -1148,13 +1148,16 @@ async fn merge_grant_needs_role() {
     }
 }
 
-#[tokio::test]
-async fn merged_removal_hands_subject() {
-    // The merged account's removal arrives before the primary's addition: the primary owns it.
+/// Seeds `merged` holding one subject and pointing at `primary`, with `primary` stored as given;
+/// then removes the subject and returns the account the index names.
+async fn hand_over_subject(
+    primary_lists: bool,
+    primary_realm: RealmId,
+) -> (UserId, UserId, Option<UserId>) {
     let (_dir, storage) = test_storage();
     let realm_id = RealmId::from_bytes([63; 32]);
     let merged = UserId::local(Ulid::from_parts(1_650, 1), realm_id);
-    let primary = UserId::local(Ulid::from_parts(1_651, 1), realm_id);
+    let primary = UserId::local(Ulid::from_parts(1_651, 1), primary_realm);
     let actor = Actor {
         node_id: node(9),
         user_id: merged,
@@ -1171,6 +1174,23 @@ async fn merged_removal_hands_subject() {
         )]
         .into(),
     };
+    let mut primary_record = User {
+        user_id: primary,
+        name: "Alice".to_string(),
+        subject_ids: Vec::new(),
+        alias_user_ids: Default::default(),
+        attributes: Default::default(),
+    };
+    if primary_lists {
+        primary_record.attributes.insert(
+            format!(
+                "{}{}",
+                aruna_core::user::validation::MERGED_PREFIX,
+                merged.user_ulid
+            ),
+            merged.to_string(),
+        );
+    }
     batch_write_to(
         &storage,
         vec![
@@ -1180,6 +1200,14 @@ async fn merged_removal_hands_subject() {
                 record.to_bytes(&actor).expect("user serializes").into(),
             ),
             (
+                USER_KEYSPACE.to_string(),
+                primary.to_bytes().into(),
+                primary_record
+                    .to_bytes(&actor)
+                    .expect("user serializes")
+                    .into(),
+            ),
+            (
                 SUBJECT_INDEX_KEYSPACE.to_string(),
                 subject_index_key("subject-moved"),
                 subject_index_value(merged),
@@ -1187,7 +1215,7 @@ async fn merged_removal_hands_subject() {
         ],
     )
     .await
-    .expect("merged user and index write");
+    .expect("users and index write");
 
     let event = AdminDocumentEvent {
         event_id: Ulid::from_parts(1_652, 1),
@@ -1203,16 +1231,30 @@ async fn merged_removal_hands_subject() {
     apply_user_operation(&storage, DocumentTarget::User { user_id: merged }, event)
         .await
         .expect("subject remove applies");
+    let owner = read_storage_value(
+        &storage,
+        SUBJECT_INDEX_KEYSPACE,
+        subject_index_key("subject-moved"),
+    )
+    .await
+    .map(|bytes| UserId::from_storage_key(&bytes).expect("index decodes"));
+    (merged, primary, owner)
+}
 
-    assert_eq!(
-        read_storage_value(
-            &storage,
-            SUBJECT_INDEX_KEYSPACE,
-            subject_index_key("subject-moved")
-        )
-        .await,
-        Some(subject_index_value(primary))
-    );
+#[tokio::test]
+async fn merged_removal_hands_subject() {
+    // The merged account's removal arrives before the primary's addition: the primary owns it.
+    let (_, primary, owner) = hand_over_subject(true, RealmId::from_bytes([63; 32])).await;
+    assert_eq!(owner, Some(primary));
+}
+
+#[tokio::test]
+async fn unverified_pointer_keeps_subject() {
+    // A pointer the primary does not confirm, or one into another realm, moves nothing.
+    for (lists, realm) in [(false, [63; 32]), (true, [65; 32])] {
+        let (merged, _, owner) = hand_over_subject(lists, RealmId::from_bytes(realm)).await;
+        assert_eq!(owner, Some(merged));
+    }
 }
 
 #[tokio::test]
