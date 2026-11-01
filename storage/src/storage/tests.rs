@@ -2364,21 +2364,22 @@ fn deletes_cross_threshold() {
     );
 }
 
-// A keyspace crossing the threshold again soon after its compaction waits for the interval.
+// A keyspace crossing the threshold again soon after its compaction hands that work on too;
+// the compactor holds it until the interval passed instead of the worker dropping it.
 #[test]
-fn compactions_spaced_apart() {
+fn compactions_handed_on() {
     let dir = tempdir().unwrap();
     let (handle, _receivers) = StorageHandle::new();
     let mut storage = worker(&dir, &handle);
     let jobs = stub_compactor(&mut storage);
-    storage.compactor.interval = std::time::Duration::from_secs(3600);
 
     storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
     let job = jobs.try_recv().expect("compaction is queued");
     crate::compaction::run_job(job, &storage.compactor.active.clone());
     storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
 
-    assert!(jobs.try_recv().is_err(), "the next compaction waits");
+    let next = jobs.try_recv().expect("the next compaction is handed on");
+    assert_eq!(next.deletes, crate::compaction::DELETE_THRESHOLD);
 }
 
 #[test]
