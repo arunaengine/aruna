@@ -17,6 +17,7 @@ use crate::structs::identity::realm::RealmId;
 pub const DESCRIPTOR_DOMAIN: &str = "aruna-realm-descriptor-v1";
 pub const REGISTRATION_DOMAIN: &str = "aruna-registry-registration-v1";
 pub const WITHDRAWAL_DOMAIN: &str = "aruna-registry-withdrawal-v1";
+pub const TOTALS_DOMAIN: &str = "aruna-registry-totals-v1";
 
 /// Longest realm name a descriptor carries.
 pub const MAX_NAME_LEN: usize = 128;
@@ -26,6 +27,8 @@ pub const MAX_DESCRIPTION_LEN: usize = 4096;
 pub const MAX_CONTACT_LEN: usize = 254;
 /// Most realms an `Only` admission list may name.
 pub const MAX_ACCEPTED_REALMS: usize = 1024;
+/// Largest realm total, so JSON readers in browsers keep it exact (2^53 - 1).
+pub const MAX_TOTAL: u64 = (1 << 53) - 1;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FederationError {
@@ -225,6 +228,39 @@ pub struct Withdrawal {
 
 impl Signable for Withdrawal {
     const DOMAIN: &'static str = WITHDRAWAL_DOMAIN;
+    fn realm_id(&self) -> RealmId {
+        self.realm_id
+    }
+}
+
+/// Self-reported realm-wide totals, signed apart from the registration, so they never touch
+/// the descriptor and with it the realm's identity or approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealmTotals {
+    pub realm_id: RealmId,
+    /// Stored and referenced bytes together, each object counted once.
+    pub data_bytes: u64,
+    pub objects: u64,
+    /// Live metadata documents, counted like `RealmKpis::live_datasets`.
+    pub datasets: u64,
+    pub observed_at: u64,
+}
+
+impl RealmTotals {
+    /// Refuses a total above `MAX_TOTAL`.
+    pub fn check(&self) -> Result<(), FederationError> {
+        if [self.data_bytes, self.objects, self.datasets]
+            .iter()
+            .any(|total| *total > MAX_TOTAL)
+        {
+            return Err(FederationError::InvalidSettings("total too large"));
+        }
+        Ok(())
+    }
+}
+
+impl Signable for RealmTotals {
+    const DOMAIN: &'static str = TOTALS_DOMAIN;
     fn realm_id(&self) -> RealmId {
         self.realm_id
     }
