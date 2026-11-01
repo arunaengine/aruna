@@ -34,6 +34,9 @@ const LOCAL_LEASE_LIMIT: usize = 2;
 /// Share link opens per address and per link: each may test a password.
 const SHARE_OPENS_MINUTE: u32 = 30;
 const SHARE_OPENS_BURST: u32 = 10;
+/// Account merges and sign-in attaches per account: each checks a token of another account.
+const ACCOUNT_LINKS_MINUTE: u32 = 6;
+const ACCOUNT_LINKS_BURST: u32 = 3;
 
 type Keyed<K> = RateLimiter<K, DefaultKeyedStateStore<K>, DefaultClock>;
 
@@ -157,6 +160,7 @@ pub struct ApiRateLimits {
     per_ip: Keyed<IpAddr>,
     per_principal: Keyed<String>,
     share_opens: Keyed<String>,
+    account_links: Keyed<String>,
     clock: DefaultClock,
     checks: AtomicU64,
     local: Arc<Mutex<LocalTable>>,
@@ -186,6 +190,7 @@ impl ApiRateLimits {
             per_ip: RateLimiter::keyed(quota(ip_per_minute, ip_burst)),
             per_principal: RateLimiter::keyed(quota(principal_per_minute, burst)),
             share_opens: RateLimiter::keyed(quota(SHARE_OPENS_MINUTE, SHARE_OPENS_BURST)),
+            account_links: RateLimiter::keyed(quota(ACCOUNT_LINKS_MINUTE, ACCOUNT_LINKS_BURST)),
             clock: DefaultClock::default(),
             checks: AtomicU64::new(0),
             local: Arc::new(Mutex::new(LocalTable::default())),
@@ -215,6 +220,7 @@ impl ApiRateLimits {
             self.per_ip.retain_recent();
             self.per_principal.retain_recent();
             self.share_opens.retain_recent();
+            self.account_links.retain_recent();
         }
     }
 
@@ -252,6 +258,17 @@ impl ApiRateLimits {
                 .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))?;
         }
         Ok(())
+    }
+}
+
+impl ApiRateLimits {
+    /// Charges one account merge or sign-in attach to the calling account.
+    pub fn check_account_link(&self, user_id: UserId) -> Result<(), u64> {
+        self.maybe_maintain();
+        let now = self.clock.now();
+        self.account_links
+            .check_key(&user_id.to_string())
+            .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))
     }
 }
 

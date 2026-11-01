@@ -85,7 +85,7 @@ fn link_refused(error: LinkLoginError) -> ServerError {
 }
 
 /// The primary login time in the verified claims of the caller's own bearer token.
-async fn bearer_auth_time(
+pub(crate) async fn bearer_auth_time(
     state: &ServerState,
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Option<u64>> {
