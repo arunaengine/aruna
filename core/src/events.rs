@@ -109,9 +109,9 @@ pub enum SubOperationEvent {
     UserUpdated {
         result: Result<(), String>,
     },
-    /// Whether a user's vault holds a saved payload.
+    /// BLAKE3 digests of the saved payloads of a user's vault heads; empty without a vault.
     VaultHeld {
-        result: Result<bool, String>,
+        result: Result<Vec<[u8; 32]>, String>,
     },
     KeyRequestsOpened {
         request_ids: Vec<Ulid>,

@@ -77,6 +77,7 @@ fn config(survivor: UserId, merged: UserId) -> MergeUsersConfig {
         actor: actor(survivor),
         survivor: portal(survivor),
         survivor_login: Some(NOW - 10),
+        survivor_token: None,
         merged: portal(merged),
         merged_login: Some(NOW - 10),
         merged_live: true,
@@ -370,16 +371,37 @@ fn cut_token_refused() {
     assert_eq!(operation.finalize(), Err(MergeError::TokenInvalid));
 }
 
-#[test]
-fn held_vault_refused() {
+/// A merge whose accounts hold vaults with the given payload digests, after both vault reads.
+fn vaults(merged: [u8; 32], survivor: [u8; 32]) -> (MergeUsersOperation, Effects) {
     let mut operation = MergeUsersOperation::new(config(id(1), id(2)));
     operation.start();
     let effects = operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
     assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
-    operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
-        result: Ok(true),
+    let effects = operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
+        result: Ok(vec![merged]),
     }));
+    assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
+    let effects = operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
+        result: Ok(vec![[9u8; 32], survivor]),
+    }));
+    (operation, effects)
+}
+
+#[test]
+fn held_vault_refused() {
+    let (operation, _) = vaults([1u8; 32], [2u8; 32]);
     assert_eq!(operation.finalize(), Err(MergeError::VaultPresent));
+}
+
+#[test]
+fn copied_vault_accepted() {
+    // The portal copied the sealed vault unchanged to the survivor, so the merge goes on.
+    let (operation, effects) = vaults([1u8; 32], [1u8; 32]);
+    assert!(matches!(
+        effects.first(),
+        Some(Effect::Storage(StorageEffect::StartTransaction { .. }))
+    ));
+    assert!(!operation.is_complete());
 }
 
 #[test]
@@ -388,7 +410,7 @@ fn failed_cutoff_aborts_merge() {
     operation.start();
     operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
     operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
-        result: Ok(false),
+        result: Ok(Vec::new()),
     }));
     let txn_id = TxnId::generate();
     operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
@@ -428,7 +450,7 @@ fn only_coordinator_merges() {
         operation.start();
         operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
         operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
-            result: Ok(false),
+            result: Ok(Vec::new()),
         }));
         let txn_id = TxnId::generate();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
@@ -530,7 +552,7 @@ fn merge_moves_everything() {
     operation.start();
     operation.step(read(vec![bytes(&survivor), bytes(&merged)]));
     operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
-        result: Ok(false),
+        result: Ok(Vec::new()),
     }));
     // The cutoff is written first, inside the merge transaction.
     let cutoff = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));

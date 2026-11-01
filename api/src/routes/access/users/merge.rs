@@ -159,8 +159,11 @@ that account. Both prove control; a matching email or name is never enough.
   finished merge answers again with `repeated: true`, also with the then cut-off token.
 
 **Limits**
-- The other account must not hold a vault: nodes never open vault payloads, so the portal moves
-  its entries first and deletes it (409, code `vault_present`).
+- Nodes never open vault payloads, so the portal first copies the other account's sealed vault
+  unchanged to the caller's (`PUT /access/users/me/vault`) and its published key with
+  `POST /access/users/me/keys`. The merge then accepts the other account's vault when every saved
+  payload of it is also a current payload of the caller's vault; otherwise it answers 409, code
+  `vault_present`. The copy left on the other account stays sealed and unreachable.
 - Service accounts and deactivated accounts are never merged. At most 6 attempts per minute."#,
     request_body(
         content = MergeAccountRequest,
@@ -175,7 +178,7 @@ that account. Both prove control; a matching email or name is never enough.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A login is too old, the other token is invalid or of another realm, both name the same account, or an account is deactivated or a service account (code `merge_refused`)", body = ErrorResponse),
         (status = 404, description = "This node holds no record of one of the accounts", body = ErrorResponse),
-        (status = 409, description = "The other account still holds a vault (code `vault_present`), or a role of it denies part of what it hands over and part of the caller's own access (code `role_conflict`, naming the role)", body = ErrorResponse),
+        (status = 409, description = "The other account holds a vault the caller's vault does not hold unchanged (code `vault_present`), or a role of it denies part of what it hands over and part of the caller's own access (code `role_conflict`, naming the role)", body = ErrorResponse),
         (status = 502, description = "The call was passed on but its answer was lost, so it may have been applied (code `relay_failed`)", body = ErrorResponse),
         (status = 503, description = "Storage or the vault holders were unavailable, or a document moved during the merge; retry. Code `not_coordinator` when the call reached a node that does not run merges, `no_management_node` when it could not be passed on", body = ErrorResponse)
     ),
@@ -192,6 +195,7 @@ async fn merge_account(
     if !state.is_management_node() {
         return Err(not_coordinator(MergeError::NotCoordinator.to_string()));
     }
+    let survivor_token = bearer.as_ref().map(|bearer| bearer.as_str().to_string());
     let survivor_login = bearer_auth_time(&state, bearer).await?;
     // A cut-off token still names its account, so a repeat of a finished merge is recognized.
     let (claims, live) = match decode_bearer_token(state.as_ref(), &request.token).await {
@@ -213,6 +217,7 @@ async fn merge_account(
         },
         survivor: auth,
         survivor_login,
+        survivor_token: survivor_token.and_then(|token| AuthToken::bearer(token).ok()),
         merged,
         merged_login,
         merged_live: live,

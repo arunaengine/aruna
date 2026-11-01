@@ -94,6 +94,8 @@ pub struct MergeUsersConfig {
     /// The caller's session: the account that survives.
     pub survivor: AuthContext,
     pub survivor_login: Option<u64>,
+    /// The caller's token, forwarded to its vault holders when the merged account has a vault.
+    pub survivor_token: Option<AuthToken>,
     /// The verified session of the account that is merged.
     pub merged: AuthContext,
     pub merged_login: Option<u64>,
@@ -151,7 +153,7 @@ pub enum MergeError {
          account's own access; remove the deny or the role first"
     )]
     RoleConflict(String),
-    #[error("the other account still holds a vault; move its entries and delete it first")]
+    #[error("the other account holds a vault that differs from this account's; copy it here first")]
     VaultPresent,
     #[error("the vault of the other account could not be read: {0}")]
     Vault(String),
@@ -182,6 +184,10 @@ enum MergeState {
     Init,
     ReadAccounts,
     CheckVault,
+    /// The merged account has a vault; it may stay only as an unchanged copy of the survivor's.
+    CheckCopy {
+        merged: Vec<[u8; 32]>,
+    },
     StartTransaction,
     ReadDocuments {
         txn_id: TxnId,
@@ -341,27 +347,42 @@ impl MergeUsersOperation {
             return Err(MergeError::StaleLogin);
         }
         self.state = MergeState::CheckVault;
+        Ok(smallvec![self.read_vault(
+            self.merged_id(),
+            self.config.merged_token.clone()
+        )])
+    }
+
+    /// Reads the digests of a user's saved vault payloads from its holders.
+    fn read_vault(&self, user_id: UserId, auth_token: Option<AuthToken>) -> Effect {
         let read = ReadVaultOperation::new(ReadVaultConfig {
             node_id: self.config.actor.node_id,
             realm_id: self.config.actor.realm_id,
-            user_id: self.merged_id(),
-            query: VaultQuery::Heads {
-                auth_token: self.config.merged_token.clone(),
-            },
+            user_id,
+            query: VaultQuery::Heads { auth_token },
             deadline: self.config.vault_deadline,
         });
-        Ok(smallvec![Effect::SubOperation(boxed_suboperation(
-            read,
-            |result| Event::SubOperation(SubOperationEvent::VaultHeld {
+        Effect::SubOperation(boxed_suboperation(read, |result| {
+            Event::SubOperation(SubOperationEvent::VaultHeld {
                 result: result
                     .map(|records| match records {
-                        VaultRecords::Heads(heads) =>
-                            heads.iter().any(|head| head.payload.is_some()),
-                        VaultRecords::Keys(_) => false,
+                        VaultRecords::Heads(heads) => heads
+                            .iter()
+                            .filter_map(|head| head.payload.as_deref())
+                            .map(|payload| *blake3::hash(payload.as_bytes()).as_bytes())
+                            .collect(),
+                        VaultRecords::Keys(_) => Vec::new(),
                     })
                     .map_err(|error| error.to_string()),
-            }),
-        ))])
+            })
+        }))
+    }
+
+    fn start_transaction(&mut self) -> Effects {
+        self.state = MergeState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn read_documents(&mut self, txn_id: TxnId) -> Effects {
@@ -687,13 +708,22 @@ impl MergeUsersOperation {
                 MergeState::CheckVault,
                 Event::SubOperation(SubOperationEvent::VaultHeld { result }),
             ) => match result {
-                Ok(true) => Err(MergeError::VaultPresent),
-                Ok(false) => {
-                    self.state = MergeState::StartTransaction;
-                    Ok(smallvec![Effect::Storage(
-                        StorageEffect::StartTransaction { read: false }
-                    )])
+                Ok(merged) if merged.is_empty() => Ok(self.start_transaction()),
+                Ok(merged) => {
+                    self.state = MergeState::CheckCopy { merged };
+                    let token = self.config.survivor_token.clone();
+                    Ok(smallvec![self.read_vault(self.survivor_id(), token)])
                 }
+                Err(error) => Err(MergeError::Vault(error)),
+            },
+            (
+                MergeState::CheckCopy { merged },
+                Event::SubOperation(SubOperationEvent::VaultHeld { result }),
+            ) => match result {
+                Ok(held) if merged.iter().all(|digest| held.contains(digest)) => {
+                    Ok(self.start_transaction())
+                }
+                Ok(_) => Err(MergeError::VaultPresent),
                 Err(error) => Err(MergeError::Vault(error)),
             },
             (
