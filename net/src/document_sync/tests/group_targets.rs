@@ -1056,3 +1056,94 @@ async fn subject_remove_cleans() {
         None
     );
 }
+
+#[tokio::test]
+async fn merge_grant_needs_role() {
+    // A merge hands a role of the merged account on, only from a management node.
+    let realm_id = RealmId::from_bytes([62; 32]);
+    let group_id = Ulid::from_parts(1_640, 1);
+    let owner = UserId::local(Ulid::from_parts(1_641, 1), realm_id);
+    let merged = UserId::local(Ulid::from_parts(1_642, 1), realm_id);
+    let survivor = UserId::local(Ulid::from_parts(1_643, 1), realm_id);
+    let role_id = Ulid::from_parts(1_644, 1);
+    let actor = test_actor(12, merged, realm_id);
+    for (kind, holder, accepted) in [
+        (RealmNodeKind::Management, merged, true),
+        (RealmNodeKind::Server, merged, false),
+        (RealmNodeKind::Management, owner, false),
+    ] {
+        let (_dir, storage) = test_storage();
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, kind.clone());
+        let group = Group {
+            display_name: "Engineering".to_string(),
+            group_id,
+            realm_id,
+            owner,
+            roles: HashSet::from([role_id]),
+        };
+        let auth = GroupAuthorizationDocument {
+            group_id,
+            policies: Vec::new(),
+            roles: HashMap::from([(
+                role_id,
+                Role {
+                    role_id,
+                    name: "member".to_string(),
+                    permissions: HashMap::new(),
+                    assigned_users: HashSet::from([holder]),
+                },
+            )]),
+        };
+        let realm_auth = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::new(),
+            operation_restrictions: Default::default(),
+        };
+        batch_write_to(
+            &storage,
+            vec![
+                target_write_entry(
+                    DocumentTarget::RealmConfig { realm_id },
+                    config.to_bytes(&actor).expect("config serializes").into(),
+                ),
+                target_write_entry(
+                    DocumentTarget::RealmAuthorization { realm_id },
+                    realm_auth
+                        .to_bytes(&actor)
+                        .expect("realm auth serializes")
+                        .into(),
+                ),
+                target_write_entry(
+                    DocumentTarget::GroupAuthorization { group_id },
+                    auth.to_bytes(&actor).expect("auth serializes").into(),
+                ),
+                (
+                    GROUP_KEYSPACE.to_string(),
+                    group_id.to_bytes().into(),
+                    group.to_bytes(&actor).expect("group serializes").into(),
+                ),
+            ],
+        )
+        .await
+        .expect("fixture writes");
+        let grant = test_admin_event(
+            Ulid::from_parts(1_645, 1),
+            AdminDocumentTarget::Group { group_id },
+            &actor,
+            1,
+            AdminDocumentOperation::GroupAssignmentAdded {
+                role_id,
+                user_id: survivor,
+            },
+        );
+        let validation = validate_group_authority(&storage, &grant, None)
+            .await
+            .expect("validation runs");
+        assert_eq!(
+            matches!(validation, AdminEventValidation::Accepted),
+            accepted,
+            "{kind:?} with holder {holder}"
+        );
+    }
+}
