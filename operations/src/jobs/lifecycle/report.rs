@@ -10,8 +10,8 @@ use aruna_core::jobs::JobStatusView;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::scheduling::{PlanCandidate, PlannedInput};
 use aruna_core::structs::execution::job::{
-    ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection, JobRecordEnvelope,
-    JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
+    CancelAuthority, ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection,
+    JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
     PhysicalExecutionResult, PhysicalExecutionState, ProjectedExecution, SubmissionId,
 };
 use aruna_core::structs::identity::auth::AuthContext;
@@ -123,6 +123,12 @@ pub async fn family_report(
         submission_id: projection.submission_id,
         request_digest: projection.request_digest,
     };
+    // A run its submitter deleted answers as absent on every holder its deletion reached.
+    match deleted(context, family).await {
+        Ok(false) => {}
+        Ok(true) => return Some(Err(JobRouteError::NotFound)),
+        Err(error) => return Some(Err(error)),
+    }
     let digest = match projection.digest() {
         Ok(digest) => digest,
         Err(error) => return Some(Err(JobRouteError::Internal(error.to_string()))),
@@ -175,6 +181,16 @@ pub async fn family_report(
         locally_exhausted: exhausted,
         plan: plan_estimate(context, family).await,
         spec,
+    }))
+}
+
+/// Whether an authentic cancel record of the family records its deletion.
+async fn deleted(context: &DriverContext, family: JobFamilyId) -> Result<bool, JobRouteError> {
+    let cancels = load_kind_complete(context, family, JobRecordKind::Cancel).await;
+    let cancels = cancels.map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
+    Ok(cancels.iter().any(|envelope| {
+        matches!(&envelope.record, JobFamilyRecord::Cancel(cancel)
+            if cancel.authority == CancelAuthority::Deletion)
     }))
 }
 
