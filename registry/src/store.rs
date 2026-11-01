@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
-use aruna_core::federation::{Registration, Signed};
+use aruna_core::federation::{RealmTotals, Registration, Signed};
 use aruna_core::structs::identity::realm::RealmId;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,8 @@ pub struct Store {
     /// Keyed by realm id and a per-realm sequence number.
     audit: Keyspace,
     names: Keyspace,
+    /// The latest self-reported totals per realm, apart from the entry.
+    totals: Keyspace,
     /// Serializes the issue-time check with the write that follows it.
     writer: Mutex<()>,
 }
@@ -79,6 +81,7 @@ impl Store {
         let admin = db.keyspace("admin", KeyspaceCreateOptions::default)?;
         let audit = db.keyspace("audit", KeyspaceCreateOptions::default)?;
         let names = db.keyspace("names", KeyspaceCreateOptions::default)?;
+        let totals = db.keyspace("totals", KeyspaceCreateOptions::default)?;
         Ok(Self {
             db,
             entries,
@@ -86,6 +89,7 @@ impl Store {
             admin,
             audit,
             names,
+            totals,
             writer: Mutex::new(()),
         })
     }
@@ -150,12 +154,41 @@ impl Store {
         self.check_issued(realm_id, issued_at, now)?;
         let mut batch = self.db.batch();
         batch.remove(&self.entries, realm_id.as_bytes().to_vec());
+        batch.remove(&self.totals, realm_id.as_bytes().to_vec());
         batch.insert(
             &self.issued,
             realm_id.as_bytes().to_vec(),
             postcard::to_allocvec(&issued_at)?,
         );
         Ok(batch.commit()?)
+    }
+
+    /// Keeps `totals` of a realm with an entry when they are newer than the stored ones.
+    pub fn put_totals(&self, totals: &RealmTotals, now: u64) -> Result<(), StoreError> {
+        let _guard = self.writer.lock().map_err(|_| StoreError::Poisoned)?;
+        let key = totals.realm_id.as_bytes();
+        if totals.observed_at > now.saturating_add(MAX_FUTURE_SECS) {
+            return Err(StoreError::FutureIssued);
+        }
+        if !self.entries.contains_key(key)? {
+            return Err(StoreError::NotFound);
+        }
+        if let Some(last) = self.totals(&totals.realm_id)?
+            && totals.observed_at <= last.observed_at
+        {
+            return Err(StoreError::Replayed);
+        }
+        Ok(self.totals.insert(key, postcard::to_allocvec(totals)?)?)
+    }
+
+    /// The realm's latest totals; none for a realm that never sent any or sent an older format.
+    pub fn totals(&self, realm_id: &RealmId) -> Result<Option<RealmTotals>, StoreError> {
+        let value = self.totals.get(realm_id.as_bytes())?;
+        Ok(value.and_then(|value| {
+            postcard::from_bytes(&value)
+                .inspect_err(|error| warn!(error = %error, "Skipping undecodable realm totals"))
+                .ok()
+        }))
     }
 
     /// The realm's entry while its lease runs.

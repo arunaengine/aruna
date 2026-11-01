@@ -15,16 +15,16 @@ use std::sync::Arc;
 
 use aruna_blob::egress::EgressGuard;
 use aruna_core::federation::{
-    FederationError, Registration, Signed, Withdrawal, valid_federation_url,
+    FederationError, RealmTotals, Registration, Signed, Withdrawal, valid_federation_url,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::time::unix_timestamp_secs;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::{Json, Router};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use serde::Serialize;
@@ -40,6 +40,8 @@ use crate::verify::{RouteProblem, verify_routes};
 /// Writes accepted per minute across all clients, and their burst.
 const WRITES_PER_MINUTE: u32 = 60;
 const WRITE_BURST: u32 = 20;
+/// Largest accepted totals body; a signed totals payload is a few hundred bytes.
+const MAX_TOTALS_BODY: usize = 4096;
 /// Registrations whose descriptor routes are fetched at the same time.
 const VERIFY_SLOTS: usize = 4;
 /// The registry route that resolves Aruna data w3ids.
@@ -87,6 +89,8 @@ pub enum RegistryError {
     BadUrl,
     #[error("invalid descriptor: {0}")]
     BadDescriptor(FederationError),
+    #[error("invalid totals: {0}")]
+    BadTotals(FederationError),
     #[error("too many registry writes, retry later")]
     RateLimited,
     #[error(transparent)]
@@ -98,7 +102,9 @@ pub enum RegistryError {
 impl IntoResponse for RegistryError {
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::BadRealm | Self::BadUrl | Self::BadDescriptor(_) => StatusCode::BAD_REQUEST,
+            Self::BadRealm | Self::BadUrl | Self::BadDescriptor(_) | Self::BadTotals(_) => {
+                StatusCode::BAD_REQUEST
+            }
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Store(StoreError::NotFound) => StatusCode::NOT_FOUND,
             Self::Signature(_) => StatusCode::FORBIDDEN,
@@ -126,10 +132,12 @@ pub struct Listing {
     pub stale: bool,
     /// Registry-owned status; `approved` realms are resolved through w3id.org.
     pub status: RealmStatus,
+    /// The latest self-reported totals; `None` for a realm that never sent any.
+    pub totals: Option<RealmTotals>,
 }
 
 impl Listing {
-    fn new(entry: Entry, now: u64, status: RealmStatus) -> Self {
+    fn new(entry: Entry, now: u64, status: RealmStatus, totals: Option<RealmTotals>) -> Self {
         Self {
             realm_id: entry
                 .registration
@@ -144,6 +152,7 @@ impl Listing {
             problems: entry.problems.iter().map(RouteProblem::summary).collect(),
             registration: entry.registration,
             status,
+            totals,
         }
     }
 }
@@ -154,6 +163,10 @@ pub fn router(state: Arc<RegistryState>) -> Router {
         .route(
             "/v1/realms/{realm_id}",
             get(get_realm).put(put_realm).delete(delete_realm),
+        )
+        .route(
+            "/v1/realms/{realm_id}/totals",
+            put(put_totals).layer(DefaultBodyLimit::max(MAX_TOTALS_BODY)),
         )
         .merge(admin_api::router())
         .with_state(state)
@@ -208,7 +221,8 @@ async fn list_realms(State(state): State<Arc<RegistryState>>) -> Result<Response
         let realm_id = entry.registration.payload.descriptor.payload.realm_id;
         let admin = state.store.admin(&realm_id)?;
         if admin.listed() {
-            listings.push(Listing::new(entry, now, admin.status));
+            let totals = state.store.totals(&realm_id)?;
+            listings.push(Listing::new(entry, now, admin.status, totals));
         }
     }
     listings.sort_by_key(|listing| listing.status != RealmStatus::Approved);
@@ -224,7 +238,8 @@ async fn get_realm(
     match state.store.entry(&realm_id, now)? {
         Some(entry) => {
             let status = state.store.admin(&realm_id)?.status;
-            Ok(public(Listing::new(entry, now, status)))
+            let totals = state.store.totals(&realm_id)?;
+            Ok(public(Listing::new(entry, now, status, totals)))
         }
         None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
@@ -347,7 +362,24 @@ async fn put_realm(
     };
     state.store.register(&realm_id, &entry, now)?;
     let status = state.store.admin(&realm_id)?.status;
-    Ok(Json(Listing::new(entry, now, status)))
+    let totals = state.store.totals(&realm_id)?;
+    Ok(Json(Listing::new(entry, now, status, totals)))
+}
+
+/// Keeps a registered realm's latest totals, signed by that realm; never changes its entry.
+async fn put_totals(
+    State(state): State<Arc<RegistryState>>,
+    Path(realm_id): Path<String>,
+    Json(signed): Json<Signed<RealmTotals>>,
+) -> Result<StatusCode, RegistryError> {
+    state.admit_write()?;
+    let realm_id = parse_realm(&realm_id)?;
+    signed.verify(&realm_id)?;
+    signed.payload.check().map_err(RegistryError::BadTotals)?;
+    state
+        .store
+        .put_totals(&signed.payload, unix_timestamp_secs())?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_realm(
@@ -426,9 +458,8 @@ mod tests {
         assert_eq!(resolving.headers()[header::CACHE_CONTROL], "no-store");
     }
 
-    #[test]
-    fn accepts_old_registration() {
-        // An older node signs its own layout, without contact and login providers.
+    /// What an older node signs: its own layout, without contact, login providers or totals.
+    fn old_registration(api: &str, portal: &str) -> Signed<Registration> {
         use aruna_core::federation::{DESCRIPTOR_DOMAIN, REGISTRATION_DOMAIN, RealmKpis, Signer};
         use ed25519_dalek::Signer as _;
         let key = SigningKey::from_bytes(&[7; 32]);
@@ -437,10 +468,6 @@ mod tests {
             bytes.extend_from_slice(payload);
             key.sign(&bytes).to_string()
         };
-        let (api, portal) = (
-            "https://realm.example.org/api/v1",
-            "https://realm.example.org/",
-        );
         let fields = (realm_id(), "Realm", "", api, portal, 1_u64);
         let signature = sign(DESCRIPTOR_DOMAIN, &postcard::to_allocvec(&fields).unwrap());
         let kpis = RealmKpis::default();
@@ -470,8 +497,162 @@ mod tests {
             "signer": "Realm",
             "signature": outer,
         });
-        let signed: Signed<Registration> = serde_json::from_value(wire).unwrap();
+        serde_json::from_value(wire).unwrap()
+    }
+
+    #[test]
+    fn accepts_old_registration() {
+        let signed = old_registration(
+            "https://realm.example.org/api/v1",
+            "https://realm.example.org/",
+        );
         check_registration(&realm_id(), &signed).unwrap();
+    }
+
+    fn test_state(dir: &std::path::Path) -> Arc<RegistryState> {
+        Arc::new(RegistryState::new(
+            Store::open(dir).unwrap(),
+            EgressGuard::new(aruna_core::egress::EgressPolicy::strict()).unwrap(),
+        ))
+    }
+
+    fn signed_totals(realm_id: RealmId, data_bytes: u64, observed_at: u64) -> Signed<RealmTotals> {
+        let totals = RealmTotals {
+            realm_id,
+            data_bytes,
+            objects: 1_234_567,
+            datasets: 42,
+            observed_at,
+        };
+        Signed::sign(totals, &capabilities()).unwrap()
+    }
+
+    async fn send_totals(
+        state: &Arc<RegistryState>,
+        path: RealmId,
+        signed: Signed<RealmTotals>,
+    ) -> Result<StatusCode, RegistryError> {
+        put_totals(State(state.clone()), Path(path.to_string()), Json(signed)).await
+    }
+
+    #[tokio::test]
+    async fn old_node_registers() {
+        // An older node sends no totals; it still registers and its listing shows none.
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let signed = old_registration("http://127.0.0.1:9/api/v1", "http://127.0.0.1:9/");
+        let path = Path(realm_id().to_string());
+        let listing = put_realm(State(state.clone()), path, Json(signed))
+            .await
+            .unwrap();
+        assert!(listing.totals.is_none());
+        let listed = body(list_realms(State(state)).await.unwrap()).await;
+        assert_eq!(listed[0]["totals"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn totals_follow_renewals() {
+        // Each renewal's newer totals replace the stored ones and leave the entry alone.
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let now = unix_timestamp_secs();
+        let entry = |issued_at| Entry {
+            registration: registration("https://realm.example.org", issued_at),
+            received_at: now,
+            verified: false,
+            problems: Vec::new(),
+        };
+        state
+            .store
+            .register(&realm_id(), &entry(now - 20), now)
+            .unwrap();
+        let sent = send_totals(&state, realm_id(), signed_totals(realm_id(), 5, now - 20));
+        assert_eq!(sent.await.unwrap(), StatusCode::NO_CONTENT);
+        state
+            .store
+            .register(&realm_id(), &entry(now - 10), now)
+            .unwrap();
+        let renewed = signed_totals(realm_id(), 12_345_678_900_000, now - 10);
+        send_totals(&state, realm_id(), renewed).await.unwrap();
+        let listed = body(list_realms(State(state.clone())).await.unwrap()).await;
+        assert_eq!(listed[0]["totals"]["data_bytes"], 12_345_678_900_000_u64);
+        assert_eq!(listed[0]["totals"]["observed_at"], now - 10);
+        assert_eq!(listed[0]["status"], "listed");
+        let stored = state.store.stored_entry(&realm_id()).unwrap().unwrap();
+        assert_eq!(stored, entry(now - 10));
+        // Older totals are a replay and change nothing.
+        let replay = send_totals(&state, realm_id(), signed_totals(realm_id(), 1, now - 15));
+        assert!(matches!(
+            replay.await,
+            Err(RegistryError::Store(StoreError::Replayed))
+        ));
+        // A withdrawal drops the totals with the entry.
+        state.store.withdraw(&realm_id(), now, now).unwrap();
+        assert_eq!(state.store.totals(&realm_id()).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn totals_other_realm() {
+        // A realm can neither file its totals under another realm nor sign another's totals.
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let now = unix_timestamp_secs();
+        let other_key = SigningKey::from_bytes(&[8; 32]).verifying_key();
+        let other_id = RealmId::from_bytes(other_key.to_bytes());
+        let own = send_totals(&state, other_id, signed_totals(realm_id(), 5, now)).await;
+        assert!(matches!(
+            own,
+            Err(RegistryError::Signature(FederationError::RealmMismatch))
+        ));
+        let forged = signed_totals(other_id, 5, now);
+        let forged = send_totals(&state, other_id, forged).await;
+        assert!(matches!(
+            forged,
+            Err(RegistryError::Signature(FederationError::BadSignature))
+        ));
+        assert_eq!(state.store.totals(&other_id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn invalid_totals_refused() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let now = unix_timestamp_secs();
+        // No entry yet: totals alone do not create a listing.
+        let unknown = send_totals(&state, realm_id(), signed_totals(realm_id(), 5, now)).await;
+        assert!(matches!(
+            unknown,
+            Err(RegistryError::Store(StoreError::NotFound))
+        ));
+        let entry = Entry {
+            registration: registration("https://realm.example.org", now),
+            received_at: now,
+            verified: false,
+            problems: Vec::new(),
+        };
+        state.store.register(&realm_id(), &entry, now).unwrap();
+        let max = aruna_core::federation::MAX_TOTAL;
+        let large = send_totals(&state, realm_id(), signed_totals(realm_id(), max + 1, now)).await;
+        assert!(matches!(large, Err(RegistryError::BadTotals(_))));
+        let future = now + crate::store::MAX_FUTURE_SECS + 1;
+        let ahead = send_totals(&state, realm_id(), signed_totals(realm_id(), 5, future)).await;
+        assert!(matches!(
+            ahead,
+            Err(RegistryError::Store(StoreError::FutureIssued))
+        ));
+        // An oversized body is refused before it is parsed.
+        let mut wire = serde_json::to_value(signed_totals(realm_id(), 5, now)).unwrap();
+        wire["padding"] = "a".repeat(MAX_TOTALS_BODY).into();
+        let request = axum::http::Request::put(format!("/v1/realms/{}/totals", realm_id()))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(wire.to_string()))
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(state.store.totals(&realm_id()).unwrap(), None);
+        let fits = send_totals(&state, realm_id(), signed_totals(realm_id(), max, now)).await;
+        assert_eq!(fits.unwrap(), StatusCode::NO_CONTENT);
     }
 
     #[test]

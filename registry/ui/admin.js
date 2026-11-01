@@ -212,7 +212,7 @@ function realmCard(realm) {
       el('dt', {}, 'Realm id'), el('dd', { class: 'mono' }, realm.realm_id),
       previous.length ? [el('dt', {}, 'Previous names'),
         el('dd', {}, previous.map((record) => `${record.name} (until ${time(record.until)})`).join(', '))] : null,
-      descriptor ? descriptorFacts(descriptor, kpis, realm.received_at) : [el('dt', {}, 'Registration'),
+      descriptor ? descriptorFacts(descriptor, kpis, realm.received_at, realm.totals) : [el('dt', {}, 'Registration'),
         el('dd', {}, 'Withdrawn by the realm')],
       realm.problems.length ? [el('dt', {}, 'Verification'),
         el('dd', {}, el('ul', { class: 'problems' }, realm.problems.map((problem) => el('li', {},
@@ -225,7 +225,14 @@ function realmCard(realm) {
       el('pre', {}, JSON.stringify(realm.registration, null, 2))) : null);
 }
 
-function descriptorFacts(descriptor, kpis, receivedAt) {
+// Data in TB with one decimal and counts with thousands separators; no totals show nothing.
+function totalsText(totals) {
+  const terabytes = (totals.data_bytes / 1e12).toFixed(1);
+  const count = (value) => value.toLocaleString('en-US');
+  return `${terabytes} TB data, ${count(totals.objects)} objects, ${count(totals.datasets)} datasets, updated ${time(totals.observed_at)}`;
+}
+
+function descriptorFacts(descriptor, kpis, receivedAt, totals) {
   const count = (value) => (value === null || value === undefined ? 'unknown' : String(value));
   return [
     descriptor.description ? [el('dt', {}, 'Description'), el('dd', {}, descriptor.description)] : null,
@@ -237,6 +244,7 @@ function descriptorFacts(descriptor, kpis, receivedAt) {
     el('dt', {}, 'Last registration'), el('dd', {}, time(receivedAt)),
     el('dt', {}, 'Datasets / groups / nodes'),
     el('dd', {}, `${count(kpis.live_datasets)} / ${count(kpis.groups)} / ${count(kpis.nodes_configured)}`),
+    totals ? [el('dt', {}, 'Totals'), el('dd', {}, totalsText(totals))] : null,
   ].flat();
 }
 

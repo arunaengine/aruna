@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::federation::{Registration, Signed};
+use aruna_core::federation::{RealmTotals, Registration, Signed};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_secs;
 use axum::extract::{Path, State};
@@ -152,6 +152,8 @@ pub struct AdminListing {
     pub admin: AdminState,
     /// Every name the realm registered with, oldest first; the last is the current one.
     pub names: Vec<NameRecord>,
+    /// The latest self-reported totals; `None` for a realm that never sent any.
+    pub totals: Option<RealmTotals>,
 }
 
 pub fn router() -> Router<Arc<RegistryState>> {
@@ -228,6 +230,7 @@ fn admin_listing(
         stale: entry.is_some_and(|entry| is_stale(entry, now)),
         admin: state.store.admin(&realm_id)?,
         names: state.store.names(&realm_id)?,
+        totals: state.store.totals(&realm_id)?,
         problems: entry
             .map(|entry| entry.problems.clone())
             .unwrap_or_default(),
