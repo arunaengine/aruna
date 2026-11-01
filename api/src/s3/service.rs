@@ -2974,7 +2974,9 @@ impl S3 for ArunaS3Service {
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
         debug!(bucket = %req.input.bucket, "Received DELETE BUCKET Request");
 
-        drive(DeleteBucketOperation::new(req.input.bucket), &self.state)
+        let delete =
+            DeleteBucketOperation::new(req.input.bucket).purge_notices(self.state.node_and_realm());
+        drive(delete, &self.state)
             .await
             .map_err(IntoS3Error::into_s3_error)?;
 

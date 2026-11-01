@@ -300,7 +300,8 @@ fn verify_node_origin(records: &[NotificationRecord], peer: NodeId) -> Result<()
         NotificationKind::BucketRestartLocked { node_id, .. }
         | NotificationKind::BucketRecoveryDegraded { node_id, .. }
         | NotificationKind::BucketKeyPending { node_id, .. }
-        | NotificationKind::ShareUpload { node_id, .. } => *node_id != peer,
+        | NotificationKind::ShareUpload { node_id, .. }
+        | NotificationKind::BucketDeleted { node_id, .. } => *node_id != peer,
         _ => false,
     });
     match foreign {
@@ -586,6 +587,9 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             bucket, group_id, ..
         }
         | NotificationKind::BucketRecoveryDegraded {
+            bucket, group_id, ..
+        }
+        | NotificationKind::BucketDeleted {
             bucket, group_id, ..
         } => {
             if bucket.is_empty() || group_id.is_nil() {

@@ -1996,4 +1996,18 @@ fn restart_notice_origin() {
     )];
     assert!(verify_node_origin(&records, origin).is_ok());
     assert!(verify_node_origin(&records, other).is_err());
+    // Only the bucket's node may purge the notices about it.
+    let deleted = NotificationKind::BucketDeleted {
+        bucket: "raw".to_string(),
+        node_id: origin,
+        group_id: Ulid::from_bytes([6; 16]),
+    };
+    let records = vec![NotificationRecord::new(
+        recipient,
+        NotificationClass::Direct,
+        deleted,
+        1,
+    )];
+    assert!(verify_node_origin(&records, origin).is_ok());
+    assert!(verify_node_origin(&records, other).is_err());
 }

@@ -384,6 +384,11 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
             bucket,
             node_id,
             group_id,
+        }
+        | NotificationKind::BucketDeleted {
+            bucket,
+            node_id,
+            group_id,
         } => {
             response.bucket = Some(bucket.clone());
             response.node_id = Some(node_id.to_string());

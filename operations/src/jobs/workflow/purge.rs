@@ -177,7 +177,8 @@ async fn run_fenced_purge(
     let bucket_deleted = if spec.scope.is_bucket() {
         if bucket_exists {
             match drive(
-                DeleteBucketOperation::new(spec.scope.bucket().to_string()),
+                DeleteBucketOperation::new(spec.scope.bucket().to_string())
+                    .purge_notices(ctx.driver.node_and_realm()),
                 &ctx.driver,
             )
             .await

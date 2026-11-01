@@ -650,7 +650,8 @@ async fn delete_local_bucket(
             }
         }
     }
-    match drive(DeleteBucketOperation::new(bucket.clone()), context).await {
+    let delete = DeleteBucketOperation::new(bucket.clone()).purge_notices(context.node_and_realm());
+    match drive(delete, context).await {
         Ok(()) | Err(DeleteBucketError::NotFound) => Ok(()),
         Err(error) => Err(error.into()),
     }
