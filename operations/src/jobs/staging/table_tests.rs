@@ -785,6 +785,159 @@ async fn empty_rows_alternate() {
     assert_eq!(import_records(400, 100, 2, false).await.0, (500, 0, 0));
 }
 
+/// The table line of record row `row`: key `samn<row>/assembly.fna.gz`, size `row`.
+fn record_line(row: usize, meta: &str) -> String {
+    let md5 = format!("{:x}", md5::compute(row.to_le_bytes()));
+    format!(
+        "samn{row:08}/assembly.fna.gz\t{COLI}{row:08}.fna.gz\t{row}\t2025-11-17T17:38:21Z\t\
+         \"{md5}\"\tapplication/gzip\t{md5}\t{meta}\n"
+    )
+}
+
+// A record import of several full pages stopped after its first page resumes there, beside a
+// second job with empty rows on the same bucket: every key once, counters and search right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_pages_resume() {
+    use crate::distribution::index_feed::{FeedLimits, Feeder};
+    use crate::distribution::key_index::{KeyQuery, RangeIndexes};
+    use crate::staging::page::rows::MAX_PAGE_ENTRIES;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+    use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
+    use std::ops::Bound;
+
+    let (endpoint, site, server) = serve(Site::ncbi).await;
+    let table = serde_json::json!({
+        "source": { "object": { "bucket": "lists", "key": "first.tsv" } },
+        "format": { "delimiter": "\t", "quote": null, "nulls": [""] },
+        "rows": { "kind": "record", "source": "{source}", "target": "{key}", "keep": [],
+                  "size": "size", "modified": "modified",
+                  "checksums": [{ "algorithm": "md5", "column": "md5" }] }
+    });
+    let fixture = Fixture::new(&endpoint, table).await;
+    let header = "key\tsource\tsize\tmodified\tetag\tcontent_type\tmd5\tmetadata\n";
+    let meta = r#"{"note":"sample"}"#;
+    let rows = 2 * MAX_PAGE_ENTRIES + 500;
+    let first: String = (0..rows).map(|row| record_line(row, meta)).collect();
+    let second: String = (rows..rows + 300)
+        .map(|row| record_line(row, meta))
+        .chain((0..3).map(|row| format!("samn{row:08}/\t\t0\t\t\t\t\t{meta}\n")))
+        .collect();
+    let ctx = fixture.context(50).await;
+    let (set_id, range_id) = searched_set(&ctx, &fixture.spec).await;
+    let lists = drive(
+        GetBucketOperation::new("lists".to_string()),
+        &fixture.driver,
+    )
+    .await
+    .unwrap();
+    let mut specs = Vec::new();
+    for (key, rows) in [("first.tsv", first), ("second.tsv", second)] {
+        let body = (Bytes::from(format!("{header}{rows}")), &BTreeMap::new());
+        write_object(&ctx, &fixture.spec, ("lists", &lists), key, body)
+            .await
+            .ok()
+            .unwrap();
+        let mut spec = fixture.spec.clone();
+        let import = spec.table.as_mut().unwrap();
+        import.source = serde_json::from_value(serde_json::json!({
+            "object": { "bucket": "lists", "key": key }
+        }))
+        .unwrap();
+        specs.push(spec);
+    }
+
+    // The shutdown comes once the first page is committed, so the job stops after its next one.
+    let (progress, stop) = (ctx.progress.clone(), ctx.shutdown.clone());
+    let watch = async move {
+        while progress.snapshot().current < MAX_PAGE_ENTRIES as u64 {
+            progress.flush_requested().await;
+        }
+        stop.cancel();
+    };
+    let run = crate::jobs::staging::run_staging_job(&ctx, &specs[0]);
+    let (outcome, ()) = tokio::join!(run, watch);
+    assert!(matches!(outcome, JobRunOutcome::Interrupted));
+    let resumed = JobContext {
+        shutdown: CancellationToken::new(),
+        ..ctx
+    };
+    let mut other = fixture.context_for(&specs[1], 51).await;
+    other.range_turns = resumed.range_turns.clone();
+    let (first, second) = tokio::join!(
+        crate::jobs::staging::run_staging_job(&resumed, &specs[0]),
+        crate::jobs::staging::run_staging_job(&other, &specs[1]),
+    );
+    let counts = |outcome| match outcome {
+        JobRunOutcome::Succeeded(JobResultPayload::Staging {
+            completed_items,
+            failed_items,
+        }) => (completed_items, failed_items),
+        JobRunOutcome::Failed(error) | JobRunOutcome::Deferred(error) => {
+            panic!("the import stopped: {error:?}")
+        }
+        _ => panic!("the import did not finish"),
+    };
+    assert_eq!(counts(first), (rows as u64, 0));
+    assert_eq!(counts(second), (303, 0));
+    assert!(site.requests.lock().unwrap().is_empty());
+
+    // One version per key: a page committed twice would add versions, not objects.
+    let read = StorageEffect::Read {
+        key_space: USAGE_STATS_KEYSPACE.to_string(),
+        key: usage_bucket_key(&fixture.spec.bucket).into(),
+        txn_id: None,
+    };
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(value), ..
+    }) = fixture
+        .driver
+        .storage_handle
+        .send_storage_effect(read)
+        .await
+    else {
+        panic!("the bucket's counters must exist");
+    };
+    let counters = BucketCounters::from_bytes(&value).unwrap();
+    let keys = rows as u64 + 303;
+    assert_eq!((counters.objects, counters.versions), (keys, keys));
+    let bytes = (0..rows + 300).map(|row| row as u64).sum::<u64>();
+    assert_eq!(counters.referenced_bytes, bytes);
+    for row in [
+        0,
+        MAX_PAGE_ENTRIES - 1,
+        MAX_PAGE_ENTRIES,
+        rows - 1,
+        rows + 299,
+    ] {
+        let key = format!("samn{row:08}/assembly.fna.gz");
+        assert_eq!(fixture.observation(&key).await.content_length, row as u64);
+    }
+
+    // The feed finds no index at first; the first index generation is built from the heads.
+    let indexes = Arc::new(RangeIndexes::new(fixture._dir.path().join("range-indexes")));
+    let mut feeder = Feeder::new(indexes.clone(), FeedLimits::default());
+    while feeder.pass(&fixture.driver).await {}
+    for row in [0, MAX_PAGE_ENTRIES, rows - 1, rows + 299] {
+        let query = KeyQuery {
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+            names: Some(format!("samn{row:08}")),
+            meta: None,
+            limit: 10,
+        };
+        let found = indexes.search(set_id, range_id, 1, query).await.unwrap();
+        let mut expected = vec![format!("samn{row:08}/assembly.fna.gz")];
+        // The empty rows are the folders of the first rows.
+        if row < 3 {
+            expected.insert(0, format!("samn{row:08}/"));
+        }
+        assert_eq!(found.keys, expected);
+    }
+    server.abort();
+}
+
 /// Imports `rows` record rows and `empty` empty rows spread over `jobs` tables at once, the
 /// drain and the search feed running beside them when `background`; returns the completed and
 /// failed rows, the storage conflicts meanwhile and the seconds the jobs took.
@@ -807,11 +960,7 @@ async fn import_records(
     let header = "key\tsource\tsize\tmodified\tetag\tcontent_type\tmd5\tmetadata\n";
     let mut tables = vec![String::from(header); jobs];
     for row in 0..rows {
-        let md5 = format!("{:x}", md5::compute(row.to_le_bytes()));
-        tables[row % jobs].push_str(&format!(
-            "samn{row:08}/assembly.fna.gz\t{COLI}{row:08}.fna.gz\t{row}\t2025-11-17T17:38:21Z\t\
-             \"{md5}\"\tapplication/gzip\t{md5}\t{meta}\n"
-        ));
+        tables[row % jobs].push_str(&record_line(row, meta));
     }
     for row in 0..empty {
         tables[row % jobs].push_str(&format!("samn{row:08}/\t\t0\t\t\t\t\t{meta}\n"));
@@ -893,8 +1042,8 @@ async fn import_records(
 }
 
 /// Makes the job's bucket a searched distributed set whose upper range, holding keys from `m`,
-/// this member coordinates, with a full key sample like a large bucket.
-async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) {
+/// this member coordinates, with a full key sample like a large bucket; returns set and range.
+async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
     use crate::distribution::test_record::{binding, searched, store_record};
     use crate::distribution::test_store::{begin, commit, install, range};
     use aruna_core::effects::StorageEffect;
@@ -947,4 +1096,5 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) {
         handle.send_storage_effect(effect).await;
     }
     assert!(commit(handle, txn_id).await);
+    (set_id, range_id)
 }
