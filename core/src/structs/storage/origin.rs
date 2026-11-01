@@ -150,9 +150,7 @@ impl SourcePin {
         use crate::structs::execution::source_connector::SourceConnectorKind;
         let mut pin = Self::of(descriptor);
         if pin.url.is_none() && descriptor.kind == SourceConnectorKind::Http {
-            let endpoint = descriptor.public_config.get("endpoint");
-            let origin = endpoint.and_then(|endpoint| url::Url::parse(endpoint).ok());
-            pin.url = (origin.map(|url| url.origin()))
+            pin.url = (bare_endpoint(descriptor).map(|url| url.origin()))
                 .filter(url::Origin::is_tuple)
                 .map(|origin| origin.ascii_serialization());
         }
@@ -237,8 +235,10 @@ pub fn public_source_url(descriptor: &PortableSourceDescriptor) -> Option<String
         return None;
     }
     let config = &descriptor.public_config;
-    let endpoint = config.get("endpoint")?.trim_end_matches('/');
-    let mut url = endpoint.to_string();
+    let mut url = bare_endpoint(descriptor)?
+        .as_str()
+        .trim_end_matches('/')
+        .to_string();
     for part in ["bucket", "root"]
         .iter()
         .filter_map(|name| config.get(*name))
@@ -251,6 +251,16 @@ pub fn public_source_url(descriptor: &PortableSourceDescriptor) -> Option<String
         url.push('/');
         url.push_str(part);
     }
+    Some(url)
+}
+
+/// The source endpoint without user info, query or fragment, which may carry credentials.
+fn bare_endpoint(descriptor: &PortableSourceDescriptor) -> Option<url::Url> {
+    let mut url = url::Url::parse(descriptor.public_config.get("endpoint")?).ok()?;
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    url.set_query(None);
+    url.set_fragment(None);
     Some(url)
 }
 

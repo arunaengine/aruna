@@ -786,3 +786,101 @@ async fn lists_writing_runs() {
         Err(ServerError::Unauthorized)
     ));
 }
+
+// Credentials in a connector endpoint never reach the origin answer or its projection.
+#[tokio::test]
+async fn hides_endpoint_credentials() {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::storage::blob::{
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
+    };
+    use std::collections::HashMap;
+    let node = node_state().await;
+    let endpoint = "https://reader:hunter2@s3.example.org?token=t0ken&X-Amz-Signature=s1g";
+    let descriptor = PortableSourceDescriptor {
+        kind: SourceConnectorKind::S3,
+        public_config: HashMap::from([
+            ("endpoint".to_string(), endpoint.to_string()),
+            ("bucket".to_string(), "lab".to_string()),
+            ("skip_signature".to_string(), "true".to_string()),
+        ]),
+        source_path: "a.txt".to_string(),
+        version_selector: None,
+        capabilities: Vec::new(),
+        origin_node_id: None,
+        namespace: None,
+        root: None,
+    };
+    let binding = VersionSourceBinding {
+        strategy: StagingStrategy::Reference,
+        descriptor,
+        connector_id: None,
+        mirrors: Vec::new(),
+    };
+    let metadata = SourceMetadata {
+        content_length: 1,
+        content_type: None,
+        etag: None,
+        last_modified: None,
+        source_version: None,
+        digests: Default::default(),
+    };
+    let created = SystemTime::UNIX_EPOCH;
+    let version = BlobVersion::reference(binding, metadata, created, node.owner.user_id, created)
+        .with_origin(Some(VersionOrigin::Source { job_id: None }));
+    let version_id = Ulid::generate();
+    let rows = [
+        (
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new(BUCKET, "ref.txt").to_bytes().unwrap(),
+            CurrentVersionPointer::new(version_id).to_bytes().unwrap(),
+        ),
+        (
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(BUCKET, "ref.txt", version_id)
+                .to_bytes()
+                .unwrap(),
+            version.to_bytes().unwrap(),
+        ),
+    ];
+    for (key_space, key, value) in rows {
+        let effect = StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        node.state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(effect)
+            .await;
+    }
+    let answer = origin(
+        &node,
+        &node.owner,
+        HeaderMap::new(),
+        BUCKET,
+        "ref.txt",
+        None,
+    )
+    .await
+    .unwrap();
+    let bare = "https://s3.example.org/lab/a.txt";
+    let source = answer.source.as_ref().unwrap();
+    assert_eq!(source.url.as_deref(), Some(bare));
+    assert_eq!(source.sources[0].url.as_deref(), Some(bare));
+    let text = serde_json::to_string(&answer).unwrap();
+    for secret in ["reader", "hunter2", "t0ken", "s1g", "token", "Signature"] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    let based_on =
+        |item: &ProjectionBody| matches!(item, ProjectionBody::BasedOn { id } if id == bare);
+    assert!(answer.projection.iter().any(based_on), "{text}");
+}

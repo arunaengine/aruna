@@ -256,3 +256,29 @@ fn served_http_server() {
     descriptor.kind = SourceConnectorKind::LocalDirectory;
     assert_eq!(SourcePin::served(&descriptor).url, None);
 }
+
+// User info, query and fragment of an endpoint never reach a source URL or pin.
+#[test]
+fn credentials_stripped() {
+    use crate::structs::execution::source_connector::SourceConnectorKind;
+    use std::collections::HashMap;
+    let endpoint = "https://user:pass@s3.example.org/store?token=abc&X-Amz-Signature=def#sig=x";
+    let descriptor = PortableSourceDescriptor {
+        kind: SourceConnectorKind::S3,
+        public_config: HashMap::from([
+            ("endpoint".to_string(), endpoint.to_string()),
+            ("bucket".to_string(), "lab".to_string()),
+            ("skip_signature".to_string(), "true".to_string()),
+        ]),
+        source_path: "a.txt".to_string(),
+        version_selector: None,
+        namespace: None,
+        capabilities: Vec::new(),
+        origin_node_id: None,
+        root: None,
+    };
+    let bare = "https://s3.example.org/store/lab/a.txt";
+    assert_eq!(public_source_url(&descriptor).as_deref(), Some(bare));
+    assert_eq!(SourcePin::of(&descriptor).url.as_deref(), Some(bare));
+    assert_eq!(SourcePin::served(&descriptor).url.as_deref(), Some(bare));
+}
