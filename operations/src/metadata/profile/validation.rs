@@ -10,9 +10,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::VALIDATION_STATUS_KEYSPACE;
 use aruna_core::metadata::{
-    MetadataError, MetadataRawRevision, MetadataValidationViolation, ProfileValidationCompleteness,
-    ProfileValidationFinding, ProfileValidationSeverity, ProfileValidationState,
-    ProfileValidationStatus, is_rocrate_specification,
+    MetadataBatch, MetadataError, MetadataQuadOp, MetadataRawRevision, MetadataValidationViolation,
+    ProfileValidationCompleteness, ProfileValidationFinding, ProfileValidationSeverity,
+    ProfileValidationState, ProfileValidationStatus, is_rocrate_specification,
 };
 use aruna_core::storage_entries::{profile_validation_entry, profile_validation_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -27,7 +27,7 @@ use crate::driver::DriverContext;
 use crate::metadata::MetadataHandle;
 use crate::metadata::api::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
-use crate::metadata::forward::export_profile_routed;
+use crate::metadata::forward::{PROFILE_DOCUMENT_PREFIX, export_profile_routed};
 use crate::metadata::profile::shacl::{
     ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
 };
@@ -161,6 +161,37 @@ pub(crate) fn submission_profile_tag(jsonld: &str) -> bool {
     data_graph(jsonld)
         .map(|(data, root)| !profile_tags(&data, &root).is_empty())
         .unwrap_or(true)
+}
+
+/// Refuses a Profile root outside `profiles/`, the only path clients list as Profiles.
+pub(crate) fn profile_path_rule(
+    document_path: &str,
+    profile: impl FnOnce() -> bool,
+) -> Result<(), MetadataError> {
+    let path = MetadataRegistryRecord::normalize_document_path(document_path);
+    if path.starts_with(PROFILE_DOCUMENT_PREFIX) || !profile() {
+        return Ok(());
+    }
+    Err(MetadataError::InvalidInput(
+        "Profiles must be stored under profiles/; use a document path that starts with profiles/"
+            .to_string(),
+    ))
+}
+
+pub(crate) fn crate_is_profile(jsonld: &str) -> bool {
+    data_graph(jsonld).is_ok_and(|(data, root)| has_type(&data, &root, DX_PROFILE))
+}
+
+pub(crate) fn batch_adds_profile(batch: &MetadataBatch) -> bool {
+    let (root, rdf_type, profile) = (
+        format!("<{}>", batch.graph_iri),
+        format!("<{RDF_TYPE}>"),
+        format!("<{DX_PROFILE}>"),
+    );
+    batch.ops.iter().any(|op| {
+        matches!(op, MetadataQuadOp::Add { subject, predicate, object, .. }
+            if *subject == root && *predicate == rdf_type && *object == profile)
+    })
 }
 
 pub async fn validate_submission(

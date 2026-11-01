@@ -43,7 +43,8 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::persistent_id::{mapping_revision, mapping_route_for, transition_entries};
 use crate::metadata::profile::validation::{
-    not_profiled_status, submission_profile_tag, validate_submission,
+    crate_is_profile, not_profiled_status, profile_path_rule, submission_profile_tag,
+    validate_submission,
 };
 use crate::metadata::projector::schedule_projection_drain;
 use crate::metadata::repository::{create_projection_entries, read_document_registry};
@@ -1004,6 +1005,12 @@ impl Operation for CreateDocumentOperation {
     type Error = CreateDocumentError;
 
     fn start(&mut self) -> Effects {
+        if let CreateDocumentPayload::RoCrate { jsonld } = &self.config.payload
+            && let Err(error) =
+                profile_path_rule(&self.config.document_path, || crate_is_profile(jsonld))
+        {
+            return self.fail_without_cleanup(error.into());
+        }
         self.validation_effect()
     }
 
@@ -1746,6 +1753,60 @@ mod tests {
         assert_ne!(
             mappings[0].pid,
             MetadataRegistryRecord::graph_iri_for(document_id)
+        );
+    }
+
+    fn profile_config(document_path: &str) -> CreateDocumentConfig {
+        let realm_id = RealmId([13u8; 32]);
+        let document_id = Ulid::generate();
+        let mut config = config(actor(realm_id, 8), GroupId::generate(), document_id);
+        config.document_path = document_path.to_string();
+        config.payload = CreateDocumentPayload::RoCrate {
+            jsonld: serde_json::json!({
+                "@context": "https://w3id.org/ro/crate/1.2/context",
+                "@graph": [
+                    {
+                        "@id": "ro-crate-metadata.json",
+                        "@type": "CreativeWork",
+                        "about": {"@id": "./"}
+                    },
+                    {
+                        "@id": "./",
+                        "@type": ["Dataset", "http://www.w3.org/ns/dx/prof/Profile"]
+                    }
+                ]
+            })
+            .to_string(),
+        };
+        config
+    }
+
+    #[test]
+    fn refuses_profile_outside() {
+        let mut operation =
+            CreateDocumentOperation::new_generated_id(profile_config("resolver-check/profile"));
+
+        assert!(operation.start().is_empty());
+        let Err(CreateDocumentError::MetadataError(MetadataError::InvalidInput(message))) =
+            operation.finalize()
+        else {
+            panic!("expected the Profile path refusal");
+        };
+        assert!(message.contains("Profiles must be stored under profiles/"));
+    }
+
+    #[test]
+    fn accepts_profile_inside() {
+        let mut operation =
+            CreateDocumentOperation::new_generated_id(profile_config("/profiles/example/"));
+
+        let effects = operation.start();
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Metadata(MetadataEffect::ValidateRoCrate { .. })]
+            ),
+            "expected crate validation, got {effects:?}"
         );
     }
 

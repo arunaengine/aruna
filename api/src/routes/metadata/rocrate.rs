@@ -527,7 +527,7 @@ as none."#,
                 )
             )
         ),
-        (status = 400, description = "Malformed body, a document id that is not a structured metadata id, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
+        (status = 400, description = "Malformed body, a document id that is not a structured metadata id, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, a Profile root (prof:Profile) for a document outside profiles/, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token, or a holder rejected the forwarded credential", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
         (status = 404, description = "No holder knows this document", body = ErrorResponse),
@@ -645,7 +645,7 @@ caller's own token.
                 )
             )
         ),
-        (status = 400, description = "Malformed body, a body that is not a single JSON-LD object or that contains @graph, a document id that is not a structured metadata id, or RO-Crate violations listed in the error body", body = ErrorResponse),
+        (status = 400, description = "Malformed body, a body that is not a single JSON-LD object or that contains @graph, a document id that is not a structured metadata id, a Profile type (prof:Profile) on the root of a document outside profiles/, or RO-Crate violations listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token, or a holder rejected the forwarded credential", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
         (status = 404, description = "No holder knows this document", body = ErrorResponse),

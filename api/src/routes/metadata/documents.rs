@@ -131,7 +131,7 @@ text of at most 4096 bytes after trimming; an empty message counts as none."#,
                 )
             )
         ),
-        (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, an invalid storage location bucket or prefix, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
+        (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, an invalid storage location bucket or prefix, a Profile root (prof:Profile) at a path outside profiles/, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is denied on the group's metadata path, the new document's path or the chosen storage location", body = ErrorResponse),
         (status = 404, description = "The chosen storage location names a bucket this node does not have", body = ErrorResponse),
