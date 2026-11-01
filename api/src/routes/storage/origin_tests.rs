@@ -677,3 +677,78 @@ async fn reads_global_version() {
         Err(ServerError::NotFound | ServerError::ServiceUnavailableReason(_))
     ));
 }
+
+/// Marks the current version of `key` as a result of `run`.
+async fn written_by(node: &Node, key: &str, run: u8) {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+    use aruna_core::structs::storage::blob::{
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
+    };
+    let context = node.state.get_ctx();
+    let read = |key_space: &str, key: Vec<u8>| {
+        let read = StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        };
+        let storage = context.storage_handle.clone();
+        async move {
+            match storage.send_storage_effect(read).await {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => value.unwrap().to_vec(),
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    let head = BlobHeadKey::new(BUCKET, key).to_bytes().unwrap();
+    let pointer = CurrentVersionPointer::from_bytes(&read(BLOB_HEAD_KEYSPACE, head).await);
+    let row = VersionKey::new(BUCKET, key, pointer.unwrap().version_id).to_bytes();
+    let row = row.unwrap();
+    let mut version = BlobVersion::from_bytes(&read(BLOB_VERSIONS_KEYSPACE, row.clone()).await);
+    let version = version.as_mut().unwrap();
+    version.origin = Some(VersionOrigin::Job {
+        run_id: Ulid::from_bytes([run; 16]),
+    });
+    let bytes = version.to_bytes().unwrap();
+    crate::tests::distributed::write(&node.state, BLOB_VERSIONS_KEYSPACE, row, bytes).await;
+}
+
+#[tokio::test]
+async fn lists_writing_runs() {
+    // The runs that wrote current files under a prefix are named once each, newest first.
+    let node = node_state().await;
+    for key in ["out/a/1.txt", "out/a/2.txt", "out/b/1.txt", "in/x.txt"] {
+        store(&node, key).await;
+    }
+    written_by(&node, "out/a/1.txt", 1).await;
+    written_by(&node, "out/a/2.txt", 1).await;
+    written_by(&node, "out/b/1.txt", 2).await;
+    let runs = |auth: Option<AuthContext>, prefix: &str| {
+        get_bucket_runs(
+            State(node.state.clone()),
+            Extension(auth),
+            Path(BUCKET.to_string()),
+            Query(BucketRunsParams {
+                prefix: prefix.to_string(),
+            }),
+        )
+    };
+    let named = |response: BucketRunsResponse| {
+        let runs = response.runs.into_iter().map(|run| run.run_id);
+        (runs.collect::<Vec<_>>(), response.complete)
+    };
+    let id = |run: u8| Ulid::from_bytes([run; 16]).to_string();
+    let Json(all) = runs(Some(node.owner.clone()), "").await.unwrap();
+    assert_eq!(named(all), (vec![id(2), id(1)], true));
+    let Json(one) = runs(Some(node.owner.clone()), "out/a/").await.unwrap();
+    assert_eq!(named(one), (vec![id(1)], true));
+    let Json(none) = runs(Some(node.owner.clone()), "in/").await.unwrap();
+    assert_eq!(named(none), (Vec::new(), true));
+    let stranger = runs(Some(node.stranger.clone()), "").await;
+    assert!(matches!(stranger, Err(ServerError::Forbidden)));
+    assert!(matches!(
+        runs(None, "").await,
+        Err(ServerError::Unauthorized)
+    ));
+}

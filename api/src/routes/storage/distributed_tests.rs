@@ -495,6 +495,40 @@ mod routes {
     }
 
     #[tokio::test]
+    async fn signed_out_status() {
+        // Signed out, the set shows only where a public role grants READ on the bucket, and a
+        // private and an absent bucket answer 401 alike.
+        use crate::tests::distributed::{LOCAL, node_id};
+        use crate::tests::routes::open_paths;
+        use aruna_core::structs::identity::auth::Actor;
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let signed_out = |bucket: &str| {
+            get_bucket_distribution(
+                State(node.state.clone()),
+                Extension(None),
+                Path(bucket.to_string()),
+            )
+        };
+        for bucket in [BUCKET, "absent"] {
+            let refused = signed_out(bucket).await;
+            assert!(matches!(refused, Err(ServerError::Unauthorized)));
+        }
+        let realm_id = node.owner.realm_id;
+        let actor = Actor {
+            node_id: node_id(LOCAL),
+            user_id: node.owner.user_id,
+            realm_id,
+        };
+        let path = bucket_permission_path(realm_id, node.group_id, node_id(LOCAL), BUCKET);
+        open_paths(&node.state.get_ctx(), &actor, node.group_id, &[path]).await;
+        let Json(open) = signed_out(BUCKET).await.unwrap();
+        assert_eq!(open.bucket, BUCKET);
+        let absent = signed_out("absent").await;
+        assert!(matches!(absent, Err(ServerError::Unauthorized)));
+    }
+
+    #[tokio::test]
     async fn admission_retry_checks() {
         let node = node_state().await;
         let set_id = distribute(&node.state, node.group_id, BUCKET)

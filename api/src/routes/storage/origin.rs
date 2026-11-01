@@ -24,7 +24,7 @@ use aruna_operations::distribution::resolve::{
     GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version,
 };
 use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
-use aruna_operations::s3::object::origin::{OriginError, OriginView, read_origin};
+use aruna_operations::s3::object::origin::{OriginError, OriginView, bucket_runs, read_origin};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
@@ -66,6 +66,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_origin))
         .routes(routes!(get_version_origin))
         .routes(routes!(get_sources))
+        .routes(routes!(get_bucket_runs))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -847,6 +848,94 @@ pub async fn get_sources(
             })
             .collect(),
         complete,
+    }))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct BucketRunsParams {
+    /// Only files whose key starts with this; empty or absent for the whole bucket.
+    #[serde(default)]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BucketRunBody {
+    /// The job id of the run, as `GET /compute/runs/{run_id}` takes it.
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BucketRunsResponse {
+    pub runs: Vec<BucketRunBody>,
+    /// Every current file under the prefix was read and no run was left out.
+    pub complete: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/runs",
+    tag = "data/storage",
+    summary = "List the runs that wrote a bucket's files",
+    description = r#"Lists the compute runs whose results are current files of the bucket under a prefix, as their origins record them.
+
+**Authentication**: realm bearer token with READ on the bucket, or on the prefix it lists.
+Without a token, READ granted by public roles applies, and a refusal answers 401.
+
+**Behavior**
+- Asked on a node that holds the bucket; another node answers 404. A distributed bucket is
+  answered from the ranges this node holds, so `complete` is false for it.
+- Runs are newest first. Files that a later upload replaced count no more.
+
+**Limits**
+- At most 5000 current files are read and at most 50 runs named; `complete` is false when
+  either limit cut the answer."#,
+    params(
+        ("bucket" = String, Path, description = "Bucket name on this node"),
+        BucketRunsParams
+    ),
+    responses(
+        (status = 200, description = "The runs that wrote current files under the prefix", body = BucketRunsResponse, example = json!({
+            "runs": [{ "run_id": "01JJRSTVWXYZ0123456789ABCD" }],
+            "complete": true
+        })),
+        (status = 401, description = "Invalid bearer token, or no public READ without one", body = ErrorResponse),
+        (status = 403, description = "No READ on the bucket or the prefix", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ())
+)]
+pub async fn get_bucket_runs(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+    Query(params): Query<BucketRunsParams>,
+) -> ServerResult<Json<BucketRunsResponse>> {
+    // Signed out, only public roles grant READ, and a refusal hides whether the bucket exists.
+    let signed_out = auth.is_none();
+    let auth = auth.unwrap_or_else(|| AuthContext::anonymous(state.get_realm_id()));
+    let auth = require_realm_auth(&state, Some(auth))?;
+    let hidden = |error| match error {
+        ServerError::NotFound | ServerError::Forbidden if signed_out => ServerError::Unauthorized,
+        error => error,
+    };
+    let info = bucket_info(&state, &bucket).await.map_err(hidden)?;
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let path = match params.prefix.is_empty() {
+        true => bucket_permission_path(realm_id, info.group_id, node_id, &bucket),
+        false => object_permission_path(realm_id, info.group_id, node_id, &bucket, &params.prefix),
+    };
+    ensure_permission(&state, &auth, path, Permission::READ)
+        .await
+        .map_err(hidden)?;
+    let found = bucket_runs(state.get_ctx().as_ref(), &bucket, &params.prefix)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let runs = found.run_ids.iter().map(|run_id| BucketRunBody {
+        run_id: run_id.to_string(),
+    });
+    Ok(Json(BucketRunsResponse {
+        runs: runs.collect(),
+        complete: found.complete && info.distribution.is_none(),
     }))
 }
 

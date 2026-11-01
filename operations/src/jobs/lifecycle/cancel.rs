@@ -105,6 +105,22 @@ async fn cancel_authority(
     .map(|()| CancelAuthority::GroupAdmin)
 }
 
+/// Records that the submitter deleted a finished run, so every holder answers it as absent.
+/// `Ok` without a record when the job has no family here.
+pub async fn publish_deletion(
+    context: &DriverContext,
+    auth: &AuthContext,
+    job_id: JobId,
+) -> Result<(), JobRouteError> {
+    let Some((_, spec)) = family_projection(context, job_id).await? else {
+        return Ok(());
+    };
+    if spec.created_by != auth.user_id {
+        return Err(JobRouteError::NotFound);
+    }
+    publish_cancel(context, &spec, auth, CancelAuthority::Deletion).await
+}
+
 /// Signs and appends the cancellation. Only a current family holder may author
 /// it, so a node that does not hold the family reports availability instead.
 async fn publish_cancel(
@@ -129,6 +145,12 @@ async fn publish_cancel(
     let view = FamilyView::resolve(&config, realm_id, family).ok_or_else(|| {
         JobRouteError::Unavailable("job family holder view unavailable".to_string())
     })?;
+    // A forwarded cancel names no deletion, so only a holder records one.
+    if !view.holds(local) && authority == CancelAuthority::Deletion {
+        return Err(JobRouteError::Unavailable(
+            "this node does not hold the job family".to_string(),
+        ));
+    }
     if !view.holds(local) {
         for holder in view
             .holders()

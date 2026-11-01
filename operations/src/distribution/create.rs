@@ -106,6 +106,12 @@ pub fn plan_layout(set_id: Ulid, input: &CreateInput) -> Result<Layout, Distribu
     let nodes = assign(&input.nodes);
     let mut layout = match &input.layout {
         LayoutKind::Replica => replica_layout(set_id, &nodes)?,
+        // Each range has one coordinator, and every sharding member must coordinate one.
+        LayoutKind::Sharding { boundaries, .. } if boundaries.len() + 1 < nodes.len() => {
+            return Err(DistributionError::Malformed(
+                "every member needs a range: give one boundary per member after the first",
+            ));
+        }
         LayoutKind::Sharding {
             boundaries,
             replicas,

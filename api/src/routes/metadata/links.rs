@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
+use crate::auth::{ValidatedBearer, ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{bearer_token_string, map_api_error};
 use crate::routes::storage::deletion::bucket_info;
@@ -466,7 +466,8 @@ pub struct PartTargetResponse {
     description = r#"Resolves the identifier of a linked part, a bucket root or a folder, to the bucket and prefix whose files it covers.
 
 **Authentication**: realm bearer token. Listing the files afterwards needs READ on the bucket
-on the node that serves them; resolving grants nothing.
+on the node that serves them; resolving grants nothing. Without a token, only a part that
+public roles grant READ on resolves, and any other part answers 401 as an absent one does.
 
 **Behavior**
 - A distributed bucket is named by its set and browsed on any member; `held_here` says whether
@@ -486,22 +487,28 @@ on the node that serves them; resolving grants nothing.
             "held_here": true
         })),
         (status = 400, description = "`id` names no bucket or prefix", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
+        (status = 401, description = "Invalid bearer token, or no public READ on the part without one", body = ErrorResponse)
     ),
-    security(("bearer_auth" = []))
+    security(("bearer_auth" = []), ())
 )]
 pub async fn part_target(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Query(params): Query<PartTargetParams>,
 ) -> ServerResult<Json<PartTargetResponse>> {
-    require_realm_auth(&state, auth)?;
+    let signed_out = auth.is_none();
+    let auth = auth.unwrap_or_else(|| AuthContext::anonymous(state.get_realm_id()));
+    let auth = require_realm_auth(&state, Some(auth))?;
     let link = DataLink::parse(params.id.trim())
         .filter(|link| link.scope().is_some())
         .ok_or_else(|| ServerError::BadRequestReason("id names no bucket or prefix".to_string()))?;
     let target = resolve_part(state.get_ctx().as_ref(), state.get_node_id(), link)
         .await
         .map_err(map_api_error)?;
+    // Signed out, a part resolves only where public roles grant READ on it here.
+    if signed_out && !any_granted(&state, &auth, &target.read_paths).await? {
+        return Err(ServerError::Unauthorized);
+    }
     let set_id = match &target.link {
         DataLink::SetPrefix { set_id, .. } => Some(set_id.to_string()),
         _ => None,
@@ -514,6 +521,19 @@ pub async fn part_target(
         node_id: target.node_id.map(|node| node.to_string()),
         held_here: target.held_here,
     }))
+}
+
+async fn any_granted(
+    state: &ServerState,
+    auth: &AuthContext,
+    paths: &[String],
+) -> ServerResult<bool> {
+    for path in paths {
+        if permission_granted(state, auth, path.clone(), Permission::READ).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

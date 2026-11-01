@@ -346,3 +346,27 @@ async fn remote_run_untouched() {
 
     assert!(!flagged(&ctx).await);
 }
+
+#[tokio::test]
+async fn deletion_hides_family() {
+    // Once its submitter deleted the run, a read by id answers absent; nobody else may delete.
+    use crate::jobs::JobRouteError;
+    use crate::jobs::lifecycle::cancel::publish_deletion;
+    use crate::jobs::lifecycle::report::family_report;
+    let family = Family::new([43u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.holder).await;
+    seed_family(&ctx, &family).await;
+    let job_id = family.spec().job_id;
+    let owner = auth(user());
+    let read = || family_report(&ctx, &owner, job_id);
+    assert!(matches!(read().await, Some(Ok(_))));
+    let stranger = auth(UserId::local(ulid::Ulid::from_bytes([44; 16]), REALM));
+    let refused = publish_deletion(&ctx, &stranger, job_id).await;
+    assert_eq!(refused, Err(JobRouteError::NotFound));
+    assert!(matches!(read().await, Some(Ok(_))));
+
+    publish_deletion(&ctx, &owner, job_id)
+        .await
+        .expect("deletion publishes");
+    assert!(matches!(read().await, Some(Err(JobRouteError::NotFound))));
+}

@@ -232,11 +232,23 @@ pub struct CreateRoCrateRequest {
     pub storage_location: Option<StorageLocationRequest>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum CreateMetadataRequest {
     Scaffold(CreateScaffoldRequest),
     RoCrate(CreateRoCrateRequest),
+}
+
+impl<'de> Deserialize<'de> for CreateMetadataRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A body with `rocrate` is a crate and any other a scaffold, so an error names its field.
+        let value = Value::deserialize(deserializer)?;
+        let request = match value.get("rocrate").is_some() {
+            true => serde_json::from_value(value).map(Self::RoCrate),
+            false => serde_json::from_value(value).map(Self::Scaffold),
+        };
+        request.map_err(serde::de::Error::custom)
+    }
 }
 
 /// Response for a metadata create request accepted into the durable
