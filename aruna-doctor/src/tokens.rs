@@ -334,6 +334,7 @@ async fn exchange_oidc_token(
         .bearer_auth(oidc_token)
         .json(&RegisterUserRequest {
             onboarding_secret: None,
+            create_new: false,
         })
         .send()
         .await?
@@ -364,6 +365,7 @@ async fn exchange_bootstrap_token(
         .bearer_auth(oidc_token)
         .json(&RegisterUserRequest {
             onboarding_secret: Some(onboarding_secret),
+            create_new: false,
         })
         .send()
         .await?
