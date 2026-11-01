@@ -94,6 +94,9 @@ fn map_merge_error(error: MergeError) -> ServerError {
         MergeError::VaultPresent => {
             ServerError::Refused(StatusCode::CONFLICT, "vault_present", message)
         }
+        MergeError::RoleConflict(_) => {
+            ServerError::Refused(StatusCode::CONFLICT, "role_conflict", message)
+        }
         MergeError::NotFound => ServerError::NotFound,
         MergeError::NotManagementNode => ServerError::Forbidden,
         MergeError::Storage(_) | MergeError::Vault(_) | MergeError::PlacementFenced => {
@@ -122,7 +125,9 @@ that account. Both prove control; a matching email or name is never enough.
   secondary never points at another secondary.
 - The other account's sign-ins move to the primary: its next sign-in opens the primary.
 - Its group and realm roles move to the primary. A role is added only where it grants the primary
-  more than its own roles; the primary never loses a role.
+  more than its own roles; the primary never loses a role. A deny of the other account that
+  overlaps a moved grant moves with it, and one that would also cut the primary's own access
+  refuses the merge.
 - Its devices are re-owned by the primary and must sign in again.
 - Profile and preference attributes the primary lacks are copied.
 - Every bearer token, S3 credential and S3 session of the other account issued up to five minutes
@@ -148,7 +153,7 @@ that account. Both prove control; a matching email or name is never enough.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A login is too old, the other token is invalid or of another realm, both name the same account, or an account is deactivated or a service account (code `merge_refused`)", body = ErrorResponse),
         (status = 404, description = "This node holds no record of one of the accounts", body = ErrorResponse),
-        (status = 409, description = "The other account still holds a vault (code `vault_present`)", body = ErrorResponse),
+        (status = 409, description = "The other account still holds a vault (code `vault_present`), or a role of it denies part of what it hands over and part of the caller's own access (code `role_conflict`, naming the role)", body = ErrorResponse),
         (status = 503, description = "Storage or the vault holders were unavailable, or a document moved during the merge; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

@@ -30,39 +30,112 @@ pub(super) fn check_accounts(survivor: &User, merged: &User) -> Result<bool, Mer
     Ok(false)
 }
 
-/// The roles `merged` holds, and those of them that grant `survivor` a path above its own level.
-pub(super) fn handed_roles(
-    roles: &HashMap<RoleId, Role>,
+/// The roles `merged` holds in each document and those handed to `survivor`, realm first. A
+/// role is handed when it grants a path above the survivor's level, and so is every deny of
+/// `merged`, in any document, that overlaps a handed grant, since a deny wins over any grant.
+/// A handed deny that also overlaps a grant of the survivor is refused, naming its role.
+pub(super) fn hand_over(
+    documents: &[&HashMap<RoleId, Role>],
     survivor: UserId,
     merged: UserId,
-) -> (Vec<RoleId>, Vec<RoleId>) {
+) -> Result<Vec<(Vec<RoleId>, Vec<RoleId>)>, MergeError> {
+    let holds = |user: UserId| {
+        documents
+            .iter()
+            .flat_map(|roles| roles.values())
+            .filter(move |role| role.assigned_users.contains(&user))
+    };
     let mut own = HashMap::<&str, u8>::new();
-    for role in roles.values() {
-        if role.assigned_users.contains(&survivor) {
-            for (path, permission) in &role.permissions {
-                let best = own.entry(path.as_str()).or_default();
-                *best = (*best).max(level(permission));
+    for (path, permission) in holds(survivor).flat_map(|role| role.permissions.iter()) {
+        let best = own.entry(path.as_str()).or_default();
+        *best = (*best).max(level(permission));
+    }
+    let grants_more = |role: &Role| {
+        role.permissions.iter().any(|(path, permission)| {
+            level(permission) > own.get(path.as_str()).copied().unwrap_or_default()
+        })
+    };
+    let mut plans: Vec<(Vec<RoleId>, Vec<RoleId>)> = documents
+        .iter()
+        .map(|roles| {
+            let mut held: Vec<RoleId> = roles
+                .iter()
+                .filter(|(_, role)| role.assigned_users.contains(&merged))
+                .map(|(role_id, _)| *role_id)
+                .collect();
+            held.sort();
+            let handed = held
+                .iter()
+                .copied()
+                .filter(|role_id| grants_more(&roles[role_id]))
+                .collect();
+            (handed, held)
+        })
+        .collect();
+    let granted: Vec<&str> = documents
+        .iter()
+        .zip(&plans)
+        .flat_map(|(roles, (handed, _))| handed.iter().map(|role_id| &roles[role_id]))
+        .flat_map(|role| grant_paths(role))
+        .collect();
+    for (roles, (handed, held)) in documents.iter().zip(plans.iter_mut()) {
+        for role_id in held.iter() {
+            let denies = deny_paths(&roles[role_id]);
+            if !handed.contains(role_id)
+                && denies
+                    .iter()
+                    .any(|deny| granted.iter().any(|grant| overlaps(deny, grant)))
+            {
+                handed.push(*role_id);
+            }
+        }
+        handed.sort();
+    }
+    let own_grants: Vec<&str> = holds(survivor).flat_map(grant_paths).collect();
+    for (roles, (handed, _)) in documents.iter().zip(&plans) {
+        for role in handed.iter().map(|role_id| &roles[role_id]) {
+            if deny_paths(role)
+                .iter()
+                .any(|deny| own_grants.iter().any(|grant| overlaps(deny, grant)))
+            {
+                return Err(MergeError::RoleConflict(role.name.clone()));
             }
         }
     }
-    let mut held: Vec<RoleId> = roles
-        .iter()
-        .filter(|(_, role)| role.assigned_users.contains(&merged))
-        .map(|(role_id, _)| *role_id)
-        .collect();
-    held.sort();
-    let handed = held
-        .iter()
-        .copied()
-        .filter(|role_id| {
-            roles[role_id].permissions.iter().any(|(path, permission)| {
-                level(permission) > own.get(path.as_str()).copied().unwrap_or_default()
-            })
-        })
-        .collect();
-    (handed, held)
+    Ok(plans)
 }
 
+fn grant_paths(role: &Role) -> Vec<&str> {
+    role.permissions
+        .iter()
+        .filter(|(_, permission)| **permission != Permission::DENY)
+        .map(|(path, _)| path.as_str())
+        .collect()
+}
+
+fn deny_paths(role: &Role) -> Vec<&str> {
+    role.permissions
+        .iter()
+        .filter(|(_, permission)| **permission == Permission::DENY)
+        .map(|(path, _)| path.as_str())
+        .collect()
+}
+
+/// Whether two path patterns may match a common path, judged by their literal prefixes; it
+/// errs towards an overlap, so a doubtful deny is kept or refused, never dropped.
+fn overlaps(left: &str, right: &str) -> bool {
+    let literal = |pattern: &'_ str| {
+        pattern
+            .split(['*', '?', '[', ']', '{', '}', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (left, right) = (literal(left), literal(right));
+    left.starts_with(&right) || right.starts_with(&left)
+}
+
+/// Grant levels; a deny never counts as a grant and is handled apart.
 fn level(permission: &Permission) -> u8 {
     match permission {
         Permission::DENY => 0,

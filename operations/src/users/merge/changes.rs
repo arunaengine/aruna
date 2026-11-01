@@ -16,11 +16,11 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, GroupId, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, RoleId, TxnId, Value};
 use aruna_core::user::validation::{DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX};
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
 use crate::placement::target_placement_ref;
@@ -53,11 +53,22 @@ impl MergeUsersOperation {
             });
         }
         let mut outcome = self.empty_outcome(false);
+        // Realm and group roles are decided together, since a realm deny also limits group paths.
+        let none = HashMap::new();
+        let realm_roles = documents
+            .realm_auth
+            .as_ref()
+            .map_or(&none, |auth| &auth.roles);
+        let all_roles: Vec<_> = std::iter::once(realm_roles)
+            .chain(self.groups.iter().map(|group| &group.roles))
+            .collect();
+        let mut plans = plan::hand_over(&all_roles, self.survivor_id(), self.merged_id())?;
+        let realm_plan = plans.remove(0);
         let subjects = documents.merged.subject_ids.clone();
         self.stage_users(&mut documents, &mut outcome)?;
         self.stage_claims(&subjects, claims)?;
-        self.stage_realm(&mut documents, &mut outcome)?;
-        self.stage_groups(group_states, &documents.config, &mut outcome)?;
+        self.stage_realm(&mut documents, &mut outcome, realm_plan)?;
+        self.stage_groups(group_states, &documents.config, &mut outcome, &plans)?;
         self.stage_devices(&mut documents, &mut outcome)?;
         self.outcome = Some(outcome);
         self.state = MergeState::Write { txn_id };
@@ -250,12 +261,12 @@ impl MergeUsersOperation {
         &mut self,
         documents: &mut Documents,
         outcome: &mut MergeOutcome,
+        (handed, held): (Vec<RoleId>, Vec<RoleId>),
     ) -> Result<(), MergeError> {
         let Some(realm_auth) = documents.realm_auth.as_mut() else {
             return Ok(());
         };
         let (survivor, merged) = (self.survivor_id(), self.merged_id());
-        let (handed, held) = plan::handed_roles(&realm_auth.roles, survivor, merged);
         if held.is_empty() {
             return Ok(());
         }
@@ -291,21 +302,16 @@ impl MergeUsersOperation {
         states: &[(ByteView, Option<Value>)],
         config: &RealmConfigDocument,
         outcome: &mut MergeOutcome,
+        plans: &[(Vec<RoleId>, Vec<RoleId>)],
     ) -> Result<(), MergeError> {
         let (survivor, merged) = (self.survivor_id(), self.merged_id());
         let actor = self.acting(merged);
         let mut groups = std::mem::take(&mut self.groups);
         outcome.groups = groups.len();
-        for (group, (_, state)) in groups.iter_mut().zip(states) {
+        for ((group, (_, state)), (handed, held)) in groups.iter_mut().zip(states).zip(plans) {
             let group_id: GroupId = group.group_id;
-            let (handed, held) = plan::handed_roles(&group.roles, survivor, merged);
             let mut change = Change::new(state.as_ref(), AdminDocumentTarget::Group { group_id })?;
-            change.move_roles(
-                &actor,
-                &mut group.roles,
-                (&handed, &held),
-                (survivor, merged),
-            )?;
+            change.move_roles(&actor, &mut group.roles, (handed, held), (survivor, merged))?;
             let document = DocumentTarget::GroupAuthorization { group_id };
             let placement = self.placement(config, &document);
             self.batch.writes.push((

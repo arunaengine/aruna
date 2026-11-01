@@ -102,6 +102,11 @@ pub enum MergeError {
     Inactive,
     #[error("service accounts are never merged")]
     ServiceAccount,
+    #[error(
+        "the role {0} of the other account denies part of what it hands over and part of this \
+         account's own access; remove the deny or the role first"
+    )]
+    RoleConflict(String),
     #[error("the other account still holds a vault; move its entries and delete it first")]
     VaultPresent,
     #[error("the vault of the other account could not be read: {0}")]
