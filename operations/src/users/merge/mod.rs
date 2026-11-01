@@ -23,7 +23,7 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::AdminDocumentError;
 use aruna_core::storage_entries::{reducer_state_key, subject_index_key, sync_revision_key};
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Role};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
@@ -31,11 +31,12 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, TxnId, Value};
+use aruna_core::types::{Effects, RoleId, TxnId, Value};
 use aruna_core::user::validation::UserAttributeError;
 use aruna_core::{NodeId, UserId};
 use byteview::ByteView;
 use smallvec::smallvec;
+use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::info;
@@ -213,6 +214,8 @@ pub struct MergeUsersOperation {
     state: MergeState,
     documents: Option<Documents>,
     groups: Vec<GroupAuthorizationDocument>,
+    /// Roles of groups only the survivor holds a role in; they only limit which denies move.
+    survivor_groups: Vec<HashMap<RoleId, Role>>,
     batch: Batch,
     outcome: Option<MergeOutcome>,
     output: Option<Result<MergeOutcome, MergeError>>,
@@ -225,6 +228,7 @@ impl MergeUsersOperation {
             state: MergeState::Init,
             documents: None,
             groups: Vec::new(),
+            survivor_groups: Vec::new(),
             batch: Batch::default(),
             outcome: None,
             output: None,
@@ -424,12 +428,13 @@ impl MergeUsersOperation {
                 continue;
             }
             let document = GroupAuthorizationDocument::from_bytes(&value)?;
-            if document
-                .roles
-                .values()
-                .any(|role| role.assigned_users.contains(&merged))
-            {
+            let holds = |user: UserId| {
+                (document.roles.values()).any(|role| role.assigned_users.contains(&user))
+            };
+            if holds(merged) {
                 self.groups.push(document);
+            } else if holds(self.survivor_id()) {
+                self.survivor_groups.push(document.roles);
             }
         }
         if let Some(after) = next {

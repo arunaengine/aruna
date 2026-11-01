@@ -65,7 +65,8 @@ impl MergeUsersOperation {
         let all_roles: Vec<_> = std::iter::once(realm_roles)
             .chain(self.groups.iter().map(|group| &group.roles))
             .collect();
-        let mut plans = plan::hand_over(&all_roles, self.survivor_id(), self.merged_id())?;
+        let others: Vec<_> = self.survivor_groups.iter().collect();
+        let mut plans = plan::hand_over(&all_roles, &others, self.survivor_id(), self.merged_id())?;
         let realm_plan = plans.remove(0);
         let subjects = documents.merged.subject_ids.clone();
         self.stage_users(&mut documents, &mut outcome)?;

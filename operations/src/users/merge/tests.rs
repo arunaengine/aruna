@@ -193,13 +193,13 @@ fn conflict_keeps_higher_role() {
     let member = role("member", Permission::READ, &[survivor]);
     let admin = role("admin", Permission::WRITE, &[merged]);
     let roles_up = roles(vec![member.clone(), admin.clone()]);
-    let plans = plan::hand_over(&[&roles_up], survivor, merged).unwrap();
+    let plans = plan::hand_over(&[&roles_up], &[], survivor, merged).unwrap();
     assert_eq!(plans, vec![(vec![admin.role_id], vec![admin.role_id])]);
 
     let admin = role("admin", Permission::WRITE, &[survivor]);
     let member = role("member", Permission::READ, &[merged]);
     let roles_down = roles(vec![member.clone(), admin]);
-    let plans = plan::hand_over(&[&roles_down], survivor, merged).unwrap();
+    let plans = plan::hand_over(&[&roles_down], &[], survivor, merged).unwrap();
     assert_eq!(plans, vec![(Vec::new(), vec![member.role_id])]);
 }
 
@@ -214,7 +214,7 @@ fn deny_moves_with_grant() {
         &[merged],
     );
     let roles = roles(vec![all.clone(), secret.clone()]);
-    let plans = plan::hand_over(&[&roles], survivor, merged).unwrap();
+    let plans = plan::hand_over(&[&roles], &[], survivor, merged).unwrap();
     let mut expected = vec![all.role_id, secret.role_id];
     expected.sort();
     assert_eq!(plans[0].0, expected);
@@ -230,7 +230,7 @@ fn realm_deny_moves_with_group_grant() {
     );
     let grant = paths("all", &[("/r/g/1/**", Permission::WRITE)], &[merged]);
     let (realm, group) = (roles(vec![deny.clone()]), roles(vec![grant.clone()]));
-    let plans = plan::hand_over(&[&realm, &group], survivor, merged).unwrap();
+    let plans = plan::hand_over(&[&realm, &group], &[], survivor, merged).unwrap();
     assert_eq!(plans[0].0, vec![deny.role_id]);
     assert_eq!(plans[1].0, vec![grant.role_id]);
 }
@@ -252,8 +252,23 @@ fn deny_on_own_access_refused() {
     );
     let roles = roles(vec![own, all, secret]);
     assert_eq!(
-        plan::hand_over(&[&roles], survivor, merged),
+        plan::hand_over(&[&roles], &[], survivor, merged),
         Err(MergeError::RoleConflict("no-secret".to_string()))
+    );
+}
+
+#[test]
+fn realm_deny_on_other_group_refused() {
+    // A realm deny moving with B's grant would cut A's access in a group only A is in.
+    let (survivor, merged) = (id(1), id(2));
+    let deny = paths("no-groups", &[("/r/g/**", Permission::DENY)], &[merged]);
+    let grant = paths("g1", &[("/r/g/1/**", Permission::READ)], &[merged]);
+    let own = paths("own", &[("/r/g/2/**", Permission::WRITE)], &[survivor]);
+    let realm = roles(vec![deny, grant]);
+    let other = roles(vec![own]);
+    assert_eq!(
+        plan::hand_over(&[&realm], &[&other], survivor, merged),
+        Err(MergeError::RoleConflict("no-groups".to_string()))
     );
 }
 
@@ -263,7 +278,7 @@ fn unrelated_deny_stays() {
     let data = paths("data", &[("/r/g/1/data/**", Permission::READ)], &[merged]);
     let other = paths("no-other", &[("/r/g/2/**", Permission::DENY)], &[merged]);
     let roles = roles(vec![data.clone(), other]);
-    let plans = plan::hand_over(&[&roles], survivor, merged).unwrap();
+    let plans = plan::hand_over(&[&roles], &[], survivor, merged).unwrap();
     assert_eq!(plans[0].0, vec![data.role_id]);
 }
 

@@ -35,9 +35,11 @@ pub(super) fn check_accounts(survivor: &User, merged: &User) -> Result<bool, Mer
 /// The roles `merged` holds in each document and those handed to `survivor`, realm first. A
 /// role is handed when it grants a path above the survivor's level, and so is every deny of
 /// `merged`, in any document, that overlaps a handed grant, since a deny wins over any grant.
-/// A handed deny that also overlaps a grant of the survivor is refused, naming its role.
+/// A handed deny that also overlaps a grant of the survivor is refused, naming its role; the
+/// survivor's grants count from every document, `others` being those `merged` has no role in.
 pub(super) fn hand_over(
     documents: &[&HashMap<RoleId, Role>],
+    others: &[&HashMap<RoleId, Role>],
     survivor: UserId,
     merged: UserId,
 ) -> Result<Vec<(Vec<RoleId>, Vec<RoleId>)>, MergeError> {
@@ -93,7 +95,13 @@ pub(super) fn hand_over(
         }
         handed.sort();
     }
-    let own_grants: Vec<&str> = holds(survivor).flat_map(grant_paths).collect();
+    let own_grants: Vec<&str> = documents
+        .iter()
+        .chain(others)
+        .flat_map(|roles| roles.values())
+        .filter(|role| role.assigned_users.contains(&survivor))
+        .flat_map(grant_paths)
+        .collect();
     for (roles, (handed, _)) in documents.iter().zip(&plans) {
         for role in handed.iter().map(|role_id| &roles[role_id]) {
             if deny_paths(role)
