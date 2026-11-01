@@ -1074,7 +1074,10 @@ async fn import_records(
     let drain = fixture.driver.clone();
     let mut woken = pages.subscribe();
     let drain = tokio::spawn(async move {
-        while background {
+        if !background {
+            return;
+        }
+        loop {
             let drained = crate::replication::queue::process_blob_batch(&drain).await;
             if !drained.is_ok_and(|drained| drained.has_more_due) && woken.changed().await.is_err()
             {
