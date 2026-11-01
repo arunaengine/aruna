@@ -40,11 +40,11 @@ pub(crate) struct Compactor {
     pub(crate) stopping: Arc<AtomicBool>,
 }
 
-/// Keeps the compactions of one keyspace an interval apart. Work that comes sooner waits,
-/// merged per keyspace, until the interval has passed; sweeps never wait.
+/// Keeps the compactions of one keyspace an interval apart, from the end of one to the start of
+/// the next. Work that comes sooner waits, merged per keyspace; sweeps never wait.
 pub(crate) struct Spacing {
     interval: Duration,
-    /// When the last compaction of each keyspace started.
+    /// When the last compaction of each keyspace ended.
     last: HashMap<String, Instant>,
     waiting: HashMap<String, CompactionJob>,
 }
@@ -96,8 +96,8 @@ impl Spacing {
             .min()
     }
 
-    /// Notes that a compaction of `key_space` starts at `now`.
-    pub(crate) fn started(&mut self, key_space: &str, now: Instant) {
+    /// Notes that a compaction of `key_space` ended at `now`.
+    pub(crate) fn finished(&mut self, key_space: &str, now: Instant) {
         if key_space != SWEEP {
             self.last.insert(key_space.to_string(), now);
         }
@@ -137,8 +137,9 @@ impl Compactor {
                     if stop.load(Ordering::Acquire) {
                         return;
                     }
-                    spacing.started(&job.key_space, Instant::now());
+                    let key_space = job.key_space.clone();
                     run_job(job, &running);
+                    spacing.finished(&key_space, Instant::now());
                 }
             }
         });
@@ -345,7 +346,7 @@ mod tests {
         let at = |secs| start + Duration::from_secs(secs);
         let mut spacing = Spacing::new(Duration::from_secs(60));
         let first = spacing.offer(job("queue", 5_000), at(0));
-        spacing.started(&first.expect("the first runs at once").key_space, at(0));
+        spacing.finished(&first.expect("the first runs at once").key_space, at(0));
 
         assert!(spacing.offer(job("queue", 5_000), at(10)).is_none());
         assert!(spacing.offer(job("queue", 3_000), at(20)).is_none());
@@ -360,6 +361,22 @@ mod tests {
             .collect();
         assert_eq!(due, [("queue", 8_000)]);
         assert_eq!(spacing.next_due(), None);
+    }
+
+    // A compaction that ran long, or started late behind another keyspace, is followed by the
+    // next one only an interval after it ended.
+    #[test]
+    fn spaced_from_end() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut spacing = Spacing::new(Duration::from_secs(60));
+        assert!(spacing.offer(job("queue", 1), at(0)).is_some());
+        spacing.finished("queue", at(100));
+
+        assert!(spacing.offer(job("queue", 1), at(110)).is_none());
+        assert_eq!(spacing.next_due(), Some(at(160)));
+        assert!(spacing.due(at(159)).is_empty());
+        assert_eq!(spacing.due(at(160)).len(), 1);
     }
 
     // The thread runs waiting work once its interval passed, though no further job arrives.
