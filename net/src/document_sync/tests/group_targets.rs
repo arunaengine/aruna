@@ -1147,3 +1147,70 @@ async fn merge_grant_needs_role() {
         );
     }
 }
+
+#[tokio::test]
+async fn merged_removal_hands_subject() {
+    // The merged account's removal arrives before the primary's addition: the primary owns it.
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([63; 32]);
+    let merged = UserId::local(Ulid::from_parts(1_650, 1), realm_id);
+    let primary = UserId::local(Ulid::from_parts(1_651, 1), realm_id);
+    let actor = Actor {
+        node_id: node(9),
+        user_id: merged,
+        realm_id,
+    };
+    let record = User {
+        user_id: merged,
+        name: "Bob".to_string(),
+        subject_ids: vec!["subject-moved".to_string()],
+        alias_user_ids: Default::default(),
+        attributes: [(
+            aruna_core::user::validation::MERGED_INTO_ATTRIBUTE.to_string(),
+            primary.to_string(),
+        )]
+        .into(),
+    };
+    batch_write_to(
+        &storage,
+        vec![
+            (
+                USER_KEYSPACE.to_string(),
+                merged.to_bytes().into(),
+                record.to_bytes(&actor).expect("user serializes").into(),
+            ),
+            (
+                SUBJECT_INDEX_KEYSPACE.to_string(),
+                subject_index_key("subject-moved"),
+                subject_index_value(merged),
+            ),
+        ],
+    )
+    .await
+    .expect("merged user and index write");
+
+    let event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(1_652, 1),
+        target: AdminDocumentTarget::User { user_id: merged },
+        origin_node_id: actor.node_id,
+        origin_seq: 1,
+        observed: AdminDocumentClock::default(),
+        actor,
+        op: AdminDocumentOperation::SubjectIdRemoved {
+            subject_id: "subject-moved".to_string(),
+        },
+    };
+    apply_user_operation(&storage, DocumentTarget::User { user_id: merged }, event)
+        .await
+        .expect("subject remove applies");
+
+    assert_eq!(
+        read_storage_value(
+            &storage,
+            SUBJECT_INDEX_KEYSPACE,
+            subject_index_key("subject-moved")
+        )
+        .await,
+        Some(subject_index_value(primary))
+    );
+}

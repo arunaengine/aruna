@@ -116,13 +116,17 @@ impl MergeUsersOperation {
                 .insert(key.clone(), value.clone());
             survivor_ops.push(AdminDocumentOperation::UserAttributeSet { key, value });
         }
-        let mut merged_ops: Vec<_> = documents
+        // The pointer goes first: a peer that applies a removal after it hands the subject's
+        // claim to the survivor, even before the survivor's own addition arrives.
+        let mut merged_ops = point_at(&mut documents.merged, survivor, true);
+        let removals: Vec<_> = documents
             .merged
             .subject_ids
             .drain(..)
             .map(|subject_id| AdminDocumentOperation::SubjectIdRemoved { subject_id })
             .collect();
-        outcome.subjects = merged_ops.len();
+        outcome.subjects = removals.len();
+        merged_ops.extend(removals);
         // The survivor stays the one primary: the merged account and its secondaries point at it.
         let merged = documents.merged.user_id;
         let moved: Vec<UserId> = std::iter::once(merged)
@@ -157,7 +161,6 @@ impl MergeUsersOperation {
             documents.merged.attributes.remove(&key);
             merged_ops.push(AdminDocumentOperation::UserAttributeRemoved { key });
         }
-        merged_ops.extend(point_at(&mut documents.merged, survivor, true));
         let config = documents.config.clone();
         // Each account authors its own document, which peers accept as self-service.
         self.stage_user(

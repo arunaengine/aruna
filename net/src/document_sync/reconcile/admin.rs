@@ -327,6 +327,9 @@ pub(in crate::document_sync) async fn user_batch(
             claims.insert(user_id);
         } else {
             claims.remove(&user_id);
+            // A merged account hands the subject to its primary, so the subject never lacks an
+            // owner while the primary's own addition is still on its way.
+            claims.extend(user.merged_into());
         }
 
         if let Some(canonical_user_id) = claims.first().copied() {
