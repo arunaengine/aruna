@@ -642,8 +642,9 @@ initial realm administrator role.
   document sync, so it may not be visible elsewhere immediately.
 - No access token is returned: exchange the same OIDC token at `GET /access/token`.
 - When the subject is new and the provider marks the token's email verified, no account is created
-  while an active account has the same verified email or the same name. The answer is 409 with
-  code `account_match` and never says which account. Nothing is stored meanwhile.
+  while an active account has the same verified email or the same public name. A name the
+  account keeps private never matches. The answer is 409 with code `account_match` and never
+  says which account. Nothing is stored meanwhile.
 - The person then either signs in with the existing account and attaches this sign-in through
   `POST /access/users/me/subjects`, or repeats this call with `create_new: true`.
 - A token without a verified email never gets this answer and registers directly."#,

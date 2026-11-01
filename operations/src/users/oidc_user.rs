@@ -570,13 +570,12 @@ impl Operation for ResolveOidcOperation {
 }
 
 /// Whether an active personal account may be the person behind a new identity: the same
-/// verified email, or the same name ignoring case.
+/// verified email, or the same name where the directory shows it, so no private name is probed.
 fn may_match(user: &User, name: &str, email_hash: &str) -> bool {
     if user.is_deactivated() || user.service_group().is_some() {
         return false;
     }
-    let same_name = !name.trim().is_empty() && user.name.trim().eq_ignore_ascii_case(name.trim());
-    same_name
+    user.public_name_is(&name.trim().to_lowercase())
         || user
             .attributes
             .get(EMAIL_HASH_ATTRIBUTE)
@@ -649,6 +648,30 @@ mod tests {
     use byteview::ByteView;
     use std::collections::BTreeSet;
     use ulid::Ulid;
+
+    #[test]
+    fn private_name_never_matches() {
+        // A chosen display name must not probe for a private name; a verified email still matches.
+        let realm_id = aruna_core::structs::identity::realm::RealmId([5u8; 32]);
+        let mut user = User {
+            user_id: UserId::local(Ulid::from_bytes([6u8; 16]), realm_id),
+            name: "Anna Smith".to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: [(
+                aruna_core::user::validation::EMAIL_HASH_ATTRIBUTE.to_string(),
+                "hash".to_string(),
+            )]
+            .into(),
+        };
+        assert!(super::may_match(&user, " anna smith ", "other"));
+        user.attributes.insert(
+            format!("{}name", aruna_core::user::profile::VISIBILITY_PREFIX),
+            "private".to_string(),
+        );
+        assert!(!super::may_match(&user, "Anna Smith", "other"));
+        assert!(super::may_match(&user, "Someone", "hash"));
+    }
 
     #[tokio::test]
     async fn creates_user_index() {
