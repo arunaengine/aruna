@@ -231,6 +231,17 @@ async fn merge_moves_signin() {
     assert_eq!(profile["user"]["user_id"], alice.id.as_str());
     assert_eq!(profile["merged_user_ids"], json!([bob.id]));
 
+    // Attaching Bob's sign-in again after the merge is a repeat, not a taken sign-in.
+    let bob_again = login_token(&key, "subject-b", "Bob", None);
+    let (status, body) = post(
+        &node,
+        "/access/users/me/subjects",
+        &alice_token,
+        json!({ "token": bob_again }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
     // A retry with the cut-off token repeats the finished merge.
     let (status, outcome) = post(&node, merge, &alice_token, json!({ "token": bob_token })).await;
     assert_eq!(status, StatusCode::OK);

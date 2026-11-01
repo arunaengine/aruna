@@ -1494,3 +1494,25 @@ fn merge_handoff_needs_coordinator() {
         AdminEventValidation::Deferred { .. }
     ));
 }
+
+#[tokio::test]
+async fn final_marker_clears_kept_claim() {
+    // B's removal kept its claim, A's addition came before its marker: the marker clears it.
+    let realm_id = RealmId::from_bytes([69; 32]);
+    let id = |seed: u64| UserId::local(Ulid::from_parts(1_710 + seed, 1), realm_id);
+    let (b, a) = (id(0), id(1));
+    let users = vec![
+        merge_user(b, &[], Some(a), &[]),
+        merge_user(a, &["subject-moved"], None, &[]),
+    ];
+    let marker = AdminDocumentOperation::UserAttributeSet {
+        key: format!(
+            "{}{}",
+            aruna_core::user::validation::MERGED_PREFIX,
+            b.user_ulid
+        ),
+        value: b.to_string(),
+    };
+    let claims = apply_with_claims(users, BTreeSet::from([a, b]), a, marker).await;
+    assert_eq!(claims, BTreeSet::from([a]));
+}

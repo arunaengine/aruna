@@ -944,11 +944,12 @@ fn attach_subject(
         (None, Some(bytes)) => BTreeSet::from([UserId::from_storage_key(bytes)?]),
         (None, None) => BTreeSet::new(),
     };
-    if claims.iter().any(|owner| *owner != user.user_id) {
-        return Err(UpdateUserError::SubjectClaimed);
-    }
+    // A repeat leaves the account unchanged, whatever stale claim another node's merge left.
     if user.subject_ids.iter().any(|known| known == subject) {
         return Ok(None);
+    }
+    if claims.iter().any(|owner| *owner != user.user_id) {
+        return Err(UpdateUserError::SubjectClaimed);
     }
     user.subject_ids.push(subject.to_string());
     Ok(Some(BTreeSet::from([user.user_id])))
@@ -1140,6 +1141,26 @@ mod pure_tests {
             revocation_floor: 0,
             revocation_next_expiry: None,
         }
+    }
+
+    #[test]
+    fn repeat_attach_ignores_stale_claim() {
+        // A merge elsewhere may leave the merged account's claim here for a while.
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let owner = UserId::local(Ulid::from_bytes([4u8; 16]), realm_id);
+        let merged = UserId::local(Ulid::from_bytes([5u8; 16]), realm_id);
+        let mut user = stored_user(owner);
+        user.subject_ids.push("subject".to_string());
+        let claims = postcard::to_allocvec(&BTreeSet::from([owner, merged])).unwrap();
+        let rows = [
+            (ByteView::from(Vec::new()), Some(ByteView::from(claims))),
+            (ByteView::from(Vec::new()), None),
+        ];
+        assert_eq!(super::attach_subject(&mut user, "subject", &rows), Ok(None));
+        assert_eq!(
+            super::attach_subject(&mut user, "other", &rows),
+            Err(UpdateUserError::SubjectClaimed)
+        );
     }
 
     #[test]
