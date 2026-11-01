@@ -302,3 +302,22 @@ async fn opposite_merges_one_wins() {
 
     stop(node, oidc_task).await;
 }
+
+#[tokio::test]
+async fn token_needs_account() {
+    let key = generate_signing_key();
+    let (provider, oidc_task) = spawn_oidc_provider(ISSUER, KID, &key).await;
+    let node = spawn_test_node(provider, true).await;
+    let unknown = login_token(&key, "subject-unknown", "Nobody", None);
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/v1/access/token", node.base_url))
+        .bearer_auth(unknown)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "account_missing");
+
+    stop(node, oidc_task).await;
+}

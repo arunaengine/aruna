@@ -44,7 +44,7 @@ use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };
 use aruna_operations::session::{CreateSessionConfig, CreateSessionError, create_making_room};
-use aruna_operations::users::get_oidc::{GetOidcInput, GetOidcOperation};
+use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
 use aruna_operations::users::oidc_user::{
@@ -790,7 +790,7 @@ somebody else.
                 "token": "<aruna-access-token>"
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token, or this node knows no user for the presented OIDC subject", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token, or no account is registered for the presented OIDC subject (code `account_missing`)", body = ErrorResponse),
         (status = 403, description = "The user is deactivated, an alias of the canonical user of that OIDC subject, or the caller holds a federated session", body = ErrorResponse),
         (status = 400, description = "`expires_in_seconds` is 0", body = ErrorResponse),
         (status = 409, description = "A service account holds 256 active sessions, or no room could be made", body = ErrorResponse)
@@ -836,7 +836,14 @@ async fn get_token(
                 &state.get_ctx(),
             )
             .await
-            .map_err(|err| ServerError::InternalError(err.to_string()))?;
+            .map_err(|err| match err {
+                GetOidcError::UserNotFound => ServerError::Refused(
+                    StatusCode::UNAUTHORIZED,
+                    "account_missing",
+                    "no account is registered for this sign-in".to_string(),
+                ),
+                other => ServerError::InternalError(other.to_string()),
+            })?;
             (
                 user.user_id,
                 SessionKind::Portal,
