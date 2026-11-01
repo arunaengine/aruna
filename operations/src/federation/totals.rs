@@ -23,28 +23,29 @@ pub async fn realm_totals(
         .await
         .map_err(|error| error.to_string())?
         .ok_or("no metadata subsystem for the dataset count")?;
-    let usage = load_realm_usage(context, node_id, RealmUsageScope::Global).await?;
-    totals_of(realm_id, &usage.counters, datasets, unix_timestamp_secs())
-}
-
-/// Stored and referenced bytes as one total; both count each object once.
-fn totals_of(
-    realm_id: RealmId,
-    counters: &UsageCounters,
-    datasets: u64,
-    observed_at: u64,
-) -> Result<RealmTotals, String> {
-    let data_bytes = counters
-        .logical_bytes
-        .checked_add(counters.referenced_bytes)
-        .ok_or("data byte total overflows")?;
+    let (objects, data_bytes) = data_totals(context, node_id).await?;
     Ok(RealmTotals {
         realm_id,
         data_bytes,
-        objects: counters.objects,
+        objects,
         datasets,
-        observed_at,
+        observed_at: unix_timestamp_secs(),
     })
+}
+
+/// The realm's current objects and data bytes, stored and referenced alike, private data
+/// included, from the realm usage sum.
+pub async fn data_totals(context: &DriverContext, node_id: NodeId) -> Result<(u64, u64), String> {
+    let usage = load_realm_usage(context, node_id, RealmUsageScope::Global).await?;
+    Ok(data_of(&usage.counters))
+}
+
+/// Objects and stored plus referenced bytes; both count each object once.
+fn data_of(counters: &UsageCounters) -> (u64, u64) {
+    let data_bytes = counters
+        .logical_bytes
+        .saturating_add(counters.referenced_bytes);
+    (counters.objects, data_bytes)
 }
 
 #[cfg(test)]
@@ -62,22 +63,7 @@ mod tests {
             referenced_bytes: 20,
             ..UsageCounters::default()
         };
-        let totals = totals_of(RealmId::from_bytes([1; 32]), &counters, 2, 9).unwrap();
-        assert_eq!(
-            (
-                totals.data_bytes,
-                totals.objects,
-                totals.datasets,
-                totals.observed_at
-            ),
-            (120, 3, 2, 9)
-        );
-        let full = UsageCounters {
-            logical_bytes: u64::MAX,
-            referenced_bytes: 1,
-            ..UsageCounters::default()
-        };
-        assert!(totals_of(RealmId::from_bytes([1; 32]), &full, 0, 9).is_err());
+        assert_eq!(data_of(&counters), (3, 120));
     }
 
     #[tokio::test]

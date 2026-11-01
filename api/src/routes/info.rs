@@ -25,6 +25,7 @@ use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, Request
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
 use aruna_operations::driver::{backend_used_bytes, drive};
+use aruna_operations::federation::totals::data_totals;
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
@@ -2284,19 +2285,10 @@ pub(crate) async fn distinct_buckets(
 /// The realm's current objects and data bytes, stored and referenced alike, private data
 /// included; aggregates only, so no bucket or dataset is named. `None` when unknown here.
 pub(crate) async fn realm_totals(state: &ServerState) -> Option<(u64, u64)> {
-    match load_realm_usage(state, RealmUsageScope::Global).await {
-        Ok(usage) => {
-            let usage = usage.counters;
-            Some((
-                usage.objects,
-                usage.logical_bytes.saturating_add(usage.referenced_bytes),
-            ))
-        }
-        Err(error) => {
-            warn!(error = %error, "realm usage unavailable for the realm totals");
-            None
-        }
-    }
+    data_totals(&state.get_ctx(), state.get_node_id())
+        .await
+        .inspect_err(|error| warn!(error = %error, "realm usage unavailable for the realm totals"))
+        .ok()
 }
 
 pub async fn load_realm_usage(
