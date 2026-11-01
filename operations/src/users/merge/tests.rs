@@ -333,6 +333,26 @@ fn held_vault_refused() {
 }
 
 #[test]
+fn failed_cutoff_aborts_merge() {
+    let mut operation = MergeUsersOperation::new(config(id(1), id(2)));
+    operation.start();
+    operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
+    operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
+        result: Ok(false),
+    }));
+    let txn_id = TxnId::generate();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    let cleanup = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+        result: Err("capacity".to_string()),
+    }));
+    assert!(matches!(
+        cleanup.first(),
+        Some(Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })) if *aborted == txn_id
+    ));
+    assert!(matches!(operation.finalize(), Err(MergeError::Cutoff(_))));
+}
+
+#[test]
 fn repeat_only_cuts_off() {
     let mut merged = user(2, &[]);
     merged
@@ -391,7 +411,16 @@ fn merge_moves_everything() {
     operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
         result: Ok(false),
     }));
-    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    // The cutoff is written first, inside the merge transaction.
+    let cutoff = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    assert!(matches!(cutoff.first(), Some(Effect::SubOperation(_))));
+    let reads = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+        result: Ok(()),
+    }));
+    assert!(matches!(
+        reads.first(),
+        Some(Effect::Storage(StorageEffect::BatchRead { txn_id: Some(read_txn), .. })) if *read_txn == txn_id
+    ));
     let realm_bytes = Some(realm.to_bytes(&actor(a)).unwrap().into());
     let scan = operation.step(read(vec![
         bytes(&survivor),
@@ -515,13 +544,12 @@ fn merge_moves_everything() {
     operation.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id,
     }));
-    operation.step(Event::Task(TaskEvent::TimerScheduled {
+    // Nothing runs after the commit that a crash could lose.
+    let after = operation.step(Event::Task(TaskEvent::TimerScheduled {
         key: TaskKey::DrainSyncOutbox,
         after: Duration::ZERO,
     }));
-    operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-        result: Ok(()),
-    }));
+    assert!(after.is_empty());
     let outcome = operation.finalize().unwrap();
     assert_eq!(
         (

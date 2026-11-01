@@ -134,7 +134,8 @@ that account. Both prove control; a matching email or name is never enough.
   after the merge is cut off on every node. Its share links stop, as for any deactivated account.
 - Runs, RO-Crates, provenance and other signed records keep naming the other account; reads of
   its id resolve to the primary.
-- The change is one transaction on a management node and replicates to every node. Repeating a
+- The change, including the cutoff, is one transaction on a management node and replicates to
+  every node. Repeating a
   finished merge answers again with `repeated: true`, also with the then cut-off token.
 
 **Limits**

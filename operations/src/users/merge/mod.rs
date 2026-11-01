@@ -133,15 +133,34 @@ enum MergeState {
     ReadAccounts,
     CheckVault,
     StartTransaction,
-    ReadDocuments { txn_id: TxnId },
-    ScanGroups { txn_id: TxnId },
-    ReadDetails { txn_id: TxnId },
-    Write { txn_id: TxnId },
-    DeleteStale { txn_id: TxnId },
-    ReadFence { txn_id: TxnId },
-    Commit { txn_id: TxnId },
+    ReadDocuments {
+        txn_id: TxnId,
+    },
+    ScanGroups {
+        txn_id: TxnId,
+    },
+    ReadDetails {
+        txn_id: TxnId,
+    },
+    Write {
+        txn_id: TxnId,
+    },
+    DeleteStale {
+        txn_id: TxnId,
+    },
+    ReadFence {
+        txn_id: TxnId,
+    },
+    Commit {
+        txn_id: TxnId,
+    },
     ScheduleDrain,
+    /// The cutoff of a repeat, alone in its own transaction.
     Cutoff,
+    /// The cutoff of a merge, written first inside the merge transaction.
+    JoinedCutoff {
+        txn_id: TxnId,
+    },
     Finish,
     Error,
 }
@@ -256,7 +275,7 @@ impl MergeUsersOperation {
         let [survivor, merged] = parse_users(values)?;
         if plan::check_accounts(&survivor, &merged)? {
             self.outcome = Some(self.empty_outcome(true));
-            return Ok(self.cutoff());
+            return Ok(self.cutoff(None));
         }
         if !self.config.merged_live {
             return Err(MergeError::TokenInvalid);
@@ -487,19 +506,30 @@ impl MergeUsersOperation {
     }
 
     /// Cuts off every credential of the merged account issued before the merge, on every node.
-    fn cutoff(&mut self) -> Effects {
-        self.state = MergeState::Cutoff;
+    /// Inside `txn_id` it commits with the merge, so no merge ever lands without it.
+    fn cutoff(&mut self, txn_id: Option<TxnId>) -> Effects {
         let cutoff = self.config.now.saturating_add(REVOCATION_GRACE_SECS);
         let merged = self.merged_id();
+        let config = RevokeTokenConfig {
+            actor: self.acting(merged),
+            token_hash: user_cutoff_hash(&merged),
+            expires_at: user_cutoff_expiry(cutoff),
+            token_owner: merged,
+            admission: RevokeTokenAdmission::Privileged,
+            now: self.config.now,
+        };
+        let operation = match txn_id {
+            Some(txn_id) => {
+                self.state = MergeState::JoinedCutoff { txn_id };
+                RevokeTokenOperation::joined(config, txn_id)
+            }
+            None => {
+                self.state = MergeState::Cutoff;
+                RevokeTokenOperation::new(config)
+            }
+        };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            RevokeTokenOperation::new(RevokeTokenConfig {
-                actor: self.acting(merged),
-                token_hash: user_cutoff_hash(&merged),
-                expires_at: user_cutoff_expiry(cutoff),
-                token_owner: merged,
-                admission: RevokeTokenAdmission::Privileged,
-                now: self.config.now,
-            }),
+            operation,
             |result| Event::SubOperation(SubOperationEvent::TokenRevoked {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
             }),
@@ -536,7 +566,14 @@ impl MergeUsersOperation {
             (
                 MergeState::StartTransaction,
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => Ok(self.read_documents(txn_id)),
+            ) => Ok(self.cutoff(Some(txn_id))),
+            (
+                MergeState::JoinedCutoff { txn_id },
+                Event::SubOperation(SubOperationEvent::TokenRevoked { result }),
+            ) => match result {
+                Ok(()) => Ok(self.read_documents(txn_id)),
+                Err(error) => Err(MergeError::Cutoff(error)),
+            },
             (
                 MergeState::ReadDocuments { txn_id },
                 Event::Storage(StorageEvent::BatchReadResult { values }),
@@ -585,7 +622,7 @@ impl MergeUsersOperation {
             (
                 MergeState::ScheduleDrain,
                 Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
-            ) => Ok(self.cutoff()),
+            ) => Ok(self.finish()),
             (
                 MergeState::CheckVault,
                 Event::SubOperation(SubOperationEvent::VaultHeld { result }),
@@ -665,7 +702,8 @@ impl Operation for MergeUsersOperation {
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            MergeState::ReadDocuments { txn_id }
+            MergeState::JoinedCutoff { txn_id }
+            | MergeState::ReadDocuments { txn_id }
             | MergeState::ScanGroups { txn_id }
             | MergeState::ReadDetails { txn_id }
             | MergeState::Write { txn_id }
