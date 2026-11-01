@@ -327,3 +327,39 @@ async fn reference_import_counted() {
         (2, 2, 10)
     );
 }
+
+#[tokio::test]
+async fn signed_out_usage() {
+    // Signed out, the usage shows only where a public role grants READ on the bucket, and a
+    // private and an absent bucket answer 401 alike.
+    use crate::tests::distributed::LOCAL;
+    use crate::tests::routes::open_paths;
+    use aruna_core::structs::identity::auth::Actor;
+    let node = node_state().await;
+    let signed_out = |bucket: &str| {
+        get_bucket_usage(
+            State(node.state.clone()),
+            Extension(None),
+            Extension(None),
+            HeaderMap::new(),
+            Path(bucket.to_string()),
+            Query(UsageQuery { held: None }),
+        )
+    };
+    for bucket in [BUCKET, "absent"] {
+        let refused = signed_out(bucket).await;
+        assert!(matches!(refused, Err(ServerError::Unauthorized)));
+    }
+    let realm_id = node.owner.realm_id;
+    let actor = Actor {
+        node_id: node_id(LOCAL),
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    let path = bucket_permission_path(realm_id, node.group_id, node_id(LOCAL), BUCKET);
+    open_paths(&node.state.get_ctx(), &actor, node.group_id, &[path]).await;
+    let open = signed_out(BUCKET).await.unwrap();
+    assert_eq!(open.0.bucket, BUCKET);
+    let absent = signed_out("absent").await;
+    assert!(matches!(absent, Err(ServerError::Unauthorized)));
+}

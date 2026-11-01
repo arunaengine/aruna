@@ -846,7 +846,8 @@ pub async fn get_distributed(
     summary = "Read the distributed bucket a bucket belongs to",
     description = r#"Returns the status of the distributed bucket this node's bucket is a member of.
 
-**Authentication**: realm bearer token with READ on the bucket.
+**Authentication**: realm bearer token with READ on the bucket. Without a token, READ granted
+by public roles applies, and a refusal answers 401.
 
 **Behavior**
 - An ordinary bucket answers 404.
@@ -854,26 +855,35 @@ pub async fn get_distributed(
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
         (status = 200, description = "The set's status", body = DistributedResponse, example = status_example),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token, or no public READ without one", body = ErrorResponse),
         (status = 403, description = "No READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found, ordinary, or its record not here yet", body = ErrorResponse)
     ),
-    security(("bearer_auth" = []))
+    security(("bearer_auth" = []), ())
 )]
 pub async fn get_bucket_distribution(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<DistributedResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
-    let info = bucket_info(&state, &bucket).await?;
+    // Signed out, only public roles grant READ, and a refusal hides whether the bucket exists.
+    let signed_out = auth.is_none();
+    let auth = auth.unwrap_or_else(|| AuthContext::anonymous(state.get_realm_id()));
+    let auth = require_realm_auth(&state, Some(auth))?;
+    let hidden = |error| match error {
+        ServerError::NotFound | ServerError::Forbidden if signed_out => ServerError::Unauthorized,
+        error => error,
+    };
+    let info = bucket_info(&state, &bucket).await.map_err(hidden)?;
     let path = bucket_permission_path(
         state.get_realm_id(),
         info.group_id,
         state.get_node_id(),
         &bucket,
     );
-    ensure_permission(&state, &auth, path, Permission::READ).await?;
+    ensure_permission(&state, &auth, path, Permission::READ)
+        .await
+        .map_err(hidden)?;
     let binding = info.distribution.ok_or(ServerError::NotFound)?;
     let mut status = owned_status(&state, info.group_id, binding.set_id).await?;
     add_progress(&state.get_ctx(), &mut status).await;

@@ -427,7 +427,7 @@ pub(crate) async fn range_sizes(
     description = r#"Reports how many objects, versions, delete markers and open multipart uploads a bucket holds on this node, and how many bytes they occupy.
 
 **Authentication**: realm bearer token with READ on the bucket, the same right that lists its
-objects.
+objects. Without a token, READ granted by public roles applies, and a refusal answers 401.
 
 **Behavior**
 - Every number comes from this node's counter of the bucket, kept up to date in the same
@@ -475,11 +475,11 @@ objects.
             })
         ),
         (status = 400, description = "`held` on a request no member relayed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token, or no public READ without one", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
-    security(("bearer_auth" = []))
+    security(("bearer_auth" = []), ())
 )]
 pub async fn get_bucket_usage(
     State(state): State<Arc<ServerState>>,
@@ -489,8 +489,15 @@ pub async fn get_bucket_usage(
     Path(bucket): Path<String>,
     Query(query): Query<UsageQuery>,
 ) -> ServerResult<Json<BucketUsageResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
-    let info = bucket_info(&state, &bucket).await?;
+    // Signed out, only public roles grant READ, and a refusal hides whether the bucket exists.
+    let signed_out = auth.is_none();
+    let auth = auth.unwrap_or_else(|| AuthContext::anonymous(state.get_realm_id()));
+    let auth = require_realm_auth(&state, Some(auth))?;
+    let hidden = |error| match error {
+        ServerError::NotFound | ServerError::Forbidden if signed_out => ServerError::Unauthorized,
+        error => error,
+    };
+    let info = bucket_info(&state, &bucket).await.map_err(hidden)?;
     ensure_permission(
         &state,
         &auth,
@@ -502,7 +509,8 @@ pub async fn get_bucket_usage(
         ),
         Permission::READ,
     )
-    .await?;
+    .await
+    .map_err(hidden)?;
     let held = query.held == Some(true);
     if held && !headers.contains_key(RELAY_HOP_HEADER) {
         return Err(ServerError::BadRequestReason(
