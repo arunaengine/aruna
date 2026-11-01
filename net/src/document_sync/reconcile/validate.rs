@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::user::validation::{DEACTIVATED_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
+use aruna_core::user::validation::{
+    DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, SERVICE_GROUP_ATTRIBUTE,
+};
 
 impl ConfigValidationCache {
     pub(in crate::document_sync) fn invalidate(&mut self) {
@@ -547,6 +549,20 @@ pub(in crate::document_sync) async fn validate_user_authority(
         ));
     }
 
+    // Merge pointers move logins between accounts, so only a management node's merge sets them,
+    // never a self-service or other attribute change.
+    let merge_key = match &event.op {
+        AdminDocumentOperation::UserAttributeSet { key, .. }
+        | AdminDocumentOperation::UserAttributeRemoved { key } => {
+            key == MERGED_INTO_ATTRIBUTE || key.starts_with(MERGED_PREFIX)
+        }
+        _ => false,
+    };
+    if merge_key && !matches!(origin_kind, RealmNodeKind::Management) {
+        return Ok(AdminEventValidation::Rejected(
+            "merge attributes come only from a management node's merge".to_string(),
+        ));
+    }
     let self_service = event.actor.user_id == user_id;
     // Only the account owner links a login; the owner or a realm administrator unlinks it.
     let alias = matches!(

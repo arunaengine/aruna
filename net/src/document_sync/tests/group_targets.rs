@@ -1214,3 +1214,53 @@ async fn merged_removal_hands_subject() {
         Some(subject_index_value(primary))
     );
 }
+
+#[tokio::test]
+async fn merge_pointer_needs_management() {
+    // A server node may not point an account at another account; a management node may.
+    let realm_id = RealmId::from_bytes([64; 32]);
+    let merged = UserId::local(Ulid::from_parts(1_660, 1), realm_id);
+    let primary = UserId::local(Ulid::from_parts(1_661, 1), realm_id);
+    let actor = test_actor(13, merged, realm_id);
+    let pointer = AdminDocumentOperation::UserAttributeSet {
+        key: aruna_core::user::validation::MERGED_INTO_ATTRIBUTE.to_string(),
+        value: primary.to_string(),
+    };
+    let ordinary = AdminDocumentOperation::UserAttributeSet {
+        key: "orcid".to_string(),
+        value: "0000-0002-1825-0097".to_string(),
+    };
+    for (kind, op, accepted) in [
+        (RealmNodeKind::Server, pointer.clone(), false),
+        (RealmNodeKind::Server, ordinary, true),
+        (RealmNodeKind::Management, pointer, true),
+    ] {
+        let (_dir, storage) = test_storage();
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, kind.clone());
+        batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                DocumentTarget::RealmConfig { realm_id },
+                config.to_bytes(&actor).expect("config serializes").into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+        let event = test_admin_event(
+            Ulid::from_parts(1_662, 1),
+            AdminDocumentTarget::User { user_id: merged },
+            &actor,
+            1,
+            op.clone(),
+        );
+        let validation = validate_user_authority(&storage, &event, None)
+            .await
+            .expect("validation runs");
+        assert_eq!(
+            matches!(validation, AdminEventValidation::Accepted),
+            accepted,
+            "{kind:?} {op:?}"
+        );
+    }
+}
