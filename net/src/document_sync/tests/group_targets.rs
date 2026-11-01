@@ -1306,3 +1306,122 @@ async fn merge_pointer_needs_management() {
         );
     }
 }
+
+fn merge_user(user_id: UserId, subjects: &[&str], into: Option<UserId>, lists: &[UserId]) -> User {
+    let mut attributes: HashMap<String, String> = lists
+        .iter()
+        .map(|listed| {
+            (
+                format!(
+                    "{}{}",
+                    aruna_core::user::validation::MERGED_PREFIX,
+                    listed.user_ulid
+                ),
+                listed.to_string(),
+            )
+        })
+        .collect();
+    if let Some(into) = into {
+        attributes.insert(
+            aruna_core::user::validation::MERGED_INTO_ATTRIBUTE.to_string(),
+            into.to_string(),
+        );
+    }
+    User {
+        user_id,
+        name: "user".to_string(),
+        subject_ids: subjects.iter().map(ToString::to_string).collect(),
+        alias_user_ids: Default::default(),
+        attributes,
+    }
+}
+
+/// Stores `users` and the subject's claims, applies `op` to `target` and returns the claims.
+async fn apply_with_claims(
+    users: Vec<User>,
+    claims: BTreeSet<UserId>,
+    target: UserId,
+    op: AdminDocumentOperation,
+) -> BTreeSet<UserId> {
+    let (_dir, storage) = test_storage();
+    let actor = Actor {
+        node_id: node(10),
+        user_id: target,
+        realm_id: target.realm_id,
+    };
+    let mut rows: Vec<_> = users
+        .iter()
+        .map(|user| {
+            (
+                USER_KEYSPACE.to_string(),
+                user.user_id.to_bytes().into(),
+                user.to_bytes(&actor).expect("user serializes").into(),
+            )
+        })
+        .collect();
+    rows.push((
+        SUBJECT_CLAIMS_KEYSPACE.to_string(),
+        subject_index_key("subject-moved"),
+        postcard::to_allocvec(&claims)
+            .expect("claims encode")
+            .into(),
+    ));
+    batch_write_to(&storage, rows)
+        .await
+        .expect("fixture writes");
+    let event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(1_670, 1),
+        target: AdminDocumentTarget::User { user_id: target },
+        origin_node_id: actor.node_id,
+        origin_seq: 1,
+        observed: AdminDocumentClock::default(),
+        actor,
+        op,
+    };
+    apply_user_operation(&storage, DocumentTarget::User { user_id: target }, event)
+        .await
+        .expect("event applies");
+    read_storage_value(
+        &storage,
+        SUBJECT_CLAIMS_KEYSPACE,
+        subject_index_key("subject-moved"),
+    )
+    .await
+    .map(|bytes| postcard::from_bytes(&bytes).expect("claims decode"))
+    .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn late_removal_reaches_root() {
+    // B into A, then A into C: B's late removal still names A, but the subject goes to C.
+    let realm_id = RealmId::from_bytes([66; 32]);
+    let id = |seed: u64| UserId::local(Ulid::from_parts(1_680 + seed, 1), realm_id);
+    let (b, a, c) = (id(0), id(1), id(2));
+    let users = vec![
+        merge_user(b, &["subject-moved"], Some(a), &[]),
+        merge_user(a, &[], Some(c), &[]),
+        merge_user(c, &[], None, &[a, b]),
+    ];
+    let op = AdminDocumentOperation::SubjectIdRemoved {
+        subject_id: "subject-moved".to_string(),
+    };
+    let claims = apply_with_claims(users, BTreeSet::from([b]), b, op).await;
+    assert_eq!(claims, BTreeSet::from([c]));
+}
+
+#[tokio::test]
+async fn root_takes_kept_claim() {
+    // B's claim waited for its root; the root's own addition ends it.
+    let realm_id = RealmId::from_bytes([67; 32]);
+    let id = |seed: u64| UserId::local(Ulid::from_parts(1_690 + seed, 1), realm_id);
+    let (b, c) = (id(0), id(1));
+    let users = vec![
+        merge_user(b, &[], Some(c), &[]),
+        merge_user(c, &[], None, &[b]),
+    ];
+    let op = AdminDocumentOperation::SubjectIdAdded {
+        subject_id: "subject-moved".to_string(),
+    };
+    let claims = apply_with_claims(users, BTreeSet::from([b]), c, op).await;
+    assert_eq!(claims, BTreeSet::from([c]));
+}
