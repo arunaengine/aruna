@@ -1745,6 +1745,7 @@ async fn put_version(
         aruna_core::structs::storage::origin::VersionOrigin::Storage {
             backend_id: run.rule.backend_id,
             key: location.backend_path.clone(),
+            job_id: Some(ctx.job_id.as_ulid()),
         },
     ))
     .with_adopted(discovered_copy(&run.rule, location))

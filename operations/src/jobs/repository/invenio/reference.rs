@@ -119,6 +119,7 @@ pub(crate) async fn write_reference(
             connector_guard: None,
             restrictions: spec.auth_context.path_restrictions.clone(),
             mirror_guards: Vec::new(),
+            job_id: Some(ctx.job_id.as_ulid()),
         },
     )
     .await

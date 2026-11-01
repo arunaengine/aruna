@@ -1073,6 +1073,7 @@ async fn put_file_output(
     .with_version_origin(Some(
         aruna_core::structs::storage::origin::VersionOrigin::Job {
             run_id: ulid::Ulid::from_bytes(record.job_id.to_bytes()),
+            started_by: Some(record.created_by).filter(|user| !user.is_nil()),
         },
     ));
     if let Some(gate) = gate {

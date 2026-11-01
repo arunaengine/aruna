@@ -567,7 +567,9 @@ fn register_rows(
         input.user_id,
         input.now,
     )
-    .with_origin(Some(VersionOrigin::Source))
+    .with_origin(Some(VersionOrigin::Source {
+        job_id: Some(input.job_id.as_ulid()),
+    }))
     .with_metadata(entry.metadata.clone().into_iter().collect())
     .with_policies(guards.policies.clone())?;
     let version_key = VersionKey::new(&input.bucket, &entry.target_key, version_id);

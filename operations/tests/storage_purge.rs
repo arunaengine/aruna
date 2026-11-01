@@ -288,6 +288,7 @@ async fn scoped_fence_isolates() {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Materialize,
+                job_id: None,
             },
         )
         .await,

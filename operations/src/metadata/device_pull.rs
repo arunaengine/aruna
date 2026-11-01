@@ -17,7 +17,7 @@ use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionSnapshot, KeyRange, RouteError, WriteRoute,
 };
-use aruna_core::structs::storage::origin::VersionOrigin;
+use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::{
     ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
     SyncPullAck, SyncPullStatus, SyncRefusal, SyncVersionPage,
@@ -604,6 +604,7 @@ fn pull_origin(node_id: NodeId, request: &SyncPull) -> VersionOrigin {
     VersionOrigin::Upload {
         node_id,
         device: Some(request.source.node_id.to_string()),
+        client: Some(UploadClient::Device),
     }
 }
 
@@ -1334,7 +1335,13 @@ mod tests {
         let request = pull_request(false);
         let origin = pull_origin(node_id, &request);
         let device = Some(request.source.node_id.to_string());
-        assert_eq!(origin, VersionOrigin::Upload { node_id, device });
+        let client = Some(UploadClient::Device);
+        let expected = VersionOrigin::Upload {
+            node_id,
+            device,
+            client,
+        };
+        assert_eq!(origin, expected);
         assert!(origin.bounded());
     }
 

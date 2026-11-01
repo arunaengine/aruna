@@ -372,12 +372,14 @@ fn page_registers_atomically() {
     assert_eq!(result.checkpoint.items_succeeded, 2);
 }
 
-// An imported version records its external source as its origin.
+// An imported version records its external source and its import job as its origin.
 #[test]
 fn origin_marks_source() {
     use aruna_core::structs::storage::blob::BlobVersion;
     use aruna_core::structs::storage::origin::VersionOrigin;
-    let mut operation = PageImportOperation::new(input(vec![entry("a")]));
+    let input = input(vec![entry("a")]);
+    let job_id = Some(input.job_id.as_ulid());
+    let mut operation = PageImportOperation::new(input);
 
     let writes = run_to_writes(&mut operation, vec![None], None);
 
@@ -385,7 +387,7 @@ fn origin_marks_source() {
         .find(|(space, ..)| space == BLOB_VERSIONS_KEYSPACE)
         .unwrap();
     let version = BlobVersion::from_bytes(value).unwrap();
-    assert_eq!(version.origin, Some(VersionOrigin::Source));
+    assert_eq!(version.origin, Some(VersionOrigin::Source { job_id }));
 }
 
 #[test]

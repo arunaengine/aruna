@@ -292,6 +292,7 @@ async fn copied(
         metadata: None,
         restrictions: auth.path_restrictions.clone(),
         references: CopyReferences::Materialize,
+        job_id: None,
     };
     let result = copy_object(context, input)
         .await

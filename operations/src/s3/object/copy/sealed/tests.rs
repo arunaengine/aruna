@@ -103,6 +103,7 @@ fn input(location: &BackendLocation, version_id: Ulid) -> SealedCopyInput {
         realm_id: RealmId::from_bytes([3; 32]),
         node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
         quota_ceiling: None,
+        job_id: None,
     }
 }
 

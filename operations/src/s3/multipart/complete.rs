@@ -64,7 +64,7 @@ use aruna_core::structs::storage::multipart::{
     MultipartObjectSummary, MultipartPart, MultipartPartKey, MultipartUpload,
     MultipartUploadStatus, WorkingShare,
 };
-use aruna_core::structs::storage::origin::VersionOrigin;
+use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::storage::routing::{PlainTarget, RoutingSnapshot};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -388,6 +388,7 @@ pub struct CompleteUploadOperation {
     fence: Option<crate::s3::object::put::fenced::FencedWrite>,
     /// The rules that read the composed path, as the finalize transaction reads them.
     readers: crate::s3::object::put::ReaderScan,
+    upload_client: Option<UploadClient>,
 }
 
 impl CompleteUploadOperation {
@@ -453,7 +454,14 @@ impl CompleteUploadOperation {
             written_intent: Vec::new(),
             fence: None,
             readers: Default::default(),
+            upload_client: None,
         }
+    }
+
+    /// The client kind the upload origin records.
+    pub fn with_upload_client(mut self, client: UploadClient) -> Self {
+        self.upload_client = Some(client);
+        self
     }
 
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
@@ -1749,6 +1757,7 @@ impl CompleteUploadOperation {
         .with_origin(Some(VersionOrigin::Upload {
             node_id: self.input.node_id,
             device: None,
+            client: self.upload_client,
         }));
         // Union with what part copies inherited: a part-wise copy of a governed
         // source can only add refs to the composed object.
