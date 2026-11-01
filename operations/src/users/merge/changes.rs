@@ -53,8 +53,9 @@ impl MergeUsersOperation {
             });
         }
         let mut outcome = self.empty_outcome(false);
+        let subjects = documents.merged.subject_ids.clone();
         self.stage_users(&mut documents, &mut outcome)?;
-        self.stage_claims(&documents.merged.subject_ids, claims)?;
+        self.stage_claims(&subjects, claims)?;
         self.stage_realm(&mut documents, &mut outcome)?;
         self.stage_groups(group_states, &documents.config, &mut outcome)?;
         self.stage_devices(&mut documents, &mut outcome)?;
