@@ -109,6 +109,10 @@ pub enum SubOperationEvent {
     UserUpdated {
         result: Result<(), String>,
     },
+    /// Whether a user's vault holds a saved payload.
+    VaultHeld {
+        result: Result<bool, String>,
+    },
     KeyRequestsOpened {
         request_ids: Vec<Ulid>,
     },

@@ -13,6 +13,12 @@ pub const RESERVED_PREFIX: &str = "aruna-engine.org/";
 pub const DEACTIVATED_ATTRIBUTE: &str = "aruna-engine.org/deactivated";
 /// Group that owns a service account.
 pub const SERVICE_GROUP_ATTRIBUTE: &str = "aruna-engine.org/service-group";
+/// The account a merged account was merged into; set together with deactivation.
+pub const MERGED_INTO_ATTRIBUTE: &str = "aruna-engine.org/merged-into";
+/// Prefix of one attribute per secondary account a primary account absorbed, keyed by its ulid.
+pub const MERGED_PREFIX: &str = "aruna-engine.org/merged.";
+/// Hex BLAKE3 of the lowercased email the issuer marked verified at registration.
+pub const EMAIL_HASH_ATTRIBUTE: &str = "aruna-engine.org/email-hash";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum UserAttributeError {

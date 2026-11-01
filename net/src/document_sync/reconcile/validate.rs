@@ -857,6 +857,20 @@ pub(in crate::document_sync) async fn validate_group_authority(
             "stored authorization identity does not match the group".to_string(),
         ));
     }
+    // An account merge hands each role of the merged account to the surviving account; only a
+    // management node merges, after both accounts proved a fresh login.
+    if let AdminDocumentOperation::GroupAssignmentAdded { role_id, .. } = &event.op
+        && matches!(
+            configured_node_kind(&config, &event.origin_node_id),
+            Some(RealmNodeKind::Management)
+        )
+        && group_auth
+            .roles
+            .get(role_id)
+            .is_some_and(|role| role.assigned_users.contains(&event.actor.user_id))
+    {
+        return Ok(AdminEventValidation::Accepted);
+    }
     // Any one of these paths carries the authority; a rename is also open to a
     // realm administrator who is not a member of the group.
     let paths = match &event.op {
