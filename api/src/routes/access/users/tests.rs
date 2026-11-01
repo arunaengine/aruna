@@ -55,6 +55,8 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
+mod merge;
+
 #[derive(Clone)]
 struct OidcProviderState {
     issuer: String,
@@ -72,6 +74,10 @@ struct TestOidcClaims {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auth_time: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email_verified: Option<bool>,
 }
 
 struct TestNode {
@@ -156,8 +162,6 @@ fn sign_oidc_token(
     name: Option<&str>,
     auth_time: Option<u64>,
 ) -> String {
-    let mut header = Header::new(Algorithm::EdDSA);
-    header.kid = Some(kid.to_string());
     let claims = TestOidcClaims {
         sub: subject.to_string(),
         iss: issuer.to_string(),
@@ -165,13 +169,21 @@ fn sign_oidc_token(
         exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
         name: name.map(str::to_string),
         auth_time,
+        email: None,
+        email_verified: None,
     };
+    sign_claims(kid, signing_key, &claims)
+}
+
+fn sign_claims(kid: &str, signing_key: &SigningKey, claims: &TestOidcClaims) -> String {
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.kid = Some(kid.to_string());
     let key_pem = signing_key
         .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
         .unwrap();
     encode(
         &header,
-        &claims,
+        claims,
         &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
     )
     .unwrap()
