@@ -6,6 +6,7 @@
 #![recursion_limit = "512"]
 
 mod abe_access;
+mod cli;
 mod compression;
 mod compute_execution;
 mod cors;

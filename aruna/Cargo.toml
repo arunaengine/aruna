@@ -65,6 +65,7 @@ byteview = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+aruna-cli = { workspace = true }
 aruna-kpabe = { workspace = true }
 axum = { workspace = true }
 aws-sdk-s3 = { workspace = true }
