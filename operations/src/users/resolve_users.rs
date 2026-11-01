@@ -26,6 +26,8 @@ pub struct ResolvedUser {
     pub user_id: UserId,
     pub name: String,
     pub attributes: HashMap<String, String>,
+    /// The primary a merged account resolves to; name and attributes are the primary's.
+    pub merged_into: Option<UserId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,6 +47,7 @@ pub struct ResolveUsersOperation {
 enum ResolveUsersState {
     Init,
     ResolveUsers,
+    ResolvePrimaries { users: Vec<ResolvedUser> },
     Finish,
     Error,
 }
@@ -153,9 +156,48 @@ impl ResolveUsersOperation {
                 user_id: user.user_id,
                 name: user.public_name(),
                 attributes: user.public_attributes(),
+                merged_into: user.merged_into(),
             });
         }
-        Ok(self.emit_finish(users))
+        let mut primaries: Vec<UserId> = users.iter().filter_map(|user| user.merged_into).collect();
+        primaries.sort();
+        primaries.dedup();
+        if primaries.is_empty() {
+            return Ok(self.emit_finish(users));
+        }
+        self.state = ResolveUsersState::ResolvePrimaries { users };
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: primaries
+                .iter()
+                .map(|id| (USER_KEYSPACE.to_string(), Key::from(id.to_bytes())))
+                .collect(),
+            txn_id: None,
+        })])
+    }
+
+    /// Shows each merged account as its primary, which always is the root of the merge.
+    fn handle_primaries(&mut self, event: Event, mut users: Vec<ResolvedUser>) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
+        };
+        let mut primaries = HashMap::new();
+        for (_, value) in values {
+            match value.map(|bytes| User::from_bytes(&bytes)).transpose() {
+                Ok(Some(user)) => {
+                    primaries.insert(user.user_id, user);
+                }
+                Ok(None) => {}
+                Err(error) => return self.fail(error.into()),
+            }
+        }
+        for resolved in &mut users {
+            if let Some(primary) = resolved.merged_into.and_then(|id| primaries.get(&id)) {
+                resolved.name = primary.public_name();
+                resolved.attributes = primary.public_attributes();
+            }
+        }
+        self.emit_finish(users)
     }
 
     fn emit_finish(&mut self, users: Vec<ResolvedUser>) -> Effects {
@@ -179,9 +221,16 @@ impl Operation for ResolveUsersOperation {
             Err(effects) => return effects,
         };
 
-        match self.state {
-            ResolveUsersState::ResolveUsers => self.handle_resolve(event),
-            ResolveUsersState::Init | ResolveUsersState::Finish | ResolveUsersState::Error => {
+        match std::mem::replace(&mut self.state, ResolveUsersState::Error) {
+            ResolveUsersState::ResolveUsers => {
+                self.state = ResolveUsersState::ResolveUsers;
+                self.handle_resolve(event)
+            }
+            ResolveUsersState::ResolvePrimaries { users } => self.handle_primaries(event, users),
+            state @ (ResolveUsersState::Init
+            | ResolveUsersState::Finish
+            | ResolveUsersState::Error) => {
+                self.state = state;
                 smallvec![]
             }
         }
@@ -271,8 +320,39 @@ mod pure_tests {
                 user_id: local.user_id,
                 name: "Local".to_string(),
                 attributes: HashMap::new(),
+                merged_into: None,
             }]
         );
+    }
+
+    #[test]
+    fn secondary_shows_primary() {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let primary = user(realm_id, 7, "Primary");
+        let mut secondary = user(realm_id, 8, "Secondary");
+        secondary.attributes.insert(
+            aruna_core::user::validation::MERGED_INTO_ATTRIBUTE.to_string(),
+            primary.user_id.to_string(),
+        );
+        let mut operation = ResolveUsersOperation::new(input(realm_id, vec![secondary.user_id]));
+
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(
+                Key::from(secondary.user_id.to_bytes()),
+                Some(value(&secondary)),
+            )],
+        }));
+        assert_eq!(effects.len(), 1);
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(Key::from(primary.user_id.to_bytes()), Some(value(&primary)))],
+        }));
+
+        let output = operation.finalize().unwrap();
+        assert_eq!(output.users.len(), 1);
+        assert_eq!(output.users[0].user_id, secondary.user_id);
+        assert_eq!(output.users[0].name, "Primary");
+        assert_eq!(output.users[0].merged_into, Some(primary.user_id));
     }
 
     #[test]

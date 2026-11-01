@@ -171,6 +171,9 @@ pub struct ResolveUserResult {
     pub name: String,
     /// Only attributes the user explicitly marks public.
     pub attributes: HashMap<String, String>,
+    /// Set for a merged account: the primary it resolves to, whose name and attributes are shown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1333,6 +1336,8 @@ async fn search_users(
 - Only explicitly public attributes are returned. Names default to public; a private name is
   replaced by the user id.
 - The response body is a JSON array, not an object.
+- A merged account keeps its own `user_id` and shows the name and public attributes of its
+  primary, which `merged_into` names.
 
 **Limits**
 - At most 100 user ids per request."#,
@@ -1405,6 +1410,7 @@ async fn resolve_users(
                     user_id: user.user_id.to_string(),
                     name: user.name,
                     attributes: user.attributes,
+                    merged_into: user.merged_into.map(|id| id.to_string()),
                 })
                 .collect(),
         ),
