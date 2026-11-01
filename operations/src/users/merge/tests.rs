@@ -3,12 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{MergeError, MergeUsersConfig, MergeUsersOperation, plan};
-use aruna_core::admin_documents::AdminDocumentOperation;
+use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, SUBJECT_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::reducer::AdminDocumentState;
+use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::storage_entries::subject_index_value;
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, Permission, Role, SessionKind, SessionRef,
@@ -400,38 +402,67 @@ fn failed_cutoff_aborts_merge() {
     assert!(matches!(operation.finalize(), Err(MergeError::Cutoff(_))));
 }
 
+/// The config reducer state naming `pinned` as merge coordinator, if any.
+fn pin(pinned: Option<NodeId>) -> Option<Value> {
+    let mut state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id: REALM });
+    if let Some(node_id) = pinned {
+        state
+            .apply_operation(
+                &actor(id(1)),
+                AdminDocumentOperation::MergeCoordinatorSet { node_id },
+            )
+            .unwrap();
+    }
+    Some(reducer_state_entry(&state).unwrap().2)
+}
+
 #[test]
 fn only_coordinator_merges() {
-    // A management node with a lower id coordinates; this node refuses before any write.
-    let lower = (1..=255u8)
-        .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
-        .find(|candidate| *candidate < node())
-        .expect("some key sorts below this node");
+    // Another management node is pinned, or none is: this node refuses before any write.
+    let other = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
     let mut realm = RealmConfigDocument::new(REALM, Vec::new(), 3);
     realm.ensure_node(node(), RealmNodeKind::Management);
-    realm.ensure_node(lower, RealmNodeKind::Management);
-    assert_eq!(super::coordinator(&realm), Some(lower));
+    realm.ensure_node(other, RealmNodeKind::Management);
+    for pinned in [Some(other), None] {
+        let mut operation = MergeUsersOperation::new(config(id(1), id(2)));
+        operation.start();
+        operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
+        operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
+            result: Ok(false),
+        }));
+        let txn_id = TxnId::generate();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+            result: Ok(()),
+        }));
+        let realm_bytes = Some(realm.to_bytes(&actor(id(1))).unwrap().into());
+        let mut values = vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))];
+        values.extend([None, None, None, None, realm_bytes, pin(pinned), None, None]);
+        let cleanup = operation.step(read(values));
+        assert!(matches!(
+            cleanup.first(),
+            Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
+        ));
+        assert_eq!(operation.finalize(), Err(MergeError::NotCoordinator));
+    }
+}
 
-    let mut operation = MergeUsersOperation::new(config(id(1), id(2)));
-    operation.start();
-    operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
-    operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
-        result: Ok(false),
-    }));
-    let txn_id = TxnId::generate();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-        result: Ok(()),
-    }));
-    let realm_bytes = Some(realm.to_bytes(&actor(id(1))).unwrap().into());
-    let mut values = vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))];
-    values.extend([None, None, None, None, realm_bytes, None, None, None]);
-    let cleanup = operation.step(read(values));
-    assert!(matches!(
-        cleanup.first(),
-        Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
-    ));
-    assert_eq!(operation.finalize(), Err(MergeError::NotCoordinator));
+#[test]
+fn pinned_node_coordinates() {
+    // The pin names a node; a node it does not list as management never counts.
+    let other = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+    let mut realm = RealmConfigDocument::new(REALM, Vec::new(), 3);
+    realm.ensure_node(node(), RealmNodeKind::Management);
+    let state = |pinned| {
+        aruna_core::reducer::decode_reducer_state(pin(Some(pinned)).unwrap().as_ref()).unwrap()
+    };
+    assert_eq!(
+        super::coordinator(&realm, Some(&state(node()))),
+        Some(node())
+    );
+    assert_eq!(super::coordinator(&realm, Some(&state(other))), None);
+    realm.ensure_node(other, RealmNodeKind::Server);
+    assert_eq!(super::coordinator(&realm, Some(&state(other))), None);
 }
 
 #[test]
@@ -512,7 +543,7 @@ fn merge_moves_everything() {
         None,
         None,
         realm_bytes,
-        None,
+        pin(Some(node())),
         None,
         None,
     ]));
@@ -643,4 +674,46 @@ fn merge_moves_everything() {
         (1, 1, 1, 1)
     );
     assert!(!outcome.repeated);
+}
+
+/// Runs a handoff to `target` on this node, the config pinning `pinned`, up to its write.
+fn hand_off(target: NodeId, pinned: Option<NodeId>) -> Result<Option<NodeId>, MergeError> {
+    use super::handoff::{HandoffConfig, HandoffOperation};
+    let mut realm = RealmConfigDocument::new(REALM, Vec::new(), 3);
+    realm.ensure_node(node(), RealmNodeKind::Management);
+    realm.ensure_node(target, RealmNodeKind::Management);
+    let mut operation = HandoffOperation::new(HandoffConfig {
+        actor: actor(id(1)),
+        auth_context: portal(id(1)),
+        node_id: target,
+    });
+    operation.start();
+    operation.step(Event::SubOperation(
+        SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+    ));
+    let txn_id = TxnId::generate();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    let realm_bytes = Some(realm.to_bytes(&actor(id(1))).unwrap().into());
+    let effects = operation.step(read(vec![realm_bytes, pin(pinned)]));
+    let Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) = effects.first() else {
+        return operation.finalize().map(|()| None);
+    };
+    let state = writes
+        .iter()
+        .find(|(space, _, _)| space == aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE)
+        .map(|(_, _, value)| aruna_core::reducer::decode_reducer_state(value).unwrap())
+        .unwrap();
+    Ok(state.materialized_merge_coordinator())
+}
+
+#[test]
+fn only_coordinator_hands_off() {
+    // The pinned node, or any management node while none is pinned, names the next one.
+    let target = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+    assert_eq!(hand_off(target, Some(node())), Ok(Some(target)));
+    assert_eq!(hand_off(target, None), Ok(Some(target)));
+    assert_eq!(
+        hand_off(target, Some(target)),
+        Err(MergeError::NotCoordinator)
+    );
 }

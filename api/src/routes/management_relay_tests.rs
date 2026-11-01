@@ -90,6 +90,14 @@ fn merge_goes_to_coordinator() {
         Some("/access/users/me/merge")
     );
     assert_eq!(coordinated_route(&Method::POST, route, true), None);
+    assert_eq!(
+        coordinated_route(
+            &Method::PUT,
+            Some("/api/v1/system/realm/merge-coordinator"),
+            false
+        ),
+        Some("/system/realm/merge-coordinator")
+    );
     assert!(
         !RELAYED_ROUTES
             .iter()

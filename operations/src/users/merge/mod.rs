@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod changes;
+pub mod handoff;
 mod plan;
 mod stage;
 #[cfg(test)]
@@ -21,7 +22,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::AdminDocumentError;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{reducer_state_key, subject_index_key, sync_revision_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Role};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -47,15 +48,19 @@ use crate::federation::link::fresh_local;
 use crate::sync::document_outbox::schedule_drain_effect;
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 
-/// The one node that runs account merges: the management node with the lowest id. Peers
-/// admit role grants and realm-config events of a merge only from a management node.
-pub fn coordinator(config: &RealmConfigDocument) -> Option<NodeId> {
+/// The one node that runs account merges: the management node the realm config names. Only
+/// that node hands the role on, so it stops merging before another one starts.
+pub fn coordinator(
+    config: &RealmConfigDocument,
+    state: Option<&AdminDocumentState>,
+) -> Option<NodeId> {
+    let pinned = state.and_then(AdminDocumentState::materialized_merge_coordinator)?;
+    let pinned_name = pinned.to_string();
     config
         .nodes
         .iter()
-        .filter(|node| matches!(node.kind, RealmNodeKind::Management))
-        .filter_map(|node| node.node_id.parse::<NodeId>().ok())
-        .min()
+        .any(|node| node.node_id == pinned_name && matches!(node.kind, RealmNodeKind::Management))
+        .then_some(pinned)
 }
 
 /// Group authorization documents read per scan page.
@@ -131,6 +136,12 @@ pub enum MergeError {
     Vault(String),
     #[error("this node does not coordinate account merges; retry the request")]
     NotCoordinator,
+    #[error("the caller may not name the merge coordinator")]
+    Unauthorized,
+    #[error("only a management node of this realm coordinates account merges")]
+    InvalidCoordinator,
+    #[error(transparent)]
+    Authorization(#[from] aruna_core::errors::AuthorizationError),
     #[error("a document moved to new holders during the merge; retry it")]
     PlacementFenced,
     #[error("the credential cutoff of the merged account failed: {0}")]
@@ -382,7 +393,10 @@ impl MergeUsersOperation {
             .transpose()?
             .ok_or(MergeError::NotCoordinator)?;
         // One node merges at a time, so opposite merges of two accounts never both commit.
-        if coordinator(&config) != Some(self.config.actor.node_id) {
+        let config_state = value(7)
+            .map(|bytes| decode_reducer_state(&bytes).map_err(ConversionError::from))
+            .transpose()?;
+        if coordinator(&config, config_state.as_ref()) != Some(self.config.actor.node_id) {
             return Err(MergeError::NotCoordinator);
         }
         let realm_auth = value(8)

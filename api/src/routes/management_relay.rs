@@ -6,6 +6,12 @@ use crate::error::ServerError;
 use crate::routes::info::{load_node_documents, management_node_urls};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
+use aruna_core::admin_documents::AdminDocumentTarget;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
+use aruna_core::reducer::decode_reducer_state;
+use aruna_core::storage_entries::reducer_state_key;
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::GetConfigOperation;
@@ -70,7 +76,10 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
 ];
 
 /// Routes every node passes to the realm's merge coordinator, a management node itself included.
-const COORDINATED_ROUTES: &[(&str, &str)] = &[("POST", "/access/users/me/merge")];
+const COORDINATED_ROUTES: &[(&str, &str)] = &[
+    ("POST", "/access/users/me/merge"),
+    ("PUT", "/system/realm/merge-coordinator"),
+];
 
 static RELAY_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -100,9 +109,9 @@ pub(crate) async fn relay_middleware(
         .map(|matched| matched.as_str().to_string());
     let has_hop = request.headers().contains_key(RELAY_HOP_HEADER);
     if let Some(route) = coordinated_route(request.method(), matched.as_deref(), has_hop) {
-        return match coordinator_target(&state).await {
+        return match coordinator_targets(&state).await {
             Ok(None) => next.run(request).await,
-            Ok(Some(url)) => relay(&state, route, vec![url], request).await,
+            Ok(Some(targets)) => relay(&state, route, targets, request).await,
             Err(error) => error.into_response(),
         };
     }
@@ -154,25 +163,48 @@ fn coordinated_route(
         .filter(|_| !has_hop)
 }
 
-/// The api url of the merge coordinator, or `None` when this node is the coordinator.
-async fn coordinator_target(state: &Arc<ServerState>) -> Result<Option<String>, ServerError> {
+/// Where a coordinated route goes: `None` when this node answers it, being the pinned merge
+/// coordinator or, while none is pinned, a management node; else the coordinator's url or, while
+/// none is pinned, the management nodes.
+async fn coordinator_targets(state: &Arc<ServerState>) -> Result<Option<Vec<String>>, ServerError> {
     let config = drive(
         GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
     .map_err(|_| ServerError::NoManagementNode)?;
-    let coordinator = merge_coordinator(&config).ok_or(ServerError::NoManagementNode)?;
-    if coordinator == state.get_node_id() {
-        return Ok(None);
+    let target = AdminDocumentTarget::RealmConfig {
+        realm_id: state.get_realm_id(),
+    };
+    let reducer = match state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: DOCUMENT_STATE_KEYSPACE.to_string(),
+            key: reducer_state_key(&target),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            value.and_then(|bytes| decode_reducer_state(&bytes).ok())
+        }
+        _ => return Err(ServerError::NoManagementNode),
+    };
+    match merge_coordinator(&config, reducer.as_ref()) {
+        Some(node) if node == state.get_node_id() => Ok(None),
+        Some(node) => {
+            let documents = load_node_documents(state, &config).await;
+            management_node_urls(&config, &documents)
+                .into_iter()
+                .find(|(node_id, _)| *node_id == node)
+                .and_then(|(_, url)| url)
+                .map(|url| Some(vec![url]))
+                .ok_or(ServerError::NoManagementNode)
+        }
+        None if state.is_management_node() => Ok(None),
+        None => Ok(Some(management_targets(state).await)),
     }
-    let documents = load_node_documents(state, &config).await;
-    management_node_urls(&config, &documents)
-        .into_iter()
-        .find(|(node_id, _)| *node_id == coordinator)
-        .and_then(|(_, url)| url)
-        .map(Some)
-        .ok_or(ServerError::NoManagementNode)
 }
 
 async fn relay(

@@ -15,6 +15,7 @@ use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::bearer_token::decode_bearer_token;
 use aruna_operations::driver::drive;
 use aruna_operations::federation::link::fresh_local;
+use aruna_operations::users::merge::handoff::{HandoffConfig, HandoffOperation};
 use aruna_operations::users::merge::{MergeError, MergeUsersConfig, MergeUsersOperation};
 use aruna_operations::users::update_user::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
 use axum::extract::State;
@@ -33,6 +34,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
         .routes(routes!(merge_account))
         .routes(routes!(attach_subject))
+        .routes(routes!(hand_off))
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -59,6 +61,12 @@ pub struct MergeAccountResponse {
     pub secondaries: usize,
     /// The other account was already merged into the caller's; nothing changed.
     pub repeated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct HandoffRequest {
+    /// The management node that runs account merges from now on.
+    pub node_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -100,6 +108,8 @@ fn map_merge_error(error: MergeError) -> ServerError {
             ServerError::Refused(StatusCode::CONFLICT, "role_conflict", message)
         }
         MergeError::NotFound => ServerError::NotFound,
+        MergeError::Unauthorized => ServerError::Forbidden,
+        MergeError::InvalidCoordinator => ServerError::BadRequestReason(message),
         MergeError::Storage(_)
         | MergeError::Vault(_)
         | MergeError::PlacementFenced
@@ -138,8 +148,9 @@ that account. Both prove control; a matching email or name is never enough.
 - Runs, RO-Crates, provenance and other signed records keep naming the other account; reads of
   its id resolve to the primary.
 - The change, including the cutoff, is one transaction on the realm's merge coordinator, the
-  management node with the lowest id; every other node passes the call there unchanged. So two
-  opposite merges of the same accounts never both commit. It replicates to every node. Repeating a
+  management node the realm config names (see `PUT /system/realm/merge-coordinator`); every
+  other node passes the call there unchanged. Only that node hands the role on, so two opposite
+  merges of the same accounts never both commit. It replicates to every node. Repeating a
   finished merge answers again with `repeated: true`, also with the then cut-off token.
 
 **Limits**
@@ -305,4 +316,61 @@ async fn attach_subject(
             other => ServerError::InternalError(other.to_string()),
         })?;
     Ok(Json(user.into()))
+}
+
+#[utoipa::path(
+    put,
+    path = "/system/realm/merge-coordinator",
+    tag = "system/realm",
+    summary = "Hand account merges to another management node",
+    description = r#"Names the one management node that runs account merges.
+
+**Authentication**: realm bearer token without path restrictions and WRITE on
+`/{realm}/admin/config`.
+
+**Behavior**
+- Every node passes this call to the current merge coordinator. It writes the new name and stops
+  merging in the same commit, so two nodes never merge at once.
+- A realm names its first node when it is created. While no management node is named, for
+  example after the named node left management, any management node may name one.
+- Merges run on the named node only and answer 503 elsewhere until the name has reached them."#,
+    request_body(
+        content = HandoffRequest,
+        example = json!({ "node_id": "<node id of a management node>" })
+    ),
+    responses(
+        (status = 204, description = "The node runs account merges from now on"),
+        (status = 400, description = "The node id is malformed or names no management node of this realm", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "The caller lacks the administration grant or the token is path-restricted", body = ErrorResponse),
+        (status = 503, description = "This node does not coordinate merges and could not pass the call on; retry", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn hand_off(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<HandoffRequest>,
+) -> ServerResult<StatusCode> {
+    let auth = require_unrestricted_auth(&state, auth)?;
+    if !state.is_management_node() {
+        return Err(ServerError::Forbidden);
+    }
+    let node_id = request
+        .node_id
+        .parse()
+        .map_err(|_| ServerError::BadRequestReason("malformed node id".to_string()))?;
+    let config = HandoffConfig {
+        actor: Actor {
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+            realm_id: state.get_realm_id(),
+        },
+        auth_context: auth,
+        node_id,
+    };
+    drive(HandoffOperation::new(config), &state.get_ctx())
+        .await
+        .map_err(map_merge_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
