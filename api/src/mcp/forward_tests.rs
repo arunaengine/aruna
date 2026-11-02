@@ -190,6 +190,19 @@ async fn tool_follows_node() {
     assert_eq!(mock.paths.lock().unwrap().len(), 1);
 }
 
+fn auth_parts(auth: &AuthContext, directed: Option<NodeId>) -> http::request::Parts {
+    let (mut parts, ()) = http::Request::new(()).into_parts();
+    parts.extensions.insert(Some(auth.clone()));
+    let token = crate::auth::ValidatedBearer::new_for_test("caller-token");
+    parts.extensions.insert(Some(token));
+    if let Some(node_id) = directed {
+        let value = http::HeaderValue::try_from(node_id.to_string()).unwrap();
+        let header = crate::routes::storage::relay::RELAY_NODE_HEADER;
+        parts.headers.insert(header, value);
+    }
+    parts
+}
+
 // A node outside the realm's servers never gets the caller's token, even when it publishes
 // an address.
 #[tokio::test]
@@ -223,4 +236,26 @@ fn devices_never_targets() {
     assert!(realm_server(&config, node(2)));
     assert!(!realm_server(&config, node(3)));
     assert!(!realm_server(&config, node(4)));
+}
+
+// A call another node forwarded runs here and is never forwarded again; one directed at
+// another node is refused, so two nodes advertising one endpoint cannot loop.
+#[tokio::test]
+async fn directed_never_forwards() {
+    let fixture = node_state().await;
+    let server = McpServer::new(fixture.state.clone());
+    let (here, peer) = (node_id(LOCAL), node_id(PEER));
+    let named = Some(peer.to_string());
+    let parts = auth_parts(&fixture.owner, Some(here));
+    let call = (&parts, &fixture.owner);
+    let local = server
+        .bucket_node(call, BUCKET, named.as_deref(), "a")
+        .await;
+    assert_eq!(local.unwrap(), None);
+    let parts = auth_parts(&fixture.owner, Some(peer));
+    let call = (&parts, &fixture.owner);
+    let looped = server
+        .bucket_node(call, BUCKET, named.as_deref(), "a")
+        .await;
+    assert_eq!(body(looped.unwrap_err())["code"], "Conflict");
 }

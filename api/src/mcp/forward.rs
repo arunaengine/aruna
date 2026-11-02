@@ -7,7 +7,7 @@ use super::compute::request_bearer;
 use super::data::map_bucket_error;
 use super::{McpServer, explained, internal_error, server_error};
 use crate::error::ServerError;
-use crate::routes::storage::relay::capped_body;
+use crate::routes::storage::relay::{RELAY_NODE_HEADER, capped_body, node_directed};
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -106,6 +106,10 @@ impl McpServer {
         named: Option<&str>,
         key: &str,
     ) -> Result<Option<NodeId>, CallToolResult> {
+        // A call another node forwarded runs here; one meant for another node is refused.
+        if node_directed(&self.state, &parts.headers).map_err(server_error)? {
+            return Ok(None);
+        }
         let named = named.map(parse_node).transpose()?;
         let context = self.state.get_ctx();
         let local = named.is_none()
@@ -176,8 +180,8 @@ impl McpServer {
         }
     }
 
-    /// Runs `tool` with `input` on `node_id` as the caller and decodes its answer; the input
-    /// names that node, so it answers itself and never forwards again.
+    /// Runs `tool` with `input` on `node_id` as the caller and decodes its answer; the call is
+    /// directed at that node, which answers itself and never forwards again.
     pub(crate) async fn forward<T: DeserializeOwned>(
         &self,
         parts: &http::request::Parts,
@@ -219,6 +223,7 @@ impl McpServer {
         let sent = async {
             let response = (CLIENT.post(mcp_url(&base)))
                 .bearer_auth(bearer.as_str())
+                .header(RELAY_NODE_HEADER, node_id.to_string())
                 .header(http::header::ACCEPT, "application/json, text/event-stream")
                 .json(&call)
                 .send()
