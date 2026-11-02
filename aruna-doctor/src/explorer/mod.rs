@@ -20,10 +20,18 @@ pub(super) enum ExplorerError {
     Fjall(#[from] fjall::Error),
     #[error(transparent)]
     Irokle(#[from] irokle::Error),
+    #[error(transparent)]
+    Craqle(Box<craqle::CraqleError>),
     #[error("keyspace not found: {0}")]
     KeyspaceNotFound(String),
     #[error("decode failed: {0}")]
     Decode(String),
     #[error("migration refused: {0}")]
     Refused(String),
+}
+
+impl From<craqle::CraqleError> for ExplorerError {
+    fn from(error: craqle::CraqleError) -> Self {
+        Self::Craqle(Box::new(error))
+    }
 }

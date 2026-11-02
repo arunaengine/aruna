@@ -56,6 +56,7 @@ use std::path::Path;
 use ulid::Ulid;
 
 mod buckets;
+mod cursor_repair;
 mod git;
 mod info_topics;
 mod jobs;
@@ -73,6 +74,7 @@ mod user_sessions;
 mod vault;
 mod versions;
 
+pub use cursor_repair::{CursorRepair, repair_cursor};
 pub use topic_purge::purge_topic;
 
 #[derive(Debug, Serialize)]

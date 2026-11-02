@@ -50,6 +50,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: TopicCommands,
     },
+    Metadata {
+        #[command(subcommand)]
+        command: MetadataCommands,
+    },
     NodeState {
         #[arg(long)]
         database_path: String,
@@ -159,6 +163,28 @@ pub enum TopicCommands {
         /// Topic id as 64 hex characters.
         #[arg(long)]
         id: String,
+        /// Document sync store; defaults to `<database_path>/document-sync`.
+        #[arg(long)]
+        sync_path: Option<String>,
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MetadataCommands {
+    /// Move one metadata graph's sync cursor onto its topic's current genesis, so the topic
+    /// replays into the kept graph. Refuses when an actor published on both geneses. Run with
+    /// the node stopped; without `--apply` it only reports both branches and their overlap.
+    RepairCursor {
+        #[arg(long)]
+        database_path: String,
+        /// Graph IRI of the metadata document.
+        #[arg(long)]
+        graph: String,
+        /// Craqle store; defaults to `<database_path>/craqle`.
+        #[arg(long)]
+        craqle_path: Option<String>,
         /// Document sync store; defaults to `<database_path>/document-sync`.
         #[arg(long)]
         sync_path: Option<String>,
