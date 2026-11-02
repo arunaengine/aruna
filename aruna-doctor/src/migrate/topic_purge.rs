@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
 };
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
-use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
+use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, PersistMode};
 use irokle::{FjallStorage, Storage, TopicId};
 use serde::Serialize;
 use std::path::Path;
@@ -60,13 +60,10 @@ fn purge_output(
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let realm_id = info_topics::node_realm(&db)?
         .ok_or_else(|| ExplorerError::Refused("node has no realm".to_string()))?;
-    if !sync_path.exists()
-        || FjallStorage::open(sync_path)?
+    let held = sync_path.exists()
+        && FjallStorage::open(sync_path)?
             .topic_state(&topic)?
-            .is_none()
-    {
-        return Err(ExplorerError::Refused(format!("topic {topic} not found")));
-    }
+            .is_some();
     let applied = db.keyspace(APPLIED_OPS_KEYSPACE, KeyspaceCreateOptions::default)?;
     let quarantine = db.keyspace(SYNC_QUARANTINE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let usage = db.keyspace(QUARANTINE_USAGE_KEYSPACE, KeyspaceCreateOptions::default)?;
@@ -80,6 +77,12 @@ fn purge_output(
     let cleanup = info_topics::topic_rows(&db, &[topic], rows, |record| {
         record.target.sync_topic_id(realm_id, &record.placement) == topic
     })?;
+    // A run that removed the topic before its rows were durable repeats to remove the rows.
+    let rows_left =
+        !(cleanup.cursors.is_empty() && cleanup.quarantine.is_empty() && cleanup.outbox.is_empty());
+    if !held && !rows_left {
+        return Err(ExplorerError::Refused(format!("topic {topic} not found")));
+    }
     let mut output = PurgeOutput {
         database_path: database_path.to_string(),
         topic_id: topic.to_string(),
@@ -93,7 +96,7 @@ fn purge_output(
     if !apply {
         return Ok(output);
     }
-    let mut txn = db.write_tx()?;
+    let mut txn = db.write_tx()?.durability(Some(PersistMode::SyncAll));
     for (keyspace, keys) in [
         (&applied, &cleanup.cursors),
         (&quarantine, &cleanup.quarantine),
@@ -108,9 +111,11 @@ fn purge_output(
     }
     txn.commit()?
         .map_err(|_| ExplorerError::Refused("conflicted with a running node".to_string()))?;
-    // The node rows go first, so an interrupted purge still finds the topic and can repeat.
-    (output.ops_deleted, output.fanout_deleted) =
-        info_topics::purge_topics(sync_path, &cleanup.topics)?;
+    // The node rows go first and durably, so an interrupted purge still finds the topic.
+    if held {
+        (output.ops_deleted, output.fanout_deleted) =
+            info_topics::purge_topics(sync_path, &cleanup.topics)?;
+    }
     Ok(output)
 }
 
@@ -241,6 +246,23 @@ mod tests {
         assert!(matches!(error, ExplorerError::Refused(_)));
         assert!(topic_exists(&store, &store.purged));
         assert_eq!(read(&store.path, SYNC_OUTBOX_KEYSPACE).len(), 2);
+    }
+
+    #[test]
+    fn retry_removes_rows() {
+        // A crash after the topic went but before its rows were durable leaves only the rows.
+        let store = two_topics();
+        info_topics::purge_topics(&store.sync, &[store.purged]).unwrap();
+
+        let output = run(&store, &store.purged.to_string(), true).unwrap();
+
+        assert_eq!(
+            (output.cursors, output.outbox, output.ops_deleted),
+            (1, 1, 0)
+        );
+        assert_eq!(read(&store.path, SYNC_OUTBOX_KEYSPACE).len(), 1);
+        assert_eq!(read(&store.path, APPLIED_OPS_KEYSPACE).len(), 1);
+        assert!(topic_exists(&store, &store.kept));
     }
 
     #[test]
