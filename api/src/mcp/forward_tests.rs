@@ -189,3 +189,38 @@ async fn tool_follows_node() {
     assert_eq!(listed.await.unwrap().0.node_id, peer.to_string());
     assert_eq!(mock.paths.lock().unwrap().len(), 1);
 }
+
+// A node outside the realm's servers never gets the caller's token, even when it publishes
+// an address.
+#[tokio::test]
+async fn forward_needs_member() {
+    let fixture = node_state().await;
+    let server = McpServer::new(fixture.state.clone());
+    let outsider = node(9);
+    let mock = mock_peer(StatusCode::OK, "{}").await;
+    publish_api(&fixture.state, outsider, &mock.url).await;
+    let (parts, input) = (caller(&fixture, true), listing());
+    let refused = server.forward::<ObjectsOutput>(&parts, outsider, "list_objects", &input);
+    let refused = body(refused.await.unwrap_err());
+    assert_eq!(refused["code"], "Bad request");
+    assert!(mock.paths.lock().unwrap().is_empty());
+}
+
+#[test]
+fn devices_never_targets() {
+    use aruna_core::structs::identity::realm::{RealmId, RealmNode, RealmNodeKind};
+    let realm_id = RealmId([3; 32]);
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    let device = RealmNodeKind::User {
+        owner: aruna_core::UserId::nil(realm_id),
+    };
+    for (seed, kind) in [(2, RealmNodeKind::Server), (3, device)] {
+        config.nodes.push(RealmNode {
+            node_id: node(seed).to_string(),
+            kind,
+        });
+    }
+    assert!(realm_server(&config, node(2)));
+    assert!(!realm_server(&config, node(3)));
+    assert!(!realm_server(&config, node(4)));
+}

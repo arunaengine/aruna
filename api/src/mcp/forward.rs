@@ -10,10 +10,12 @@ use crate::error::ServerError;
 use crate::routes::storage::relay::capped_body;
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_operations::distribution::delegate::node_urls;
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
@@ -80,6 +82,13 @@ pub(crate) fn pick_node(
             holders.iter().map(|holder| holder.node_id).collect(),
         )),
     }
+}
+
+/// Whether `node_id` is a server or management node in the realm's current configuration;
+/// devices and nodes no longer configured never receive a forwarded call and its token.
+pub(crate) fn realm_server(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    let node_id = node_id.to_string();
+    (config.nodes.iter()).any(|node| node.node_id == node_id && node.kind.is_sync_eligible())
 }
 
 /// The `/mcp` url on a node's published api base, which may carry the REST nest.
@@ -183,7 +192,19 @@ impl McpServer {
                 "node {node_id} holds the bucket but {why}; retry later"
             )))
         };
-        let urls = node_urls(self.state.get_ctx().as_ref(), node_id).await;
+        let context = self.state.get_ctx();
+        let realm = GetConfigOperation::new(self.state.get_realm_id());
+        let realm = drive(realm, &context).await.map_err(internal_error)?;
+        if !realm_server(&realm, node_id) {
+            return Err(explained(
+                ServerError::BadRequest,
+                format!(
+                    "node {node_id} is not a server node of this realm; pass a node_id from \
+                     list_buckets or omit it"
+                ),
+            ));
+        }
+        let urls = node_urls(context.as_ref(), node_id).await;
         let Some(base) = urls.and_then(|urls| urls.api) else {
             return Err(silent("publishes no api address".to_string()));
         };
