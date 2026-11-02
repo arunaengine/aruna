@@ -84,7 +84,7 @@ chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 # Pinned to craqle 0.3.2 main with Irokle 0.3.2; it resolves the irokle below.
-craqle = { git = "https://github.com/arunaengine/craqle", rev = "a6f05d0614b8a37aa16851bf93f894d2f4e64045", features = [
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "542793585b0582e31f8caf58e33e63e960f1f6e1", features = [
     "iroh",
     "shacl-core",
 ] }
