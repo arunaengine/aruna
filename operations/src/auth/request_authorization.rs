@@ -120,4 +120,13 @@ impl BucketAccess {
         let request = policy_request_with(&path, permission, Some(&self.auth), extras);
         self.rules.allows(&path, permission) && self.policies.evaluate(&request).is_ok()
     }
+
+    /// Whether the caller may read all of `prefix`, empty or ending in `/`: READ on it, and no
+    /// role deny or path restriction below it hides a part of it.
+    pub fn reads_subtree(&self, prefix: &str) -> bool {
+        use aruna_core::structs::storage::abe_access::KeyScope;
+        let scope = KeyScope::Subtree(prefix.to_string());
+        let key = (!prefix.is_empty()).then_some(prefix);
+        self.allows(key, &Permission::READ) && self.rules.admits_scope(&self.bucket_path, &scope)
+    }
 }

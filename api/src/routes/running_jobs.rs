@@ -3,13 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::permission_granted;
-use crate::error::ServerResult;
+use crate::error::{ServerError, ServerResult};
 use crate::routes::execution::jobs::{JobProgressResponse, rfc3339};
 use crate::routes::info::{InfoAccess, info_access};
 use crate::server::state::ServerState;
 use aruna_core::jobs::{JobTarget, RunningJobView};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
+use aruna_core::structs::storage::blob::group_permission_path;
+use aruna_operations::auth::request_authorization::BucketAccess;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -90,9 +91,10 @@ impl From<RunningJobView> for NodeJobResponse {
 **Behavior**
 - A realm admin (WRITE on the realm configuration admin path) sees every job with what it works on,
   its progress and its start time, including jobs that belong to no group. `hidden` is 0.
-- Another caller with a token of this realm sees a job in detail when it may read the job's bucket,
-  or its group when the job works on no bucket, or when it created the job with an unrestricted
-  token. Every other job only adds to `hidden`.
+- Another caller with a token of this realm sees a job in detail when it may read what the job
+  works on (its key, or all of its prefix or bucket with no deny below it), or the job's group
+  when the job works on no bucket, or when it created the job with an unrestricted token. Every
+  other job only adds to `hidden`.
 - An anonymous caller gets one entry with only `kind` per running job and `hidden` 0.
 - `target` is a bucket with an optional key or prefix, or a dataset id. `progress` is present only
   while the job counts something; `total` is absent when the job has only a count.
@@ -187,13 +189,20 @@ async fn may_read(
         return Ok(false);
     };
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
-    let path = match &job.target {
-        Some(JobTarget::Bucket { bucket, .. }) => {
-            bucket_permission_path(realm_id, group_id, node_id, bucket)
-        }
-        _ => group_permission_path(realm_id, group_id, node_id),
+    let Some(JobTarget::Bucket { bucket, path }) = &job.target else {
+        let path = group_permission_path(realm_id, group_id, node_id);
+        return permission_granted(state, auth, path, Permission::READ).await;
     };
-    permission_granted(state, auth, path, Permission::READ).await
+    let context = state.get_ctx();
+    let access = BucketAccess::load(&context, auth, (realm_id, group_id, node_id), bucket)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    // A prefix shows only when no deny below it hides a part of what the job touches.
+    let path = path.as_deref().unwrap_or_default();
+    Ok(match path.is_empty() || path.ends_with('/') {
+        true => access.reads_subtree(path),
+        false => access.allows(Some(path), &Permission::READ),
+    })
 }
 
 #[cfg(test)]

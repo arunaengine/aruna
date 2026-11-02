@@ -212,3 +212,41 @@ async fn visitor_sees_kinds() {
         }));
     }
 }
+
+#[tokio::test]
+async fn deny_below_hides() {
+    // A deny below the job's prefix hides the job; a deny beside it does not.
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+    use aruna_core::structs::storage::blob::bucket_permission_path;
+    let fixture = fixture().await;
+    let (realm_id, node_id) = (fixture.state.get_realm_id(), fixture.state.get_node_id());
+    let root = bucket_permission_path(realm_id, fixture.group, node_id, "bakta-runs");
+    let caller = |denied: &str| AuthContext {
+        path_restrictions: Some(vec![
+            PathRestriction {
+                pattern: root.clone(),
+                permission: Permission::READ,
+            },
+            PathRestriction {
+                pattern: format!("{root}/**"),
+                permission: Permission::READ,
+            },
+            PathRestriction {
+                pattern: format!("{root}/{denied}"),
+                permission: Permission::DENY,
+            },
+        ]),
+        ..auth(&fixture, fixture.member)
+    };
+    let jobs = || vec![copy_job(fixture.group, "bakta-runs", fixture.admin, 1)];
+    let below = caller("assemblies/2025/private/**");
+    let response = visible_jobs(&fixture.state, Some(&below), jobs())
+        .await
+        .unwrap();
+    assert_eq!((response.jobs.len(), response.hidden), (0, 1));
+    let beside = caller("reads/**");
+    let response = visible_jobs(&fixture.state, Some(&beside), jobs())
+        .await
+        .unwrap();
+    assert_eq!((response.jobs.len(), response.hidden), (1, 0));
+}
