@@ -12,6 +12,7 @@ use super::{
     field, map_read_error, merge_search_hits, metadata_node_call, paginate, query_union_safe,
     record_elapsed_ms, resume_fetch_limit, run_metadata_fanout,
 };
+use std::collections::BTreeMap;
 
 pub(super) fn object_search_fingerprint(
     realm_id: RealmId,
@@ -204,18 +205,29 @@ pub(super) async fn run_query_distributed(
     let partition_query = ordered
         .as_ref()
         .map_or_else(|| query.clone(), |(text, _)| text.clone());
+    let ties = ordered
+        .as_ref()
+        .zip(select_limit)
+        .map(|((_, order), limit)| (order.clone(), limit));
     let local_call: MetadataNodeCall<MetadataQueryResults> = metadata_node_call(
         (
             handle.clone(),
             auth.clone(),
             graph_iris.clone(),
             partition_query.clone(),
+            ties.clone(),
         ),
-        |(handle, auth, graph_iris, query), _| async move {
-            handle
-                .query_authorized_local(auth, graph_iris, query)
-                .await
-                .map_err(crate::metadata::handle::metadata_read_error)
+        move |(handle, auth, graph_iris, query, ties), _| async move {
+            fetch_ties(query, ties, deadline, MERGE_PERMITS.clone(), |query| {
+                let (handle, auth, graph_iris) = (handle.clone(), auth.clone(), graph_iris.clone());
+                async move {
+                    handle
+                        .query_authorized_local(auth, graph_iris, query)
+                        .await
+                        .map_err(crate::metadata::handle::metadata_read_error)
+                }
+            })
+            .await
         },
     );
     let remote_call: MetadataNodeCall<MetadataQueryResults> = metadata_node_call(
@@ -224,11 +236,19 @@ pub(super) async fn run_query_distributed(
             remote_auth_token.clone(),
             graph_iris.clone(),
             partition_query.clone(),
+            ties,
         ),
-        |(handle, auth_token, graph_iris, query), node_id| async move {
-            handle
-                .query_remote_graphs(node_id, auth_token, graph_iris, query)
-                .await
+        move |(handle, auth_token, graph_iris, query, ties), node_id| async move {
+            fetch_ties(query, ties, deadline, MERGE_PERMITS.clone(), |query| {
+                let (handle, auth_token, graph_iris) =
+                    (handle.clone(), auth_token.clone(), graph_iris.clone());
+                async move {
+                    handle
+                        .query_remote_graphs(node_id, auth_token, graph_iris, query)
+                        .await
+                }
+            })
+            .await
         },
     );
     let (parts, fanout_stats) = run_metadata_fanout(
@@ -251,8 +271,7 @@ pub(super) async fn run_query_distributed(
             None => aggregate_query_results(Vec::new(), query_form, select_limit),
         }
     } else if let Some((_, order)) = ordered {
-        let row_limit = select_limit.unwrap_or(QUERY_MAX_ROWS).min(QUERY_MAX_ROWS);
-        merge_ordered(parts, order, row_limit, deadline, MERGE_PERMITS.clone())
+        merge_ordered(parts, order, deadline, MERGE_PERMITS.clone())
             .await
             .and_then(|rows| aggregate_query_results(vec![rows], query_form, select_limit))
     } else {
@@ -520,10 +539,21 @@ static MERGE_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
 pub(super) async fn merge_ordered(
     results: Vec<MetadataQueryResults>,
     order: Vec<spargebra::algebra::OrderExpression>,
-    row_limit: usize,
     deadline: tokio::time::Instant,
     permits: Arc<tokio::sync::Semaphore>,
 ) -> Result<MetadataQueryResults, MetadataApiError> {
+    run_ordering(deadline, permits, move |cancel| {
+        order_solutions(results, &order, cancel)
+    })
+    .await
+}
+
+/// Runs a spareval ordering job on the blocking pool under a merge permit and `deadline`.
+async fn run_ordering<T: Send + 'static>(
+    deadline: tokio::time::Instant,
+    permits: Arc<tokio::sync::Semaphore>,
+    job: impl FnOnce(&spareval::CancellationToken) -> Result<T, MetadataApiError> + Send + 'static,
+) -> Result<T, MetadataApiError> {
     if tokio::time::Instant::now() >= deadline {
         return Err(MetadataApiError::ServiceUnavailable);
     }
@@ -538,7 +568,7 @@ pub(super) async fn merge_ordered(
         if task_cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
             return Err(MetadataApiError::ServiceUnavailable);
         }
-        order_solutions(results, &order, row_limit, &task_cancel)
+        job(&task_cancel)
     });
     match tokio::time::timeout_at(deadline, task).await {
         Ok(Ok(merged)) => merged,
@@ -547,6 +577,57 @@ pub(super) async fn merge_ordered(
             cancel.cancel();
             Err(MetadataApiError::ServiceUnavailable)
         }
+    }
+}
+
+/// Runs a partition's ordered query and also keeps every row past its `LIMIT` that orders equal
+/// to the last row inside it, refetching with a doubling margin, so no partition cuts a tie.
+pub(super) async fn fetch_ties<F, Fut>(
+    query: String,
+    ties: Option<(Vec<spargebra::algebra::OrderExpression>, usize)>,
+    deadline: tokio::time::Instant,
+    permits: Arc<tokio::sync::Semaphore>,
+    run: F,
+) -> Result<MetadataQueryResults, MetadataReadError>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<MetadataQueryResults, MetadataReadError>>,
+{
+    let Some((order, limit)) = ties.filter(|(_, limit)| *limit > 0) else {
+        return run(query).await;
+    };
+    let Ok(mut parsed) = spargebra::SparqlParser::new().parse_query(&query) else {
+        return run(query).await;
+    };
+    let order = Arc::new(order);
+    let mut margin = 1usize;
+    loop {
+        let fetch = limit.saturating_add(margin);
+        let spargebra::Query::Select {
+            pattern: spargebra::algebra::GraphPattern::Slice { length, .. },
+            ..
+        } = &mut parsed
+        else {
+            return run(query).await;
+        };
+        *length = Some(fetch);
+        let rows = match run(parsed.to_string()).await? {
+            MetadataQueryResults::Solutions(rows) if rows.len() > limit => rows,
+            result => return Ok(result),
+        };
+        let order = order.clone();
+        let (mut rows, tied) = run_ordering(deadline, permits.clone(), move |cancel| {
+            let tied = tied_rows(&rows[limit - 1..], &order, cancel)?;
+            Ok((rows, tied))
+        })
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?;
+        let kept = limit - 1 + tied;
+        if kept < rows.len() || rows.len() < fetch {
+            rows.truncate(kept);
+            return Ok(MetadataQueryResults::Solutions(rows));
+        }
+        margin = margin.saturating_mul(2);
     }
 }
 
@@ -614,21 +695,16 @@ pub(super) fn ordered_query(
 pub(super) fn order_solutions(
     results: Vec<MetadataQueryResults>,
     order: &[spargebra::algebra::OrderExpression],
-    row_limit: usize,
     cancel: &spareval::CancellationToken,
 ) -> Result<MetadataQueryResults, MetadataApiError> {
-    use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, Quad, Term, Variable};
-    use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
-    use spargebra::term::TriplePattern;
-
-    // A partition's rows past `row_limit` cannot reach the merged top rows.
+    // Partitions return whole tie groups past `LIMIT`, so only the byte budget bounds the union.
     let mut rows = Vec::new();
     let mut bytes = 0usize;
     for result in results {
         let MetadataQueryResults::Solutions(part) = result else {
             continue;
         };
-        for row in part.into_iter().take(row_limit) {
+        for row in part {
             bytes = row.iter().fold(bytes, |bytes, (name, value)| {
                 bytes.saturating_add(name.len()).saturating_add(value.len())
             });
@@ -640,6 +716,43 @@ pub(super) fn order_solutions(
     }
     rows.sort_unstable();
     rows.dedup();
+    let positions = sorted_positions(&rows, order, false, cancel)?;
+    let mut slots: Vec<_> = rows.into_iter().map(Some).collect();
+    let mut ordered = Vec::with_capacity(slots.len());
+    for position in positions {
+        let row = slots
+            .get_mut(position)
+            .and_then(Option::take)
+            .ok_or_else(|| MetadataApiError::Internal("ordering lost a row".to_string()))?;
+        ordered.push(row);
+    }
+    Ok(MetadataQueryResults::Solutions(ordered))
+}
+
+/// Counts the leading `rows` that order equal to the first one, for rows already in key order.
+pub(super) fn tied_rows(
+    rows: &[BTreeMap<String, String>],
+    order: &[spargebra::algebra::OrderExpression],
+    cancel: &spareval::CancellationToken,
+) -> Result<usize, MetadataApiError> {
+    // Ties sort by descending position, so the first row out is the last row tied with the first.
+    let last = sorted_positions(rows, order, true, cancel)?
+        .first()
+        .copied();
+    Ok(last.map_or(0, |last| last + 1))
+}
+
+/// Orders row positions by `order`, then by position, with spareval's SPARQL ordering.
+fn sorted_positions(
+    rows: &[BTreeMap<String, String>],
+    order: &[spargebra::algebra::OrderExpression],
+    descending: bool,
+    cancel: &spareval::CancellationToken,
+) -> Result<Vec<usize>, MetadataApiError> {
+    use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, Quad, Term, Variable};
+    use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
+    use spargebra::term::TriplePattern;
+
     // Each row becomes a subject with its position and one column triple per bound variable.
     let row = Variable::new_unchecked("order-row");
     let index = Variable::new_unchecked("order-index");
@@ -696,7 +809,11 @@ pub(super) fn order_solutions(
         };
     }
     let mut expression = order.to_vec();
-    expression.push(OrderExpression::Asc(Expression::Variable(index.clone())));
+    let position = Expression::Variable(index.clone());
+    expression.push(match descending {
+        true => OrderExpression::Desc(position),
+        false => OrderExpression::Asc(position),
+    });
     let query = spargebra::Query::Select {
         dataset: None,
         base_iri: None,
@@ -722,20 +839,19 @@ pub(super) fn order_solutions(
             "ordering returned no rows".to_string(),
         ));
     };
-    let mut slots: Vec<_> = rows.into_iter().map(Some).collect();
-    let mut ordered = Vec::with_capacity(slots.len());
+    let mut positions = Vec::with_capacity(rows.len());
     for solution in solutions {
         let solution = solution.map_err(evaluation_error)?;
         let position = match solution.get(&index) {
             Some(Term::Literal(literal)) => literal.value().parse::<usize>().ok(),
             _ => None,
         };
-        let row = position
-            .and_then(|position| slots.get_mut(position)?.take())
-            .ok_or_else(|| MetadataApiError::Internal("ordering lost a row".to_string()))?;
-        ordered.push(row);
+        positions.push(
+            position
+                .ok_or_else(|| MetadataApiError::Internal("ordering lost a row".to_string()))?,
+        );
     }
-    Ok(MetadataQueryResults::Solutions(ordered))
+    Ok(positions)
 }
 
 pub fn query_form(query: &str) -> Option<MetadataQueryForm> {

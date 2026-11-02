@@ -4,7 +4,7 @@
 
 use super::*;
 
-use super::super::distributed::{merge_ordered, order_solutions, ordered_query};
+use super::super::distributed::{fetch_ties, merge_ordered, order_solutions, ordered_query};
 
 const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
@@ -25,7 +25,7 @@ fn merge_parts(
         .collect();
     let limit = query_select_limit(query);
     let merged = match ordered_query(query).unwrap() {
-        Some((_, order)) => order_solutions(parts, &order, QUERY_MAX_ROWS, &Default::default())
+        Some((_, order)) => order_solutions(parts, &order, &Default::default())
             .and_then(|rows| aggregate_query_results(vec![rows], MetadataQueryForm::Select, limit)),
         None => aggregate_query_results(parts, MetadataQueryForm::Select, limit),
     };
@@ -276,7 +276,7 @@ fn merge_refuses_oversize() {
         .unwrap()
         .1;
     let parts = vec![large_partition("a"), large_partition("b")];
-    let merged = order_solutions(parts, &order, 5, &Default::default());
+    let merged = order_solutions(parts, &order, &Default::default());
     assert!(matches!(merged, Err(MetadataApiError::BadRequest)));
 }
 
@@ -291,7 +291,7 @@ fn merge_stops_cancelled() {
     )])])];
     let cancel = spareval::CancellationToken::new();
     cancel.cancel();
-    let merged = order_solutions(parts, &order, 1, &cancel);
+    let merged = order_solutions(parts, &order, &cancel);
     assert!(matches!(merged, Err(MetadataApiError::ServiceUnavailable)));
 }
 
@@ -305,7 +305,7 @@ async fn merge_past_deadline() {
         "s", "<urn:a>",
     )])])];
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-    let merged = merge_ordered(parts, order, 1, tokio::time::Instant::now(), permits).await;
+    let merged = merge_ordered(parts, order, tokio::time::Instant::now(), permits).await;
     assert!(matches!(merged, Err(MetadataApiError::ServiceUnavailable)));
 }
 
@@ -322,7 +322,7 @@ async fn merge_waits_permit() {
     )])])];
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
-    let merged = merge_ordered(parts, order, 1, deadline, permits).await;
+    let merged = merge_ordered(parts, order, deadline, permits).await;
     assert!(matches!(merged, Err(MetadataApiError::ServiceUnavailable)));
 }
 
@@ -411,4 +411,114 @@ fn query_validation_enforces() {
         ))
         .is_err()
     );
+}
+
+async fn fetch_partition(query: &str, objects: &[(&str, String)]) -> Vec<BTreeMap<String, String>> {
+    let (partition, order) = ordered_query(query).unwrap().unwrap();
+    let ties = query_select_limit(query).map(|limit| (order, limit));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let fetched = fetch_ties(partition, ties, deadline, permits, |text| async move {
+        Ok(MetadataQueryResults::Solutions(partition_rows(
+            &text, objects,
+        )))
+    })
+    .await;
+    let Ok(MetadataQueryResults::Solutions(rows)) = fetched else {
+        panic!("expected solutions");
+    };
+    rows
+}
+
+#[tokio::test]
+async fn canonical_ties_merge() {
+    // spareval reads these pairs as one value and datatype, but results keep each original term.
+    let query = "SELECT DISTINCT ?k WHERE { ?s <urn:k> ?k } ORDER BY ?k LIMIT 1";
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    for value in 1..=20 {
+        for pair in [
+            [
+                format!("\"{value}\"^^<{xsd}int>"),
+                format!("\"{value}\"^^<{xsd}integer>"),
+            ],
+            [
+                format!("\"{value}\"^^<{xsd}integer>"),
+                format!("\"0{value}\"^^<{xsd}integer>"),
+            ],
+        ] {
+            let preferred = pair.iter().min().unwrap();
+            let other = pair.iter().max().unwrap();
+            for subjects in [["a", "z"], ["z", "a"]] {
+                let objects = [
+                    (subjects[0], preferred.clone()),
+                    (subjects[1], other.clone()),
+                ];
+                let first = fetch_partition(query, &objects).await;
+                let second = fetch_partition(query, &[("m", other.clone())]).await;
+                for parts in [vec![first.clone(), second.clone()], vec![second, first]] {
+                    assert_eq!(
+                        merge_parts(query, parts),
+                        vec![solution_row(&[("k", preferred)])]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn tie_group_whole() {
+    let query = "SELECT DISTINCT ?k WHERE { ?s <urn:k> ?k } ORDER BY ?k LIMIT 2";
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    let tied = [
+        format!("\"1\"^^<{xsd}int>"),
+        format!("\"1\"^^<{xsd}integer>"),
+        format!("\"01\"^^<{xsd}integer>"),
+        format!("\"001\"^^<{xsd}integer>"),
+    ];
+    let mut objects: Vec<_> = ["a", "b", "c", "d"]
+        .into_iter()
+        .zip(tied.iter().cloned())
+        .collect();
+    objects.push(("e", format!("\"2\"^^<{xsd}integer>")));
+    let mut rows = fetch_partition(query, &objects).await;
+    rows.sort();
+    let mut expected: Vec<_> = tied
+        .iter()
+        .map(|term| solution_row(&[("k", term)]))
+        .collect();
+    expected.sort();
+    assert_eq!(rows, expected);
+}
+
+#[test]
+fn merge_refuses_ties() {
+    // Every partition may now return a tie group past LIMIT, so only the byte budget bounds it.
+    let order = ordered_query("SELECT DISTINCT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?s LIMIT 1")
+        .unwrap()
+        .unwrap()
+        .1;
+    let parts = vec![large_partition("a"), large_partition("b")];
+    let merged = order_solutions(parts, &order, &Default::default());
+    assert!(matches!(merged, Err(MetadataApiError::BadRequest)));
+}
+
+#[tokio::test]
+async fn unordered_runs_once() {
+    let query = "SELECT DISTINCT ?s WHERE { ?s ?p ?o } LIMIT 1".to_string();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let runs = std::sync::Mutex::new(Vec::new());
+    let rows = vec![
+        solution_row(&[("s", "<urn:a>")]),
+        solution_row(&[("s", "<urn:b>")]),
+    ];
+    let fetched = fetch_ties(query.clone(), None, deadline, permits, |text| {
+        runs.lock().unwrap().push(text);
+        let rows = rows.clone();
+        async move { Ok(MetadataQueryResults::Solutions(rows)) }
+    })
+    .await;
+    assert_eq!(*runs.lock().unwrap(), vec![query]);
+    assert_eq!(fetched, Ok(MetadataQueryResults::Solutions(rows)));
 }
