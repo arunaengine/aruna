@@ -196,6 +196,9 @@ pub enum MetadataApiError {
     PlacementUnavailable(crate::placement::PlacementResolveError),
     #[error("{0}")]
     InvalidCursor(String),
+    /// The query is valid for the client but cannot be run as asked.
+    #[error("{0}")]
+    InvalidQuery(String),
     #[error("{0}")]
     Internal(String),
 }

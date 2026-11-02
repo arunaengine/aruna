@@ -24,7 +24,7 @@ fn merge_parts(
         .map(MetadataQueryResults::Solutions)
         .collect();
     let limit = query_select_limit(query);
-    let merged = match ordered_query(query) {
+    let merged = match ordered_query(query).unwrap() {
         Some((_, order)) => order_solutions(parts, &order, QUERY_MAX_ROWS, &Default::default())
             .and_then(|rows| aggregate_query_results(vec![rows], MetadataQueryForm::Select, limit)),
         None => aggregate_query_results(parts, MetadataQueryForm::Select, limit),
@@ -192,7 +192,7 @@ fn partition_rows(query: &str, objects: &[(&str, String)]) -> Vec<BTreeMap<Strin
 #[test]
 fn ties_cut_consistently() {
     let query = "SELECT DISTINCT ?s ?k WHERE { ?s <urn:k> ?k } ORDER BY ?k LIMIT 1";
-    let (partition, _) = ordered_query(query).unwrap();
+    let (partition, _) = ordered_query(query).unwrap().unwrap();
     assert!(ensure_query_form(&partition).is_ok());
     let one = format!("\"1\"^^<{INTEGER}>");
     let first: Vec<_> = ["z", "y", "x", "w", "a"]
@@ -214,7 +214,7 @@ fn ties_cut_consistently() {
 fn equal_values_cut_consistently() {
     // Tied engine picks vary per process, so distinct trials make a wrong cut show reliably.
     let query = "SELECT DISTINCT ?n WHERE { ?s <urn:k> ?n } ORDER BY ?n LIMIT 1";
-    let (partition, _) = ordered_query(query).unwrap();
+    let (partition, _) = ordered_query(query).unwrap().unwrap();
     assert!(ensure_query_form(&partition).is_ok());
     let xsd = "http://www.w3.org/2001/XMLSchema#";
     for value in 1..=20 {
@@ -249,6 +249,17 @@ fn equal_values_cut_consistently() {
     }
 }
 
+#[test]
+fn partition_query_bounded() {
+    let name = "v".repeat(20_000);
+    let query = format!("SELECT DISTINCT ?{name} WHERE {{ ?{name} ?p ?o }} ORDER BY ?{name}");
+    assert!(ensure_query_form(&query).is_ok());
+    let Err(MetadataApiError::InvalidQuery(message)) = ordered_query(&query) else {
+        panic!("expected a refused partition query");
+    };
+    assert!(message.contains("too long to run across the realm"));
+}
+
 fn large_partition(prefix: &str) -> MetadataQueryResults {
     let value = format!("\"{}\"", "x".repeat(1024 * 1024));
     MetadataQueryResults::Solutions(
@@ -262,6 +273,7 @@ fn large_partition(prefix: &str) -> MetadataQueryResults {
 fn merge_refuses_oversize() {
     let order = ordered_query("SELECT DISTINCT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?s LIMIT 5")
         .unwrap()
+        .unwrap()
         .1;
     let parts = vec![large_partition("a"), large_partition("b")];
     let merged = order_solutions(parts, &order, 5, &Default::default());
@@ -271,6 +283,7 @@ fn merge_refuses_oversize() {
 #[test]
 fn merge_stops_cancelled() {
     let order = ordered_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?s")
+        .unwrap()
         .unwrap()
         .1;
     let parts = vec![MetadataQueryResults::Solutions(vec![solution_row(&[(
@@ -285,6 +298,7 @@ fn merge_stops_cancelled() {
 #[tokio::test]
 async fn merge_past_deadline() {
     let order = ordered_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?s")
+        .unwrap()
         .unwrap()
         .1;
     let parts = vec![MetadataQueryResults::Solutions(vec![solution_row(&[(
@@ -358,7 +372,7 @@ fn unordered_keeps_arrival() {
         solution_row(&[("s", "<urn:m>")]),
         solution_row(&[("s", "<urn:b>")]),
     ];
-    assert!(ordered_query(query).is_none());
+    assert!(ordered_query(query).unwrap().is_none());
     assert_eq!(
         merge_parts(query, vec![first, second]),
         vec![

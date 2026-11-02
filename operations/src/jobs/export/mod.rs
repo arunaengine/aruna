@@ -1451,6 +1451,7 @@ fn snapshot_read_failure(error: MetadataApiError) -> ExportFailure {
         MetadataApiError::BadRequest => {
             ExportFailure::Permanent("invalid metadata export request".to_string())
         }
+        MetadataApiError::InvalidQuery(message) => ExportFailure::Permanent(message),
         MetadataApiError::ServiceUnavailable => {
             ExportFailure::Retryable("metadata document is unavailable".to_string())
         }

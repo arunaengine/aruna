@@ -248,7 +248,7 @@ caller may read, so an anonymous request sees the public documents alone.
                 )
             )
         ),
-        (status = 400, description = "Malformed body, a query that is not SELECT or ASK, a query over the size or row limits, a SERVICE clause, or a distributed query that is not union-safe", body = ErrorResponse),
+        (status = 400, description = "Malformed body, a query that is not SELECT or ASK, a query over the size or row limits, a SERVICE clause, a distributed query that is not union-safe, or an ordered distributed query too long to run across the realm", body = ErrorResponse),
         (status = 501, description = "Unsupported query mode; not reachable today because both local and distributed are supported", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))

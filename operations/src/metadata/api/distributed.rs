@@ -7,10 +7,10 @@ use super::{
     HashMap, HashSet, Instant, MAX_PAGINATION_DEPTH, MAX_RESULT_BYTES, MetadataApiError,
     MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall,
     MetadataQueryResults, MetadataReadError, MetadataSearchHit, NodeId, NodeSearchResult,
-    ObjectKeyMatch, ObjectQueryMode, QUERY_MAX_ROWS, RealmId, ReferenceNodeExecution,
-    SearchNodePage, SearchPageCursor, SearchWatermark, Span, fanout_bearer, field, map_read_error,
-    merge_search_hits, metadata_node_call, paginate, query_union_safe, record_elapsed_ms,
-    resume_fetch_limit, run_metadata_fanout,
+    ObjectKeyMatch, ObjectQueryMode, QUERY_MAX_BYTES, QUERY_MAX_ROWS, RealmId,
+    ReferenceNodeExecution, SearchNodePage, SearchPageCursor, SearchWatermark, Span, fanout_bearer,
+    field, map_read_error, merge_search_hits, metadata_node_call, paginate, query_union_safe,
+    record_elapsed_ms, resume_fetch_limit, run_metadata_fanout,
 };
 
 pub(super) fn object_search_fingerprint(
@@ -197,9 +197,10 @@ pub(super) async fn run_query_distributed(
     let deadline = scope
         .deadline
         .unwrap_or_else(|| tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE);
-    let ordered = (!single_dataset_result)
-        .then(|| ordered_query(&query))
-        .flatten();
+    let ordered = match single_dataset_result {
+        true => None,
+        false => ordered_query(&query)?,
+    };
     let partition_query = ordered
         .as_ref()
         .map_or_else(|| query.clone(), |(text, _)| text.clone());
@@ -537,12 +538,14 @@ pub(super) async fn merge_ordered(
 /// projected variable, then each variable's term parts, so each `LIMIT` cuts a total order.
 pub(super) fn ordered_query(
     query: &str,
-) -> Option<(String, Vec<spargebra::algebra::OrderExpression>)> {
+) -> Result<Option<(String, Vec<spargebra::algebra::OrderExpression>)>, MetadataApiError> {
     use spargebra::algebra::{Expression, Function, GraphPattern, OrderExpression};
 
-    let mut parsed = spargebra::SparqlParser::new().parse_query(query).ok()?;
+    let Ok(mut parsed) = spargebra::SparqlParser::new().parse_query(query) else {
+        return Ok(None);
+    };
     let spargebra::Query::Select { pattern, .. } = &mut parsed else {
-        return None;
+        return Ok(None);
     };
     let mut pattern = pattern;
     let mut projected = Vec::new();
@@ -576,10 +579,18 @@ pub(super) fn ordered_query(
                 }
                 break expression.clone();
             }
-            _ => return None,
+            _ => return Ok(None),
         };
     };
-    Some((parsed.to_string(), keys))
+    let partition = parsed.to_string();
+    if partition.len() > QUERY_MAX_BYTES {
+        return Err(MetadataApiError::InvalidQuery(
+            "This ordered query is too long to run across the realm; shorten its variable names \
+             or run it locally"
+                .to_string(),
+        ));
+    }
+    Ok(Some((partition, keys)))
 }
 
 /// Sorts the union of partition rows with the engine's SPARQL ordering (spareval), so terms
