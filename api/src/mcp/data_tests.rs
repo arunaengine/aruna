@@ -517,3 +517,91 @@ mod distributed {
         assert!(head.is_err(), "nothing is stored on the relaying member");
     }
 }
+
+fn caller(auth: &AuthContext) -> http::request::Parts {
+    let (mut parts, ()) = http::Request::new(()).into_parts();
+    parts.extensions.insert(Some(auth.clone()));
+    parts
+        .extensions
+        .insert(None::<crate::auth::ValidatedBearer>);
+    parts
+}
+
+// The bucket list shows what the bucket search shows: a public bucket of another group joins
+// the caller's own, while a closed bucket or one a deny policy hides is left out, not refused.
+#[tokio::test]
+async fn lists_readable_buckets() {
+    use crate::tests::distributed::{bucket_info, node_state, write};
+    use crate::tests::routes::{open_paths, seed_group_docs};
+    use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = node_state().await;
+    let (state, realm_id) = (&node.state, node.state.get_realm_id());
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.ensure_node(state.get_node_id(), RealmNodeKind::Server);
+    config.request_policies = vec![RequestPolicy {
+        policy_id: ulid::Ulid::from_parts(3, 3),
+        name: "hide-bucket".to_string(),
+        kind: PolicyKind::Deny,
+        when: None,
+        expression: "path.endsWith('/hidden')".to_string(),
+        enabled: true,
+    }];
+    let config = config.to_bytes(&actor).unwrap();
+    write(
+        state,
+        REALM_CONFIG_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        config,
+    )
+    .await;
+    let other = ulid::Ulid::from_bytes([21; 16]);
+    let stranger = Actor {
+        user_id: node.stranger.user_id,
+        ..actor
+    };
+    let context = state.get_ctx();
+    seed_group_docs(
+        &context,
+        realm_id,
+        &stranger,
+        other,
+        "other",
+        stranger.user_id,
+    )
+    .await;
+    for (bucket, group_id) in [
+        ("hidden", node.group_id),
+        ("open-data", other),
+        ("closed-data", other),
+    ] {
+        let info = bucket_info(group_id, None).to_bytes().unwrap();
+        write(state, S3_BUCKET_KEYSPACE, bucket.as_bytes().to_vec(), info).await;
+    }
+    let open = bucket_permission_path(realm_id, other, state.get_node_id(), "open-data");
+    open_paths(&context, &stranger, other, &[open]).await;
+    let server = McpServer::new(state.clone());
+    for (auth, expected) in [
+        (&node.owner, ["open-data", "routed"]),
+        (&node.stranger, ["closed-data", "open-data"]),
+    ] {
+        let input = Parameters(ListBucketsInput::default());
+        let listed = server.list_buckets(Extension(caller(auth)), input).await;
+        let listed = listed.unwrap().0;
+        let names: Vec<&str> = listed
+            .buckets
+            .iter()
+            .map(|hit| hit.bucket.as_str())
+            .collect();
+        assert_eq!(names, expected);
+        assert_eq!(listed.buckets[0].node_id, state.get_node_id().to_string());
+    }
+}

@@ -3,10 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::compute::request_bearer;
-use super::context::member_groups;
 use super::{
-    JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
-    request_auth, server_error, tool_extras,
+    JsonPayload, McpServer, authorize_tool, bad_request, explained, internal_error, request_auth,
+    server_error, tool_extras,
 };
 use crate::routes::storage::objects::{ListRequest, object_page};
 use crate::routes::storage::relay::{relay_json, rest_target};
@@ -19,10 +18,10 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::data::identity::content_id;
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
+use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::complete_put;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::object::get::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
 };
@@ -49,17 +48,29 @@ const MAX_SCAN_OBJECTS: usize = 50_000;
 const SCAN_PAGE_KEYS: usize = 1_000;
 const DEFAULT_BUCKETS: usize = 200;
 const MAX_BUCKETS: usize = 1_000;
+const BUCKET_PAGE: usize = 50;
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct BucketOutput {
     pub bucket: String,
     pub group_id: String,
+    pub node_id: String,
     pub created_at: String,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct BucketsOutput {
     pub buckets: Vec<BucketOutput>,
+    pub next_cursor: Option<String>,
+    pub nodes_failed: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ListBucketsInput {
+    /// Opaque continuation token copied verbatim from the `next_cursor` of a
+    /// previous `list_buckets` answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -310,7 +321,7 @@ pub(crate) fn toolset() -> rmcp::handler::server::router::tool::ToolRouter<McpSe
 #[tool_router(router = data_router)]
 impl McpServer {
     #[tool(
-        description = "List the buckets on this node that the caller may read, each with its name, owning group_id, and creation time. Call it first to obtain the bucket name that list_objects, read_object, write_object, and run_script require. Buckets are node-local, so a name absent here may still exist on another node. Takes no arguments.",
+        description = "List the buckets across the realm that the caller may read, as the bucket search does: the caller's own groups' buckets, buckets shared with the caller and public buckets, each with its name, owning group_id, node_id, and creation time. Call it first to obtain the bucket name that list_objects, read_object, write_object, and run_script require. Those tools read buckets held by this node (get_node_info names it); a distributed bucket shows once, under one of its member nodes. Follow next_cursor for the next page; nodes_failed above zero means buckets of an unreachable node may be missing.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -320,45 +331,45 @@ impl McpServer {
     pub async fn list_buckets(
         &self,
         Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ListBucketsInput>,
     ) -> Result<Json<BucketsOutput>, CallToolResult> {
         let auth = request_auth(&parts)?;
-        let mut buckets = Vec::new();
-        for group in member_groups(self, &auth).await? {
-            let result = drive(
-                ListBucketsOperation::new(ListBucketsInput {
-                    group_id: group.group_id,
-                    prefix: None,
-                    continuation_token: None,
-                    max_buckets: None,
-                }),
-                &self.state.get_ctx(),
-            )
-            .await
-            .map_err(internal_error)?;
-            for (bucket, info) in result.buckets {
-                authorize_tool(
-                    &self.state,
-                    &auth,
-                    bucket_permission_path(
-                        self.state.get_realm_id(),
-                        info.group_id,
-                        self.state.get_node_id(),
-                        &bucket,
-                    ),
-                    Permission::READ,
-                    empty_extras("list_buckets"),
-                )
-                .await
-                .map_err(server_error)?;
-                buckets.push(BucketOutput {
-                    bucket,
-                    group_id: info.group_id.to_string(),
-                    created_at: chrono::DateTime::<chrono::Utc>::from(info.created_at).to_rfc3339(),
-                });
-            }
-        }
-        buckets.sort_by(|left, right| left.bucket.cmp(&right.bucket));
-        Ok(Json(BucketsOutput { buckets }))
+        authorize_search(self, &auth, tool_extras("list_buckets", &input)?).await?;
+        // Every node checks the caller on its own buckets and leaves out what it may not read.
+        let bearer = request_bearer(&parts).map(|carrier| carrier.as_str().to_string());
+        let result = search_buckets_distributed(
+            self.state.get_ctx().as_ref(),
+            self.state.get_realm_id(),
+            self.state.get_node_id(),
+            BucketSearchRequest {
+                auth,
+                bearer_token: bearer,
+                query: String::new(),
+                limit: BUCKET_PAGE,
+                group_id: None,
+                cursor: input.cursor,
+                target_nodes: None,
+                database: false,
+            },
+        )
+        .await
+        .map_err(crate::metadata::map_api_error)
+        .map_err(server_error)?;
+        let buckets = result
+            .hits
+            .into_iter()
+            .map(|hit| BucketOutput {
+                bucket: hit.bucket,
+                group_id: hit.group_id.to_string(),
+                node_id: hit.node_id.to_string(),
+                created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
+            })
+            .collect();
+        Ok(Json(BucketsOutput {
+            buckets,
+            next_cursor: result.next_cursor,
+            nodes_failed: result.fanout_stats.nodes_failed,
+        }))
     }
 
     #[tool(
@@ -866,13 +877,13 @@ fn fold_buckets(samples: &[ObjectSample], unit: BucketUnit, max_buckets: usize) 
     }
 }
 
-/// Bucket names are node-local, so a caller needs to be told to look at this
-/// node's list rather than assume the bucket is elsewhere.
+/// Bucket names are node-local, so a caller needs to be told which node holds a listed bucket.
 fn missing_bucket() -> CallToolResult {
     explained(
         crate::error::ServerError::NotFound,
-        "no bucket with that name exists on this node; call list_buckets for readable names, and \
-         pass the bare bucket name without an s3:// prefix or a key",
+        "no bucket with that name exists on this node; list_buckets names the node that holds \
+         each readable bucket, and this tool reads only buckets this node holds. Pass the bare \
+         bucket name without an s3:// prefix or a key",
     )
 }
 
