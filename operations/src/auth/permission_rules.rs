@@ -173,53 +173,28 @@ impl PermissionRules {
             KeyScope::Exact(key) => self.allows(&format!("{root}/{key}"), &Permission::READ),
             KeyScope::Writes(writes) => (writes.iter())
                 .all(|(key, _)| self.allows(&format!("{root}/{key}"), &Permission::READ)),
-            KeyScope::Subtree(prefix) => {
-                let path = format!("{root}/{prefix}");
-                let patterns: Vec<_> = self
-                    .rules
-                    .iter()
-                    .filter_map(|rule| {
-                        if rule.direct || rule.public && rule.permission == Permission::READ {
-                            Some((rule.matcher.glob().glob(), &rule.permission))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                let covers = |patterns: &[(&str, &Permission)]| {
-                    let mut allowed = false;
-                    for (pattern, permission) in patterns {
-                        let literal = pattern
-                            .split(['*', '?', '[', ']', '{', '}', '\\'])
-                            .next()
-                            .unwrap_or_default();
-                        if **permission == Permission::DENY {
-                            if literal.starts_with(&path) || path.starts_with(literal) {
-                                return false;
-                            }
-                        } else if let Some(base) = pattern.strip_suffix("**")
-                            && (base.is_empty() || base.ends_with('/'))
-                            && !base.contains(['*', '?', '[', ']', '{', '}', '\\'])
-                            && path.starts_with(base)
-                        {
-                            allowed = true;
-                        }
-                    }
-                    allowed
-                };
-                if !covers(&patterns) {
-                    return false;
-                }
-                match &self.restrictions {
-                    None => true,
-                    Some(rules) => covers(
-                        &rules
-                            .iter()
-                            .map(|rule| (rule.matcher.glob().glob(), &rule.permission))
-                            .collect::<Vec<_>>(),
-                    ),
-                }
-            }
+            KeyScope::Subtree(prefix) => self.reads_below(&format!("{root}/{prefix}")),
+        }
+    }
+
+    /// Whether every path that starts with `path` is readable: a role grant and, for a scoped
+    /// token, a restriction cover all of them, and no deny of either could reach one.
+    pub fn reads_below(&self, path: &str) -> bool {
+        let patterns: Vec<_> = (self.rules.iter())
+            .filter(|rule| rule.direct || rule.public && rule.permission == Permission::READ)
+            .map(|rule| (rule.matcher.glob().glob(), &rule.permission))
+            .collect();
+        if !covers_below(&patterns, path) {
+            return false;
+        }
+        match &self.restrictions {
+            None => true,
+            Some(rules) => covers_below(
+                &(rules.iter())
+                    .map(|rule| (rule.matcher.glob().glob(), &rule.permission))
+                    .collect::<Vec<_>>(),
+                path,
+            ),
         }
     }
 
@@ -251,6 +226,40 @@ impl PermissionRules {
         }
         allowed
     }
+}
+
+/// Whether `patterns` grant every path that starts with `path` and no deny could reach one. A
+/// grant ends in `**` below a base of whole segments, its wildcards matched against `path`.
+fn covers_below(patterns: &[(&str, &Permission)], path: &str) -> bool {
+    let mut allowed = false;
+    for (pattern, permission) in patterns {
+        if **permission == Permission::DENY {
+            let literal =
+                (pattern.split(['*', '?', '[', ']', '{', '}', '\\']).next()).unwrap_or_default();
+            if literal.starts_with(path) || path.starts_with(literal) {
+                return false;
+            }
+        } else if let Some(base) = pattern.strip_suffix("**")
+            && (base.is_empty() || base.ends_with('/'))
+            && base_matches(base, path)
+        {
+            allowed = true;
+        }
+    }
+    allowed
+}
+
+/// Whether the glob `base`, whole segments that end in `/`, matches as many leading segments
+/// of `path`, so everything below them matches `base` followed by `**`.
+fn base_matches(base: &str, path: &str) -> bool {
+    let depth = base.matches('/').count();
+    let Some(end) = depth.checked_sub(1) else {
+        return true;
+    };
+    let Some((at, _)) = path.match_indices('/').nth(end) else {
+        return false;
+    };
+    compile_permission_matcher(base).is_ok_and(|matcher| matcher.is_match(&path[..=at]))
 }
 
 /// The subtrees at or below `root` the caller reaches, decided from the realm
@@ -1030,6 +1039,23 @@ mod pure_tests {
         )
         .expect("patterns compile");
         assert!(!denied.allows(&path, &Permission::READ));
+    }
+
+    #[test]
+    fn node_glob_covers() {
+        // The distributed bucket grant names every node by a wildcard segment; it covers a
+        // prefix of the bucket on any node, while a deny below the prefix still hides it.
+        let root = "/realm/g/group/data";
+        let any_node = format!("{root}/*/bucket/**");
+        let rules = direct_rules(HashMap::from([(any_node.clone(), Permission::READ)]));
+        assert!(rules.reads_below(&format!("{root}/node/bucket/raw/")));
+        assert!(rules.reads_below(&format!("{root}/node/bucket/raw")));
+        assert!(!rules.reads_below(&format!("{root}/node/other/raw/")));
+        let denied = direct_rules(HashMap::from([
+            (any_node, Permission::READ),
+            (format!("{root}/node/bucket/raw/x/**"), Permission::DENY),
+        ]));
+        assert!(!denied.reads_below(&format!("{root}/node/bucket/raw/")));
     }
 
     #[test]
