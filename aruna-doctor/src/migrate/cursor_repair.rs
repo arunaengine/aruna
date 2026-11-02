@@ -129,10 +129,15 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
         .sync_path
         .as_ref()
         .map_or_else(|| storage.join("document-sync"), PathBuf::from);
-    for path in [&craqle_path, &sync_path] {
-        if !path.exists() {
+    // Opening a path that holds no database would create one, and an inspection writes nothing.
+    for path in [
+        storage.to_path_buf(),
+        craqle_path.join("store"),
+        sync_path.clone(),
+    ] {
+        if !fjall_database(&path) {
             return Err(ExplorerError::Refused(format!(
-                "store {} not found",
+                "{} is not an existing database",
                 path.display()
             )));
         }
@@ -244,9 +249,6 @@ fn open_graphs(craqle_path: &Path) -> Result<(Database, Keyspace), ExplorerError
     let store = craqle_path.join("store");
     let not_craqle =
         || ExplorerError::Refused(format!("{} is not a Craqle store", store.display()));
-    if !store.exists() {
-        return Err(not_craqle());
-    }
     let db = Database::builder(&store).open()?;
     // Opening a missing keyspace would create it, and an inspection must write nothing.
     if !db.keyspace_exists("graphs") || !db.keyspace_exists("terms") {
@@ -382,6 +384,11 @@ fn actor_overlap(
         .collect()
 }
 
+/// Fjall recovers a database only where its version marker exists and creates one anywhere else.
+fn fjall_database(path: &Path) -> bool {
+    path.join("version").is_file()
+}
+
 /// Aruna's own Craqle actor, the node id, which writes local metadata without publishing it.
 fn local_writer(database_path: &Path) -> Result<craqle::ActorId, ExplorerError> {
     let db = OptimisticTxDatabase::builder(database_path).open()?;
@@ -466,6 +473,8 @@ mod tests {
         stranger_writes: bool,
         /// The replica's graph only has a local policy, so Craqle wrote no separate clock key.
         policy_only: bool,
+        /// The storage root has no node database with an identity.
+        without_identity: bool,
     }
 
     fn signed(seed: u8) -> Irokle {
@@ -538,7 +547,9 @@ mod tests {
     /// holds a second genesis for the same graph topic, shaped by `setup`.
     fn replaced_replica(setup: Setup) -> (TempDir, CursorRepair) {
         let temp = tempdir().unwrap();
-        store_identity(temp.path());
+        if !setup.without_identity {
+            store_identity(temp.path());
+        }
         let second_seed = if setup.shared_signer { 1 } else { 2 };
         let (first, second) = (signed(1), signed(second_seed));
         let replica_sync = replica_irokle(temp.path());
@@ -853,6 +864,50 @@ mod tests {
             let error = metadata_clock(malformed).unwrap_err();
             assert!(matches!(error, ExplorerError::Decode(_)), "{error}");
         }
+    }
+
+    /// Every path below `path`, so a refused dry run can be shown to have created nothing.
+    fn files(path: &Path) -> BTreeSet<PathBuf> {
+        let mut found = BTreeSet::new();
+        let mut pending = vec![path.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap().path();
+                if entry.is_dir() {
+                    pending.push(entry.clone());
+                }
+                found.insert(entry);
+            }
+        }
+        found
+    }
+
+    /// A root, Craqle store or sync store that is not an existing database is refused before
+    /// anything opens it, so a dry run creates no database or keyspace there.
+    #[test]
+    fn refuses_missing_stores() {
+        let empty = tempdir().unwrap();
+        assert!(repair_output(&dry_request(empty.path())).is_err());
+        assert!(files(empty.path()).is_empty());
+
+        let (temp, request) = replaced_replica(Setup {
+            without_identity: true,
+            ..Setup::default()
+        });
+        let before = files(temp.path());
+        let error = repair_output(&request).unwrap_err();
+        assert!(matches!(error, ExplorerError::Refused(_)), "{error}");
+        assert_eq!(files(temp.path()), before);
+
+        let bare = tempdir().unwrap();
+        store_identity(bare.path());
+        for store in ["craqle/store", "document-sync"] {
+            std::fs::create_dir_all(bare.path().join(store)).unwrap();
+        }
+        let before = files(bare.path());
+        let error = repair_output(&dry_request(bare.path())).unwrap_err();
+        assert!(matches!(error, ExplorerError::Refused(_)), "{error}");
+        assert_eq!(files(bare.path()), before);
     }
 
     /// After the repair Craqle opens with sync again, and the kept graph takes the new genesis.

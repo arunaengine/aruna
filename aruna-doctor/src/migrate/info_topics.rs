@@ -70,6 +70,10 @@ pub(super) fn node_realm(db: &OptimisticTxDatabase) -> Result<Option<RealmId>, E
 pub(super) fn persisted_node_state(
     db: &OptimisticTxDatabase,
 ) -> Result<Option<PersistedNodeState>, ExplorerError> {
+    // Opening a missing keyspace would create it.
+    if !db.keyspace_exists(NODE_STATE_KEYSPACE) {
+        return Ok(None);
+    }
     let states = db.keyspace(NODE_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let Some(state) = db.read_tx().get(&states, NODE_STATE_KEY)? else {
         return Ok(None);
