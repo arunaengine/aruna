@@ -29,12 +29,30 @@ fn body(result: CallToolResult) -> Value {
 #[test]
 fn local_stays_here() {
     let here = node(1);
-    assert_eq!(pick_node(here, (None, true), &[], &[]), Ok(None));
-    assert_eq!(pick_node(here, (Some(here), false), &[], &[]), Ok(None));
+    assert_eq!(pick_node(here, (None, true, None), &[], &[]), Ok(None));
+    assert_eq!(
+        pick_node(here, (Some(here), false, None), &[], &[]),
+        Ok(None)
+    );
     // A named node wins over a local bucket of the same name.
     assert_eq!(
-        pick_node(here, (Some(node(2)), true), &[], &[]),
+        pick_node(here, (Some(node(2)), true, None), &[], &[]),
         Ok(Some(node(2)))
+    );
+}
+
+#[test]
+fn routed_goes_member() {
+    // A member without the key's records, here or named, sends the call to the member with them.
+    let (here, holder) = (node(1), Some(node(2)));
+    assert_eq!(pick_node(here, (None, true, holder), &[], &[]), Ok(holder));
+    assert_eq!(
+        pick_node(here, (Some(here), true, holder), &[], &[]),
+        Ok(holder)
+    );
+    assert_eq!(
+        pick_node(here, (None, true, Some(here)), &[], &[]),
+        Ok(None)
     );
 }
 
@@ -42,17 +60,20 @@ fn local_stays_here() {
 fn remote_goes_holder() {
     let here = node(1);
     let one = [holder(2, None)];
-    assert_eq!(pick_node(here, (None, false), &one, &[]), Ok(Some(node(2))));
     assert_eq!(
-        pick_node(here, (None, false), &[], &[]),
+        pick_node(here, (None, false, None), &one, &[]),
+        Ok(Some(node(2)))
+    );
+    assert_eq!(
+        pick_node(here, (None, false, None), &[], &[]),
         Err(RouteError::Missing)
     );
     // Different buckets of one name on several nodes need the caller's choice.
     let two = [holder(2, None), holder(3, None)];
     let ambiguous = Err(RouteError::Ambiguous(vec![node(2), node(3)]));
-    assert_eq!(pick_node(here, (None, false), &two, &[]), ambiguous);
+    assert_eq!(pick_node(here, (None, false, None), &two, &[]), ambiguous);
     let mixed = [holder(2, Some(7)), holder(3, None)];
-    assert!(pick_node(here, (None, false), &mixed, &[]).is_err());
+    assert!(pick_node(here, (None, false, None), &mixed, &[]).is_err());
 }
 
 #[test]
@@ -62,11 +83,14 @@ fn distributed_goes_member() {
     // The members that keep the key come first; this node never answers for a bucket it lacks.
     let members = [here, node(3), node(2)];
     assert_eq!(
-        pick_node(here, (None, false), &set, &members),
+        pick_node(here, (None, false, None), &set, &members),
         Ok(Some(node(3)))
     );
     // Without a record naming the key's members, the member the search found answers.
-    assert_eq!(pick_node(here, (None, false), &set, &[]), Ok(Some(node(2))));
+    assert_eq!(
+        pick_node(here, (None, false, None), &set, &[]),
+        Ok(Some(node(2)))
+    );
 }
 
 // The record of a distributed bucket names the member for each key: this node below `m`, the
@@ -83,7 +107,7 @@ async fn record_picks_member() {
     let outside = node(9);
     for (key, member) in [("a/x", LOCAL), ("z/y", PEER)] {
         let members = key_holders(&context, snapshot.set_id(), key).await;
-        let picked = pick_node(outside, (None, false), &set, &members);
+        let picked = pick_node(outside, (None, false, None), &set, &members);
         assert_eq!(picked, Ok(Some(node_id(member))), "{key}");
     }
 }
@@ -258,4 +282,23 @@ async fn directed_never_forwards() {
         .bucket_node(call, BUCKET, named.as_deref(), "a")
         .await;
     assert_eq!(body(looped.unwrap_err())["code"], "Conflict");
+}
+
+// A member of a distributed bucket that keeps no records of a key's range sends the call to
+// the member that does, as the REST reads do; a key of its own range stays here.
+#[tokio::test]
+async fn member_routes_key() {
+    let fixture = node_state().await;
+    distribute(&fixture.state, fixture.group_id, BUCKET).await;
+    let server = McpServer::new(fixture.state.clone());
+    let parts = auth_parts(&fixture.owner, None);
+    let here = Some(node_id(LOCAL).to_string());
+    for named in [None, here.as_deref()] {
+        let call = (&parts, &fixture.owner);
+        let routed = server.bucket_node(call, BUCKET, named, "z/x").await;
+        assert_eq!(routed.unwrap(), Some(node_id(PEER)));
+        let call = (&parts, &fixture.owner);
+        let own = server.bucket_node(call, BUCKET, named, "a/x").await;
+        assert_eq!(own.unwrap(), None);
+    }
 }

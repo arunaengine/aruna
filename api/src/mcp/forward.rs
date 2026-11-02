@@ -7,11 +7,14 @@ use super::compute::request_bearer;
 use super::data::map_bucket_error;
 use super::{McpServer, explained, internal_error, server_error};
 use crate::error::ServerError;
+use crate::routes::storage::distributed::map_guard_error;
 use crate::routes::storage::relay::{RELAY_NODE_HEADER, capped_body, node_directed};
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_operations::distribution::delegate::node_urls;
+use aruna_operations::distribution::guard::{GuardError, route_read};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
@@ -54,20 +57,20 @@ pub(crate) enum RouteError {
     Ambiguous(Vec<NodeId>),
 }
 
-/// The node a call on a bucket runs on, `None` for this node: the `named` node, else this node
-/// when it holds the bucket, else the one holder; for a distributed bucket the first of
-/// `members`, the members that keep the call's key, when this node's record names them.
+/// The node a call on a bucket runs on, `None` for this node: the `named` node; else this node
+/// when it holds the bucket, unless `routed` names the member keeping the key's records; else
+/// the one holder, for a distributed bucket the first of `members` that keep the call's key.
 pub(crate) fn pick_node(
     here: NodeId,
-    (named, local): (Option<NodeId>, bool),
+    (named, local, routed): (Option<NodeId>, bool, Option<NodeId>),
     holders: &[Holder],
     members: &[NodeId],
 ) -> Result<Option<NodeId>, RouteError> {
-    if let Some(named) = named {
-        return Ok((named != here).then_some(named));
+    if let Some(named) = named.filter(|named| *named != here) {
+        return Ok(Some(named));
     }
-    if local {
-        return Ok(None);
+    if named.is_some() || local {
+        return Ok(routed.filter(|routed| *routed != here));
     }
     let Some(first) = holders.first() else {
         return Err(RouteError::Missing);
@@ -111,23 +114,32 @@ impl McpServer {
             return Ok(None);
         }
         let named = named.map(parse_node).transpose()?;
-        let context = self.state.get_ctx();
-        let local = named.is_none()
-            && match drive(GetBucketOperation::new(bucket.to_string()), &context).await {
-                Ok(_) => true,
-                Err(GetBucketError::NotFound) => false,
+        let (here, context) = (self.state.get_node_id(), self.state.get_ctx());
+        let mut info = None;
+        if named.is_none_or(|named| named == here) {
+            info = match drive(GetBucketOperation::new(bucket.to_string()), &context).await {
+                Ok(info) => Some(info),
+                Err(GetBucketError::NotFound) => None,
                 Err(error) => return Err(map_bucket_error(error)),
             };
+        }
+        // A member that keeps no records of the key's range sends the call to one that does.
+        let mut routed = None;
+        if let Some(binding) = info.as_ref().and_then(|info| info.distribution.as_ref()) {
+            let route = route_read(&context, binding, key, false).await;
+            if let ReadRoute::Holder { node_id, .. } = route.map_err(guard_error)? {
+                routed = Some(node_id);
+            }
+        }
         let (mut holders, mut failed) = (Vec::new(), 0);
-        if named.is_none() && !local {
+        if named.is_none() && info.is_none() {
             (holders, failed) = self.find_holders(parts, auth, bucket).await?;
         }
         let mut members = Vec::new();
         if let Some(set_id) = holders.first().and_then(|holder| holder.set_id) {
             members = key_holders(&context, set_id, key).await;
         }
-        let here = self.state.get_node_id();
-        pick_node(here, (named, local), &holders, &members)
+        pick_node(here, (named, info.is_some(), routed), &holders, &members)
             .map_err(|error| route_error(error, bucket, failed))
     }
 
@@ -293,6 +305,10 @@ fn named_error(mut result: CallToolResult, node_id: NodeId) -> CallToolResult {
         result.content = vec![ContentBlock::text(text)];
     }
     result
+}
+
+fn guard_error(error: GuardError) -> CallToolResult {
+    server_error(map_guard_error(error))
 }
 
 fn parse_node(value: &str) -> Result<NodeId, CallToolResult> {
