@@ -6,7 +6,9 @@
 use super::info_topics;
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
-use craqle::{GraphId, TopicCursorRepairAudit, VectorClock, topic_cursor_digest};
+use craqle::{
+    GraphId, GraphPolicy, PolicyTag, TopicCursorRepairAudit, VectorClock, topic_cursor_digest,
+};
 use fjall::OptimisticTxDatabase;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use irokle::{ActorClock, FjallStorage, OpId, Storage, TopicId};
@@ -39,6 +41,26 @@ struct CursorPayload {
     genesis: OpId,
     clock: ActorClock,
     target: Option<ActorClock>,
+}
+
+/// Craqle's stored graph metadata, field for field; its clock is the fallback clock.
+#[derive(Serialize, Deserialize)]
+struct GraphMeta {
+    policy: GraphPolicy,
+    policy_tag: PolicyTag,
+    clock: VectorClock,
+    irokle_topic: Option<[u8; 32]>,
+    rocrate_context: Option<String>,
+    rocrate_license: Option<String>,
+    rocrate_license_digest: Option<[u8; 32]>,
+    context_tag: ContextTag,
+}
+
+/// Craqle's ordering tag for stored RO-Crate render hints.
+#[derive(Serialize, Deserialize)]
+struct ContextTag {
+    counter: u64,
+    actor: craqle::ActorId,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -288,16 +310,27 @@ fn applied_dots(
     let id = &hash.as_bytes()[..16];
     let graph_key = |prefix: u8| [&[prefix][..], id].concat();
     let terms = db.keyspace("terms", KeyspaceCreateOptions::default)?;
-    if terms.get(id)?.as_deref() != Some(term.as_bytes())
-        || graphs.get(graph_key(META_PREFIX))?.is_none()
-    {
+    let known = terms.get(id)?.as_deref() == Some(term.as_bytes());
+    let Some(meta) = graphs.get(graph_key(META_PREFIX))?.filter(|_| known) else {
         return Err(ExplorerError::Refused(format!("graph {graph} not found")));
+    };
+    match graphs.get(graph_key(CLOCK_PREFIX))? {
+        Some(clock) => postcard::from_bytes(&clock)
+            .map_err(|error| ExplorerError::Decode(format!("graph clock: {error}"))),
+        // Craqle reads this fallback until a data mutation writes the separate clock key.
+        None => metadata_clock(&meta),
     }
-    let clock = graphs
-        .get(graph_key(CLOCK_PREFIX))?
-        .ok_or_else(|| ExplorerError::Refused(format!("graph {graph} has no stored clock")))?;
-    postcard::from_bytes(&clock)
-        .map_err(|error| ExplorerError::Decode(format!("graph clock: {error}")))
+}
+
+/// The clock inside Craqle's stored graph metadata; any other length is malformed.
+fn metadata_clock(bytes: &[u8]) -> Result<VectorClock, ExplorerError> {
+    let malformed = |reason: String| ExplorerError::Decode(format!("graph metadata: {reason}"));
+    let (meta, rest) = postcard::take_from_bytes::<GraphMeta>(bytes)
+        .map_err(|error| malformed(error.to_string()))?;
+    if !rest.is_empty() {
+        return Err(malformed(format!("{} trailing bytes", rest.len())));
+    }
+    Ok(meta.clock)
 }
 
 fn encode_cursor(payload: CursorPayload) -> Result<Vec<u8>, ExplorerError> {
@@ -431,6 +464,8 @@ mod tests {
         own_write: bool,
         /// The replica's local content is written by an actor that is not this node.
         stranger_writes: bool,
+        /// The replica's graph only has a local policy, so Craqle wrote no separate clock key.
+        policy_only: bool,
     }
 
     fn signed(seed: u8) -> Irokle {
@@ -525,7 +560,16 @@ mod tests {
             } else {
                 node_writer()
             };
-            create_local(&replica, writer);
+            if setup.policy_only {
+                let write = craqle::PolicyWrite {
+                    graph: &graph,
+                    policy: policy(),
+                    durability: CraqleRequestDurability::WalAlreadyDurable,
+                };
+                replica.set_policy_with(&AllowAllAuthorizer, write).unwrap();
+            } else {
+                create_local(&replica, writer);
+            }
             first_node
                 .mint_irokle_topic(&graph, BTreeSet::from([replica_id]))
                 .unwrap();
@@ -769,6 +813,46 @@ mod tests {
         request.apply = true;
         let error = repair_output(&request).unwrap_err();
         assert!(matches!(error, ExplorerError::Refused(_)));
+    }
+
+    /// A graph that never had a data mutation keeps its clock in the graph metadata.
+    #[test]
+    fn reads_metadata_clock() {
+        let (_temp, mut request) = replaced_replica(Setup {
+            policy_only: true,
+            ..Setup::default()
+        });
+        let output = repair_output(&request).unwrap();
+        assert!(output.overlap.is_empty() && output.applied_actors.is_empty());
+        request.apply = true;
+        assert!(repair_output(&request).unwrap().applied);
+    }
+
+    /// A metadata record that is cut short or carries extra bytes is malformed, not a clock.
+    #[test]
+    fn rejects_malformed_metadata() {
+        let mut clock = VectorClock::new();
+        clock.0.insert(craqle::ActorId::from_bytes([5; 32]), 3);
+        let meta = GraphMeta {
+            policy: policy(),
+            policy_tag: PolicyTag::GENESIS,
+            clock: clock.clone(),
+            irokle_topic: Some([1; 32]),
+            rocrate_context: None,
+            rocrate_license: Some("license".to_string()),
+            rocrate_license_digest: None,
+            context_tag: ContextTag {
+                counter: 2,
+                actor: craqle::ActorId::from_bytes([6; 32]),
+            },
+        };
+        let bytes = postcard::to_allocvec(&meta).unwrap();
+        assert_eq!(metadata_clock(&bytes).unwrap(), clock);
+        let longer = [bytes.as_slice(), &[0]].concat();
+        for malformed in [&bytes[..bytes.len() - 1], longer.as_slice()] {
+            let error = metadata_clock(malformed).unwrap_err();
+            assert!(matches!(error, ExplorerError::Decode(_)), "{error}");
+        }
     }
 
     /// After the repair Craqle opens with sync again, and the kept graph takes the new genesis.
