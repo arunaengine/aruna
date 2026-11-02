@@ -3,12 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    ApiQueryMode, Arc, AuthContext, BucketPage, DriverContext, GroupId, HashMap, HashSet, Instant,
-    MAX_PAGINATION_DEPTH, MAX_RESULT_BYTES, MetadataApiError, MetadataFanoutOperation,
-    MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataQueryResults,
-    MetadataReadError, MetadataSearchHit, NodeId, NodeSearchResult, ObjectKeyMatch,
-    ObjectQueryMode, QUERY_MAX_ROWS, RealmId, ReferenceNodeExecution, SearchNodePage,
-    SearchPageCursor, SearchWatermark, Span, fanout_bearer, field, map_read_error,
+    ApiQueryMode, Arc, AuthContext, BucketPage, DISTRIBUTED_QUERY_DEADLINE, DriverContext, GroupId,
+    HashMap, HashSet, Instant, MAX_PAGINATION_DEPTH, MAX_RESULT_BYTES, MetadataApiError,
+    MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall,
+    MetadataQueryResults, MetadataReadError, MetadataSearchHit, NodeId, NodeSearchResult,
+    ObjectKeyMatch, ObjectQueryMode, QUERY_MAX_ROWS, RealmId, ReferenceNodeExecution,
+    SearchNodePage, SearchPageCursor, SearchWatermark, Span, fanout_bearer, field, map_read_error,
     merge_search_hits, metadata_node_call, paginate, query_union_safe, record_elapsed_ms,
     resume_fetch_limit, run_metadata_fanout,
 };
@@ -194,6 +194,9 @@ pub(super) async fn run_query_distributed(
     }
     span.record("cache", "miss");
 
+    let deadline = scope
+        .deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE);
     let ordered = (!single_dataset_result)
         .then(|| ordered_query(&query))
         .flatten();
@@ -246,8 +249,10 @@ pub(super) async fn run_query_distributed(
             Some(result) => Ok(result),
             None => aggregate_query_results(Vec::new(), query_form, select_limit),
         }
-    } else if let Some((_, order)) = &ordered {
-        order_solutions(parts, order)
+    } else if let Some((_, order)) = ordered {
+        let row_limit = select_limit.unwrap_or(QUERY_MAX_ROWS).min(QUERY_MAX_ROWS);
+        merge_ordered(parts, order, row_limit, deadline)
+            .await
             .and_then(|rows| aggregate_query_results(vec![rows], query_form, select_limit))
     } else {
         aggregate_query_results(parts, query_form, select_limit)
@@ -503,6 +508,31 @@ pub fn query_select_limit(query: &str) -> Option<usize> {
     length
 }
 
+/// Orders partition rows off the async workers and gives up when `deadline` passes.
+pub(super) async fn merge_ordered(
+    results: Vec<MetadataQueryResults>,
+    order: Vec<spargebra::algebra::OrderExpression>,
+    row_limit: usize,
+    deadline: tokio::time::Instant,
+) -> Result<MetadataQueryResults, MetadataApiError> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    let cancel = spareval::CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        order_solutions(results, &order, row_limit, &task_cancel)
+    });
+    match tokio::time::timeout_at(deadline, task).await {
+        Ok(Ok(merged)) => merged,
+        Ok(Err(error)) => Err(MetadataApiError::Internal(error.to_string())),
+        Err(_) => {
+            cancel.cancel();
+            Err(MetadataApiError::ServiceUnavailable)
+        }
+    }
+}
+
 /// Returns the query each partition runs and the merge keys: the `ORDER BY` keys plus every
 /// other projected variable as an `ASC` key, so each partition's `LIMIT` cuts a total order.
 pub(super) fn ordered_query(
@@ -546,18 +576,30 @@ pub(super) fn ordered_query(
 pub(super) fn order_solutions(
     results: Vec<MetadataQueryResults>,
     order: &[spargebra::algebra::OrderExpression],
+    row_limit: usize,
+    cancel: &spareval::CancellationToken,
 ) -> Result<MetadataQueryResults, MetadataApiError> {
     use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, Quad, Term, Variable};
     use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
     use spargebra::term::TriplePattern;
 
-    let mut rows: Vec<_> = results
-        .into_iter()
-        .flat_map(|result| match result {
-            MetadataQueryResults::Solutions(rows) => rows,
-            _ => Vec::new(),
-        })
-        .collect();
+    // A partition's rows past `row_limit` cannot reach the merged top rows.
+    let mut rows = Vec::new();
+    let mut bytes = 0usize;
+    for result in results {
+        let MetadataQueryResults::Solutions(part) = result else {
+            continue;
+        };
+        for row in part.into_iter().take(row_limit) {
+            bytes = row.iter().fold(bytes, |bytes, (name, value)| {
+                bytes.saturating_add(name.len()).saturating_add(value.len())
+            });
+            if bytes > MAX_RESULT_BYTES {
+                return Err(MetadataApiError::BadRequest);
+            }
+            rows.push(row);
+        }
+    }
     rows.sort_unstable();
     rows.dedup();
     // Each row becomes a subject with its position and one column triple per bound variable.
@@ -567,6 +609,9 @@ pub(super) fn order_solutions(
     let column = |name: &str| NamedNode::new_unchecked(format!("urn:aruna:order:column:{name}"));
     let mut dataset = Dataset::new();
     for (position, values) in rows.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
         let subject = BlankNode::default();
         let position = Literal::from(position as u64);
         dataset.insert(&Quad::new(
@@ -625,11 +670,15 @@ pub(super) fn order_solutions(
             variables: vec![index.clone()],
         },
     };
-    let evaluator = spareval::QueryEvaluator::new();
+    let evaluation_error = |error: spareval::QueryEvaluationError| match error {
+        spareval::QueryEvaluationError::Cancelled => MetadataApiError::ServiceUnavailable,
+        error => MetadataApiError::Internal(error.to_string()),
+    };
+    let evaluator = spareval::QueryEvaluator::new().with_cancellation_token(cancel.clone());
     let spareval::QueryResults::Solutions(solutions) = evaluator
         .prepare(&query)
         .execute(&dataset)
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+        .map_err(evaluation_error)?
     else {
         return Err(MetadataApiError::Internal(
             "ordering returned no rows".to_string(),
@@ -638,7 +687,7 @@ pub(super) fn order_solutions(
     let mut slots: Vec<_> = rows.into_iter().map(Some).collect();
     let mut ordered = Vec::with_capacity(slots.len());
     for solution in solutions {
-        let solution = solution.map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        let solution = solution.map_err(evaluation_error)?;
         let position = match solution.get(&index) {
             Some(Term::Literal(literal)) => literal.value().parse::<usize>().ok(),
             _ => None,

@@ -4,7 +4,7 @@
 
 use super::*;
 
-use super::super::distributed::{order_solutions, ordered_query};
+use super::super::distributed::{merge_ordered, order_solutions, ordered_query};
 
 const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
@@ -25,7 +25,7 @@ fn merge_parts(
         .collect();
     let limit = query_select_limit(query);
     let merged = match ordered_query(query) {
-        Some((_, order)) => order_solutions(parts, &order)
+        Some((_, order)) => order_solutions(parts, &order, QUERY_MAX_ROWS, &Default::default())
             .and_then(|rows| aggregate_query_results(vec![rows], MetadataQueryForm::Select, limit)),
         None => aggregate_query_results(parts, MetadataQueryForm::Select, limit),
     };
@@ -202,6 +202,51 @@ fn ties_cut_consistently() {
         merge_parts(query, vec![first, second]),
         vec![solution_row(&[("s", "<urn:a>"), ("k", &one)])]
     );
+}
+
+fn large_partition(prefix: &str) -> MetadataQueryResults {
+    let value = format!("\"{}\"", "x".repeat(1024 * 1024));
+    MetadataQueryResults::Solutions(
+        (0..5)
+            .map(|index| solution_row(&[("s", &format!("<urn:{prefix}{index}>")), ("v", &value)]))
+            .collect(),
+    )
+}
+
+#[test]
+fn merge_refuses_oversize() {
+    let order = ordered_query("SELECT DISTINCT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?s LIMIT 5")
+        .unwrap()
+        .1;
+    let parts = vec![large_partition("a"), large_partition("b")];
+    let merged = order_solutions(parts, &order, 5, &Default::default());
+    assert!(matches!(merged, Err(MetadataApiError::BadRequest)));
+}
+
+#[test]
+fn merge_stops_cancelled() {
+    let order = ordered_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?s")
+        .unwrap()
+        .1;
+    let parts = vec![MetadataQueryResults::Solutions(vec![solution_row(&[(
+        "s", "<urn:a>",
+    )])])];
+    let cancel = spareval::CancellationToken::new();
+    cancel.cancel();
+    let merged = order_solutions(parts, &order, 1, &cancel);
+    assert!(matches!(merged, Err(MetadataApiError::ServiceUnavailable)));
+}
+
+#[tokio::test]
+async fn merge_past_deadline() {
+    let order = ordered_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?s")
+        .unwrap()
+        .1;
+    let parts = vec![MetadataQueryResults::Solutions(vec![solution_row(&[(
+        "s", "<urn:a>",
+    )])])];
+    let merged = merge_ordered(parts, order, 1, tokio::time::Instant::now()).await;
+    assert!(matches!(merged, Err(MetadataApiError::ServiceUnavailable)));
 }
 
 #[test]
