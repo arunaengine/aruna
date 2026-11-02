@@ -51,8 +51,9 @@ pub enum ValidationError {
     #[error("endpoint must be spelled as the http client parses it")]
     AmbiguousEndpoint,
     #[error(
-        "endpoint must not carry a user name, password, query or fragment; put credentials in \
-         the connector's secret settings"
+        "endpoint must not carry a user name, password, fragment or a query parameter that holds \
+         a secret, such as a token, key or signature; put credentials in the connector's secret \
+         settings"
     )]
     EndpointCredentials,
     #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
@@ -144,12 +145,7 @@ pub fn validate_connector_input(
     }
     // Version and source root records copy the endpoint, and listings show it.
     if let Some(endpoint) = public_config.get("endpoint")
-        && url::Url::parse(endpoint).is_ok_and(|url| {
-            !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-        })
+        && url::Url::parse(endpoint).is_ok_and(|url| carries_secret(&url))
     {
         return Err(ValidationError::EndpointCredentials);
     }
@@ -183,6 +179,43 @@ pub fn validate_connector_input(
     }
 
     Ok(())
+}
+
+/// Query parameter names that hold a secret, compared in lower case with `-` read as `_`.
+const SECRET_PARAMETERS: &[&str] = &[
+    "token",
+    "access_token",
+    "key",
+    "api_key",
+    "apikey",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "auth",
+    "authorization",
+    "sig",
+    "signature",
+    "credential",
+    "session",
+];
+
+/// Whether an endpoint carries a login, a fragment or a query parameter named like a secret,
+/// including every S3 and Google Cloud signing parameter.
+fn carries_secret(url: &url::Url) -> bool {
+    let secret = |name: &str| {
+        let name = name.to_ascii_lowercase().replace('-', "_");
+        SECRET_PARAMETERS.contains(&name.as_str())
+            || name.starts_with("x_amz_")
+            || name.starts_with("x_goog_")
+            || ["_token", "_secret", "_key", "_password"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+    };
+    !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query_pairs().any(|(name, _)| secret(&name))
 }
 
 pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorRules {
@@ -486,6 +519,11 @@ mod pure_tests {
             "https://reader@example.org/data",
             "https://example.org/data?token=canary-11",
             "https://example.org/data#canary-11",
+            "https://example.org/data?download=1&Signature=canary-11",
+            "https://example.org/data?X-Amz-Credential=canary-11",
+            "https://example.org/data?x-goog-signature=canary-11",
+            "https://example.org/data?Refresh-Token=canary-11",
+            "https://example.org/data?API_KEY=canary-11",
         ] {
             let public = HashMap::from([("endpoint".to_string(), endpoint.to_string())]);
             for kind in [SourceConnectorKind::Http, SourceConnectorKind::Webdav] {
@@ -499,6 +537,16 @@ mod pure_tests {
         }
         let error = ValidationError::EndpointCredentials.to_string();
         assert!(error.contains("secret settings") && !error.contains("canary"));
+        // A public query parameter stays allowed.
+        for endpoint in [
+            "https://example.org/data?download=1",
+            "https://example.org/data?format=csv&monkey=1",
+        ] {
+            let public = HashMap::from([("endpoint".to_string(), endpoint.to_string())]);
+            let kind = SourceConnectorKind::Http;
+            let accepted = validate_connector_input("source", kind, &public, &HashMap::new());
+            assert_eq!(accepted, Ok(()), "{endpoint}");
+        }
     }
 
     #[test]
