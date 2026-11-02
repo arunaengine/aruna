@@ -743,3 +743,51 @@ async fn lists_public_prefix() {
         .0;
     assert_eq!((stat.size, stat.content_type.as_str()), (7, "text/plain"));
 }
+
+// An exact grant on one key admits that key as a prefix, but the aggregate counts only what the
+// caller may read, as the REST listing shows it, not a longer key behind the same prefix.
+#[tokio::test]
+async fn aggregate_hides_keys() {
+    use crate::tests::distributed::{BUCKET, node_state};
+    use aruna_core::structs::identity::auth::Actor;
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = node_state().await;
+    let info = crate::routes::storage::deletion::bucket_info(&node.state, BUCKET)
+        .await
+        .unwrap();
+    for key in ["open.txt", "open.txt.secret"] {
+        let input = WriteObjectInput {
+            node_id: None,
+            bucket: BUCKET.to_string(),
+            key: key.to_string(),
+            text: "x".to_string(),
+            content_type: None,
+        };
+        store_text(&node.state, &node.owner, &info, input, Default::default())
+            .await
+            .unwrap();
+    }
+    let state = &node.state;
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let open = object_permission_path(realm_id, node.group_id, node_id, BUCKET, "open.txt");
+    let actor = Actor {
+        node_id,
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    crate::tests::routes::open_paths(&state.get_ctx(), &actor, node.group_id, &[open]).await;
+    let server = McpServer::new(state.clone());
+    let aggregate = AggregateObjectsInput {
+        node_id: None,
+        bucket: BUCKET.to_string(),
+        prefix: Some("open.txt".to_string()),
+        bucket_by: BucketUnit::Day,
+        since: None,
+        until: None,
+        max_buckets: None,
+    };
+    let counted =
+        server.aggregate_objects(Extension(caller(&node.stranger)), Parameters(aggregate));
+    let counted = counted.await.unwrap().0;
+    assert_eq!((counted.scanned, counted.total_count), (1, 1));
+}

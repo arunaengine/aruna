@@ -26,7 +26,7 @@ use aruna_operations::s3::object::get::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
 };
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_operations::s3::object::list::{ListBucketInput, ListBucketOperation, ListedObject};
+use aruna_operations::s3::object::list::ListedObject;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
@@ -262,11 +262,15 @@ pub struct AggregateObjectsOutput {
     /// dropped.
     pub total_count: u64,
     pub total_bytes: u64,
-    /// Objects the scan examined before filtering.
+    /// Readable objects the scan examined before the time window applied.
     pub scanned: usize,
     /// The scan hit its object cap or the series exceeded `max_buckets`, so the
     /// answer covers only part of the prefix.
     pub truncated: bool,
+    /// Key ranges a copy listed because their coordinator could not answer; their
+    /// counts may miss recent changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_ranges: Vec<String>,
     /// The node that answered the call.
     pub node_id: String,
 }
@@ -601,7 +605,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Count objects and bytes per calendar bucket over one bucket and optional key prefix, so a question such as documents per week is answered in one call instead of paging list_objects. Objects are bucketed by their last modification in UTC, with weeks starting Monday, and an optional since and until window bounds the range. The scan stops after 50000 objects and the series after max_buckets, both reported as truncated.",
+        description = "Count objects and bytes per calendar bucket over one bucket and optional key prefix, so a question such as documents per week is answered in one call instead of paging list_objects. Objects are bucketed by their last modification in UTC, with weeks starting Monday, and an optional since and until window bounds the range. Only objects the caller may read count, across every key range of a distributed bucket; stale_ranges names ranges a possibly lagging copy answered. The scan stops after 50000 objects and the series after max_buckets, both reported as truncated.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -638,40 +642,47 @@ impl McpServer {
         authorize_tool(&self.state, &auth, path, Permission::READ, extras)
             .await
             .map_err(|error| object_error(error, "read"))?;
-        let mut samples = Vec::new();
+        // Only what the caller may read counts, as in the REST listing, across every key range.
+        let bearer = request_bearer(&parts);
+        let expiry = (bearer.as_ref()).map_or(0, crate::auth::ValidatedBearer::expires_at_secs);
+        let (mut samples, mut stale_ranges) = (Vec::new(), Vec::new());
         let mut cursor = None;
         let mut scanned = 0usize;
         let mut scan_truncated = false;
         loop {
-            let page = drive(
-                ListBucketOperation::new(ListBucketInput {
-                    bucket: input.bucket.clone(),
-                    group_id: bucket_info.group_id,
-                    continuation_token: cursor,
-                    max_keys: Some(SCAN_PAGE_KEYS),
-                    prefix: input.prefix.clone(),
-                    delimiter: None,
-                    start_after: None,
-                }),
-                &self.state.get_ctx(),
-            )
-            .await
-            .map_err(internal_error)?;
+            let request = ListRequest {
+                bucket: input.bucket.clone(),
+                prefix: input.prefix.clone(),
+                delimiter: None,
+                cursor,
+                limit: SCAN_PAGE_KEYS,
+            };
+            let caller = (bearer.as_ref(), Some((&auth, expiry)));
+            let page = object_page(&self.state, &bucket_info, caller, request)
+                .await
+                .map_err(server_error)?;
             scanned = scanned.saturating_add(page.objects.len());
             for object in &page.objects {
-                let Some(at) = entry_time(object) else {
+                let at = object.last_modified.as_deref();
+                let Some(at) = at.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                else {
                     continue;
                 };
-                let at = chrono::DateTime::<chrono::Utc>::from(at);
+                let at = at.with_timezone(&chrono::Utc);
                 if since.is_some_and(|since| at < since) || until.is_some_and(|until| at >= until) {
                     continue;
                 }
                 samples.push(ObjectSample {
                     at,
-                    bytes: entry_size(object).unwrap_or(0),
+                    bytes: object.size.unwrap_or(0),
                 });
             }
-            cursor = page.continuation_token;
+            for range in page.stale_ranges {
+                if !stale_ranges.contains(&range) {
+                    stale_ranges.push(range);
+                }
+            }
+            cursor = page.next_cursor;
             if cursor.is_none() {
                 break;
             }
@@ -690,6 +701,7 @@ impl McpServer {
             total_bytes: folded.total_bytes,
             scanned,
             truncated: scan_truncated || folded.truncated,
+            stale_ranges,
             node_id: self.state.get_node_id().to_string(),
         }))
     }
