@@ -13,6 +13,7 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 const KEY_CONTEXT: &str = "aruna s3 credential seal v1";
+const PSEUDONYM_CONTEXT: &str = "aruna central assistant user v1";
 
 /// Node-held symmetric key that encrypts S3 credential secrets at rest. It is
 /// derived from the node's long-term secret, so only the issuing node can
@@ -32,6 +33,14 @@ impl CredentialEncryptionKey {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).expect("operating system random number generator failed");
         Self(bytes)
+    }
+
+    /// Stable hex id for a user that reveals nothing about the user id without this key.
+    pub fn user_pseudonym(&self, user_id: &UserId) -> String {
+        let key = blake3::derive_key(PSEUDONYM_CONTEXT, &self.0);
+        blake3::keyed_hash(&key, &user_id.to_bytes())
+            .to_hex()
+            .to_string()
     }
 
     fn cipher(&self) -> XChaCha20Poly1305 {
@@ -211,6 +220,20 @@ mod tests {
         let aad = sample_aad();
         let encrypted = EncryptedS3Secret::encrypt(&key, "top-secret", &aad).unwrap();
         assert_eq!(encrypted.open(&key, &aad).unwrap(), "top-secret");
+    }
+
+    #[test]
+    fn pseudonyms_separate_users() {
+        let key = CredentialEncryptionKey::derive(&[7u8; 32]);
+        let first = UserId::local(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let second = UserId::local(Ulid::from_bytes([5u8; 16]), RealmId([1u8; 32]));
+        let id = key.user_pseudonym(&first);
+        assert_eq!(id.len(), 64);
+        assert_eq!(id, key.user_pseudonym(&first));
+        assert_ne!(id, key.user_pseudonym(&second));
+        assert!(!id.contains(&first.to_string()));
+        let other = CredentialEncryptionKey::derive(&[8u8; 32]);
+        assert_ne!(id, other.user_pseudonym(&first));
     }
 
     #[test]

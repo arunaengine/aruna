@@ -133,6 +133,10 @@ pub const ASSISTANT_PROVIDER_KEYSPACE: &str = "assistant_providers";
 pub const PROVIDER_OWNER_KEYSPACE: &str = "assistant_provider_owner";
 pub const CHAT_HEAD_KEYSPACE: &str = "assistant_chat_heads";
 pub const CHAT_TURN_KEYSPACE: &str = "assistant_chat_turns";
+/// The realm's central assistant provider on its holder node, one row.
+pub const CENTRAL_ASSISTANT_KEYSPACE: &str = "assistant_central";
+/// Central assistant calls of each user on the current UTC day, keyed by user.
+pub const ASSISTANT_USAGE_KEYSPACE: &str = "assistant_usage";
 
 // Blob + S3 keyspaces
 pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
@@ -621,6 +625,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     PROVIDER_OWNER_KEYSPACE,
     CHAT_HEAD_KEYSPACE,
     CHAT_TURN_KEYSPACE,
+    CENTRAL_ASSISTANT_KEYSPACE,
+    ASSISTANT_USAGE_KEYSPACE,
     BLOB_LOCATIONS_KEYSPACE,
     BLOB_CLEANUP_KEYSPACE,
     BLOB_RECLAIM_KEYSPACE,
