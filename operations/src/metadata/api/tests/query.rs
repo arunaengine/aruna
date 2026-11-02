@@ -4,7 +4,7 @@
 
 use super::*;
 
-use super::super::distributed::{order_solutions, query_order};
+use super::super::distributed::{order_solutions, ordered_query};
 
 const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
@@ -24,8 +24,8 @@ fn merge_parts(
         .map(MetadataQueryResults::Solutions)
         .collect();
     let limit = query_select_limit(query);
-    let merged = match query_order(query) {
-        Some(order) => order_solutions(parts, &order)
+    let merged = match ordered_query(query) {
+        Some((_, order)) => order_solutions(parts, &order)
             .and_then(|rows| aggregate_query_results(vec![rows], MetadataQueryForm::Select, limit)),
         None => aggregate_query_results(parts, MetadataQueryForm::Select, limit),
     };
@@ -161,6 +161,49 @@ fn query_validation_accepts() {
     ));
 }
 
+fn partition_rows(query: &str, subjects: &[&str]) -> Vec<BTreeMap<String, String>> {
+    let mut dataset = oxrdf::Dataset::new();
+    for subject in subjects {
+        dataset.insert(&oxrdf::Quad::new(
+            oxrdf::NamedNode::new_unchecked(format!("urn:{subject}")),
+            oxrdf::NamedNode::new_unchecked("urn:k"),
+            oxrdf::Literal::from(1i64),
+            oxrdf::GraphName::DefaultGraph,
+        ));
+    }
+    let query = spargebra::SparqlParser::new().parse_query(query).unwrap();
+    let evaluator = spareval::QueryEvaluator::new();
+    let Ok(spareval::QueryResults::Solutions(solutions)) =
+        evaluator.prepare(&query).execute(&dataset)
+    else {
+        panic!("expected solutions");
+    };
+    solutions
+        .map(|solution| {
+            let solution = solution.unwrap();
+            solution
+                .iter()
+                .map(|(variable, term)| (variable.as_str().to_string(), term.to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn ties_cut_consistently() {
+    let query = "SELECT DISTINCT ?s ?k WHERE { ?s <urn:k> ?k } ORDER BY ?k LIMIT 1";
+    let (partition, _) = ordered_query(query).unwrap();
+    assert!(query_union_safe(&partition) && ensure_query_form(&partition).is_ok());
+    let first = partition_rows(&partition, &["z", "y", "x", "w", "a"]);
+    let second = partition_rows(&partition, &["v", "u", "t", "b"]);
+    assert_eq!((first.len(), second.len()), (1, 1));
+    let one = format!("\"1\"^^<{INTEGER}>");
+    assert_eq!(
+        merge_parts(query, vec![first, second]),
+        vec![solution_row(&[("s", "<urn:a>"), ("k", &one)])]
+    );
+}
+
 #[test]
 fn orders_numeric_desc() {
     let query = "SELECT DISTINCT ?s ?n WHERE { ?s <urn:n> ?n } ORDER BY DESC(?n) LIMIT 3";
@@ -225,7 +268,7 @@ fn unordered_keeps_arrival() {
         solution_row(&[("s", "<urn:m>")]),
         solution_row(&[("s", "<urn:b>")]),
     ];
-    assert!(query_order(query).is_none());
+    assert!(ordered_query(query).is_none());
     assert_eq!(
         merge_parts(query, vec![first, second]),
         vec![

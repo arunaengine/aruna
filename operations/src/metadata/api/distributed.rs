@@ -194,12 +194,18 @@ pub(super) async fn run_query_distributed(
     }
     span.record("cache", "miss");
 
+    let ordered = (!single_dataset_result)
+        .then(|| ordered_query(&query))
+        .flatten();
+    let partition_query = ordered
+        .as_ref()
+        .map_or_else(|| query.clone(), |(text, _)| text.clone());
     let local_call: MetadataNodeCall<MetadataQueryResults> = metadata_node_call(
         (
             handle.clone(),
             auth.clone(),
             graph_iris.clone(),
-            query.clone(),
+            partition_query.clone(),
         ),
         |(handle, auth, graph_iris, query), _| async move {
             handle
@@ -213,7 +219,7 @@ pub(super) async fn run_query_distributed(
             handle.clone(),
             remote_auth_token.clone(),
             graph_iris.clone(),
-            query.clone(),
+            partition_query.clone(),
         ),
         |(handle, auth_token, graph_iris, query), node_id| async move {
             handle
@@ -240,8 +246,8 @@ pub(super) async fn run_query_distributed(
             Some(result) => Ok(result),
             None => aggregate_query_results(Vec::new(), query_form, select_limit),
         }
-    } else if let Some(order) = query_order(&query) {
-        order_solutions(parts, &order)
+    } else if let Some((_, order)) = &ordered {
+        order_solutions(parts, order)
             .and_then(|rows| aggregate_query_results(vec![rows], query_form, select_limit))
     } else {
         aggregate_query_results(parts, query_form, select_limit)
@@ -497,24 +503,42 @@ pub fn query_select_limit(query: &str) -> Option<usize> {
     length
 }
 
-/// Returns the `ORDER BY` keys of a `SELECT` below its slice, distinct and projection.
-pub(super) fn query_order(query: &str) -> Option<Vec<spargebra::algebra::OrderExpression>> {
-    use spargebra::algebra::GraphPattern;
+/// Returns the query each partition runs and the merge keys: the `ORDER BY` keys plus every
+/// other projected variable as an `ASC` key, so each partition's `LIMIT` cuts a total order.
+pub(super) fn ordered_query(
+    query: &str,
+) -> Option<(String, Vec<spargebra::algebra::OrderExpression>)> {
+    use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
 
-    let spargebra::Query::Select { mut pattern, .. } =
-        spargebra::SparqlParser::new().parse_query(query).ok()?
-    else {
+    let mut parsed = spargebra::SparqlParser::new().parse_query(query).ok()?;
+    let spargebra::Query::Select { pattern, .. } = &mut parsed else {
         return None;
     };
-    loop {
+    let mut pattern = pattern;
+    let mut projected = Vec::new();
+    let keys = loop {
         pattern = match pattern {
-            GraphPattern::Slice { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Project { inner, .. } => *inner,
-            GraphPattern::OrderBy { expression, .. } => return Some(expression),
+            GraphPattern::Slice { inner, .. } | GraphPattern::Distinct { inner } => inner,
+            GraphPattern::Project { inner, variables } => {
+                projected = variables.clone();
+                inner
+            }
+            GraphPattern::OrderBy { expression, .. } => {
+                for variable in projected {
+                    let keyed = expression.iter().any(|order| {
+                        matches!(order, OrderExpression::Asc(Expression::Variable(key))
+                            | OrderExpression::Desc(Expression::Variable(key)) if *key == variable)
+                    });
+                    if !keyed {
+                        expression.push(OrderExpression::Asc(Expression::Variable(variable)));
+                    }
+                }
+                break expression.clone();
+            }
             _ => return None,
         };
-    }
+    };
+    Some((parsed.to_string(), keys))
 }
 
 /// Sorts the union of partition rows with the engine's SPARQL ordering (spareval), so terms
