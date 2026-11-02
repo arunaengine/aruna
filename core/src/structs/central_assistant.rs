@@ -59,10 +59,11 @@ impl AssistantUsage {
         Ok(postcard::from_bytes(bytes)?)
     }
 
-    /// Calls counted for `today`; a row of an earlier day counts as none.
+    /// Calls counted for `today`; a row of an earlier day counts as none. A row of a later
+    /// day still counts, so a clock stepped back never grants a new allowance.
     pub fn used_on(usage: Option<Self>, today: u32) -> u32 {
         usage
-            .filter(|usage| usage.day == today)
+            .filter(|usage| usage.day >= today)
             .map_or(0, |usage| usage.count)
     }
 }
@@ -90,7 +91,7 @@ pub fn charge(
         return Err(QuotaReached { used, limit });
     }
     Ok(AssistantUsage {
-        day: today,
+        day: usage.map_or(today, |usage| usage.day.max(today)),
         count: used.saturating_add(1),
     })
 }
@@ -137,6 +138,24 @@ mod tests {
             count: u32::MAX,
         };
         assert_eq!(charge(Some(usage), 5, None).unwrap().count, u32::MAX);
+    }
+
+    #[test]
+    fn clock_back_keeps_day() {
+        // A clock stepped back across midnight must not reset today's count.
+        let usage = AssistantUsage { day: 10, count: 50 };
+        assert_eq!(
+            charge(Some(usage), 9, Some(50)),
+            Err(QuotaReached {
+                used: 50,
+                limit: 50
+            })
+        );
+        assert_eq!(
+            charge(Some(AssistantUsage { day: 10, count: 3 }), 9, None),
+            Ok(AssistantUsage { day: 10, count: 4 })
+        );
+        assert_eq!(AssistantUsage::used_on(Some(usage), 9), 50);
     }
 
     #[test]
