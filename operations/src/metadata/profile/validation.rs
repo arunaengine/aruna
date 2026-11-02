@@ -19,7 +19,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis as now_ms;
 use aruna_core::types::{GroupId, TxnId};
 use craqle::{CrateViolation, ShaclValidationResult};
-use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Quad, Term};
 use oxttl::NQuadsParser;
 use ulid::Ulid;
 
@@ -973,11 +973,14 @@ fn data_graph(jsonld: &str) -> Result<(Dataset, NamedOrBlankNode), MetadataError
     Ok((dataset, root))
 }
 
+/// The entity the metadata descriptor is `about`; an `about` of any other entity names no root.
 fn crate_root(dataset: &Dataset) -> Option<NamedOrBlankNode> {
     for predicate in [SCHEMA_ABOUT, SCHEMA_HTTPS_ABOUT] {
         let predicate = NamedNode::new_unchecked(predicate);
         for quad in dataset.quads_for_predicate(&predicate) {
-            if !quad.graph_name.is_default_graph() {
+            let descriptor = matches!(quad.subject, NamedOrBlankNodeRef::NamedNode(subject)
+                if subject.as_str().ends_with("ro-crate-metadata.json"));
+            if !quad.graph_name.is_default_graph() || !descriptor {
                 continue;
             }
             if let Some(root) = term_as_node(quad.object.into_owned()) {
@@ -1232,6 +1235,29 @@ mod tests {
             ]
         })
         .to_string()
+    }
+
+    #[test]
+    fn root_from_descriptor() {
+        // An `about` of another entity never picks the root, so a Profile root stays a Profile.
+        let mut graph = vec![
+            serde_json::json!({
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "https://example.test/profile"}
+            }),
+            serde_json::json!({"@id": "https://example.test/profile", "@type": DX_PROFILE}),
+        ];
+        for index in 0..16 {
+            let note = format!("https://example.test/note/{index}");
+            let other = format!("https://example.test/other/{index}");
+            graph.push(serde_json::json!({"@id": note, "about": {"@id": other.clone()}}));
+            graph.push(serde_json::json!({"@id": other, "@type": "Thing"}));
+        }
+        let context = "https://w3id.org/ro/crate/1.2/context";
+        let jsonld = serde_json::json!({"@context": context, "@graph": graph}).to_string();
+        assert!(crate_is_profile(&jsonld));
     }
 
     #[test]
