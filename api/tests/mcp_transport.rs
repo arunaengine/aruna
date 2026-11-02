@@ -1208,8 +1208,8 @@ async fn publish_api(state: &ServerState, node_id: aruna_core::NodeId, api: &str
     write_value(state, NODE_INFO_KEYSPACE, node_info_key(node_id), value).await;
 }
 
-// A data tool call naming another node runs on that node's /mcp over HTTP with the caller's
-// token, and the answer names that node; a node without an address fails naming it.
+// A data tool call naming another server node runs on that node's /mcp over HTTP with the
+// caller's token and its answer names that node; one without an address fails naming it.
 #[tokio::test]
 async fn forwards_to_holder() {
     let fixture = setup_fixture().await;
@@ -1227,6 +1227,26 @@ async fn forwards_to_holder() {
     )
     .await;
     let (other_url, other_stop, other_task) = start_server(Arc::new(other)).await;
+    // Only server nodes of the realm receive a forwarded call; the silent one has no address.
+    let silent = iroh::SecretKey::from_bytes(&[35u8; 32]).public();
+    let realm_id = fixture.state.get_realm_id();
+    let mut realm = drive(GetConfigOperation::new(realm_id), &fixture.state.get_ctx())
+        .await
+        .unwrap();
+    for node_id in [holder, silent] {
+        realm.ensure_node(
+            node_id,
+            aruna_core::structs::identity::realm::RealmNodeKind::Server,
+        );
+    }
+    let realm = realm.to_bytes(&fixture.actor).unwrap();
+    write_value(
+        &fixture.state,
+        REALM_CONFIG_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        realm,
+    )
+    .await;
     let base = other_url.trim_end_matches("/mcp");
     publish_api(&fixture.state, holder, &format!("{base}/api/v1")).await;
     let (url, shutdown, task) = start_server(fixture.state.clone()).await;
@@ -1255,16 +1275,25 @@ async fn forwards_to_holder() {
     let text = missing.structured_content.as_ref().unwrap()["error"].to_string();
     assert!(text.contains(&named), "{text}");
 
-    let silent = iroh::SecretKey::from_bytes(&[35u8; 32])
-        .public()
-        .to_string();
     let unknown = call(
         &client,
         "stat_object",
-        json!({ "bucket": "mcp-data", "key": "nope.txt", "node_id": silent }),
+        json!({ "bucket": "mcp-data", "key": "nope.txt", "node_id": silent.to_string() }),
     )
     .await;
     assert_eq!(code(&unknown), "Service unavailable");
+
+    // A node that is not a server of the realm never gets the caller's token.
+    let outsider = iroh::SecretKey::from_bytes(&[36u8; 32])
+        .public()
+        .to_string();
+    let refused = call(
+        &client,
+        "stat_object",
+        json!({ "bucket": "mcp-data", "key": "nope.txt", "node_id": outsider }),
+    )
+    .await;
+    assert_eq!(code(&refused), "Bad request");
 
     client.cancel().await.unwrap();
     shutdown.cancel();
