@@ -388,20 +388,10 @@ impl McpServer {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("list_objects", &input)?;
         let bucket_info = self.bucket_info(&input.bucket).await?;
-        authorize_tool(
-            &self.state,
-            &auth,
-            bucket_permission_path(
-                self.state.get_realm_id(),
-                bucket_info.group_id,
-                self.state.get_node_id(),
-                &input.bucket,
-            ),
-            Permission::READ,
-            extras,
-        )
-        .await
-        .map_err(|error| object_error(error, "read"))?;
+        let path = listing_path(&self.state, &bucket_info, &input.bucket, &input.prefix);
+        authorize_tool(&self.state, &auth, path, Permission::READ, extras)
+            .await
+            .map_err(|error| object_error(error, "read"))?;
         let limit = input.limit.unwrap_or(100).clamp(1, 200);
         // Only what the caller may read shows, as in the bucket's own listing; a distributed
         // bucket is listed across its key ranges.
@@ -585,20 +575,10 @@ impl McpServer {
             .unwrap_or(DEFAULT_BUCKETS)
             .clamp(1, MAX_BUCKETS);
         let bucket_info = self.bucket_info(&input.bucket).await?;
-        authorize_tool(
-            &self.state,
-            &auth,
-            bucket_permission_path(
-                self.state.get_realm_id(),
-                bucket_info.group_id,
-                self.state.get_node_id(),
-                &input.bucket,
-            ),
-            Permission::READ,
-            extras,
-        )
-        .await
-        .map_err(|error| object_error(error, "read"))?;
+        let path = listing_path(&self.state, &bucket_info, &input.bucket, &input.prefix);
+        authorize_tool(&self.state, &auth, path, Permission::READ, extras)
+            .await
+            .map_err(|error| object_error(error, "read"))?;
         let mut samples = Vec::new();
         let mut cursor = None;
         let mut scanned = 0usize;
@@ -874,6 +854,20 @@ fn fold_buckets(samples: &[ObjectSample], unit: BucketUnit, max_buckets: usize) 
         total_count,
         total_bytes,
         truncated,
+    }
+}
+
+/// The path a listing needs READ on: the listed prefix, as for the REST listing, or the bucket.
+fn listing_path(
+    state: &ServerState,
+    info: &BucketInfo,
+    bucket: &str,
+    prefix: &Option<String>,
+) -> String {
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    match prefix.as_deref().filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => object_permission_path(realm_id, info.group_id, node_id, bucket, prefix),
+        None => bucket_permission_path(realm_id, info.group_id, node_id, bucket),
     }
 }
 

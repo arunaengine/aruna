@@ -605,3 +605,133 @@ async fn lists_readable_buckets() {
         assert_eq!(listed.buckets[0].node_id, state.get_node_id().to_string());
     }
 }
+
+/// Writes `key` as a reference to an external file, which keeps no blob on this node.
+async fn external_reference(node: &crate::tests::distributed::Node, key: &str) {
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    let descriptor = PortableSourceDescriptor {
+        kind: SourceConnectorKind::Http,
+        public_config: HashMap::new(),
+        source_path: "https://ftp.ncbi.nlm.nih.gov/genomes/all/x.fna".to_string(),
+        version_selector: None,
+        capabilities: Vec::new(),
+        origin_node_id: None,
+        namespace: None,
+        root: None,
+    };
+    let write = ReferenceWrite {
+        job_id: None,
+        preassigned_version_id: None,
+        group_id: node.group_id,
+        user_id: node.owner.user_id,
+        realm_id: node.owner.realm_id,
+        node_id: node.state.get_node_id(),
+        bucket: crate::tests::distributed::BUCKET.to_string(),
+        key: key.to_string(),
+        expected_bucket: None,
+        version_source: VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor,
+            connector_id: None,
+            mirrors: Vec::new(),
+        },
+        metadata: SourceMetadata {
+            content_length: 7,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("ref".to_string()),
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        },
+        inherited_policies: Vec::new(),
+        connector_guard: None,
+        restrictions: None,
+        mirror_guards: Vec::new(),
+    };
+    write_reference_version(&node.state.get_ctx(), write)
+        .await
+        .unwrap();
+}
+
+// READ that a public role grants on a prefix lists that prefix, external references included,
+// as the REST listing does; the bucket root stays refused.
+#[tokio::test]
+async fn lists_public_prefix() {
+    use crate::tests::distributed::{BUCKET, node_state};
+    use aruna_core::structs::identity::auth::Actor;
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = node_state().await;
+    let info = crate::routes::storage::deletion::bucket_info(&node.state, BUCKET)
+        .await
+        .unwrap();
+    for key in ["closed.md", "open/b.md"] {
+        let input = WriteObjectInput {
+            bucket: BUCKET.to_string(),
+            key: key.to_string(),
+            text: "x".to_string(),
+            content_type: None,
+        };
+        store_text(&node.state, &node.owner, &info, input, Default::default())
+            .await
+            .unwrap();
+    }
+    external_reference(&node, "open/ref.fna").await;
+    let state = &node.state;
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let open = object_permission_path(realm_id, node.group_id, node_id, BUCKET, "open/**");
+    let actor = Actor {
+        node_id,
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    crate::tests::routes::open_paths(&state.get_ctx(), &actor, node.group_id, &[open]).await;
+    let server = McpServer::new(state.clone());
+    let list = |prefix: Option<&str>| ListObjectsInput {
+        bucket: BUCKET.to_string(),
+        prefix: prefix.map(str::to_string),
+        cursor: None,
+        limit: None,
+    };
+    let stranger = || Extension(caller(&node.stranger));
+    let listed = server.list_objects(stranger(), Parameters(list(Some("open/"))));
+    let listed = listed.await.unwrap().0;
+    let keys: Vec<&str> = listed
+        .objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect();
+    assert_eq!(keys, ["open/b.md", "open/ref.fna"]);
+    let root = server
+        .list_objects(stranger(), Parameters(list(None)))
+        .await;
+    let Err(root) = root else {
+        panic!("the bucket root stays refused");
+    };
+    assert_eq!(body(root)["code"], "Forbidden");
+    let aggregate = AggregateObjectsInput {
+        bucket: BUCKET.to_string(),
+        prefix: Some("open/".to_string()),
+        bucket_by: BucketUnit::Day,
+        since: None,
+        until: None,
+        max_buckets: None,
+    };
+    let counted = server.aggregate_objects(stranger(), Parameters(aggregate));
+    assert_eq!(counted.await.unwrap().0.scanned, 2);
+    let stat = StatObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "open/ref.fna".to_string(),
+        version_id: None,
+    };
+    let stat = server
+        .stat_object(stranger(), Parameters(stat))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!((stat.size, stat.content_type.as_str()), (7, "text/plain"));
+}
