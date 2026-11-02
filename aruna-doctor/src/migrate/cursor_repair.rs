@@ -6,16 +6,22 @@
 use super::info_topics;
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
+use aruna_core::keyspaces::EVENT_LOG_KEYSPACE;
+use aruna_core::metadata::{
+    MetadataActor, MetadataEventRecord, deterministic_materialization_actor,
+};
+use aruna_core::storage_entries::{event_log_key, event_log_prefix};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use craqle::{
     GraphId, GraphPolicy, PolicyTag, TopicCursorRepairAudit, VectorClock, topic_cursor_digest,
 };
-use fjall::OptimisticTxDatabase;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
+use fjall::{OptimisticTxDatabase, Readable};
 use irokle::{ActorClock, FjallStorage, OpId, Storage, TopicId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use ulid::Ulid;
 
 const CURSOR_VERSION: u8 = 2;
 const CURSOR_PREFIX: u8 = b'C';
@@ -88,8 +94,8 @@ pub struct RepairOutput {
     topic_id: String,
     stale: BranchView,
     current: BranchView,
-    /// Every actor in the graph's applied clock by highest sequence; all but this node's own block.
-    applied_actors: BTreeMap<String, u64>,
+    /// Every actor in the graph's applied clock; all but identified local writers block.
+    applied_actors: BTreeMap<String, AppliedActor>,
     /// Actors whose sequences can collide across the geneses, so a replay could skip records.
     overlap: Vec<ActorOverlap>,
     old_cursor_digest: String,
@@ -102,6 +108,13 @@ struct BranchView {
     epoch: u64,
     genesis: String,
     actors: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AppliedActor {
+    sequence: u64,
+    /// How the event log or node identity names this local writer, or "unidentified".
+    origin: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -122,15 +135,14 @@ pub async fn repair_cursor(request: CursorRepair) -> Result<(), CliError> {
 
 fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> {
     // The document id names the event log that identifies the graph's local writers.
-    if MetadataRegistryRecord::graph_document(&request.graph)
+    let document_id = MetadataRegistryRecord::graph_document(&request.graph)
         .filter(|document| MetadataRegistryRecord::graph_iri_for(*document) == request.graph)
-        .is_none()
-    {
-        return Err(ExplorerError::Refused(format!(
-            "{} is not an Aruna metadata graph IRI",
-            request.graph
-        )));
-    }
+        .ok_or_else(|| {
+            ExplorerError::Refused(format!(
+                "{} is not an Aruna metadata graph IRI",
+                request.graph
+            ))
+        })?;
     let storage = Path::new(&request.database_path);
     let craqle_path = request
         .craqle_path
@@ -154,7 +166,7 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
         }
     }
     let graph = GraphId::new(&request.graph);
-    let local = local_writer(storage)?;
+    let writers = local_writers(storage, document_id)?;
     // Both stores stay open, and so locked, from validation through the durable write; the
     // locks also refuse while the node runs.
     let sync = FjallStorage::open(&sync_path)?;
@@ -200,13 +212,22 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
         .chain(stale.clock.iter().map(|(actor, _)| *actor.as_bytes()))
         .chain(view.clock.iter().map(|(actor, _)| *actor.as_bytes()))
         .chain(members.map(|actor| *actor.as_bytes()))
-        .filter(|actor| actor != local.as_bytes())
+        .filter(|actor| !writers.contains_key(actor))
         .collect();
     let overlap = actor_overlap(&candidates, &stale.clock, &applied, &view.clock);
     let applied_actors = applied
         .0
         .iter()
-        .map(|(actor, sequence)| (hex::encode(actor.as_bytes()), *sequence))
+        .map(|(actor, sequence)| {
+            let origin = writers
+                .get(actor.as_bytes())
+                .map_or("unidentified", String::as_str);
+            let entry = AppliedActor {
+                sequence: *sequence,
+                origin: origin.to_string(),
+            };
+            (hex::encode(actor.as_bytes()), entry)
+        })
         .collect();
     let mut output = RepairOutput {
         graph: request.graph.clone(),
@@ -400,13 +421,44 @@ fn fjall_database(path: &Path) -> bool {
     path.join("version").is_file()
 }
 
-/// Aruna's own Craqle actor, the node id, which writes local metadata without publishing it.
-fn local_writer(database_path: &Path) -> Result<craqle::ActorId, ExplorerError> {
+/// The actors Aruna writes this document's graph with locally, each with its derivation: the
+/// node id, and per logged event its materialization actor and the document actor its node
+/// starts there. These are domain-separated hashes, so none is an Irokle topic actor.
+fn local_writers(
+    database_path: &Path,
+    document_id: Ulid,
+) -> Result<BTreeMap<[u8; 32], String>, ExplorerError> {
     let db = OptimisticTxDatabase::builder(database_path).open()?;
     let state = info_topics::persisted_node_state(&db)?
         .ok_or_else(|| ExplorerError::Refused("node has no stored identity".to_string()))?;
     let node_id = iroh::SecretKey::from_bytes(&state.net_secret_key).public();
-    Ok(craqle::ActorId::from_bytes(*node_id.as_bytes()))
+    let mut writers = BTreeMap::from([(*node_id.as_bytes(), "this node".to_string())]);
+    // Opening a missing keyspace would create it.
+    if !db.keyspace_exists(EVENT_LOG_KEYSPACE) {
+        return Ok(writers);
+    }
+    let events = db.keyspace(EVENT_LOG_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let read = db.read_tx();
+    for entry in read.prefix(&events, event_log_prefix(document_id)) {
+        let (key, value) = entry.into_inner()?;
+        let event: MetadataEventRecord = postcard::from_bytes(&value)
+            .map_err(|error| ExplorerError::Decode(format!("metadata event: {error}")))?;
+        let id = event.event_id;
+        if key.as_ref() != event_log_key(document_id, id).as_ref() {
+            return Err(ExplorerError::Decode(format!(
+                "metadata event {id} is stored under another key"
+            )));
+        }
+        writers
+            .entry(deterministic_materialization_actor(id))
+            .or_insert_with(|| format!("materialization of event {id}"));
+        if let Some(actor) = MetadataActor::next(None, document_id, event.node_id, id) {
+            writers.entry(actor.actor).or_insert_with(|| {
+                format!("document actor of node {} from event {id}", event.node_id)
+            });
+        }
+    }
+    Ok(writers)
 }
 
 fn applied_sequence(applied: &VectorClock, actor: &irokle::ActorId) -> u64 {
@@ -431,6 +483,7 @@ fn branch_view(epoch: u64, genesis: &OpId, clock: &ActorClock) -> BranchView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataEventPayload};
     use craqle::{
         AllowAllAuthorizer, CraqleIrokleOptions, CraqleNode, CraqleOptions,
         CraqleRequestDurability, CreateCrateRequest, GraphPolicy, SearchStorage,
@@ -442,6 +495,83 @@ mod tests {
     const GRAPH: &str = "https://w3id.org/aruna/0000000000000000000000001A";
     const REPLICA_SEED: u8 = 9;
     const NODE_SECRET: [u8; 32] = [21; 32];
+    const OTHER_SECRET: [u8; 32] = [31; 32];
+    const DEVICE_ACTOR: [u8; 32] = [88; 32];
+    const EVENT_ONE: Ulid = Ulid(101);
+    const EVENT_TWO: Ulid = Ulid(102);
+
+    fn document() -> Ulid {
+        MetadataRegistryRecord::graph_document(GRAPH).unwrap()
+    }
+
+    /// Logs one event of the document, as every holder keeps it in its event log.
+    fn log_event(
+        path: &Path,
+        event_id: Ulid,
+        node_id: iroh::PublicKey,
+        payload: MetadataEventPayload,
+    ) {
+        use aruna_core::structs::placement::record::PlacementRef;
+        let realm_id = aruna_core::structs::identity::realm::RealmId([3u8; 32]);
+        let event = MetadataEventRecord {
+            event_id,
+            record: MetadataRegistryRecord {
+                realm_id,
+                group_id: Ulid(1),
+                document_id: document(),
+                document_path: "datasets/repair".into(),
+                graph_iri: GRAPH.to_string(),
+                public: false,
+                permission_path: String::new(),
+                placement: PlacementRef::NIL,
+                holder_node_ids: vec![node_id],
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                establishing_event_id: event_id,
+                last_event_id: event_id,
+            },
+            user_id: aruna_core::UserId::nil(realm_id),
+            node_id,
+            payload,
+            occurred_at_ms: 1,
+        };
+        let (_, key, value) = aruna_core::storage_entries::create_event_entry(&event).unwrap();
+        super::super::tests::write(
+            path,
+            EVENT_LOG_KEYSPACE,
+            vec![(key.as_ref(), value.to_vec())],
+        );
+    }
+
+    /// One local, unpublished data entity written as `actor`.
+    fn patch_local(node: &CraqleNode, actor: [u8; 32]) {
+        let entity = craqle::CreateEntityRequest {
+            graph: GraphId::new(GRAPH),
+            entity_id: "local.csv".to_string(),
+            entity_type: "File".to_string(),
+            name: "local".to_string(),
+            additional_triples: Vec::new(),
+        };
+        let request = craqle::PatchEntityRequest {
+            entity,
+            replaced_predicates: Vec::new(),
+        };
+        let durability = CraqleRequestDurability::WalAlreadyDurable;
+        let actor = Some(craqle::ActorId::from_bytes(actor));
+        node.patch_data_with(&AllowAllAuthorizer, request, durability, actor)
+            .unwrap();
+    }
+
+    fn other_node() -> iroh::PublicKey {
+        iroh::SecretKey::from_bytes(&OTHER_SECRET).public()
+    }
+
+    /// The document actor another node starts at `EVENT_TWO`.
+    fn other_actor() -> [u8; 32] {
+        MetadataActor::next(None, document(), other_node(), EVENT_TWO)
+            .unwrap()
+            .actor
+    }
 
     /// The Craqle actor Aruna writes local metadata with: the id of the node holding `NODE_SECRET`.
     fn node_writer() -> craqle::ActorId {
@@ -486,6 +616,10 @@ mod tests {
         policy_only: bool,
         /// The storage root has no node database with an identity.
         without_identity: bool,
+        /// The replica's content comes from a materialized event and another node's first batch.
+        aruna_writers: bool,
+        /// The replica merged a batch whose actor a device chose.
+        device_writer: bool,
     }
 
     fn signed(seed: u8) -> Irokle {
@@ -539,6 +673,33 @@ mod tests {
             .unwrap();
     }
 
+    fn scaffold() -> MetadataEventPayload {
+        MetadataEventPayload::Scaffold {
+            name: "first".to_string(),
+            description: "description".to_string(),
+            date_published: "2025-01-01".to_string(),
+            license: None,
+        }
+    }
+
+    /// A batch a device planned under an actor it chose itself.
+    fn device_batch() -> MetadataEventPayload {
+        let source = MetadataBatchSource::UpsertDataEntity {
+            jsonld: "{}".to_string(),
+        };
+        MetadataEventPayload::ApplyBatch {
+            batch: MetadataBatch {
+                graph_iri: GRAPH.to_string(),
+                actor: DEVICE_ACTOR,
+                counter: 1,
+                base_clock: VectorClock::new(),
+                ops: Vec::new(),
+                timestamp_millis: 0,
+            },
+            authored: source,
+        }
+    }
+
     /// The replica's unpublished local crate, written as `actor`.
     fn create_local(node: &CraqleNode, actor: craqle::ActorId) {
         let request = CreateCrateRequest::new(
@@ -582,7 +743,21 @@ mod tests {
             } else {
                 node_writer()
             };
-            if setup.policy_only {
+            if setup.aruna_writers {
+                let writer = deterministic_materialization_actor(EVENT_ONE);
+                create_local(&replica, craqle::ActorId::from_bytes(writer));
+                patch_local(&replica, other_actor());
+                let node = iroh::SecretKey::from_bytes(&NODE_SECRET).public();
+                log_event(temp.path(), EVENT_ONE, node, scaffold());
+                let upsert = MetadataEventPayload::UpsertDataEntity {
+                    jsonld: "{}".to_string(),
+                };
+                log_event(temp.path(), EVENT_TWO, other_node(), upsert);
+            } else if setup.device_writer {
+                create_local(&replica, node_writer());
+                patch_local(&replica, DEVICE_ACTOR);
+                log_event(temp.path(), EVENT_TWO, other_node(), device_batch());
+            } else if setup.policy_only {
                 let write = craqle::PolicyWrite {
                     graph: &graph,
                     policy: policy(),
@@ -688,7 +863,7 @@ mod tests {
         assert_eq!(again.old_cursor_digest, output.old_cursor_digest);
     }
 
-    /// Every key and value of the Craqle and sync stores, read without starting a node.
+    /// Every key and value of the Craqle, sync and node stores, read without starting a node.
     fn store_state(path: &Path) -> BTreeMap<(String, Vec<u8>), Vec<u8>> {
         let mut state = BTreeMap::new();
         let craqle = Database::builder(path.join("craqle").join("store"))
@@ -704,26 +879,32 @@ mod tests {
             }
         }
         drop(craqle);
-        let sync = fjall::OptimisticTxDatabase::builder(path.join("document-sync"))
-            .open()
-            .unwrap();
-        for name in sync.list_keyspace_names() {
-            let keyspace = sync
-                .inner()
-                .keyspace(&name, KeyspaceCreateOptions::default)
-                .unwrap();
-            for guard in keyspace.iter() {
-                let (key, value) = guard.into_inner().unwrap();
-                state.insert((format!("sync {}", &*name), key.to_vec()), value.to_vec());
+        for (label, store) in [("sync", path.join("document-sync")), ("node", path.into())] {
+            let db = OptimisticTxDatabase::builder(store).open().unwrap();
+            for name in db.list_keyspace_names() {
+                let keyspace = db
+                    .inner()
+                    .keyspace(&name, KeyspaceCreateOptions::default)
+                    .unwrap();
+                for guard in keyspace.iter() {
+                    let (key, value) = guard.into_inner().unwrap();
+                    state.insert(
+                        (format!("{label} {}", &*name), key.to_vec()),
+                        value.to_vec(),
+                    );
+                }
             }
         }
         state
     }
 
-    /// A dry run starts no node, so it rebuilds, repairs or settles nothing in either store.
+    /// A dry run starts no node, so it rebuilds, repairs or settles nothing in any store.
     #[test]
     fn dry_run_untouched() {
-        let (temp, request) = replaced_replica(Setup::default());
+        let (temp, request) = replaced_replica(Setup {
+            aruna_writers: true,
+            ..Setup::default()
+        });
         let before = store_state(temp.path());
         repair_output(&request).unwrap();
         assert_eq!(store_state(temp.path()), before);
@@ -783,10 +964,8 @@ mod tests {
             panic!("expected one applied actor, got {:?}", output.overlap);
         };
         assert!(overlap.stale_cursor > 0 && overlap.applied > 0 && overlap.current == 0);
-        assert_eq!(
-            output.applied_actors.get(&overlap.actor),
-            Some(&overlap.applied)
-        );
+        let applied = output.applied_actors.get(&overlap.actor);
+        assert_eq!(applied.map(|actor| actor.sequence), Some(overlap.applied));
         request.apply = true;
         let error = repair_output(&request).unwrap_err();
         assert!(matches!(error, ExplorerError::Refused(_)));
@@ -808,10 +987,8 @@ mod tests {
             panic!("expected the replica's actor, got {:?}", output.overlap);
         };
         assert!(overlap.applied > 0 && overlap.stale_cursor == 0 && overlap.current == 0);
-        assert_eq!(
-            output.applied_actors.get(&overlap.actor),
-            Some(&overlap.applied)
-        );
+        let applied = output.applied_actors.get(&overlap.actor);
+        assert_eq!(applied.map(|actor| actor.sequence), Some(overlap.applied));
         request.apply = true;
         let error = repair_output(&request).unwrap_err();
         assert!(matches!(error, ExplorerError::Refused(_)));
@@ -832,6 +1009,7 @@ mod tests {
         };
         assert_eq!(overlap.actor, stranger);
         assert!(overlap.applied > 0 && overlap.stale_cursor == 0 && overlap.current == 0);
+        assert_eq!(output.applied_actors[&stranger].origin, "unidentified");
         request.apply = true;
         let error = repair_output(&request).unwrap_err();
         assert!(matches!(error, ExplorerError::Refused(_)));
@@ -936,6 +1114,49 @@ mod tests {
                 "{graph}: {error}"
             );
         }
+    }
+
+    /// A materialized event's actor and another node's first-batch actor are Aruna's own local
+    /// writers, identified from the event log, so they do not block the repair.
+    #[test]
+    fn identifies_local_writers() {
+        let (_temp, mut request) = replaced_replica(Setup {
+            aruna_writers: true,
+            ..Setup::default()
+        });
+        let output = repair_output(&request).unwrap();
+        assert!(output.overlap.is_empty(), "{:?}", output.overlap);
+        let origin = |actor: [u8; 32]| output.applied_actors[&hex::encode(actor)].origin.clone();
+        let materialized = deterministic_materialization_actor(EVENT_ONE);
+        assert_eq!(
+            origin(materialized),
+            format!("materialization of event {EVENT_ONE}")
+        );
+        assert_eq!(
+            origin(other_actor()),
+            format!(
+                "document actor of node {} from event {EVENT_TWO}",
+                other_node()
+            )
+        );
+        request.apply = true;
+        assert!(repair_output(&request).unwrap().applied);
+    }
+
+    /// A device chooses its batch actor itself; no derivation names it, so it still refuses.
+    #[test]
+    fn refuses_device_actor() {
+        let (_temp, mut request) = replaced_replica(Setup {
+            device_writer: true,
+            ..Setup::default()
+        });
+        let output = repair_output(&request).unwrap();
+        let device = hex::encode(DEVICE_ACTOR);
+        assert_eq!(output.applied_actors[&device].origin, "unidentified");
+        assert!(output.overlap.iter().any(|overlap| overlap.actor == device));
+        request.apply = true;
+        let error = repair_output(&request).unwrap_err();
+        assert!(matches!(error, ExplorerError::Refused(_)));
     }
 
     /// After the repair Craqle opens with sync again, and the kept graph takes the new genesis.
