@@ -173,9 +173,9 @@ pub enum TopicCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum MetadataCommands {
-    /// Move one metadata graph's sync cursor from a replaced genesis onto the current one, so the
-    /// topic replays into the kept graph. Refuses when the genesis is unchanged or actor sequences
-    /// could collide. Run with the node stopped; without `--apply` it only reports.
+    /// Move one metadata graph's sync cursor from a replaced genesis onto the current one. Refuses
+    /// when the genesis is unchanged or actor sequences could collide. Run with the node stopped;
+    /// without `--apply` it only reports both branches and every actor the graph applied.
     RepairCursor {
         #[arg(long)]
         database_path: String,
