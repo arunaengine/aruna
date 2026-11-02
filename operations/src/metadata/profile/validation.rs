@@ -29,7 +29,7 @@ use crate::metadata::api::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
 use crate::metadata::forward::{PROFILE_DOCUMENT_PREFIX, export_profile_routed};
 use crate::metadata::profile::shacl::{
-    ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
+    CRAQLE_BASE_IRI, ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
 };
 use crate::metadata::raw_revision::load_raw_revision;
 use crate::metadata::repository::{StorageReadError, parse_registry_read, read_document_registry};
@@ -979,7 +979,7 @@ fn crate_root(dataset: &Dataset) -> Option<NamedOrBlankNode> {
         let predicate = NamedNode::new_unchecked(predicate);
         for quad in dataset.quads_for_predicate(&predicate) {
             let descriptor = matches!(quad.subject, NamedOrBlankNodeRef::NamedNode(subject)
-                if subject.as_str().ends_with("ro-crate-metadata.json"));
+                if subject.as_str().strip_prefix(CRAQLE_BASE_IRI) == Some("ro-crate-metadata.json"));
             if !quad.graph_name.is_default_graph() || !descriptor {
                 continue;
             }
@@ -1256,6 +1256,24 @@ mod tests {
             graph.push(serde_json::json!({"@id": other, "@type": "Thing"}));
         }
         let context = "https://w3id.org/ro/crate/1.2/context";
+        let jsonld = serde_json::json!({"@context": context, "@graph": graph}).to_string();
+        assert!(crate_is_profile(&jsonld));
+        // A subject whose name only ends like the descriptor's names no root either.
+        let mut graph =
+            vec![serde_json::json!({"@id": "https://example.test/profile", "@type": DX_PROFILE})];
+        for index in 0..16 {
+            let other = format!("https://example.test/other/{index}");
+            graph.push(serde_json::json!({
+                "@id": format!("note-{index}-ro-crate-metadata.json"),
+                "about": {"@id": other.clone()}
+            }));
+            graph.push(serde_json::json!({"@id": other, "@type": "Thing"}));
+        }
+        graph.push(serde_json::json!({
+            "@id": "ro-crate-metadata.json",
+            "@type": "CreativeWork",
+            "about": {"@id": "https://example.test/profile"}
+        }));
         let jsonld = serde_json::json!({"@context": context, "@graph": graph}).to_string();
         assert!(crate_is_profile(&jsonld));
     }

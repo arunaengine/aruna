@@ -22,7 +22,7 @@ use tracing::warn;
 /// can bind it statically.
 pub(crate) const VALIDATION_GRAPH_IRI: &str = "https://craqle.invalid/validation/document";
 /// Base craqle resolves relative RO-Crate ids against while parsing JSON-LD.
-const CRAQLE_BASE_IRI: &str = "https://craqle.invalid/";
+pub(crate) const CRAQLE_BASE_IRI: &str = "https://craqle.invalid/";
 /// Legacy base the portal writes into generated Profile shapes.
 const PORTAL_BASE_IRI: &str = "arcp://name,aruna-portal/crate/";
 
