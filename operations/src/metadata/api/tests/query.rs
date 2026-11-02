@@ -304,7 +304,25 @@ async fn merge_past_deadline() {
     let parts = vec![MetadataQueryResults::Solutions(vec![solution_row(&[(
         "s", "<urn:a>",
     )])])];
-    let merged = merge_ordered(parts, order, 1, tokio::time::Instant::now()).await;
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let merged = merge_ordered(parts, order, 1, tokio::time::Instant::now(), permits).await;
+    assert!(matches!(merged, Err(MetadataApiError::ServiceUnavailable)));
+}
+
+#[tokio::test]
+async fn merge_waits_permit() {
+    let order = ordered_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?s")
+        .unwrap()
+        .unwrap()
+        .1;
+    // A row the merge cannot parse would answer an internal error if the merge ever ran.
+    let parts = vec![MetadataQueryResults::Solutions(vec![solution_row(&[(
+        "s",
+        "not a term",
+    )])])];
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+    let merged = merge_ordered(parts, order, 1, deadline, permits).await;
     assert!(matches!(merged, Err(MetadataApiError::ServiceUnavailable)));
 }
 

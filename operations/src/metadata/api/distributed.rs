@@ -252,7 +252,7 @@ pub(super) async fn run_query_distributed(
         }
     } else if let Some((_, order)) = ordered {
         let row_limit = select_limit.unwrap_or(QUERY_MAX_ROWS).min(QUERY_MAX_ROWS);
-        merge_ordered(parts, order, row_limit, deadline)
+        merge_ordered(parts, order, row_limit, deadline, MERGE_PERMITS.clone())
             .await
             .and_then(|rows| aggregate_query_results(vec![rows], query_form, select_limit))
     } else {
@@ -509,19 +509,35 @@ pub fn query_select_limit(query: &str) -> Option<usize> {
     length
 }
 
+/// Ordered merges that may sort at once, so they cannot fill the shared blocking pool.
+static MERGE_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        Arc::new(tokio::sync::Semaphore::new(cpus))
+    });
+
 /// Orders partition rows off the async workers and gives up when `deadline` passes.
 pub(super) async fn merge_ordered(
     results: Vec<MetadataQueryResults>,
     order: Vec<spargebra::algebra::OrderExpression>,
     row_limit: usize,
     deadline: tokio::time::Instant,
+    permits: Arc<tokio::sync::Semaphore>,
 ) -> Result<MetadataQueryResults, MetadataApiError> {
     if tokio::time::Instant::now() >= deadline {
         return Err(MetadataApiError::ServiceUnavailable);
     }
+    let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, permits.acquire_owned()).await else {
+        return Err(MetadataApiError::ServiceUnavailable);
+    };
     let cancel = spareval::CancellationToken::new();
     let task_cancel = cancel.clone();
     let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        // A job that starts late drops its rows without work.
+        if task_cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
         order_solutions(results, &order, row_limit, &task_cancel)
     });
     match tokio::time::timeout_at(deadline, task).await {
