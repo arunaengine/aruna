@@ -785,6 +785,24 @@ async fn lists_writing_runs() {
         runs(None, "").await,
         Err(ServerError::Unauthorized)
     ));
+
+    // A file a deny hides from the caller names no run.
+    let (realm_id, local) = (node.state.get_realm_id(), node.state.get_node_id());
+    let root = bucket_permission_path(realm_id, node.group_id, local, BUCKET);
+    let rule = |pattern: String, permission| aruna_core::structs::identity::auth::PathRestriction {
+        pattern,
+        permission,
+    };
+    let narrowed = AuthContext {
+        path_restrictions: Some(vec![
+            rule(root.clone(), Permission::READ),
+            rule(format!("{root}/**"), Permission::READ),
+            rule(format!("{root}/out/b/**"), Permission::DENY),
+        ]),
+        ..node.owner.clone()
+    };
+    let Json(shown) = runs(Some(narrowed), "").await.unwrap();
+    assert_eq!(named(shown), (vec![id(1)], true));
 }
 
 // Credentials in a connector endpoint never reach the origin answer or its projection.

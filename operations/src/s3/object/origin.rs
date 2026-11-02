@@ -311,11 +311,13 @@ pub struct BucketRuns {
     pub complete: bool,
 }
 
-/// The runs that wrote the current files of `bucket` under `prefix`, from their origins.
+/// The runs that wrote the current files of `bucket` under `prefix` that are `readable` to the
+/// caller, from their origins.
 pub async fn bucket_runs(
     context: &DriverContext,
     bucket: &str,
     prefix: &str,
+    readable: impl Fn(&str) -> bool,
 ) -> Result<BucketRuns, OriginError> {
     let storage =
         |error: aruna_core::errors::ConversionError| OriginError::Storage(error.to_string());
@@ -340,6 +342,9 @@ pub async fn bucket_runs(
         scanned += heads.len();
         for (head, pointer) in heads {
             let key = BlobHeadKey::from_bytes(&head).map_err(storage)?;
+            if !readable(&key.key) {
+                continue;
+            }
             let pointer = CurrentVersionPointer::from_bytes(&pointer).map_err(storage)?;
             let row = VersionKey::new(bucket, &key.key, pointer.version_id).to_bytes();
             let Some(value) = read(context, BLOB_VERSIONS_KEYSPACE, row.map_err(storage)?).await?
