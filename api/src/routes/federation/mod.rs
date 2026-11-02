@@ -64,6 +64,18 @@ pub enum AcceptedRealmsSetting {
     Any,
 }
 
+impl From<&AcceptedRealms> for AcceptedRealmsSetting {
+    fn from(accepted: &AcceptedRealms) -> Self {
+        match accepted {
+            AcceptedRealms::None => Self::None,
+            AcceptedRealms::Any => Self::Any,
+            AcceptedRealms::Only(realms) => Self::Only {
+                realms: realms.iter().map(RealmId::to_string).collect(),
+            },
+        }
+    }
+}
+
 /// Realm federation settings. The request replaces the stored settings; the
 /// response adds the descriptor signed from them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -107,13 +119,7 @@ impl RealmFederation {
                 RegistrationMode::Enabled => RegistrationSetting::Enabled,
                 RegistrationMode::Disabled => RegistrationSetting::Disabled,
             },
-            accepted_realms: match &settings.accepted_realms {
-                AcceptedRealms::None => AcceptedRealmsSetting::None,
-                AcceptedRealms::Any => AcceptedRealmsSetting::Any,
-                AcceptedRealms::Only(realms) => AcceptedRealmsSetting::Only {
-                    realms: realms.iter().map(RealmId::to_string).collect(),
-                },
-            },
+            accepted_realms: AcceptedRealmsSetting::from(&settings.accepted_realms),
             descriptor: Some(
                 serde_json::to_value(&settings.descriptor)
                     .map_err(|error| ServerError::InternalError(error.to_string()))?,
