@@ -130,7 +130,6 @@ pub(crate) async fn relay_middleware(
         .extensions()
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_string());
-    let has_hop = request.headers().contains_key(RELAY_HOP_HEADER);
     // The holder is checked on every central call, relayed or not: a hop header proves nothing.
     if holder_route(request.method(), matched.as_deref(), request.uri()) {
         return match holder_target(&state).await {
@@ -292,29 +291,6 @@ async fn holder_target(
             .map(|url| Some((None, url)))
             .ok_or(ServerError::NoManagementNode),
     }
-}
-
-/// The nodes a central call passed, this one appended; `None` when the call came through this
-/// node or the target already, which would make it circle.
-fn passed_hops(
-    state: &ServerState,
-    headers: &HeaderMap,
-    target: Option<NodeId>,
-) -> Option<HeaderValue> {
-    let own = state.get_node_id().to_string();
-    let passed = headers
-        .get(RELAY_HOP_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    let seen = |node: &str| passed.split(',').any(|hop| hop.trim() == node);
-    if seen(&own) || target.is_some_and(|node| seen(&node.to_string())) {
-        return None;
-    }
-    let hops = match passed.is_empty() {
-        true => own,
-        false => format!("{passed},{own}"),
-    };
-    HeaderValue::from_str(&hops).ok()
 }
 
 /// Passes a central assistant call to its holder and streams the answer back as it arrives.
