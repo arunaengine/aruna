@@ -9,7 +9,7 @@ use aruna_core::NodeId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{CONTENT_TYPE_KEY, UserAccess, object_permission_path};
-use aruna_core::structs::storage::distribution::delegation::Payload;
+use aruna_core::structs::storage::distribution::delegation::{MAX_VALID_SECS, Payload};
 use aruna_core::structs::storage::link::LinkTarget;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::GroupId;
@@ -176,9 +176,14 @@ pub async fn read_target(
     Ok(body_stream(stream))
 }
 
-/// The verified caller a delegation carries; the read fills in what it binds.
+/// The verified caller a delegation carries; the read fills in what it binds. A signed-out
+/// caller has no credential to bound it, so its own validity does and the target checks READ.
 fn delegation(caller: &LinkCaller, target: NodeId) -> DelegationInput {
     let (credential_id, group_id, expiry) = caller.credential.clone();
+    let expiry = match caller.auth.user_id.is_nil() {
+        true => aruna_core::time::unix_timestamp_secs().saturating_add(MAX_VALID_SECS),
+        false => expiry,
+    };
     DelegationInput {
         set_id: Ulid::nil(),
         range_id: Ulid::nil(),
@@ -379,6 +384,25 @@ mod tests {
         assert_eq!(here, Ok(true));
         let there = target_visible(&context, &caller, &target(remote), local).await;
         assert!(matches!(there, Err(LinkError::Unavailable(_))), "{there:?}");
+    }
+
+    #[test]
+    fn signed_out_delegation() {
+        // A signed-out caller has no credential expiry; its delegation must still be valid now.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let target = iroh::SecretKey::from_bytes(&[5; 32]).public();
+        let caller = |auth| LinkCaller {
+            auth,
+            credential: (String::new(), Ulid::from_parts(2, 2), 0),
+        };
+        let now = aruna_core::time::unix_timestamp_secs();
+        let visitor = delegation(&caller(AuthContext::anonymous(realm_id)), target);
+        assert!(visitor.credential_expiry >= now);
+        let member = AuthContext {
+            user_id: aruna_core::UserId::new(Ulid::from_parts(7, 7), realm_id),
+            ..AuthContext::anonymous(realm_id)
+        };
+        assert_eq!(delegation(&caller(member), target).credential_expiry, 0);
     }
 
     #[tokio::test]
