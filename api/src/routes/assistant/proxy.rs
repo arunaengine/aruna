@@ -257,8 +257,9 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 - A central call needs the `x-session-id` header naming the chat: 1 to 64 characters from A-Z,
   a-z, 0-9, `_` and `-`. It is forwarded unchanged in the admin's session header.
 - A central call names the user only by a stable pseudonymous id, in the admin's user header and
-  in the body's `user` field (`metadata.user_id` for `anthropic`). Other inbound headers are
-  dropped, and the body's `model` must be one the admin allowed.
+  in the body's `user` field (`metadata.user_id` for `anthropic`). Other inbound headers and all
+  body fields outside the standard chat request fields are dropped, and the body's `model` must be
+  one the admin allowed.
 - A central call counts once against the caller's daily limit before it is forwarded; a refused
   call is not counted, a call that fails upstream stays counted.
 

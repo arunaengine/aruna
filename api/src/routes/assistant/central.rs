@@ -475,21 +475,39 @@ pub(super) async fn central_models(
     Ok(provider_summary(&central.provider).models)
 }
 
-/// Open WebUI request fields that open, create or extend chats, files and server tools under the
-/// one account that owns the key, so callers never reach them.
-const SERVER_FIELDS: &[&str] = &[
-    "background_tasks",
-    "chat_id",
-    "features",
-    "files",
-    "id",
-    "message_ids",
-    "model_item",
-    "params",
-    "parent_id",
-    "session_id",
-    "tool_ids",
-    "variables",
+/// Standard chat request fields a central call may carry. Anything else, such as Open WebUI
+/// fields that reach chats, folders, files, skills or terminals of the key owner, is dropped.
+const CHAT_FIELDS: &[&str] = &[
+    "frequency_penalty",
+    "input",
+    "instructions",
+    "logit_bias",
+    "logprobs",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "max_tokens",
+    "messages",
+    "model",
+    "n",
+    "parallel_tool_calls",
+    "presence_penalty",
+    "reasoning",
+    "reasoning_effort",
+    "response_format",
+    "seed",
+    "stop",
+    "stop_sequences",
+    "stream",
+    "stream_options",
+    "system",
+    "temperature",
+    "text",
+    "thinking",
+    "tool_choice",
+    "tools",
+    "top_k",
+    "top_logprobs",
+    "top_p",
 ];
 
 /// Checks the model against the allow-list and names the user and the chat session.
@@ -516,7 +534,7 @@ fn central_body(
             "model is not allowed for the central assistant".to_string(),
         ));
     }
-    object.retain(|field, _| !SERVER_FIELDS.contains(&field.as_str()));
+    object.retain(|field, _| CHAT_FIELDS.contains(&field.as_str()));
     // Open WebUI adds its own server tools to a session whose `tools` is missing or null.
     let compatible = central.provider.kind == AssistantProviderKind::OpenaiCompatible;
     let named = object

@@ -544,3 +544,49 @@ fn empty_tools_no_session() {
     );
     assert_eq!(body["session_id"], "s1");
 }
+
+#[test]
+fn forwards_chat_fields_only() {
+    // Folder context, terminals, skills and any field Open WebUI adds later stay with the caller.
+    let central = compatible_central();
+    let body = rewritten(
+        &central,
+        serde_json::json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "tool_choice": "auto",
+            "reasoning_effort": "low",
+            "folder_id": "owner-folder",
+            "terminal_id": "owner-terminal",
+            "skill_ids": ["s"],
+            "tool_servers": [{"url": "https://x"}],
+            "filter_ids": ["f"],
+            "a_future_field": true,
+        }),
+    );
+    let mut fields: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        [
+            "max_tokens",
+            "messages",
+            "model",
+            "reasoning_effort",
+            "stream",
+            "stream_options",
+            "temperature",
+            "tool_choice",
+            "user"
+        ]
+    );
+}
