@@ -59,15 +59,11 @@ pub(crate) struct Missed {
     pub incomplete: bool,
 }
 
-/// Whether a holder search stops after a page: at the end, once a holder is known and the
-/// page went past its name or nodes failed, or when nodes failed and nothing came back.
-pub(crate) fn search_done(
-    found: bool,
-    passed: bool,
-    (hits, failed): (bool, bool),
-    end: bool,
-) -> bool {
-    end || (found && (passed || failed)) || (failed && !hits)
+/// Whether a holder search stops after a page: at the end, once a holder is known and nodes
+/// failed, or when nodes failed and nothing came back. A node still scanning may hold a bucket
+/// of the same name, so a page past the name does not end the search.
+pub(crate) fn search_done(found: bool, (hits, failed): (bool, bool), end: bool) -> bool {
+    end || (found && failed) || (failed && !hits)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -194,15 +190,17 @@ impl McpServer {
                     database: false,
                 },
             );
+            // Out of time, a bucket of the same name elsewhere is not ruled out.
             let Ok(page) = tokio::time::timeout_at(deadline, search).await else {
-                let missed = Missed {
-                    nodes: Vec::new(),
-                    incomplete: true,
-                };
-                return Ok((holders, missed));
+                return Err(explained(
+                    ServerError::ServiceUnavailable,
+                    format!(
+                        "the realm search for bucket {bucket} did not finish in time; retry, or \
+                         pass node_id from list_buckets"
+                    ),
+                ));
             };
             let page = (page.map_err(crate::metadata::map_api_error)).map_err(server_error)?;
-            let passed = page.hits.iter().any(|hit| hit.bucket.as_str() > bucket);
             let stats = page.fanout_stats;
             let page_state = (!page.hits.is_empty(), stats.nodes_failed > 0);
             for hit in page.hits.into_iter().filter(|hit| hit.bucket == bucket) {
@@ -219,7 +217,7 @@ impl McpServer {
                 }
             }
             cursor = page.next_cursor;
-            if search_done(!holders.is_empty(), passed, page_state, cursor.is_none()) {
+            if search_done(!holders.is_empty(), page_state, cursor.is_none()) {
                 let missed = Missed {
                     nodes: stats.failed_partitions,
                     incomplete: stats.nodes_failed > 0,

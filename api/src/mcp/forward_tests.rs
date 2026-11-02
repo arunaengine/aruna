@@ -58,14 +58,15 @@ fn routed_goes_member() {
 
 #[test]
 fn search_stops() {
-    // Ends at the last page, once a holder is known and the page went past its name or nodes
-    // failed, and when failed nodes leave nothing new to read, as a cursor would ask them again.
-    assert!(search_done(false, false, (true, false), true));
-    assert!(search_done(true, true, (true, false), false));
-    assert!(search_done(true, false, (true, true), false));
-    assert!(search_done(false, false, (false, true), false));
-    assert!(!search_done(false, false, (true, true), false));
-    assert!(!search_done(true, false, (true, false), false));
+    // Ends at the last page, once a holder is known and nodes failed, and when failed nodes
+    // leave nothing new to read, as a cursor would ask them again.
+    assert!(search_done(false, (true, false), true));
+    assert!(search_done(true, (true, true), false));
+    assert!(search_done(false, (false, true), false));
+    assert!(!search_done(false, (true, true), false));
+    // A page past the name proves nothing for a node that stopped early with a sealed cursor:
+    // its own bucket of the same name may still follow, so the search goes on.
+    assert!(!search_done(true, (true, false), false));
 }
 
 #[test]
