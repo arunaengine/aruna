@@ -5,17 +5,20 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::structs::execution::table::{SEARCH_EXACT_KEY, SEARCH_TEXT_KEY, search_terms};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
-use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::storage::blob::{
+    BackendRef, BlobVersion, BucketInfo, VersionKey, object_permission_path,
+};
 use aruna_core::structs::storage::distribution::inventory::head_position;
-use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::{Compression, EncodingClass};
 use tempfile::TempDir;
 
 use super::super::search_local_objects;
 use super::super::tests::{Fixture, input, seed_materialized, setup, write_value};
 use super::*;
-use crate::distribution::key_index::{IndexedKey, KeyChange};
+use crate::distribution::key_index::{IndexedKey, KeyChange, MetaTerms};
 use crate::distribution::test_record::{binding, record, store_record};
 
 struct Distributed {
@@ -127,6 +130,35 @@ impl Distributed {
         input.bucket = Some("spire".to_string());
         input
     }
+}
+
+/// Gives `key` of "spire" a current version whose search text is `organism` and whose exact
+/// `taxid` is the key's length, and returns its index document.
+async fn describe(fixture: &Fixture, key: &str, organism: &str) -> KeyChange {
+    let hash = key.as_bytes()[0];
+    let version_id = seed_materialized(fixture, "spire", key, UNIX_EPOCH, hash).await;
+    let raw = EncodingClass::Raw;
+    let backend = BackendRef::node_default();
+    let mut version =
+        BlobVersion::materialized([hash; 32], backend, raw, UNIX_EPOCH, fixture.owner, None);
+    version.metadata = HashMap::from([
+        (SEARCH_TEXT_KEY.to_string(), "organism".to_string()),
+        ("organism".to_string(), organism.to_string()),
+        (SEARCH_EXACT_KEY.to_string(), "taxid".to_string()),
+        ("taxid".to_string(), key.len().to_string()),
+    ]);
+    let version_key = VersionKey::new("spire", key, version_id)
+        .to_bytes()
+        .unwrap();
+    let bytes = version.to_bytes().unwrap();
+    write_value(&fixture.context, BLOB_VERSIONS_KEYSPACE, version_key, bytes).await;
+    let (text, exact) = search_terms(&version.metadata);
+    KeyChange::Put(IndexedKey {
+        key: key.to_string(),
+        size: 0,
+        version_id,
+        terms: Some(MetaTerms { text, exact }),
+    })
 }
 
 fn keys(page: &SearchNodePage) -> Vec<&str> {
@@ -376,31 +408,21 @@ async fn realm_skips_distributed() {
 // may not read the folders sees no hit and no key, the owner finds them by their terms.
 #[tokio::test]
 async fn metadata_hits_authorized() {
-    use crate::distribution::key_index::MetaTerms;
     let ready = IndexState::Ready { generation: 1 };
     let folders = ["a/", "b/", "c/"];
     let test = distributed(ready, &folders).await;
-    let described = (folders.iter()).map(|key| {
-        let organism = match *key {
+    let mut described = Vec::new();
+    for key in folders {
+        let organism = match key {
             "b/" => "salmonella",
             _ => "escherichia",
         };
-        KeyChange::Put(IndexedKey {
-            key: key.to_string(),
-            size: 0,
-            version_id: Ulid::nil(),
-            terms: Some(MetaTerms {
-                text: [organism.to_string()].into(),
-                exact: [format!("taxid={}", key.len())].into(),
-            }),
-        })
-    });
+        described.push(describe(&test.fixture, key, organism).await);
+    }
     let set_id = test.binding.set_id;
-    (test
-        .indexes
-        .apply(set_id, test.lower, 1, described.collect()))
-    .await
-    .unwrap();
+    (test.indexes.apply(set_id, test.lower, 1, described))
+        .await
+        .unwrap();
     let metadata = |auth, query: &str| {
         let mut input = test.input(auth, query);
         input.key_match = ObjectKeyMatch::Metadata;
@@ -434,6 +456,36 @@ async fn metadata_hits_authorized() {
     assert!(sealed_position(&cursor));
     let last = BlobHeadKey::new("spire", "a/").to_bytes().unwrap();
     assert_eq!(open_position(&cursor).unwrap(), last);
+}
+
+// Metadata words of at least three characters match by their start, through the index query
+// and, for a prefix too common for the index, through the check of the loaded versions.
+#[tokio::test]
+async fn metadata_prefixes_found() {
+    let ready = IndexState::Ready { generation: 1 };
+    let folders = [("a/", "SAMD00012345"), ("b/", "SAMN00000001"), ("c/", "sa")];
+    let mut test = distributed(ready, &[]).await;
+    let mut described = Vec::new();
+    for (key, organism) in folders {
+        described.push(describe(&test.fixture, key, organism).await);
+    }
+    for scan in [1_000_000, 0] {
+        let dir = test._index_dir.path().join(scan.to_string());
+        test.indexes = Arc::new(RangeIndexes::with_scan(dir, scan));
+        let changes = described.clone();
+        let set_id = test.binding.set_id;
+        (test.indexes.apply(set_id, test.lower, 1, changes))
+            .await
+            .unwrap();
+        let metadata = |query: &str| {
+            let mut input = test.input(owner(&test.fixture), query);
+            input.key_match = ObjectKeyMatch::Metadata;
+            input
+        };
+        assert_eq!(keys(&test.search(metadata("samd"), 10).await), ["a/"]);
+        assert_eq!(keys(&test.search(metadata("sa"), 10).await), ["c/"]);
+        assert!(test.search(metadata("amd0"), 10).await.hits.is_empty());
+    }
 }
 
 // A realm-wide scan skips the distributed bucket and names it, so the realm search can search

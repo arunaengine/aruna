@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use aruna_core::keyspaces::prefix_upper_bound;
+use aruna_core::structs::execution::table::PREFIX_CHARS;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{BooleanQuery, EnableScoring, Occur, Query, RangeQuery, TermQuery, Weight};
 use tantivy::schema::{FAST, Field, IndexRecordOption, STORED, STRING, Schema, TEXT};
@@ -44,8 +45,6 @@ const OPEN_WRITERS: usize = 8;
 const INDEX_PERMITS: usize = 4;
 /// Matches a page scans at most: a query whose rarest term has more walks the keys instead.
 const MATCH_SCAN_LIMIT: u64 = 1_000_000;
-/// Name words this long also match the name parts that start with them.
-const PREFIX_CHARS: usize = 3;
 
 #[derive(Debug, Error)]
 pub enum KeyIndexError {
@@ -84,9 +83,9 @@ pub enum KeyChange {
     Remove(String),
 }
 
-/// Keys between `start` and `end` in key order; with `names`, only keys holding every name token
-/// of that text, or a name part starting with it for tokens of at least three characters, and
-/// with `meta`, only searchable keys holding every term of the query.
+/// Keys between `start` and `end` in key order; with `names` or `meta`, only keys holding every
+/// token or term of the query. Text tokens of at least three characters match by their start; a
+/// metadata one with too many matches is left out, so callers check the loaded versions.
 /// A query with terms returns at most `limit` matches; one without examines at most `limit` keys
 /// per index segment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,7 +182,7 @@ impl RangeIndexes {
     }
 
     #[cfg(test)]
-    fn with_scan(root: impl Into<PathBuf>, scan_limit: u64) -> Self {
+    pub(crate) fn with_scan(root: impl Into<PathBuf>, scan_limit: u64) -> Self {
         Self {
             scan_limit,
             ..Self::new(root)
@@ -491,18 +490,20 @@ fn search_keys(
         let mut stream = analyzer.token_stream(names);
         while let Some(token) = stream.next() {
             match token.text.chars().count() >= PREFIX_CHARS {
-                true => prefixes.push(token.text.clone()),
+                true => prefixes.push((fields.name, token.text.clone())),
                 false => terms.push(Term::from_field_text(fields.name, &token.text)),
             }
         }
     }
     if let Some(meta) = &query.meta {
-        let text = meta.text.iter().map(|token| (fields.meta, token));
-        let exact = meta.exact.iter().map(|term| (fields.exact, term));
-        terms.extend(
-            text.chain(exact)
-                .map(|(field, term)| Term::from_field_text(field, term)),
-        );
+        for token in &meta.text {
+            match token.chars().count() >= PREFIX_CHARS {
+                true => prefixes.push((fields.meta, token.clone())),
+                false => terms.push(Term::from_field_text(fields.meta, token)),
+            }
+        }
+        let exact = meta.exact.iter();
+        terms.extend(exact.map(|term| Term::from_field_text(fields.exact, term)));
     }
     let searcher = open.reader.searcher();
     if terms.is_empty() && prefixes.is_empty() {
@@ -512,25 +513,27 @@ fn search_keys(
     for term in &terms {
         rarest = rarest.min(searcher.doc_freq(term)?);
     }
-    // A prefix with more matches than the scan limit is checked against each found key instead.
+    // A prefix with more matches than the scan limit stays out of the index query: a name prefix
+    // is checked on each found key, a metadata prefix by the caller on each loaded version.
     let (mut ranges, mut checked) = (Vec::new(), Vec::new());
-    for prefix in prefixes {
-        let found = prefix_freq(&searcher, fields.name, &prefix, scan_limit)?;
+    for (field, prefix) in prefixes {
+        let found = prefix_freq(&searcher, field, &prefix, scan_limit)?;
         rarest = rarest.min(found);
-        match found > scan_limit {
-            true => checked.push(prefix),
-            false => ranges.push(prefix),
+        match (found > scan_limit, field == fields.name) {
+            (false, _) => ranges.push((field, prefix)),
+            (true, true) => checked.push(prefix),
+            (true, false) => {}
         }
     }
     let mut page = match rarest > scan_limit {
         true => walk_keys(&searcher, fields, query, Some(&terms))?,
         false => {
-            let ranges = ranges.iter().map(|prefix| {
+            let ranges = ranges.iter().map(|(field, prefix)| {
                 let end = prefix_upper_bound(prefix.as_bytes());
                 let end = end.map_or(Bound::Unbounded, |end| {
-                    Bound::Excluded(Term::from_field_bytes(fields.name, &end))
+                    Bound::Excluded(Term::from_field_bytes(*field, &end))
                 });
-                let start = Bound::Included(Term::from_field_text(fields.name, prefix));
+                let start = Bound::Included(Term::from_field_text(*field, prefix));
                 let query: Box<dyn Query> = Box::new(RangeQuery::new(start, end));
                 (Occur::Must, query)
             });
@@ -1040,6 +1043,27 @@ mod tests {
                 limit,
             )
         }
+    }
+
+    // A long text token matches the indexed tokens that start with it, a short one only itself.
+    #[tokio::test]
+    async fn metadata_prefixes_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = Arc::new(RangeIndexes::new(dir.path()));
+        let changes = vec![
+            described("a/", &["samd00012345"], &["taxid=562"]),
+            described("b/", &["samn00000001"], &[]),
+            described("c/", &["sa"], &[]),
+        ];
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+        let found = |text| meta(&[text], &[], 10, None);
+        let page = indexes.search(set(), range(), 1, found("samd")).await;
+        assert_eq!(page.unwrap().keys, ["a/"]);
+        let page = indexes.search(set(), range(), 1, found("sa")).await;
+        assert_eq!(page.unwrap().keys, ["c/"]);
+        let exact = meta(&[], &["taxid=56"], 10, None);
+        let page = indexes.search(set(), range(), 1, exact).await;
+        assert!(page.unwrap().keys.is_empty(), "exact terms stay exact");
     }
 
     // Metadata queries match the indexed terms of searchable keys and continue after the last

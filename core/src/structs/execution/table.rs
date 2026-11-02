@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Read};
+use std::ops::Bound;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,19 @@ pub const RECORD_METADATA: &str = "metadata";
 /// Whether version metadata names columns that metadata search matches.
 pub fn searchable(metadata: &std::collections::HashMap<String, String>) -> bool {
     metadata.contains_key(SEARCH_TEXT_KEY) || metadata.contains_key(SEARCH_EXACT_KEY)
+}
+
+/// Query words this long also match the longer words that start with them.
+pub const PREFIX_CHARS: usize = 3;
+
+/// Whether `tokens` hold `word`, or a token that starts with it when `word` is long enough.
+pub fn token_matches(tokens: &BTreeSet<String>, word: &str) -> bool {
+    match word.chars().count() >= PREFIX_CHARS {
+        true => (tokens.range::<str, _>((Bound::Included(word), Bound::Unbounded)))
+            .next()
+            .is_some_and(|token| token.starts_with(word)),
+        false => tokens.contains(word),
+    }
 }
 
 /// The lowercase alphanumeric words of `text` that free text search matches.
@@ -107,7 +121,7 @@ fn quoted_end(text: &str) -> usize {
     text.find('"').unwrap_or(text.len())
 }
 
-/// Whether a version's metadata holds every token of `text` and every exact `column=value`.
+/// Whether a version's metadata matches every token of `text` and every exact `column=value`.
 pub fn metadata_matches(
     metadata: &std::collections::HashMap<String, String>,
     text: &str,
@@ -119,7 +133,7 @@ pub fn metadata_matches(
     let (tokens, terms) = search_terms(metadata);
     search_tokens(text)
         .iter()
-        .all(|token| tokens.contains(token))
+        .all(|token| token_matches(&tokens, token))
         && exact.iter().all(|term| terms.contains(term))
 }
 

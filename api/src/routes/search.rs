@@ -542,7 +542,8 @@ restrictions and request policies before it can be returned.
   the error message says how many ranges and about how many keys are still to be indexed.
 - `match=metadata` matches object metadata instead of keys, for objects whose version names
   searchable columns in `aruna-search-text` and `aruna-search-exact` (table imports set both).
-  Words of `q` must all appear in the text columns (case-insensitive, whole words); terms
+  Words of `q` must all appear in the text columns (case-insensitive; a word of at least 3
+  characters also matches the words that start with it, a shorter word only a whole word); terms
   `column=value` must equal an exact column, with quotes around values with spaces, as in
   `coli taxid=562 assembly_level="Complete Genome"`. Each hit carries the object's kept metadata
   columns in `metadata`, after the same authorization as every hit. A distributed bucket finds the
