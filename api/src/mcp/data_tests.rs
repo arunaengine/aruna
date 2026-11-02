@@ -802,3 +802,84 @@ async fn aggregate_hides_keys() {
     let counted = counted.await.unwrap().0;
     assert_eq!((counted.scanned, counted.total_count), (1, 1));
 }
+
+// A mostly unreadable bucket ends the aggregate after a bounded number of listing pages, hidden
+// entries included, and reports it as truncated without saying how many entries were hidden.
+#[tokio::test]
+async fn aggregate_work_bounded() {
+    use crate::tests::distributed::{BUCKET, node_state, write};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, VersionKey};
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = node_state().await;
+    let state = &node.state;
+    let info = crate::routes::storage::deletion::bucket_info(state, BUCKET)
+        .await
+        .unwrap();
+    let input = WriteObjectInput {
+        node_id: None,
+        bucket: BUCKET.to_string(),
+        key: "a.md".to_string(),
+        text: "x".to_string(),
+        content_type: None,
+    };
+    let stored = store_text(state, &node.owner, &info, input, Default::default());
+    let version_id = ulid::Ulid::from_string(&stored.await.unwrap().version_id).unwrap();
+    let row = VersionKey::new(BUCKET, "a.md", version_id)
+        .to_bytes()
+        .unwrap();
+    let read = StorageEffect::Read {
+        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+        key: row.into(),
+        txn_id: None,
+    };
+    let event = state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(read)
+        .await;
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(version),
+        ..
+    }) = event
+    else {
+        panic!("the stored version is readable");
+    };
+    // More hidden keys than the aggregate may examine, each a version of the same stored blob.
+    for index in 0..MAX_SCAN_OBJECTS + 1 {
+        let key = format!("a.md.{index:06}");
+        let version_id = ulid::Ulid::generate();
+        let head = BlobHeadKey::new(BUCKET, &key).to_bytes().unwrap();
+        let pointer = CurrentVersionPointer::new(version_id).to_bytes().unwrap();
+        write(state, BLOB_HEAD_KEYSPACE, head, pointer).await;
+        let row = VersionKey::new(BUCKET, &key, version_id)
+            .to_bytes()
+            .unwrap();
+        write(state, BLOB_VERSIONS_KEYSPACE, row, version.to_vec()).await;
+    }
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let open = object_permission_path(realm_id, node.group_id, node_id, BUCKET, "a.md");
+    let actor = Actor {
+        node_id,
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    crate::tests::routes::open_paths(&state.get_ctx(), &actor, node.group_id, &[open]).await;
+    let server = McpServer::new(state.clone());
+    let aggregate = AggregateObjectsInput {
+        node_id: None,
+        bucket: BUCKET.to_string(),
+        prefix: Some("a.md".to_string()),
+        bucket_by: BucketUnit::Day,
+        since: None,
+        until: None,
+        max_buckets: None,
+    };
+    let counted =
+        server.aggregate_objects(Extension(caller(&node.stranger)), Parameters(aggregate));
+    let counted = counted.await.unwrap().0;
+    assert_eq!((counted.scanned, counted.truncated), (1, true));
+}

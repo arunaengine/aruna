@@ -47,6 +47,9 @@ const MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// rather than holding the tool open.
 const MAX_SCAN_OBJECTS: usize = 50_000;
 const SCAN_PAGE_KEYS: usize = 1_000;
+/// Listing pages one aggregation reads at most, readable entries or not; each page examines a
+/// bounded number of entries, so a mostly unreadable bucket ends the scan too.
+const MAX_SCAN_PAGES: usize = MAX_SCAN_OBJECTS / SCAN_PAGE_KEYS;
 const DEFAULT_BUCKETS: usize = 200;
 const MAX_BUCKETS: usize = 1_000;
 const BUCKET_PAGE: usize = 50;
@@ -618,7 +621,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Count objects and bytes per calendar bucket over one bucket and optional key prefix, so a question such as documents per week is answered in one call instead of paging list_objects. Objects are bucketed by their last modification in UTC, with weeks starting Monday, and an optional since and until window bounds the range. Only objects the caller may read count, across every key range of a distributed bucket; stale_ranges names ranges a possibly lagging copy answered. The scan stops after 50000 objects and the series after max_buckets, both reported as truncated.",
+        description = "Count objects and bytes per calendar bucket over one bucket and optional key prefix, so a question such as documents per week is answered in one call instead of paging list_objects. Objects are bucketed by their last modification in UTC, with weeks starting Monday, and an optional since and until window bounds the range. Only objects the caller may read count, across every key range of a distributed bucket; stale_ranges names ranges a possibly lagging copy answered. The scan stops after 50000 objects or 50 listing pages, and the series after max_buckets, both reported as truncated.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -660,7 +663,7 @@ impl McpServer {
         let expiry = (bearer.as_ref()).map_or(0, crate::auth::ValidatedBearer::expires_at_secs);
         let (mut samples, mut stale_ranges) = (Vec::new(), Vec::new());
         let mut cursor = None;
-        let mut scanned = 0usize;
+        let (mut scanned, mut pages) = (0usize, 0usize);
         let mut scan_truncated = false;
         loop {
             let request = ListRequest {
@@ -696,10 +699,11 @@ impl McpServer {
                 }
             }
             cursor = page.next_cursor;
+            pages += 1;
             if cursor.is_none() {
                 break;
             }
-            if scanned >= MAX_SCAN_OBJECTS {
+            if scanned >= MAX_SCAN_OBJECTS || pages >= MAX_SCAN_PAGES {
                 scan_truncated = true;
                 break;
             }
