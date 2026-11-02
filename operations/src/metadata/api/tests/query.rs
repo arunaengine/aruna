@@ -161,13 +161,13 @@ fn query_validation_accepts() {
     ));
 }
 
-fn partition_rows(query: &str, subjects: &[&str]) -> Vec<BTreeMap<String, String>> {
+fn partition_rows(query: &str, objects: &[(&str, String)]) -> Vec<BTreeMap<String, String>> {
     let mut dataset = oxrdf::Dataset::new();
-    for subject in subjects {
+    for (subject, object) in objects {
         dataset.insert(&oxrdf::Quad::new(
             oxrdf::NamedNode::new_unchecked(format!("urn:{subject}")),
             oxrdf::NamedNode::new_unchecked("urn:k"),
-            oxrdf::Literal::from(1i64),
+            object.parse::<oxrdf::Term>().unwrap(),
             oxrdf::GraphName::DefaultGraph,
         ));
     }
@@ -193,15 +193,60 @@ fn partition_rows(query: &str, subjects: &[&str]) -> Vec<BTreeMap<String, String
 fn ties_cut_consistently() {
     let query = "SELECT DISTINCT ?s ?k WHERE { ?s <urn:k> ?k } ORDER BY ?k LIMIT 1";
     let (partition, _) = ordered_query(query).unwrap();
-    assert!(query_union_safe(&partition) && ensure_query_form(&partition).is_ok());
-    let first = partition_rows(&partition, &["z", "y", "x", "w", "a"]);
-    let second = partition_rows(&partition, &["v", "u", "t", "b"]);
-    assert_eq!((first.len(), second.len()), (1, 1));
+    assert!(ensure_query_form(&partition).is_ok());
     let one = format!("\"1\"^^<{INTEGER}>");
+    let first: Vec<_> = ["z", "y", "x", "w", "a"]
+        .map(|subject| (subject, one.clone()))
+        .into();
+    let second: Vec<_> = ["v", "u", "t", "b"]
+        .map(|subject| (subject, one.clone()))
+        .into();
+    let first = partition_rows(&partition, &first);
+    let second = partition_rows(&partition, &second);
+    assert_eq!((first.len(), second.len()), (1, 1));
     assert_eq!(
         merge_parts(query, vec![first, second]),
         vec![solution_row(&[("s", "<urn:a>"), ("k", &one)])]
     );
+}
+
+#[test]
+fn equal_values_cut_consistently() {
+    // Tied engine picks vary per process, so distinct trials make a wrong cut show reliably.
+    let query = "SELECT DISTINCT ?n WHERE { ?s <urn:k> ?n } ORDER BY ?n LIMIT 1";
+    let (partition, _) = ordered_query(query).unwrap();
+    assert!(ensure_query_form(&partition).is_ok());
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    for value in 1..=20 {
+        let numbers = [
+            format!("\"{value}\"^^<{xsd}integer>"),
+            format!("\"{value}.0E0\"^^<{xsd}double>"),
+            format!("\"{value}.0\"^^<{xsd}decimal>"),
+        ];
+        let texts = [
+            format!("\"t{value}\"@en--rtl"),
+            format!("\"t{value}\"@en--ltr"),
+        ];
+        for terms in [&numbers[..], &texts[..]] {
+            let first: Vec<_> = terms
+                .iter()
+                .enumerate()
+                .map(|(index, term)| (["a", "b", "c"][index], term.clone()))
+                .collect();
+            let second = vec![("d", terms[0].clone())];
+            let first = partition_rows(&partition, &first);
+            let second = partition_rows(&partition, &second);
+            let expected = if terms.len() == 3 {
+                &terms[2]
+            } else {
+                &terms[1]
+            };
+            assert_eq!(
+                merge_parts(query, vec![first, second]),
+                vec![solution_row(&[("n", expected)])]
+            );
+        }
+    }
 }
 
 fn large_partition(prefix: &str) -> MetadataQueryResults {

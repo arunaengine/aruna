@@ -533,12 +533,12 @@ pub(super) async fn merge_ordered(
     }
 }
 
-/// Returns the query each partition runs and the merge keys: the `ORDER BY` keys plus every
-/// other projected variable as an `ASC` key, so each partition's `LIMIT` cuts a total order.
+/// Returns the query each partition runs and the merge keys: the `ORDER BY` keys, every other
+/// projected variable, then each variable's term parts, so each `LIMIT` cuts a total order.
 pub(super) fn ordered_query(
     query: &str,
 ) -> Option<(String, Vec<spargebra::algebra::OrderExpression>)> {
-    use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
+    use spargebra::algebra::{Expression, Function, GraphPattern, OrderExpression};
 
     let mut parsed = spargebra::SparqlParser::new().parse_query(query).ok()?;
     let spargebra::Query::Select { pattern, .. } = &mut parsed else {
@@ -554,13 +554,24 @@ pub(super) fn ordered_query(
                 inner
             }
             GraphPattern::OrderBy { expression, .. } => {
-                for variable in projected {
+                for variable in &projected {
                     let keyed = expression.iter().any(|order| {
                         matches!(order, OrderExpression::Asc(Expression::Variable(key))
-                            | OrderExpression::Desc(Expression::Variable(key)) if *key == variable)
+                            | OrderExpression::Desc(Expression::Variable(key)) if key == variable)
                     });
                     if !keyed {
-                        expression.push(OrderExpression::Asc(Expression::Variable(variable)));
+                        expression
+                            .push(OrderExpression::Asc(Expression::Variable(variable.clone())));
+                    }
+                }
+                // Value-equal terms such as 1 and 1.0 still differ in these term parts.
+                for variable in &projected {
+                    for function in [Function::Str, Function::Datatype, Function::LangDir] {
+                        let argument = Expression::Variable(variable.clone());
+                        expression.push(OrderExpression::Asc(Expression::FunctionCall(
+                            function,
+                            vec![argument],
+                        )));
                     }
                 }
                 break expression.clone();
