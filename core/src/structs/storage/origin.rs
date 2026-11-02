@@ -114,6 +114,13 @@ impl VersionOrigin {
         }
     }
 
+    /// The job a copy signed with `access_key` runs as: a run's workspace credential copies as
+    /// its run, any other credential as no job.
+    pub fn copy_job(access_key: &str) -> Option<Ulid> {
+        use crate::structs::execution::job::credential_job_id;
+        credential_job_id(access_key).map(|job_id| Ulid::from_bytes(job_id.to_bytes()))
+    }
+
     /// Whether the record stays within its size budget.
     pub fn bounded(&self) -> bool {
         match self {
