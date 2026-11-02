@@ -15,6 +15,7 @@ use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
+use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
@@ -606,15 +607,19 @@ async fn charge_call(
     limit: Option<u32>,
     now: u64,
 ) -> ServerResult<()> {
-    let operation = ChargeUsageOperation::new(user_id, utc_day(now), limit);
-    match drive(operation, &state.get_ctx()).await {
-        Ok(_) => Ok(()),
-        Err(CentralStoreError::QuotaReached(reached)) => Err(ServerError::AssistantQuota {
-            used: reached.used,
-            limit: reached.limit,
-            retry_after: secs_to_midnight(now),
-        }),
-        Err(error) => Err(map_central_error(error)),
+    loop {
+        let operation = ChargeUsageOperation::new(user_id, utc_day(now), limit);
+        return match drive(operation, &state.get_ctx()).await {
+            Ok(_) => Ok(()),
+            // Another call of this user committed first; charge again against its count.
+            Err(CentralStoreError::Storage(StorageError::TransactionConflict)) => continue,
+            Err(CentralStoreError::QuotaReached(reached)) => Err(ServerError::AssistantQuota {
+                used: reached.used,
+                limit: reached.limit,
+                retry_after: secs_to_midnight(now),
+            }),
+            Err(error) => Err(map_central_error(error)),
+        };
     }
 }
 

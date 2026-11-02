@@ -491,3 +491,25 @@ fn session_needs_tools() {
     assert_eq!(body["metadata"]["user_id"], "p");
     assert!(body.get("user").is_none());
 }
+
+#[tokio::test]
+async fn concurrent_charges_count() {
+    // Calls racing on one user's counter all settle: none fails, the limit still holds.
+    let fixture = fixture().await;
+    let user_id = fixture.member.user_id;
+    let now = 86_400 * 20_000;
+    let calls = (0..16).map(|_| {
+        let state = fixture.state.clone();
+        tokio::spawn(async move { charge_call(&state, user_id, Some(10), now).await })
+    });
+    let results = futures_util::future::join_all(calls).await;
+    let allowed = results
+        .iter()
+        .filter(|result| matches!(result, Ok(Ok(()))))
+        .count();
+    let refused = results
+        .iter()
+        .filter(|result| matches!(result, Ok(Err(ServerError::AssistantQuota { .. }))))
+        .count();
+    assert_eq!((allowed, refused), (10, 6));
+}
