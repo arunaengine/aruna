@@ -66,14 +66,13 @@ fn central_goes_to_holder() {
         "/api/v1/system/assistant/providers/01JCNCTR0123456789ABCDEFGH/proxy/v1/messages"
             .parse()
             .unwrap();
-    assert!(holder_route(&Method::POST, proxy, &central, false));
-    // A user's own provider stays on the node that stored it, and a relayed call stays put.
-    assert!(!holder_route(&Method::POST, proxy, &own, false));
-    assert!(!holder_route(&Method::POST, proxy, &central, true));
+    assert!(holder_route(&Method::POST, proxy, &central));
+    // A user's own provider stays on the node that stored it.
+    assert!(!holder_route(&Method::POST, proxy, &own));
     let setup: Uri = "/api/v1/system/assistant/central".parse().unwrap();
     let route = Some("/api/v1/system/assistant/central");
-    assert!(holder_route(&Method::PUT, route, &setup, false));
-    assert!(!holder_route(&Method::PATCH, route, &setup, false));
+    assert!(holder_route(&Method::PUT, route, &setup));
+    assert!(!holder_route(&Method::PATCH, route, &setup));
 }
 
 #[test]

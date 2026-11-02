@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::routes::assistant::proxy::proxy_post;
-use crate::routes::management_relay::relay_middleware;
+use crate::routes::management_relay::{RELAY_HOP_HEADER, relay_middleware};
 use crate::tests::assistant::spawn_mock;
 use crate::tests::routes::{test_state, test_storage};
 use aruna_core::keys::generate_signing_key;
@@ -391,7 +391,7 @@ async fn write_row(state: &ServerState, key_space: &str, key: Vec<u8>, value: Ve
 }
 
 /// A device that is not the holder and knows the holder's address from its installation.
-async fn device_relay(holder_url: String, realm_id: RealmId) -> (TempDir, Router) {
+async fn device_relay(holder_url: String, realm_id: RealmId) -> (TempDir, Router, String) {
     let (dir, storage) = test_storage();
     let context = Arc::new(crate::tests::routes::test_context(storage));
     let node_id = iroh::SecretKey::generate().public();
@@ -418,7 +418,7 @@ async fn device_relay(holder_url: String, realm_id: RealmId) -> (TempDir, Router
         )
         .layer(from_fn_with_state(state.clone(), relay_middleware))
         .with_state(state);
-    (dir, router)
+    (dir, router, node_id.to_string())
 }
 
 #[tokio::test]
@@ -431,7 +431,7 @@ async fn relays_to_holder() {
         .layer(Extension(Some(fixture.member.clone())))
         .with_state(fixture.state.clone());
     let (holder_url, _handle) = spawn_mock(holder).await;
-    let (_dir, device) = device_relay(holder_url, fixture.state.get_realm_id()).await;
+    let (_dir, device, _) = device_relay(holder_url, fixture.state.get_realm_id()).await;
 
     call(&fixture, &fixture.member, chat_request(Some("c1"), MODEL))
         .await
@@ -589,4 +589,52 @@ fn forwards_chat_fields_only() {
             "user"
         ]
     );
+}
+
+fn relayed_chat(hop: &str) -> Request {
+    let mut request = chat_request(Some("c1"), MODEL);
+    *request.uri_mut() = "/system/assistant/providers/central/proxy/v1/chat/completions"
+        .parse()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert(RELAY_HOP_HEADER, HeaderValue::from_str(hop).unwrap());
+    request
+}
+
+#[tokio::test]
+async fn hop_still_reaches_holder() {
+    // A hop header, from a client or a former holder, never makes a non-holder answer itself.
+    let fixture = fixture().await;
+    let (base_url, mut seen, _) = mock_provider().await;
+    set_up(&fixture, &base_url, None).await;
+    let (holder, _) = super::super::router().split_for_parts();
+    let holder = holder
+        .layer(Extension(Some(fixture.member.clone())))
+        .with_state(fixture.state.clone());
+    let (holder_url, _handle) = spawn_mock(holder).await;
+    let (_dir, device, _) = device_relay(holder_url, fixture.state.get_realm_id()).await;
+
+    let response = device.oneshot(relayed_chat("client-made")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(seen.recv().await.unwrap().headers[SESSION_HEADER], "c1");
+}
+
+#[tokio::test]
+async fn relay_loop_refused() {
+    // A call that already passed this node is refused instead of circling between nodes.
+    let fixture = fixture().await;
+    let (_dir, device, node_id) = device_relay(
+        "http://127.0.0.1:9".to_string(),
+        fixture.state.get_realm_id(),
+    )
+    .await;
+
+    let response = device
+        .oneshot(relayed_chat(&format!("other,{node_id}")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

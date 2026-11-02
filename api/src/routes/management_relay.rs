@@ -131,10 +131,17 @@ pub(crate) async fn relay_middleware(
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_string());
     let has_hop = request.headers().contains_key(RELAY_HOP_HEADER);
-    if holder_route(request.method(), matched.as_deref(), request.uri(), has_hop) {
+    // The holder is checked on every central call, relayed or not: a hop header proves nothing.
+    if holder_route(request.method(), matched.as_deref(), request.uri()) {
         return match holder_target(&state).await {
             Ok(None) => next.run(request).await,
-            Ok(Some(target)) => stream_relay(&state, &target, request).await,
+            Ok(Some((node, target))) => match passed_hops(&state, request.headers(), node) {
+                Some(hops) => stream_relay(&target, hops, request).await,
+                None => {
+                    warn!(relay_target = %target, "Central assistant call would circle between nodes");
+                    ServerError::NoManagementNode.into_response()
+                }
+            },
             Err(error) => error.into_response(),
         };
     }
@@ -251,8 +258,8 @@ fn passed_hops(
 }
 
 /// Whether the central assistant's holder must answer this request.
-fn holder_route(method: &Method, matched: Option<&str>, uri: &Uri, has_hop: bool) -> bool {
-    let Some(matched) = matched.filter(|_| !has_hop) else {
+fn holder_route(method: &Method, matched: Option<&str>, uri: &Uri) -> bool {
+    let Some(matched) = matched else {
         return false;
     };
     let path = matched.strip_prefix(API_PREFIX).unwrap_or(matched);
@@ -265,7 +272,9 @@ fn holder_route(method: &Method, matched: Option<&str>, uri: &Uri, has_hop: bool
 
 /// `None` when this node holds the central assistant: the first management node in realm order.
 /// A device knows no node addresses and asks the management node it was installed from.
-async fn holder_target(state: &Arc<ServerState>) -> Result<Option<String>, ServerError> {
+async fn holder_target(
+    state: &Arc<ServerState>,
+) -> Result<Option<(Option<NodeId>, String)>, ServerError> {
     let config = drive(
         GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
@@ -275,28 +284,49 @@ async fn holder_target(state: &Arc<ServerState>) -> Result<Option<String>, Serve
     let documents = load_node_documents(state, &config).await;
     match management_node_urls(&config, &documents).into_iter().next() {
         Some((node, _)) if node == state.get_node_id() => Ok(None),
-        Some((_, Some(url))) => Ok(Some(url)),
+        Some((node, Some(url))) => Ok(Some((Some(node), url))),
         _ => installed_management_urls(&state.get_ctx(), state.get_realm_id())
             .await
             .into_iter()
             .next()
-            .map(Some)
+            .map(|url| Some((None, url)))
             .ok_or(ServerError::NoManagementNode),
     }
 }
 
+/// The nodes a central call passed, this one appended; `None` when the call came through this
+/// node or the target already, which would make it circle.
+fn passed_hops(
+    state: &ServerState,
+    headers: &HeaderMap,
+    target: Option<NodeId>,
+) -> Option<HeaderValue> {
+    let own = state.get_node_id().to_string();
+    let passed = headers
+        .get(RELAY_HOP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let seen = |node: &str| passed.split(',').any(|hop| hop.trim() == node);
+    if seen(&own) || target.is_some_and(|node| seen(&node.to_string())) {
+        return None;
+    }
+    let hops = match passed.is_empty() {
+        true => own,
+        false => format!("{passed},{own}"),
+    };
+    HeaderValue::from_str(&hops).ok()
+}
+
 /// Passes a central assistant call to its holder and streams the answer back as it arrives.
-async fn stream_relay(state: &Arc<ServerState>, target: &str, request: Request) -> Response {
+async fn stream_relay(target: &str, hops: HeaderValue, request: Request) -> Response {
     let uri = request
         .extensions()
         .get::<OriginalUri>()
         .map_or_else(|| request.uri().clone(), |original| original.0.clone());
     let url = relay_url(target, &uri);
-    let hop = HeaderValue::from_str(&state.get_node_id().to_string())
-        .unwrap_or_else(|_| HeaderValue::from_static("relayed"));
     let mut outgoing = STREAM_CLIENT
         .request(request.method().clone(), &url)
-        .header(RELAY_HOP_HEADER, hop);
+        .header(RELAY_HOP_HEADER, hops);
     let forwarded = [
         header::AUTHORIZATION,
         header::CONTENT_TYPE,
