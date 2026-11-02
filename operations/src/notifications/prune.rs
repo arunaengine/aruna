@@ -7,7 +7,9 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{
+    NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE,
+};
 use aruna_core::structs::execution::notification::{
     DIRECT_TTL_MS, NotificationClass, NotificationRecord, TRANSIENT_TTL_MS, TRANSIENT_USER_CAP,
     notification_inbox_key, notification_prune_key, parse_prune_key,
@@ -68,6 +70,7 @@ pub(crate) async fn process_prune_page(
     let now_ms = unix_timestamp_millis();
     let phase_a = prune_expired_rows(storage, now_ms, page_size).await?;
     let phase_b = sweep_primary_keyspace(storage, now_ms, page_size).await?;
+    sweep_cutoffs(storage, now_ms, page_size).await?;
     Ok(NotificationPruneOutcome {
         expired: phase_a.expired.saturating_add(phase_b.expired),
         capped: phase_b.capped,
@@ -246,6 +249,39 @@ async fn sweep_primary_keyspace(
     }
 
     Ok(PhaseBOutcome { expired, capped })
+}
+
+/// Removes the bucket deletion times every notice they could drop has outlived.
+async fn sweep_cutoffs(
+    storage: &StorageHandle,
+    now_ms: u64,
+    page_size: usize,
+) -> Result<(), String> {
+    let longest = DIRECT_TTL_MS.max(TRANSIENT_TTL_MS);
+    let mut start_after = None;
+    loop {
+        let (values, next_start_after) = iter_page(
+            storage,
+            NOTIFICATION_CUTOFF_KEYSPACE,
+            start_after,
+            page_size,
+        )
+        .await?;
+        let deletes = (values.into_iter())
+            .filter(|(_, value)| {
+                <[u8; 8]>::try_from(value.as_ref())
+                    .ok()
+                    .map(u64::from_be_bytes)
+                    .is_none_or(|cutoff| cutoff.saturating_add(longest) <= now_ms)
+            })
+            .map(|(key, _)| (NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key))
+            .collect();
+        batch_delete(storage, deletes).await?;
+        match next_start_after {
+            Some(next) => start_after = Some(next),
+            None => return Ok(()),
+        }
+    }
 }
 
 async fn first_prune_delay(storage: &StorageHandle) -> Result<Duration, String> {
@@ -510,6 +546,32 @@ mod tests {
         assert!(!index_exists(&storage, &expired).await);
         assert!(primary_exists(&storage, &live).await);
         assert!(index_exists(&storage, &live).await);
+    }
+
+    #[tokio::test]
+    async fn outlived_cutoffs_pruned() {
+        // A deletion time goes once every notice it could drop has expired.
+        let (_dir, storage) = temp_storage();
+        let now = unix_timestamp_millis();
+        let row = |seed: u8, at: u64| {
+            let key = vec![seed; 4].into();
+            let value = at.to_be_bytes().to_vec().into();
+            (NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key, value)
+        };
+        let writes = vec![row(1, now - 91 * DAY_MS), row(2, now - DAY_MS)];
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+
+        process_prune_batch(&context(&storage))
+            .await
+            .expect("prune succeeds");
+
+        let key = |seed: u8| vec![seed; 4].into();
+        assert!(!key_exists(&storage, NOTIFICATION_CUTOFF_KEYSPACE, key(1)).await);
+        assert!(key_exists(&storage, NOTIFICATION_CUTOFF_KEYSPACE, key(2)).await);
     }
 
     #[tokio::test]

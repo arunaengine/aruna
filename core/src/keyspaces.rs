@@ -284,6 +284,8 @@ pub const PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
 pub const WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
+/// The newest deletion time of a bucket per recipient, which drops older notices about it.
+pub const NOTIFICATION_CUTOFF_KEYSPACE: &str = "notification_bucket_cutoff";
 
 pub const STORAGE_ROUTING_KEYSPACE: &str = "group_storage_routing";
 
@@ -692,6 +694,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NOTIFICATION_OUTBOX_KEYSPACE,
     WATCH_SUBSCRIPTIONS_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
+    NOTIFICATION_CUTOFF_KEYSPACE,
     STORAGE_ROUTING_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
     BACKEND_SECRET_KEYSPACE,
