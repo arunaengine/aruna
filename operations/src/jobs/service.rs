@@ -689,13 +689,11 @@ async fn delete_recorded(
     let cleanup = read(cleanup_job_id(job_id))
         .await
         .map_err(JobMutationError::Storage)?;
-    if deletable
-        && cleanup.is_none_or(|cleanup| cleanup.state.is_terminal())
-        && let Err(error) = cancel::publish_deletion(context, auth, job_id).await
-    {
+    let recorded = deletable && cleanup.is_none_or(|cleanup| cleanup.state.is_terminal());
+    if recorded && let Err(error) = cancel::publish_deletion(context, auth, job_id).await {
         return Ok(RunDelete::Unrecorded(error.to_string()));
     }
-    delete_finished_run(storage, auth.user_id, job_id).await
+    delete_finished_run(storage, auth.user_id, job_id, recorded).await
 }
 
 pub async fn read_owned_job(
