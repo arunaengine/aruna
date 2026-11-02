@@ -31,6 +31,8 @@ use ulid::Ulid;
 
 const API_PREFIX: &str = "/api/v1";
 const SEARCH_PAGE: usize = 50;
+/// How long finding the node that holds a bucket may take, every search page included.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a forwarded call may take, its answer included; a scan may run for a while.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -47,6 +49,25 @@ pub(crate) struct Holder {
     pub node_id: NodeId,
     /// The distributed bucket this node's bucket is a member of.
     pub set_id: Option<Ulid>,
+}
+
+/// What a holder search could not cover: the nodes that did not answer, and whether nodes
+/// failed, node discovery failed or the search ran out of time.
+#[derive(Debug, Default)]
+pub(crate) struct Missed {
+    pub nodes: Vec<NodeId>,
+    pub incomplete: bool,
+}
+
+/// Whether a holder search stops after a page: at the end, once a holder is known and the
+/// page went past its name or nodes failed, or when nodes failed and nothing came back.
+pub(crate) fn search_done(
+    found: bool,
+    passed: bool,
+    (hits, failed): (bool, bool),
+    end: bool,
+) -> bool {
+    end || (found && (passed || failed)) || (failed && !hits)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -131,31 +152,33 @@ impl McpServer {
                 routed = Some(node_id);
             }
         }
-        let (mut holders, mut failed) = (Vec::new(), 0);
+        let (mut holders, mut missed) = (Vec::new(), Missed::default());
         if named.is_none() && info.is_none() {
-            (holders, failed) = self.find_holders(parts, auth, bucket).await?;
+            (holders, missed) = self.find_holders(parts, auth, bucket).await?;
         }
         let mut members = Vec::new();
         if let Some(set_id) = holders.first().and_then(|holder| holder.set_id) {
             members = key_holders(&context, set_id, key).await;
         }
         pick_node(here, (named, info.is_some(), routed), &holders, &members)
-            .map_err(|error| route_error(error, bucket, failed))
+            .map_err(|error| route_error(error, bucket, &missed))
     }
 
     /// The nodes holding a readable bucket named `bucket`, each distributed bucket once, and
-    /// how many nodes the search could not ask.
-    async fn find_holders(
+    /// what the search could not cover before it stopped.
+    pub(crate) async fn find_holders(
         &self,
         parts: &http::request::Parts,
         auth: &AuthContext,
         bucket: &str,
-    ) -> Result<(Vec<Holder>, usize), CallToolResult> {
+    ) -> Result<(Vec<Holder>, Missed), CallToolResult> {
         let bearer = request_bearer(parts).map(|carrier| carrier.as_str().to_string());
+        let deadline = tokio::time::Instant::now() + DISCOVERY_TIMEOUT;
         let (mut holders, mut cursor) = (Vec::<Holder>::new(), None);
+        let context = self.state.get_ctx();
         loop {
-            let page = search_buckets_distributed(
-                self.state.get_ctx().as_ref(),
+            let search = search_buckets_distributed(
+                context.as_ref(),
                 self.state.get_realm_id(),
                 self.state.get_node_id(),
                 BucketSearchRequest {
@@ -168,10 +191,18 @@ impl McpServer {
                     target_nodes: None,
                     database: false,
                 },
-            )
-            .await
-            .map_err(crate::metadata::map_api_error)
-            .map_err(server_error)?;
+            );
+            let Ok(page) = tokio::time::timeout_at(deadline, search).await else {
+                let missed = Missed {
+                    nodes: Vec::new(),
+                    incomplete: true,
+                };
+                return Ok((holders, missed));
+            };
+            let page = (page.map_err(crate::metadata::map_api_error)).map_err(server_error)?;
+            let passed = page.hits.iter().any(|hit| hit.bucket.as_str() > bucket);
+            let stats = page.fanout_stats;
+            let page_state = (!page.hits.is_empty(), stats.nodes_failed > 0);
             for hit in page.hits.into_iter().filter(|hit| hit.bucket == bucket) {
                 let holder = Holder {
                     node_id: hit.node_id,
@@ -186,8 +217,12 @@ impl McpServer {
                 }
             }
             cursor = page.next_cursor;
-            if cursor.is_none() {
-                return Ok((holders, page.fanout_stats.nodes_failed));
+            if search_done(!holders.is_empty(), passed, page_state, cursor.is_none()) {
+                let missed = Missed {
+                    nodes: stats.failed_partitions,
+                    incomplete: stats.nodes_failed > 0,
+                };
+                return Ok((holders, missed));
             }
         }
     }
@@ -320,16 +355,26 @@ fn parse_node(value: &str) -> Result<NodeId, CallToolResult> {
     })
 }
 
-fn route_error(error: RouteError, bucket: &str, failed: usize) -> CallToolResult {
+fn route_error(error: RouteError, bucket: &str, missed: &Missed) -> CallToolResult {
     match error {
-        RouteError::Missing if failed > 0 => explained(
-            ServerError::ServiceUnavailable,
-            format!(
-                "no answering node holds a readable bucket named {bucket}, but the realm search \
-                 missed {failed} nodes or could not list them; retry, or pass node_id from \
-                 list_buckets"
-            ),
-        ),
+        RouteError::Missing if missed.incomplete => {
+            let nodes = missed
+                .nodes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let silent = match nodes.is_empty() {
+                true => String::new(),
+                false => format!(" (no answer from nodes {})", nodes.join(", ")),
+            };
+            explained(
+                ServerError::ServiceUnavailable,
+                format!(
+                    "no answering node holds a readable bucket named {bucket}, but the realm \
+                     search was incomplete{silent}; retry, or pass node_id from list_buckets"
+                ),
+            )
+        }
         RouteError::Missing => explained(
             ServerError::NotFound,
             format!(

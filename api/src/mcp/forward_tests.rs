@@ -57,6 +57,18 @@ fn routed_goes_member() {
 }
 
 #[test]
+fn search_stops() {
+    // Ends at the last page, once a holder is known and the page went past its name or nodes
+    // failed, and when failed nodes leave nothing new to read, as a cursor would ask them again.
+    assert!(search_done(false, false, (true, false), true));
+    assert!(search_done(true, true, (true, false), false));
+    assert!(search_done(true, false, (true, true), false));
+    assert!(search_done(false, false, (false, true), false));
+    assert!(!search_done(false, false, (true, true), false));
+    assert!(!search_done(true, false, (true, false), false));
+}
+
+#[test]
 fn remote_goes_holder() {
     let here = node(1);
     let one = [holder(2, None)];
@@ -282,6 +294,33 @@ async fn directed_never_forwards() {
         .bucket_node(call, BUCKET, named.as_deref(), "a")
         .await;
     assert_eq!(body(looped.unwrap_err())["code"], "Conflict");
+}
+
+// A realm node that is found but never answers ends the holder search with an answer naming
+// it, instead of the search asking it again and again.
+#[tokio::test]
+async fn discovery_stops() {
+    use aruna_operations::realm::announce_presence::{
+        AnnouncePresenceConfig, AnnouncePresenceOperation,
+    };
+    let fixture = node_state().await;
+    let server = McpServer::new(fixture.state.clone());
+    let context = fixture.state.get_ctx();
+    for node_id in [node_id(LOCAL), node_id(PEER)] {
+        let presence = AnnouncePresenceConfig {
+            realm_id: fixture.state.get_realm_id(),
+            node_id,
+            schedule_refresh: false,
+        };
+        let _ = drive(AnnouncePresenceOperation::new(presence), &context).await;
+    }
+    let parts = auth_parts(&fixture.owner, None);
+    let call = (&parts, &fixture.owner);
+    let found = server.bucket_node(call, "absent-bucket", None, "a");
+    // Generous cap: only a search that never stops reaches it.
+    let found = tokio::time::timeout(Duration::from_secs(120), found).await;
+    let refused = body(found.expect("the holder search stops").unwrap_err());
+    assert!(["Not found", "Service unavailable"].contains(&refused["code"].as_str().unwrap()));
 }
 
 // A member of a distributed bucket that keeps no records of a key's range sends the call to
