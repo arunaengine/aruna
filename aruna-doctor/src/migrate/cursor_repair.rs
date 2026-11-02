@@ -5,9 +5,7 @@
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
-use craqle::{
-    CraqleNode, CraqleOptions, GraphId, TopicCursorRepairAudit, VectorClock, topic_cursor_digest,
-};
+use craqle::{GraphId, TopicCursorRepairAudit, VectorClock, topic_cursor_digest};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use irokle::{ActorClock, FjallStorage, OpId, Storage, TopicId};
 use serde::{Deserialize, Serialize};
@@ -19,6 +17,9 @@ const CURSOR_PREFIX: u8 = b'C';
 const BINDING_PREFIX: u8 = b'T';
 const AUDIT_PREFIX: u8 = b'A';
 const TOPIC_DOMAIN: &str = "craqle-graph-topic-v1";
+const META_PREFIX: u8 = b'M';
+const CLOCK_PREFIX: u8 = b'K';
+const TERM_DOMAIN: &[u8] = b"craqle-term/v1\0";
 
 /// Craqle's version 2 applied topic cursor, checked by version, topic and checksum.
 #[derive(Serialize, Deserialize)]
@@ -107,20 +108,23 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
     }
     let graph = GraphId::new(&request.graph);
     // Each store is opened in turn; opening takes its lock, so this refuses while the node runs.
-    let applied = applied_dots(&craqle_path, &graph)?;
     let topic = graph_topic(&graph);
-    let bytes = {
-        let (_db, graphs) = open_graphs(&craqle_path)?;
+    let (applied, bytes) = {
+        let (db, graphs) = open_graphs(&craqle_path)?;
+        let applied = applied_dots(&db, &graphs, &graph)?;
         let bound = graphs.get(store_key(BINDING_PREFIX, &topic))?;
         if bound.as_deref() != Some(request.graph.as_bytes()) {
             return Err(ExplorerError::Refused(format!(
                 "topic {topic} is not bound to graph {graph}"
             )));
         }
-        graphs
+        let bytes = graphs
             .get(store_key(CURSOR_PREFIX, &topic))?
             .map(|value| value.to_vec())
-            .ok_or_else(|| ExplorerError::Refused("graph has no applied sync cursor".to_string()))?
+            .ok_or_else(|| {
+                ExplorerError::Refused("graph has no applied sync cursor".to_string())
+            })?;
+        (applied, bytes)
     };
     let stale = decode_cursor(&topic, &bytes)?;
     let view = FjallStorage::open(&sync_path)?
@@ -199,7 +203,17 @@ fn store_key(prefix: u8, topic: &TopicId) -> [u8; 33] {
 }
 
 fn open_graphs(craqle_path: &Path) -> Result<(Database, Keyspace), ExplorerError> {
-    let db = Database::builder(craqle_path.join("store")).open()?;
+    let store = craqle_path.join("store");
+    let not_craqle =
+        || ExplorerError::Refused(format!("{} is not a Craqle store", store.display()));
+    if !store.exists() {
+        return Err(not_craqle());
+    }
+    let db = Database::builder(&store).open()?;
+    // Opening a missing keyspace would create it, and an inspection must write nothing.
+    if !db.keyspace_exists("graphs") || !db.keyspace_exists("terms") {
+        return Err(not_craqle());
+    }
     let graphs = db.keyspace("graphs", KeyspaceCreateOptions::default)?;
     Ok((db, graphs))
 }
@@ -239,13 +253,31 @@ fn replace_cursor(
     Ok(audit)
 }
 
-/// The dots the graph applied, read through Craqle without sync, which skips reconciliation.
-fn applied_dots(craqle_path: &Path, graph: &GraphId) -> Result<VectorClock, ExplorerError> {
-    let node = CraqleNode::open_with_options(craqle_path, CraqleOptions::new())?;
-    if !node.contains_graph(graph)? {
+/// The graph's applied clock, read from Craqle's keys: a node start would rebuild search,
+/// repair diagnostics and settle validation work in the store.
+fn applied_dots(
+    db: &Database,
+    graphs: &Keyspace,
+    graph: &GraphId,
+) -> Result<VectorClock, ExplorerError> {
+    let term = format!("<{}>", graph.as_str());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(TERM_DOMAIN);
+    hasher.update(term.as_bytes());
+    let hash = hasher.finalize();
+    let id = &hash.as_bytes()[..16];
+    let graph_key = |prefix: u8| [&[prefix][..], id].concat();
+    let terms = db.keyspace("terms", KeyspaceCreateOptions::default)?;
+    if terms.get(id)?.as_deref() != Some(term.as_bytes())
+        || graphs.get(graph_key(META_PREFIX))?.is_none()
+    {
         return Err(ExplorerError::Refused(format!("graph {graph} not found")));
     }
-    Ok(node.vector_clock(graph)?)
+    let clock = graphs
+        .get(graph_key(CLOCK_PREFIX))?
+        .ok_or_else(|| ExplorerError::Refused(format!("graph {graph} has no stored clock")))?;
+    postcard::from_bytes(&clock)
+        .map_err(|error| ExplorerError::Decode(format!("graph clock: {error}")))
 }
 
 fn encode_cursor(payload: CursorPayload) -> Result<Vec<u8>, ExplorerError> {
@@ -326,8 +358,8 @@ fn branch_view(epoch: u64, genesis: &OpId, clock: &ActorClock) -> BranchView {
 mod tests {
     use super::*;
     use craqle::{
-        AllowAllAuthorizer, CraqleIrokleOptions, CraqleRequestDurability, CreateCrateRequest,
-        GraphPolicy, SearchStorage,
+        AllowAllAuthorizer, CraqleIrokleOptions, CraqleNode, CraqleOptions,
+        CraqleRequestDurability, CreateCrateRequest, GraphPolicy, SearchStorage,
     };
     use irokle::{Ed25519Signer, Irokle, PeerId};
     use std::collections::BTreeSet;
@@ -510,6 +542,48 @@ mod tests {
         assert!(output.overlap.is_empty() && !output.applied);
         let again = repair_output(&request).unwrap();
         assert_eq!(again.old_cursor_digest, output.old_cursor_digest);
+    }
+
+    /// Every key and value of the Craqle and sync stores, read without starting a node.
+    fn store_state(path: &Path) -> BTreeMap<(String, Vec<u8>), Vec<u8>> {
+        let mut state = BTreeMap::new();
+        let craqle = Database::builder(path.join("craqle").join("store"))
+            .open()
+            .unwrap();
+        for name in craqle.list_keyspace_names() {
+            let keyspace = craqle
+                .keyspace(&name, KeyspaceCreateOptions::default)
+                .unwrap();
+            for guard in keyspace.iter() {
+                let (key, value) = guard.into_inner().unwrap();
+                state.insert((format!("craqle {}", &*name), key.to_vec()), value.to_vec());
+            }
+        }
+        drop(craqle);
+        let sync = fjall::OptimisticTxDatabase::builder(path.join("document-sync"))
+            .open()
+            .unwrap();
+        for name in sync.list_keyspace_names() {
+            let keyspace = sync
+                .inner()
+                .keyspace(&name, KeyspaceCreateOptions::default)
+                .unwrap();
+            for guard in keyspace.iter() {
+                let (key, value) = guard.into_inner().unwrap();
+                state.insert((format!("sync {}", &*name), key.to_vec()), value.to_vec());
+            }
+        }
+        state
+    }
+
+    /// A dry run starts no node, so it rebuilds, repairs or settles nothing in either store.
+    #[test]
+    fn dry_run_untouched() {
+        let (temp, request) = replaced_replica(2, false, false);
+        let before = store_state(temp.path());
+        repair_output(&request).unwrap();
+        assert_eq!(store_state(temp.path()), before);
+        assert!(!temp.path().join("craqle").join("search").exists());
     }
 
     /// One signer minted both geneses, so its sequences collide and the cursor stays.
