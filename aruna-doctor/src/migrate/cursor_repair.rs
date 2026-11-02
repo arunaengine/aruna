@@ -55,7 +55,9 @@ pub struct RepairOutput {
     topic_id: String,
     stale: BranchView,
     current: BranchView,
-    /// Actors on both geneses; their sequences collide, so a replay could skip records.
+    /// Topic actors with records applied to the graph, by highest applied sequence.
+    applied_actors: BTreeMap<String, u64>,
+    /// Actors whose sequences can collide across the geneses, so a replay could skip records.
     overlap: Vec<ActorOverlap>,
     old_cursor_digest: String,
     replacement_cursor_digest: Option<String>,
@@ -137,11 +139,21 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
     } else {
         actor_overlap(&stale.clock, &applied, &view.clock)
     };
+    let applied_actors = stale
+        .clock
+        .iter()
+        .chain(view.clock.iter())
+        .filter_map(|(actor, _)| {
+            let sequence = applied_sequence(&applied, actor);
+            (sequence > 0).then(|| (hex::encode(actor.as_bytes()), sequence))
+        })
+        .collect();
     let mut output = RepairOutput {
         graph: request.graph.clone(),
         topic_id: topic.to_string(),
         stale: branch_view(stale.epoch, &stale.genesis, &stale.clock),
         current: branch_view(view.epoch, &view.state.genesis, &view.clock),
+        applied_actors,
         overlap,
         old_cursor_digest: hex::encode(topic_cursor_digest(&bytes)),
         replacement_cursor_digest: None,
@@ -152,7 +164,7 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
     }
     if !output.overlap.is_empty() {
         return Err(ExplorerError::Refused(format!(
-            "actors published on both geneses, so a replay could skip records: {}",
+            "actor sequences can collide across the geneses, so a replay could skip records: {}",
             serde_json::to_string(&output.overlap).unwrap_or_default()
         )));
     }
@@ -257,28 +269,41 @@ fn decode_cursor(topic: &TopicId, bytes: &[u8]) -> Result<CursorPayload, Explore
     Ok(envelope.payload)
 }
 
+/// An actor collides when the graph applied its old records or the current genesis has it too,
+/// since the current genesis gives it the same actor id and restarts its sequences.
 fn actor_overlap(
     stale: &ActorClock,
     applied: &VectorClock,
     current: &ActorClock,
 ) -> Vec<ActorOverlap> {
-    current
+    let actors: BTreeMap<String, irokle::ActorId> = stale
         .iter()
-        .filter_map(|(actor, current)| {
-            let stale_cursor = stale.get(actor);
-            let applied = applied
-                .0
-                .get(&craqle::ActorId::from_bytes(*actor.as_bytes()))
-                .copied()
-                .unwrap_or(0);
-            (*current > 0 && (stale_cursor > 0 || applied > 0)).then(|| ActorOverlap {
-                actor: hex::encode(actor.as_bytes()),
+        .chain(current.iter())
+        .map(|(actor, _)| (hex::encode(actor.as_bytes()), *actor))
+        .collect();
+    actors
+        .into_iter()
+        .filter_map(|(name, actor)| {
+            let (stale_cursor, current) = (stale.get(&actor), current.get(&actor));
+            let applied = applied_sequence(applied, &actor);
+            let collides =
+                (stale_cursor > 0 && (applied > 0 || current > 0)) || (current > 0 && applied > 0);
+            collides.then_some(ActorOverlap {
+                actor: name,
                 stale_cursor,
                 applied,
-                current: *current,
+                current,
             })
         })
         .collect()
+}
+
+fn applied_sequence(applied: &VectorClock, actor: &irokle::ActorId) -> u64 {
+    applied
+        .0
+        .get(&craqle::ActorId::from_bytes(*actor.as_bytes()))
+        .copied()
+        .unwrap_or(0)
 }
 
 fn branch_view(epoch: u64, genesis: &OpId, clock: &ActorClock) -> BranchView {
@@ -296,9 +321,11 @@ fn branch_view(epoch: u64, genesis: &OpId, clock: &ActorClock) -> BranchView {
 mod tests {
     use super::*;
     use craqle::{
-        AllowAllAuthorizer, CraqleIrokleOptions, CreateCrateRequest, GraphPolicy, SearchStorage,
+        AllowAllAuthorizer, CraqleIrokleOptions, CraqleRequestDurability, CreateCrateRequest,
+        GraphPolicy, SearchStorage,
     };
     use irokle::{Ed25519Signer, Irokle, PeerId};
+    use std::collections::BTreeSet;
     use tempfile::{TempDir, tempdir};
 
     const GRAPH: &str = "urn:test:doctor-repair-cursor";
@@ -335,25 +362,30 @@ mod tests {
         let _ = from.apply_sync_ack(&ack.0);
     }
 
-    fn create(node: &CraqleNode, name: &str) {
-        let policy = GraphPolicy {
+    fn policy() -> GraphPolicy {
+        GraphPolicy {
             public: true,
             permission_paths: vec!["/t/x".to_string()],
-        };
+        }
+    }
+
+    fn create(node: &CraqleNode, name: &str, durability: CraqleRequestDurability) {
         let request = CreateCrateRequest::new(
             GraphId::new(GRAPH),
             name,
             "description",
             "2025-01-01",
             None,
-            policy,
+            policy(),
         );
-        node.create_crate(&AllowAllAuthorizer, request).unwrap();
+        node.create_crate_with_durability(&AllowAllAuthorizer, request, durability)
+            .unwrap();
     }
 
     /// A stopped replica whose cursor names a genesis minted by seed 1, while its sync store now
-    /// holds a second genesis minted by `second_seed` for the same graph topic.
-    fn replaced_replica(second_seed: u8) -> (TempDir, CursorRepair) {
+    /// holds a second genesis minted by `second_seed`. Without `first_writes` the replica's
+    /// content is local and unpublished, as Aruna writes it, and the first genesis has a policy.
+    fn replaced_replica(second_seed: u8, first_writes: bool) -> (TempDir, CursorRepair) {
         let temp = tempdir().unwrap();
         let (first, second) = (signed(1), signed(second_seed));
         let replica_sync = replica_irokle(temp.path());
@@ -366,9 +398,23 @@ mod tests {
             &replica_sync,
             &[first.peer_id()],
         );
-        create(&first_node, "first");
-        create(&second_node, "second");
         let graph = GraphId::new(GRAPH);
+        if first_writes {
+            create(&first_node, "first", CraqleRequestDurability::Durable);
+        } else {
+            create(
+                &replica,
+                "first",
+                CraqleRequestDurability::WalAlreadyDurable,
+            );
+            first_node
+                .mint_irokle_topic(&graph, BTreeSet::from([replica_id]))
+                .unwrap();
+            first_node
+                .set_graph_policy(&AllowAllAuthorizer, &graph, policy())
+                .unwrap();
+        }
+        create(&second_node, "second", CraqleRequestDurability::Durable);
         second_node
             .add_data_entity(
                 &AllowAllAuthorizer,
@@ -398,9 +444,10 @@ mod tests {
 
     #[test]
     fn dry_run_reports() {
-        let (_temp, request) = replaced_replica(2);
+        let (_temp, request) = replaced_replica(2, false);
         let output = repair_output(&request).unwrap();
         assert_ne!(output.stale.genesis, output.current.genesis);
+        assert!(!output.stale.actors.is_empty() && output.applied_actors.is_empty());
         assert!(output.overlap.is_empty() && !output.applied);
         let again = repair_output(&request).unwrap();
         assert_eq!(again.old_cursor_digest, output.old_cursor_digest);
@@ -409,7 +456,7 @@ mod tests {
     /// One signer minted both geneses, so its sequences collide and the cursor stays.
     #[test]
     fn refuses_shared_actor() {
-        let (_temp, mut request) = replaced_replica(1);
+        let (_temp, mut request) = replaced_replica(1, true);
         let output = repair_output(&request).unwrap();
         let [overlap] = output.overlap.as_slice() else {
             panic!("expected one shared actor, got {:?}", output.overlap);
@@ -423,10 +470,32 @@ mod tests {
         assert_eq!(after.old_cursor_digest, output.old_cursor_digest);
     }
 
+    /// The graph applied an old-genesis actor that has not published on the current genesis
+    /// yet; its later records there would reuse those sequences, so the cursor stays.
+    #[test]
+    fn refuses_applied_actor() {
+        let (_temp, mut request) = replaced_replica(2, true);
+        let output = repair_output(&request).unwrap();
+        let [overlap] = output.overlap.as_slice() else {
+            panic!("expected one applied actor, got {:?}", output.overlap);
+        };
+        assert!(overlap.stale_cursor > 0 && overlap.applied > 0 && overlap.current == 0);
+        assert_eq!(
+            output.applied_actors.get(&overlap.actor),
+            Some(&overlap.applied)
+        );
+        request.apply = true;
+        let error = repair_output(&request).unwrap_err();
+        assert!(matches!(error, ExplorerError::Refused(_)));
+        request.apply = false;
+        let after = repair_output(&request).unwrap();
+        assert_eq!(after.old_cursor_digest, output.old_cursor_digest);
+    }
+
     /// After the repair Craqle opens with sync again, and the kept graph takes the new genesis.
     #[test]
     fn apply_repairs_cursor() {
-        let (temp, mut request) = replaced_replica(2);
+        let (temp, mut request) = replaced_replica(2, false);
         request.apply = true;
         let output = repair_output(&request).unwrap();
         assert!(output.applied && output.replacement_cursor_digest.is_some());
@@ -449,7 +518,7 @@ mod tests {
 
     #[test]
     fn refuses_running_node() {
-        let (temp, mut request) = replaced_replica(2);
+        let (temp, mut request) = replaced_replica(2, false);
         let craqle_path = temp.path().join("craqle");
         let running = CraqleNode::open_with_options(&craqle_path, CraqleOptions::new()).unwrap();
         request.apply = true;
