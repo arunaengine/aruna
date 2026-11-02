@@ -11,10 +11,11 @@ use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use aruna_core::keyspaces::prefix_upper_bound;
 use tantivy::directory::MmapDirectory;
-use tantivy::query::{BooleanQuery, EnableScoring, Occur, Query, TermQuery, Weight};
+use tantivy::query::{BooleanQuery, EnableScoring, Occur, Query, RangeQuery, TermQuery, Weight};
 use tantivy::schema::{FAST, Field, IndexRecordOption, STORED, STRING, Schema, TEXT};
-use tantivy::tokenizer::TokenStream;
+use tantivy::tokenizer::{TextAnalyzer, TokenStream};
 use tantivy::{
     DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TERMINATED, TantivyDocument,
     TantivyError, Term,
@@ -43,6 +44,8 @@ const OPEN_WRITERS: usize = 8;
 const INDEX_PERMITS: usize = 4;
 /// Matches a page scans at most: a query whose rarest term has more walks the keys instead.
 const MATCH_SCAN_LIMIT: u64 = 1_000_000;
+/// Name words this long also match the name parts that start with them.
+const PREFIX_CHARS: usize = 3;
 
 #[derive(Debug, Error)]
 pub enum KeyIndexError {
@@ -81,8 +84,9 @@ pub enum KeyChange {
     Remove(String),
 }
 
-/// Keys between `start` and `end` in key order; with `names`, only keys that hold every name
-/// token of that text, and with `meta`, only searchable keys holding every term of the query.
+/// Keys between `start` and `end` in key order; with `names`, only keys holding every name token
+/// of that text, or a name part starting with it for tokens of at least three characters, and
+/// with `meta`, only searchable keys holding every term of the query.
 /// A query with terms returns at most `limit` matches; one without examines at most `limit` keys
 /// per index segment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -482,11 +486,14 @@ fn search_keys(
 ) -> Result<KeyPage, KeyIndexError> {
     let fields = fields(&open.index.schema())?;
     let mut analyzer = open.index.tokenizer_for_field(fields.name)?;
-    let mut terms = Vec::new();
+    let (mut terms, mut prefixes) = (Vec::new(), Vec::new());
     if let Some(names) = &query.names {
         let mut stream = analyzer.token_stream(names);
         while let Some(token) = stream.next() {
-            terms.push(Term::from_field_text(fields.name, &token.text));
+            match token.text.chars().count() >= PREFIX_CHARS {
+                true => prefixes.push(token.text.clone()),
+                false => terms.push(Term::from_field_text(fields.name, &token.text)),
+            }
         }
     }
     if let Some(meta) = &query.meta {
@@ -498,25 +505,86 @@ fn search_keys(
         );
     }
     let searcher = open.reader.searcher();
-    if terms.is_empty() {
+    if terms.is_empty() && prefixes.is_empty() {
         return walk_keys(&searcher, fields, query, None);
     }
     let mut rarest = u64::MAX;
     for term in &terms {
         rarest = rarest.min(searcher.doc_freq(term)?);
     }
-    if rarest > scan_limit {
-        return walk_keys(&searcher, fields, query, Some(&terms));
+    // A prefix with more matches than the scan limit is checked against each found key instead.
+    let (mut ranges, mut checked) = (Vec::new(), Vec::new());
+    for prefix in prefixes {
+        let found = prefix_freq(&searcher, fields.name, &prefix, scan_limit)?;
+        rarest = rarest.min(found);
+        match found > scan_limit {
+            true => checked.push(prefix),
+            false => ranges.push(prefix),
+        }
     }
-    let clauses = (terms.into_iter())
-        .map(|term| {
-            let query: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
-            (Occur::Must, query)
-        })
-        .collect();
-    let weight =
-        BooleanQuery::new(clauses).weight(EnableScoring::disabled_from_searcher(&searcher))?;
-    matched_keys(&searcher, weight.as_ref(), query)
+    let mut page = match rarest > scan_limit {
+        true => walk_keys(&searcher, fields, query, Some(&terms))?,
+        false => {
+            let ranges = ranges.iter().map(|prefix| {
+                let end = prefix_upper_bound(prefix.as_bytes());
+                let end = end.map_or(Bound::Unbounded, |end| {
+                    Bound::Excluded(Term::from_field_bytes(fields.name, &end))
+                });
+                let start = Bound::Included(Term::from_field_text(fields.name, prefix));
+                let query: Box<dyn Query> = Box::new(RangeQuery::new(start, end));
+                (Occur::Must, query)
+            });
+            let clauses = (terms.into_iter())
+                .map(|term| {
+                    let query: Box<dyn Query> =
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                    (Occur::Must, query)
+                })
+                .chain(ranges)
+                .collect();
+            let scoring = EnableScoring::disabled_from_searcher(&searcher);
+            let weight = BooleanQuery::new(clauses).weight(scoring)?;
+            matched_keys(&searcher, weight.as_ref(), query)?
+        }
+    };
+    if !checked.is_empty() {
+        page.keys
+            .retain(|key| starts_parts(&mut analyzer, key, &checked));
+    }
+    Ok(page)
+}
+
+/// Documents holding a term that starts with `prefix`, counted until the count passes `limit`.
+fn prefix_freq(
+    searcher: &Searcher,
+    field: Field,
+    prefix: &str,
+    limit: u64,
+) -> Result<u64, KeyIndexError> {
+    let end = prefix_upper_bound(prefix.as_bytes());
+    let mut found = 0u64;
+    for segment in searcher.segment_readers() {
+        let inverted = segment.inverted_index(field)?;
+        let mut range = inverted.terms().range().ge(prefix.as_bytes());
+        if let Some(end) = &end {
+            range = range.lt(end);
+        }
+        let mut stream = range.into_stream()?;
+        while found <= limit && stream.advance() {
+            found += u64::from(stream.value().doc_freq);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether every prefix starts one of the name parts of `key`.
+fn starts_parts(analyzer: &mut TextAnalyzer, key: &str, prefixes: &[String]) -> bool {
+    let mut parts = Vec::new();
+    let mut stream = analyzer.token_stream(key);
+    while let Some(token) = stream.next() {
+        parts.push(token.text.clone());
+    }
+    (prefixes.iter()).all(|prefix| parts.iter().any(|part| part.starts_with(prefix.as_str())))
 }
 
 /// The first `query.limit` live keys of the window that hold every term. Each segment keeps
@@ -817,6 +885,39 @@ mod tests {
 
     // A term too common to scan walks a bounded number of keys per page and still continues
     // to every hit, while a rare term of the same index is scanned.
+    #[tokio::test]
+    async fn name_prefixes_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["SAMD00012345/a.fna", "SAMN00000001/b.fna", "sa/sample.txt"];
+        for scan in [MATCH_SCAN_LIMIT, 0] {
+            let indexes = Arc::new(RangeIndexes::with_scan(
+                dir.path().join(scan.to_string()),
+                scan,
+            ));
+            let changes = keys.iter().map(|key| put(key)).collect();
+            indexes.apply(set(), range(), 1, changes).await.unwrap();
+            let names = |text: &str| query(Bound::Unbounded, Bound::Unbounded, Some(text), 10);
+            let found = indexes
+                .search(set(), range(), 1, names("SAMD"))
+                .await
+                .unwrap();
+            assert_eq!(found.keys, ["SAMD00012345/a.fna"], "scan limit {scan}");
+            let found = indexes
+                .search(set(), range(), 1, names("sa"))
+                .await
+                .unwrap();
+            assert_eq!(found.keys, ["sa/sample.txt"], "short words stay exact");
+            let found = indexes
+                .search(set(), range(), 1, names("AMD0"))
+                .await
+                .unwrap();
+            assert!(
+                found.keys.is_empty(),
+                "only the start of a name part matches"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn common_term_walks() {
         let dir = tempfile::tempdir().unwrap();

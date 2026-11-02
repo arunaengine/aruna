@@ -529,8 +529,9 @@ restrictions and request policies before it can be returned.
   holds the next matches in key order and an index answers no more hits once a page comes back
   without a cursor. A page can still return a cursor with few or no hits when the caller may not
   read the matches, or when a range is only partly indexed. A prefix query without terms
-  examines a bounded number of keys per page. Substring queries match whole name parts of
-  the key, split at `/`, `.`, `-`, `_` and other separators. `coverage.incomplete_ranges` counts
+  examines a bounded number of keys per page. Substring queries match name parts of the key,
+  split at `/`, `.`, `-`, `_` and other separators: a word of at least 3 characters matches the
+  parts that start with it, a shorter word only a whole part. `coverage.incomplete_ranges` counts
   ranges whose index is missing or still being built (and, in `local` mode, ranges another
   member coordinates); they are never scanned, and `complete` is false while any remain.
   A range whose index is still being built answers for the keys indexed so far and is listed in
