@@ -17,85 +17,55 @@ use std::time::Instant;
 #[test]
 fn matches_allowlisted_routes() {
     assert_eq!(
-        relay_route(
-            &Method::PUT,
-            Some("/api/v1/system/realm/quota"),
-            false,
-            false
-        ),
+        relay_route(&Method::PUT, Some("/api/v1/system/realm/quota"), false),
         Some("/system/realm/quota")
     );
     assert_eq!(
         relay_route(
             &Method::DELETE,
             Some("/api/v1/access/onboarding/secrets/{id}"),
-            false,
             false
         ),
         Some("/access/onboarding/secrets/{id}")
     );
     assert_eq!(
-        relay_route(&Method::GET, Some("/api/v1/access/token"), false, false),
+        relay_route(&Method::GET, Some("/api/v1/access/token"), false),
         Some("/access/token")
     );
     assert_eq!(
-        relay_route(&Method::POST, Some("/api/v1/access/sessions"), false, false),
+        relay_route(&Method::POST, Some("/api/v1/access/sessions"), false),
         Some("/access/sessions")
     );
     // Node-local admin routes stay on the node they were called on.
     assert_eq!(
-        relay_route(&Method::POST, Some("/api/v1/compute/drain"), false, false),
+        relay_route(&Method::POST, Some("/api/v1/compute/drain"), false),
         None
     );
     assert_eq!(
         relay_route(
             &Method::GET,
             Some("/api/v1/data/placement/diagnostics"),
-            false,
             false
         ),
         None
     );
     // The method is part of the match: only PUT on the quota route relays.
     assert_eq!(
-        relay_route(
-            &Method::GET,
-            Some("/api/v1/system/realm/quota"),
-            false,
-            false
-        ),
-        None
-    );
-}
-
-#[test]
-fn hop_stops_relay() {
-    assert_eq!(
-        relay_route(
-            &Method::PUT,
-            Some("/api/v1/system/realm/quota"),
-            false,
-            true
-        ),
+        relay_route(&Method::GET, Some("/api/v1/system/realm/quota"), false),
         None
     );
 }
 
 #[test]
 fn merge_goes_to_coordinator() {
-    // Every node, a management node too, passes a merge on; the coordinator answers a relayed one.
+    // Every node, a management node too, passes a merge on to the coordinator.
     let route = Some("/api/v1/access/users/me/merge");
     assert_eq!(
-        coordinated_route(&Method::POST, route, false),
+        coordinated_route(&Method::POST, route),
         Some("/access/users/me/merge")
     );
-    assert_eq!(coordinated_route(&Method::POST, route, true), None);
     assert_eq!(
-        coordinated_route(
-            &Method::PUT,
-            Some("/api/v1/system/realm/merge-coordinator"),
-            false
-        ),
+        coordinated_route(&Method::PUT, Some("/api/v1/system/realm/merge-coordinator")),
         Some("/system/realm/merge-coordinator")
     );
     assert!(
@@ -106,10 +76,10 @@ fn merge_goes_to_coordinator() {
     // Attaching a sign-in runs where merges run, so it cannot race one on another node.
     let attach = Some("/api/v1/access/users/me/subjects");
     assert_eq!(
-        coordinated_route(&Method::POST, attach, false),
+        coordinated_route(&Method::POST, attach),
         Some("/access/users/me/subjects")
     );
-    assert_eq!(relay_route(&Method::POST, attach, false, false), None);
+    assert_eq!(relay_route(&Method::POST, attach, false), None);
 }
 
 #[test]
@@ -117,21 +87,16 @@ fn relays_user_registration() {
     // A device has no subject index for realm users; a local register mints a stray user.
     let route = Some("/api/v1/access/users/register");
     assert_eq!(
-        relay_route(&Method::POST, route, false, false),
+        relay_route(&Method::POST, route, false),
         Some("/access/users/register")
     );
-    assert_eq!(relay_route(&Method::POST, route, true, false), None);
+    assert_eq!(relay_route(&Method::POST, route, true), None);
 }
 
 #[test]
 fn management_answers_itself() {
     assert_eq!(
-        relay_route(
-            &Method::PUT,
-            Some("/api/v1/system/realm/quota"),
-            true,
-            false
-        ),
+        relay_route(&Method::PUT, Some("/api/v1/system/realm/quota"), true),
         None
     );
 }
@@ -265,7 +230,6 @@ fn allowlist_matches_router() {
             relay_route(
                 &Method::from_bytes(method.as_bytes()).expect("valid method"),
                 Some(&format!("{API_PREFIX}{route}")),
-                false,
                 false
             )
             .is_some(),

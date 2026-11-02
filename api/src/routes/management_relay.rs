@@ -26,8 +26,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-/// Loop guard: a request that already carries a hop is answered by the node it
-/// reached, never relayed again.
+/// The nodes a relayed call passed, comma-separated. Anyone can send it, so it never makes a
+/// node answer a call it would relay; it only stops a call that would circle.
 pub(crate) const RELAY_HOP_HEADER: HeaderName = HeaderName::from_static("x-aruna-relay-hop");
 
 /// The nest every REST route is served under, stripped before the path is
@@ -107,8 +107,8 @@ pub(crate) async fn relay_middleware(
         .extensions()
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_string());
-    let has_hop = request.headers().contains_key(RELAY_HOP_HEADER);
-    if let Some(route) = coordinated_route(request.method(), matched.as_deref(), has_hop) {
+    // Each node routes by its own view, relayed or not: a hop header proves nothing.
+    if let Some(route) = coordinated_route(request.method(), matched.as_deref()) {
         return match coordinator_targets(&state).await {
             Ok(None) => next.run(request).await,
             Ok(Some(targets)) => relay(&state, route, targets, request).await,
@@ -119,7 +119,6 @@ pub(crate) async fn relay_middleware(
         request.method(),
         matched.as_deref(),
         state.is_management_node(),
-        has_hop,
     );
     let Some(route) = route else {
         return next.run(request).await;
@@ -135,11 +134,7 @@ fn relay_route(
     method: &Method,
     matched: Option<&str>,
     is_management: bool,
-    has_hop: bool,
 ) -> Option<&'static str> {
-    if has_hop {
-        return None;
-    }
     let matched = matched?;
     let path = matched.strip_prefix(API_PREFIX).unwrap_or(matched);
     RELAYED_ROUTES
@@ -149,18 +144,13 @@ fn relay_route(
         .filter(|_| !is_management)
 }
 
-/// The coordinated route this request names; a relayed request is answered where it arrived.
-fn coordinated_route(
-    method: &Method,
-    matched: Option<&str>,
-    has_hop: bool,
-) -> Option<&'static str> {
+/// The coordinated route this request names.
+fn coordinated_route(method: &Method, matched: Option<&str>) -> Option<&'static str> {
     let path = matched?.strip_prefix(API_PREFIX).unwrap_or(matched?);
     COORDINATED_ROUTES
         .iter()
         .find(|(route_method, route)| method.as_str() == *route_method && path == *route)
         .map(|(_, route)| *route)
-        .filter(|_| !has_hop)
 }
 
 /// Where a coordinated route goes: `None` when this node answers it, being the pinned merge
@@ -207,6 +197,29 @@ async fn coordinator_targets(state: &Arc<ServerState>) -> Result<Option<Vec<Stri
     }
 }
 
+/// The nodes a call passed, this one appended; `None` when the call came through this node or
+/// the target already, which would make it circle.
+fn passed_hops(
+    state: &ServerState,
+    headers: &HeaderMap,
+    target: Option<NodeId>,
+) -> Option<HeaderValue> {
+    let own = state.get_node_id().to_string();
+    let passed = headers
+        .get(RELAY_HOP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let seen = |node: &str| passed.split(',').any(|hop| hop.trim() == node);
+    if seen(&own) || target.is_some_and(|node| seen(&node.to_string())) {
+        return None;
+    }
+    let hops = match passed.is_empty() {
+        true => own,
+        false => format!("{passed},{own}"),
+    };
+    HeaderValue::from_str(&hops).ok()
+}
+
 async fn relay(
     state: &Arc<ServerState>,
     route: &'static str,
@@ -218,6 +231,10 @@ async fn relay(
         return ServerError::NoManagementNode.into_response();
     }
 
+    let Some(hop) = passed_hops(state, request.headers(), None) else {
+        warn!(route, "A relayed route would circle between nodes");
+        return ServerError::NoManagementNode.into_response();
+    };
     let method = request.method().clone();
     // Inside the `/api/v1` nest the URI lacks that prefix; the original URI keeps it.
     let uri = request
@@ -237,8 +254,6 @@ async fn relay(
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
-    let hop = HeaderValue::from_str(&state.get_node_id().to_string())
-        .unwrap_or_else(|_| HeaderValue::from_static("relayed"));
 
     // Targets are tried in order, but only a failure that provably predates
     // processing may move a non-idempotent request on to the next target.
