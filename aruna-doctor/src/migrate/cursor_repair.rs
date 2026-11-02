@@ -128,17 +128,17 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
         .ok_or_else(|| {
             ExplorerError::Refused(format!("topic {topic} is not in the local sync store"))
         })?;
-    if stale.epoch == view.epoch && stale.genesis == view.state.genesis {
-        return Err(ExplorerError::Refused(
-            "the cursor already names the current topic branch".to_string(),
-        ));
+    if stale.genesis == view.state.genesis {
+        let reason = if stale.epoch == view.epoch {
+            "the cursor already names the current topic branch"
+        } else {
+            // A reset clears actor tips, so a rejoin can bring back truncated history.
+            "the topic kept the same genesis after a reset; a rejoin can reuse applied sequences, \
+             and this command only repairs a replaced genesis"
+        };
+        return Err(ExplorerError::Refused(reason.to_string()));
     }
-    // One genesis never reuses a sequence, so only a replaced genesis can collide.
-    let overlap = if stale.genesis == view.state.genesis {
-        Vec::new()
-    } else {
-        actor_overlap(&stale.clock, &applied, &view.clock)
-    };
+    let overlap = actor_overlap(&stale.clock, &applied, &view.clock);
     let applied_actors = stale
         .clock
         .iter()
@@ -432,14 +432,57 @@ mod tests {
         replica.reconcile_irokle().unwrap();
         replica_sync.storage().reset_topic(&topic).unwrap();
         push(&second, &replica_sync, topic);
-        let request = CursorRepair {
-            database_path: temp.path().display().to_string(),
+        let request = dry_request(temp.path());
+        (temp, request)
+    }
+
+    fn dry_request(path: &Path) -> CursorRepair {
+        CursorRepair {
+            database_path: path.display().to_string(),
             graph: GRAPH.to_string(),
             craqle_path: None,
             sync_path: None,
             apply: false,
-        };
+        }
+    }
+
+    /// A stopped replica whose topic was reset and rejoined under the same genesis.
+    fn rejoined_replica() -> (TempDir, CursorRepair) {
+        let temp = tempdir().unwrap();
+        let first = signed(1);
+        let replica_sync = replica_irokle(temp.path());
+        let first_node = member(
+            &temp.path().join("first"),
+            &first,
+            &[replica_sync.peer_id()],
+        );
+        let replica = member(
+            &temp.path().join("craqle"),
+            &replica_sync,
+            &[first.peer_id()],
+        );
+        create(&first_node, "first", CraqleRequestDurability::Durable);
+        let topic = first_node
+            .irokle_topic_id(&GraphId::new(GRAPH))
+            .unwrap()
+            .unwrap();
+        push(&first, &replica_sync, topic);
+        replica.reconcile_irokle().unwrap();
+        replica_sync.storage().reset_topic(&topic).unwrap();
+        push(&first, &replica_sync, topic);
+        let request = dry_request(temp.path());
         (temp, request)
+    }
+
+    /// A reset under the same genesis can rejoin truncated history, so it is refused outright.
+    #[test]
+    fn refuses_same_genesis() {
+        let (_temp, request) = rejoined_replica();
+        let error = repair_output(&request).unwrap_err();
+        assert!(
+            matches!(&error, ExplorerError::Refused(reason) if reason.contains("same genesis")),
+            "{error}"
+        );
     }
 
     #[test]
